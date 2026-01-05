@@ -564,8 +564,18 @@ mod tests {
         .expect("verifier should accept correct proof");
 
         // Compute expected evaluation by fixing the same point in the prover state.
-        // After nvars rounds, streaming state has fixed all variables; eval_at_index(0) is the point eval.
-        let vals_at_point: Vec<R> = st.mles.iter().map(|m| m.eval_at_index(0)).collect();
+        //
+        // IMPORTANT: In the sumcheck schedule, the verifier samples `r_i` *after* the prover sends
+        // the i-th univariate. The prover only applies `r_i` at the *start of the next round*.
+        // So after `nvars` rounds, `st.mles` has only applied r_0..r_{nvars-2}; we must still
+        // apply the last challenge r_{nvars-1} to reach the full evaluation point.
+        let last_r = challenges[nvars - 1];
+        let fixed_last = st
+            .mles
+            .iter()
+            .map(|m| m.fix_variable(R::from(last_r)))
+            .collect::<Vec<_>>();
+        let vals_at_point: Vec<R> = fixed_last.iter().map(|m| m.eval_at_index(0)).collect();
         let expected = comb(&vals_at_point);
         assert_eq!(sub.expected_evaluation, expected, "subclaim mismatch");
     }
