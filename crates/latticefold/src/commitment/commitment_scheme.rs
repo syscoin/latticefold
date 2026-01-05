@@ -8,6 +8,10 @@ use stark_rings_linalg::Matrix;
 use rand_chacha::ChaCha20Rng;
 use rand::SeedableRng;
 use sha2::{Digest, Sha256};
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+#[cfg(feature = "parallel")]
+use ark_std::cfg_into_iter;
 
 use super::homomorphic_commitment::Commitment;
 use crate::{
@@ -94,19 +98,55 @@ impl<R: Ring> AjtaiCommitmentScheme<R> {
                 if f.len() != *n {
                     return Err(CommitmentError::WrongWitnessLength(f.len(), *n));
                 }
-                let mut acc = vec![R::ZERO; *kappa];
-                for (j, fj) in f.iter().enumerate() {
-                    if *fj == R::ZERO {
-                        continue;
-                    }
-                    let col_seed = Self::derive_col_seed(domain, seed, j as u64);
-                    let mut rng = ChaCha20Rng::from_seed(col_seed);
-                    for i in 0..*kappa {
-                        let aij = R::rand(&mut rng);
-                        acc[i] += aij * *fj;
-                    }
+                #[cfg(feature = "parallel")]
+                {
+                    let kappa = *kappa;
+                    let domain = domain.as_slice();
+                    let seed = *seed;
+                    let acc = cfg_into_iter!(0..f.len())
+                        .fold(
+                            || vec![R::ZERO; kappa],
+                            |mut local, j| {
+                                let fj = f[j];
+                                if fj == R::ZERO {
+                                    return local;
+                                }
+                                let col_seed = Self::derive_col_seed(domain, &seed, j as u64);
+                                let mut rng = ChaCha20Rng::from_seed(col_seed);
+                                for i in 0..kappa {
+                                    let aij = R::rand(&mut rng);
+                                    local[i] += aij * fj;
+                                }
+                                local
+                            },
+                        )
+                        .reduce(
+                            || vec![R::ZERO; kappa],
+                            |mut a, b| {
+                                for i in 0..kappa {
+                                    a[i] += b[i];
+                                }
+                                a
+                            },
+                        );
+                    Ok(Commitment::from_vec_raw(acc))
                 }
-                Ok(Commitment::from_vec_raw(acc))
+                #[cfg(not(feature = "parallel"))]
+                {
+                    let mut acc = vec![R::ZERO; *kappa];
+                    for (j, fj) in f.iter().enumerate() {
+                        if *fj == R::ZERO {
+                            continue;
+                        }
+                        let col_seed = Self::derive_col_seed(domain, seed, j as u64);
+                        let mut rng = ChaCha20Rng::from_seed(col_seed);
+                        for i in 0..*kappa {
+                            let aij = R::rand(&mut rng);
+                            acc[i] += aij * *fj;
+                        }
+                    }
+                    Ok(Commitment::from_vec_raw(acc))
+                }
             }
         }
     }
