@@ -2,6 +2,7 @@ use cyclotomic_rings::rings::SuitableRing;
 use stark_rings::{
     balanced_decomposition::DecomposeToVec,
     cyclotomic_ring::{CRT, ICRT},
+    PolyRing,
     Ring,
 };
 use stark_rings_linalg::Matrix;
@@ -143,6 +144,88 @@ impl<R: Ring> AjtaiCommitmentScheme<R> {
                         for i in 0..*kappa {
                             let aij = R::rand(&mut rng);
                             acc[i] += aij * *fj;
+                        }
+                    }
+                    Ok(Commitment::from_vec_raw(acc))
+                }
+            }
+        }
+    }
+
+    /// Commit to a witness, using a fast-path when all witness entries are *constant-coefficient*
+    /// ring elements (i.e., elements embedded from the base ring).
+    ///
+    /// This is a pure optimization: if any entry is not constant-coefficient, we fall back to
+    /// `commit()` with identical outputs.
+    pub fn commit_const_coeff_fast(&self, f: &[R]) -> Result<Commitment<R>, CommitmentError>
+    where
+        R: PolyRing,
+        R::BaseRing: Ring,
+        R: core::ops::Mul<R::BaseRing, Output = R>,
+    {
+        // Quick check: if any nonzero entry has a nonzero non-constant coefficient, fall back.
+        for fj in f {
+            if *fj == R::ZERO {
+                continue;
+            }
+            let coeffs = fj.coeffs();
+            if coeffs.iter().skip(1).any(|c| *c != R::BaseRing::ZERO) {
+                return self.commit(f);
+            }
+        }
+
+        match &self.matrix {
+            AjtaiMatrix::Explicit(_) => self.commit(f),
+            AjtaiMatrix::Seeded { seed, domain, kappa, n } => {
+                if f.len() != *n {
+                    return Err(CommitmentError::WrongWitnessLength(f.len(), *n));
+                }
+                #[cfg(feature = "parallel")]
+                {
+                    let kappa = *kappa;
+                    let domain = domain.as_slice();
+                    let seed = *seed;
+                    let acc = cfg_into_iter!(0..f.len())
+                        .fold(
+                            || vec![R::ZERO; kappa],
+                            |mut local, j| {
+                                let fj0 = f[j].coeffs()[0];
+                                if fj0 == R::BaseRing::ZERO {
+                                    return local;
+                                }
+                                let col_seed = Self::derive_col_seed(domain, &seed, j as u64);
+                                let mut rng = ChaCha20Rng::from_seed(col_seed);
+                                for i in 0..kappa {
+                                    let aij = R::rand(&mut rng);
+                                    local[i] += aij * fj0;
+                                }
+                                local
+                            },
+                        )
+                        .reduce(
+                            || vec![R::ZERO; kappa],
+                            |mut a, b| {
+                                for i in 0..kappa {
+                                    a[i] += b[i];
+                                }
+                                a
+                            },
+                        );
+                    Ok(Commitment::from_vec_raw(acc))
+                }
+                #[cfg(not(feature = "parallel"))]
+                {
+                    let mut acc = vec![R::ZERO; *kappa];
+                    for (j, fj) in f.iter().enumerate() {
+                        let fj0 = fj.coeffs()[0];
+                        if fj0 == R::BaseRing::ZERO {
+                            continue;
+                        }
+                        let col_seed = Self::derive_col_seed(domain, seed, j as u64);
+                        let mut rng = ChaCha20Rng::from_seed(col_seed);
+                        for i in 0..*kappa {
+                            let aij = R::rand(&mut rng);
+                            acc[i] += aij * fj0;
                         }
                     }
                     Ok(Commitment::from_vec_raw(acc))

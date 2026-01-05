@@ -122,7 +122,7 @@ where
                 .iter()
                 .map(|u| {
                     had_s
-                        .commit(&encode_had_u_instance::<R>(u))
+                        .commit_const_coeff_fast(&encode_had_u_instance::<R>(u))
                         .map_err(|e| format!("PiFold: cfs_had_u commit failed: {e:?}"))
                         .map(|c| c.as_ref().to_vec())
                 })
@@ -133,7 +133,7 @@ where
                 .iter()
                 .map(|b| {
                     mon_s
-                        .commit(b)
+                        .commit_const_coeff_fast(b)
                         .map_err(|e| format!("PiFold: cfs_mon_b commit failed: {e:?}"))
                         .map(|c| c.as_ref().to_vec())
                 })
@@ -593,38 +593,35 @@ where
     had_state.randomness = had_rand.clone();
     mon_state.randomness = mon_rand.clone();
 
+    // The streaming sumcheck round driver fixes variables using the *previous* round's challenge.
+    // After the last round we have one remaining variable that must be fixed by the final sampled r.
+    if log_m > 0 {
+        had_state.fix_last_variable(*had_rand.last().expect("had_rand non-empty"));
+    }
+    if g_nvars > 0 {
+        mon_state.fix_last_variable(*mon_rand.last().expect("mon_rand non-empty"));
+    }
+
     let had_sumcheck = convert_streaming_proof(&StreamingProof(had_msgs));
     let mon_sumcheck = convert_streaming_proof(&StreamingProof(mon_msgs));
 
     // -----------------
     // Compute aux witness
     // -----------------
-    let ts_r_had = ts_weights(&had_rand);
-
     let t_aux_had = Instant::now();
     let mut had_u: Vec<[Vec<R::BaseRing>; 3]> = Vec::with_capacity(ell);
+    let had_evals = had_state.final_evals();
     for inst_idx in 0..ell {
-        let mut U: [Vec<R::BaseRing>; 3] = [
-            Vec::with_capacity(d),
-            Vec::with_capacity(d),
-            Vec::with_capacity(d),
-        ];
+        let base = inst_idx * 4;
+        // MLE order per instance: [eq(s,r), y1, y2, y3]
+        let y1 = had_evals[base + 1];
+        let y2 = had_evals[base + 2];
+        let y3 = had_evals[base + 3];
 
-        for i in 0..3 {
-            for j in 0..d {
-                let mut acc = R::BaseRing::ZERO;
-                for row in 0..m {
-                    let mut y_row = R::ZERO;
-                    for (coeff, col_idx) in &M[i].coeffs[row] {
-                        if *col_idx < witnesses[inst_idx].len() {
-                            y_row += *coeff * witnesses[inst_idx][*col_idx];
-                        }
-                    }
-                    acc += ts_r_had[row] * y_row.coeffs()[j];
-                }
-                U[i].push(acc);
-            }
-        }
+        let mut U: [Vec<R::BaseRing>; 3] = [Vec::with_capacity(d), Vec::with_capacity(d), Vec::with_capacity(d)];
+        U[0].extend_from_slice(y1.coeffs());
+        U[1].extend_from_slice(y2.coeffs());
+        U[2].extend_from_slice(y3.coeffs());
 
         for x in &U[0] {
             transcript.absorb_field_element(x);

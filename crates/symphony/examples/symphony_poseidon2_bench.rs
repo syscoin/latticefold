@@ -599,7 +599,11 @@ where
     // Seeded Ajtai is the intended “CRS-as-seed” instantiation (matches the whitepaper).
     const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
     let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, kappa, n);
-    let cm = scheme.commit(witness.as_ref()).unwrap().as_ref().to_vec();
+    let cm = scheme
+        .commit_const_coeff_fast(witness.as_ref())
+        .unwrap()
+        .as_ref()
+        .to_vec();
 
     // Symphony Π_rg parameters
     let rg_params = if decomp && k_g == 3 {

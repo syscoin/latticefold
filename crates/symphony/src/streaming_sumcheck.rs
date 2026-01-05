@@ -229,6 +229,41 @@ where
     round: usize,
 }
 
+impl<R: OverField + PolyRing> StreamingSumcheckState<R>
+where
+    R::BaseRing: Ring,
+{
+    /// Number of variables remaining in the internal MLEs.
+    #[inline]
+    pub fn remaining_vars(&self) -> usize {
+        self.mles[0].num_vars()
+    }
+
+    /// Apply one additional verifier challenge by fixing the next variable in all internal MLEs.
+    ///
+    /// This is useful when the caller samples the final challenge but does not call `prove_round`
+    /// again (e.g., shared-schedule drivers that end immediately after the last transcript squeeze).
+    pub fn fix_last_variable(&mut self, r: R::BaseRing) {
+        let nv = self.remaining_vars();
+        assert!(
+            nv == 1,
+            "fix_last_variable expects exactly 1 remaining var, got {nv}"
+        );
+        let r_ring = R::from(r);
+        self.mles = self.mles.iter().map(|m| m.fix_variable(r_ring)).collect();
+    }
+
+    /// Evaluate all internal MLEs at the fully fixed point (after all variables are fixed).
+    pub fn final_evals(&self) -> Vec<R> {
+        let nv = self.remaining_vars();
+        assert!(
+            nv == 0,
+            "final_evals expects 0 remaining vars (fully fixed), got {nv}"
+        );
+        self.mles.iter().map(|m| m.eval_at_index(0)).collect()
+    }
+}
+
 /// Streaming sumcheck prover.
 pub struct StreamingSumcheck;
 

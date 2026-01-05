@@ -179,7 +179,7 @@ where
                 .iter()
                 .map(|u| {
                     had_s
-                        .commit(&encode_had_u_instance::<R>(u))
+                        .commit_const_coeff_fast(&encode_had_u_instance::<R>(u))
                         .map_err(|e| format!("PiFold: cfs_had_u commit failed: {e:?}"))
                         .map(|c| c.as_ref().to_vec())
                 })
@@ -190,7 +190,7 @@ where
                 .iter()
                 .map(|b| {
                     mon_s
-                        .commit(b)
+                        .commit_const_coeff_fast(b)
                         .map_err(|e| format!("PiFold: cfs_mon_b commit failed: {e:?}"))
                         .map(|c| c.as_ref().to_vec())
                 })
