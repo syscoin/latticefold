@@ -127,8 +127,8 @@ where
                     .collect();
                 StreamingMleEnum::dense(new_evals)
             }
-            // Sparse/base scalar: materialize to dense once fixed (avoids exponential recursion).
-            StreamingMleEnum::SparseMatVec { .. } | StreamingMleEnum::BaseScalarVec { .. } => {
+            // Sparse mat-vec: materialize to dense once fixed (avoids exponential recursion).
+            StreamingMleEnum::SparseMatVec { .. } => {
                 let new_evals: Vec<R> = (0..half)
                     .map(|i| {
                         let f0 = self.eval_at_index(i << 1);
@@ -137,6 +137,21 @@ where
                     })
                     .collect();
                 StreamingMleEnum::dense(new_evals)
+            }
+            // Base-scalar table: keep it base-scalar after fixing (critical for memory).
+            //
+            // Materializing this into `Vec<R>` blows up memory by ~dim(R)× because `R` stores `d`
+            // base-ring coefficients. We only need constant-coefficient values here.
+            StreamingMleEnum::BaseScalarVec { evals, num_vars } => {
+                let r0 = r.coeffs()[0];
+                let one_minus = R::BaseRing::ONE - r0;
+                let new_evals: Vec<R::BaseRing> = (0..half)
+                    .map(|i| one_minus * evals[i << 1] + r0 * evals[(i << 1) | 1])
+                    .collect();
+                StreamingMleEnum::BaseScalarVec {
+                    evals: Arc::new(new_evals),
+                    num_vars: num_vars - 1,
+                }
             }
             // EqBase: keep structural (base-field) with updated scale and shortened r vector.
             StreamingMleEnum::EqBase {
