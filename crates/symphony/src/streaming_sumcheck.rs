@@ -58,10 +58,12 @@ impl<R: OverField> StreamingMle<R> for FixedStreamingMle<R> {
     }
 
     fn eval_at_index(&self, index: usize) -> R {
-        // Fix the *least significant* variable (matches latticefold sumcheck / MLE ordering):
-        // f'(b) = (1-r)*f(0,b) + r*f(1,b), where the original indices are 2*b and 2*b+1.
-        let f0 = self.inner.eval_at_index(index << 1);
-        let f1 = self.inner.eval_at_index((index << 1) | 1);
+        // Fix the *most significant* variable (matches latticefold MLSumcheck / DenseMLE ordering):
+        // f'(b) = (1-r)*f(0,b) + r*f(1,b), where the original indices are b and b+2^(n-1).
+        let inner_nv = self.inner.num_vars();
+        let half = 1 << (inner_nv - 1);
+        let f0 = self.inner.eval_at_index(index);
+        let f1 = self.inner.eval_at_index(index + half);
         (R::ONE - self.r) * f0 + self.r * f1
     }
 
@@ -102,7 +104,7 @@ impl<R: OverField> StreamingMle<R> for DenseStreamingMle<R> {
         // Actually fix the variable by creating a smaller dense MLE.
         let half = self.evals.len() / 2;
         let new_evals: Vec<R> = (0..half)
-            .map(|i| (R::ONE - r) * self.evals[i << 1] + r * self.evals[(i << 1) | 1])
+            .map(|i| (R::ONE - r) * self.evals[i] + r * self.evals[i + half])
             .collect();
         Box::new(DenseStreamingMle::new(new_evals))
     }
@@ -264,10 +266,10 @@ impl StreamingSumcheck {
         let result = {
             let mut s = scratch();
             for b in 0..domain_half {
-                // Evaluate all MLEs at indices 2*b (for x_i=0) and 2*b+1 (for x_i=1)
+                // Evaluate all MLEs at indices b (for x_i=0) and b+half (for x_i=1)
                 for (i, mle) in state.mles.iter().enumerate() {
-                    s.vals0[i] = mle.eval_at_index(b << 1);
-                    s.vals1[i] = mle.eval_at_index((b << 1) | 1);
+                    s.vals0[i] = mle.eval_at_index(b);
+                    s.vals1[i] = mle.eval_at_index(b + domain_half);
                 }
 
                 s.levals[0] = comb_fn(&s.vals0);
@@ -301,8 +303,8 @@ impl StreamingSumcheck {
             let evaluations = cfg_into_iter!(0..domain_half)
                 .fold(scratch, |mut s, b| {
                     for (i, mle) in state.mles.iter().enumerate() {
-                        s.vals0[i] = mle.eval_at_index(b << 1);
-                        s.vals1[i] = mle.eval_at_index((b << 1) | 1);
+                        s.vals0[i] = mle.eval_at_index(b);
+                        s.vals1[i] = mle.eval_at_index(b + domain_half);
                     }
 
                     s.levals[0] = comb_fn(&s.vals0);
