@@ -251,9 +251,9 @@ where
     // -----------------
     // Per-instance Π_rg coins and Π_mon setup
     // -----------------
-    let mut H_digits_all: Vec<Vec<Vec<Vec<R::BaseRing>>>> = Vec::with_capacity(ell); // [ell][k_g][m_j][d]
     let mut cba_all: Vec<Vec<(Vec<R>, R::BaseRing, R::BaseRing)>> = Vec::with_capacity(ell);
     let mut rc_all: Vec<Option<R::BaseRing>> = Vec::with_capacity(ell);
+    let mut Js: Vec<Vec<Vec<R::BaseRing>>> = Vec::with_capacity(ell);
 
     // This is used to build the monomial vector length.
     // Assume same n across instances.
@@ -288,33 +288,8 @@ where
         }
 
 
-        // Build H_digits for this instance (on m_J rows).
-        let mut H = vec![vec![R::BaseRing::ZERO; d]; m_j];
-        let Jref = &J;
-        for b in 0..blocks {
-            for i in 0..rg_params.lambda_pj {
-                let out_row = b * rg_params.lambda_pj + i;
-                for t in 0..rg_params.l_h {
-                    let in_row = b * rg_params.l_h + t;
-                    let coef = Jref[i][t];
-                    for col in 0..d {
-                        H[out_row][col] += coef * f[in_row].coeffs()[col];
-                    }
-                }
-            }
-        }
-
-        let mut H_digits: Vec<Vec<Vec<R::BaseRing>>> =
-            vec![vec![vec![R::BaseRing::ZERO; d]; m_j]; rg_params.k_g];
-        for r in 0..m_j {
-            let row_digits = H[r].decompose_to_vec(rg_params.d_prime, rg_params.k_g);
-            for c in 0..d {
-                for i in 0..rg_params.k_g {
-                    H_digits[i][r][c] = row_digits[c][i];
-                }
-            }
-        }
-        H_digits_all.push(H_digits);
+        // Keep J; we will stream-compute projected digits as needed (no H_digits materialization).
+        Js.push(J);
 
         // setchk vector-only pre-sumcheck coins for this instance.
         let mut cba: Vec<(Vec<R>, R::BaseRing, R::BaseRing)> = Vec::with_capacity(rg_params.k_g);
@@ -401,31 +376,51 @@ where
         .map(|cba| cba.iter().map(|(_, _, a)| R::from(*a)).collect::<Vec<_>>())
         .collect::<Vec<_>>();
 
-    // Build g vectors per instance and corresponding MLEs.
-    let expand_row = |row: usize| -> usize { row % m_j };
-    let mut g_all: Vec<Vec<Vec<R>>> = Vec::with_capacity(ell); // [ell][k_g][g_len]
+    // Helper: compute projected row digits for out_row ∈ [0, m_J).
+    // Returns digits as [d][k_g] in base ring.
+    let proj_row_digits = |f: &[R], J: &[Vec<R::BaseRing>], out_row: usize| -> Vec<Vec<R::BaseRing>> {
+        let i = out_row % rg_params.lambda_pj;
+        let b = out_row / rg_params.lambda_pj;
+        let mut h_row = vec![R::BaseRing::ZERO; d];
+        for t in 0..rg_params.l_h {
+            let in_row = b * rg_params.l_h + t;
+            let coef = J[i][t];
+            let coeffs = f[in_row].coeffs();
+            for col in 0..d {
+                h_row[col] += coef * coeffs[col];
+            }
+        }
+        h_row.decompose_to_vec(rg_params.d_prime, rg_params.k_g)
+    };
 
     for inst_idx in 0..ell {
-        let mut g_inst: Vec<Vec<R>> = Vec::with_capacity(rg_params.k_g);
-        for dig in 0..rg_params.k_g {
-            let mut gi = Vec::with_capacity(g_len);
-            for c in 0..d {
-                for r in 0..m {
-                    gi.push(exp::<R>(H_digits_all[inst_idx][dig][expand_row(r)][c]).expect("Exp failed"));
-                }
-            }
-            g_inst.push(gi);
-        }
-        g_all.push(g_inst);
+        let f = witnesses[inst_idx];
+        let J = &Js[inst_idx];
+        let reps = m / m_j;
 
         // For each digit, add (m_j, m'_j, eq(c)) MLEs.
         for dig in 0..rg_params.k_g {
             let (_c, beta_i, _a) = &cba_all[inst_idx][dig];
-            let m_j_evals = g_all[inst_idx][dig]
-                .iter()
-                .map(|r| R::from(ev(r, *beta_i)))
-                .collect::<Vec<_>>();
-            let m_prime = m_j_evals.iter().map(|z| *z * z).collect::<Vec<_>>();
+
+            let mut m_j_evals: Vec<R> = vec![R::ZERO; g_len];
+            let mut m_prime: Vec<R> = vec![R::ZERO; g_len];
+
+            // Fill by streaming over projected rows; repeat pattern if m > m_J.
+            for out_row in 0..m_j {
+                let digits = proj_row_digits(f, J, out_row);
+                for col in 0..d {
+                    let g = exp::<R>(digits[col][dig]).expect("Exp failed");
+                    let mj_ring = R::from(ev(&g, *beta_i));
+                    let mp_ring = mj_ring * mj_ring;
+                    for rep in 0..reps {
+                        let r = out_row + rep * m_j;
+                        let idx = col * m + r;
+                        m_j_evals[idx] = mj_ring;
+                        m_prime[idx] = mp_ring;
+                    }
+                }
+            }
+
             mles_mon_batched.push(DenseMultilinearExtension::from_evaluations_vec(g_nvars, m_j_evals));
             mles_mon_batched.push(DenseMultilinearExtension::from_evaluations_vec(g_nvars, m_prime));
             let eq = build_eq_x_r(&cba_all[inst_idx][dig].0).unwrap();
@@ -483,11 +478,14 @@ where
             }
             for inst_idx in 0..ell {
                 let b = beta_cts[inst_idx];
-                for dig in 0..rg_params.k_g {
-                    for row in 0..m_j {
-                        let w = ts_r[row];
-                        for col in 0..d {
-                            v_digits_folded[dig][col] += b * H_digits_all[inst_idx][dig][row][col] * w;
+                let f = witnesses[inst_idx];
+                let J = &Js[inst_idx];
+                for row in 0..m_j {
+                    let w = ts_r[row];
+                    let digits = proj_row_digits(f, J, row);
+                    for col in 0..d {
+                        for dig in 0..rg_params.k_g {
+                            v_digits_folded[dig][col] += b * digits[col][dig] * w;
                         }
                     }
                 }
@@ -528,14 +526,28 @@ where
     drop(ys);
 
     let r_mon = mon_ps.randomness.clone();
-    let r_poly_mon: Vec<R> = r_mon.iter().copied().map(R::from).collect();
+    let ts_r_mon = ts_weights(&r_mon);
 
     let mut mon_b: Vec<Vec<R>> = Vec::with_capacity(ell);
     for inst_idx in 0..ell {
         let mut b_inst = Vec::with_capacity(rg_params.k_g);
         for dig in 0..rg_params.k_g {
-            let mle = DenseMultilinearExtension::from_evaluations_slice(g_nvars, &g_all[inst_idx][dig]);
-            b_inst.push(mle.evaluate(&r_poly_mon).unwrap());
+            let f = witnesses[inst_idx];
+            let J = &Js[inst_idx];
+            let reps = m / m_j;
+            let mut acc = R::ZERO;
+            for out_row in 0..m_j {
+                let digits = proj_row_digits(f, J, out_row);
+                for col in 0..d {
+                    let g = exp::<R>(digits[col][dig]).expect("Exp failed");
+                    for rep in 0..reps {
+                        let r = out_row + rep * m_j;
+                        let idx = col * m + r;
+                        acc += R::from(ts_r_mon[idx]) * g;
+                    }
+                }
+            }
+            b_inst.push(acc);
         }
         transcript.absorb_slice(&b_inst);
         mon_b.push(b_inst);
