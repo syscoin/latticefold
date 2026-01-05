@@ -73,8 +73,16 @@ fn main() {
     println!("Step 1: Loading R1CS (chunked)...");
     let load_start = Instant::now();
     
-    // Pad columns to a multiple of l_h to satisfy Π_rg’s block structure, without power-of-two blowup.
-    let pad_cols_to_multiple_of = 64usize;
+    // Π_rg parameters that affect how we pad/load the witness.
+    //
+    // IMPORTANT: `l_h` directly controls `blocks = n_f / l_h` and therefore `m_J = blocks * lambda_pj`.
+    // For large SP1 witnesses, a larger `l_h` can dramatically reduce RAM (tables scale with m_J).
+    let l_h: usize = std::env::var("L_H")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
+    // Pad columns to a multiple of l_h to satisfy Π_rg’s block structure.
+    let pad_cols_to_multiple_of = l_h;
     let cache = open_sp1_r1cs_chunk_cache::<R, BabyBear>(&r1cs_path, chunk_size, pad_cols_to_multiple_of)
         .expect("Failed to open/build chunk cache");
     
@@ -102,12 +110,34 @@ fn main() {
     println!("Step 3: Setting up Symphony parameters...");
     let kappa = 8;
     let k_g = 3;
+    // Projection dimension for Π_rg (must satisfy: lambda_pj <= l_h and l_h % lambda_pj == 0).
+    // For production SP1 runs, lambda_pj=1 is a toy setting; default to 32 and allow override.
+    let lambda_pj: usize = std::env::var("LAMBDA_PJ")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
     let rg_params = RPParams {
-        l_h: 64,
-        lambda_pj: 1,
+        l_h,
+        lambda_pj,
         k_g,
         d_prime: (R::dimension() as u128) - 2,
     };
+    assert!(
+        rg_params.lambda_pj <= rg_params.l_h,
+        "Π_rg requires lambda_pj <= l_h (got lambda_pj={}, l_h={})",
+        rg_params.lambda_pj,
+        rg_params.l_h
+    );
+    assert!(
+        rg_params.l_h % rg_params.lambda_pj == 0,
+        "Π_rg requires lambda_pj | l_h so that m_J divides m (got lambda_pj={}, l_h={})",
+        rg_params.lambda_pj,
+        rg_params.l_h
+    );
+    println!(
+        "  Π_rg params: l_h={}, lambda_pj={}, k_g={}, d'={}",
+        rg_params.l_h, rg_params.lambda_pj, rg_params.k_g, rg_params.d_prime
+    );
     
     // Main commitment (shared across chunks)
     let setup_start = Instant::now();
