@@ -13,8 +13,7 @@ use std::sync::Arc;
 use stark_rings::{OverField, PolyRing, Ring};
 use stark_rings_linalg::SparseMatrix;
 
-use crate::streaming_sumcheck::StreamingMle;
-use crate::streaming_sumcheck::FixedStreamingMle;
+use crate::streaming_sumcheck::{DenseStreamingMle, StreamingMle};
 
 /// Streaming MLE backed by a base-ring scalar evaluation vector.
 ///
@@ -42,7 +41,14 @@ impl<R: OverField> StreamingMle<R> for BaseScalarVecMle<R> {
     }
 
     fn fix_variable(&self, r: R) -> Box<dyn StreamingMle<R>> {
-        Box::new(FixedStreamingMle::new(Box::new(self.clone()), r))
+        // Materialize the fixed polynomial evaluations to avoid exponential recursion.
+        let half = 1 << (self.num_vars - 1);
+        let new_evals: Vec<R> = (0..half)
+            .map(|i| {
+                (R::ONE - r) * R::from(self.evals[i << 1]) + r * R::from(self.evals[(i << 1) | 1])
+            })
+            .collect();
+        Box::new(DenseStreamingMle::new(new_evals))
     }
 }
 
@@ -93,15 +99,18 @@ impl<R: OverField> StreamingMle<R> for SparseMatrixMle<R> {
     }
 
     fn fix_variable(&self, r: R) -> Box<dyn StreamingMle<R>> {
-        // Keep it streaming: wrap with an interpolating fixed-variable adapter.
-        Box::new(FixedStreamingMle::new(
-            Box::new(SparseMatrixMle {
-                matrix: self.matrix.clone(),
-                witness: self.witness.clone(),
-                num_vars: self.num_vars,
-            }),
-            r,
-        ))
+        // Materialize the fixed polynomial evaluations to avoid exponential recursion.
+        // This keeps total work O(m) across rounds (like dense sumcheck), while still
+        // avoiding materializing the full length-m vector up front.
+        let half = 1 << (self.num_vars - 1);
+        let new_evals: Vec<R> = (0..half)
+            .map(|i| {
+                let f0 = self.compute_row(i << 1);
+                let f1 = self.compute_row((i << 1) | 1);
+                (R::ONE - r) * f0 + r * f1
+            })
+            .collect();
+        Box::new(DenseStreamingMle::new(new_evals))
     }
 }
 
@@ -353,15 +362,17 @@ where
     }
 
     fn fix_variable(&self, r: R) -> Box<dyn StreamingMle<R>> {
-        // Keep it streaming: wrap with an interpolating fixed-variable adapter.
-        Box::new(FixedStreamingMle::new(
-            Box::new(ClosureMle {
-                eval_fn: self.eval_fn.clone(),
-                num_vars: self.num_vars,
-                _phantom: std::marker::PhantomData,
-            }),
-            r,
-        ))
+        // Materialize the fixed polynomial evaluations to avoid exponential recursion.
+        let half = 1 << (self.num_vars - 1);
+        let eval_fn = self.eval_fn.clone();
+        let new_evals: Vec<R> = (0..half)
+            .map(|i| {
+                let f0 = eval_fn(i << 1);
+                let f1 = eval_fn((i << 1) | 1);
+                (R::ONE - r) * f0 + r * f1
+            })
+            .collect();
+        Box::new(DenseStreamingMle::new(new_evals))
     }
 }
 
