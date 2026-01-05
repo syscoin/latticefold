@@ -1,0 +1,707 @@
+//! Symphony Poseidon2 Benchmark — SP1 Verifier Component GM-1B
+//!
+//! This implements the SP1 Poseidon2 hash function as a Hadamard relation (M1·f ⊙ M2·f = M3·f)
+//! and folds it using Symphony's Π_fold to measure performance.
+//!
+//! SP1 Poseidon2 parameters:
+//! - WIDTH = 16
+//! - NUM_EXTERNAL_ROUNDS = 8 (4 at start, 4 at end)
+//! - NUM_INTERNAL_ROUNDS = 13
+//! - S-box: x^7 (computed as x² → x³ → x⁶ → x⁷, 4 mult constraints per S-box)
+//!
+//! Run:
+//! - `cargo run -p latticefold-plus --example symphony_poseidon2_bench --release --features symphony`
+
+use std::time::Instant;
+use ark_ff::PrimeField;
+
+#[cfg(feature = "symphony")]
+fn main() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use stark_rings::PolyRing;
+    use cyclotomic_rings::rings::FrogPoseidonConfig;
+    use stark_rings::cyclotomic_ring::models::frog_ring;
+
+    struct PanicHookGuard(Option<Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>>);
+    impl PanicHookGuard {
+        fn silence_expected_panics() -> Self {
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {
+                // Intentionally silent: the benchmark uses `catch_unwind` for expected failures
+                // (e.g. too-small k_g in balanced decomposition).
+            }));
+            Self(Some(prev))
+        }
+    }
+    impl Drop for PanicHookGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = self.0.take() {
+                std::panic::set_hook(prev);
+            }
+        }
+    }
+
+    fn run_for_ring<
+        R: stark_rings::CoeffRing,
+        PC: cyclotomic_rings::rings::GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
+    >(
+        ring_name: &str,
+    ) where
+        R::BaseRing: stark_rings::Zq + stark_rings::balanced_decomposition::Decompose + ark_ff::PrimeField,
+    {
+    const WIDTH: usize = 16;
+    const NUM_EXTERNAL_ROUNDS: usize = 8;
+    const NUM_INTERNAL_ROUNDS: usize = 13;
+
+    println!("=========================================================");
+        println!("Symphony Poseidon2 Benchmark — {ring_name}");
+    println!("=========================================================");
+    println!();
+    println!("SP1 Poseidon2 parameters:");
+    println!("  WIDTH = {WIDTH}");
+    println!("  NUM_EXTERNAL_ROUNDS = {NUM_EXTERNAL_ROUNDS} (4 + 4)");
+    println!("  NUM_INTERNAL_ROUNDS = {NUM_INTERNAL_ROUNDS}");
+    println!("  S-box = x^7 (4 mult constraints per S-box)");
+    println!();
+
+    println!("Expected constraints per permutation:");
+    println!("  External: 8 rounds × 16 S-boxes × 4 mults = 512");
+    println!("  Internal: 13 rounds × 1 S-box × 4 mults = 52");
+    println!("  Total S-box: ~564 constraints");
+    println!();
+
+        // Digit-sizing hint based on modulus size.
+        let d_prime: u32 = (R::dimension() as u32) / 2;
+        let bits_per_digit = (d_prime as f64).log2();
+        let mod_bits = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField::MODULUS_BIT_SIZE;
+        let k_suggest = ((mod_bits as f64) / bits_per_digit).ceil() as usize;
+        println!(
+            "Digit-sizing hint: dim={} => d'={d_prime} (~{bits_per_digit:.2} bits/digit), modulus bits={mod_bits} => suggest k_g≈{k_suggest}",
+            R::dimension()
+        );
+
+        // Sweep permutation counts.
+        //
+        // With paper-style R1CS witness decomposition enabled unconditionally in this benchmark,
+        // we use k_g=3 (Table 1 instantiation).
+        //
+        // Default is FAST: perms={1}. Opt into the full sweep with `SYMPHONY_POSEIDON2_FULL=1`.
+        let full = std::env::var("SYMPHONY_POSEIDON2_FULL").ok().as_deref() == Some("1");
+        let _ring_sel = std::env::var("SYMPHONY_RING").unwrap_or_else(|_| "sp1bb16".to_string());
+        let k_list = vec![3usize];
+        let perms_list: Vec<usize> = if full { vec![1, 2, 4, 8] } else { vec![1] };
+        println!(
+            "Sweep mode: {} (set SYMPHONY_POSEIDON2_FULL=1 for full sweep)",
+            if full { "FULL" } else { "FAST" }
+        );
+        for &k_g in &k_list {
+            for &num_perms in &perms_list {
+                // Silence panic-hook output only for the `catch_unwind` region so expected failures
+                // don't print scary backtraces.
+                let _hook_guard = PanicHookGuard::silence_expected_panics();
+                let r = catch_unwind(AssertUnwindSafe(|| {
+                    test_symphony_poseidon2_folding::<R, PC>(num_perms, k_g);
+                }));
+                if let Err(_) = r {
+                    println!("  !! PANIC: decomposition overflow for perms={num_perms}, k_g={k_g}");
+                }
+            }
+    }
+
+    println!("\n=========================================================");
+    println!("GM-1B Insight: SP1 compressed verifier uses ~1000 Poseidon2 calls");
+    println!("At ~564 constraints/perm, that's ~564K constraints");
+    println!("=========================================================");
+    }
+
+    // NOTE: Frog is ~64-bit modulus and is very expensive once k_g is raised high enough.
+    // For B1 we focus on BabyBear modulus first.
+    // Default to Frog (matches the paper's instantiation modulus family and has d=16 in this repo).
+    // Note: the built-in BabyBear ring in this repo has d=72, which is incompatible with our Π_fold
+    // MLE domain requirement that m*d is a power-of-two.
+    run_for_ring::<frog_ring::RqPoly, FrogPoseidonConfig>("Frog ring (64-bit prime, d=16)");
+
+    // Constraint count per permutation:
+    // - 8 external rounds × 16 S-boxes × 4 mults = 512 constraints
+    // - 13 internal rounds × 1 S-box × 4 mults = 52 constraints
+    // Total: ~564 mult constraints per permutation
+
+    // All printing is done inside `run_for_ring`.
+}
+
+/// Build Poseidon2 Hadamard relation matrices (M1, M2, M3) for Symphony.
+///
+/// For the Hadamard relation M1·f ⊙ M2·f = M3·f:
+/// - Each S-box x^7 requires 4 mult constraints
+/// - Witness f contains: [state_0..state_{WIDTH-1}, aux_vars...]
+#[cfg(feature = "symphony")]
+fn build_poseidon2_hadamard_matrices<R: stark_rings::PolyRing>(
+    num_permutations: usize,
+) -> (
+    stark_rings_linalg::SparseMatrix<R>,
+    stark_rings_linalg::SparseMatrix<R>,
+    stark_rings_linalg::SparseMatrix<R>,
+    Vec<R>,
+    usize,
+) {
+    use stark_rings_linalg::SparseMatrix;
+
+    const WIDTH: usize = 16;
+    const NUM_EXTERNAL_ROUNDS: usize = 8;
+    const NUM_INTERNAL_ROUNDS: usize = 13;
+
+    // Count constraints and variables first
+    let sboxes_per_perm = NUM_EXTERNAL_ROUNDS * WIDTH + NUM_INTERNAL_ROUNDS;
+    let constraints_per_perm = sboxes_per_perm * 4; // 4 mult constraints per S-box
+    let total_constraints = constraints_per_perm * num_permutations;
+
+    // Variables: initial state + intermediate values
+    // Each S-box creates 5 values: rc_add + x² + x³ + x⁶ + x⁷
+    // External round: 16 sboxes × 5 + 16 state update = 96 per round
+    // Internal round: 1 sbox × 5 + 16 state update = 21 per round
+    let aux_per_round_external = WIDTH * 5 + WIDTH; // 5 per sbox + state update
+    let aux_per_round_internal = 5 + WIDTH; // 1 sbox + state update
+    let aux_per_perm = NUM_EXTERNAL_ROUNDS * aux_per_round_external / 2 * 2
+        + NUM_INTERNAL_ROUNDS * aux_per_round_internal;
+
+    let total_aux = aux_per_perm * num_permutations;
+    let n = WIDTH + total_aux; // witness length
+
+    // Round to power of 2 for folding (with extra headroom)
+    let n_padded = (n * 2).next_power_of_two();
+    
+    // m must be >= m_J where m_J = (n / l_h) * lambda_pj
+    // With l_h=64, lambda_pj=32: m_J = n_padded / 64 * 32 = n_padded / 2
+    // So ensure m >= n_padded / 2 and m is a multiple of m_J
+    let m_j_estimate = (n_padded / 64) * 32;
+    let m_min = total_constraints.max(m_j_estimate);
+    let m = m_min.next_power_of_two();
+
+    // Build sparse matrices - format is (value, column_index) per row
+    let mut m1_coeffs: Vec<Vec<(R, usize)>> = vec![Vec::new(); m];
+    let mut m2_coeffs: Vec<Vec<(R, usize)>> = vec![Vec::new(); m];
+    let mut m3_coeffs: Vec<Vec<(R, usize)>> = vec![Vec::new(); m];
+
+    // Build witness
+    let mut witness = vec![R::ZERO; n_padded];
+
+    // Initialize state.
+    //
+    // IMPORTANT:
+    // This benchmark only constrains the Poseidon2 S-box *multiplication* structure (x^7),
+    // not the full set of linear/additive constraints of a real Poseidon2 permutation.
+    //
+    // We still use it to stress-test the *magnitude* of witness values for Π_rg decomposition
+    // by actually computing x^7 chains (this is what broke and forced `ONE`-witnesses).
+    let mut state_indices: Vec<usize> = (0..WIDTH).collect();
+    let mut state_vals: Vec<R> = (0..WIDTH).map(|_| R::from(5u128)).collect(); // 5^7 = 78125 > 4096
+    for i in 0..WIDTH {
+        witness[i] = state_vals[i];
+    }
+
+    let mut next_aux = WIDTH;
+    let mut constraint_idx = 0;
+    let one = R::ONE;
+
+    for _perm in 0..num_permutations {
+        // === External rounds (first half) ===
+        for _round in 0..NUM_EXTERNAL_ROUNDS / 2 {
+            let mut new_state_indices = Vec::with_capacity(WIDTH);
+            let mut new_state_vals = Vec::with_capacity(WIDTH);
+
+            for i in 0..WIDTH {
+                let with_rc_idx = next_aux;
+                let with_rc_val = state_vals[i] + R::ONE;
+                witness[with_rc_idx] = with_rc_val;
+                next_aux += 1;
+
+                let t1_idx = next_aux;
+                let t1_val = with_rc_val * with_rc_val;
+                witness[t1_idx] = t1_val;
+                next_aux += 1;
+                m1_coeffs[constraint_idx].push((one, with_rc_idx));
+                m2_coeffs[constraint_idx].push((one, with_rc_idx));
+                m3_coeffs[constraint_idx].push((one, t1_idx));
+                constraint_idx += 1;
+
+                let t2_idx = next_aux;
+                let t2_val = t1_val * with_rc_val;
+                witness[t2_idx] = t2_val;
+                next_aux += 1;
+                m1_coeffs[constraint_idx].push((one, t1_idx));
+                m2_coeffs[constraint_idx].push((one, with_rc_idx));
+                m3_coeffs[constraint_idx].push((one, t2_idx));
+                constraint_idx += 1;
+
+                let t3_idx = next_aux;
+                let t3_val = t2_val * t2_val;
+                witness[t3_idx] = t3_val;
+                next_aux += 1;
+                m1_coeffs[constraint_idx].push((one, t2_idx));
+                m2_coeffs[constraint_idx].push((one, t2_idx));
+                m3_coeffs[constraint_idx].push((one, t3_idx));
+                constraint_idx += 1;
+
+                let t4_idx = next_aux;
+                let t4_val = t3_val * with_rc_val;
+                witness[t4_idx] = t4_val;
+                next_aux += 1;
+                m1_coeffs[constraint_idx].push((one, t3_idx));
+                m2_coeffs[constraint_idx].push((one, with_rc_idx));
+                m3_coeffs[constraint_idx].push((one, t4_idx));
+                constraint_idx += 1;
+
+                new_state_indices.push(t4_idx);
+                new_state_vals.push(t4_val);
+            }
+
+            // Linear layer placeholder: sum and add (like the R1CS toy circuit).
+            // Not constrained here, but keeps subsequent S-box inputs growing realistically.
+            let sum_val = new_state_vals.iter().copied().fold(R::ZERO, |a, b| a + b);
+            state_indices.clear();
+            state_vals.clear();
+            for i in 0..WIDTH {
+                let new_idx = next_aux;
+                let new_val = new_state_vals[i] + sum_val;
+                witness[new_idx] = new_val;
+                next_aux += 1;
+                state_indices.push(new_idx);
+                state_vals.push(new_val);
+            }
+        }
+
+        // === Internal rounds ===
+        for _round in 0..NUM_INTERNAL_ROUNDS {
+            // Round constant (+1)
+            let s0_with_rc_idx = next_aux;
+            let s0_with_rc_val = state_vals[0] + R::ONE;
+            witness[s0_with_rc_idx] = s0_with_rc_val;
+            next_aux += 1;
+
+            // S-box for first element (4 constraints)
+            let t1_idx = next_aux;
+            let t1_val = s0_with_rc_val * s0_with_rc_val;
+            witness[t1_idx] = t1_val;
+            next_aux += 1;
+            m1_coeffs[constraint_idx].push((one, s0_with_rc_idx));
+            m2_coeffs[constraint_idx].push((one, s0_with_rc_idx));
+            m3_coeffs[constraint_idx].push((one, t1_idx));
+            constraint_idx += 1;
+
+            let t2_idx = next_aux;
+            let t2_val = t1_val * s0_with_rc_val;
+            witness[t2_idx] = t2_val;
+            next_aux += 1;
+            m1_coeffs[constraint_idx].push((one, t1_idx));
+            m2_coeffs[constraint_idx].push((one, s0_with_rc_idx));
+            m3_coeffs[constraint_idx].push((one, t2_idx));
+            constraint_idx += 1;
+
+            let t3_idx = next_aux;
+            let t3_val = t2_val * t2_val;
+            witness[t3_idx] = t3_val;
+            next_aux += 1;
+            m1_coeffs[constraint_idx].push((one, t2_idx));
+            m2_coeffs[constraint_idx].push((one, t2_idx));
+            m3_coeffs[constraint_idx].push((one, t3_idx));
+            constraint_idx += 1;
+
+            let t4_idx = next_aux;
+            let t4_val = t3_val * s0_with_rc_val;
+            witness[t4_idx] = t4_val;
+            next_aux += 1;
+            m1_coeffs[constraint_idx].push((one, t3_idx));
+            m2_coeffs[constraint_idx].push((one, s0_with_rc_idx));
+            m3_coeffs[constraint_idx].push((one, t4_idx));
+            constraint_idx += 1;
+
+            // State update (all bounded)
+            state_indices[0] = t4_idx;
+            state_vals[0] = t4_val;
+            let sum_val = state_vals.iter().copied().fold(R::ZERO, |a, b| a + b);
+            for i in 0..WIDTH {
+                let new_idx = next_aux;
+                let new_val = state_vals[i] + sum_val;
+                witness[new_idx] = new_val;
+                next_aux += 1;
+                state_indices[i] = new_idx;
+                state_vals[i] = new_val;
+            }
+        }
+
+        // === External rounds (second half) ===
+        for _round in NUM_EXTERNAL_ROUNDS / 2..NUM_EXTERNAL_ROUNDS {
+            let mut new_state_indices = Vec::with_capacity(WIDTH);
+            let mut new_state_vals = Vec::with_capacity(WIDTH);
+
+            for i in 0..WIDTH {
+                let with_rc_idx = next_aux;
+                let with_rc_val = state_vals[i] + R::ONE;
+                witness[with_rc_idx] = with_rc_val;
+                next_aux += 1;
+
+                // S-box (4 constraints)
+                let t1_idx = next_aux;
+                let t1_val = with_rc_val * with_rc_val;
+                witness[t1_idx] = t1_val;
+                next_aux += 1;
+                m1_coeffs[constraint_idx].push((one, with_rc_idx));
+                m2_coeffs[constraint_idx].push((one, with_rc_idx));
+                m3_coeffs[constraint_idx].push((one, t1_idx));
+                constraint_idx += 1;
+
+                let t2_idx = next_aux;
+                let t2_val = t1_val * with_rc_val;
+                witness[t2_idx] = t2_val;
+                next_aux += 1;
+                m1_coeffs[constraint_idx].push((one, t1_idx));
+                m2_coeffs[constraint_idx].push((one, with_rc_idx));
+                m3_coeffs[constraint_idx].push((one, t2_idx));
+                constraint_idx += 1;
+
+                let t3_idx = next_aux;
+                let t3_val = t2_val * t2_val;
+                witness[t3_idx] = t3_val;
+                next_aux += 1;
+                m1_coeffs[constraint_idx].push((one, t2_idx));
+                m2_coeffs[constraint_idx].push((one, t2_idx));
+                m3_coeffs[constraint_idx].push((one, t3_idx));
+                constraint_idx += 1;
+
+                let t4_idx = next_aux;
+                let t4_val = t3_val * with_rc_val;
+                witness[t4_idx] = t4_val;
+                next_aux += 1;
+                m1_coeffs[constraint_idx].push((one, t3_idx));
+                m2_coeffs[constraint_idx].push((one, with_rc_idx));
+                m3_coeffs[constraint_idx].push((one, t4_idx));
+                constraint_idx += 1;
+
+                new_state_indices.push(t4_idx);
+                new_state_vals.push(t4_val);
+            }
+
+            // Linear layer
+            let sum_val = new_state_vals.iter().copied().fold(R::ZERO, |a, b| a + b);
+            state_indices.clear();
+            state_vals.clear();
+            for i in 0..WIDTH {
+                let new_idx = next_aux;
+                let new_val = new_state_vals[i] + sum_val;
+                witness[new_idx] = new_val;
+                next_aux += 1;
+                state_indices.push(new_idx);
+                state_vals.push(new_val);
+            }
+        }
+    }
+
+    // Construct SparseMatrix directly
+    let m1 = SparseMatrix {
+        nrows: m,
+        ncols: n_padded,
+        coeffs: m1_coeffs,
+    };
+    let m2 = SparseMatrix {
+        nrows: m,
+        ncols: n_padded,
+        coeffs: m2_coeffs,
+    };
+    let m3 = SparseMatrix {
+        nrows: m,
+        ncols: n_padded,
+        coeffs: m3_coeffs,
+    };
+
+    (m1, m2, m3, witness, constraint_idx)
+}
+
+#[cfg(feature = "symphony")]
+fn r1cs_decompose_witness_and_expand_matrices<R: stark_rings::CoeffRing>(
+    m1: &stark_rings_linalg::SparseMatrix<R>,
+    m2: &stark_rings_linalg::SparseMatrix<R>,
+    m3: &stark_rings_linalg::SparseMatrix<R>,
+    witness: &[R],
+    k_cs: usize,
+    base_b: u128,
+) -> (
+    stark_rings_linalg::SparseMatrix<R>,
+    stark_rings_linalg::SparseMatrix<R>,
+    stark_rings_linalg::SparseMatrix<R>,
+    Vec<R>,
+)
+where
+    R::BaseRing: stark_rings::Zq + ark_ff::PrimeField,
+{
+    use ark_ff::Field as _;
+    use ark_ff::PrimeField;
+    use stark_rings_linalg::SparseMatrix;
+
+    let d = R::dimension();
+    let n = witness.len();
+
+    // Read modulus into u128 (works for p <= 2^128).
+    let modulus_big = <R::BaseRing as PrimeField>::MODULUS;
+    let mut q: u128 = 0;
+    for (i, limb) in modulus_big.as_ref().iter().enumerate() {
+        q |= (*limb as u128) << (64 * i);
+    }
+    let q_half = q / 2;
+    let b = base_b as i128;
+    let b_half = (base_b / 2) as i128;
+
+    // Decompose each ring element coefficient-wise into k_cs digits base b.
+    // New witness layout: for original index j, digit t is at (j*k_cs + t).
+    let mut out = vec![R::ZERO; n * k_cs];
+    for (j, r) in witness.iter().enumerate() {
+        let coeffs = r.coeffs();
+        debug_assert_eq!(coeffs.len(), d);
+
+        // digits[t][k] is the digit at position t of coefficient k.
+        let mut digits: Vec<Vec<R::BaseRing>> = vec![vec![R::BaseRing::ZERO; d]; k_cs];
+        for (k, c) in coeffs.iter().enumerate() {
+            // Convert coefficient to centered i128 in (-q/2, q/2].
+            let big = c.into_bigint();
+            let mut u: u128 = 0;
+            for (i, limb) in big.as_ref().iter().enumerate() {
+                u |= (*limb as u128) << (64 * i);
+            }
+            let mut x: i128 = if u > q_half { u as i128 - q as i128 } else { u as i128 };
+
+            for t in 0..k_cs {
+                // Balanced remainder in [-b/2, b/2].
+                let mut r0 = x.rem_euclid(b);
+                if r0 > b_half {
+                    r0 -= b;
+                }
+                x = (x - r0) / b;
+                let fe = if r0 >= 0 {
+                    R::BaseRing::from(r0 as u64)
+                } else {
+                    -R::BaseRing::from((-r0) as u64)
+                };
+                digits[t][k] = fe;
+            }
+        }
+        for t in 0..k_cs {
+            out[j * k_cs + t] = R::from(digits[t].clone());
+        }
+    }
+
+    // Expand sparse matrices: each original column j becomes k_cs columns with weights b^t.
+    fn expand<R: stark_rings::CoeffRing>(
+        m: &SparseMatrix<R>,
+        k_cs: usize,
+        base_b: u128,
+    ) -> SparseMatrix<R>
+    where
+        R::BaseRing: stark_rings::Zq,
+    {
+        let mut coeffs = vec![Vec::<(R, usize)>::new(); m.nrows];
+        for (row, row_terms) in m.coeffs.iter().enumerate() {
+            let mut new_row = Vec::with_capacity(row_terms.len() * k_cs);
+            for (a, col) in row_terms.iter() {
+                let mut bpow: u128 = 1;
+                for t in 0..k_cs {
+                    let w = R::from(bpow);
+                    new_row.push((*a * w, col * k_cs + t));
+                    bpow = bpow.saturating_mul(base_b);
+                }
+            }
+            coeffs[row] = new_row;
+        }
+        SparseMatrix::<R> {
+            nrows: m.nrows,
+            ncols: m.ncols * k_cs,
+            coeffs,
+        }
+    }
+
+    (expand(m1, k_cs, base_b), expand(m2, k_cs, base_b), expand(m3, k_cs, base_b), out)
+}
+
+#[cfg(feature = "symphony")]
+fn test_symphony_poseidon2_folding<
+    R: stark_rings::CoeffRing,
+    PC: cyclotomic_rings::rings::GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
+>(
+    num_permutations: usize,
+    k_g: usize,
+)
+where
+    R::BaseRing: stark_rings::Zq + stark_rings::balanced_decomposition::Decompose + ark_ff::PrimeField,
+{
+    use ark_ff::{BigInteger, Field, PrimeField};
+    use latticefold::commitment::AjtaiCommitmentScheme;
+    use latticefold_plus::{
+        rp_rgchk::RPParams,
+        symphony_open::MultiAjtaiOpenVerifier,
+        symphony_pifold_batched::prove_pi_fold_batched_sumcheck_fs,
+        symphony_we_relation::check_r_cp_poseidon_fs,
+    };
+    use stark_rings_linalg::Matrix;
+
+    println!("\n=== Testing Symphony Poseidon2 with {} permutation(s), k_g={} ===", num_permutations, k_g);
+
+    let build_start = Instant::now();
+    let (m1, m2, m3, witness, actual_constraints) =
+        build_poseidon2_hadamard_matrices::<R>(num_permutations);
+    let build_time = build_start.elapsed();
+
+    // Paper-style R1CS witness decomposition (k_cs digits base 2^4), expanding the witness and the
+    // linear maps so the Hadamard relation is unchanged. This is the Table 1 instantiation setup
+    // and is enabled unconditionally in this benchmark.
+    println!("  R1CS witness decomposition: ENABLED (k_cs=16, b=2^4)");
+    let (m1, m2, m3, witness) =
+        r1cs_decompose_witness_and_expand_matrices::<R>(&m1, &m2, &m3, &witness, 16, 16);
+
+    let n = witness.len();
+    let m = m1.nrows;
+
+    println!("  Hadamard matrices built:");
+    println!("    Permutations: {num_permutations}");
+    println!("    Actual constraints: {actual_constraints}");
+    println!("    Matrix rows (m): {m}");
+    println!("    Witness length (n): {n}");
+    println!("    Build time: {build_time:?}");
+
+    // Witness magnitude proxy: maximum bit-length among base-prime-field limbs.
+    //
+    // This is not “signed magnitude” in Zq, but it is a useful indicator of whether values
+    // are staying tiny vs spanning the full modulus.
+    let mut max_bits = 0u32;
+    for r in &witness {
+        for c in r.coeffs() {
+            for limb in c.to_base_prime_field_elements() {
+                max_bits = max_bits.max(limb.into_bigint().num_bits());
+            }
+        }
+    }
+    println!("    Witness max limb bits: {max_bits}");
+
+    // Verify Hadamard relation holds: M1·f ⊙ M2·f = M3·f
+    let y1 = m1.try_mul_vec(&witness).expect("M1*f failed");
+    let y2 = m2.try_mul_vec(&witness).expect("M2*f failed");
+    let y3 = m3.try_mul_vec(&witness).expect("M3*f failed");
+    let mut hadamard_ok = true;
+    for row in 0..m {
+        if y1[row] * y2[row] != y3[row] {
+            hadamard_ok = false;
+            println!("    Hadamard FAILED at row {row}");
+            break;
+        }
+    }
+    if hadamard_ok {
+        println!("  Hadamard relation: PASSED ✓");
+    } else {
+        println!("  Hadamard relation: FAILED ✗");
+        return;
+    }
+
+    // Commitment setup
+    let kappa = 8; // Ajtai commitment rows
+    let a = Matrix::<R>::rand(&mut ark_std::test_rng(), kappa, n);
+    let scheme = AjtaiCommitmentScheme::<R>::new(a);
+    let cm = scheme.commit(&witness).unwrap().as_ref().to_vec();
+
+    // Symphony Π_rg parameters
+    let rg_params = if decomp && k_g == 3 {
+        // Paper-style prototype mode:
+        // - use d' := d-2 in Eq.(29) / (33)
+        // - keep m_J small by using lambda_pj=1 (toy bench knob; paper uses 2^8)
+        RPParams {
+            l_h: 64,
+            lambda_pj: 1,
+            k_g,
+            d_prime: (R::dimension() as u128) - 2,
+        }
+    } else {
+        RPParams {
+        l_h: 64,
+        lambda_pj: 32,
+            k_g,
+        d_prime: (R::dimension() as u128) / 2,
+        }
+    };
+
+    // CP commitment schemes for aux messages
+    let a_had = Matrix::<R>::rand(&mut ark_std::test_rng(), kappa, 3 * R::dimension());
+    let a_mon = Matrix::<R>::rand(&mut ark_std::test_rng(), kappa, rg_params.k_g);
+    let scheme_had = AjtaiCommitmentScheme::<R>::new(a_had);
+    let scheme_mon = AjtaiCommitmentScheme::<R>::new(a_mon);
+
+    // Public inputs (statement binding)
+    let public_inputs: Vec<R::BaseRing> = vec![
+        R::BaseRing::from(0x5350315fu128), // "SP1_"
+        R::BaseRing::from(num_permutations as u128),
+        R::BaseRing::from(k_g as u128),
+    ];
+
+    // Prove Π_fold (single instance for this benchmark)
+    println!("  Π_fold prove: START...");
+    let prove_start = Instant::now();
+    let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
+        [&m1, &m2, &m3],
+        &[cm.clone()],
+        &[witness.clone()],
+        &public_inputs,
+        Some(&scheme_had),
+        Some(&scheme_mon),
+        rg_params.clone(),
+    );
+    let prove_time = prove_start.elapsed();
+
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => {
+            println!("  Π_fold prove FAILED: {e}");
+            return;
+        }
+    };
+    println!("  Π_fold prove: PASSED ✓ ({prove_time:?})");
+
+    // Verify R_cp
+    let open = MultiAjtaiOpenVerifier::<R>::new()
+        .with_scheme("cfs_had_u", scheme_had)
+        .with_scheme("cfs_mon_b", scheme_mon);
+
+    println!("  R_cp verify: START...");
+    let verify_start = Instant::now();
+    let result = check_r_cp_poseidon_fs::<R, PC>(
+        [&m1, &m2, &m3],
+        &[cm],
+        &out.proof,
+        &open,
+        &out.cfs_had_u,
+        &out.cfs_mon_b,
+        &out.aux,
+        &public_inputs,
+    );
+    let verify_time = verify_start.elapsed();
+
+    match result {
+        Ok(_) => {
+            println!("  R_cp verify: PASSED ✓ ({verify_time:?})");
+        }
+        Err(e) => {
+            println!("  R_cp verify FAILED: {e}");
+            return;
+        }
+    }
+
+    // Proof size estimate (coins bytes only for simplicity)
+    let proof_bytes = out.proof.coins.bytes.len();
+
+    println!("\n  === RESULTS ===");
+    println!("  Permutations: {num_permutations}");
+    println!("  Constraints: {actual_constraints} (padded to {m})");
+    println!("  Witness size: {n}");
+    println!("  Prove time: {prove_time:?}");
+    println!("  Verify time: {verify_time:?}");
+    println!("  Proof coins: {} bytes", proof_bytes);
+}
+
+#[cfg(not(feature = "symphony"))]
+fn main() {
+    eprintln!("This example requires `--features symphony`.");
+}

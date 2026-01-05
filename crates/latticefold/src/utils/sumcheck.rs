@@ -1,5 +1,6 @@
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::{fmt::Display, marker::PhantomData};
+use ark_std::boxed::Box;
 use prover::{ProverMsg, ProverState};
 use stark_rings::{OverField, Ring};
 use stark_rings_poly::polynomials::{ArithErrors, DenseMultilinearExtension};
@@ -41,6 +42,24 @@ pub struct MLSumcheck<R, T>(#[doc(hidden)] PhantomData<(R, T)>);
 #[derive(Clone, Debug, PartialEq, CanonicalSerialize, CanonicalDeserialize)]
 pub struct Proof<R1: Ring>(Vec<ProverMsg<R1>>);
 
+/// Spec for running one sumcheck as part of a k-way shared-randomness schedule.
+///
+/// This is the generalization of `prove_two_as_subprotocol_shared_with_hook` to `k >= 1`.
+pub struct SharedSumcheckProverSpec<R: OverField> {
+    pub mles: Vec<DenseMultilinearExtension<R>>,
+    pub nvars: usize,
+    pub degree: usize,
+    pub comb_fn: Box<dyn Fn(&[R]) -> R + Sync + Send>,
+}
+
+/// Verifier spec for the k-way shared-randomness schedule.
+pub struct SharedSumcheckVerifySpec<'a, R: OverField> {
+    pub nvars: usize,
+    pub degree: usize,
+    pub claimed_sum: R,
+    pub proof: &'a Proof<R>,
+}
+
 impl<R: OverField, T: Transcript<R>> MLSumcheck<R, T> {
     /// extract sum from the proof
     pub fn extract_sum(proof: &Proof<R>) -> R {
@@ -79,6 +98,63 @@ impl<R: OverField, T: Transcript<R>> MLSumcheck<R, T> {
         (Proof(prover_msgs), prover_state)
     }
 
+    /// Variant of `prove_as_subprotocol` that invokes a caller-provided hook after a fixed number
+    /// of verifier challenges (rounds) have been sampled.
+    ///
+    /// This is useful for protocols like Symphony Π_rg (Figure 2), where the prover must send an
+    /// additional message (e.g., `v^{(i)}`) *after* the verifier has fixed a prefix of the MLE point
+    /// (the `r` part) but *before* sampling the remaining suffix challenges (the `s` part).
+    ///
+    /// The hook is invoked **after** the `hook_round`-th verifier randomness has been sampled and
+    /// absorbed into the transcript, and **before** sampling the next round's randomness.
+    pub fn prove_as_subprotocol_with_hook(
+        transcript: &mut T,
+        mles: Vec<DenseMultilinearExtension<R>>,
+        nvars: usize,
+        degree: usize,
+        comb_fn: impl Fn(&[R]) -> R + Sync + Send,
+        hook_round: usize,
+        mut hook: impl FnMut(&mut T, &[R::BaseRing]),
+    ) -> (Proof<R>, ProverState<R>) {
+        assert!(
+            hook_round <= nvars,
+            "hook_round {} must be <= nvars {}",
+            hook_round,
+            nvars
+        );
+        transcript.absorb(&R::from(nvars as u128));
+        transcript.absorb(&R::from(degree as u128));
+        let mut prover_state = IPForMLSumcheck::<R, T>::prover_init(mles, nvars, degree);
+        let mut verifier_msg = None;
+        let mut prover_msgs = Vec::with_capacity(nvars);
+
+        // Track sampled challenges in-order (length increases by 1 each round).
+        let mut sampled: Vec<R::BaseRing> = Vec::with_capacity(nvars);
+
+        for _ in 0..nvars {
+            let prover_msg =
+                IPForMLSumcheck::<R, T>::prove_round(&mut prover_state, &verifier_msg, &comb_fn);
+            transcript.absorb_slice(&prover_msg.evaluations);
+            prover_msgs.push(prover_msg);
+
+            let next_verifier_msg = IPForMLSumcheck::<R, T>::sample_round(transcript);
+            transcript.absorb(&next_verifier_msg.randomness.into());
+            sampled.push(next_verifier_msg.randomness);
+
+            if hook_round != 0 && sampled.len() == hook_round {
+                hook(transcript, &sampled);
+            }
+
+            verifier_msg = Some(next_verifier_msg);
+        }
+
+        prover_state
+            .randomness
+            .push(verifier_msg.unwrap().randomness);
+
+        (Proof(prover_msgs), prover_state)
+    }
+
     /// This function does the same thing as `prove`, but it uses a cryptographic sponge as the transcript/to generate the
     /// verifier challenges. This allows this sumcheck to be used as a part of a larger protocol.
     pub fn verify_as_subprotocol(
@@ -101,6 +177,387 @@ impl<R: OverField, T: Transcript<R>> MLSumcheck<R, T> {
         }
 
         IPForMLSumcheck::<R, T>::check_and_generate_subclaim(verifier_state, claimed_sum)
+    }
+
+    /// Variant of `verify_as_subprotocol` that invokes a caller-provided hook after a fixed number
+    /// of verifier challenges have been sampled and absorbed (mirroring `prove_as_subprotocol_with_hook`).
+    pub fn verify_as_subprotocol_with_hook(
+        transcript: &mut T,
+        nvars: usize,
+        degree: usize,
+        claimed_sum: R,
+        proof: &Proof<R>,
+        hook_round: usize,
+        mut hook: impl FnMut(&mut T, &[R::BaseRing]),
+    ) -> Result<SubClaim<R>, SumCheckError<R>> {
+        assert!(
+            hook_round <= nvars,
+            "hook_round {} must be <= nvars {}",
+            hook_round,
+            nvars
+        );
+        transcript.absorb(&R::from(nvars as u128));
+        transcript.absorb(&R::from(degree as u128));
+
+        let mut verifier_state = IPForMLSumcheck::<R, T>::verifier_init(nvars, degree);
+        let mut sampled: Vec<R::BaseRing> = Vec::with_capacity(nvars);
+
+        for i in 0..nvars {
+            let prover_msg = proof.0.get(i).expect("proof is incomplete");
+            transcript.absorb_slice(&prover_msg.evaluations);
+            let verifier_msg =
+                IPForMLSumcheck::verify_round(prover_msg.clone(), &mut verifier_state, transcript);
+            transcript.absorb(&verifier_msg.randomness.into());
+            sampled.push(verifier_msg.randomness);
+
+            if hook_round != 0 && sampled.len() == hook_round {
+                hook(transcript, &sampled);
+            }
+        }
+
+        IPForMLSumcheck::<R, T>::check_and_generate_subclaim(verifier_state, claimed_sum)
+    }
+
+    /// Transcript-only variant of `verify_as_subprotocol_with_hook`.
+    ///
+    /// This drives the *exact same* transcript interactions (absorbing prover messages and
+    /// sampling/verifying-round challenges), but it does **not** perform any arithmetic checks.
+    ///
+    /// This is useful for CP-style "Fiat–Shamir outside" constructions where we want to
+    /// (re-)derive the verifier coin stream from a canonical public transcript without
+    /// re-running all verifier arithmetic.
+    pub fn bind_as_subprotocol_with_hook(
+        transcript: &mut T,
+        nvars: usize,
+        degree: usize,
+        proof: &Proof<R>,
+        hook_round: usize,
+        mut hook: impl FnMut(&mut T, &[R::BaseRing]),
+    ) -> Vec<R::BaseRing> {
+        assert!(
+            hook_round <= nvars,
+            "hook_round {} must be <= nvars {}",
+            hook_round,
+            nvars
+        );
+        transcript.absorb(&R::from(nvars as u128));
+        transcript.absorb(&R::from(degree as u128));
+
+        let mut sampled: Vec<R::BaseRing> = Vec::with_capacity(nvars);
+        for i in 0..nvars {
+            let prover_msg = proof.0.get(i).expect("proof is incomplete");
+            transcript.absorb_slice(&prover_msg.evaluations);
+
+            // Sample the same verifier message as in verification, without checks.
+            let verifier_msg = IPForMLSumcheck::<R, T>::sample_round(transcript);
+            transcript.absorb(&verifier_msg.randomness.into());
+            sampled.push(verifier_msg.randomness);
+
+            if hook_round != 0 && sampled.len() == hook_round {
+                hook(transcript, &sampled);
+            }
+        }
+
+        sampled
+    }
+
+    /// Run **two** sumchecks in parallel with **shared** verifier randomness per round.
+    ///
+    /// This matches the structure used by Symphony (ePrint 2025/1905, Figure 3 Step 3),
+    /// where two sumcheck protocols share the same challenge vector prefix (and potentially
+    /// one continues for more rounds).
+    ///
+    /// Schedule (per round `i`):
+    /// - Prover messages are absorbed in fixed order: first A (if active), then B (if active)
+    /// - One verifier randomness `r_i` is sampled from the transcript and absorbed
+    /// - The same `r_i` is fed to all active sumchecks for the next round
+    ///
+    /// The hook is invoked after the `hook_round`-th randomness is sampled and absorbed.
+    pub fn prove_two_as_subprotocol_shared_with_hook(
+        transcript: &mut T,
+        // A
+        mles_a: Vec<DenseMultilinearExtension<R>>,
+        nvars_a: usize,
+        degree_a: usize,
+        comb_fn_a: impl Fn(&[R]) -> R + Sync + Send,
+        // B
+        mles_b: Vec<DenseMultilinearExtension<R>>,
+        nvars_b: usize,
+        degree_b: usize,
+        comb_fn_b: impl Fn(&[R]) -> R + Sync + Send,
+        // hook
+        hook_round: usize,
+        mut hook: impl FnMut(&mut T, &[R::BaseRing]),
+    ) -> ((Proof<R>, ProverState<R>), (Proof<R>, ProverState<R>)) {
+        assert!(nvars_a > 0 && nvars_b > 0);
+        assert!(hook_round <= nvars_b);
+
+        // Encode both sumcheck parameter blocks up front.
+        transcript.absorb(&R::from(nvars_a as u128));
+        transcript.absorb(&R::from(degree_a as u128));
+        transcript.absorb(&R::from(nvars_b as u128));
+        transcript.absorb(&R::from(degree_b as u128));
+
+        let mut ps_a = IPForMLSumcheck::<R, T>::prover_init(mles_a, nvars_a, degree_a);
+        let mut ps_b = IPForMLSumcheck::<R, T>::prover_init(mles_b, nvars_b, degree_b);
+
+        let mut v_msg: Option<verifier::VerifierMsg<R>> = None;
+        let mut msgs_a = Vec::with_capacity(nvars_a);
+        let mut msgs_b = Vec::with_capacity(nvars_b);
+        let mut sampled: Vec<R::BaseRing> = Vec::with_capacity(nvars_b.max(nvars_a));
+
+        let rounds = nvars_a.max(nvars_b);
+        for round_idx in 0..rounds {
+            // Prover messages for this round (if active).
+            if round_idx < nvars_a {
+                let pm_a = IPForMLSumcheck::<R, T>::prove_round(&mut ps_a, &v_msg, &comb_fn_a);
+                transcript.absorb_slice(&pm_a.evaluations);
+                msgs_a.push(pm_a);
+            }
+            if round_idx < nvars_b {
+                let pm_b = IPForMLSumcheck::<R, T>::prove_round(&mut ps_b, &v_msg, &comb_fn_b);
+                transcript.absorb_slice(&pm_b.evaluations);
+                msgs_b.push(pm_b);
+            }
+
+            // Sample one shared randomness.
+            let r_i = transcript.get_challenge();
+            transcript.absorb(&r_i.into());
+            sampled.push(r_i);
+
+            if hook_round != 0 && sampled.len() == hook_round {
+                hook(transcript, &sampled);
+            }
+
+            v_msg = Some(verifier::VerifierMsg { randomness: r_i });
+        }
+
+        // Push the final randomness used by each protocol into its prover state, as in `prove_as_subprotocol`.
+        // IMPORTANT: if `nvars_a != nvars_b`, they stop at different rounds, so their "last" randomness differs.
+        let last_a = sampled[nvars_a - 1];
+        let last_b = sampled[nvars_b - 1];
+        ps_a.randomness.push(last_a);
+        ps_b.randomness.push(last_b);
+
+        ((Proof(msgs_a), ps_a), (Proof(msgs_b), ps_b))
+    }
+
+    /// Verify two sumchecks under the same shared-randomness schedule as
+    /// `prove_two_as_subprotocol_shared_with_hook`.
+    pub fn verify_two_as_subprotocol_shared_with_hook(
+        transcript: &mut T,
+        // A
+        nvars_a: usize,
+        degree_a: usize,
+        claimed_sum_a: R,
+        proof_a: &Proof<R>,
+        // B
+        nvars_b: usize,
+        degree_b: usize,
+        claimed_sum_b: R,
+        proof_b: &Proof<R>,
+        // hook
+        hook_round: usize,
+        mut hook: impl FnMut(&mut T, &[R::BaseRing]),
+    ) -> Result<(SubClaim<R>, SubClaim<R>), SumCheckError<R>> {
+        assert!(nvars_a > 0 && nvars_b > 0);
+        assert!(hook_round <= nvars_b);
+
+        transcript.absorb(&R::from(nvars_a as u128));
+        transcript.absorb(&R::from(degree_a as u128));
+        transcript.absorb(&R::from(nvars_b as u128));
+        transcript.absorb(&R::from(degree_b as u128));
+
+        let mut vs_a = IPForMLSumcheck::<R, T>::verifier_init(nvars_a, degree_a);
+        let mut vs_b = IPForMLSumcheck::<R, T>::verifier_init(nvars_b, degree_b);
+
+        let rounds = nvars_a.max(nvars_b);
+        let mut sampled: Vec<R::BaseRing> = Vec::with_capacity(rounds);
+
+        for round_idx in 0..rounds {
+            if round_idx < nvars_a {
+                let pm_a = proof_a.0.get(round_idx).expect("proof A incomplete").clone();
+                transcript.absorb_slice(&pm_a.evaluations);
+                // randomness sampled below
+                // store later via verify_round_with_randomness
+                // (needs to happen after randomness is known)
+                // we'll call after sampling randomness.
+            }
+            if round_idx < nvars_b {
+                let pm_b = proof_b.0.get(round_idx).expect("proof B incomplete").clone();
+                transcript.absorb_slice(&pm_b.evaluations);
+            }
+
+            let r_i = transcript.get_challenge();
+            transcript.absorb(&r_i.into());
+            sampled.push(r_i);
+
+            if hook_round != 0 && sampled.len() == hook_round {
+                hook(transcript, &sampled);
+            }
+
+            // Apply randomness to active verifier states, consuming the corresponding prover msgs.
+            if round_idx < nvars_a {
+                let pm_a = proof_a.0.get(round_idx).unwrap().clone();
+                IPForMLSumcheck::<R, T>::verify_round_with_randomness(pm_a, &mut vs_a, r_i);
+            }
+            if round_idx < nvars_b {
+                let pm_b = proof_b.0.get(round_idx).unwrap().clone();
+                IPForMLSumcheck::<R, T>::verify_round_with_randomness(pm_b, &mut vs_b, r_i);
+            }
+        }
+
+        let sc_a = IPForMLSumcheck::<R, T>::check_and_generate_subclaim(vs_a, claimed_sum_a)?;
+        let sc_b = IPForMLSumcheck::<R, T>::check_and_generate_subclaim(vs_b, claimed_sum_b)?;
+        Ok((sc_a, sc_b))
+    }
+
+
+    /// Run **k** sumchecks in parallel with **shared** verifier randomness per round.
+    ///
+    /// This is the k-way generalization of `prove_two_as_subprotocol_shared_with_hook`.
+    ///
+    /// Schedule per round:
+    /// - absorb prover messages in spec order for all active protocols
+    /// - sample one shared randomness `r_i` from the transcript and absorb it
+    /// - feed the same `r_i` to all active protocols
+    ///
+    /// The hook is invoked after the `hook_round`-th randomness is sampled and absorbed.
+    pub fn prove_many_as_subprotocol_shared_with_hook(
+        transcript: &mut T,
+        specs: Vec<SharedSumcheckProverSpec<R>>,
+        hook_round: usize,
+        mut hook: impl FnMut(&mut T, &[R::BaseRing]),
+    ) -> Vec<(Proof<R>, ProverState<R>)> {
+        assert!(!specs.is_empty());
+        for s in &specs {
+            assert!(s.nvars > 0);
+        }
+
+        let max_nvars = specs.iter().map(|s| s.nvars).max().unwrap();
+        assert!(hook_round <= max_nvars);
+
+        // Encode all sumcheck parameter blocks up front.
+        for s in &specs {
+            transcript.absorb(&R::from(s.nvars as u128));
+            transcript.absorb(&R::from(s.degree as u128));
+        }
+
+        let mut prover_states = specs
+            .iter()
+            .map(|s| IPForMLSumcheck::<R, T>::prover_init(s.mles.clone(), s.nvars, s.degree))
+            .collect::<Vec<_>>();
+
+        let mut prover_msgs: Vec<Vec<prover::ProverMsg<R>>> = specs
+            .iter()
+            .map(|s| Vec::with_capacity(s.nvars))
+            .collect();
+
+        let mut v_msg: Option<verifier::VerifierMsg<R>> = None;
+        let mut sampled: Vec<R::BaseRing> = Vec::with_capacity(max_nvars);
+
+        for round_idx in 0..max_nvars {
+            // Prover messages for this round (all active specs, in order).
+            for (spec_idx, s) in specs.iter().enumerate() {
+                if round_idx < s.nvars {
+                    let pm = IPForMLSumcheck::<R, T>::prove_round(
+                        &mut prover_states[spec_idx],
+                        &v_msg,
+                        &*s.comb_fn,
+                    );
+                    transcript.absorb_slice(&pm.evaluations);
+                    prover_msgs[spec_idx].push(pm);
+                }
+            }
+
+            // Sample one shared randomness.
+            let r_i = transcript.get_challenge();
+            transcript.absorb(&r_i.into());
+            sampled.push(r_i);
+
+            if hook_round != 0 && sampled.len() == hook_round {
+                hook(transcript, &sampled);
+            }
+
+            v_msg = Some(verifier::VerifierMsg { randomness: r_i });
+        }
+
+        // Push the final randomness used by each protocol into its prover state, as in `prove_as_subprotocol`.
+        for (spec_idx, s) in specs.iter().enumerate() {
+            let last = sampled[s.nvars - 1];
+            prover_states[spec_idx].randomness.push(last);
+        }
+
+        prover_msgs
+            .into_iter()
+            .zip(prover_states.into_iter())
+            .map(|(msgs, ps)| (Proof(msgs), ps))
+            .collect()
+    }
+
+    /// Verify **k** sumchecks under the same shared-randomness schedule as
+    /// `prove_many_as_subprotocol_shared_with_hook`.
+    pub fn verify_many_as_subprotocol_shared_with_hook<'a>(
+        transcript: &mut T,
+        specs: Vec<SharedSumcheckVerifySpec<'a, R>>,
+        hook_round: usize,
+        mut hook: impl FnMut(&mut T, &[R::BaseRing]),
+    ) -> Result<Vec<SubClaim<R>>, SumCheckError<R>> {
+        assert!(!specs.is_empty());
+        for s in &specs {
+            assert!(s.nvars > 0);
+        }
+
+        let max_nvars = specs.iter().map(|s| s.nvars).max().unwrap();
+        assert!(hook_round <= max_nvars);
+
+        for s in &specs {
+            transcript.absorb(&R::from(s.nvars as u128));
+            transcript.absorb(&R::from(s.degree as u128));
+        }
+
+        let mut verifier_states = specs
+            .iter()
+            .map(|s| IPForMLSumcheck::<R, T>::verifier_init(s.nvars, s.degree))
+            .collect::<Vec<_>>();
+
+        let mut sampled: Vec<R::BaseRing> = Vec::with_capacity(max_nvars);
+
+        for round_idx in 0..max_nvars {
+            // Absorb prover messages for this round (all active specs, in order).
+            for (_spec_idx, s) in specs.iter().enumerate() {
+                if round_idx < s.nvars {
+                    let pm = s.proof.0.get(round_idx).expect("proof incomplete").clone();
+                    transcript.absorb_slice(&pm.evaluations);
+                }
+            }
+
+            let r_i = transcript.get_challenge();
+            transcript.absorb(&r_i.into());
+            sampled.push(r_i);
+
+            if hook_round != 0 && sampled.len() == hook_round {
+                hook(transcript, &sampled);
+            }
+
+            // Apply randomness to active verifier states.
+            for (spec_idx, s) in specs.iter().enumerate() {
+                if round_idx < s.nvars {
+                    let pm = s.proof.0.get(round_idx).unwrap().clone();
+                    IPForMLSumcheck::<R, T>::verify_round_with_randomness(
+                        pm,
+                        &mut verifier_states[spec_idx],
+                        r_i,
+                    );
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(specs.len());
+        for (vs, s) in verifier_states.into_iter().zip(specs.iter()) {
+            out.push(IPForMLSumcheck::<R, T>::check_and_generate_subclaim(vs, s.claimed_sum)?);
+        }
+        Ok(out)
     }
 }
 
@@ -223,6 +680,105 @@ mod tests {
         }
     }
 
+
+    fn test_shared_many_sumcheck<R, CS>()
+    where
+        R: SuitableRing,
+        CS: LatticefoldChallengeSet<R>,
+    {
+        let mut rng = ark_std::test_rng();
+        let nvars = 6;
+        let k = 3;
+
+        // Build k random sumcheck specs.
+        let mut specs = Vec::with_capacity(k);
+        let mut claimed = Vec::with_capacity(k);
+        for _ in 0..k {
+            let ((poly_mles, poly_degree), products, sum) =
+                rand_poly(nvars, (2, 5), 3, &mut rng).unwrap();
+            let comb_fn = Box::new(move |vals: &[R]| -> R { rand_poly_comb_fn(vals, &products) });
+            specs.push(super::SharedSumcheckProverSpec {
+                mles: poly_mles,
+                nvars,
+                degree: poly_degree,
+                comb_fn,
+            });
+            claimed.push((poly_degree, sum));
+        }
+
+        let mut transcript = PoseidonTranscript::<R, CS>::default();
+        let proofs = MLSumcheck::<R, PoseidonTranscript<R, CS>>::prove_many_as_subprotocol_shared_with_hook(
+            &mut transcript,
+            specs,
+            0,
+            |_t, _r| {},
+        );
+
+        let mut transcript_v: PoseidonTranscript<R, CS> = PoseidonTranscript::default();
+        let vspecs = proofs
+            .iter()
+            .zip(claimed.iter())
+            .map(|((p, _ps), (deg, sum))| super::SharedSumcheckVerifySpec {
+                nvars,
+                degree: *deg,
+                claimed_sum: *sum,
+                proof: p,
+            })
+            .collect::<Vec<_>>();
+
+        let res = MLSumcheck::<R, PoseidonTranscript<R, CS>>::verify_many_as_subprotocol_shared_with_hook(
+            &mut transcript_v,
+            vspecs,
+            0,
+            |_t, _r| {},
+        );
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap().len(), k);
+    }
+
+    fn test_shared_many_sumcheck_fails<R, CS>()
+    where
+        R: SuitableRing,
+        CS: LatticefoldChallengeSet<R>,
+    {
+        let mut rng = ark_std::test_rng();
+        let nvars = 6;
+
+        let ((poly_mles, poly_degree), products, sum) =
+            rand_poly(nvars, (2, 5), 3, &mut rng).unwrap();
+        let comb_fn = Box::new(move |vals: &[R]| -> R { rand_poly_comb_fn(vals, &products) });
+
+        let mut transcript = PoseidonTranscript::<R, CS>::default();
+        let proofs = MLSumcheck::<R, PoseidonTranscript<R, CS>>::prove_many_as_subprotocol_shared_with_hook(
+            &mut transcript,
+            vec![super::SharedSumcheckProverSpec {
+                mles: poly_mles,
+                nvars,
+                degree: poly_degree,
+                comb_fn,
+            }],
+            0,
+            |_t, _r| {},
+        );
+
+        let mut transcript_v: PoseidonTranscript<R, CS> = PoseidonTranscript::default();
+        let bad_sum = R::zero();
+        let vspec = vec![super::SharedSumcheckVerifySpec {
+            nvars,
+            degree: poly_degree,
+            claimed_sum: if sum == bad_sum { R::one() } else { bad_sum },
+            proof: &proofs[0].0,
+        }];
+
+        let res = MLSumcheck::<R, PoseidonTranscript<R, CS>>::verify_many_as_subprotocol_shared_with_hook(
+            &mut transcript_v,
+            vspec,
+            0,
+            |_t, _r| {},
+        );
+        assert!(res.is_err());
+    }
+
     mod stark {
         use cyclotomic_rings::rings::StarkChallengeSet;
         use stark_rings::cyclotomic_ring::models::stark_prime::RqNTT;
@@ -242,6 +798,16 @@ mod tests {
         #[test]
         fn test_failing_sumcheck() {
             super::test_failing_sumcheck::<RqNTT, CS>();
+        }
+
+        #[test]
+        fn test_shared_many_sumcheck() {
+            super::test_shared_many_sumcheck::<RqNTT, CS>();
+        }
+
+        #[test]
+        fn test_shared_many_sumcheck_fails() {
+            super::test_shared_many_sumcheck_fails::<RqNTT, CS>();
         }
     }
 

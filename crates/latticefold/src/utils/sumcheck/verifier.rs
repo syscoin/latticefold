@@ -130,6 +130,37 @@ impl<R: OverField, T: Transcript<R>> IPForMLSumcheck<R, T> {
             randomness: transcript.get_challenge(),
         }
     }
+
+    /// Variant of `verify_round` that **does not** sample randomness from the transcript.
+    ///
+    /// This is used by higher-level protocols (e.g. Symphony Π_gr1cs / Π_fold) that run multiple
+    /// sumchecks **in parallel with shared verifier challenges**, as in ePrint 2025/1905 Figure 3.
+    ///
+    /// The caller is responsible for:
+    /// - absorbing the prover message evaluations into the transcript in the desired schedule
+    /// - sampling exactly one randomness value per round (from the transcript)
+    /// - absorbing that randomness into the transcript
+    /// - passing the sampled randomness into this function for all parallel sumchecks that are active
+    pub fn verify_round_with_randomness(
+        prover_msg: ProverMsg<R>,
+        verifier_state: &mut VerifierState<R>,
+        randomness: R::BaseRing,
+    ) {
+        if verifier_state.finished {
+            panic!("Incorrect verifier state: Verifier is already finished.");
+        }
+
+        verifier_state.randomness.push(randomness);
+        verifier_state
+            .polynomials_received
+            .push(prover_msg.evaluations);
+
+        if verifier_state.round == verifier_state.nv {
+            verifier_state.finished = true;
+        } else {
+            verifier_state.round += 1;
+        }
+    }
 }
 
 /// interpolate the *unique* univariate polynomial of degree *at most*
