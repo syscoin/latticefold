@@ -492,6 +492,7 @@ mod tests {
     #[test]
     fn test_streaming_sumcheck_matches_dense_on_linear_combiner() {
         use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as R;
+        use stark_rings::PolyRing;
         use stark_rings::Ring;
 
         // 3 variables => 8 evals
@@ -509,11 +510,8 @@ mod tests {
 
         // Streaming: run the protocol with a dummy transcript by directly iterating rounds with fixed challenges.
         // We pick deterministic challenges so both implementations use the same point.
-        let challenges = vec![
-            R::BaseRing::from(11u128),
-            R::BaseRing::from(22u128),
-            R::BaseRing::from(33u128),
-        ];
+        type K = <R as PolyRing>::BaseRing;
+        let challenges = vec![K::from(11u128), K::from(22u128), K::from(33u128)];
 
         let mut st = StreamingSumcheck::prover_init(vec![m1, m2], nvars, 1);
         let mut v_msg = None;
