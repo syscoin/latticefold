@@ -83,4 +83,7 @@ name = "symphony_poseidon2_bench"
 name = "symphony_sp1_r1cs_stats"
 
 [[example]]
-name = "symphony_sp1_fold"
+name = "symphony_sp1_fold_chunked"
+
+[[example]]
+name = "symphony_bench"
