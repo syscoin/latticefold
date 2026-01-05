@@ -58,12 +58,10 @@ impl<R: OverField> StreamingMle<R> for FixedStreamingMle<R> {
     }
 
     fn eval_at_index(&self, index: usize) -> R {
-        // Fix the *most significant* variable (matches latticefold MLSumcheck / DenseMLE ordering):
-        // f'(b) = (1-r)*f(0,b) + r*f(1,b), where the original indices are b and b+2^(n-1).
-        let inner_nv = self.inner.num_vars();
-        let half = 1 << (inner_nv - 1);
-        let f0 = self.inner.eval_at_index(index);
-        let f1 = self.inner.eval_at_index(index + half);
+        // Fix the *least significant* variable (matches latticefold MLSumcheck prover/verifier):
+        // f'(b) = (1-r)*f(0,b) + r*f(1,b), where the original indices are 2*b and 2*b+1.
+        let f0 = self.inner.eval_at_index(index << 1);
+        let f1 = self.inner.eval_at_index((index << 1) | 1);
         (R::ONE - self.r) * f0 + self.r * f1
     }
 
@@ -104,7 +102,7 @@ impl<R: OverField> StreamingMle<R> for DenseStreamingMle<R> {
         // Actually fix the variable by creating a smaller dense MLE.
         let half = self.evals.len() / 2;
         let new_evals: Vec<R> = (0..half)
-            .map(|i| (R::ONE - r) * self.evals[i] + r * self.evals[i + half])
+            .map(|i| (R::ONE - r) * self.evals[i << 1] + r * self.evals[(i << 1) | 1])
             .collect();
         Box::new(DenseStreamingMle::new(new_evals))
     }
@@ -266,10 +264,10 @@ impl StreamingSumcheck {
         let result = {
             let mut s = scratch();
             for b in 0..domain_half {
-                // Evaluate all MLEs at indices b (for x_i=0) and b+half (for x_i=1)
+                // Evaluate all MLEs at indices 2*b (for x_i=0) and 2*b+1 (for x_i=1)
                 for (i, mle) in state.mles.iter().enumerate() {
-                    s.vals0[i] = mle.eval_at_index(b);
-                    s.vals1[i] = mle.eval_at_index(b + domain_half);
+                    s.vals0[i] = mle.eval_at_index(b << 1);
+                    s.vals1[i] = mle.eval_at_index((b << 1) | 1);
                 }
 
                 s.levals[0] = comb_fn(&s.vals0);
@@ -303,8 +301,8 @@ impl StreamingSumcheck {
             let evaluations = cfg_into_iter!(0..domain_half)
                 .fold(scratch, |mut s, b| {
                     for (i, mle) in state.mles.iter().enumerate() {
-                        s.vals0[i] = mle.eval_at_index(b);
-                        s.vals1[i] = mle.eval_at_index(b + domain_half);
+                        s.vals0[i] = mle.eval_at_index(b << 1);
+                        s.vals1[i] = mle.eval_at_index((b << 1) | 1);
                     }
 
                     s.levals[0] = comb_fn(&s.vals0);
@@ -496,6 +494,8 @@ mod tests {
         use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as R;
         use stark_rings::PolyRing;
         use stark_rings::Ring;
+        use latticefold::utils::sumcheck::prover::ProverMsg;
+        use latticefold::utils::sumcheck::IPForMLSumcheck;
 
         // 3 variables => 8 evals
         let nvars = 3usize;
@@ -510,11 +510,11 @@ mod tests {
 
         let comb = |vals: &[R]| -> R { vals[0] * R::from(13u128) + vals[1] * R::from(29u128) };
 
-        // Streaming: run the protocol with a dummy transcript by directly iterating rounds with fixed challenges.
-        // We pick deterministic challenges so both implementations use the same point.
+        // Streaming: run the protocol directly with fixed challenges (BaseRing elements).
         type K = <R as PolyRing>::BaseRing;
         let challenges = vec![K::from(11u128), K::from(22u128), K::from(33u128)];
 
+        // Asserted sum over {0,1}^n
         let mut st = StreamingSumcheck::prover_init(vec![m1, m2], nvars, 1);
         let mut v_msg = None;
         let mut msgs = Vec::new();
@@ -543,6 +543,31 @@ mod tests {
             let r = R::from(challenges[round]);
             claim = (R::ONE - r) * pm.evaluations[0] + r * pm.evaluations[1];
         }
+
+        // Stronger check: feed the same prover messages into latticefold's *real* verifier state
+        // with the chosen randomness, and ensure the produced subclaim matches evaluation at that point.
+        let mut vs = IPForMLSumcheck::<R, crate::transcript::PoseidonTranscript<R>>::verifier_init(nvars, 1);
+        for (pm, r) in msgs.iter().zip(challenges.iter().copied()) {
+            IPForMLSumcheck::<R, crate::transcript::PoseidonTranscript<R>>::verify_round_with_randomness(
+                ProverMsg::new(pm.evaluations.clone()),
+                &mut vs,
+                r,
+            );
+        }
+        let sub = IPForMLSumcheck::<R, crate::transcript::PoseidonTranscript<R>>::check_and_generate_subclaim(vs, {
+            let mut acc = R::ZERO;
+            for idx in 0..len {
+                acc += comb(&[f1[idx], f2[idx]]);
+            }
+            acc
+        })
+        .expect("verifier should accept correct proof");
+
+        // Compute expected evaluation by fixing the same point in the prover state.
+        // After nvars rounds, streaming state has fixed all variables; eval_at_index(0) is the point eval.
+        let vals_at_point: Vec<R> = st.mles.iter().map(|m| m.eval_at_index(0)).collect();
+        let expected = comb(&vals_at_point);
+        assert_eq!(sub.expected_evaluation, expected, "subclaim mismatch");
     }
 
     #[test]

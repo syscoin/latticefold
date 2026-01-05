@@ -28,7 +28,7 @@ use stark_rings_poly::mle::DenseMultilinearExtension;
 
 use latticefold::{
     transcript::Transcript,
-    utils::sumcheck::{utils::build_eq_x_r, MLSumcheck},
+    utils::sumcheck::utils::build_eq_x_r,
 };
 
 use crate::mle_oracle::{EqStreamingMle, SparseMatrixMle};
@@ -285,34 +285,70 @@ where
     };
 
     // -----------------
-    // Run sumchecks (streaming Hadamard, dense monomial)
+    // Run sumchecks with SHARED challenges (must match verifier schedule)
     // -----------------
+    use latticefold::utils::sumcheck::verifier::VerifierMsg;
+    use latticefold::utils::sumcheck::IPForMLSumcheck;
+
     let hook_round = log2(m_j.next_power_of_two()) as usize;
-    let mut v_digits_folded: Vec<Vec<R::BaseRing>> = vec![vec![R::BaseRing::ZERO; d]; rg_params.k_g];
+    let mut v_digits_folded: Vec<Vec<R::BaseRing>> =
+        vec![vec![R::BaseRing::ZERO; d]; rg_params.k_g];
 
-    // Run streaming Hadamard sumcheck
-    let (had_proof, had_rand) = StreamingSumcheck::prove_as_subprotocol_with_hook(
-        transcript,
-        mles_had,
-        log_m,
+    // Sumcheck transcript header (matches latticefold verify_two_as_subprotocol_shared_with_hook)
+    transcript.absorb(&R::from(log_m as u128));
+    transcript.absorb(&R::from(3u128));
+    transcript.absorb(&R::from(g_nvars as u128));
+    transcript.absorb(&R::from(3u128));
+
+    let mut had_state = StreamingSumcheck::prover_init(mles_had, log_m, 3);
+    let mut mon_state = IPForMLSumcheck::<R, crate::transcript::PoseidonTranscript<R>>::prover_init(
+        mles_mon_batched,
+        g_nvars,
         3,
-        comb_had,
-        hook_round,
-        |t, sampled_r| {
-            let ts_r_full = ts_weights(sampled_r);
-            let ts_r = &ts_r_full[..m_j];
+    );
 
+    let mut had_msgs = Vec::with_capacity(log_m);
+    let mut mon_msgs = Vec::with_capacity(g_nvars);
+    let mut sampled: Vec<R::BaseRing> = Vec::with_capacity(log_m.max(g_nvars));
+    let mut v_msg_had: Option<R::BaseRing> = None;
+    let mut v_msg_mon: Option<VerifierMsg<R>> = None;
+
+    let rounds = log_m.max(g_nvars);
+    for round_idx in 0..rounds {
+        // Prover messages (in the same order as latticefold's shared schedule)
+        if round_idx < log_m {
+            let pm_had = StreamingSumcheck::prove_round(&mut had_state, v_msg_had, &comb_had);
+            transcript.absorb_slice(&pm_had.evaluations);
+            had_msgs.push(pm_had);
+        }
+        if round_idx < g_nvars {
+            let pm_mon = IPForMLSumcheck::<R, crate::transcript::PoseidonTranscript<R>>::prove_round(
+                &mut mon_state,
+                &v_msg_mon,
+                &comb_mon,
+            );
+            transcript.absorb_slice(&pm_mon.evaluations);
+            mon_msgs.push(pm_mon);
+        }
+
+        // Shared verifier randomness
+        let r = transcript.get_challenge();
+        transcript.absorb(&R::from(r));
+        sampled.push(r);
+
+        if hook_round != 0 && sampled.len() == hook_round {
+            // Bind folded v_digits* after |r̄| challenges, before continuing.
+            let ts_r_full = ts_weights(&sampled);
+            let ts_r = &ts_r_full[..m_j];
             for dig in 0..rg_params.k_g {
                 for col in 0..d {
                     v_digits_folded[dig][col] = R::BaseRing::ZERO;
                 }
             }
-
             for inst_idx in 0..ell {
                 let b = beta_cts[inst_idx];
                 let f: &[R] = &witnesses[inst_idx];
                 let J = &Js[inst_idx];
-
                 for row in 0..m_j {
                     let w = ts_r[row];
                     let digits = proj_row_digits(f, J, row);
@@ -323,26 +359,25 @@ where
                     }
                 }
             }
-
             for v_i in &v_digits_folded {
                 for x in v_i {
-                    t.absorb_field_element(x);
+                    transcript.absorb_field_element(x);
                 }
             }
-        },
-    );
+        }
 
-    // Run dense monomial sumcheck (using standard MLSumcheck)
-    let (mon_sumcheck, mon_ps) = MLSumcheck::<R, _>::prove_as_subprotocol(
-        transcript,
-        mles_mon_batched,
-        g_nvars,
-        3,
-        comb_mon,
-    );
+        v_msg_had = Some(r);
+        v_msg_mon = Some(VerifierMsg { randomness: r });
+    }
 
-    // Convert streaming proof to standard format
-    let had_sumcheck = convert_streaming_proof(&had_proof);
+    // Final randomness vectors for each sumcheck (same convention as latticefold sumcheck state)
+    let had_rand = sampled[..log_m].to_vec();
+    let mon_rand = sampled[..g_nvars].to_vec();
+    had_state.randomness = had_rand.clone();
+    mon_state.randomness = mon_rand.clone();
+
+    let had_sumcheck = convert_streaming_proof(&StreamingProof(had_msgs));
+    let mon_sumcheck = latticefold::utils::sumcheck::Proof::new(mon_msgs);
 
     // -----------------
     // Compute aux witness
@@ -385,8 +420,7 @@ where
         had_u.push(U);
     }
 
-    let r_mon = mon_ps.randomness.clone();
-    let ts_r_mon = ts_weights(&r_mon);
+    let ts_r_mon = ts_weights(&mon_rand);
 
     let mut mon_b: Vec<Vec<R>> = Vec::with_capacity(ell);
     for inst_idx in 0..ell {
