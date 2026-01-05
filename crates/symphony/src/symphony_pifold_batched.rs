@@ -343,7 +343,9 @@ where
     // -----------------
     // Build batched Π_had sumcheck (one)
     // -----------------
-    let had_mles_per = 1 + 3 * d;
+    // Instead of allocating one MLE per coefficient (3*d), keep y1/y2/y3 as ring elements
+    // and do coefficient-wise multiplication inside the combiner.
+    let had_mles_per = 1 + 3;
     let mut mles_had_batched: Vec<DenseMultilinearExtension<R>> = Vec::with_capacity(ell * had_mles_per);
 
     // Precompute y vectors per instance.
@@ -360,12 +362,11 @@ where
     for inst_idx in 0..ell {
         mles_had_batched.push(eq_mle.clone());
         for i in 0..3 {
-            for j in 0..d {
-                let evals = (0..m)
-                    .map(|row| R::from(ys[inst_idx][i][row].coeffs()[j]))
-                    .collect::<Vec<_>>();
-                mles_had_batched.push(DenseMultilinearExtension::from_evaluations_vec(log_m, evals));
-            }
+            // y_i is already a ring element carrying all d coefficients.
+            mles_had_batched.push(DenseMultilinearExtension::from_evaluations_vec(
+                log_m,
+                ys[inst_idx][i].clone(),
+            ));
         }
     }
 
@@ -375,12 +376,13 @@ where
         for inst_idx in 0..ell {
             let base = inst_idx * had_mles_per;
             let eq = vals[base];
+            let y1 = vals[base + 1];
+            let y2 = vals[base + 2];
+            let y3 = vals[base + 3];
             let mut acc = R::ZERO;
             for j in 0..d {
-                let g1 = vals[base + 1 + j];
-                let g2 = vals[base + 1 + d + j];
-                let g3 = vals[base + 1 + 2 * d + j];
-                acc += alpha_pows[j] * eq * (g1 * g2 - g3);
+                let term = y1.coeffs()[j] * y2.coeffs()[j] - y3.coeffs()[j];
+                acc += alpha_pows[j] * eq * R::from(term);
             }
             acc_all += rhos_had[inst_idx] * acc;
         }
