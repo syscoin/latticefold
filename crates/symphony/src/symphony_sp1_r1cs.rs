@@ -177,12 +177,17 @@ pub struct SymphonyMatrixHeader {
     pub digest: [u8; 32],
 }
 
+/// Buffer size for I/O (256 MB)
+const IO_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+
 /// Save Symphony matrices to file (avoids re-conversion from SP1 R1CS).
 /// 
 /// File format:
 /// - Header: SYMM | v1 | nrows | ncols | nnz_total | sp1_digest
 /// - For each matrix (A, B, C):
 ///   - For each row: num_terms (u32), then (col_idx u32, coeff u64) pairs
+/// 
+/// Uses 256MB buffered I/O for performance on large files.
 pub fn save_symphony_matrices<R>(
     path: &str,
     matrices: &[SparseMatrix<R>; 3],
@@ -192,7 +197,10 @@ where
     R: OverField,
     R::BaseRing: Zq + Into<u64>,
 {
-    let mut file = std::fs::File::create(path)?;
+    use std::io::BufWriter;
+    
+    let file = std::fs::File::create(path)?;
+    let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, file);
     
     let nrows = matrices[0].nrows;
     let ncols = matrices[0].ncols;
@@ -202,30 +210,33 @@ where
         .sum();
     
     // Write header
-    file.write_all(SYMPHONY_MAGIC)?;
-    file.write_all(&SYMPHONY_VERSION.to_le_bytes())?;
-    file.write_all(&(nrows as u64).to_le_bytes())?;
-    file.write_all(&(ncols as u64).to_le_bytes())?;
-    file.write_all(&nnz.to_le_bytes())?;
-    file.write_all(sp1_digest)?;
+    writer.write_all(SYMPHONY_MAGIC)?;
+    writer.write_all(&SYMPHONY_VERSION.to_le_bytes())?;
+    writer.write_all(&(nrows as u64).to_le_bytes())?;
+    writer.write_all(&(ncols as u64).to_le_bytes())?;
+    writer.write_all(&nnz.to_le_bytes())?;
+    writer.write_all(sp1_digest)?;
     
     // Write matrices
     for matrix in matrices {
         for row in &matrix.coeffs {
-            file.write_all(&(row.len() as u32).to_le_bytes())?;
+            writer.write_all(&(row.len() as u32).to_le_bytes())?;
             for (val, col_idx) in row {
-                file.write_all(&(*col_idx as u32).to_le_bytes())?;
+                writer.write_all(&(*col_idx as u32).to_le_bytes())?;
                 // Convert ring element to u64 via BaseRing
                 let coeff_u64: u64 = val.coeffs()[0].into();
-                file.write_all(&coeff_u64.to_le_bytes())?;
+                writer.write_all(&coeff_u64.to_le_bytes())?;
             }
         }
     }
     
+    writer.flush()?;
     Ok(())
 }
 
 /// Load Symphony matrices from file (fast, no conversion needed).
+/// 
+/// Uses 256MB buffered I/O for performance on large files.
 pub fn load_symphony_matrices<R>(
     path: &str,
 ) -> std::io::Result<([SparseMatrix<R>; 3], SymphonyMatrixHeader)>
@@ -233,11 +244,14 @@ where
     R: OverField,
     R::BaseRing: Zq + From<u64>,
 {
-    let mut file = std::fs::File::open(path)?;
+    use std::io::BufReader;
+    
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::with_capacity(IO_BUFFER_SIZE, file);
     
     // Read header
     let mut magic = [0u8; 4];
-    file.read_exact(&mut magic)?;
+    reader.read_exact(&mut magic)?;
     if &magic != SYMPHONY_MAGIC {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -248,7 +262,7 @@ where
     let mut buf4 = [0u8; 4];
     let mut buf8 = [0u8; 8];
     
-    file.read_exact(&mut buf4)?;
+    reader.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
     if version != SYMPHONY_VERSION {
         return Err(std::io::Error::new(
@@ -257,15 +271,15 @@ where
         ));
     }
     
-    file.read_exact(&mut buf8)?;
+    reader.read_exact(&mut buf8)?;
     let nrows = u64::from_le_bytes(buf8) as usize;
-    file.read_exact(&mut buf8)?;
+    reader.read_exact(&mut buf8)?;
     let ncols = u64::from_le_bytes(buf8) as usize;
-    file.read_exact(&mut buf8)?;
+    reader.read_exact(&mut buf8)?;
     let nnz = u64::from_le_bytes(buf8);
     
     let mut digest = [0u8; 32];
-    file.read_exact(&mut digest)?;
+    reader.read_exact(&mut digest)?;
     
     let header = SymphonyMatrixHeader { nrows, ncols, nnz, digest };
     
@@ -278,14 +292,14 @@ where
     
     for matrix in &mut matrices {
         for _ in 0..nrows {
-            file.read_exact(&mut buf4)?;
+            reader.read_exact(&mut buf4)?;
             let num_terms = u32::from_le_bytes(buf4) as usize;
             
             let mut row = Vec::with_capacity(num_terms);
             for _ in 0..num_terms {
-                file.read_exact(&mut buf4)?;
+                reader.read_exact(&mut buf4)?;
                 let col_idx = u32::from_le_bytes(buf4) as usize;
-                file.read_exact(&mut buf8)?;
+                reader.read_exact(&mut buf8)?;
                 let coeff = u64::from_le_bytes(buf8);
                 let val = R::from(R::BaseRing::from(coeff));
                 row.push((val, col_idx));
