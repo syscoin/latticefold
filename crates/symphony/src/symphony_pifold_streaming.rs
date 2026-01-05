@@ -26,11 +26,14 @@ use stark_rings::{
 use stark_rings_linalg::SparseMatrix;
 use stark_rings_poly::mle::DenseMultilinearExtension;
 
+use cyclotomic_rings::rings::GetPoseidonParams;
 use latticefold::{
+    commitment::AjtaiCommitmentScheme,
     transcript::Transcript,
     utils::sumcheck::utils::build_eq_x_r,
 };
 
+use crate::recording_transcript::RecordingTranscriptRef;
 use crate::mle_oracle::{EqStreamingMle, SparseMatrixMle};
 use crate::rp_rgchk::RPParams;
 use crate::streaming_sumcheck::{StreamingMle, StreamingProof, StreamingSumcheck};
@@ -41,6 +44,111 @@ use crate::symphony_pifold_batched::{PiFoldAuxWitness, PiFoldBatchedProof, PiFol
 // Re-export streaming types
 pub use crate::mle_oracle::ClosureMle;
 pub use crate::streaming_sumcheck::{StreamingProverMsg, StreamingSumcheckState};
+
+fn absorb_public_inputs<R: OverField>(ts: &mut impl Transcript<R>, public_inputs: &[R::BaseRing])
+where
+    R::BaseRing: Zq,
+{
+    // Keep identical statement-binding schedule to symphony_pifold_batched.
+    ts.absorb_field_element(&R::BaseRing::from(0x4c465053_5055424cu128)); // "LFPS_PUBL"
+    ts.absorb_field_element(&R::BaseRing::from(public_inputs.len() as u128));
+    for x in public_inputs {
+        ts.absorb_field_element(x);
+    }
+}
+
+fn encode_had_u_instance<R: OverField>(u: &[Vec<R::BaseRing>; 3]) -> Vec<R>
+where
+    R::BaseRing: Zq,
+{
+    let d = R::dimension();
+    debug_assert_eq!(u[0].len(), d);
+    debug_assert_eq!(u[1].len(), d);
+    debug_assert_eq!(u[2].len(), d);
+    let mut out = Vec::with_capacity(3 * d);
+    out.extend(u[0].iter().copied().map(R::from));
+    out.extend(u[1].iter().copied().map(R::from));
+    out.extend(u[2].iter().copied().map(R::from));
+    out
+}
+
+/// Poseidon-FS wrapper for the streaming Π_fold prover.
+///
+/// Produces the same `PiFoldProverOutput` shape as `prove_pi_fold_batched_sumcheck_fs`:
+/// - records transcript coins into `proof.coins`
+/// - optionally commits to CP transcript witness messages (`cfs_*`)
+pub fn prove_pi_fold_streaming_sumcheck_fs<R: CoeffRing, PC>(
+    M: [Arc<SparseMatrix<R>>; 3],
+    cms: &[Vec<R>],
+    witnesses: &[Arc<Vec<R>>],
+    public_inputs: &[R::BaseRing],
+    cfs_had_u_scheme: Option<&AjtaiCommitmentScheme<R>>,
+    cfs_mon_b_scheme: Option<&AjtaiCommitmentScheme<R>>,
+    rg_params: RPParams,
+) -> Result<PiFoldProverOutput<R>, String>
+where
+    R::BaseRing: Zq + Decompose,
+    PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
+{
+    if cms.is_empty() {
+        return Err("PiFold: empty batch".to_string());
+    }
+    if cms.len() != witnesses.len() {
+        return Err("PiFold: cms/witnesses length mismatch".to_string());
+    }
+
+    let mut ts = crate::transcript::PoseidonTranscript::<R>::empty::<PC>();
+    let mut rts = RecordingTranscriptRef::<R, _>::new(&mut ts);
+    rts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
+    absorb_public_inputs::<R>(&mut rts, public_inputs);
+
+    let mut out = prove_pi_fold_streaming(&mut rts, M, cms, witnesses, rg_params)
+        .map_err(|e| format!("PiFold: poseidon-fs prove failed: {e}"))?;
+
+    out.proof.coins = SymphonyCoins::<R> {
+        challenges: rts.coins_challenges,
+        bytes: rts.coins_bytes,
+        events: rts.events,
+    };
+
+    // Optionally commit to CP transcript witness messages (WE/DPP-facing path).
+    out.cfs_had_u.clear();
+    out.cfs_mon_b.clear();
+    match (cfs_had_u_scheme, cfs_mon_b_scheme) {
+        (Some(had_s), Some(mon_s)) => {
+            out.cfs_had_u = out
+                .aux
+                .had_u
+                .iter()
+                .map(|u| {
+                    had_s
+                        .commit(&encode_had_u_instance::<R>(u))
+                        .map_err(|e| format!("PiFold: cfs_had_u commit failed: {e:?}"))
+                        .map(|c| c.as_ref().to_vec())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            out.cfs_mon_b = out
+                .aux
+                .mon_b
+                .iter()
+                .map(|b| {
+                    mon_s
+                        .commit(b)
+                        .map_err(|e| format!("PiFold: cfs_mon_b commit failed: {e:?}"))
+                        .map(|c| c.as_ref().to_vec())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "PiFold: must provide both cfs_had_u_scheme and cfs_mon_b_scheme or neither".to_string(),
+            );
+        }
+    }
+
+    Ok(out)
+}
 
 /// Streaming Π_fold prover.
 ///

@@ -24,6 +24,7 @@ use symphony::sp1_r1cs_loader::FieldFromU64;
 use symphony::symphony_sp1_r1cs::open_sp1_r1cs_chunk_cache;
 use symphony::rp_rgchk::RPParams;
 use symphony::symphony_pifold_batched::prove_pi_fold_batched_sumcheck_fs;
+use symphony::symphony_pifold_streaming::prove_pi_fold_streaming_sumcheck_fs;
 
 /// BabyBear field element for loading R1CS.
 #[derive(Debug, Clone, Copy, Default)]
@@ -59,6 +60,8 @@ fn main() {
     println!("Configuration:");
     println!("  Chunk size:     {} (2^{})", chunk_size, chunk_size.trailing_zeros());
     println!("  Max concurrent: {} chunks at once", max_concurrent);
+    let pifold_mode = std::env::var("SYMPHONY_PIFOLD_MODE").unwrap_or_else(|_| "dense".to_string());
+    println!("  PiFold mode:    {pifold_mode}");
     // We'll use a local rayon pool sized to the chunk-level parallelism to avoid oversubscription.
     let prove_threads: usize = std::env::var("PROVE_THREADS")
         .ok()
@@ -174,16 +177,27 @@ fn main() {
                 .into_par_iter() // <-- parallel over loaded chunks
                 .map(|(i, [m1, m2, m3])| {
                 let chunk_start = Instant::now();
-                
-                let result = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
-                    [&m1, &m2, &m3],
-                    &[cm_main.clone()],
-                    &[witness.as_ref().as_slice()],
-                    &public_inputs,
-                    Some(scheme_had.as_ref()),
-                    Some(scheme_mon.as_ref()),
-                    rg_params.clone(),
-                );
+                let result = if pifold_mode == "streaming" {
+                    prove_pi_fold_streaming_sumcheck_fs::<R, PC>(
+                        [Arc::new(m1), Arc::new(m2), Arc::new(m3)],
+                        &[cm_main.clone()],
+                        &[witness.clone()],
+                        &public_inputs,
+                        Some(scheme_had.as_ref()),
+                        Some(scheme_mon.as_ref()),
+                        rg_params.clone(),
+                    )
+                } else {
+                    prove_pi_fold_batched_sumcheck_fs::<R, PC>(
+                        [&m1, &m2, &m3],
+                        &[cm_main.clone()],
+                        &[witness.as_ref().as_slice()],
+                        &public_inputs,
+                        Some(scheme_had.as_ref()),
+                        Some(scheme_mon.as_ref()),
+                        rg_params.clone(),
+                    )
+                };
                 
                 (i, result, chunk_start.elapsed())
             })
