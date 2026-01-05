@@ -48,26 +48,26 @@ fn main() {
     ) where
         R::BaseRing: stark_rings::Zq + stark_rings::balanced_decomposition::Decompose + ark_ff::PrimeField,
     {
-    const WIDTH: usize = 16;
-    const NUM_EXTERNAL_ROUNDS: usize = 8;
-    const NUM_INTERNAL_ROUNDS: usize = 13;
+        const WIDTH: usize = 16;
+        const NUM_EXTERNAL_ROUNDS: usize = 8;
+        const NUM_INTERNAL_ROUNDS: usize = 13;
 
-    println!("=========================================================");
+        println!("=========================================================");
         println!("Symphony Poseidon2 Benchmark — {ring_name}");
-    println!("=========================================================");
-    println!();
-    println!("SP1 Poseidon2 parameters:");
-    println!("  WIDTH = {WIDTH}");
-    println!("  NUM_EXTERNAL_ROUNDS = {NUM_EXTERNAL_ROUNDS} (4 + 4)");
-    println!("  NUM_INTERNAL_ROUNDS = {NUM_INTERNAL_ROUNDS}");
-    println!("  S-box = x^7 (4 mult constraints per S-box)");
-    println!();
+        println!("=========================================================");
+        println!();
+        println!("SP1 Poseidon2 parameters:");
+        println!("  WIDTH = {WIDTH}");
+        println!("  NUM_EXTERNAL_ROUNDS = {NUM_EXTERNAL_ROUNDS} (4 + 4)");
+        println!("  NUM_INTERNAL_ROUNDS = {NUM_INTERNAL_ROUNDS}");
+        println!("  S-box = x^7 (4 mult constraints per S-box)");
+        println!();
 
-    println!("Expected constraints per permutation:");
-    println!("  External: 8 rounds × 16 S-boxes × 4 mults = 512");
-    println!("  Internal: 13 rounds × 1 S-box × 4 mults = 52");
-    println!("  Total S-box: ~564 constraints");
-    println!();
+        println!("Expected constraints per permutation:");
+        println!("  External: 8 rounds × 16 S-boxes × 4 mults = 512");
+        println!("  Internal: 13 rounds × 1 S-box × 4 mults = 52");
+        println!("  Total S-box: ~564 constraints");
+        println!();
 
         // Digit-sizing hint based on modulus size.
         let d_prime: u32 = (R::dimension() as u32) / 2;
@@ -83,16 +83,8 @@ fn main() {
         //
         // With paper-style R1CS witness decomposition enabled unconditionally in this benchmark,
         // we use k_g=3 (Table 1 instantiation).
-        //
-        // Default is FAST: perms={1}. Opt into the full sweep with `SYMPHONY_POSEIDON2_FULL=1`.
-        let full = std::env::var("SYMPHONY_POSEIDON2_FULL").ok().as_deref() == Some("1");
-        let _ring_sel = std::env::var("SYMPHONY_RING").unwrap_or_else(|_| "sp1bb16".to_string());
         let k_list = vec![3usize];
-        let perms_list: Vec<usize> = if full { vec![1, 2, 4, 8] } else { vec![1] };
-        println!(
-            "Sweep mode: {} (set SYMPHONY_POSEIDON2_FULL=1 for full sweep)",
-            if full { "FULL" } else { "FAST" }
-        );
+        let perms_list: Vec<usize> = vec![1, 2, 4, 8];
         for &k_g in &k_list {
             for &num_perms in &perms_list {
                 // Silence panic-hook output only for the `catch_unwind` region so expected failures
@@ -105,12 +97,7 @@ fn main() {
                     println!("  !! PANIC: decomposition overflow for perms={num_perms}, k_g={k_g}");
                 }
             }
-    }
-
-    println!("\n=========================================================");
-    println!("GM-1B Insight: SP1 compressed verifier uses ~1000 Poseidon2 calls");
-    println!("At ~564 constraints/perm, that's ~564K constraints");
-    println!("=========================================================");
+        }
     }
 
     // NOTE: Frog is ~64-bit modulus and is very expensive once k_g is raised high enough.
