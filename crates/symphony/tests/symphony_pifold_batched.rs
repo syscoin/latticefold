@@ -16,7 +16,7 @@ use symphony::{
 };
 use latticefold::commitment::AjtaiCommitmentScheme;
 use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing, Ring};
-use stark_rings_linalg::{Matrix, SparseMatrix};
+use stark_rings_linalg::SparseMatrix;
 
 #[test]
 fn test_pifold_batched_sumcheck_two_instances() {
@@ -37,8 +37,8 @@ fn test_pifold_batched_sumcheck_two_instances() {
         row.clear();
     }
 
-    let a = Matrix::<R>::rand(&mut ark_std::test_rng(), 2, n);
-    let scheme = AjtaiCommitmentScheme::<R>::new(a.clone());
+    const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
+    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
     let open = AjtaiOpenVerifier { scheme: scheme.clone() };
 
     let f0 = vec![R::one(); n];
@@ -115,8 +115,8 @@ fn test_pifold_batched_aux_witness_path_matches() {
         row.clear();
     }
 
-    let a = Matrix::<R>::rand(&mut ark_std::test_rng(), 2, n);
-    let scheme = AjtaiCommitmentScheme::<R>::new(a.clone());
+    const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
+    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
     let open = AjtaiOpenVerifier { scheme: scheme.clone() };
 
     let f0 = vec![R::one(); n];
@@ -197,8 +197,8 @@ fn test_pifold_batched_aux_witness_rejects_tamper() {
         row.clear();
     }
 
-    let a = Matrix::<R>::rand(&mut ark_std::test_rng(), 2, n);
-    let scheme = AjtaiCommitmentScheme::<R>::new(a.clone());
+    const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
+    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
     let open = AjtaiOpenVerifier { scheme: scheme.clone() };
 
     let f0 = vec![R::one(); n];
@@ -274,8 +274,8 @@ fn test_pifold_batched_public_statement_binding_rejects_mismatch() {
         row.clear();
     }
 
-    let a = Matrix::<R>::rand(&mut ark_std::test_rng(), 2, n);
-    let scheme = AjtaiCommitmentScheme::<R>::new(a.clone());
+    const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
+    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
     let open = AjtaiOpenVerifier { scheme: scheme.clone() };
 
     let f0 = vec![R::one(); n];

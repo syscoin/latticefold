@@ -10,7 +10,9 @@ use symphony::{
     symphony_we_relation::{check_r_we_poseidon_fs, ReducedRelation},
 };
 use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing, Ring, Zq};
-use stark_rings_linalg::{Matrix, SparseMatrix};
+use stark_rings_linalg::SparseMatrix;
+
+const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
 
 struct RoCheckCEquals;
 
@@ -50,8 +52,8 @@ fn test_r_we_conjunction_ok() {
         row.clear();
     }
 
-    let a = Matrix::<R>::rand(&mut ark_std::test_rng(), 2, n);
-    let scheme = AjtaiCommitmentScheme::<R>::new(a.clone());
+    const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
+    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
 
     let f0 = vec![R::one(); n];
     let f1 = vec![R::ZERO; n];
@@ -65,10 +67,10 @@ fn test_r_we_conjunction_ok() {
         d_prime: (R::dimension() as u128) / 2,
     };
 
-    let a_had = Matrix::<R>::rand(&mut ark_std::test_rng(), 2, 3 * R::dimension());
-    let a_mon = Matrix::<R>::rand(&mut ark_std::test_rng(), 2, rg_params.k_g);
-    let scheme_had = AjtaiCommitmentScheme::<R>::new(a_had);
-    let scheme_mon = AjtaiCommitmentScheme::<R>::new(a_mon);
+    let scheme_had =
+        AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, 2, 3 * R::dimension());
+    let scheme_mon =
+        AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 2, rg_params.k_g);
 
     let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],
@@ -137,8 +139,7 @@ fn test_r_we_conjunction_rejects_bad_ro_witness() {
         row.clear();
     }
 
-    let a = Matrix::<R>::rand(&mut ark_std::test_rng(), 2, n);
-    let scheme = AjtaiCommitmentScheme::<R>::new(a.clone());
+    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
 
     let f0 = vec![R::one(); n];
     let f1 = vec![R::ZERO; n];
@@ -152,10 +153,10 @@ fn test_r_we_conjunction_rejects_bad_ro_witness() {
         d_prime: (R::dimension() as u128) / 2,
     };
 
-    let a_had = Matrix::<R>::rand(&mut ark_std::test_rng(), 2, 3 * R::dimension());
-    let a_mon = Matrix::<R>::rand(&mut ark_std::test_rng(), 2, rg_params.k_g);
-    let scheme_had = AjtaiCommitmentScheme::<R>::new(a_had);
-    let scheme_mon = AjtaiCommitmentScheme::<R>::new(a_mon);
+    let scheme_had =
+        AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, 2, 3 * R::dimension());
+    let scheme_mon =
+        AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 2, rg_params.k_g);
 
     let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],
@@ -216,8 +217,7 @@ fn test_r_cp_poseidon_fs_rejects_tampered_commitment() {
         row.clear();
     }
 
-    let a = Matrix::<R>::rand(&mut ark_std::test_rng(), 2, n);
-    let scheme = AjtaiCommitmentScheme::<R>::new(a.clone());
+    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
 
     let f0 = vec![R::one(); n];
     let f1 = vec![R::ZERO; n];
@@ -231,10 +231,10 @@ fn test_r_cp_poseidon_fs_rejects_tampered_commitment() {
         d_prime: (R::dimension() as u128) / 2,
     };
 
-    let a_had = Matrix::<R>::rand(&mut ark_std::test_rng(), 2, 3 * R::dimension());
-    let a_mon = Matrix::<R>::rand(&mut ark_std::test_rng(), 2, rg_params.k_g);
-    let scheme_had = AjtaiCommitmentScheme::<R>::new(a_had);
-    let scheme_mon = AjtaiCommitmentScheme::<R>::new(a_mon);
+    let scheme_had =
+        AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, 2, 3 * R::dimension());
+    let scheme_mon =
+        AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 2, rg_params.k_g);
 
     let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],
@@ -296,8 +296,7 @@ fn test_r_cp_poseidon_fs_rejects_tampered_cfs_commitment() {
     }
 
     // Underlying witness commitments (cm_f) used by Π_fold (not opened in CP relation).
-    let a_f = Matrix::<R>::rand(&mut ark_std::test_rng(), 2, n);
-    let scheme_f = AjtaiCommitmentScheme::<R>::new(a_f);
+    let scheme_f = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
     let f0 = vec![R::one(); n];
     let f1 = vec![R::ZERO; n];
     let cm0 = scheme_f.commit(&f0).unwrap().as_ref().to_vec();
@@ -310,10 +309,10 @@ fn test_r_cp_poseidon_fs_rejects_tampered_cfs_commitment() {
         d_prime: (R::dimension() as u128) / 2,
     };
 
-    let a_had = Matrix::<R>::rand(&mut ark_std::test_rng(), 2, 3 * R::dimension());
-    let a_mon = Matrix::<R>::rand(&mut ark_std::test_rng(), 2, rg_params.k_g);
-    let scheme_had = AjtaiCommitmentScheme::<R>::new(a_had);
-    let scheme_mon = AjtaiCommitmentScheme::<R>::new(a_mon);
+    let scheme_had =
+        AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, 2, 3 * R::dimension());
+    let scheme_mon =
+        AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 2, rg_params.k_g);
 
     let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],
@@ -374,8 +373,7 @@ fn test_r_we_nonvacuous_had_identity_passes() {
     let f1 = vec![R::ZERO; n];
 
     // Commitments to f (cm_f).
-    let a_f = Matrix::<R>::rand(&mut ark_std::test_rng(), 8, n);
-    let scheme_f = AjtaiCommitmentScheme::<R>::new(a_f);
+    let scheme_f = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 8, n);
     let cm0 = scheme_f.commit(&f0).unwrap().as_ref().to_vec();
     let cm1 = scheme_f.commit(&f1).unwrap().as_ref().to_vec();
 
@@ -387,10 +385,10 @@ fn test_r_we_nonvacuous_had_identity_passes() {
     };
 
     // CP commitment schemes for aux messages (bigger row-count than other tests).
-    let a_had = Matrix::<R>::rand(&mut ark_std::test_rng(), 32, 3 * R::dimension());
-    let a_mon = Matrix::<R>::rand(&mut ark_std::test_rng(), 32, rg_params.k_g);
-    let scheme_had = AjtaiCommitmentScheme::<R>::new(a_had);
-    let scheme_mon = AjtaiCommitmentScheme::<R>::new(a_mon);
+    let scheme_had =
+        AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, 32, 3 * R::dimension());
+    let scheme_mon =
+        AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 32, rg_params.k_g);
 
     let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],
@@ -455,8 +453,7 @@ fn test_r_we_nonvacuous_had_identity_rejects_non_idempotent_witness() {
     let f0 = vec![two; n];
     let f1 = vec![R::ZERO; n];
 
-    let a_f = Matrix::<R>::rand(&mut ark_std::test_rng(), 8, n);
-    let scheme_f = AjtaiCommitmentScheme::<R>::new(a_f);
+    let scheme_f = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 8, n);
     let cm0 = scheme_f.commit(&f0).unwrap().as_ref().to_vec();
     let cm1 = scheme_f.commit(&f1).unwrap().as_ref().to_vec();
 
@@ -467,10 +464,10 @@ fn test_r_we_nonvacuous_had_identity_rejects_non_idempotent_witness() {
         d_prime: (R::dimension() as u128) / 2,
     };
 
-    let a_had = Matrix::<R>::rand(&mut ark_std::test_rng(), 16, 3 * R::dimension());
-    let a_mon = Matrix::<R>::rand(&mut ark_std::test_rng(), 16, rg_params.k_g);
-    let scheme_had = AjtaiCommitmentScheme::<R>::new(a_had);
-    let scheme_mon = AjtaiCommitmentScheme::<R>::new(a_mon);
+    let scheme_had =
+        AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, 16, 3 * R::dimension());
+    let scheme_mon =
+        AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 16, rg_params.k_g);
 
     let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],

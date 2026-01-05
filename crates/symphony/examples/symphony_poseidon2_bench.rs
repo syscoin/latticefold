@@ -528,7 +528,6 @@ where
         transcript::PoseidonTranscript,
         symphony_we_relation::check_r_cp_poseidon_fs,
     };
-    use stark_rings_linalg::Matrix;
 
     println!("\n=== Testing Symphony Poseidon2 with {} permutation(s), k_g={} ===", num_permutations, k_g);
 
@@ -597,8 +596,9 @@ where
 
     // Commitment setup
     let kappa = 8; // Ajtai commitment rows
-    let a = Matrix::<R>::rand(&mut ark_std::test_rng(), kappa, n);
-    let scheme = AjtaiCommitmentScheme::<R>::new(a);
+    // Seeded Ajtai is the intended “CRS-as-seed” instantiation (matches the whitepaper).
+    const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
+    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, kappa, n);
     let cm = scheme.commit(witness.as_ref()).unwrap().as_ref().to_vec();
 
     // Symphony Π_rg parameters
@@ -622,10 +622,9 @@ where
     };
 
     // CP commitment schemes for aux messages
-    let a_had = Matrix::<R>::rand(&mut ark_std::test_rng(), kappa, 3 * R::dimension());
-    let a_mon = Matrix::<R>::rand(&mut ark_std::test_rng(), kappa, rg_params.k_g);
-    let scheme_had = AjtaiCommitmentScheme::<R>::new(a_had);
-    let scheme_mon = AjtaiCommitmentScheme::<R>::new(a_mon);
+    let scheme_had =
+        AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, kappa, 3 * R::dimension());
+    let scheme_mon = AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, kappa, rg_params.k_g);
 
     // Public inputs (statement binding)
     let public_inputs: Vec<R::BaseRing> = vec![

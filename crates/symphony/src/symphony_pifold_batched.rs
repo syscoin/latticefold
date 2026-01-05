@@ -11,6 +11,7 @@
 //! - Full paper compression replaces these with commitment+opening checks (`VfyOpen`).
 
 use ark_std::log2;
+use std::sync::Arc;
 use cyclotomic_rings::rings::GetPoseidonParams;
 use latticefold::{
     commitment::AjtaiCommitmentScheme,
@@ -376,27 +377,44 @@ where
         .map(|cba| cba.iter().map(|(_, _, a)| R::from(*a)).collect::<Vec<_>>())
         .collect::<Vec<_>>();
 
-    // Helper: compute projected row digits for out_row ∈ [0, m_J).
-    // Returns digits as [d][k_g] in base ring.
-    let proj_row_digits = |f: &[R], J: &[Vec<R::BaseRing>], out_row: usize| -> Vec<Vec<R::BaseRing>> {
-        let i = out_row % rg_params.lambda_pj;
-        let b = out_row / rg_params.lambda_pj;
-        let mut h_row = vec![R::BaseRing::ZERO; d];
-        for t in 0..rg_params.l_h {
-            let in_row = b * rg_params.l_h + t;
-            let coef = J[i][t];
-            let coeffs = f[in_row].coeffs();
-            for col in 0..d {
-                h_row[col] += coef * coeffs[col];
-            }
-        }
-        h_row.decompose_to_vec(rg_params.d_prime, rg_params.k_g)
-    };
+    // Precompute projected digits once per instance.
+    // Layout: digits[(row * d + col) * k_g + dig] where
+    // - row ∈ [0, m_j)
+    // - col ∈ [0, d)
+    // - dig ∈ [0, k_g)
+    let mut proj_digits_by_inst: Vec<Arc<Vec<R::BaseRing>>> = Vec::with_capacity(ell);
 
     for inst_idx in 0..ell {
         let f = witnesses[inst_idx];
         let J = &Js[inst_idx];
+        let k_g = rg_params.k_g;
+        let lambda_pj = rg_params.lambda_pj;
+        let l_h = rg_params.l_h;
+        let d_prime = rg_params.d_prime;
         let reps = m / m_j;
+
+        let mut digits_flat = vec![R::BaseRing::ZERO; m_j * d * k_g];
+        for out_row in 0..m_j {
+            let i = out_row % lambda_pj;
+            let b = out_row / lambda_pj;
+            let mut h_row = vec![R::BaseRing::ZERO; d];
+            for t in 0..l_h {
+                let in_row = b * l_h + t;
+                let coef = J[i][t];
+                let coeffs = f[in_row].coeffs();
+                for col in 0..d {
+                    h_row[col] += coef * coeffs[col];
+                }
+            }
+            let digits = h_row.decompose_to_vec(d_prime, k_g);
+            for col in 0..d {
+                for dig in 0..k_g {
+                    digits_flat[(out_row * d + col) * k_g + dig] = digits[col][dig];
+                }
+            }
+        }
+        let digits_flat = Arc::new(digits_flat);
+        proj_digits_by_inst.push(digits_flat.clone());
 
         // For each digit, add (m_j, m'_j, eq(c)) MLEs.
         for dig in 0..rg_params.k_g {
@@ -407,9 +425,9 @@ where
 
             // Fill by streaming over projected rows; repeat pattern if m > m_J.
             for out_row in 0..m_j {
-                let digits = proj_row_digits(f, J, out_row);
                 for col in 0..d {
-                    let g = exp::<R>(digits[col][dig]).expect("Exp failed");
+                    let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
+                    let g = exp::<R>(digit).expect("Exp failed");
                     let mj_ring = R::from(ev(&g, *beta_i));
                     let mp_ring = mj_ring * mj_ring;
                     for rep in 0..reps {
@@ -478,14 +496,13 @@ where
             }
             for inst_idx in 0..ell {
                 let b = beta_cts[inst_idx];
-                let f = witnesses[inst_idx];
-                let J = &Js[inst_idx];
+                let digits_flat = &proj_digits_by_inst[inst_idx];
                 for row in 0..m_j {
                     let w = ts_r[row];
-                    let digits = proj_row_digits(f, J, row);
                     for col in 0..d {
                         for dig in 0..rg_params.k_g {
-                            v_digits_folded[dig][col] += b * digits[col][dig] * w;
+                            let digit = digits_flat[(row * d + col) * rg_params.k_g + dig];
+                            v_digits_folded[dig][col] += b * digit * w;
                         }
                     }
                 }
@@ -532,14 +549,13 @@ where
     for inst_idx in 0..ell {
         let mut b_inst = Vec::with_capacity(rg_params.k_g);
         for dig in 0..rg_params.k_g {
-            let f = witnesses[inst_idx];
-            let J = &Js[inst_idx];
+            let digits_flat = &proj_digits_by_inst[inst_idx];
             let reps = m / m_j;
             let mut acc = R::ZERO;
             for out_row in 0..m_j {
-                let digits = proj_row_digits(f, J, out_row);
                 for col in 0..d {
-                    let g = exp::<R>(digits[col][dig]).expect("Exp failed");
+                    let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
+                    let g = exp::<R>(digit).expect("Exp failed");
                     for rep in 0..reps {
                         let r = out_row + rep * m_j;
                         let idx = col * m + r;

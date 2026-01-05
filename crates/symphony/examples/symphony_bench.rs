@@ -16,7 +16,7 @@ fn main() {
         symphony_we_relation::{check_r_cp_poseidon_fs, TrivialRo},
     };
     use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing, Ring};
-    use stark_rings_linalg::{Matrix, SparseMatrix};
+    use stark_rings_linalg::SparseMatrix;
 
     // Keep these at the test-friendly “toy” scale for interactive runs. Increase if you want.
     let n = 1 << 10;
@@ -44,8 +44,8 @@ fn main() {
     ];
 
     // Ajtai commitment for cm_f.
-    let a_f = Matrix::<R>::rand(&mut ark_std::test_rng(), 8, n);
-    let scheme_f = AjtaiCommitmentScheme::<R>::new(a_f);
+    const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
+    let scheme_f = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 8, n);
 
     // Try a few batch sizes ℓ.
     for &ell in &[2usize, 4, 8] {
@@ -66,10 +66,10 @@ fn main() {
 
         // CP commitments for aux messages (cfs_*). Use a larger row count so we can see the
         // Ajtai-open verification cost.
-        let a_had = Matrix::<R>::rand(&mut ark_std::test_rng(), 32, 3 * R::dimension());
-        let a_mon = Matrix::<R>::rand(&mut ark_std::test_rng(), 32, rg_params.k_g);
-        let scheme_had = AjtaiCommitmentScheme::<R>::new(a_had);
-        let scheme_mon = AjtaiCommitmentScheme::<R>::new(a_mon);
+        let scheme_had =
+            AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, 32, 3 * R::dimension());
+        let scheme_mon =
+            AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 32, rg_params.k_g);
 
         let prove_start = Instant::now();
         let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(

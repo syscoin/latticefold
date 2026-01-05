@@ -13,7 +13,7 @@ use latticefold::commitment::AjtaiCommitmentScheme;
 use latticefold::transcript::Transcript;
 use symphony::public_coin_transcript::FixedTranscript;
 use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing, Ring};
-use stark_rings_linalg::{Matrix, SparseMatrix};
+use stark_rings_linalg::SparseMatrix;
 
 #[test]
 fn test_ajtai_openings_for_cms_are_verified() {
@@ -35,8 +35,8 @@ fn test_ajtai_openings_for_cms_are_verified() {
     }
 
     // Ajtai matrix used for the witness commitments.
-    let a = Matrix::<R>::rand(&mut ark_std::test_rng(), 2, n);
-    let scheme = AjtaiCommitmentScheme::<R>::new(a.clone());
+    const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
+    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
     let open = AjtaiOpenVerifier { scheme: scheme.clone() };
 
     // Two witnesses and their commitments.

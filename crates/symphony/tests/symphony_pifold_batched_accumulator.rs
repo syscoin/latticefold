@@ -14,7 +14,9 @@ use symphony::{
 };
 use latticefold::commitment::AjtaiCommitmentScheme;
 use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing, Ring};
-use stark_rings_linalg::{Matrix, SparseMatrix};
+use stark_rings_linalg::SparseMatrix;
+
+const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
 
 fn fold_vec(beta0: R, beta1: R, a: &[R], b: &[R]) -> Vec<R> {
     assert_eq!(a.len(), b.len());
@@ -43,8 +45,7 @@ fn test_pifold_batched_accumulator_two_steps() {
         row.clear();
     }
 
-    let a = Matrix::<R>::rand(&mut ark_std::test_rng(), 2, n);
-    let scheme = AjtaiCommitmentScheme::<R>::new(a.clone());
+    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
     let open = AjtaiOpenVerifier { scheme: scheme.clone() };
 
     let rg_params = RPParams {
