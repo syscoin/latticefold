@@ -111,11 +111,17 @@ fn main() {
     let kappa = 8;
     let k_g = 3;
     // Projection dimension for Π_rg (must satisfy: lambda_pj <= l_h and l_h % lambda_pj == 0).
-    // For production SP1 runs, lambda_pj=1 is a toy setting; default to 32 and allow override.
+    //
+    // IMPORTANT for SP1 chunked proving: `m_J = (ncols/l_h) * lambda_pj` must be <= `m` (chunk rows)
+    // and must divide `m`. With SP1 chunk sizes like 2^20, choosing lambda_pj too large will violate
+    // `m_J <= m` and cause proving to fail (often only on the last partial chunks).
+    //
+    // Default to lambda_pj=1 for SP1 production runs; override via env if you are also increasing
+    // chunk size so that `m` is large enough.
     let lambda_pj: usize = std::env::var("LAMBDA_PJ")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(32);
+        .unwrap_or(1);
     let rg_params = RPParams {
         l_h,
         lambda_pj,
@@ -134,9 +140,12 @@ fn main() {
         rg_params.lambda_pj,
         rg_params.l_h
     );
+    // Print m_J implied by witness length (independent of chunk index) so configs are sanity-checkable.
+    let blocks = ncols / rg_params.l_h;
+    let m_j = blocks * rg_params.lambda_pj;
     println!(
-        "  Π_rg params: l_h={}, lambda_pj={}, k_g={}, d'={}",
-        rg_params.l_h, rg_params.lambda_pj, rg_params.k_g, rg_params.d_prime
+        "  Π_rg params: l_h={}, lambda_pj={}, k_g={}, d'={}  (m_J={})",
+        rg_params.l_h, rg_params.lambda_pj, rg_params.k_g, rg_params.d_prime, m_j
     );
     
     // Main commitment (shared across chunks)
