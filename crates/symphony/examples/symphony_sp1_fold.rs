@@ -52,7 +52,7 @@ fn main() {
     println!("Step 1: Loading R1CS and converting to Symphony matrices...");
     let load_start = Instant::now();
     
-    let (sp1_r1cs, [m1, m2, m3], stats): (_, [SparseMatrix<R>; 3], _) = 
+    let ([m1, m2, m3], stats): ([SparseMatrix<R>; 3], _) = 
         load_sp1_r1cs_as_symphony::<R, BabyBear>(&r1cs_path, None)
             .expect("Failed to load R1CS");
     
@@ -67,7 +67,7 @@ fn main() {
         stats.digest[0], stats.digest[1], stats.digest[2], stats.digest[3],
         stats.digest[28], stats.digest[29], stats.digest[30], stats.digest[31]);
     println!("  Load time: {load_time:?}");
-    println!("  Matrix dimensions: {} rows × {} cols", m1.nrows, m1.ncols);
+    println!("  Matrix dimensions: {} rows × {} cols (padded)", m1.nrows, m1.ncols);
     
     let nnz_a: usize = m1.coeffs.iter().map(|r| r.len()).sum();
     let nnz_b: usize = m2.coeffs.iter().map(|r| r.len()).sum();
@@ -76,21 +76,25 @@ fn main() {
 
     // Step 2: Create dummy witness for benchmarking
     // Real witness would come from SP1 proof execution
-    println!("Step 3: Creating dummy witness...");
-    let n = sp1_r1cs.num_vars;
+    println!("Step 2: Creating dummy witness...");
+    
+    // Witness must match padded column count from matrices
+    let n_padded = m1.ncols; // This is the padded size (power of 2)
+    let n_orig = stats.num_vars;
     
     // Dummy witness: w[0] = 1, rest = 0
     // This won't satisfy the R1CS but lets us benchmark the folding mechanics
-    let mut witness: Vec<R> = vec![R::ZERO; n];
+    let mut witness: Vec<R> = vec![R::ZERO; n_padded];
     witness[0] = R::ONE;
-    println!("  Witness length: {n}");
+    println!("  Original witness length: {n_orig}");
+    println!("  Padded witness length: {n_padded} (2^{})", n_padded.trailing_zeros());
     println!("  (Using dummy witness - real witness would come from SP1 proof)\n");
 
     // Step 3: Setup commitment scheme
     println!("Step 3: Setting up Ajtai commitment...");
     let kappa = 8; // Commitment security parameter
     let setup_start = Instant::now();
-    let a = Matrix::<R>::rand(&mut ark_std::test_rng(), kappa, n);
+    let a = Matrix::<R>::rand(&mut ark_std::test_rng(), kappa, n_padded);
     let scheme = AjtaiCommitmentScheme::<R>::new(a);
     let cm = scheme.commit(&witness).unwrap().as_ref().to_vec();
     let setup_time = setup_start.elapsed();
