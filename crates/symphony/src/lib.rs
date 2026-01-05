@@ -30,5 +30,4 @@ pub mod rp_rgchk;
 
 // Streaming sumcheck (memory-efficient MLE handling)
 pub mod streaming_sumcheck;
-pub mod mle_oracle;
 pub mod symphony_pifold_streaming;

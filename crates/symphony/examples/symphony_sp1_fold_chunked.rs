@@ -167,9 +167,12 @@ fn main() {
         let batch_start_time = Instant::now();
 
         // Load the chunk matrices for this batch (streaming; keeps peak RAM bounded).
+        let load_mat_start = Instant::now();
         let batch_mats: Vec<(usize, [stark_rings_linalg::SparseMatrix<R>; 3])> = (batch_start..batch_end)
             .map(|i| (i, cache.read_chunk(i).expect("read_chunk failed")))
             .collect();
+        let load_mat_time = load_mat_start.elapsed();
+        println!("    Loaded {batch_size} chunks from cache in {load_mat_time:?}");
         
         // Process this batch in PARALLEL using rayon
         let batch_results: Vec<_> = pool.install(|| {

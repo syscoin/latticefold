@@ -5,9 +5,9 @@
 //!
 //! ## Key Optimizations
 //!
-//! 1. **Hadamard MLEs**: `SparseMatrixMle` computes y[row] = (M*w)[row] on demand
-//! 2. **Eq MLEs**: `EqStreamingMle` computes eq(bits(idx), r) directly
-//! 3. **Monomial MLEs**: Pre-computed per-digit (still dense, but smaller)
+//! 1. **Hadamard MLEs**: sparse mat-vec is evaluated on-demand, then fixed rounds materialize dense
+//! 2. **Eq MLEs**: evaluated in the base ring (constant-coefficient) and lifted to `R`
+//! 3. **Monomial MLEs**: base-field scalars (m_j/m') + base-field eq(c), both streaming/compact
 //!
 //! ## Memory Comparison (1M constraints, d=16)
 //!
@@ -19,6 +19,7 @@
 
 use ark_std::log2;
 use std::sync::Arc;
+use std::time::Instant;
 use stark_rings::{
     balanced_decomposition::{Decompose, DecomposeToVec},
     exp, CoeffRing, OverField, Ring, Zq,
@@ -31,15 +32,13 @@ use latticefold::{
 };
 
 use crate::recording_transcript::RecordingTranscriptRef;
-use crate::mle_oracle::{BaseScalarVecMle, EqBaseStreamingMle, SparseMatrixMle};
 use crate::rp_rgchk::RPParams;
-use crate::streaming_sumcheck::{StreamingMle, StreamingProof, StreamingSumcheck};
+use crate::streaming_sumcheck::{StreamingMleEnum, StreamingProof, StreamingSumcheck};
 use crate::symphony_cm::SymphonyCoins;
 use crate::symphony_coins::{derive_beta_chi, derive_J, ev, ts_weights};
 use crate::symphony_pifold_batched::{PiFoldAuxWitness, PiFoldBatchedProof, PiFoldProverOutput};
 
 // Re-export streaming types
-pub use crate::mle_oracle::ClosureMle;
 pub use crate::streaming_sumcheck::{StreamingProverMsg, StreamingSumcheckState};
 
 fn absorb_public_inputs<R: OverField>(ts: &mut impl Transcript<R>, public_inputs: &[R::BaseRing])
@@ -172,6 +171,8 @@ pub fn prove_pi_fold_streaming<R: CoeffRing>(
 where
     R::BaseRing: Zq + Decompose,
 {
+    let prof = std::env::var("SYMPHONY_PROFILE").ok().as_deref() == Some("1");
+    let t_all = Instant::now();
     let ell = cms.len();
     let beta_cts = derive_beta_chi::<R>(transcript, ell);
     if ell == 0 || witnesses.len() != ell {
@@ -261,16 +262,16 @@ where
     // -----------------
     // STREAMING Hadamard MLEs
     // -----------------
-    // Key optimization: use SparseMatrixMle instead of materializing y = M*w
-    let mut mles_had: Vec<Box<dyn StreamingMle<R>>> = Vec::with_capacity(ell * 4);
+    // Key optimization: use sparse mat-vec MLEs instead of materializing y = M*w
+    let mut mles_had: Vec<StreamingMleEnum<R>> = Vec::with_capacity(ell * 4);
 
     for inst_idx in 0..ell {
-        mles_had.push(Box::new(EqBaseStreamingMle::<R>::new(s_base.clone())));
+        mles_had.push(StreamingMleEnum::eq_base(s_base.clone()));
         for i in 0..3 {
-            mles_had.push(Box::new(SparseMatrixMle::new(
+            mles_had.push(StreamingMleEnum::sparse_mat_vec(
                 M[i].clone(),
                 witnesses[inst_idx].clone(),
-            )));
+            ));
         }
     }
 
@@ -301,7 +302,7 @@ where
     // We keep m_j/m' as base-ring scalars (compact), and make eq(c) fully streaming.
     // -----------------
     let mon_mles_per = 3 * rg_params.k_g;
-    let mut mles_mon: Vec<Box<dyn StreamingMle<R>>> = Vec::with_capacity(ell * mon_mles_per);
+    let mut mles_mon: Vec<StreamingMleEnum<R>> = Vec::with_capacity(ell * mon_mles_per);
 
     let alphas_ring = cba_all
         .iter()
@@ -329,6 +330,7 @@ where
 
     let reps = m / m_j;
 
+    let t_mon_build = Instant::now();
     for inst_idx in 0..ell {
         let f: &[R] = &witnesses[inst_idx];
         let J = &Js[inst_idx];
@@ -355,18 +357,22 @@ where
                 }
             }
 
-            mles_mon.push(Box::new(BaseScalarVecMle::<R>::new(
-                g_nvars,
-                Arc::new(m_j_evals),
-            )));
-            mles_mon.push(Box::new(BaseScalarVecMle::<R>::new(
-                g_nvars,
-                Arc::new(m_prime),
-            )));
+            mles_mon.push(StreamingMleEnum::base_scalar_vec(g_nvars, Arc::new(m_j_evals)));
+            mles_mon.push(StreamingMleEnum::base_scalar_vec(g_nvars, Arc::new(m_prime)));
             // eq(c) as streaming MLE (no 2^n table).
             let c_base = c.iter().map(|x| x.coeffs()[0]).collect::<Vec<_>>();
-            mles_mon.push(Box::new(EqBaseStreamingMle::<R>::new(c_base)));
+            mles_mon.push(StreamingMleEnum::eq_base(c_base));
         }
+    }
+    if prof {
+        eprintln!(
+            "[PiFold streaming] built mon MLEs in {:?} (g_len={}, g_nvars={}, k_g={}, ell={})",
+            t_mon_build.elapsed(),
+            g_len,
+            g_nvars,
+            rg_params.k_g,
+            ell
+        );
     }
 
     let rc_all_clone = rc_all.clone();
@@ -416,6 +422,7 @@ where
     let mut v_msg_mon: Option<R::BaseRing> = None;
 
     let rounds = log_m.max(g_nvars);
+    let t_sumcheck = Instant::now();
     for round_idx in 0..rounds {
         // Prover messages (in the same order as latticefold's shared schedule)
         if round_idx < log_m {
@@ -467,6 +474,15 @@ where
         v_msg_had = Some(r);
         v_msg_mon = Some(r);
     }
+    if prof {
+        eprintln!(
+            "[PiFold streaming] sumchecks done in {:?} (log_m={}, g_nvars={}, rounds={})",
+            t_sumcheck.elapsed(),
+            log_m,
+            g_nvars,
+            rounds
+        );
+    }
 
     // Final randomness vectors for each sumcheck (same convention as latticefold sumcheck state)
     let had_rand = sampled[..log_m].to_vec();
@@ -482,6 +498,7 @@ where
     // -----------------
     let ts_r_had = ts_weights(&had_rand);
 
+    let t_aux_had = Instant::now();
     let mut had_u: Vec<[Vec<R::BaseRing>; 3]> = Vec::with_capacity(ell);
     for inst_idx in 0..ell {
         let mut U: [Vec<R::BaseRing>; 3] = [
@@ -517,9 +534,13 @@ where
         }
         had_u.push(U);
     }
+    if prof {
+        eprintln!("[PiFold streaming] aux had_u done in {:?}", t_aux_had.elapsed());
+    }
 
     let ts_r_mon = ts_weights(&mon_rand);
 
+    let t_aux_mon = Instant::now();
     let mut mon_b: Vec<Vec<R>> = Vec::with_capacity(ell);
     for inst_idx in 0..ell {
         let mut b_inst = Vec::with_capacity(rg_params.k_g);
@@ -543,6 +564,10 @@ where
         }
         transcript.absorb_slice(&b_inst);
         mon_b.push(b_inst);
+    }
+    if prof {
+        eprintln!("[PiFold streaming] aux mon_b done in {:?}", t_aux_mon.elapsed());
+        eprintln!("[PiFold streaming] total prove_pi_fold_streaming time {:?}", t_all.elapsed());
     }
 
     Ok(PiFoldProverOutput {
@@ -587,18 +612,18 @@ pub fn build_hadamard_streaming_mles<R: OverField + stark_rings::PolyRing>(
     matrices: [Arc<SparseMatrix<R>>; 3],
     witnesses: &[Arc<Vec<R>>],
     s_r: Vec<R>,
-) -> Vec<Box<dyn StreamingMle<R>>> {
+) -> Vec<StreamingMleEnum<R>> {
     let ell = witnesses.len();
-    let mut mles: Vec<Box<dyn StreamingMle<R>>> = Vec::with_capacity(ell * 4);
+    let mut mles: Vec<StreamingMleEnum<R>> = Vec::with_capacity(ell * 4);
 
     for inst_idx in 0..ell {
         let s_base = s_r.iter().map(|x| x.coeffs()[0]).collect::<Vec<_>>();
-        mles.push(Box::new(EqBaseStreamingMle::<R>::new(s_base)));
+        mles.push(StreamingMleEnum::eq_base(s_base));
         for i in 0..3 {
-            mles.push(Box::new(SparseMatrixMle::new(
+            mles.push(StreamingMleEnum::sparse_mat_vec(
                 matrices[i].clone(),
                 witnesses[inst_idx].clone(),
-            )));
+            ));
         }
     }
 

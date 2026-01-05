@@ -9,64 +9,153 @@
 use ark_std::vec::Vec;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
-use stark_rings::OverField;
+use std::sync::Arc;
+use stark_rings::{OverField, PolyRing, Ring};
+use stark_rings_linalg::SparseMatrix;
 
 use latticefold::transcript::Transcript;
 
-// ============================================================================
-// Streaming MLE: index-based lookup without dense storage
-// ============================================================================
-
-/// Trait for MLEs that can be evaluated at hypercube indices on demand.
-///
-/// Instead of storing O(2^n) evaluations, implementors compute `eval(index)` from
-/// the underlying structure (sparse matrix, witness, etc.).
-pub trait StreamingMle<R: OverField>: Send + Sync {
-    /// Number of variables (log2 of domain size).
-    fn num_vars(&self) -> usize;
-
-    /// Domain size = 2^num_vars.
-    fn len(&self) -> usize {
-        1 << self.num_vars()
-    }
-
-    /// Evaluate at boolean hypercube index (0 <= index < 2^num_vars).
-    fn eval_at_index(&self, index: usize) -> R;
-
-    /// Fix the first variable to value `r`, returning a new MLE over (n-1) variables.
-    /// Default: creates a wrapper that interpolates.
-    fn fix_variable(&self, r: R) -> Box<dyn StreamingMle<R>>;
+/// Concrete streaming MLE variants (no dynamic dispatch in hot loops).
+#[derive(Clone)]
+pub enum StreamingMleEnum<R: OverField + PolyRing>
+where
+    R::BaseRing: Ring,
+{
+    Dense(DenseStreamingMle<R>),
+    /// y[row] = (M * w)[row], computed from sparse rows (only used before the first fix).
+    SparseMatVec {
+        matrix: Arc<SparseMatrix<R>>,
+        witness: Arc<Vec<R>>,
+        num_vars: usize,
+    },
+    /// A base-ring scalar table (stored as BaseRing), lifted to R via R::from.
+    BaseScalarVec {
+        evals: Arc<Vec<R::BaseRing>>,
+        num_vars: usize,
+    },
+    /// eq(bits(index), r) evaluated in the base ring, then lifted to R.
+    EqBase {
+        scale: R::BaseRing,
+        r: Vec<R::BaseRing>,
+        one_minus_r: Vec<R::BaseRing>,
+    },
 }
 
-/// Wrapper for fixing a variable in a streaming MLE.
-pub(crate) struct FixedStreamingMle<R: OverField> {
-    /// The underlying MLE (boxed to allow recursive fixing).
-    inner: Box<dyn StreamingMle<R>>,
-    /// The value the first variable is fixed to.
-    r: R,
-}
-
-impl<R: OverField> FixedStreamingMle<R> {
-    pub(crate) fn new(inner: Box<dyn StreamingMle<R>>, r: R) -> Self {
-        Self { inner, r }
-    }
-}
-
-impl<R: OverField> StreamingMle<R> for FixedStreamingMle<R> {
-    fn num_vars(&self) -> usize {
-        self.inner.num_vars() - 1
+impl<R: OverField + PolyRing> StreamingMleEnum<R>
+where
+    R::BaseRing: Ring,
+{
+    pub fn dense(evals: Vec<R>) -> Self {
+        Self::Dense(DenseStreamingMle::new(evals))
     }
 
-    fn eval_at_index(&self, index: usize) -> R {
-        // Fix the *least significant* variable (matches latticefold MLSumcheck prover/verifier):
-        // f'(b) = (1-r)*f(0,b) + r*f(1,b), where the original indices are 2*b and 2*b+1.
-        let f0 = self.inner.eval_at_index(index << 1);
-        let f1 = self.inner.eval_at_index((index << 1) | 1);
-        (R::ONE - self.r) * f0 + self.r * f1
+    pub fn sparse_mat_vec(matrix: Arc<SparseMatrix<R>>, witness: Arc<Vec<R>>) -> Self {
+        let nrows = matrix.nrows;
+        assert!(nrows.is_power_of_two(), "nrows must be power-of-two");
+        let num_vars = nrows.trailing_zeros() as usize;
+        Self::SparseMatVec {
+            matrix,
+            witness,
+            num_vars,
+        }
     }
 
-    fn fix_variable(&self, r: R) -> Box<dyn StreamingMle<R>> {
-        Box::new(FixedStreamingMle::new(self.inner.fix_variable(self.r), r))
+    pub fn base_scalar_vec(num_vars: usize, evals: Arc<Vec<R::BaseRing>>) -> Self {
+        Self::BaseScalarVec { evals, num_vars }
+    }
+
+    pub fn eq_base(r: Vec<R::BaseRing>) -> Self {
+        let one_minus_r = r.iter().copied().map(|x| R::BaseRing::ONE - x).collect();
+        Self::EqBase {
+            scale: R::BaseRing::ONE,
+            r,
+            one_minus_r,
+        }
+    }
+
+    #[inline]
+    pub fn num_vars(&self) -> usize {
+        match self {
+            StreamingMleEnum::Dense(m) => m.num_vars,
+            StreamingMleEnum::SparseMatVec { num_vars, .. } => *num_vars,
+            StreamingMleEnum::BaseScalarVec { num_vars, .. } => *num_vars,
+            StreamingMleEnum::EqBase { r, .. } => r.len(),
+        }
+    }
+
+    #[inline]
+    pub fn eval_at_index(&self, index: usize) -> R {
+        match self {
+            StreamingMleEnum::Dense(m) => m.evals[index],
+            StreamingMleEnum::SparseMatVec {
+                matrix, witness, ..
+            } => {
+                let mut sum = R::ZERO;
+                for (coeff, col_idx) in &matrix.coeffs[index] {
+                    if *col_idx < witness.len() {
+                        sum += *coeff * witness[*col_idx];
+                    }
+                }
+                sum
+            }
+            StreamingMleEnum::BaseScalarVec { evals, .. } => R::from(evals[index]),
+            StreamingMleEnum::EqBase {
+                scale,
+                r,
+                one_minus_r,
+            } => {
+                let mut prod = R::BaseRing::ONE;
+                for i in 0..r.len() {
+                    let bit = ((index >> i) & 1) == 1;
+                    prod *= if bit { r[i] } else { one_minus_r[i] };
+                }
+                R::from(*scale * prod)
+            }
+        }
+    }
+
+    /// Fix the next variable (LSB-first) and return a new MLE over one fewer variable.
+    pub fn fix_variable(&self, r: R) -> StreamingMleEnum<R> {
+        let nv = self.num_vars();
+        assert!(nv > 0);
+        let half = 1 << (nv - 1);
+        match self {
+            // Dense: materialize smaller dense.
+            StreamingMleEnum::Dense(m) => {
+                let new_evals: Vec<R> = (0..half)
+                    .map(|i| (R::ONE - r) * m.evals[i << 1] + r * m.evals[(i << 1) | 1])
+                    .collect();
+                StreamingMleEnum::dense(new_evals)
+            }
+            // Sparse/base scalar: materialize to dense once fixed (avoids exponential recursion).
+            StreamingMleEnum::SparseMatVec { .. } | StreamingMleEnum::BaseScalarVec { .. } => {
+                let new_evals: Vec<R> = (0..half)
+                    .map(|i| {
+                        let f0 = self.eval_at_index(i << 1);
+                        let f1 = self.eval_at_index((i << 1) | 1);
+                        (R::ONE - r) * f0 + r * f1
+                    })
+                    .collect();
+                StreamingMleEnum::dense(new_evals)
+            }
+            // EqBase: keep structural (base-field) with updated scale and shortened r vector.
+            StreamingMleEnum::EqBase {
+                scale,
+                r: rr,
+                one_minus_r,
+            } => {
+                let r0 = r.coeffs()[0];
+                let eq_factor = (R::BaseRing::ONE - r0) * one_minus_r[0] + r0 * rr[0];
+                let new_scale = *scale * eq_factor;
+                let new_r = rr[1..].to_vec();
+                let new_om = one_minus_r[1..].to_vec();
+                StreamingMleEnum::EqBase {
+                    scale: new_scale,
+                    r: new_r,
+                    one_minus_r: new_om,
+                }
+            }
+        }
     }
 }
 
@@ -75,6 +164,7 @@ impl<R: OverField> StreamingMle<R> for FixedStreamingMle<R> {
 // ============================================================================
 
 /// Dense MLE (fallback, stores all evaluations).
+#[derive(Clone)]
 pub struct DenseStreamingMle<R: OverField> {
     evals: Vec<R>,
     num_vars: usize,
@@ -87,74 +177,13 @@ impl<R: OverField> DenseStreamingMle<R> {
         let num_vars = len.trailing_zeros() as usize;
         Self { evals, num_vars }
     }
-}
 
-impl<R: OverField> StreamingMle<R> for DenseStreamingMle<R> {
-    fn num_vars(&self) -> usize {
+    pub fn num_vars(&self) -> usize {
         self.num_vars
     }
 
-    fn eval_at_index(&self, index: usize) -> R {
+    pub fn eval_at_index(&self, index: usize) -> R {
         self.evals[index]
-    }
-
-    fn fix_variable(&self, r: R) -> Box<dyn StreamingMle<R>> {
-        // Actually fix the variable by creating a smaller dense MLE.
-        let half = self.evals.len() / 2;
-        let new_evals: Vec<R> = (0..half)
-            .map(|i| (R::ONE - r) * self.evals[i << 1] + r * self.evals[(i << 1) | 1])
-            .collect();
-        Box::new(DenseStreamingMle::new(new_evals))
-    }
-}
-
-/// Streaming MLE computed via a closure (zero allocation for large domains).
-pub struct LazyStreamingMle<R, F>
-where
-    R: OverField,
-    F: Fn(usize) -> R + Send + Sync,
-{
-    eval_fn: F,
-    num_vars: usize,
-    _phantom: std::marker::PhantomData<R>,
-}
-
-impl<R, F> LazyStreamingMle<R, F>
-where
-    R: OverField,
-    F: Fn(usize) -> R + Send + Sync,
-{
-    pub fn new(num_vars: usize, eval_fn: F) -> Self {
-        Self {
-            eval_fn,
-            num_vars,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<R, F> StreamingMle<R> for LazyStreamingMle<R, F>
-where
-    R: OverField,
-    F: Fn(usize) -> R + Send + Sync + Clone + 'static,
-{
-    fn num_vars(&self) -> usize {
-        self.num_vars
-    }
-
-    fn eval_at_index(&self, index: usize) -> R {
-        (self.eval_fn)(index)
-    }
-
-    fn fix_variable(&self, r: R) -> Box<dyn StreamingMle<R>> {
-        Box::new(FixedStreamingMle {
-            inner: Box::new(LazyStreamingMle {
-                eval_fn: self.eval_fn.clone(),
-                num_vars: self.num_vars,
-                _phantom: std::marker::PhantomData,
-            }),
-            r,
-        })
     }
 }
 
@@ -174,8 +203,11 @@ pub struct StreamingProverMsg<R: OverField> {
 pub struct StreamingProof<R: OverField>(pub Vec<StreamingProverMsg<R>>);
 
 /// Streaming sumcheck prover state.
-pub struct StreamingSumcheckState<R: OverField> {
-    mles: Vec<Box<dyn StreamingMle<R>>>,
+pub struct StreamingSumcheckState<R: OverField + PolyRing>
+where
+    R::BaseRing: Ring,
+{
+    mles: Vec<StreamingMleEnum<R>>,
     pub randomness: Vec<R::BaseRing>,
     num_vars: usize,
     max_degree: usize,
@@ -187,8 +219,8 @@ pub struct StreamingSumcheck;
 
 impl StreamingSumcheck {
     /// Initialize prover with streaming MLEs.
-    pub fn prover_init<R: OverField>(
-        mles: Vec<Box<dyn StreamingMle<R>>>,
+    pub fn prover_init<R: OverField + PolyRing>(
+        mles: Vec<StreamingMleEnum<R>>,
         nvars: usize,
         degree: usize,
     ) -> StreamingSumcheckState<R> {
@@ -208,7 +240,7 @@ impl StreamingSumcheck {
     }
 
     /// Prove one round of sumcheck.
-    pub fn prove_round<R: OverField>(
+    pub fn prove_round<R: OverField + PolyRing>(
         state: &mut StreamingSumcheckState<R>,
         v_msg: Option<R::BaseRing>,
         comb_fn: &(dyn Fn(&[R]) -> R + Sync + Send),
@@ -220,11 +252,7 @@ impl StreamingSumcheck {
 
             // Fix variable in all MLEs
             let r_ring = R::from(r);
-            state.mles = state
-                .mles
-                .iter()
-                .map(|m| m.fix_variable(r_ring))
-                .collect();
+            state.mles = state.mles.iter().map(|m| m.fix_variable(r_ring)).collect();
         } else {
             assert!(state.round == 0);
         }
@@ -342,9 +370,9 @@ impl StreamingSumcheck {
     }
 
     /// Run streaming sumcheck as subprotocol.
-    pub fn prove_as_subprotocol<R: OverField, T: Transcript<R>>(
+    pub fn prove_as_subprotocol<R: OverField + PolyRing, T: Transcript<R>>(
         transcript: &mut T,
-        mles: Vec<Box<dyn StreamingMle<R>>>,
+        mles: Vec<StreamingMleEnum<R>>,
         nvars: usize,
         degree: usize,
         comb_fn: impl Fn(&[R]) -> R + Sync + Send,
@@ -371,9 +399,9 @@ impl StreamingSumcheck {
     }
 
     /// Run streaming sumcheck with hook after `hook_round` challenges.
-    pub fn prove_as_subprotocol_with_hook<R: OverField, T: Transcript<R>>(
+    pub fn prove_as_subprotocol_with_hook<R: OverField + PolyRing, T: Transcript<R>>(
         transcript: &mut T,
-        mles: Vec<Box<dyn StreamingMle<R>>>,
+        mles: Vec<StreamingMleEnum<R>>,
         nvars: usize,
         degree: usize,
         comb_fn: impl Fn(&[R]) -> R + Sync + Send,
@@ -411,15 +439,15 @@ impl StreamingSumcheck {
     }
 
     /// Run TWO streaming sumchecks with shared randomness (Symphony schedule).
-    pub fn prove_two_shared_with_hook<R: OverField, T: Transcript<R>>(
+    pub fn prove_two_shared_with_hook<R: OverField + PolyRing, T: Transcript<R>>(
         transcript: &mut T,
         // A
-        mles_a: Vec<Box<dyn StreamingMle<R>>>,
+        mles_a: Vec<StreamingMleEnum<R>>,
         nvars_a: usize,
         degree_a: usize,
         comb_fn_a: impl Fn(&[R]) -> R + Sync + Send,
         // B
-        mles_b: Vec<Box<dyn StreamingMle<R>>>,
+        mles_b: Vec<StreamingMleEnum<R>>,
         nvars_b: usize,
         degree_b: usize,
         comb_fn_b: impl Fn(&[R]) -> R + Sync + Send,
@@ -505,8 +533,8 @@ mod tests {
             .map(|i| R::from(((i * 7 + 3) % 97) as u128))
             .collect::<Vec<_>>();
 
-        let m1: Box<dyn StreamingMle<R>> = Box::new(DenseStreamingMle::new(f1.clone()));
-        let m2: Box<dyn StreamingMle<R>> = Box::new(DenseStreamingMle::new(f2.clone()));
+        let m1 = StreamingMleEnum::dense(f1.clone());
+        let m2 = StreamingMleEnum::dense(f2.clone());
 
         let comb = |vals: &[R]| -> R { vals[0] * R::from(13u128) + vals[1] * R::from(29u128) };
 
