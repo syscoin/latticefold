@@ -77,9 +77,13 @@ pub struct SP1R1CSStats {
     pub digest: [u8; 32],
 }
 
-/// Read just the header/stats from an R1CS file (fast, no matrix loading).
+/// Read just the header/stats from an R1CS file (fast, reads only 72 bytes).
 pub fn read_sp1_r1cs_stats(path: &str) -> std::io::Result<SP1R1CSStats> {
-    let header_bytes = std::fs::read(path)?;
+    use std::io::Read;
+    
+    let mut file = std::fs::File::open(path)?;
+    let mut header_bytes = [0u8; 72];
+    file.read_exact(&mut header_bytes)?;
     
     // Use a dummy field type just for header parsing
     #[derive(Clone)]
