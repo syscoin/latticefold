@@ -7,7 +7,6 @@
 
 use crate::sp1_r1cs_loader::{SP1R1CS, FieldFromU64, SparseRow as LoaderSparseRow};
 use ark_ff::PrimeField;
-use rayon::prelude::*;
 use stark_rings::{OverField, Zq};
 use stark_rings_linalg::SparseMatrix;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};

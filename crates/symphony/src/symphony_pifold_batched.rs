@@ -543,10 +543,10 @@ where
                 U[i].push(acc);
             }
         }
-        had_u.push(U);
         for x in &U[0] { transcript.absorb_field_element(x); }
         for x in &U[1] { transcript.absorb_field_element(x); }
         for x in &U[2] { transcript.absorb_field_element(x); }
+        had_u.push(U);
     }
 
     // ys is no longer needed past here; free it before monomial-side work.
@@ -562,8 +562,8 @@ where
             let mle = DenseMultilinearExtension::from_evaluations_slice(g_nvars, &g_all[inst_idx][dig]);
             b_inst.push(mle.evaluate(&r_poly_mon).unwrap());
         }
-        mon_b.push(b_inst);
         transcript.absorb_slice(&b_inst);
+        mon_b.push(b_inst);
     }
 
     Ok(PiFoldProverOutput {
@@ -1087,7 +1087,7 @@ where
 
     // If we don't have auxiliary transcript messages, we will recompute them from witness openings,
     // which requires a consistent witness length to define m_J.
-    let (n_f, blocks) = if aux.is_none() {
+    let (_n_f, blocks) = if aux.is_none() {
         let n_f = cms_openings[0].len();
         if n_f == 0 || n_f % rg_params.l_h != 0 {
             return Err("PiFold: invalid witness length".to_string());
