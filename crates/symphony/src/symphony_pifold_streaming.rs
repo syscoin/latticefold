@@ -314,17 +314,96 @@ where
         .collect::<Vec<_>>();
 
     let reps = m / m_j;
-    // IMPORTANT: Do NOT cache all projected digits (size = m_j * d * k_g).
-    // On large chunks this can be hundreds of MB per chunk and explodes at high MAX_CONCURRENT.
-    // We recompute projected digits on-the-fly per row instead.
 
-    let t_mon_build = Instant::now();
+    // Precompute projected digits once per instance.
+    // Layout: digits[(row * d + col) * k_g + dig] where
+    // - row ∈ [0, m_j)
+    // - col ∈ [0, d)
+    // - dig ∈ [0, k_g)
+    let t_digits = Instant::now();
+    let mut proj_digits_by_inst: Vec<Arc<Vec<R::BaseRing>>> = Vec::with_capacity(ell);
     for inst_idx in 0..ell {
         let f: &[R] = &witnesses[inst_idx];
         let J = &Js[inst_idx];
+        let k_g = rg_params.k_g;
         let lambda_pj = rg_params.lambda_pj;
         let l_h = rg_params.l_h;
         let d_prime = rg_params.d_prime;
+
+        let mut digits_flat = vec![R::BaseRing::ZERO; m_j * d * k_g];
+
+        #[cfg(feature = "parallel")]
+        {
+            use ark_std::cfg_into_iter;
+            let out_ptr = digits_flat.as_mut_ptr() as usize;
+            cfg_into_iter!(0..m_j).for_each(|out_row| {
+                let i = out_row % lambda_pj;
+                let b = out_row / lambda_pj;
+                let mut h_row = vec![R::BaseRing::ZERO; d];
+                for t in 0..l_h {
+                    let in_row = b * l_h + t;
+                    if in_row >= f.len() {
+                        continue;
+                    }
+                    let coef = J[i][t];
+                    let coeffs = f[in_row].coeffs();
+                    for col in 0..d {
+                        h_row[col] += coef * coeffs[col];
+                    }
+                }
+                let digits = h_row.decompose_to_vec(d_prime, k_g);
+                for col in 0..d {
+                    for dig in 0..k_g {
+                        let idx = (out_row * d + col) * k_g + dig;
+                        unsafe {
+                            *(out_ptr as *mut R::BaseRing).add(idx) = digits[col][dig];
+                        }
+                    }
+                }
+            });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for out_row in 0..m_j {
+                let i = out_row % lambda_pj;
+                let b = out_row / lambda_pj;
+                let mut h_row = vec![R::BaseRing::ZERO; d];
+                for t in 0..l_h {
+                    let in_row = b * l_h + t;
+                    if in_row >= f.len() {
+                        continue;
+                    }
+                    let coef = J[i][t];
+                    let coeffs = f[in_row].coeffs();
+                    for col in 0..d {
+                        h_row[col] += coef * coeffs[col];
+                    }
+                }
+                let digits = h_row.decompose_to_vec(d_prime, k_g);
+                for col in 0..d {
+                    for dig in 0..k_g {
+                        digits_flat[(out_row * d + col) * k_g + dig] = digits[col][dig];
+                    }
+                }
+            }
+        }
+
+        proj_digits_by_inst.push(Arc::new(digits_flat));
+    }
+    if prof {
+        eprintln!(
+            "[PiFold streaming] precomputed proj digits in {:?} (ell={}, m_j={}, d={}, k_g={})",
+            t_digits.elapsed(),
+            ell,
+            m_j,
+            d,
+            rg_params.k_g
+        );
+    }
+
+    let t_mon_build = Instant::now();
+    for inst_idx in 0..ell {
+        let digits_flat = proj_digits_by_inst[inst_idx].clone();
 
         for dig in 0..rg_params.k_g {
             let (c, beta_i, _a) = &cba_all[inst_idx][dig];
@@ -339,24 +418,10 @@ where
                 let out_ptr = mj_compact.as_mut_ptr() as usize;
                 let beta = *beta_i;
                 let dig_local = dig;
+                let digits_flat = digits_flat.clone();
                 cfg_into_iter!(0..m_j).for_each(|out_row| {
-                    let i = out_row % lambda_pj;
-                    let b = out_row / lambda_pj;
-        let mut h_row = vec![R::BaseRing::ZERO; d];
-                    for t in 0..l_h {
-                        let in_row = b * l_h + t;
-            if in_row >= f.len() {
-                continue;
-            }
-            let coef = J[i][t];
-            let coeffs = f[in_row].coeffs();
-            for col in 0..d {
-                h_row[col] += coef * coeffs[col];
-            }
-        }
-                    let digits = h_row.decompose_to_vec(d_prime, rg_params.k_g);
                     for col in 0..d {
-                        let digit = digits[col][dig_local];
+                        let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig_local];
                         let g = exp::<R>(digit).expect("Exp failed");
                         let mjv = ev(&g, beta);
                         let idx = col * m_j + out_row;
@@ -368,24 +433,9 @@ where
             }
             #[cfg(not(feature = "parallel"))]
             {
-            for out_row in 0..m_j {
-                    let i = out_row % lambda_pj;
-                    let b = out_row / lambda_pj;
-                    let mut h_row = vec![R::BaseRing::ZERO; d];
-                    for t in 0..l_h {
-                        let in_row = b * l_h + t;
-                        if in_row >= f.len() {
-                            continue;
-                        }
-                        let coef = J[i][t];
-                        let coeffs = f[in_row].coeffs();
-                        for col in 0..d {
-                            h_row[col] += coef * coeffs[col];
-                        }
-                    }
-                    let digits = h_row.decompose_to_vec(d_prime, rg_params.k_g);
-                for col in 0..d {
-                        let digit = digits[col][dig];
+                for out_row in 0..m_j {
+                    for col in 0..d {
+                        let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
                         let g = exp::<R>(digit).expect("Exp failed");
                         let mjv = ev(&g, *beta_i);
                         mj_compact[col * m_j + out_row] = mjv;
@@ -503,31 +553,13 @@ where
             }
             for inst_idx in 0..ell {
                 let b = beta_cts[inst_idx];
-                let f: &[R] = &witnesses[inst_idx];
-                let J = &Js[inst_idx];
-                let lambda_pj = rg_params.lambda_pj;
-                let l_h = rg_params.l_h;
-                let d_prime = rg_params.d_prime;
+                let digits_flat = &proj_digits_by_inst[inst_idx];
                 for row in 0..m_j {
                     let w = ts_r[row];
-                    let i = row % lambda_pj;
-                    let bb = row / lambda_pj;
-                    let mut h_row = vec![R::BaseRing::ZERO; d];
-                    for t in 0..l_h {
-                        let in_row = bb * l_h + t;
-                        if in_row >= f.len() {
-                            continue;
-                        }
-                        let coef = J[i][t];
-                        let coeffs = f[in_row].coeffs();
-                        for col in 0..d {
-                            h_row[col] += coef * coeffs[col];
-                        }
-                    }
-                    let digits = h_row.decompose_to_vec(d_prime, rg_params.k_g);
                     for col in 0..d {
                         for dig in 0..rg_params.k_g {
-                            v_digits_folded[dig][col] += b * digits[col][dig] * w;
+                            let digit = digits_flat[(row * d + col) * rg_params.k_g + dig];
+                            v_digits_folded[dig][col] += b * digit * w;
                         }
                     }
                 }
@@ -547,7 +579,7 @@ where
             "[PiFold streaming] sumchecks done in {:?} (log_m={}, g_nvars={}, rounds={})",
             t_sumcheck.elapsed(),
             log_m,
-        g_nvars,
+            g_nvars,
             rounds
         );
     }
@@ -609,36 +641,18 @@ where
     let mut mon_b: Vec<Vec<R>> = Vec::with_capacity(ell);
     for inst_idx in 0..ell {
         let mut b_inst = Vec::with_capacity(rg_params.k_g);
-        let f: &[R] = &witnesses[inst_idx];
-        let J = &Js[inst_idx];
-        let lambda_pj = rg_params.lambda_pj;
-        let l_h = rg_params.l_h;
-        let d_prime = rg_params.d_prime;
+        let digits_flat = proj_digits_by_inst[inst_idx].clone();
         for dig in 0..rg_params.k_g {
             #[cfg(feature = "parallel")]
             let acc = {
                 use ark_std::cfg_into_iter;
                 let dig_local = dig;
+                let digits_flat = digits_flat.clone();
                 cfg_into_iter!(0..m_j)
                     .map(|out_row| {
-                        let i = out_row % lambda_pj;
-                        let b = out_row / lambda_pj;
-                        let mut h_row = vec![R::BaseRing::ZERO; d];
-                        for t in 0..l_h {
-                            let in_row = b * l_h + t;
-                            if in_row >= f.len() {
-                                continue;
-                            }
-                            let coef = J[i][t];
-                            let coeffs = f[in_row].coeffs();
-                            for col in 0..d {
-                                h_row[col] += coef * coeffs[col];
-                            }
-                        }
-                        let digits = h_row.decompose_to_vec(d_prime, rg_params.k_g);
                         let mut local = R::ZERO;
                         for col in 0..d {
-                            let digit = digits[col][dig_local];
+                            let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig_local];
                             let g = exp::<R>(digit).expect("Exp failed");
                             for rep in 0..reps {
                                 let r = out_row + rep * m_j;
@@ -652,33 +666,18 @@ where
             };
             #[cfg(not(feature = "parallel"))]
             let acc = {
-            let mut acc = R::ZERO;
-            for out_row in 0..m_j {
-                    let i = out_row % lambda_pj;
-                    let b = out_row / lambda_pj;
-                    let mut h_row = vec![R::BaseRing::ZERO; d];
-                    for t in 0..l_h {
-                        let in_row = b * l_h + t;
-                        if in_row >= f.len() {
-                            continue;
-                        }
-                        let coef = J[i][t];
-                        let coeffs = f[in_row].coeffs();
-                        for col in 0..d {
-                            h_row[col] += coef * coeffs[col];
-                        }
-                    }
-                    let digits = h_row.decompose_to_vec(d_prime, rg_params.k_g);
-                for col in 0..d {
-                        let digit = digits[col][dig];
+                let mut acc = R::ZERO;
+                for out_row in 0..m_j {
+                    for col in 0..d {
+                        let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
                         let g = exp::<R>(digit).expect("Exp failed");
-                    for rep in 0..reps {
-                        let r = out_row + rep * m_j;
-                        let idx = col * m + r;
-                        acc += R::from(ts_r_mon[idx]) * g;
+                        for rep in 0..reps {
+                            let r = out_row + rep * m_j;
+                            let idx = col * m + r;
+                            acc += R::from(ts_r_mon[idx]) * g;
+                        }
                     }
                 }
-            }
                 acc
             };
             b_inst.push(acc);
