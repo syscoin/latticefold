@@ -6,7 +6,7 @@
 
 use ark_std::One;
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
-use latticefold_plus::{
+use symphony::{
     symphony_cm::{prove_rg_fs, verify_rg, verify_rg_fs_bound},
     rp_rgchk::RPParams,
 };

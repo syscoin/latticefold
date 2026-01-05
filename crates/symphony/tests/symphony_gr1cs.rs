@@ -2,7 +2,7 @@
 
 use ark_std::One;
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
-use latticefold_plus::{
+use symphony::{
     rp_rgchk::RPParams,
     symphony_gr1cs::{
         prove_pi_gr1cs,

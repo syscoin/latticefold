@@ -2,7 +2,7 @@
 
 use ark_std::One;
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
-use latticefold_plus::{
+use symphony::{
     public_coin_transcript::FixedTranscript,
     recording_transcript::RecordingTranscriptRef,
     rp_rgchk::{verify_pi_rg_and_output, RPParams, RPRangeProver},

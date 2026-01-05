@@ -2,7 +2,7 @@
 
 use ark_std::One;
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
-use latticefold_plus::{symphony_had::*, transcript::PoseidonTranscript};
+use symphony::{symphony_had::*, transcript::PoseidonTranscript};
 use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as R;
 use stark_rings_linalg::SparseMatrix;
 

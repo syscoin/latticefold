@@ -3,9 +3,9 @@
 
 use ark_std::One;
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
-use latticefold_plus::symphony_coins::derive_beta_chi;
+use symphony::symphony_coins::derive_beta_chi;
 use latticefold::transcript::Transcript;
-use latticefold_plus::{
+use symphony::{
     rp_rgchk::RPParams,
     symphony_pifold_batched::{
         prove_pi_fold_batched_sumcheck_fs,
@@ -67,7 +67,7 @@ fn test_pifold_batched_sumcheck_two_instances() {
 
     // Paper-faithful FS verification: challenges are derived by hashing the transcript (Poseidon).
     let (folded_inst, _folded_bat) =
-        latticefold_plus::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs::<R, PC>(
+        symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs::<R, PC>(
         [&m1, &m2, &m3],
         &[cm0.clone(), cm1.clone()],
         &proof,
@@ -78,7 +78,7 @@ fn test_pifold_batched_sumcheck_two_instances() {
     .unwrap();
 
     // Recompute β from the FS coin stream.
-    let mut ts = latticefold_plus::public_coin_transcript::FixedTranscript::<R>::new_with_coins_and_events(
+    let mut ts = symphony::public_coin_transcript::FixedTranscript::<R>::new_with_coins_and_events(
         proof.coins.challenges.clone(),
         proof.coins.bytes.clone(),
         proof.coins.events.clone(),
@@ -155,7 +155,7 @@ fn test_pifold_batched_aux_witness_path_matches() {
 
     let aux = out.aux;
 
-    let mut ts = latticefold_plus::transcript::PoseidonTranscript::<R>::empty::<PC>();
+    let mut ts = symphony::transcript::PoseidonTranscript::<R>::empty::<PC>();
     ts.absorb_field_element(&<R as stark_rings::PolyRing>::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
     // Match the library Poseidon-FS transcript prefix (public statement binding, empty here).
     ts.absorb_field_element(&<R as stark_rings::PolyRing>::BaseRing::from(0x4c465053_5055424cu128)); // "LFPS_PUBL"
@@ -232,7 +232,7 @@ fn test_pifold_batched_aux_witness_rejects_tamper() {
     // u1*u2-u3. We therefore tamper U2.
     aux.had_u[0][1][0] += <R as stark_rings::PolyRing>::BaseRing::ONE;
 
-    let mut ts = latticefold_plus::transcript::PoseidonTranscript::<R>::empty::<PC>();
+    let mut ts = symphony::transcript::PoseidonTranscript::<R>::empty::<PC>();
     ts.absorb_field_element(&<R as stark_rings::PolyRing>::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
     // Match the library Poseidon-FS transcript prefix (public statement binding, empty here).
     ts.absorb_field_element(&<R as stark_rings::PolyRing>::BaseRing::from(0x4c465053_5055424cu128)); // "LFPS_PUBL"

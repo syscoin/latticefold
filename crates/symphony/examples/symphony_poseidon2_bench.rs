@@ -533,7 +533,7 @@ where
 {
     use ark_ff::{BigInteger, Field, PrimeField};
     use latticefold::commitment::AjtaiCommitmentScheme;
-    use latticefold_plus::{
+    use symphony::{
         rp_rgchk::RPParams,
         symphony_open::MultiAjtaiOpenVerifier,
         symphony_pifold_batched::prove_pi_fold_batched_sumcheck_fs,
@@ -551,6 +551,8 @@ where
     // Paper-style R1CS witness decomposition (k_cs digits base 2^4), expanding the witness and the
     // linear maps so the Hadamard relation is unchanged. This is the Table 1 instantiation setup
     // and is enabled unconditionally in this benchmark.
+    // R1CS witness decomposition always enabled in this benchmark
+    let decomp = true;
     println!("  R1CS witness decomposition: ENABLED (k_cs=16, b=2^4)");
     let (m1, m2, m3, witness) =
         r1cs_decompose_witness_and_expand_matrices::<R>(&m1, &m2, &m3, &witness, 16, 16);

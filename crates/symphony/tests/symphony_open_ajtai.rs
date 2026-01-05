@@ -1,7 +1,7 @@
 #![cfg(feature = "symphony")]
 
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
-use latticefold_plus::{
+use symphony::{
     rp_rgchk::RPParams,
     symphony_open::AjtaiOpenVerifier,
     symphony_pifold_batched::{
@@ -11,7 +11,7 @@ use latticefold_plus::{
 };
 use latticefold::commitment::AjtaiCommitmentScheme;
 use latticefold::transcript::Transcript;
-use latticefold_plus::public_coin_transcript::FixedTranscript;
+use symphony::public_coin_transcript::FixedTranscript;
 use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing, Ring};
 use stark_rings_linalg::{Matrix, SparseMatrix};
 

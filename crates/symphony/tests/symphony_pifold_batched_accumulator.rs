@@ -3,9 +3,9 @@
 
 use ark_std::One;
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
-use latticefold_plus::symphony_coins::derive_beta_chi;
+use symphony::symphony_coins::derive_beta_chi;
 use latticefold::transcript::Transcript;
-use latticefold_plus::{
+use symphony::{
     rp_rgchk::RPParams,
     symphony_pifold_batched::{
         prove_pi_fold_batched_sumcheck_fs,
@@ -75,7 +75,7 @@ fn test_pifold_batched_accumulator_two_steps() {
     let pf1 = pf1_out.proof;
 
     // Recompute β for step 1 from the FS coin stream.
-    let mut ts1 = latticefold_plus::public_coin_transcript::FixedTranscript::<R>::new_with_coins_and_events(
+    let mut ts1 = symphony::public_coin_transcript::FixedTranscript::<R>::new_with_coins_and_events(
         pf1.coins.challenges.clone(),
         pf1.coins.bytes.clone(),
         pf1.coins.events.clone(),
@@ -85,7 +85,7 @@ fn test_pifold_batched_accumulator_two_steps() {
     let beta10 = R::from(beta1_cts[0]);
     let beta11 = R::from(beta1_cts[1]);
 
-    let (folded1, _bat1) = latticefold_plus::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs::<R, PC>(
+    let (folded1, _bat1) = symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs::<R, PC>(
         [&m1, &m2, &m3],
         &[cm_acc.clone(), cm1.clone()],
         &pf1,
@@ -117,7 +117,7 @@ fn test_pifold_batched_accumulator_two_steps() {
     let pf2 = pf2_out.proof;
 
     // Recompute β for step 2 from the FS coin stream.
-    let mut ts2 = latticefold_plus::public_coin_transcript::FixedTranscript::<R>::new_with_coins_and_events(
+    let mut ts2 = symphony::public_coin_transcript::FixedTranscript::<R>::new_with_coins_and_events(
         pf2.coins.challenges.clone(),
         pf2.coins.bytes.clone(),
         pf2.coins.events.clone(),
@@ -127,7 +127,7 @@ fn test_pifold_batched_accumulator_two_steps() {
     let beta20 = R::from(beta2_cts[0]);
     let beta21 = R::from(beta2_cts[1]);
 
-    let (folded2, _bat2) = latticefold_plus::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs::<R, PC>(
+    let (folded2, _bat2) = symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs::<R, PC>(
         [&m1, &m2, &m3],
         &[cm_acc.clone(), cm2.clone()],
         &pf2,

@@ -10,7 +10,7 @@ use std::time::Instant;
 fn main() {
     use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
     use latticefold::commitment::AjtaiCommitmentScheme;
-    use latticefold_plus::{
+    use symphony::{
         rp_rgchk::RPParams,
         symphony_open::MultiAjtaiOpenVerifier,
         symphony_pifold_batched::prove_pi_fold_batched_sumcheck_fs,
@@ -103,7 +103,7 @@ fn main() {
         let verify_time = verify_start.elapsed();
 
         // Sanity: `TrivialRo` exists just to show how R_WE would be checked; we don’t benchmark it.
-        let _: Result<(), String> = <TrivialRo as latticefold_plus::symphony_we_relation::ReducedRelation<R>>::check(
+        let _: Result<(), String> = <TrivialRo as symphony::symphony_we_relation::ReducedRelation<R>>::check(
             &_out_folded,
             &(),
         );

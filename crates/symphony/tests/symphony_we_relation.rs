@@ -3,7 +3,7 @@
 use ark_std::One;
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
 use latticefold::commitment::AjtaiCommitmentScheme;
-use latticefold_plus::{
+use symphony::{
     rp_rgchk::RPParams,
     symphony_open::MultiAjtaiOpenVerifier,
     symphony_pifold_batched::{prove_pi_fold_batched_sumcheck_fs},
@@ -21,7 +21,7 @@ where
     type Witness = Vec<R>;
 
     fn check(
-        public: &latticefold_plus::symphony_we_relation::FoldedOutput<R>,
+        public: &symphony::symphony_we_relation::FoldedOutput<R>,
         witness: &Self::Witness,
     ) -> Result<(), String> {
         if public.folded_inst.c != *witness {
@@ -94,11 +94,11 @@ fn test_r_we_conjunction_ok() {
 
     // Compute expected folded output commitment via the reference verifier (no CP commitments).
     let (folded_inst, _folded_bat) =
-        latticefold_plus::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs::<R, PC>(
+        symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs::<R, PC>(
             [&m1, &m2, &m3],
             &[cm0.clone(), cm1.clone()],
             &proof,
-            &latticefold_plus::symphony_open::NoOpen,
+            &symphony::symphony_open::NoOpen,
             &[f0.clone(), f1.clone()],
             &[],
         )
@@ -260,7 +260,7 @@ fn test_r_cp_poseidon_fs_rejects_tampered_commitment() {
     cm0[0] += R::ONE;
 
     let err =
-        latticefold_plus::symphony_we_relation::check_r_cp_poseidon_fs::<R, PC>(
+        symphony::symphony_we_relation::check_r_cp_poseidon_fs::<R, PC>(
             [&m1, &m2, &m3],
             &[cm0, cm1],
             &proof,
@@ -338,7 +338,7 @@ fn test_r_cp_poseidon_fs_rejects_tampered_cfs_commitment() {
         .with_scheme("cfs_had_u", scheme_had)
         .with_scheme("cfs_mon_b", scheme_mon);
 
-    let err = latticefold_plus::symphony_we_relation::check_r_cp_poseidon_fs::<R, PC>(
+    let err = symphony::symphony_we_relation::check_r_cp_poseidon_fs::<R, PC>(
         [&m1, &m2, &m3],
         &[cm0, cm1],
         &proof,
@@ -414,11 +414,11 @@ fn test_r_we_nonvacuous_had_identity_passes() {
 
     // Compute expected folded commitment via reference verifier (no CP commitments).
     let (folded_inst, _bat) =
-        latticefold_plus::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs::<R, PC>(
+        symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs::<R, PC>(
             [&m1, &m2, &m3],
             &[cm0.clone(), cm1.clone()],
             &proof,
-            &latticefold_plus::symphony_open::NoOpen,
+            &symphony::symphony_open::NoOpen,
             &[f0, f1],
             &[],
         )
@@ -488,7 +488,7 @@ fn test_r_we_nonvacuous_had_identity_rejects_non_idempotent_witness() {
         .with_scheme("cfs_mon_b", scheme_mon);
 
     // Even with valid cfs commitments/openings, Π_had should reject because the underlying had relation is false.
-    let err = latticefold_plus::symphony_we_relation::check_r_cp_poseidon_fs::<R, PC>(
+    let err = symphony::symphony_we_relation::check_r_cp_poseidon_fs::<R, PC>(
         [&m1, &m2, &m3],
         &[cm0, cm1],
         &out.proof,

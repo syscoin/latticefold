@@ -2,7 +2,7 @@
 
 use ark_std::One;
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
-use latticefold_plus::{
+use symphony::{
     public_coin_transcript::FixedTranscript,
     recording_transcript::RecordingTranscriptRef,
     rp_rgchk::{
@@ -125,12 +125,12 @@ fn test_pi_rg_folding_preserves_auxj_lin_relation_with_explicit_witness() {
     }
 
     // And ensure our fold helper matches the same folded (c,r,v) shape.
-    let inst0 = latticefold_plus::symphony_fold::SymphonyInstance {
+    let inst0 = symphony::symphony_fold::SymphonyInstance {
         c: cm0,
         r: r0.clone(),
         v: v0_rq,
     };
-    let inst1 = latticefold_plus::symphony_fold::SymphonyInstance {
+    let inst1 = symphony::symphony_fold::SymphonyInstance {
         c: cm1,
         r: r1,
         v: v1_rq,
