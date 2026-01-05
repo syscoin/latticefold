@@ -237,8 +237,14 @@ where
                             let base = col * *m_j;
                             let out_base = col * new_mj;
                             for i in 0..new_mj {
-                                let a = evals[base + (i << 1)];
-                                let b = evals[base + (i << 1) | 1];
+                                let mut a = evals[base + (i << 1)];
+                                let mut b = evals[base + (i << 1) | 1];
+                                // IMPORTANT: if this MLE represents vertex-wise squares, we must
+                                // fix variables on the squared values (not square after fixing).
+                                if *square {
+                                    a *= a;
+                                    b *= b;
+                                }
                                 new_evals[out_base + i] = one_minus * a + r0 * b;
                             }
                         }
@@ -248,17 +254,22 @@ where
                             m: new_m,
                             m_j: new_mj,
                             d: *d,
-                            square: *square,
+                            square: false,
                         }
                     } else {
                         // Independent of this row bit: combining equal values yields same table.
                         StreamingMleEnum::PeriodicBaseScalarVec {
-                            evals: evals.clone(),
+                            evals: if *square {
+                                // Materialize squared values once so future fixes are correct.
+                                Arc::new(evals.iter().map(|x| (*x) * (*x)).collect())
+                            } else {
+                                evals.clone()
+                            },
                             num_vars: num_vars - 1,
                             m: new_m,
                             m_j: *m_j,
                             d: *d,
-                            square: *square,
+                            square: false,
                         }
                     }
                 } else {
@@ -266,9 +277,7 @@ where
                     if *d == 1 {
                         // Fully fixed after this; treat as Dense of length 1.
                         let mut v = evals[0];
-                        if *square {
-                            v *= v;
-                        }
+                        if *square { v *= v; }
                         StreamingMleEnum::base_scalar_vec(0, Arc::new(vec![v]))
                     } else {
                         let new_d = *d / 2;
@@ -276,8 +285,12 @@ where
                         // m_j should be 1 once m==1 in our use-case, but keep it generic.
                         for col in 0..new_d {
                             for row in 0..*m_j {
-                                let a = evals[(col << 1) * *m_j + row];
-                                let b = evals[((col << 1) | 1) * *m_j + row];
+                                let mut a = evals[(col << 1) * *m_j + row];
+                                let mut b = evals[((col << 1) | 1) * *m_j + row];
+                                if *square {
+                                    a *= a;
+                                    b *= b;
+                                }
                                 new_evals[col * *m_j + row] = one_minus * a + r0 * b;
                             }
                         }
@@ -287,7 +300,7 @@ where
                             m: *m,
                             m_j: *m_j,
                             d: new_d,
-                            square: *square,
+                            square: false,
                         }
                     }
                 }
