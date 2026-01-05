@@ -110,11 +110,13 @@ impl<R: OverField> StreamingMle<R> for SparseMatrixMle<R> {
 /// eq(bits(index), r) = prod_i (bits_i * r_i + (1-bits_i) * (1-r_i))
 pub struct EqStreamingMle<R: OverField> {
     r: Vec<R>,
+    one_minus_r: Vec<R>,
 }
 
 impl<R: OverField> EqStreamingMle<R> {
     pub fn new(r: Vec<R>) -> Self {
-        Self { r }
+        let one_minus_r = r.iter().copied().map(|x| R::ONE - x).collect();
+        Self { r, one_minus_r }
     }
 }
 
@@ -125,13 +127,10 @@ impl<R: OverField> StreamingMle<R> for EqStreamingMle<R> {
 
     fn eval_at_index(&self, index: usize) -> R {
         let mut prod = R::ONE;
-        for (i, r_i) in self.r.iter().enumerate() {
+        // Slightly faster than recomputing (1 - r_i) each time.
+        for i in 0..self.r.len() {
             let bit = ((index >> i) & 1) == 1;
-            if bit {
-                prod *= *r_i;
-            } else {
-                prod *= R::ONE - *r_i;
-            }
+            prod *= if bit { self.r[i] } else { self.one_minus_r[i] };
         }
         prod
     }
@@ -141,7 +140,7 @@ impl<R: OverField> StreamingMle<R> for EqStreamingMle<R> {
         //        = ((1-r)*(1-r[0]) + r*r[0]) * eq(b, r[1:])
         //        = eq(r, r[0]) * eq(b, r[1:])
         // So we can just prepend the eq factor and use remaining r values.
-        let eq_factor = (R::ONE - r) * (R::ONE - self.r[0]) + r * self.r[0];
+        let eq_factor = (R::ONE - r) * self.one_minus_r[0] + r * self.r[0];
         let new_r: Vec<R> = self.r[1..].to_vec();
 
         if new_r.is_empty() {
