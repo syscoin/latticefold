@@ -10,7 +10,7 @@
 //! - S-box: x^7 (computed as x² → x³ → x⁶ → x⁷, 4 mult constraints per S-box)
 //!
 //! Run:
-//! - `cargo run -p latticefold-plus --example symphony_poseidon2_bench --release --features symphony`
+//! - `cargo run -p symphony --example symphony_poseidon2_bench --release
 
 use std::time::Instant;
 use ark_ff::PrimeField;
