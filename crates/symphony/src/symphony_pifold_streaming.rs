@@ -24,17 +24,14 @@ use stark_rings::{
     exp, CoeffRing, OverField, Ring, Zq,
 };
 use stark_rings_linalg::SparseMatrix;
-use stark_rings_poly::mle::DenseMultilinearExtension;
-
 use cyclotomic_rings::rings::GetPoseidonParams;
 use latticefold::{
     commitment::AjtaiCommitmentScheme,
     transcript::Transcript,
-    utils::sumcheck::utils::build_eq_x_r,
 };
 
 use crate::recording_transcript::RecordingTranscriptRef;
-use crate::mle_oracle::{EqStreamingMle, SparseMatrixMle};
+use crate::mle_oracle::{BaseScalarVecMle, EqStreamingMle, SparseMatrixMle};
 use crate::rp_rgchk::RPParams;
 use crate::streaming_sumcheck::{StreamingMle, StreamingProof, StreamingSumcheck};
 use crate::symphony_cm::SymphonyCoins;
@@ -300,11 +297,13 @@ where
     };
 
     // -----------------
-    // Monomial MLEs (still dense - complex digit structure)
+    // Monomial MLEs (streaming/compact)
+    //
+    // Critical: avoid materializing the huge dense eq(c) MLE tables (size = m*d ring elements).
+    // We keep m_j/m' as base-ring scalars (compact), and make eq(c) fully streaming.
     // -----------------
     let mon_mles_per = 3 * rg_params.k_g;
-    let mut mles_mon_batched: Vec<DenseMultilinearExtension<R>> =
-        Vec::with_capacity(ell * mon_mles_per);
+    let mut mles_mon: Vec<Box<dyn StreamingMle<R>>> = Vec::with_capacity(ell * mon_mles_per);
 
     let alphas_ring = cba_all
         .iter()
@@ -337,34 +336,37 @@ where
         let J = &Js[inst_idx];
 
         for dig in 0..rg_params.k_g {
-            let (_c, beta_i, _a) = &cba_all[inst_idx][dig];
+            let (c, beta_i, _a) = &cba_all[inst_idx][dig];
 
-            let mut m_j_evals: Vec<R> = vec![R::ZERO; g_len];
-            let mut m_prime: Vec<R> = vec![R::ZERO; g_len];
+            // Compact m_j/m' as base-ring scalars.
+            let mut m_j_evals: Vec<R::BaseRing> = vec![R::BaseRing::ZERO; g_len];
+            let mut m_prime: Vec<R::BaseRing> = vec![R::BaseRing::ZERO; g_len];
 
             for out_row in 0..m_j {
                 let digits = proj_row_digits(f, J, out_row);
                 for col in 0..d {
                     let g = exp::<R>(digits[col][dig]).expect("Exp failed");
-                    let mj_ring = R::from(ev(&g, *beta_i));
-                    let mp_ring = mj_ring * mj_ring;
+                    let mj = ev(&g, *beta_i);
+                    let mp = mj * mj;
                     for rep in 0..reps {
                         let r = out_row + rep * m_j;
                         let idx = col * m + r;
-                        m_j_evals[idx] = mj_ring;
-                        m_prime[idx] = mp_ring;
+                        m_j_evals[idx] = mj;
+                        m_prime[idx] = mp;
                     }
                 }
             }
 
-            mles_mon_batched.push(DenseMultilinearExtension::from_evaluations_vec(
-                g_nvars, m_j_evals,
-            ));
-            mles_mon_batched.push(DenseMultilinearExtension::from_evaluations_vec(
-                g_nvars, m_prime,
-            ));
-            let eq = build_eq_x_r(&cba_all[inst_idx][dig].0).unwrap();
-            mles_mon_batched.push(eq);
+            mles_mon.push(Box::new(BaseScalarVecMle::<R>::new(
+                g_nvars,
+                Arc::new(m_j_evals),
+            )));
+            mles_mon.push(Box::new(BaseScalarVecMle::<R>::new(
+                g_nvars,
+                Arc::new(m_prime),
+            )));
+            // eq(c) as streaming MLE (no 2^n table).
+            mles_mon.push(Box::new(EqStreamingMle::new(c.clone())));
         }
     }
 
@@ -395,9 +397,6 @@ where
     // -----------------
     // Run sumchecks with SHARED challenges (must match verifier schedule)
     // -----------------
-    use latticefold::utils::sumcheck::verifier::VerifierMsg;
-    use latticefold::utils::sumcheck::IPForMLSumcheck;
-
     let hook_round = log2(m_j.next_power_of_two()) as usize;
     let mut v_digits_folded: Vec<Vec<R::BaseRing>> =
         vec![vec![R::BaseRing::ZERO; d]; rg_params.k_g];
@@ -409,17 +408,13 @@ where
     transcript.absorb(&R::from(3u128));
 
     let mut had_state = StreamingSumcheck::prover_init(mles_had, log_m, 3);
-    let mut mon_state = IPForMLSumcheck::<R, crate::transcript::PoseidonTranscript<R>>::prover_init(
-        mles_mon_batched,
-        g_nvars,
-        3,
-    );
+    let mut mon_state = StreamingSumcheck::prover_init(mles_mon, g_nvars, 3);
 
     let mut had_msgs = Vec::with_capacity(log_m);
     let mut mon_msgs = Vec::with_capacity(g_nvars);
     let mut sampled: Vec<R::BaseRing> = Vec::with_capacity(log_m.max(g_nvars));
     let mut v_msg_had: Option<R::BaseRing> = None;
-    let mut v_msg_mon: Option<VerifierMsg<R>> = None;
+    let mut v_msg_mon: Option<R::BaseRing> = None;
 
     let rounds = log_m.max(g_nvars);
     for round_idx in 0..rounds {
@@ -430,11 +425,7 @@ where
             had_msgs.push(pm_had);
         }
         if round_idx < g_nvars {
-            let pm_mon = IPForMLSumcheck::<R, crate::transcript::PoseidonTranscript<R>>::prove_round(
-                &mut mon_state,
-                &v_msg_mon,
-                &comb_mon,
-            );
+            let pm_mon = StreamingSumcheck::prove_round(&mut mon_state, v_msg_mon, &comb_mon);
             transcript.absorb_slice(&pm_mon.evaluations);
             mon_msgs.push(pm_mon);
         }
@@ -475,7 +466,7 @@ where
         }
 
         v_msg_had = Some(r);
-        v_msg_mon = Some(VerifierMsg { randomness: r });
+        v_msg_mon = Some(r);
     }
 
     // Final randomness vectors for each sumcheck (same convention as latticefold sumcheck state)
@@ -485,7 +476,7 @@ where
     mon_state.randomness = mon_rand.clone();
 
     let had_sumcheck = convert_streaming_proof(&StreamingProof(had_msgs));
-    let mon_sumcheck = latticefold::utils::sumcheck::Proof::new(mon_msgs);
+    let mon_sumcheck = convert_streaming_proof(&StreamingProof(mon_msgs));
 
     // -----------------
     // Compute aux witness

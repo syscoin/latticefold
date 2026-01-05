@@ -16,6 +16,36 @@ use stark_rings_linalg::SparseMatrix;
 use crate::streaming_sumcheck::StreamingMle;
 use crate::streaming_sumcheck::FixedStreamingMle;
 
+/// Streaming MLE backed by a base-ring scalar evaluation vector.
+///
+/// Stores `evals[index]` in the base ring and lifts to the ambient ring via `R::from`.
+/// This is useful when the polynomial is known to be *constant-coefficient* in the ring.
+#[derive(Clone)]
+pub struct BaseScalarVecMle<R: OverField> {
+    evals: Arc<Vec<R::BaseRing>>,
+    num_vars: usize,
+}
+
+impl<R: OverField> BaseScalarVecMle<R> {
+    pub fn new(num_vars: usize, evals: Arc<Vec<R::BaseRing>>) -> Self {
+        Self { evals, num_vars }
+    }
+}
+
+impl<R: OverField> StreamingMle<R> for BaseScalarVecMle<R> {
+    fn num_vars(&self) -> usize {
+        self.num_vars
+    }
+
+    fn eval_at_index(&self, index: usize) -> R {
+        R::from(self.evals[index])
+    }
+
+    fn fix_variable(&self, r: R) -> Box<dyn StreamingMle<R>> {
+        Box::new(FixedStreamingMle::new(Box::new(self.clone()), r))
+    }
+}
+
 // ============================================================================
 // Hadamard-side Streaming MLEs
 // ============================================================================
