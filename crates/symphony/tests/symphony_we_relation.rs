@@ -73,7 +73,7 @@ fn test_r_we_conjunction_ok() {
     let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],
         &[cm0.clone(), cm1.clone()],
-        &[f0.clone(), f1.clone()],
+        &[f0.as_slice(), f1.as_slice()],
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),
@@ -160,7 +160,7 @@ fn test_r_we_conjunction_rejects_bad_ro_witness() {
     let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],
         &[cm0.clone(), cm1.clone()],
-        &[f0.clone(), f1.clone()],
+        &[f0.as_slice(), f1.as_slice()],
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),
@@ -239,7 +239,7 @@ fn test_r_cp_poseidon_fs_rejects_tampered_commitment() {
     let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],
         &[cm0.clone(), cm1.clone()],
-        &[f0.clone(), f1.clone()],
+        &[f0.as_slice(), f1.as_slice()],
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),
@@ -318,7 +318,7 @@ fn test_r_cp_poseidon_fs_rejects_tampered_cfs_commitment() {
     let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],
         &[cm0.clone(), cm1.clone()],
-        &[f0.clone(), f1.clone()],
+        &[f0.as_slice(), f1.as_slice()],
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),
@@ -395,7 +395,7 @@ fn test_r_we_nonvacuous_had_identity_passes() {
     let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],
         &[cm0.clone(), cm1.clone()],
-        &[f0.clone(), f1.clone()],
+        &[f0.as_slice(), f1.as_slice()],
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),
@@ -475,7 +475,7 @@ fn test_r_we_nonvacuous_had_identity_rejects_non_idempotent_witness() {
     let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],
         &[cm0.clone(), cm1.clone()],
-        &[f0, f1],
+        &[f0.as_slice(), f1.as_slice()],
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),

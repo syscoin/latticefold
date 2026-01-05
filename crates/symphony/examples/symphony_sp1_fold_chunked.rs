@@ -14,15 +14,16 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use rayon::prelude::*;
+
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
 use latticefold::commitment::AjtaiCommitmentScheme;
 use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as R;
 use stark_rings::{PolyRing, Ring};
-use stark_rings_linalg::Matrix;
 use symphony::sp1_r1cs_loader::FieldFromU64;
 use symphony::symphony_sp1_r1cs::load_sp1_r1cs_chunked_cached;
 use symphony::rp_rgchk::RPParams;
-use symphony::symphony_pifold_batched::prove_pi_fold_batched_sumcheck_fs;
+use symphony::symphony_pifold_batched::{prove_pi_fold_batched_sumcheck_poseidon_fs, PiFoldProverOutput};
 
 /// BabyBear field element for loading R1CS.
 #[derive(Debug, Clone, Copy, Default)]
@@ -64,7 +65,9 @@ fn main() {
     println!("Step 1: Loading R1CS (chunked)...");
     let load_start = Instant::now();
     
-    let chunked = load_sp1_r1cs_chunked_cached::<R, BabyBear>(&r1cs_path, chunk_size)
+    // Pad columns to a multiple of l_h to satisfy Π_rg’s block structure, without power-of-two blowup.
+    let pad_cols_to_multiple_of = 64usize;
+    let chunked = load_sp1_r1cs_chunked_cached::<R, BabyBear>(&r1cs_path, chunk_size, pad_cols_to_multiple_of)
         .expect("Failed to load R1CS");
     
     let load_time = load_start.elapsed();
@@ -96,31 +99,45 @@ fn main() {
     
     // Main commitment (shared across chunks)
     let setup_start = Instant::now();
-    let a_main = Matrix::<R>::rand(&mut ark_std::test_rng(), kappa, ncols);
-    let scheme_main = Arc::new(AjtaiCommitmentScheme::<R>::new(a_main));
+    // Avoid materializing a dense Ajtai matrix: define it implicitly from a seed.
+    //
+    // IMPORTANT: treat this as part of the public parameters (fixed).
+    // Different commitment families are domain-separated under this seed.
+    // NOTE: If you change this, you must treat it as a parameter version bump (it changes statements).
+    const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1________";
+    let scheme_main = Arc::new(AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, kappa, ncols));
     let cm_main = scheme_main.commit(&witness).unwrap().as_ref().to_vec();
     let setup_time = setup_start.elapsed();
     println!("  Commitment setup: {setup_time:?}\n");
 
     // Auxiliary schemes
-    let a_had = Matrix::<R>::rand(&mut ark_std::test_rng(), kappa, 3 * R::dimension());
-    let a_mon = Matrix::<R>::rand(&mut ark_std::test_rng(), kappa, rg_params.k_g);
-    let scheme_had = Arc::new(AjtaiCommitmentScheme::<R>::new(a_had));
-    let scheme_mon = Arc::new(AjtaiCommitmentScheme::<R>::new(a_mon));
+    let scheme_had = Arc::new(AjtaiCommitmentScheme::<R>::seeded(
+        b"cfs_had_u",
+        MASTER_SEED,
+        kappa,
+        3 * R::dimension(),
+    ));
+    let scheme_mon = Arc::new(AjtaiCommitmentScheme::<R>::seeded(
+        b"cfs_mon_b",
+        MASTER_SEED,
+        kappa,
+        rg_params.k_g,
+    ));
 
     let public_inputs: Vec<<R as PolyRing>::BaseRing> = vec![
         <R as PolyRing>::BaseRing::from(1u128),
     ];
 
-    // Step 4: Prove chunks with limited concurrency
-    println!("Step 4: Proving {} chunks ({} at a time)...\n", num_chunks, max_concurrent);
+    // Step 4: Prove chunks with limited concurrency (actually parallel within batches)
+    println!("Step 4: Proving {} chunks ({} at a time, parallel)...\n", num_chunks, max_concurrent);
     let prove_start = Instant::now();
     
     let mut successes = 0;
     let mut failures = 0;
     let mut total_proof_bytes = 0usize;
+    let mut chunk_outputs: Vec<PiFoldProverOutput<R>> = Vec::with_capacity(num_chunks);
     
-    // Process in batches of max_concurrent
+    // Process in batches of max_concurrent (parallel within each batch)
     for batch_start in (0..num_chunks).step_by(max_concurrent) {
         let batch_end = std::cmp::min(batch_start + max_concurrent, num_chunks);
         let batch_size = batch_end - batch_start;
@@ -128,17 +145,17 @@ fn main() {
         println!("  Batch {}-{} of {}...", batch_start, batch_end - 1, num_chunks);
         let batch_start_time = Instant::now();
         
-        // Process this batch in parallel using rayon's thread pool
+        // Process this batch in PARALLEL using rayon
         let batch_results: Vec<_> = (batch_start..batch_end)
-            .into_iter()
+            .into_par_iter()  // <-- parallel!
             .map(|i| {
                 let chunk_start = Instant::now();
                 let [m1, m2, m3] = &chunked.chunks[i];
                 
-                let result = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
+                let result = prove_pi_fold_batched_sumcheck_poseidon_fs::<R, PC>(
                     [m1, m2, m3],
                     &[cm_main.clone()],
-                    &[(*witness).clone()],
+                    &[witness.as_ref().as_slice()],
                     &public_inputs,
                     Some(scheme_had.as_ref()),
                     Some(scheme_mon.as_ref()),
@@ -158,6 +175,7 @@ fn main() {
                     println!("    Chunk {}: ✓ {:.2?}, {} bytes", i, chunk_time, proof_size);
                     successes += 1;
                     total_proof_bytes += proof_size;
+                    chunk_outputs.push(out);
                 }
                 Err(e) => {
                     println!("    Chunk {}: ✗ {:.2?}, {}", i, chunk_time, e);

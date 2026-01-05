@@ -56,7 +56,7 @@ fn test_ajtai_openings_for_cms_are_verified() {
     let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],
         &[cm0.clone(), cm1.clone()],
-        &[f0.clone(), f1.clone()],
+        &[f0.as_slice(), f1.as_slice()],
         &[],
         None,
         None,

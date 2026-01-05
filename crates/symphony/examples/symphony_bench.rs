@@ -62,6 +62,7 @@ fn main() {
             witnesses.push(f);
             cm_f.push(cm);
         }
+        let witness_slices: Vec<&[R]> = witnesses.iter().map(|w| w.as_slice()).collect();
 
         // CP commitments for aux messages (cfs_*). Use a larger row count so we can see the
         // Ajtai-open verification cost.
@@ -74,7 +75,7 @@ fn main() {
         let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
             [&m1, &m2, &m3],
             &cm_f,
-            &witnesses,
+            &witness_slices,
             &public_inputs,
             Some(&scheme_had),
             Some(&scheme_mon),

@@ -65,7 +65,7 @@ fn test_pifold_batched_accumulator_two_steps() {
     let pf1_out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],
         &[cm_acc.clone(), cm1.clone()],
-        &[f_acc.clone(), f1.clone()],
+        &[f_acc.as_slice(), f1.as_slice()],
         &[],
         None,
         None,
@@ -107,7 +107,7 @@ fn test_pifold_batched_accumulator_two_steps() {
     let pf2_out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],
         &[cm_acc.clone(), cm2.clone()],
-        &[f_acc.clone(), f2.clone()],
+        &[f_acc.as_slice(), f2.as_slice()],
         &[],
         None,
         None,

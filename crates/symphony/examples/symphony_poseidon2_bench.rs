@@ -628,7 +628,7 @@ where
     let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],
         &[cm.clone()],
-        &[witness.clone()],
+        &[witness.as_slice()],
         &public_inputs,
         Some(&scheme_had),
         Some(&scheme_mon),

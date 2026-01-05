@@ -194,6 +194,7 @@ where
 pub fn load_sp1_r1cs_chunked_cached<R, F>(
     path: &str,
     chunk_size: usize,
+    pad_cols_to_multiple_of: usize,
 ) -> std::io::Result<ChunkedMatrices<R>>
 where
     R: OverField + Clone + Send + Sync,
@@ -204,28 +205,37 @@ where
     let stats = read_sp1_r1cs_stats(path)?;
     let cache_path = format!("{}.chunks", path);
     
-    // Try cache first
-    if let Ok(cached) = load_chunked_cache::<R>(&cache_path, &stats.digest) {
-        if cached.chunk_size == chunk_size {
-            eprintln!("  ✓ Loaded from cache: {cache_path}");
-            eprintln!("    {} chunks of {} constraints", cached.chunks.len(), chunk_size);
-            return Ok(cached);
-        }
-        eprintln!("  Cache chunk_size mismatch ({} vs {}), re-converting...", 
-            cached.chunk_size, chunk_size);
-    }
-    
     // Load and convert
     eprintln!("  Loading SP1 R1CS: {path}");
     let r1cs: SP1R1CS<F> = SP1R1CS::load(path)?;
     
-    let ncols = next_power_of_two(r1cs.num_vars);
+    if pad_cols_to_multiple_of == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "pad_cols_to_multiple_of must be > 0",
+        ));
+    }
+    let ncols = ((r1cs.num_vars + pad_cols_to_multiple_of - 1) / pad_cols_to_multiple_of)
+        * pad_cols_to_multiple_of;
+
+    // Try cache first (must match digest, chunk_size, and derived ncols).
+    if let Ok(cached) = load_chunked_cache::<R>(&cache_path, &stats.digest) {
+        if cached.chunk_size == chunk_size && cached.ncols == ncols {
+            eprintln!("  ✓ Loaded from cache: {cache_path}");
+            eprintln!("    {} chunks of {} constraints", cached.chunks.len(), chunk_size);
+            return Ok(cached);
+        }
+        eprintln!(
+            "  Cache params mismatch (chunk_size {} vs {}, ncols {} vs {}), re-converting...",
+            cached.chunk_size, chunk_size, cached.ncols, ncols
+        );
+    }
     let num_chunks = (r1cs.num_constraints + chunk_size - 1) / chunk_size;
     
     eprintln!("  Converting {} constraints → {} chunks of {} each", 
         r1cs.num_constraints, num_chunks, chunk_size);
-    eprintln!("  Columns: {} → {} (padded to 2^{})", 
-        r1cs.num_vars, ncols, ncols.trailing_zeros());
+    eprintln!("  Columns: {} → {} (padded to multiple of {})", 
+        r1cs.num_vars, ncols, pad_cols_to_multiple_of);
     
     // Convert rows to Symphony format (parallel)
     fn convert_rows<R, F>(rows: &[LoaderSparseRow<F>]) -> Vec<Vec<(R, usize)>>

@@ -56,7 +56,7 @@ fn test_pifold_batched_sumcheck_two_instances() {
     let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],
         &[cm0.clone(), cm1.clone()],
-        &[f0.clone(), f1.clone()],
+        &[f0.as_slice(), f1.as_slice()],
         &[],
         None,
         None,
@@ -134,7 +134,7 @@ fn test_pifold_batched_aux_witness_path_matches() {
     let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],
         &[cm0.clone(), cm1.clone()],
-        &[f0.clone(), f1.clone()],
+        &[f0.as_slice(), f1.as_slice()],
         &[],
         None,
         None,
@@ -216,7 +216,7 @@ fn test_pifold_batched_aux_witness_rejects_tamper() {
     let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],
         &[cm0.clone(), cm1.clone()],
-        &[f0.clone(), f1.clone()],
+        &[f0.as_slice(), f1.as_slice()],
         &[],
         None,
         None,
@@ -297,7 +297,7 @@ fn test_pifold_batched_public_statement_binding_rejects_mismatch() {
     let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
         [&m1, &m2, &m3],
         &[cm0.clone(), cm1.clone()],
-        &[f0.clone(), f1.clone()],
+        &[f0.as_slice(), f1.as_slice()],
         &stmt_ok,
         None,
         None,
@@ -323,7 +323,7 @@ fn test_pifold_batched_public_statement_binding_rejects_mismatch() {
         &[cm0, cm1],
         &proof,
         &open,
-        &[f0, f1],
+        &[f0.clone(), f1.clone()],
         &stmt_bad,
     )
     .unwrap_err();

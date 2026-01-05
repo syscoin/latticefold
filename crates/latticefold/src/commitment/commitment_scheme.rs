@@ -5,23 +5,40 @@ use stark_rings::{
     Ring,
 };
 use stark_rings_linalg::Matrix;
+use rand_chacha::ChaCha20Rng;
+use rand::SeedableRng;
+use sha2::{Digest, Sha256};
 
 use super::homomorphic_commitment::Commitment;
 use crate::{
     ark_base::*, commitment::CommitmentError, decomposition_parameters::DecompositionParams,
 };
 
+#[derive(Clone, Debug)]
+enum AjtaiMatrix<R> {
+    Explicit(Matrix<R>),
+    /// A pseudorandom Ajtai matrix defined implicitly by a seed.
+    ///
+    /// This avoids materializing a `kappa x n` dense matrix in memory.
+    Seeded {
+        seed: [u8; 32],
+        domain: Vec<u8>,
+        kappa: usize,
+        n: usize,
+    },
+}
+
 /// A concrete instantiation of the Ajtai commitment scheme.
-/// Contains a random Ajtai matrix (kappa x n).
+/// Contains either an explicit Ajtai matrix (kappa x n) or a seeded implicit matrix.
 #[derive(Clone, Debug)]
 pub struct AjtaiCommitmentScheme<R> {
-    matrix: Matrix<R>,
+    matrix: AjtaiMatrix<R>,
 }
 
 impl<R> AjtaiCommitmentScheme<R> {
     /// Create a new scheme using the provided Ajtai matrix
     pub fn new(matrix: Matrix<R>) -> Self {
-        Self { matrix }
+        Self { matrix: AjtaiMatrix::Explicit(matrix) }
     }
 }
 
@@ -30,41 +47,88 @@ impl<R: Ring> AjtaiCommitmentScheme<R> {
     pub fn rand<Rng: rand::Rng + ?Sized>(kappa: usize, n: usize, rng: &mut Rng) -> Self {
         Self::new(vec![vec![R::rand(rng); n]; kappa].into())
     }
+
+    /// Create a scheme with an implicitly-defined pseudorandom Ajtai matrix.
+    ///
+    /// The matrix is derived deterministically from `(domain, seed)`; different domains should use
+    /// different labels and/or different seeds.
+    pub fn seeded(domain: impl AsRef<[u8]>, seed: [u8; 32], kappa: usize, n: usize) -> Self {
+        Self {
+            matrix: AjtaiMatrix::Seeded {
+                seed,
+                domain: domain.as_ref().to_vec(),
+                kappa,
+                n,
+            },
+        }
+    }
+
+    fn derive_col_seed(domain: &[u8], seed: &[u8; 32], col: u64) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(b"AJTAI_COL_V1");
+        h.update((domain.len() as u64).to_le_bytes());
+        h.update(domain);
+        h.update(seed);
+        h.update(col.to_le_bytes());
+        let out = h.finalize();
+        let mut s = [0u8; 32];
+        s.copy_from_slice(&out);
+        s
+    }
 }
 
 impl<R: Ring> AjtaiCommitmentScheme<R> {
     /// Commit to a witness
     pub fn commit(&self, f: &[R]) -> Result<Commitment<R>, CommitmentError> {
-        if f.len() != self.matrix.ncols {
-            return Err(CommitmentError::WrongWitnessLength(
-                f.len(),
-                self.matrix.ncols,
-            ));
+        match &self.matrix {
+            AjtaiMatrix::Explicit(matrix) => {
+                if f.len() != matrix.ncols {
+                    return Err(CommitmentError::WrongWitnessLength(f.len(), matrix.ncols));
+                }
+                let commitment = matrix
+                    .checked_mul_vec(f)
+                    .ok_or(CommitmentError::WrongWitnessLength(f.len(), matrix.ncols))?;
+                Ok(Commitment::from_vec_raw(commitment))
+            }
+            AjtaiMatrix::Seeded { seed, domain, kappa, n } => {
+                if f.len() != *n {
+                    return Err(CommitmentError::WrongWitnessLength(f.len(), *n));
+                }
+                let mut acc = vec![R::ZERO; *kappa];
+                for (j, fj) in f.iter().enumerate() {
+                    if *fj == R::ZERO {
+                        continue;
+                    }
+                    let col_seed = Self::derive_col_seed(domain, seed, j as u64);
+                    let mut rng = ChaCha20Rng::from_seed(col_seed);
+                    for i in 0..*kappa {
+                        let aij = R::rand(&mut rng);
+                        acc[i] += aij * *fj;
+                    }
+                }
+                Ok(Commitment::from_vec_raw(acc))
+            }
         }
-
-        let commitment =
-            self.matrix
-                .checked_mul_vec(f)
-                .ok_or(CommitmentError::WrongWitnessLength(
-                    f.len(),
-                    self.matrix.ncols,
-                ))?;
-
-        Ok(Commitment::from_vec_raw(commitment))
     }
 
     /// Ajtai matrix number of rows
     ///
     /// This value affects the security of the scheme.
     pub fn kappa(&self) -> usize {
-        self.matrix.nrows
+        match &self.matrix {
+            AjtaiMatrix::Explicit(m) => m.nrows,
+            AjtaiMatrix::Seeded { kappa, .. } => *kappa,
+        }
     }
 
     /// Ajtai matrix number of columns
     ///
     /// The size of the witness must be equal to this value.
     pub fn width(&self) -> usize {
-        self.matrix.ncols
+        match &self.matrix {
+            AjtaiMatrix::Explicit(m) => m.ncols,
+            AjtaiMatrix::Seeded { n, .. } => *n,
+        }
     }
 }
 

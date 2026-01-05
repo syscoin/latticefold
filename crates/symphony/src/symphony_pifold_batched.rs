@@ -129,11 +129,88 @@ where
     }
 }
 
+/// Prover (paper-faithful FS): run once under Poseidon-FS and **record** the coin stream.
+///
+/// This avoids the 2× work of `prove_pi_fold_batched_sumcheck_fs` (record + fixed-coin replay),
+/// while keeping a serializable `proof.coins` for WE/DPP frontends.
+pub fn prove_pi_fold_batched_sumcheck_poseidon_fs<R: CoeffRing, PC>(
+    M: [&SparseMatrix<R>; 3],
+    cms: &[Vec<R>],
+    witnesses: &[&[R]],
+    public_inputs: &[R::BaseRing],
+    cfs_had_u_scheme: Option<&AjtaiCommitmentScheme<R>>,
+    cfs_mon_b_scheme: Option<&AjtaiCommitmentScheme<R>>,
+    rg_params: RPParams,
+) -> Result<PiFoldProverOutput<R>, String>
+where
+    R::BaseRing: Zq + Decompose,
+    PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
+{
+    if cms.is_empty() {
+        return Err("PiFold: empty batch".to_string());
+    }
+    if cms.len() != witnesses.len() {
+        return Err("PiFold: cms/witnesses length mismatch".to_string());
+    }
+
+    let mut ts = crate::transcript::PoseidonTranscript::<R>::empty::<PC>();
+    let mut rts = RecordingTranscriptRef::<R, _>::new(&mut ts);
+    rts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
+    absorb_public_inputs::<R>(&mut rts, public_inputs);
+
+    let mut out = prove_pi_fold_batched_sumcheck(&mut rts, M, cms, witnesses, rg_params)
+        .map_err(|e| format!("PiFold: poseidon-fs prove failed: {e}"))?;
+
+    out.proof.coins = SymphonyCoins::<R> {
+        challenges: rts.coins_challenges,
+        bytes: rts.coins_bytes,
+        events: rts.events,
+    };
+
+    // Optionally commit to CP transcript witness messages (WE/DPP-facing path).
+    out.cfs_had_u.clear();
+    out.cfs_mon_b.clear();
+    match (cfs_had_u_scheme, cfs_mon_b_scheme) {
+        (Some(had_s), Some(mon_s)) => {
+            out.cfs_had_u = out
+                .aux
+                .had_u
+                .iter()
+                .map(|u| {
+                    had_s
+                        .commit(&encode_had_u_instance::<R>(u))
+                        .map_err(|e| format!("PiFold: cfs_had_u commit failed: {e:?}"))
+                        .map(|c| c.as_ref().to_vec())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            out.cfs_mon_b = out
+                .aux
+                .mon_b
+                .iter()
+                .map(|b| {
+                    mon_s
+                        .commit(b)
+                        .map_err(|e| format!("PiFold: cfs_mon_b commit failed: {e:?}"))
+                        .map(|c| c.as_ref().to_vec())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "PiFold: must provide both cfs_had_u_scheme and cfs_mon_b_scheme or neither".to_string(),
+            );
+        }
+    }
+
+    Ok(out)
+}
+
 /// Prover: derive a shared FS coin stream once, then produce a batched-sumcheck Π_fold proof.
 pub fn prove_pi_fold_batched_sumcheck_fs<R: CoeffRing, PC>(
     M: [&SparseMatrix<R>; 3],
     cms: &[Vec<R>],
-    witnesses: &[Vec<R>],
+    witnesses: &[&[R]],
     public_inputs: &[R::BaseRing],
     cfs_had_u_scheme: Option<&AjtaiCommitmentScheme<R>>,
     cfs_mon_b_scheme: Option<&AjtaiCommitmentScheme<R>>,
@@ -224,7 +301,7 @@ pub fn prove_pi_fold_batched_sumcheck<R: CoeffRing>(
     transcript: &mut impl Transcript<R>,
     M: [&SparseMatrix<R>; 3],
     cms: &[Vec<R>],
-    witnesses: &[Vec<R>],
+    witnesses: &[&[R]],
     rg_params: RPParams,
 ) -> Result<PiFoldProverOutput<R>, String>
 where
@@ -285,7 +362,7 @@ where
     }
     let g_nvars = log2(g_len) as usize;
 
-    for (cm_f, f) in cms.iter().zip(witnesses.iter()) {
+    for (cm_f, f) in cms.iter().zip(witnesses.iter().copied()) {
         if f.len() != n_f {
             return Err("PiFold: inconsistent witness lengths".to_string());
         }
@@ -368,6 +445,7 @@ where
     // Precompute y vectors per instance.
     let ys = witnesses
         .iter()
+        .copied()
         .map(|f| {
             M.iter()
                 .map(|Mi| Mi.try_mul_vec(f).expect("mat-vec mul failed"))
