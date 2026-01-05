@@ -33,6 +33,24 @@ where
         evals: Arc<Vec<R::BaseRing>>,
         num_vars: usize,
     },
+    /// A compact base-scalar table that is periodic in the "row" dimension.
+    ///
+    /// This is tailored for Symphony's monomial side, where `m_j` values repeat across `rep`
+    /// blocks, so we can store only `m_j * d` base scalars instead of `m * d`.
+    ///
+    /// Storage layout is column-major: `evals[col * m_j + row]`.
+    PeriodicBaseScalarVec {
+        evals: Arc<Vec<R::BaseRing>>,
+        num_vars: usize,
+        /// Current row count for the full domain (power-of-two).
+        m: usize,
+        /// Current projected row count (power-of-two, <= m).
+        m_j: usize,
+        /// Current number of columns (power-of-two).
+        d: usize,
+        /// If true, return the square of the looked-up base scalar.
+        square: bool,
+    },
     /// eq(bits(index), r) evaluated in the base ring, then lifted to R.
     EqBase {
         scale: R::BaseRing,
@@ -64,6 +82,29 @@ where
         Self::BaseScalarVec { evals, num_vars }
     }
 
+    pub fn periodic_base_scalar_vec(
+        num_vars: usize,
+        m: usize,
+        m_j: usize,
+        d: usize,
+        evals: Arc<Vec<R::BaseRing>>,
+        square: bool,
+    ) -> Self {
+        debug_assert!(m.is_power_of_two());
+        debug_assert!(m_j.is_power_of_two());
+        debug_assert!(d.is_power_of_two());
+        debug_assert!(m_j <= m);
+        debug_assert_eq!(evals.len(), m_j * d);
+        Self::PeriodicBaseScalarVec {
+            evals,
+            num_vars,
+            m,
+            m_j,
+            d,
+            square,
+        }
+    }
+
     pub fn eq_base(r: Vec<R::BaseRing>) -> Self {
         let one_minus_r = r.iter().copied().map(|x| R::BaseRing::ONE - x).collect();
         Self::EqBase {
@@ -79,6 +120,7 @@ where
             StreamingMleEnum::Dense(m) => m.num_vars,
             StreamingMleEnum::SparseMatVec { num_vars, .. } => *num_vars,
             StreamingMleEnum::BaseScalarVec { num_vars, .. } => *num_vars,
+            StreamingMleEnum::PeriodicBaseScalarVec { num_vars, .. } => *num_vars,
             StreamingMleEnum::EqBase { r, .. } => r.len(),
         }
     }
@@ -99,6 +141,24 @@ where
                 sum
             }
             StreamingMleEnum::BaseScalarVec { evals, .. } => R::from(evals[index]),
+            StreamingMleEnum::PeriodicBaseScalarVec {
+                evals,
+                m,
+                m_j,
+                d,
+                square,
+                ..
+            } => {
+                debug_assert_eq!(*m * *d, 1usize << self.num_vars());
+                let col = index / *m;
+                let r = index % *m;
+                let row = if *m_j == 0 { 0 } else { r % *m_j };
+                let mut v = evals[col * *m_j + row];
+                if *square {
+                    v *= v;
+                }
+                R::from(v)
+            }
             StreamingMleEnum::EqBase {
                 scale,
                 r,
@@ -151,6 +211,85 @@ where
                 StreamingMleEnum::BaseScalarVec {
                     evals: Arc::new(new_evals),
                     num_vars: num_vars - 1,
+                }
+            }
+            StreamingMleEnum::PeriodicBaseScalarVec {
+                evals,
+                num_vars,
+                m,
+                m_j,
+                d,
+                square,
+            } => {
+                let r0 = r.coeffs()[0];
+                let one_minus = R::BaseRing::ONE - r0;
+
+                // We are fixing variables LSB-first. As long as m > 1, the LSB is a row bit.
+                // Once m == 1, remaining bits are column bits.
+                if *m > 1 {
+                    let new_m = *m / 2;
+                    // If m_j > 1, the periodicity depends on this bit and we must compress m_j too.
+                    // If m_j == 1, the function is already independent of row bits.
+                    if *m_j > 1 {
+                        let new_mj = *m_j / 2;
+                        let mut new_evals = vec![R::BaseRing::ZERO; new_mj * *d];
+                        for col in 0..*d {
+                            let base = col * *m_j;
+                            let out_base = col * new_mj;
+                            for i in 0..new_mj {
+                                let a = evals[base + (i << 1)];
+                                let b = evals[base + (i << 1) | 1];
+                                new_evals[out_base + i] = one_minus * a + r0 * b;
+                            }
+                        }
+                        StreamingMleEnum::PeriodicBaseScalarVec {
+                            evals: Arc::new(new_evals),
+                            num_vars: num_vars - 1,
+                            m: new_m,
+                            m_j: new_mj,
+                            d: *d,
+                            square: *square,
+                        }
+                    } else {
+                        // Independent of this row bit: combining equal values yields same table.
+                        StreamingMleEnum::PeriodicBaseScalarVec {
+                            evals: evals.clone(),
+                            num_vars: num_vars - 1,
+                            m: new_m,
+                            m_j: *m_j,
+                            d: *d,
+                            square: *square,
+                        }
+                    }
+                } else {
+                    // Column bits.
+                    if *d == 1 {
+                        // Fully fixed after this; treat as Dense of length 1.
+                        let mut v = evals[0];
+                        if *square {
+                            v *= v;
+                        }
+                        StreamingMleEnum::base_scalar_vec(0, Arc::new(vec![v]))
+                    } else {
+                        let new_d = *d / 2;
+                        let mut new_evals = vec![R::BaseRing::ZERO; *m_j * new_d];
+                        // m_j should be 1 once m==1 in our use-case, but keep it generic.
+                        for col in 0..new_d {
+                            for row in 0..*m_j {
+                                let a = evals[(col << 1) * *m_j + row];
+                                let b = evals[((col << 1) | 1) * *m_j + row];
+                                new_evals[col * *m_j + row] = one_minus * a + r0 * b;
+                            }
+                        }
+                        StreamingMleEnum::PeriodicBaseScalarVec {
+                            evals: Arc::new(new_evals),
+                            num_vars: num_vars - 1,
+                            m: *m,
+                            m_j: *m_j,
+                            d: new_d,
+                            square: *square,
+                        }
+                    }
                 }
             }
             // EqBase: keep structural (base-field) with updated scale and shortened r vector.

@@ -408,20 +408,14 @@ where
         for dig in 0..rg_params.k_g {
             let (c, beta_i, _a) = &cba_all[inst_idx][dig];
 
-            // Compact m_j/m' as base-ring scalars.
-            let mut m_j_evals: Vec<R::BaseRing> = vec![R::BaseRing::ZERO; g_len];
-            let mut m_prime: Vec<R::BaseRing> = vec![R::BaseRing::ZERO; g_len];
+            // Compact m_j values as base-ring scalars over only m_j rows (periodic over m).
+            // Store column-major: mj_compact[col * m_j + out_row].
+            let mut mj_compact: Vec<R::BaseRing> = vec![R::BaseRing::ZERO; m_j * d];
 
-            // Parallel fill (disjoint writes by out_row -> unique r -> unique idx).
             #[cfg(feature = "parallel")]
             {
                 use ark_std::cfg_into_iter;
-                // We pass raw pointers as usize to satisfy Send+Sync bounds; we only do disjoint writes.
-                let mj_ptr = m_j_evals.as_mut_ptr() as usize;
-                let mp_ptr = m_prime.as_mut_ptr() as usize;
-                let m_local = m;
-                let mj_local = m_j;
-                let reps_local = reps;
+                let out_ptr = mj_compact.as_mut_ptr() as usize;
                 let beta = *beta_i;
                 let dig_local = dig;
                 let digits_flat = digits_flat.clone();
@@ -430,15 +424,9 @@ where
                         let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig_local];
                         let g = exp::<R>(digit).expect("Exp failed");
                         let mjv = ev(&g, beta);
-                        let mpv = mjv * mjv;
-                        for rep in 0..reps_local {
-                            let r = out_row + rep * mj_local;
-                            let idx = col * m_local + r;
-                            // SAFETY: for different out_row, r differs => idx differs for all col/rep.
-                            unsafe {
-                                *(mj_ptr as *mut R::BaseRing).add(idx) = mjv;
-                                *(mp_ptr as *mut R::BaseRing).add(idx) = mpv;
-                            }
+                        let idx = col * m_j + out_row;
+                        unsafe {
+                            *(out_ptr as *mut R::BaseRing).add(idx) = mjv;
                         }
                     }
                 });
@@ -449,20 +437,29 @@ where
                     for col in 0..d {
                         let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
                         let g = exp::<R>(digit).expect("Exp failed");
-                        let mj = ev(&g, *beta_i);
-                        let mp = mj * mj;
-                        for rep in 0..reps {
-                            let r = out_row + rep * m_j;
-                            let idx = col * m + r;
-                            m_j_evals[idx] = mj;
-                            m_prime[idx] = mp;
-                        }
+                        let mjv = ev(&g, *beta_i);
+                        mj_compact[col * m_j + out_row] = mjv;
                     }
                 }
             }
 
-            mles_mon.push(StreamingMleEnum::base_scalar_vec(g_nvars, Arc::new(m_j_evals)));
-            mles_mon.push(StreamingMleEnum::base_scalar_vec(g_nvars, Arc::new(m_prime)));
+            let mj_compact = Arc::new(mj_compact);
+            mles_mon.push(StreamingMleEnum::periodic_base_scalar_vec(
+                g_nvars,
+                m,
+                m_j,
+                d,
+                mj_compact.clone(),
+                false,
+            ));
+            mles_mon.push(StreamingMleEnum::periodic_base_scalar_vec(
+                g_nvars,
+                m,
+                m_j,
+                d,
+                mj_compact,
+                true,
+            ));
             // eq(c) as streaming MLE (no 2^n table).
             let c_base = c.iter().map(|x| x.coeffs()[0]).collect::<Vec<_>>();
             mles_mon.push(StreamingMleEnum::eq_base(c_base));
