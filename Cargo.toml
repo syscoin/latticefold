@@ -3,7 +3,6 @@ members = [
     "crates/cyclotomic-rings",
     "crates/latticefold",
     "crates/latticefold-plus",
-    "crates/symphony-sp1/script",
 ]
 resolver = "2"
 
