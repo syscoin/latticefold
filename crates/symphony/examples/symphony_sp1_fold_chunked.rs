@@ -23,7 +23,7 @@ use stark_rings::{PolyRing, Ring};
 use symphony::sp1_r1cs_loader::FieldFromU64;
 use symphony::symphony_sp1_r1cs::open_sp1_r1cs_chunk_cache;
 use symphony::rp_rgchk::RPParams;
-use symphony::symphony_pifold_batched::prove_pi_fold_batched_sumcheck_poseidon_fs;
+use symphony::symphony_pifold_batched::prove_pi_fold_batched_sumcheck_fs;
 
 /// BabyBear field element for loading R1CS.
 #[derive(Debug, Clone, Copy, Default)]
@@ -89,7 +89,11 @@ fn main() {
     let mut witness: Vec<R> = vec![R::ZERO; ncols];
     witness[0] = R::ONE;
     let witness = Arc::new(witness);
-    println!("  Witness length: {ncols} (2^{})\n", ncols.trailing_zeros());
+    if ncols.is_power_of_two() {
+        println!("  Witness length: {ncols} (2^{})\n", ncols.trailing_zeros());
+    } else {
+        println!("  Witness length: {ncols}\n");
+    }
 
     // Step 3: Setup Symphony parameters
     println!("Step 3: Setting up Symphony parameters...");
@@ -171,7 +175,7 @@ fn main() {
                 .map(|(i, [m1, m2, m3])| {
                 let chunk_start = Instant::now();
                 
-                let result = prove_pi_fold_batched_sumcheck_poseidon_fs::<R, PC>(
+                let result = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
                     [&m1, &m2, &m3],
                     &[cm_main.clone()],
                     &[witness.as_ref().as_slice()],

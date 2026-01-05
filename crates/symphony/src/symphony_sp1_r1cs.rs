@@ -378,8 +378,12 @@ where
     eprintln!("  Loading SP1 R1CS: {path}");
     let r1cs: SP1R1CS<F> = SP1R1CS::load(path)?;
 
-    let ncols = ((r1cs.num_vars + pad_cols_to_multiple_of - 1) / pad_cols_to_multiple_of)
-        * pad_cols_to_multiple_of;
+    // IMPORTANT: Π_rg requires `m % m_J == 0`, and with our chunking `m` is a power-of-two.
+    // For `lambda_pj = 1`, this forces `blocks = ncols / l_h` to be a power-of-two divisor of `m`,
+    // hence `ncols` must be `l_h * 2^k` (i.e. a power-of-two multiple of `l_h`).
+    let blocks = (r1cs.num_vars + pad_cols_to_multiple_of - 1) / pad_cols_to_multiple_of;
+    let blocks_pow2 = next_power_of_two(blocks);
+    let ncols = blocks_pow2 * pad_cols_to_multiple_of;
     let num_chunks = (r1cs.num_constraints + chunk_size - 1) / chunk_size;
 
     eprintln!(
@@ -460,8 +464,18 @@ where
 {
     let stats = read_sp1_r1cs_stats(path)?;
     let cache_path = format!("{}.chunks", path);
+    if pad_cols_to_multiple_of == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "pad_cols_to_multiple_of must be > 0",
+        ));
+    }
+    let blocks = (stats.num_vars + pad_cols_to_multiple_of - 1) / pad_cols_to_multiple_of;
+    let blocks_pow2 = next_power_of_two(blocks);
+    let expected_ncols = blocks_pow2 * pad_cols_to_multiple_of;
+
     if let Ok(cache) = open_chunk_cache::<R>(&cache_path, &stats.digest) {
-        if cache.chunk_size == chunk_size {
+        if cache.chunk_size == chunk_size && cache.ncols == expected_ncols {
             return Ok(cache);
         }
     }
@@ -469,14 +483,9 @@ where
     // Build cache with streaming conversion: convert per-chunk and write, avoiding giant
     // `rows_a/rows_b/rows_c` allocations.
     let r1cs: SP1R1CS<F> = SP1R1CS::load(path)?;
-    if pad_cols_to_multiple_of == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "pad_cols_to_multiple_of must be > 0",
-        ));
-    }
-    let ncols = ((r1cs.num_vars + pad_cols_to_multiple_of - 1) / pad_cols_to_multiple_of)
-        * pad_cols_to_multiple_of;
+    let blocks = (r1cs.num_vars + pad_cols_to_multiple_of - 1) / pad_cols_to_multiple_of;
+    let blocks_pow2 = next_power_of_two(blocks);
+    let ncols = blocks_pow2 * pad_cols_to_multiple_of;
     let num_chunks = (r1cs.num_constraints + chunk_size - 1) / chunk_size;
 
     let total_nonzeros = (r1cs.a.iter().map(|r| r.terms.len()).sum::<usize>()

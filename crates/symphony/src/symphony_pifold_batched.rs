@@ -133,7 +133,7 @@ where
 ///
 /// This avoids the 2× work of `prove_pi_fold_batched_sumcheck_fs` (record + fixed-coin replay),
 /// while keeping a serializable `proof.coins` for WE/DPP frontends.
-pub fn prove_pi_fold_batched_sumcheck_poseidon_fs<R: CoeffRing, PC>(
+pub fn prove_pi_fold_batched_sumcheck_fs<R: CoeffRing, PC>(
     M: [&SparseMatrix<R>; 3],
     cms: &[Vec<R>],
     witnesses: &[&[R]],
@@ -206,33 +206,6 @@ where
     Ok(out)
 }
 
-/// Prover: derive a shared FS coin stream once, then produce a batched-sumcheck Π_fold proof.
-pub fn prove_pi_fold_batched_sumcheck_fs<R: CoeffRing, PC>(
-    M: [&SparseMatrix<R>; 3],
-    cms: &[Vec<R>],
-    witnesses: &[&[R]],
-    public_inputs: &[R::BaseRing],
-    cfs_had_u_scheme: Option<&AjtaiCommitmentScheme<R>>,
-    cfs_mon_b_scheme: Option<&AjtaiCommitmentScheme<R>>,
-    rg_params: RPParams,
-) -> Result<PiFoldProverOutput<R>, String>
-where
-    R::BaseRing: Zq + Decompose,
-    PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
-{
-    // Historically this function did a record+replay (Poseidon transcript → FixedTranscript)
-    // to enforce that the prover is a pure function of the coin stream. That costs ~2× time.
-    // For production/streaming, use the one-pass Poseidon-FS prover.
-    prove_pi_fold_batched_sumcheck_poseidon_fs::<R, PC>(
-        M,
-        cms,
-        witnesses,
-        public_inputs,
-        cfs_had_u_scheme,
-        cfs_mon_b_scheme,
-        rg_params,
-    )
-}
 
 /// Core prover under an arbitrary transcript (Poseidon or FixedTranscript).
 pub fn prove_pi_fold_batched_sumcheck<R: CoeffRing>(
