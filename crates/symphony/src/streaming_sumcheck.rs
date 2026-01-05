@@ -34,7 +34,7 @@ where
         num_vars: usize,
     },
     /// A compact base-scalar table that is periodic in the "row" dimension.
-    ///
+///
     /// This is tailored for Symphony's monomial side, where `m_j` values repeat across `rep`
     /// blocks, so we can store only `m_j * d` base scalars instead of `m * d`.
     ///
@@ -343,7 +343,7 @@ impl<R: OverField> DenseStreamingMle<R> {
         assert!(len.is_power_of_two(), "Length must be power of 2");
         let num_vars = len.trailing_zeros() as usize;
         Self { evals, num_vars }
-    }
+}
 
     pub fn num_vars(&self) -> usize {
         self.num_vars

@@ -138,12 +138,12 @@ where
     w.flush()?;
 
     let mut offsets: Vec<u64> = vec![0u64; num_chunks];
-
+    
     // Each chunk: nrows, then 3 matrices
     for (i, [ma, mb, mc]) in chunked.chunks.iter().enumerate() {
         offsets[i] = w.stream_position()?;
         w.write_all(&(ma.nrows as u64).to_le_bytes())?;
-
+        
         for matrix in [ma, mb, mc] {
             for row in &matrix.coeffs {
                 w.write_all(&(row.len() as u32).to_le_bytes())?;
@@ -224,7 +224,7 @@ where
         r.read_exact(&mut buf8)?;
         offsets[i] = u64::from_le_bytes(buf8);
     }
-
+    
     let mut chunks = Vec::with_capacity(num_chunks);
     
     for i in 0..num_chunks {
@@ -373,11 +373,11 @@ where
         }
         eprintln!("  Cache chunk_size mismatch, re-converting...");
     }
-
+    
     // Build cache with streaming conversion (avoid materializing converted rows for all constraints).
     eprintln!("  Loading SP1 R1CS: {path}");
     let r1cs: SP1R1CS<F> = SP1R1CS::load(path)?;
-
+    
     // IMPORTANT: Π_rg requires `m % m_J == 0`, and with our chunking `m` is a power-of-two.
     // For `lambda_pj = 1`, this forces `blocks = ncols / l_h` to be a power-of-two divisor of `m`,
     // hence `ncols` must be `l_h * 2^k` (i.e. a power-of-two multiple of `l_h`).
@@ -385,7 +385,7 @@ where
     let blocks_pow2 = next_power_of_two(blocks);
     let ncols = blocks_pow2 * pad_cols_to_multiple_of;
     let num_chunks = (r1cs.num_constraints + chunk_size - 1) / chunk_size;
-
+    
     eprintln!(
         "  Converting {} constraints → {} chunks of {} each",
         r1cs.num_constraints, num_chunks, chunk_size
@@ -403,20 +403,20 @@ where
     {
         row.terms
             .iter()
-            .map(|(col_idx, coeff)| {
-                let val = R::from(R::BaseRing::from(coeff.as_canonical_u64()));
-                (val, *col_idx)
+                    .map(|(col_idx, coeff)| {
+                        let val = R::from(R::BaseRing::from(coeff.as_canonical_u64()));
+                        (val, *col_idx)
             })
             .collect()
     }
-
+    
     let mut chunks: Vec<[SparseMatrix<R>; 3]> = Vec::with_capacity(num_chunks);
     for i in 0..num_chunks {
         let start = i * chunk_size;
         let end = std::cmp::min(start + chunk_size, r1cs.num_constraints);
         let actual_rows = end - start;
         let padded_rows = next_power_of_two(actual_rows);
-
+        
         let make = |rows: &[LoaderSparseRow<F>]| -> SparseMatrix<R> {
             let mut coeffs: Vec<Vec<(R, usize)>> = (start..end)
                 .map(|r| convert_row::<R, F>(&rows[r]))
@@ -424,10 +424,10 @@ where
             coeffs.resize_with(padded_rows, Vec::new);
             SparseMatrix { nrows: padded_rows, ncols, coeffs }
         };
-
+        
         chunks.push([make(&r1cs.a), make(&r1cs.b), make(&r1cs.c)]);
     }
-
+    
     let result = ChunkedMatrices {
         chunks,
         stats: SP1R1CSStats {
@@ -442,12 +442,12 @@ where
         chunk_size,
         ncols,
     };
-
+    
     eprintln!("  Saving cache: {cache_path}");
     if let Err(e) = save_chunked_cache(&cache_path, &result) {
         eprintln!("  Warning: failed to save cache: {e}");
     }
-
+    
     Ok(result)
 }
 

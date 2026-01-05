@@ -665,31 +665,31 @@ where
     let mut dense_metrics = None;
     if mode == "dense" || mode == "both" {
         println!("  Π_fold prove (dense): START...");
-        let prove_start = Instant::now();
-        let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
+    let prove_start = Instant::now();
+    let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
             [m1.as_ref(), m2.as_ref(), m3.as_ref()],
-            &[cm.clone()],
+        &[cm.clone()],
             &[witness.as_ref().as_slice()],
-            &public_inputs,
-            Some(&scheme_had),
-            Some(&scheme_mon),
-            rg_params.clone(),
-        );
-        let prove_time = prove_start.elapsed();
-        let out = match out {
-            Ok(o) => o,
-            Err(e) => {
+        &public_inputs,
+        Some(&scheme_had),
+        Some(&scheme_mon),
+        rg_params.clone(),
+    );
+    let prove_time = prove_start.elapsed();
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => {
                 println!("  Π_fold prove (dense) FAILED: {e}");
-                return;
-            }
-        };
+            return;
+        }
+    };
         println!("  Π_fold prove (dense): PASSED ✓ ({prove_time:?})");
 
         println!("  R_cp verify (dense): START...");
-        let verify_start = Instant::now();
+    let verify_start = Instant::now();
         match verify(&out) {
             Ok(_) => {
-                let verify_time = verify_start.elapsed();
+    let verify_time = verify_start.elapsed();
                 println!("  R_cp verify (dense): PASSED ✓ ({verify_time:?})");
                 dense_metrics = Some((prove_time, verify_time, out.proof.coins.bytes.len()));
             }
@@ -771,10 +771,10 @@ where
                 let verify_time = verify_start.elapsed();
                 println!("  R_cp verify (streaming-had): PASSED ✓ ({verify_time:?})");
                 streaming_metrics = Some((prove_time, verify_time, out.proof.coins.bytes.len()));
-            }
-            Err(e) => {
+        }
+        Err(e) => {
                 println!("  R_cp verify (streaming-had) FAILED: {e}");
-                return;
+            return;
             }
         }
     }

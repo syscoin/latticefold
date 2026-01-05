@@ -101,7 +101,7 @@ fn main() {
     witness[0] = R::ONE;
     let witness = Arc::new(witness);
     if ncols.is_power_of_two() {
-        println!("  Witness length: {ncols} (2^{})\n", ncols.trailing_zeros());
+    println!("  Witness length: {ncols} (2^{})\n", ncols.trailing_zeros());
     } else {
         println!("  Witness length: {ncols}\n");
     }
@@ -217,13 +217,17 @@ fn main() {
         let load_mat_time = load_mat_start.elapsed();
         println!("    Loaded {batch_size} chunks from cache in {load_mat_time:?}");
         
-        // Process this batch in PARALLEL using rayon
-        let batch_results: Vec<_> = pool.install(|| {
+        // Process this batch in PARALLEL using rayon.
+        //
+        // IMPORTANT: do not retain full `PiFoldProverOutput` objects in memory.
+        // We immediately map each result down to a tiny record (proof_size or error string)
+        // and `drop(out)` inside the worker thread to keep peak RSS bounded.
+        let batch_results: Vec<(usize, Result<usize, String>, std::time::Duration)> = pool.install(|| {
             batch_mats
                 .into_par_iter() // <-- parallel over loaded chunks
                 .map(|(i, [m1, m2, m3])| {
                 let chunk_start = Instant::now();
-                let result = if pifold_mode == "streaming" {
+                let result: Result<usize, String> = if pifold_mode == "streaming" {
                     prove_pi_fold_streaming_sumcheck_fs::<R, PC>(
                         [Arc::new(m1), Arc::new(m2), Arc::new(m3)],
                         &[cm_main.clone()],
@@ -233,16 +237,26 @@ fn main() {
                         Some(scheme_mon.as_ref()),
                         rg_params.clone(),
                     )
+                    .map(|out| {
+                        let proof_size = out.proof.coins.bytes.len();
+                        drop(out);
+                        proof_size
+                    })
                 } else {
                     prove_pi_fold_batched_sumcheck_fs::<R, PC>(
                         [&m1, &m2, &m3],
-                        &[cm_main.clone()],
+                    &[cm_main.clone()],
                         &[witness.as_ref().as_slice()],
-                        &public_inputs,
-                        Some(scheme_had.as_ref()),
-                        Some(scheme_mon.as_ref()),
-                        rg_params.clone(),
+                    &public_inputs,
+                    Some(scheme_had.as_ref()),
+                    Some(scheme_mon.as_ref()),
+                    rg_params.clone(),
                     )
+                    .map(|out| {
+                        let proof_size = out.proof.coins.bytes.len();
+                        drop(out);
+                        proof_size
+                    })
                 };
                 
                 (i, result, chunk_start.elapsed())
@@ -254,13 +268,10 @@ fn main() {
         
         for (i, result, chunk_time) in batch_results {
             match result {
-                Ok(out) => {
-                    let proof_size = out.proof.coins.bytes.len();
+                Ok(proof_size) => {
                     println!("    Chunk {}: ✓ {:.2?}, {} bytes", i, chunk_time, proof_size);
                     successes += 1;
                     total_proof_bytes += proof_size;
-                    // Drop the proof immediately to keep RAM bounded.
-                    drop(out);
                 }
                 Err(e) => {
                     println!("    Chunk {}: ✗ {:.2?}, {}", i, chunk_time, e);

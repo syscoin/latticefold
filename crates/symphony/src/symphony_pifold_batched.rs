@@ -497,9 +497,9 @@ where
             for inst_idx in 0..ell {
                 let b = beta_cts[inst_idx];
                 let digits_flat = &proj_digits_by_inst[inst_idx];
-                for row in 0..m_j {
-                    let w = ts_r[row];
-                    for col in 0..d {
+                    for row in 0..m_j {
+                        let w = ts_r[row];
+                        for col in 0..d {
                         for dig in 0..rg_params.k_g {
                             let digit = digits_flat[(row * d + col) * rg_params.k_g + dig];
                             v_digits_folded[dig][col] += b * digit * w;
@@ -560,7 +560,7 @@ where
                         let r = out_row + rep * m_j;
                         let idx = col * m + r;
                         acc += R::from(ts_r_mon[idx]) * g;
-                    }
+        }
                 }
             }
             b_inst.push(acc);
