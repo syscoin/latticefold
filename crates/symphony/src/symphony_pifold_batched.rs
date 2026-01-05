@@ -220,80 +220,18 @@ where
     R::BaseRing: Zq + Decompose,
     PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
 {
-    if cms.is_empty() {
-        return Err("PiFold: empty batch".to_string());
-    }
-    if cms.len() != witnesses.len() {
-        return Err("PiFold: cms/witnesses length mismatch".to_string());
-    }
-
-    // Record a canonical coin stream by running the full batched prover once on a real transcript.
-    let mut ts = crate::transcript::PoseidonTranscript::<R>::empty::<PC>();
-    let mut rts = RecordingTranscriptRef::<R, _>::new(&mut ts);
-    rts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
-    absorb_public_inputs::<R>(&mut rts, public_inputs);
-
-    // Run once to record coins.
-    let _ = prove_pi_fold_batched_sumcheck(&mut rts, M, cms, witnesses, rg_params.clone())
-        .map_err(|e| format!("PiFold: representative prove failed: {e}"))?;
-
-    let coins = SymphonyCoins::<R> {
-        challenges: rts.coins_challenges,
-        bytes: rts.coins_bytes,
-        events: rts.events,
-    };
-
-    // Replay with FixedTranscript.
-    let mut fts = FixedTranscript::<R>::new_with_coins_and_events(
-        coins.challenges.clone(),
-        coins.bytes.clone(),
-        coins.events.clone(),
-    );
-    let mut out = prove_pi_fold_batched_sumcheck(&mut fts, M, cms, witnesses, rg_params)
-        .map_err(|e| format!("PiFold: fixed-coin prove failed: {e}"))?;
-
-    // Ensure exact coin consumption.
-    if fts.remaining_challenges() != 0 || fts.remaining_bytes() != 0 || fts.remaining_events() != 0 {
-        return Err("PiFold: coin stream not fully consumed".to_string());
-    }
-
-    out.proof.coins = coins;
-
-    // Optionally commit to CP transcript witness messages (WE/DPP-facing path).
-    out.cfs_had_u.clear();
-    out.cfs_mon_b.clear();
-    match (cfs_had_u_scheme, cfs_mon_b_scheme) {
-        (Some(had_s), Some(mon_s)) => {
-            out.cfs_had_u = out
-                .aux
-                .had_u
-                .iter()
-                .map(|u| {
-                    had_s
-                        .commit(&encode_had_u_instance::<R>(u))
-                        .map_err(|e| format!("PiFold: cfs_had_u commit failed: {e:?}"))
-                        .map(|c| c.as_ref().to_vec())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            out.cfs_mon_b = out
-                .aux
-                .mon_b
-                .iter()
-                .map(|b| {
-                    mon_s
-                        .commit(b)
-                        .map_err(|e| format!("PiFold: cfs_mon_b commit failed: {e:?}"))
-                        .map(|c| c.as_ref().to_vec())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-        }
-        (None, None) => {}
-        _ => {
-            return Err("PiFold: must provide both cfs_had_u_scheme and cfs_mon_b_scheme or neither"
-                .to_string());
-        }
-    }
-    Ok(out)
+    // Historically this function did a record+replay (Poseidon transcript → FixedTranscript)
+    // to enforce that the prover is a pure function of the coin stream. That costs ~2× time.
+    // For production/streaming, use the one-pass Poseidon-FS prover.
+    prove_pi_fold_batched_sumcheck_poseidon_fs::<R, PC>(
+        M,
+        cms,
+        witnesses,
+        public_inputs,
+        cfs_had_u_scheme,
+        cfs_mon_b_scheme,
+        rg_params,
+    )
 }
 
 /// Core prover under an arbitrary transcript (Poseidon or FixedTranscript).
@@ -378,13 +316,6 @@ where
 
 
         // Build H_digits for this instance (on m_J rows).
-        let mut cf = vec![vec![R::BaseRing::ZERO; d]; n_f];
-        for (row, r) in cf.iter_mut().zip(f.iter()) {
-            for (j, c) in r.coeffs().iter().enumerate() {
-                row[j] = *c;
-            }
-        }
-
         let mut H = vec![vec![R::BaseRing::ZERO; d]; m_j];
         let Jref = &J;
         for b in 0..blocks {
@@ -394,7 +325,7 @@ where
                     let in_row = b * rg_params.l_h + t;
                     let coef = Jref[i][t];
                     for col in 0..d {
-                        H[out_row][col] += coef * cf[in_row][col];
+                        H[out_row][col] += coef * f[in_row].coeffs()[col];
                     }
                 }
             }
@@ -482,9 +413,6 @@ where
         }
         acc_all
     };
-
-    // We'll need the same MLEs to compute U_i at the had point.
-    let mles_had_for_u = mles_had_batched.clone();
 
     // -----------------
     // Build batched Π_mon sumcheck (one)
@@ -601,26 +529,28 @@ where
     // Finish: compute per-instance U at had point, and per-instance b at mon point, then absorb them.
     // These are the CP transcript witness messages for the WE/DPP-facing path.
     let r_had = had_ps.randomness.clone();
-    let r_poly_had: Vec<R> = r_had.iter().copied().map(R::from).collect();
+    let ts_r_had = ts_weights(&r_had);
 
     let mut had_u: Vec<[Vec<R::BaseRing>; 3]> = Vec::with_capacity(ell);
     for inst_idx in 0..ell {
-        let base = inst_idx * had_mles_per;
         let mut U: [Vec<R::BaseRing>; 3] = [Vec::with_capacity(d), Vec::with_capacity(d), Vec::with_capacity(d)];
         for i in 0..3 {
             for j in 0..d {
-                let idx = base + 1 + i * d + j;
-                let v = mles_had_for_u[idx]
-                    .evaluate(&r_poly_had)
-                    .expect("MLE evaluate returned None");
-                U[i].push(v.ct());
+                let mut acc = R::BaseRing::ZERO;
+                for row in 0..m {
+                    acc += ts_r_had[row] * ys[inst_idx][i][row].coeffs()[j];
+                }
+                U[i].push(acc);
             }
         }
-        had_u.push(U.clone());
+        had_u.push(U);
         for x in &U[0] { transcript.absorb_field_element(x); }
         for x in &U[1] { transcript.absorb_field_element(x); }
         for x in &U[2] { transcript.absorb_field_element(x); }
     }
+
+    // ys is no longer needed past here; free it before monomial-side work.
+    drop(ys);
 
     let r_mon = mon_ps.randomness.clone();
     let r_poly_mon: Vec<R> = r_mon.iter().copied().map(R::from).collect();
@@ -632,7 +562,7 @@ where
             let mle = DenseMultilinearExtension::from_evaluations_slice(g_nvars, &g_all[inst_idx][dig]);
             b_inst.push(mle.evaluate(&r_poly_mon).unwrap());
         }
-        mon_b.push(b_inst.clone());
+        mon_b.push(b_inst);
         transcript.absorb_slice(&b_inst);
     }
 
@@ -889,12 +819,6 @@ where
     for inst_idx in 0..ell {
         // Build H_digits for this instance (on m_J rows).
         let f = &cms_openings[inst_idx];
-        let mut cf = vec![vec![R::BaseRing::ZERO; d]; n_f];
-        for (row, r) in cf.iter_mut().zip(f.iter()) {
-            for (j, c) in r.coeffs().iter().enumerate() {
-                row[j] = *c;
-            }
-        }
         let mut H = vec![vec![R::BaseRing::ZERO; d]; m_j];
         let Jref = &Js[inst_idx];
         for b in 0..blocks {
@@ -904,7 +828,7 @@ where
                     let in_row = b * rg_params.l_h + t;
                     let coef = Jref[i][t];
                     for col in 0..d {
-                        H[out_row][col] += coef * cf[in_row][col];
+                        H[out_row][col] += coef * f[in_row].coeffs()[col];
                     }
                 }
             }
@@ -1326,12 +1250,6 @@ where
         for inst_idx in 0..ell {
             // Build H_digits for this instance (on m_J rows).
             let f = &cms_openings[inst_idx];
-            let mut cf = vec![vec![R::BaseRing::ZERO; d]; n_f];
-            for (row, r) in cf.iter_mut().zip(f.iter()) {
-                for (j, c) in r.coeffs().iter().enumerate() {
-                    row[j] = *c;
-                }
-            }
             let mut H = vec![vec![R::BaseRing::ZERO; d]; m_j];
             let Jref = &Js[inst_idx];
             for b in 0..blocks {
@@ -1341,7 +1259,7 @@ where
                         let in_row = b * rg_params.l_h + t;
                         let coef = Jref[i][t];
                         for col in 0..d {
-                            H[out_row][col] += coef * cf[in_row][col];
+                            H[out_row][col] += coef * f[in_row].coeffs()[col];
                         }
                     }
                 }

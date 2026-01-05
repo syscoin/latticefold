@@ -21,9 +21,9 @@ use latticefold::commitment::AjtaiCommitmentScheme;
 use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as R;
 use stark_rings::{PolyRing, Ring};
 use symphony::sp1_r1cs_loader::FieldFromU64;
-use symphony::symphony_sp1_r1cs::load_sp1_r1cs_chunked_cached;
+use symphony::symphony_sp1_r1cs::open_sp1_r1cs_chunk_cache;
 use symphony::rp_rgchk::RPParams;
-use symphony::symphony_pifold_batched::{prove_pi_fold_batched_sumcheck_poseidon_fs, PiFoldProverOutput};
+use symphony::symphony_pifold_batched::prove_pi_fold_batched_sumcheck_poseidon_fs;
 
 /// BabyBear field element for loading R1CS.
 #[derive(Debug, Clone, Copy, Default)]
@@ -59,7 +59,12 @@ fn main() {
     println!("Configuration:");
     println!("  Chunk size:     {} (2^{})", chunk_size, chunk_size.trailing_zeros());
     println!("  Max concurrent: {} chunks at once", max_concurrent);
-    println!("  Total threads:  {}\n", rayon::current_num_threads());
+    // We'll use a local rayon pool sized to the chunk-level parallelism to avoid oversubscription.
+    let prove_threads: usize = std::env::var("PROVE_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(max_concurrent);
+    println!("  Prove threads:  {prove_threads}\n");
 
     // Step 1: Load and chunk R1CS (uses cache)
     println!("Step 1: Loading R1CS (chunked)...");
@@ -67,20 +72,20 @@ fn main() {
     
     // Pad columns to a multiple of l_h to satisfy Π_rg’s block structure, without power-of-two blowup.
     let pad_cols_to_multiple_of = 64usize;
-    let chunked = load_sp1_r1cs_chunked_cached::<R, BabyBear>(&r1cs_path, chunk_size, pad_cols_to_multiple_of)
-        .expect("Failed to load R1CS");
+    let cache = open_sp1_r1cs_chunk_cache::<R, BabyBear>(&r1cs_path, chunk_size, pad_cols_to_multiple_of)
+        .expect("Failed to open/build chunk cache");
     
     let load_time = load_start.elapsed();
-    let num_chunks = chunked.chunks.len();
+    let num_chunks = cache.num_chunks;
     
-    println!("  Constraints: {}", chunked.stats.num_constraints);
-    println!("  Variables:   {}", chunked.stats.num_vars);
+    println!("  Constraints: {}", cache.stats.num_constraints);
+    println!("  Variables:   {}", cache.stats.num_vars);
     println!("  Chunks:      {}", num_chunks);
     println!("  Load time:   {load_time:?}\n");
 
     // Step 2: Create witness (same for all chunks)
     println!("Step 2: Creating witness...");
-    let ncols = chunked.ncols;
+    let ncols = cache.ncols;
     let mut witness: Vec<R> = vec![R::ZERO; ncols];
     witness[0] = R::ONE;
     let witness = Arc::new(witness);
@@ -129,31 +134,45 @@ fn main() {
     ];
 
     // Step 4: Prove chunks with limited concurrency (actually parallel within batches)
-    println!("Step 4: Proving {} chunks ({} at a time, parallel)...\n", num_chunks, max_concurrent);
+    println!(
+        "Step 4: Proving {} chunks ({} at a time, parallel)...\n",
+        num_chunks, max_concurrent
+    );
     let prove_start = Instant::now();
     
     let mut successes = 0;
     let mut failures = 0;
     let mut total_proof_bytes = 0usize;
-    let mut chunk_outputs: Vec<PiFoldProverOutput<R>> = Vec::with_capacity(num_chunks);
+    // NOTE: We intentionally do NOT retain per-chunk proofs in RAM here.
+    // A production driver would stream them to disk or feed them directly into an accumulator.
     
     // Process in batches of max_concurrent (parallel within each batch)
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(prove_threads)
+        .build()
+        .expect("failed to build rayon pool");
+
     for batch_start in (0..num_chunks).step_by(max_concurrent) {
         let batch_end = std::cmp::min(batch_start + max_concurrent, num_chunks);
         let batch_size = batch_end - batch_start;
         
         println!("  Batch {}-{} of {}...", batch_start, batch_end - 1, num_chunks);
         let batch_start_time = Instant::now();
+
+        // Load the chunk matrices for this batch (streaming; keeps peak RAM bounded).
+        let batch_mats: Vec<(usize, [stark_rings_linalg::SparseMatrix<R>; 3])> = (batch_start..batch_end)
+            .map(|i| (i, cache.read_chunk(i).expect("read_chunk failed")))
+            .collect();
         
         // Process this batch in PARALLEL using rayon
-        let batch_results: Vec<_> = (batch_start..batch_end)
-            .into_par_iter()  // <-- parallel!
-            .map(|i| {
+        let batch_results: Vec<_> = pool.install(|| {
+            batch_mats
+                .into_par_iter() // <-- parallel over loaded chunks
+                .map(|(i, [m1, m2, m3])| {
                 let chunk_start = Instant::now();
-                let [m1, m2, m3] = &chunked.chunks[i];
                 
                 let result = prove_pi_fold_batched_sumcheck_poseidon_fs::<R, PC>(
-                    [m1, m2, m3],
+                    [&m1, &m2, &m3],
                     &[cm_main.clone()],
                     &[witness.as_ref().as_slice()],
                     &public_inputs,
@@ -164,7 +183,8 @@ fn main() {
                 
                 (i, result, chunk_start.elapsed())
             })
-            .collect();
+            .collect()
+        });
         
         let batch_time = batch_start_time.elapsed();
         
@@ -175,7 +195,8 @@ fn main() {
                     println!("    Chunk {}: ✓ {:.2?}, {} bytes", i, chunk_time, proof_size);
                     successes += 1;
                     total_proof_bytes += proof_size;
-                    chunk_outputs.push(out);
+                    // Drop the proof immediately to keep RAM bounded.
+                    drop(out);
                 }
                 Err(e) => {
                     println!("    Chunk {}: ✗ {:.2?}, {}", i, chunk_time, e);
@@ -192,7 +213,7 @@ fn main() {
     println!("=========================================================");
     println!("Summary");
     println!("=========================================================");
-    println!("Total constraints:    {}", chunked.stats.num_constraints);
+    println!("Total constraints:    {}", cache.stats.num_constraints);
     println!("Chunks:               {num_chunks}");
     println!("Chunk size:           {chunk_size}");
     println!("Max concurrent:       {max_concurrent}");
