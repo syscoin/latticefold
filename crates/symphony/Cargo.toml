@@ -9,6 +9,7 @@ default = ["std", "parallel"]
 std = ["ark-std/std", "cyclotomic-rings/std", "rand/std"]
 parallel = [
     "ark-std/parallel",
+    "latticefold/parallel",
     "stark-rings/parallel",
     "stark-rings-linalg/parallel",
     "stark-rings-poly/parallel",
