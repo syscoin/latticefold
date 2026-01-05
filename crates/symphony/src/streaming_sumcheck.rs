@@ -546,7 +546,6 @@ mod tests {
     #[test]
     fn test_dense_streaming_mle() {
         use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as R;
-        use stark_rings::Ring;
         let evals = vec![R::from(1u128), R::from(2u128), R::from(3u128), R::from(4u128)];
         let mle = DenseStreamingMle::new(evals.clone());
         assert_eq!(mle.num_vars(), 2);
