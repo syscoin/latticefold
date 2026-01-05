@@ -104,7 +104,7 @@ fn main() {
     // IMPORTANT: treat this as part of the public parameters (fixed).
     // Different commitment families are domain-separated under this seed.
     // NOTE: If you change this, you must treat it as a parameter version bump (it changes statements).
-    const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_0000000000";
+    const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
     let scheme_main = Arc::new(AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, kappa, ncols));
     let cm_main = scheme_main.commit(&witness).unwrap().as_ref().to_vec();
     let setup_time = setup_start.elapsed();
