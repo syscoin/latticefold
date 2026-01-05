@@ -48,10 +48,11 @@ where
 }
 
 /// Load SP1 shrink verifier R1CS from file and convert to Symphony format.
+/// Returns (raw_r1cs, [A, B, C] matrices, stats).
 pub fn load_sp1_r1cs_as_symphony<R, F>(
     path: &str,
     expected_digest: Option<&[u8; 32]>,
-) -> std::io::Result<(SP1R1CS<F>, [SparseMatrix<R>; 3])>
+) -> std::io::Result<(SP1R1CS<F>, [SparseMatrix<R>; 3], SP1R1CSStats)>
 where
     R: OverField,
     R::BaseRing: Zq + From<u64>,
@@ -63,8 +64,21 @@ where
         SP1R1CS::load(path)?
     };
     
+    let digest = r1cs.compute_digest();
+    let total_nonzeros = r1cs.a.iter().chain(r1cs.b.iter()).chain(r1cs.c.iter())
+        .map(|row| row.terms.len() as u64)
+        .sum();
+    
+    let stats = SP1R1CSStats {
+        num_vars: r1cs.num_vars,
+        num_constraints: r1cs.num_constraints,
+        num_public: r1cs.num_public,
+        total_nonzeros,
+        digest,
+    };
+    
     let matrices = sp1_r1cs_to_symphony_matrices(&r1cs);
-    Ok((r1cs, matrices))
+    Ok((r1cs, matrices, stats))
 }
 
 /// R1CS stats for quick inspection.
