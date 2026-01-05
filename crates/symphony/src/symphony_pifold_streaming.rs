@@ -25,6 +25,10 @@ use stark_rings::{
     exp, CoeffRing, OverField, Ring, Zq,
 };
 use stark_rings_linalg::SparseMatrix;
+#[cfg(feature = "parallel")]
+use rayon::iter::IntoParallelIterator;
+#[cfg(feature = "parallel")]
+use rayon::iter::ParallelIterator;
 use cyclotomic_rings::rings::GetPoseidonParams;
 use latticefold::{
     commitment::AjtaiCommitmentScheme,
@@ -342,17 +346,49 @@ where
             let mut m_j_evals: Vec<R::BaseRing> = vec![R::BaseRing::ZERO; g_len];
             let mut m_prime: Vec<R::BaseRing> = vec![R::BaseRing::ZERO; g_len];
 
-            for out_row in 0..m_j {
-                let digits = proj_row_digits(f, J, out_row);
-                for col in 0..d {
-                    let g = exp::<R>(digits[col][dig]).expect("Exp failed");
-                    let mj = ev(&g, *beta_i);
-                    let mp = mj * mj;
-                    for rep in 0..reps {
-                        let r = out_row + rep * m_j;
-                        let idx = col * m + r;
-                        m_j_evals[idx] = mj;
-                        m_prime[idx] = mp;
+            // Parallel fill (disjoint writes by out_row -> unique r -> unique idx).
+            #[cfg(feature = "parallel")]
+            {
+                use ark_std::cfg_into_iter;
+                // We pass raw pointers as usize to satisfy Send+Sync bounds; we only do disjoint writes.
+                let mj_ptr = m_j_evals.as_mut_ptr() as usize;
+                let mp_ptr = m_prime.as_mut_ptr() as usize;
+                let m_local = m;
+                let mj_local = m_j;
+                let reps_local = reps;
+                let beta = *beta_i;
+                cfg_into_iter!(0..m_j).for_each(|out_row| {
+                    let digits = proj_row_digits(f, J, out_row);
+                    for col in 0..d {
+                        let g = exp::<R>(digits[col][dig]).expect("Exp failed");
+                        let mjv = ev(&g, beta);
+                        let mpv = mjv * mjv;
+                        for rep in 0..reps_local {
+                            let r = out_row + rep * mj_local;
+                            let idx = col * m_local + r;
+                            // SAFETY: for different out_row, r differs => idx differs for all col/rep.
+                            unsafe {
+                                *(mj_ptr as *mut R::BaseRing).add(idx) = mjv;
+                                *(mp_ptr as *mut R::BaseRing).add(idx) = mpv;
+                            }
+                        }
+                    }
+                });
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                for out_row in 0..m_j {
+                    let digits = proj_row_digits(f, J, out_row);
+                    for col in 0..d {
+                        let g = exp::<R>(digits[col][dig]).expect("Exp failed");
+                        let mj = ev(&g, *beta_i);
+                        let mp = mj * mj;
+                        for rep in 0..reps {
+                            let r = out_row + rep * m_j;
+                            let idx = col * m + r;
+                            m_j_evals[idx] = mj;
+                            m_prime[idx] = mp;
+                        }
                     }
                 }
             }
@@ -548,18 +584,41 @@ where
             let f: &[R] = &witnesses[inst_idx];
             let J = &Js[inst_idx];
 
-            let mut acc = R::ZERO;
-            for out_row in 0..m_j {
-                let digits = proj_row_digits(f, J, out_row);
-                for col in 0..d {
-                    let g = exp::<R>(digits[col][dig]).expect("Exp failed");
-                    for rep in 0..reps {
-                        let r = out_row + rep * m_j;
-                        let idx = col * m + r;
-                        acc += R::from(ts_r_mon[idx]) * g;
+            #[cfg(feature = "parallel")]
+            let acc = {
+                use ark_std::cfg_into_iter;
+                cfg_into_iter!(0..m_j)
+                    .map(|out_row| {
+                        let digits = proj_row_digits(f, J, out_row);
+                        let mut local = R::ZERO;
+                        for col in 0..d {
+                            let g = exp::<R>(digits[col][dig]).expect("Exp failed");
+                            for rep in 0..reps {
+                                let r = out_row + rep * m_j;
+                                let idx = col * m + r;
+                                local += R::from(ts_r_mon[idx]) * g;
+                            }
+                        }
+                        local
+                    })
+                    .reduce(|| R::ZERO, |a, b| a + b)
+            };
+            #[cfg(not(feature = "parallel"))]
+            let acc = {
+                let mut acc = R::ZERO;
+                for out_row in 0..m_j {
+                    let digits = proj_row_digits(f, J, out_row);
+                    for col in 0..d {
+                        let g = exp::<R>(digits[col][dig]).expect("Exp failed");
+                        for rep in 0..reps {
+                            let r = out_row + rep * m_j;
+                            let idx = col * m + r;
+                            acc += R::from(ts_r_mon[idx]) * g;
+                        }
                     }
                 }
-            }
+                acc
+            };
             b_inst.push(acc);
         }
         transcript.absorb_slice(&b_inst);
