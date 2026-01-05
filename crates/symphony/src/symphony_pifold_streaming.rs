@@ -31,7 +31,7 @@ use latticefold::{
 };
 
 use crate::recording_transcript::RecordingTranscriptRef;
-use crate::mle_oracle::{BaseScalarVecMle, EqStreamingMle, SparseMatrixMle};
+use crate::mle_oracle::{BaseScalarVecMle, EqBaseStreamingMle, SparseMatrixMle};
 use crate::rp_rgchk::RPParams;
 use crate::streaming_sumcheck::{StreamingMle, StreamingProof, StreamingSumcheck};
 use crate::symphony_cm::SymphonyCoins;
@@ -192,8 +192,6 @@ where
     let s_base = transcript.get_challenges(log_m);
     let alpha_base = transcript.get_challenge();
 
-    let s_r: Vec<R> = s_base.iter().copied().map(R::from).collect();
-
     let mut alpha_pows = Vec::with_capacity(d);
     let mut pow = R::BaseRing::ONE;
     for _ in 0..d {
@@ -267,7 +265,7 @@ where
     let mut mles_had: Vec<Box<dyn StreamingMle<R>>> = Vec::with_capacity(ell * 4);
 
     for inst_idx in 0..ell {
-        mles_had.push(Box::new(EqStreamingMle::new(s_r.clone())));
+        mles_had.push(Box::new(EqBaseStreamingMle::<R>::new(s_base.clone())));
         for i in 0..3 {
             mles_had.push(Box::new(SparseMatrixMle::new(
                 M[i].clone(),
@@ -366,7 +364,8 @@ where
                 Arc::new(m_prime),
             )));
             // eq(c) as streaming MLE (no 2^n table).
-            mles_mon.push(Box::new(EqStreamingMle::new(c.clone())));
+            let c_base = c.iter().map(|x| x.coeffs()[0]).collect::<Vec<_>>();
+            mles_mon.push(Box::new(EqBaseStreamingMle::<R>::new(c_base)));
         }
     }
 
@@ -581,7 +580,10 @@ pub fn convert_streaming_proof<R: OverField>(
 }
 
 /// Build streaming MLEs for Hadamard (helper for custom usage).
-pub fn build_hadamard_streaming_mles<R: OverField>(
+///
+/// NOTE: `s_r` must be constant-coefficient ring elements (embedded base-ring scalars),
+/// because we evaluate `eq(s, r)` in the base ring for performance.
+pub fn build_hadamard_streaming_mles<R: OverField + stark_rings::PolyRing>(
     matrices: [Arc<SparseMatrix<R>>; 3],
     witnesses: &[Arc<Vec<R>>],
     s_r: Vec<R>,
@@ -590,7 +592,8 @@ pub fn build_hadamard_streaming_mles<R: OverField>(
     let mut mles: Vec<Box<dyn StreamingMle<R>>> = Vec::with_capacity(ell * 4);
 
     for inst_idx in 0..ell {
-        mles.push(Box::new(EqStreamingMle::new(s_r.clone())));
+        let s_base = s_r.iter().map(|x| x.coeffs()[0]).collect::<Vec<_>>();
+        mles.push(Box::new(EqBaseStreamingMle::<R>::new(s_base)));
         for i in 0..3 {
             mles.push(Box::new(SparseMatrixMle::new(
                 matrices[i].clone(),

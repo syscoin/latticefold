@@ -10,7 +10,7 @@
 
 use ark_std::vec::Vec;
 use std::sync::Arc;
-use stark_rings::OverField;
+use stark_rings::{OverField, PolyRing, Ring};
 use stark_rings_linalg::SparseMatrix;
 
 use crate::streaming_sumcheck::StreamingMle;
@@ -197,6 +197,113 @@ impl<R: OverField> StreamingMle<R> for ScaledMle<R> {
             scale: self.scale,
             inner: self.inner.fix_variable(r),
         })
+    }
+}
+
+/// Streaming eq MLE specialized to **constant-coefficient ring elements**.
+///
+/// Stores challenges in the base ring and evaluates `eq(bits(index), r)` in the base ring,
+/// then lifts to `R` via `R::from`.
+///
+/// This is a big constant-factor win vs `EqStreamingMle<R>` when `R` is a polynomial ring
+/// and the challenges were sampled from the base ring and embedded as constant terms.
+pub struct EqBaseStreamingMle<R: OverField + PolyRing>
+where
+    R::BaseRing: Ring,
+{
+    r: Vec<R::BaseRing>,
+    one_minus_r: Vec<R::BaseRing>,
+}
+
+impl<R: OverField + PolyRing> EqBaseStreamingMle<R>
+where
+    R::BaseRing: Ring,
+{
+    pub fn new(r: Vec<R::BaseRing>) -> Self {
+        let one_minus_r = r.iter().copied().map(|x| R::BaseRing::ONE - x).collect();
+        Self { r, one_minus_r }
+    }
+}
+
+impl<R: OverField + PolyRing> StreamingMle<R> for EqBaseStreamingMle<R>
+where
+    R::BaseRing: Ring,
+{
+    fn num_vars(&self) -> usize {
+        self.r.len()
+    }
+
+    fn eval_at_index(&self, index: usize) -> R {
+        let mut prod = R::BaseRing::ONE;
+        for i in 0..self.r.len() {
+            let bit = ((index >> i) & 1) == 1;
+            prod *= if bit { self.r[i] } else { self.one_minus_r[i] };
+        }
+        R::from(prod)
+    }
+
+    fn fix_variable(&self, r: R) -> Box<dyn StreamingMle<R>> {
+        // r is sampled from the transcript as a base-ring element and embedded into R,
+        // so extracting coeffs()[0] recovers the scalar.
+        let r0 = r.coeffs()[0];
+        let eq_factor = (R::BaseRing::ONE - r0) * self.one_minus_r[0] + r0 * self.r[0];
+        let new_r: Vec<R::BaseRing> = self.r[1..].to_vec();
+
+        if new_r.is_empty() {
+            Box::new(crate::streaming_sumcheck::DenseStreamingMle::new(vec![R::from(eq_factor)]))
+        } else {
+            Box::new(ScaledEqBaseStreamingMle::<R>::new(eq_factor, new_r))
+        }
+    }
+}
+
+/// Base-ring eq MLE with an extra base-ring scale factor.
+struct ScaledEqBaseStreamingMle<R: OverField + PolyRing>
+where
+    R::BaseRing: Ring,
+{
+    scale: R::BaseRing,
+    r: Vec<R::BaseRing>,
+    one_minus_r: Vec<R::BaseRing>,
+}
+
+impl<R: OverField + PolyRing> ScaledEqBaseStreamingMle<R>
+where
+    R::BaseRing: Ring,
+{
+    fn new(scale: R::BaseRing, r: Vec<R::BaseRing>) -> Self {
+        let one_minus_r = r.iter().copied().map(|x| R::BaseRing::ONE - x).collect();
+        Self { scale, r, one_minus_r }
+    }
+}
+
+impl<R: OverField + PolyRing> StreamingMle<R> for ScaledEqBaseStreamingMle<R>
+where
+    R::BaseRing: Ring,
+{
+    fn num_vars(&self) -> usize {
+        self.r.len()
+    }
+
+    fn eval_at_index(&self, index: usize) -> R {
+        let mut prod = R::BaseRing::ONE;
+        for i in 0..self.r.len() {
+            let bit = ((index >> i) & 1) == 1;
+            prod *= if bit { self.r[i] } else { self.one_minus_r[i] };
+        }
+        R::from(self.scale * prod)
+    }
+
+    fn fix_variable(&self, r: R) -> Box<dyn StreamingMle<R>> {
+        let r0 = r.coeffs()[0];
+        let eq_factor = (R::BaseRing::ONE - r0) * self.one_minus_r[0] + r0 * self.r[0];
+        let new_scale = self.scale * eq_factor;
+        let new_r: Vec<R::BaseRing> = self.r[1..].to_vec();
+        if new_r.is_empty() {
+            Box::new(crate::streaming_sumcheck::DenseStreamingMle::new(vec![R::from(new_scale)]))
+        } else {
+            Box::new(ScaledEqBaseStreamingMle::<R>::new(new_scale, new_r))
+        }
     }
 }
 
