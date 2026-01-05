@@ -42,6 +42,16 @@ pub struct MLSumcheck<R, T>(#[doc(hidden)] PhantomData<(R, T)>);
 #[derive(Clone, Debug, PartialEq, CanonicalSerialize, CanonicalDeserialize)]
 pub struct Proof<R1: Ring>(Vec<ProverMsg<R1>>);
 
+impl<R1: Ring> Proof<R1> {
+    pub fn new(msgs: Vec<ProverMsg<R1>>) -> Self {
+        Self(msgs)
+    }
+
+    pub fn msgs(&self) -> &[ProverMsg<R1>] {
+        &self.0
+    }
+}
+
 /// Spec for running one sumcheck as part of a k-way shared-randomness schedule.
 ///
 /// This is the generalization of `prove_two_as_subprotocol_shared_with_hook` to `k >= 1`.

@@ -13,7 +13,13 @@ use super::{verifier::VerifierMsg, IPForMLSumcheck};
 #[derive(Clone, Debug, PartialEq, CanonicalSerialize, CanonicalDeserialize)]
 pub struct ProverMsg<R1: Ring> {
     /// evaluations on P(0), P(1), P(2), ...
-    pub(crate) evaluations: Vec<R1>,
+    pub evaluations: Vec<R1>,
+}
+
+impl<R1: Ring> ProverMsg<R1> {
+    pub fn new(evaluations: Vec<R1>) -> Self {
+        Self { evaluations }
+    }
 }
 
 /// Prover State
