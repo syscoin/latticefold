@@ -5,10 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["symphony"]
+default = ["std"]
 std = ["ark-std/std", "cyclotomic-rings/std", "rand/std"]
-# Symphony-focused build (CP-style range proof + folding paths).
-symphony = ["std"]
 parallel = [
     "dep:rayon",
     "std",
@@ -79,12 +77,9 @@ implicit_clone = "warn"
 
 [[example]]
 name = "symphony_public_coin_rg"
-required-features = ["symphony"]
 
 [[example]]
 name = "symphony_poseidon2_bench"
-required-features = ["symphony"]
 
 [[example]]
 name = "symphony_sp1_r1cs_stats"
-required-features = ["symphony"]

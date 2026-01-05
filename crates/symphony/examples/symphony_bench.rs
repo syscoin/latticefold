@@ -6,7 +6,6 @@
 
 use std::time::Instant;
 
-#[cfg(feature = "symphony")]
 fn main() {
     use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
     use latticefold::commitment::AjtaiCommitmentScheme;
@@ -115,10 +114,5 @@ fn main() {
             out.proof.coins.bytes.len()
         );
     }
-}
-
-#[cfg(not(feature = "symphony"))]
-fn main() {
-    eprintln!("This example requires `--features symphony`.");
 }
 

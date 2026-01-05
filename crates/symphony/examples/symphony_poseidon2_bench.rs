@@ -15,7 +15,6 @@
 use std::time::Instant;
 use ark_ff::PrimeField;
 
-#[cfg(feature = "symphony")]
 fn main() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use stark_rings::PolyRing;
@@ -134,7 +133,6 @@ fn main() {
 /// For the Hadamard relation M1·f ⊙ M2·f = M3·f:
 /// - Each S-box x^7 requires 4 mult constraints
 /// - Witness f contains: [state_0..state_{WIDTH-1}, aux_vars...]
-#[cfg(feature = "symphony")]
 fn build_poseidon2_hadamard_matrices<R: stark_rings::PolyRing>(
     num_permutations: usize,
 ) -> (
@@ -416,7 +414,6 @@ fn build_poseidon2_hadamard_matrices<R: stark_rings::PolyRing>(
     (m1, m2, m3, witness, constraint_idx)
 }
 
-#[cfg(feature = "symphony")]
 fn r1cs_decompose_witness_and_expand_matrices<R: stark_rings::CoeffRing>(
     m1: &stark_rings_linalg::SparseMatrix<R>,
     m2: &stark_rings_linalg::SparseMatrix<R>,
@@ -520,7 +517,6 @@ where
     (expand(m1, k_cs, base_b), expand(m2, k_cs, base_b), expand(m3, k_cs, base_b), out)
 }
 
-#[cfg(feature = "symphony")]
 fn test_symphony_poseidon2_folding<
     R: stark_rings::CoeffRing,
     PC: cyclotomic_rings::rings::GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
@@ -701,9 +697,4 @@ where
     println!("  Prove time: {prove_time:?}");
     println!("  Verify time: {verify_time:?}");
     println!("  Proof coins: {} bytes", proof_bytes);
-}
-
-#[cfg(not(feature = "symphony"))]
-fn main() {
-    eprintln!("This example requires `--features symphony`.");
 }

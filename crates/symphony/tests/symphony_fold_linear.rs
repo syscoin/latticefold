@@ -1,4 +1,4 @@
-#![cfg(feature = "symphony")]
+
 
 use ark_std::One;
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;

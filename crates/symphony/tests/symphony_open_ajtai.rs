@@ -1,4 +1,4 @@
-#![cfg(feature = "symphony")]
+
 
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
 use symphony::{
