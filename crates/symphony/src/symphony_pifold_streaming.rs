@@ -45,6 +45,14 @@ use crate::symphony_pifold_batched::{PiFoldAuxWitness, PiFoldBatchedProof, PiFol
 // Re-export streaming types
 pub use crate::streaming_sumcheck::{StreamingProverMsg, StreamingSumcheckState};
 
+fn env_flag(name: &str, default_on: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .as_deref()
+        .map(|s| !(s == "0" || s.eq_ignore_ascii_case("false")))
+        .unwrap_or(default_on)
+}
+
 fn is_const_coeff_ring_elem<R: stark_rings::PolyRing>(x: &R) -> bool {
     x.coeffs()
         .iter()
@@ -53,11 +61,7 @@ fn is_const_coeff_ring_elem<R: stark_rings::PolyRing>(x: &R) -> bool {
 }
 
 fn const_coeff_fastpath_enabled(default_on: bool) -> bool {
-    std::env::var("CONST_COEFF_FASTPATH")
-        .ok()
-        .as_deref()
-        .map(|s| !(s == "0" || s.eq_ignore_ascii_case("false")))
-        .unwrap_or(default_on)
+    env_flag("CONST_COEFF_FASTPATH", default_on)
 }
 
 fn seems_const_coeff_inputs<R: stark_rings::PolyRing>(
@@ -111,6 +115,48 @@ fn seems_const_coeff_inputs<R: stark_rings::PolyRing>(
     }
 
     true
+}
+
+fn sparse_mat_vec_const_coeff_dense<R>(
+    matrix: &stark_rings_linalg::SparseMatrix<R>,
+    witness0: &[<R as stark_rings::PolyRing>::BaseRing],
+) -> Vec<<R as stark_rings::PolyRing>::BaseRing>
+where
+    R: CoeffRing + stark_rings::PolyRing,
+    <R as stark_rings::PolyRing>::BaseRing: Zq,
+{
+    let nrows = matrix.nrows;
+    debug_assert!(nrows.is_power_of_two());
+
+    #[cfg(feature = "parallel")]
+    {
+        use ark_std::cfg_into_iter;
+        cfg_into_iter!(0..nrows)
+            .map(|row| {
+                let mut sum = <R as stark_rings::PolyRing>::BaseRing::ZERO;
+                for (coeff, col_idx) in &matrix.coeffs[row] {
+                    if *col_idx < witness0.len() {
+                        sum += coeff.coeffs()[0] * witness0[*col_idx];
+                    }
+                }
+                sum
+            })
+            .collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut out = vec![<R as stark_rings::PolyRing>::BaseRing::ZERO; nrows];
+        for row in 0..nrows {
+            let mut sum = <R as stark_rings::PolyRing>::BaseRing::ZERO;
+            for (coeff, col_idx) in &matrix.coeffs[row] {
+                if *col_idx < witness0.len() {
+                    sum += coeff.coeffs()[0] * witness0[*col_idx];
+                }
+            }
+            out[row] = sum;
+        }
+        out
+    }
 }
 
 fn absorb_public_inputs<R: OverField>(ts: &mut impl Transcript<R>, public_inputs: &[R::BaseRing])
@@ -332,6 +378,9 @@ where
     let const_coeff_fastpath_requested = const_coeff_fastpath_enabled(true);
     let const_coeff_fastpath = const_coeff_fastpath_requested
         && seems_const_coeff_inputs::<R>(witnesses, &[M[0].clone(), M[1].clone(), M[2].clone()]);
+    // Optional: trade memory for speed by precomputing y=M*w in the base ring.
+    // Default off; enable via `CONST_COEFF_PRECOMPUTE_Y=1`.
+    let const_coeff_precompute_y = const_coeff_fastpath && env_flag("CONST_COEFF_PRECOMPUTE_Y", false);
 
     let prof = std::env::var("SYMPHONY_PROFILE").ok().as_deref() == Some("1");
     let t_all = Instant::now();
@@ -442,10 +491,15 @@ where
         };
         for i in 0..3 {
             if const_coeff_fastpath {
-                mles_had.push(StreamingMleEnum::sparse_mat_vec_const_coeff(
-                    M[i].clone(),
-                    w0.as_ref().expect("w0 present").clone(),
-                ));
+                if const_coeff_precompute_y {
+                    let y0 = sparse_mat_vec_const_coeff_dense::<R>(&M[i], w0.as_ref().expect("w0 present").as_slice());
+                    mles_had.push(StreamingMleEnum::base_scalar_vec(log_m, Arc::new(y0)));
+                } else {
+                    mles_had.push(StreamingMleEnum::sparse_mat_vec_const_coeff(
+                        M[i].clone(),
+                        w0.as_ref().expect("w0 present").clone(),
+                    ));
+                }
             } else {
                 mles_had.push(StreamingMleEnum::sparse_mat_vec(
                 M[i].clone(),
@@ -942,6 +996,7 @@ where
                 Ms[0][2].clone(),
             ],
         );
+    let const_coeff_precompute_y = const_coeff_fastpath && env_flag("CONST_COEFF_PRECOMPUTE_Y", false);
     // Keep this function bit-for-bit aligned with `prove_pi_fold_streaming` except that each
     // instance pulls y = M*w from its own matrices.
     let prof = std::env::var("SYMPHONY_PROFILE").ok().as_deref() == Some("1");
@@ -1066,10 +1121,18 @@ where
         };
         for i in 0..3 {
             if const_coeff_fastpath {
-                mles_had.push(StreamingMleEnum::sparse_mat_vec_const_coeff(
-                    Ms[inst_idx][i].clone(),
-                    w0.as_ref().expect("w0 present").clone(),
-                ));
+                if const_coeff_precompute_y {
+                    let y0 = sparse_mat_vec_const_coeff_dense::<R>(
+                        &Ms[inst_idx][i],
+                        w0.as_ref().expect("w0 present").as_slice(),
+                    );
+                    mles_had.push(StreamingMleEnum::base_scalar_vec(log_m, Arc::new(y0)));
+                } else {
+                    mles_had.push(StreamingMleEnum::sparse_mat_vec_const_coeff(
+                        Ms[inst_idx][i].clone(),
+                        w0.as_ref().expect("w0 present").clone(),
+                    ));
+                }
             } else {
                 mles_had.push(StreamingMleEnum::sparse_mat_vec(
                     Ms[inst_idx][i].clone(),
