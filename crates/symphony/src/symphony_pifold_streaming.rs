@@ -604,7 +604,7 @@ where
                         let coef = J[i][t];
                         h0 += coef * f[in_row].coeffs()[0];
                     }
-                    // Decompose in the same way as the generic path (paper-faithful), but only
+                    // Decompose exactly as the generic path does, but only
                     // write the nonzero column (col=0). Other columns remain zero in `digits_flat`.
                     let mut h_row = vec![R::BaseRing::ZERO; d];
                     h_row[0] = h0;
@@ -1083,6 +1083,7 @@ where
     let mut cba_all: Vec<Vec<(Vec<R>, R::BaseRing, R::BaseRing)>> = Vec::with_capacity(ell);
     let mut rc_all: Vec<Option<R::BaseRing>> = Vec::with_capacity(ell);
     let mut Js: Vec<Vec<Vec<R::BaseRing>>> = Vec::with_capacity(ell);
+    let t_coins = Instant::now();
 
     let n_f = witnesses[0].len();
     if n_f == 0 || n_f % rg_params.l_h != 0 {
@@ -1137,6 +1138,15 @@ where
         cba_all.push(cba);
         rc_all.push(rc);
     }
+    if prof {
+        eprintln!(
+            "[PiFold streaming hetero] coins+J: {:?} (ell={}, k_g={}, g_nvars={})",
+            t_coins.elapsed(),
+            ell,
+            rg_params.k_g,
+            g_nvars
+        );
+    }
 
     let rhos = transcript
         .get_challenges(ell)
@@ -1147,27 +1157,35 @@ where
     // -----------------
     // STREAMING Hadamard MLEs
     // -----------------
+    let t_had_build = Instant::now();
+    let mut t_w0 = std::time::Duration::from_secs(0);
+    let mut t_y0 = std::time::Duration::from_secs(0);
     // `eq(s, ·)` is shared across all instances; include it once.
     let mut mles_had: Vec<StreamingMleEnum<R>> = Vec::with_capacity(1 + ell * 3);
     mles_had.push(StreamingMleEnum::eq_base(s_base.clone()));
     for inst_idx in 0..ell {
         let w0 = if const_coeff_fastpath {
-            Some(Arc::new(
+            let t0 = Instant::now();
+            let out = Some(Arc::new(
                 witnesses[inst_idx]
                     .iter()
                     .map(|x| x.coeffs()[0])
                     .collect::<Vec<_>>(),
-            ))
+            ));
+            t_w0 += t0.elapsed();
+            out
         } else {
             None
         };
         for i in 0..3 {
             if const_coeff_fastpath {
                 if const_coeff_precompute_y {
+                    let t0 = Instant::now();
                     let y0 = sparse_mat_vec_const_coeff_dense::<R>(
                         &Ms[inst_idx][i],
                         w0.as_ref().expect("w0 present").as_slice(),
                     );
+                    t_y0 += t0.elapsed();
                     mles_had.push(StreamingMleEnum::base_scalar_vec(log_m, Arc::new(y0)));
                 } else {
                     mles_had.push(StreamingMleEnum::sparse_mat_vec_const_coeff(
@@ -1182,6 +1200,16 @@ where
                 ));
             }
         }
+    }
+    if prof {
+        eprintln!(
+            "[PiFold streaming hetero] had MLE build: {:?} (w0={:?}, precompute_y={:?}, const_coeff_fastpath={}, precompute_y_enabled={})",
+            t_had_build.elapsed(),
+            t_w0,
+            t_y0,
+            const_coeff_fastpath,
+            const_coeff_precompute_y
+        );
     }
 
     let rhos_had = rhos.clone();
