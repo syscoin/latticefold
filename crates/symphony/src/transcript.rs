@@ -68,11 +68,11 @@ impl<R: OverField> Transcript<R> for PoseidonTranscript<R> {
     /// 3. Different values at any absorption point lead to different transcript states
     ///
     /// For SP1 one-proof mode (ℓ=47, l_h=512): reduces J absorption from ~385k elements to ~24k.
-    /*fn absorb_field_element(&mut self, v: &R::BaseRing) {
+    fn absorb_field_element(&mut self, v: &R::BaseRing) {
         let elems: Vec<_> = v.to_base_prime_field_elements().collect();
         self.metrics.absorbed_elems += elems.len() as u64;
         self.sponge.absorb(&elems);
-    }*/
+    }
 
     fn get_challenge(&mut self) -> R::BaseRing {
         let extension_degree = R::BaseRing::extension_degree();
