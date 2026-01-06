@@ -45,6 +45,74 @@ use crate::symphony_pifold_batched::{PiFoldAuxWitness, PiFoldBatchedProof, PiFol
 // Re-export streaming types
 pub use crate::streaming_sumcheck::{StreamingProverMsg, StreamingSumcheckState};
 
+fn is_const_coeff_ring_elem<R: stark_rings::PolyRing>(x: &R) -> bool {
+    x.coeffs()
+        .iter()
+        .skip(1)
+        .all(|c| *c == <R as stark_rings::PolyRing>::BaseRing::ZERO)
+}
+
+fn const_coeff_fastpath_enabled(default_on: bool) -> bool {
+    std::env::var("CONST_COEFF_FASTPATH")
+        .ok()
+        .as_deref()
+        .map(|s| !(s == "0" || s.eq_ignore_ascii_case("false")))
+        .unwrap_or(default_on)
+}
+
+fn seems_const_coeff_inputs<R: stark_rings::PolyRing>(
+    witnesses: &[Arc<Vec<R>>],
+    mats_to_check: &[Arc<stark_rings_linalg::SparseMatrix<R>>],
+) -> bool {
+    // Cheap, deterministic sampling to avoid unsound use of the fast path.
+    // Defaults are tiny vs proving time; override via env if desired.
+    let w_samples: usize = std::env::var("CONST_COEFF_FASTPATH_WITNESS_SAMPLES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1024);
+    let m_entries: usize = std::env::var("CONST_COEFF_FASTPATH_MATRIX_ENTRIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4096);
+
+    // Witness sample
+    if w_samples > 0 {
+        for w in witnesses.iter().take(1) {
+            let step = (w.len() / w_samples.max(1)).max(1);
+            let mut checked = 0usize;
+            for i in (0..w.len()).step_by(step) {
+                if !is_const_coeff_ring_elem(&w[i]) {
+                    return false;
+                }
+                checked += 1;
+                if checked >= w_samples {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Matrix coefficient sample (scan nonzeros)
+    if m_entries > 0 {
+        let mut checked = 0usize;
+        for m in mats_to_check.iter().take(3) {
+            for row in &m.coeffs {
+                for (coeff, _col) in row {
+                    if !is_const_coeff_ring_elem(coeff) {
+                        return false;
+                    }
+                    checked += 1;
+                    if checked >= m_entries {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    true
+}
+
 fn absorb_public_inputs<R: OverField>(ts: &mut impl Transcript<R>, public_inputs: &[R::BaseRing])
 where
     R::BaseRing: Zq,
@@ -253,6 +321,18 @@ pub fn prove_pi_fold_streaming<R: CoeffRing>(
 where
     R::BaseRing: Zq + Decompose,
 {
+    // Constant-coefficient fast path: enabled by default.
+    //
+    // For many real applications (including SP1-style R1CS), matrices and witnesses are base-field
+    // scalars embedded into the ring as constant-coefficient polynomials. In that common case,
+    // `y = M*w` stays constant-coefficient and Π_had can be evaluated mostly in the base ring.
+    //
+    // Safety: we auto-disable this fast path if a small deterministic sample detects any
+    // non-constant coefficients. Override the default at runtime with `CONST_COEFF_FASTPATH=0/false`.
+    let const_coeff_fastpath_requested = const_coeff_fastpath_enabled(true);
+    let const_coeff_fastpath = const_coeff_fastpath_requested
+        && seems_const_coeff_inputs::<R>(witnesses, &[M[0].clone(), M[1].clone(), M[2].clone()]);
+
     let prof = std::env::var("SYMPHONY_PROFILE").ok().as_deref() == Some("1");
     let t_all = Instant::now();
     let ell = cms.len();
@@ -350,32 +430,69 @@ where
     let mut mles_had: Vec<StreamingMleEnum<R>> = Vec::with_capacity(1 + ell * 3);
     mles_had.push(StreamingMleEnum::eq_base(s_base.clone()));
     for inst_idx in 0..ell {
+        let w0 = if const_coeff_fastpath {
+            Some(Arc::new(
+                witnesses[inst_idx]
+                    .iter()
+                    .map(|x| x.coeffs()[0])
+                    .collect::<Vec<_>>(),
+            ))
+        } else {
+            None
+        };
         for i in 0..3 {
-            mles_had.push(StreamingMleEnum::sparse_mat_vec(
+            if const_coeff_fastpath {
+                mles_had.push(StreamingMleEnum::sparse_mat_vec_const_coeff(
+                    M[i].clone(),
+                    w0.as_ref().expect("w0 present").clone(),
+                ));
+            } else {
+                mles_had.push(StreamingMleEnum::sparse_mat_vec(
                 M[i].clone(),
                 witnesses[inst_idx].clone(),
-            ));
+                ));
+            }
         }
     }
 
     // Hadamard combiner (must match Π_had: coefficient-wise constraint with alpha powers)
     let rhos_had = rhos.clone();
-    let comb_had = move |vals: &[R]| -> R {
-        let eq = vals[0];
-        let mut acc_all = R::ZERO;
+    let comb_had: Box<dyn Fn(&[R]) -> R + Sync + Send> = if const_coeff_fastpath {
+        // Constant-coeff specialization: only coeff[0] can be nonzero.
+        // This preserves the Π_had relation when inputs are embedded base-field scalars.
+        Box::new(move |vals: &[R]| -> R {
+            let eq0 = vals[0].coeffs()[0];
+            let mut acc_all0 = R::BaseRing::ZERO;
         for inst_idx in 0..ell {
-            let base = 1 + inst_idx * 3;
-            let y1 = &vals[base];
-            let y2 = &vals[base + 1];
-            let y3 = &vals[base + 2];
-            let mut acc = R::ZERO;
-            for j in 0..d {
-                let term = y1.coeffs()[j] * y2.coeffs()[j] - y3.coeffs()[j];
-                acc += alpha_pows[j] * eq * R::from(term);
+                let base = 1 + inst_idx * 3;
+                let y10 = vals[base].coeffs()[0];
+                let y20 = vals[base + 1].coeffs()[0];
+                let y30 = vals[base + 2].coeffs()[0];
+                let term0 = y10 * y20 - y30;
+                // α_0 is 1 in our construction (pow starts at 1), but keep it explicit.
+                let acc0 = alpha_pows[0].coeffs()[0] * eq0 * term0;
+                acc_all0 += rhos_had[inst_idx].coeffs()[0] * acc0;
             }
-            acc_all += rhos_had[inst_idx] * acc;
-        }
-        acc_all
+            R::from(acc_all0)
+        })
+    } else {
+        Box::new(move |vals: &[R]| -> R {
+            let eq = vals[0];
+            let mut acc_all = R::ZERO;
+            for inst_idx in 0..ell {
+                let base = 1 + inst_idx * 3;
+                let y1 = &vals[base];
+                let y2 = &vals[base + 1];
+                let y3 = &vals[base + 2];
+                let mut acc = R::ZERO;
+                for j in 0..d {
+                    let term = y1.coeffs()[j] * y2.coeffs()[j] - y3.coeffs()[j];
+                    acc += alpha_pows[j] * eq * R::from(term);
+                }
+                acc_all += rhos_had[inst_idx] * acc;
+            }
+            acc_all
+        })
     };
 
     // -----------------
@@ -418,18 +535,18 @@ where
             cfg_into_iter!(0..m_j).for_each(|out_row| {
                 let i = out_row % lambda_pj;
                 let b = out_row / lambda_pj;
-                let mut h_row = vec![R::BaseRing::ZERO; d];
+        let mut h_row = vec![R::BaseRing::ZERO; d];
                 for t in 0..l_h {
                     let in_row = b * l_h + t;
-                    if in_row >= f.len() {
-                        continue;
-                    }
-                    let coef = J[i][t];
-                    let coeffs = f[in_row].coeffs();
-                    for col in 0..d {
-                        h_row[col] += coef * coeffs[col];
-                    }
-                }
+            if in_row >= f.len() {
+                continue;
+            }
+            let coef = J[i][t];
+            let coeffs = f[in_row].coeffs();
+            for col in 0..d {
+                h_row[col] += coef * coeffs[col];
+            }
+        }
                 let digits = h_row.decompose_to_vec(d_prime, k_g);
                 for col in 0..d {
                     for dig in 0..k_g {
@@ -512,8 +629,8 @@ where
             }
             #[cfg(not(feature = "parallel"))]
             {
-                for out_row in 0..m_j {
-                    for col in 0..d {
+            for out_row in 0..m_j {
+                for col in 0..d {
                         let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
                         let g = exp::<R>(digit).expect("Exp failed");
                         let mjv = ev(&g, *beta_i);
@@ -606,7 +723,7 @@ where
     for round_idx in 0..rounds {
         // Prover messages (in the same order as latticefold's shared schedule)
         if round_idx < log_m {
-            let pm_had = StreamingSumcheck::prove_round(&mut had_state, v_msg_had, &comb_had);
+            let pm_had = StreamingSumcheck::prove_round(&mut had_state, v_msg_had, comb_had.as_ref());
             transcript.absorb_slice(&pm_had.evaluations);
             had_msgs.push(pm_had);
         }
@@ -658,7 +775,7 @@ where
             "[PiFold streaming] sumchecks done in {:?} (log_m={}, g_nvars={}, rounds={})",
             t_sumcheck.elapsed(),
             log_m,
-            g_nvars,
+        g_nvars,
             rounds
         );
     }
@@ -802,6 +919,17 @@ pub fn prove_pi_fold_streaming_hetero_m<R: CoeffRing>(
 where
     R::BaseRing: Zq + Decompose,
 {
+    let const_coeff_fastpath_requested = const_coeff_fastpath_enabled(true);
+    // Cheap sample: first witness and first instance matrices.
+    let const_coeff_fastpath = const_coeff_fastpath_requested
+        && seems_const_coeff_inputs::<R>(
+            witnesses,
+            &[
+                Ms[0][0].clone(),
+                Ms[0][1].clone(),
+                Ms[0][2].clone(),
+            ],
+        );
     // Keep this function bit-for-bit aligned with `prove_pi_fold_streaming` except that each
     // instance pulls y = M*w from its own matrices.
     let prof = std::env::var("SYMPHONY_PROFILE").ok().as_deref() == Some("1");
@@ -914,31 +1042,65 @@ where
     let mut mles_had: Vec<StreamingMleEnum<R>> = Vec::with_capacity(1 + ell * 3);
     mles_had.push(StreamingMleEnum::eq_base(s_base.clone()));
     for inst_idx in 0..ell {
+        let w0 = if const_coeff_fastpath {
+            Some(Arc::new(
+                witnesses[inst_idx]
+                    .iter()
+                    .map(|x| x.coeffs()[0])
+                    .collect::<Vec<_>>(),
+            ))
+        } else {
+            None
+        };
         for i in 0..3 {
-            mles_had.push(StreamingMleEnum::sparse_mat_vec(
-                Ms[inst_idx][i].clone(),
-                witnesses[inst_idx].clone(),
-            ));
+            if const_coeff_fastpath {
+                mles_had.push(StreamingMleEnum::sparse_mat_vec_const_coeff(
+                    Ms[inst_idx][i].clone(),
+                    w0.as_ref().expect("w0 present").clone(),
+                ));
+            } else {
+                mles_had.push(StreamingMleEnum::sparse_mat_vec(
+                    Ms[inst_idx][i].clone(),
+                    witnesses[inst_idx].clone(),
+                ));
+            }
         }
     }
 
     let rhos_had = rhos.clone();
-    let comb_had = move |vals: &[R]| -> R {
-        let eq = vals[0];
-        let mut acc_all = R::ZERO;
-        for inst_idx in 0..ell {
-            let base = 1 + inst_idx * 3;
-            let y1 = &vals[base];
-            let y2 = &vals[base + 1];
-            let y3 = &vals[base + 2];
-            let mut acc = R::ZERO;
-            for j in 0..d {
-                let term = y1.coeffs()[j] * y2.coeffs()[j] - y3.coeffs()[j];
-                acc += alpha_pows[j] * eq * R::from(term);
+    let comb_had: Box<dyn Fn(&[R]) -> R + Sync + Send> = if const_coeff_fastpath {
+        Box::new(move |vals: &[R]| -> R {
+            let eq0 = vals[0].coeffs()[0];
+            let mut acc_all0 = R::BaseRing::ZERO;
+            for inst_idx in 0..ell {
+                let base = 1 + inst_idx * 3;
+                let y10 = vals[base].coeffs()[0];
+                let y20 = vals[base + 1].coeffs()[0];
+                let y30 = vals[base + 2].coeffs()[0];
+                let term0 = y10 * y20 - y30;
+                let acc0 = alpha_pows[0].coeffs()[0] * eq0 * term0;
+                acc_all0 += rhos_had[inst_idx].coeffs()[0] * acc0;
             }
-            acc_all += rhos_had[inst_idx] * acc;
-        }
-        acc_all
+            R::from(acc_all0)
+        })
+    } else {
+        Box::new(move |vals: &[R]| -> R {
+            let eq = vals[0];
+            let mut acc_all = R::ZERO;
+            for inst_idx in 0..ell {
+                let base = 1 + inst_idx * 3;
+                let y1 = &vals[base];
+                let y2 = &vals[base + 1];
+                let y3 = &vals[base + 2];
+                let mut acc = R::ZERO;
+                for j in 0..d {
+                    let term = y1.coeffs()[j] * y2.coeffs()[j] - y3.coeffs()[j];
+                    acc += alpha_pows[j] * eq * R::from(term);
+                }
+                acc_all += rhos_had[inst_idx] * acc;
+            }
+            acc_all
+        })
     };
 
     // -----------------
@@ -955,8 +1117,8 @@ where
     let t_digits = Instant::now();
     let mut proj_digits_by_inst: Vec<Arc<Vec<R::BaseRing>>> = Vec::with_capacity(ell);
     for inst_idx in 0..ell {
-        let f: &[R] = &witnesses[inst_idx];
-        let J = &Js[inst_idx];
+            let f: &[R] = &witnesses[inst_idx];
+            let J = &Js[inst_idx];
         let k_g = rg_params.k_g;
         let lambda_pj = rg_params.lambda_pj;
         let l_h = rg_params.l_h;
@@ -1149,7 +1311,7 @@ where
     let t_sumcheck = Instant::now();
     for round_idx in 0..rounds {
         if round_idx < log_m {
-            let pm_had = StreamingSumcheck::prove_round(&mut had_state, v_msg_had, &comb_had);
+            let pm_had = StreamingSumcheck::prove_round(&mut had_state, v_msg_had, comb_had.as_ref());
             transcript.absorb_slice(&pm_had.evaluations);
             had_msgs.push(pm_had);
         }
@@ -1263,18 +1425,18 @@ where
             };
             #[cfg(not(feature = "parallel"))]
             let acc = {
-                let mut acc = R::ZERO;
-                for out_row in 0..m_j {
-                    for col in 0..d {
+            let mut acc = R::ZERO;
+            for out_row in 0..m_j {
+                for col in 0..d {
                         let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
                         let g = exp::<R>(digit).expect("Exp failed");
-                        for rep in 0..reps {
-                            let r = out_row + rep * m_j;
-                            let idx = col * m + r;
-                            acc += R::from(ts_r_mon[idx]) * g;
-                        }
+                    for rep in 0..reps {
+                        let r = out_row + rep * m_j;
+                        let idx = col * m + r;
+                        acc += R::from(ts_r_mon[idx]) * g;
                     }
                 }
+            }
                 acc
             };
             b_inst.push(acc);

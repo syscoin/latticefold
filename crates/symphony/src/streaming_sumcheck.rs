@@ -28,6 +28,19 @@ where
         witness: Arc<Vec<R>>,
         num_vars: usize,
     },
+    /// Constant-coefficient specialization of `SparseMatVec`.
+    ///
+    /// When the matrix and witness are embedded base-field scalars inside the ring (i.e., all
+    /// non-constant coefficients are zero), the product `M*w` stays constant-coefficient too.
+    /// We can then evaluate this MLE purely in the base ring and lift to `R` at the end.
+    ///
+    /// This is expected for many applications (including SP1-style R1CS), and matches the
+    /// “base-field embedded in the ring” setting used in the Symphony paper streaming notes.
+    SparseMatVecConstCoeff {
+        matrix: Arc<SparseMatrix<R>>,
+        witness0: Arc<Vec<R::BaseRing>>,
+        num_vars: usize,
+    },
     /// A base-ring scalar table (stored as BaseRing), lifted to R via R::from.
     BaseScalarVec {
         evals: Arc<Vec<R::BaseRing>>,
@@ -78,6 +91,17 @@ where
         }
     }
 
+    pub fn sparse_mat_vec_const_coeff(matrix: Arc<SparseMatrix<R>>, witness0: Arc<Vec<R::BaseRing>>) -> Self {
+        let nrows = matrix.nrows;
+        assert!(nrows.is_power_of_two(), "nrows must be power-of-two");
+        let num_vars = nrows.trailing_zeros() as usize;
+        Self::SparseMatVecConstCoeff {
+            matrix,
+            witness0,
+            num_vars,
+        }
+    }
+
     pub fn base_scalar_vec(num_vars: usize, evals: Arc<Vec<R::BaseRing>>) -> Self {
         Self::BaseScalarVec { evals, num_vars }
     }
@@ -119,6 +143,7 @@ where
         match self {
             StreamingMleEnum::Dense(m) => m.num_vars,
             StreamingMleEnum::SparseMatVec { num_vars, .. } => *num_vars,
+            StreamingMleEnum::SparseMatVecConstCoeff { num_vars, .. } => *num_vars,
             StreamingMleEnum::BaseScalarVec { num_vars, .. } => *num_vars,
             StreamingMleEnum::PeriodicBaseScalarVec { num_vars, .. } => *num_vars,
             StreamingMleEnum::EqBase { r, .. } => r.len(),
@@ -139,6 +164,18 @@ where
                     }
                 }
                 sum
+            }
+            StreamingMleEnum::SparseMatVecConstCoeff {
+                matrix, witness0, ..
+            } => {
+                let mut sum = R::BaseRing::ZERO;
+                for (coeff, col_idx) in &matrix.coeffs[index] {
+                    if *col_idx < witness0.len() {
+                        // Safety: caller guarantees constant-coefficient embedding.
+                        sum += coeff.coeffs()[0] * witness0[*col_idx];
+                    }
+                }
+                R::from(sum)
             }
             StreamingMleEnum::BaseScalarVec { evals, .. } => R::from(evals[index]),
             StreamingMleEnum::PeriodicBaseScalarVec {
@@ -197,6 +234,22 @@ where
                     })
                     .collect();
                 StreamingMleEnum::dense(new_evals)
+            }
+            // Constant-coeff sparse mat-vec: keep it base-scalar after fixing.
+            StreamingMleEnum::SparseMatVecConstCoeff { num_vars, .. } => {
+                let r0 = r.coeffs()[0];
+                let one_minus = R::BaseRing::ONE - r0;
+                let new_evals: Vec<R::BaseRing> = (0..half)
+                    .map(|i| {
+                        let f0 = self.eval_at_index(i << 1).coeffs()[0];
+                        let f1 = self.eval_at_index((i << 1) | 1).coeffs()[0];
+                        one_minus * f0 + r0 * f1
+                    })
+                    .collect();
+                StreamingMleEnum::BaseScalarVec {
+                    evals: Arc::new(new_evals),
+                    num_vars: num_vars - 1,
+                }
             }
             // Base-scalar table: keep it base-scalar after fixing (critical for memory).
             //
