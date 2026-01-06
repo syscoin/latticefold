@@ -184,15 +184,13 @@ fn main() {
     // Step 2: Create witness (same for all chunks)
     println!("Step 2: Creating witness...");
     let ncols = cache.ncols;
-    let witness_path =
-        std::env::var("SP1_WITNESS_U32LE").expect("Set SP1_WITNESS_U32LE=/path/to/witness.u32le");
-    let w0 = Instant::now();
-    let witness = Arc::new(load_witness_u32le(&witness_path, ncols));
-    println!("  Loaded witness from {witness_path} in {:?}.", w0.elapsed());
+    let mut witness: Vec<R> = vec![R::ZERO; ncols];
+    witness[0] = R::ONE;
+    let witness = Arc::new(witness);
     if ncols.is_power_of_two() {
-        println!("  Witness length: {ncols} (2^{})", ncols.trailing_zeros());
+    println!("  Witness length: {ncols} (2^{})\n", ncols.trailing_zeros());
     } else {
-        println!("  Witness length: {ncols}");
+        println!("  Witness length: {ncols}\n");
     }
 
     // Step 3: Setup Symphony parameters
@@ -272,17 +270,9 @@ fn main() {
         rg_params.k_g,
     ));
 
-    // Public statement binding: SP1 program hash (vk hash) and statement digest (public-values hash).
-    // We represent each bytes32 as 8 little-endian u32 limbs, and absorb all 16 limbs as field elements.
-    let vk_hash_bytes32 = parse_bytes32_env("SP1_VK_HASH_BYTES32");
-    let stmt_digest_bytes32 = parse_bytes32_env("SP1_STATEMENT_DIGEST_BYTES32");
-    let vk_u32s = bytes32_to_u32s_le(vk_hash_bytes32);
-    let stmt_u32s = bytes32_to_u32s_le(stmt_digest_bytes32);
-    let public_inputs: Vec<<R as PolyRing>::BaseRing> = vk_u32s
-        .into_iter()
-        .chain(stmt_u32s.into_iter())
-        .map(|x| <R as PolyRing>::BaseRing::from(x as u128))
-        .collect();
+    let public_inputs: Vec<<R as PolyRing>::BaseRing> = vec![
+        <R as PolyRing>::BaseRing::from(1u128),
+    ];
 
     // Step 4: Prove chunks with limited concurrency (actually parallel within batches)
     println!(
