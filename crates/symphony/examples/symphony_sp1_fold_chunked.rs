@@ -166,7 +166,7 @@ fn main() {
     let l_h: usize = std::env::var("L_H")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(512);
+        .unwrap_or(256);
     // Pad columns to a multiple of l_h to satisfy Π_rg’s block structure.
     //
     // Note: Increasing `l_h` also increases the FS coin bytes because `derive_J` squeezes

@@ -280,15 +280,9 @@ where
             return Err("PiFold: inconsistent witness lengths".to_string());
         }
 
-        // Bind statement commitment, derive and bind J.
+        // Bind statement commitment, derive J.
         transcript.absorb_slice(cm_f);
         let J = derive_J::<R>(transcript, rg_params.lambda_pj, rg_params.l_h);
-        for row in &J {
-            for x in row {
-                transcript.absorb_field_element(x);
-            }
-        }
-
 
         // Keep J; we will stream-compute projected digits as needed (no H_digits materialization).
         Js.push(J);
@@ -815,11 +809,6 @@ where
     for cm_f in cms.iter() {
         transcript.absorb_slice(cm_f);
         let J = derive_J::<R>(transcript, rg_params.lambda_pj, rg_params.l_h);
-        for row in &J {
-            for x in row {
-                transcript.absorb_field_element(x);
-            }
-        }
         Js.push(J);
 
         let mut cba: Vec<(Vec<R>, R::BaseRing, R::BaseRing)> = Vec::with_capacity(rg_params.k_g);
@@ -1166,11 +1155,6 @@ where
     for cm_f in cms.iter() {
         ts.absorb_slice(cm_f);
         let J = derive_J::<R>(&mut ts, rg_params.lambda_pj, rg_params.l_h);
-        for row in &J {
-            for x in row {
-                ts.absorb_field_element(x);
-            }
-        }
         Js.push(J);
 
         let mut cba: Vec<(Vec<R>, R::BaseRing, R::BaseRing)> = Vec::with_capacity(rg_params.k_g);
@@ -1737,11 +1721,6 @@ where
     for cm_f in cms.iter() {
         transcript.absorb_slice(cm_f);
         let J = derive_J::<R>(transcript, rg_params.lambda_pj, rg_params.l_h);
-        for row in &J {
-            for x in row {
-                transcript.absorb_field_element(x);
-            }
-        }
         Js.push(J);
 
         let mut cba: Vec<(Vec<R>, R::BaseRing, R::BaseRing)> = Vec::with_capacity(rg_params.k_g);

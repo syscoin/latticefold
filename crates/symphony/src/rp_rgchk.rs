@@ -170,14 +170,8 @@ where
         transcript.absorb_slice(cm_f);
 
         // --- Step 1 (paper): verifier sends projection matrix J ← χ^{λ_pj×ℓ_h}.
-        // Here we derive J from the transcript (FS-style) and then absorb it back in to
-        // bind it as part of the transcript state for subsequent challenges.
+        // Here we derive J from the transcript (FS-style).
         let J = derive_J::<R>(transcript, self.params.lambda_pj, self.params.l_h);
-        for row in &J {
-            for x in row {
-                transcript.absorb_field_element(x);
-            }
-        }
 
         // --- Step 2 (paper): compute H := (I_{n/ℓ_h} ⊗ J) * cf(f).
         let d = R::dimension();
@@ -322,15 +316,10 @@ pub fn verify_monomial_only<R: OverField>(
     transcript: &mut impl Transcript<R>,
 ) -> bool {
     transcript.absorb_slice(cm_f);
-    // Re-derive and bind J into the transcript.
+    // Re-derive J.
     let J = derive_J::<R>(transcript, proof.params.lambda_pj, proof.params.l_h);
     if J != proof.J {
         return false;
-    }
-    for row in &J {
-        for x in row {
-            transcript.absorb_field_element(x);
-        }
     }
     // Mirror Π_rg ordering: bind v_digits after r̄ is fixed but before sampling s̄ and s.
     let log_mj = log2(proof.m_j.next_power_of_two()) as usize;
@@ -375,15 +364,10 @@ where
     R::BaseRing: Zq,
 {
     transcript.absorb_slice(cm_f);
-    // Re-derive and bind J into the transcript.
+    // Re-derive J.
     let J = derive_J::<R>(transcript, proof.params.lambda_pj, proof.params.l_h);
     if J != proof.J {
         return Err(RPConsistencyError::JMismatch);
-    }
-    for row in &J {
-        for x in row {
-            transcript.absorb_field_element(x);
-        }
     }
 
     let d = R::dimension();
@@ -590,14 +574,9 @@ pub fn bind_pi_rg_transcript<R: CoeffRing>(
     R::BaseRing: Zq,
 {
     transcript.absorb_slice(cm_f);
-    // Re-derive and bind J into the transcript.
+    // Re-derive J.
     let J = derive_J::<R>(transcript, proof.params.lambda_pj, proof.params.l_h);
     assert_eq!(J, proof.J, "bind_pi_rg_transcript: J mismatch");
-    for row in &J {
-        for x in row {
-            transcript.absorb_field_element(x);
-        }
-    }
 
     // Mirror Pi_rg ordering: bind v_digits after the `r` prefix is fixed but before sampling `s`.
     let d = R::dimension();
@@ -791,12 +770,7 @@ mod tests {
         // with an incorrect hook_round.
         let mut ts_v_bad = PoseidonTranscript::empty::<PC>();
         ts_v_bad.absorb_slice(&cm_f);
-        let J = super::derive_J::<R>(&mut ts_v_bad, proof.params.lambda_pj, proof.params.l_h);
-        for row in &J {
-            for x in row {
-                ts_v_bad.absorb_field_element(x);
-            }
-        }
+        let _J = super::derive_J::<R>(&mut ts_v_bad, proof.params.lambda_pj, proof.params.l_h);
         // wrong hook_round: shift by 1 (if possible)
         let d = R::dimension();
         let log_d = log2(d.next_power_of_two()) as usize;

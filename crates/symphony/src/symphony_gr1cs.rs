@@ -256,11 +256,6 @@ where
 
     transcript.absorb_slice(cm_f);
     let J = derive_J::<R>(transcript, rg_params.lambda_pj, rg_params.l_h);
-    for row in &J {
-        for x in row {
-            transcript.absorb_field_element(x);
-        }
-    }
 
     let blocks = n_f / rg_params.l_h;
     let m_j = blocks * rg_params.lambda_pj;
@@ -499,11 +494,6 @@ where
     let J = derive_J::<R>(transcript, proof.rg.params.lambda_pj, proof.rg.params.l_h);
     if J != proof.rg.J {
         return Err(PiGr1csError::Rg(RPConsistencyError::JMismatch));
-    }
-    for row in &J {
-        for x in row {
-            transcript.absorb_field_element(x);
-        }
     }
 
     // setchk vector-only pre-sumcheck coins
