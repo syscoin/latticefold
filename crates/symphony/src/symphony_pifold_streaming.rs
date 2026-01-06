@@ -1187,12 +1187,20 @@ where
     let mon_sumcheck = convert_streaming_proof(&StreamingProof(mon_msgs));
 
     // -----------------
-    // Auxiliary transcript witness messages (had_u, mon_b)
+    // Compute aux witness (match prove_pi_fold_streaming)
     // -----------------
-    // `StreamingSumcheckState` keeps one last variable to be fixed after the final prover round.
-    let had_rand = had_state.randomness.clone();
+    // Final randomness vectors for each sumcheck.
+    let had_rand = sampled[..log_m].to_vec();
+    let mon_rand = sampled[..g_nvars].to_vec();
     had_state.randomness = had_rand.clone();
-    had_state.fix_last_variable(*had_rand.last().expect("had_rand non-empty"));
+    mon_state.randomness = mon_rand.clone();
+    if log_m > 0 {
+        had_state.fix_last_variable(*had_rand.last().expect("had_rand non-empty"));
+    }
+    if g_nvars > 0 {
+        mon_state.fix_last_variable(*mon_rand.last().expect("mon_rand non-empty"));
+    }
+
     let had_evals = had_state.final_evals();
     let mut had_u: Vec<[Vec<R::BaseRing>; 3]> = Vec::with_capacity(ell);
     for inst_idx in 0..ell {
@@ -1209,18 +1217,51 @@ where
         had_u.push(U);
     }
 
-    let mon_rand = mon_state.randomness.clone();
-    mon_state.randomness = mon_rand.clone();
-    mon_state.fix_last_variable(*mon_rand.last().expect("mon_rand non-empty"));
-    let mon_evals = mon_state.final_evals();
+    let reps = m / m_j;
+    let ts_r_mon = ts_weights(&mon_rand);
     let mut mon_b: Vec<Vec<R>> = Vec::with_capacity(ell);
     for inst_idx in 0..ell {
         let mut b_inst = Vec::with_capacity(rg_params.k_g);
+        let digits_flat = proj_digits_by_inst[inst_idx].clone();
         for dig in 0..rg_params.k_g {
-            // base points at mj (not eq); see comb_mon indexing.
-            let base = inst_idx * mon_mles_per + dig * 3;
-            let mj = mon_evals[base];
-            b_inst.push(mj);
+            #[cfg(feature = "parallel")]
+            let acc = {
+                use ark_std::cfg_into_iter;
+                let dig_local = dig;
+                let digits_flat = digits_flat.clone();
+                cfg_into_iter!(0..m_j)
+                    .map(|out_row| {
+                        let mut local = R::ZERO;
+                        for col in 0..d {
+                            let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig_local];
+                            let g = exp::<R>(digit).expect("Exp failed");
+                            for rep in 0..reps {
+                                let r = out_row + rep * m_j;
+                                let idx = col * m + r;
+                                local += R::from(ts_r_mon[idx]) * g;
+                            }
+                        }
+                        local
+                    })
+                    .reduce(|| R::ZERO, |a, b| a + b)
+            };
+            #[cfg(not(feature = "parallel"))]
+            let acc = {
+                let mut acc = R::ZERO;
+                for out_row in 0..m_j {
+                    for col in 0..d {
+                        let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
+                        let g = exp::<R>(digit).expect("Exp failed");
+                        for rep in 0..reps {
+                            let r = out_row + rep * m_j;
+                            let idx = col * m + r;
+                            acc += R::from(ts_r_mon[idx]) * g;
+                        }
+                    }
+                }
+                acc
+            };
+            b_inst.push(acc);
         }
         transcript.absorb_slice(&b_inst);
         mon_b.push(b_inst);

@@ -24,10 +24,10 @@ use symphony::sp1_r1cs_loader::FieldFromU64;
 use symphony::symphony_sp1_r1cs::open_sp1_r1cs_chunk_cache;
 use symphony::rp_rgchk::RPParams;
 use symphony::symphony_pifold_batched::prove_pi_fold_batched_sumcheck_fs;
-use symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m;
-use symphony::symphony_open::AjtaiOpenVerifier;
+use symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m;
 use symphony::symphony_pifold_streaming::prove_pi_fold_streaming_sumcheck_fs;
 use symphony::symphony_pifold_streaming::prove_pi_fold_streaming_sumcheck_fs_hetero_m;
+use symphony::symphony_open::MultiAjtaiOpenVerifier;
 
 /// BabyBear field element for loading R1CS.
 #[derive(Debug, Clone, Copy, Default)]
@@ -261,14 +261,31 @@ fn main() {
                 .iter()
                 .map(|m| [&*m[0], &*m[1], &*m[2]])
                 .collect();
-            let open = AjtaiOpenVerifier { scheme: (*scheme_main).clone() };
-            let openings: Vec<Vec<R>> = vec![witness.as_ref().clone(); num_chunks];
-            let _ = verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m::<R, PC>(
+
+            // IMPORTANT: do NOT clone the full witness `num_chunks` times here.
+            // Instead, (1) sanity-check the witness commitment once, then (2) verify the folding proof
+            // using the prover-provided auxiliary transcript messages (`out.aux`) so the verifier does
+            // not need per-instance openings.
+            let expected_cm = scheme_main
+                .commit_const_coeff_fast(&witness)
+                .expect("commit_const_coeff_fast failed")
+                .as_ref()
+                .to_vec();
+            assert_eq!(expected_cm, cm_main, "cm_f does not open to the provided witness");
+
+            // Faithful WE/DPP-facing check: verify Π_fold under Poseidon-FS and verify openings of
+            // the CP transcript-message commitments `cfs_*` to `out.aux`.
+            let open_cfs = MultiAjtaiOpenVerifier::new()
+                .with_scheme("cfs_had_u", (*scheme_had).clone())
+                .with_scheme("cfs_mon_b", (*scheme_mon).clone());
+            let _ = verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m::<R, PC>(
                 ms_refs.as_slice(),
                 &cms_all,
                 &out.proof,
-                &open,
-                &openings,
+                &open_cfs,
+                &out.cfs_had_u,
+                &out.cfs_mon_b,
+                &out.aux,
                 &public_inputs,
             )
             .expect("one-proof verify failed");

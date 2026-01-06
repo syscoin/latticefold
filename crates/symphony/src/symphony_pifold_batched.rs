@@ -630,7 +630,15 @@ where
     let mut ts = crate::transcript::PoseidonTranscript::<R>::empty::<PC>();
     ts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
     absorb_public_inputs::<R>(&mut ts, public_inputs);
-    verify_pi_fold_batched_and_fold_outputs_with_openings(&mut ts, M, cms, proof, open, cms_openings)
+    verify_pi_fold_batched_and_fold_outputs_with_openings_and_aux(
+        &mut ts,
+        M,
+        cms,
+        proof,
+        open,
+        cms_openings,
+        None,
+    )
 }
 
 /// Verifier (Poseidon-FS) for a *heterogeneous-matrix* batched Π_fold proof.
@@ -642,6 +650,7 @@ pub fn verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m<R: CoeffRing
     proof: &PiFoldBatchedProof<R>,
     open: &impl VfyOpen<R>,
     cms_openings: &[Vec<R>],
+    aux: Option<&PiFoldAuxWitness<R>>,
     public_inputs: &[R::BaseRing],
 ) -> Result<(SymphonyInstance<R>, SymphonyBatchLin<R>), String>
 where
@@ -651,28 +660,14 @@ where
     let mut ts = crate::transcript::PoseidonTranscript::<R>::empty::<PC>();
     ts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
     absorb_public_inputs::<R>(&mut ts, public_inputs);
-    verify_pi_fold_batched_and_fold_outputs_with_openings_hetero_m(&mut ts, Ms, cms, proof, open, cms_openings)
-}
-
-pub fn verify_pi_fold_batched_and_fold_outputs_with_openings_hetero_m<R: CoeffRing>(
-    transcript: &mut impl Transcript<R>,
-    Ms: &[[&SparseMatrix<R>; 3]],
-    cms: &[Vec<R>],
-    proof: &PiFoldBatchedProof<R>,
-    open: &impl VfyOpen<R>,
-    cms_openings: &[Vec<R>],
-) -> Result<(SymphonyInstance<R>, SymphonyBatchLin<R>), String>
-where
-    R::BaseRing: Zq + Decompose,
-{
     verify_pi_fold_batched_and_fold_outputs_with_openings_and_aux_hetero_m(
-        transcript,
+        &mut ts,
         Ms,
         cms,
         proof,
         open,
         cms_openings,
-        None,
+        aux,
     )
 }
 
@@ -689,15 +684,18 @@ pub fn verify_pi_fold_batched_and_fold_outputs_with_openings_and_aux_hetero_m<R:
 where
     R::BaseRing: Zq + Decompose,
 {
-    if cms.len() != cms_openings.len() {
-        return Err("PiFold: cms/openings length mismatch".to_string());
-    }
     if cms.len() != Ms.len() {
         return Err("PiFold: Ms/cms length mismatch".to_string());
     }
-
-    for (cm, open_val) in cms.iter().zip(cms_openings.iter()) {
-        open.verify_opening(transcript, "cm_witness", cm, &[], open_val, &[])?;
+    if !cms_openings.is_empty() {
+        if cms.len() != cms_openings.len() {
+            return Err("PiFold: cms/openings length mismatch".to_string());
+        }
+        for (cm, open_val) in cms.iter().zip(cms_openings.iter()) {
+            open.verify_opening(transcript, "cm_witness", cm, &[], open_val, &[])?;
+        }
+    } else if aux.is_none() {
+        return Err("PiFold: cms_openings required when aux is not provided".to_string());
     }
 
     let ell = cms.len();
@@ -1376,7 +1374,7 @@ where
         cm_f,
         proof,
         &NoOpen, // cm_f is not opened in CP relation
-        &vec![Vec::<R>::new(); ell], // no witness openings needed; lengths ignored when aux present
+        &[], // no witness openings needed; cm_f treated as part of the statement
         Some(aux),
     )?;
 
@@ -1391,6 +1389,57 @@ where
         open.verify_opening(&mut ts, "cfs_mon_b", &cfs_mon_b[i], &[], &aux.mon_b[i], &[])?;
     }
 
+    Ok(out)
+}
+
+/// WE/DPP-facing verifier for hetero-M batched Π_fold: check Poseidon-FS proof using CP transcript-message commitments.
+///
+/// This is the “one proof for all chunks” verification interface: `cm_f` and `cfs_*` are part of the
+/// statement, while `aux` is the (opened) CP transcript witness.
+pub fn verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m<R: CoeffRing, PC>(
+    Ms: &[[&SparseMatrix<R>; 3]],
+    cm_f: &[Vec<R>],
+    proof: &PiFoldBatchedProof<R>,
+    open: &impl VfyOpen<R>,
+    cfs_had_u: &[Vec<R>],
+    cfs_mon_b: &[Vec<R>],
+    aux: &PiFoldAuxWitness<R>,
+    public_inputs: &[R::BaseRing],
+) -> Result<(SymphonyInstance<R>, SymphonyBatchLin<R>), String>
+where
+    R::BaseRing: Zq + Decompose,
+    PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
+{
+    let mut ts = crate::transcript::PoseidonTranscript::<R>::empty::<PC>();
+    ts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
+    absorb_public_inputs::<R>(&mut ts, public_inputs);
+
+    if cfs_had_u.len() != cm_f.len() || cfs_mon_b.len() != cm_f.len() {
+        return Err("PiFoldCP: cfs length mismatch".to_string());
+    }
+    let ell = cm_f.len();
+    if ell == 0 {
+        return Err("PiFoldCP: empty batch".to_string());
+    }
+    if aux.had_u.len() != ell || aux.mon_b.len() != ell {
+        return Err("PiFoldCP: aux length mismatch".to_string());
+    }
+
+    let out = verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m::<R, PC>(
+        Ms,
+        cm_f,
+        proof,
+        &NoOpen, // cm_f is not opened in CP relation
+        &[],
+        Some(aux),
+        public_inputs,
+    )?;
+
+    for i in 0..ell {
+        let had_u_enc = encode_had_u_instance::<R>(&aux.had_u[i]);
+        open.verify_opening(&mut ts, "cfs_had_u", &cfs_had_u[i], &[], &had_u_enc, &[])?;
+        open.verify_opening(&mut ts, "cfs_mon_b", &cfs_mon_b[i], &[], &aux.mon_b[i], &[])?;
+    }
     Ok(out)
 }
 
@@ -1431,13 +1480,7 @@ where
     R::BaseRing: Zq + Decompose,
 {
     verify_pi_fold_batched_and_fold_outputs_with_openings_and_aux(
-        transcript,
-        M,
-        cms,
-        proof,
-        open,
-        cms_openings,
-        None,
+        transcript, M, cms, proof, open, cms_openings, None,
     )
 }
 
@@ -1455,15 +1498,21 @@ pub fn verify_pi_fold_batched_and_fold_outputs_with_openings_and_aux<R: CoeffRin
 where
     R::BaseRing: Zq + Decompose,
 {
-    if cms.len() != cms_openings.len() {
-        return Err("PiFold: cms/openings length mismatch".to_string());
-    }
-
     // Commitment-opening layer is verified **outside** the transcript schedule used for the
-    // folding/sumcheck subprotocols. Our AjtaiOpenVerifier ignores the transcript argument,
-    // matching the CP-SNARK intent.
-    for (cm, open_val) in cms.iter().zip(cms_openings.iter()) {
-        open.verify_opening(transcript, "cm_witness", cm, &[], open_val, &[])?;
+    // folding/sumcheck subprotocols.
+    //
+    // When `aux` is provided (CP/WE-facing path), the verifier does not need the full witness
+    // openings; callers may pass `cms_openings = &[]` to skip opening checks for `cm_witness`.
+    // (In that mode, `cm_f` is treated as part of the public statement.)
+    if !cms_openings.is_empty() {
+        if cms.len() != cms_openings.len() {
+            return Err("PiFold: cms/openings length mismatch".to_string());
+        }
+        for (cm, open_val) in cms.iter().zip(cms_openings.iter()) {
+            open.verify_opening(transcript, "cm_witness", cm, &[], open_val, &[])?;
+        }
+    } else if aux.is_none() {
+        return Err("PiFold: cms_openings required when aux is not provided".to_string());
     }
 
     let ell = cms.len();

@@ -97,6 +97,7 @@ fn test_pifold_streaming_hetero_m_roundtrip() {
         &out.proof,
         &open,
         &[f0, f1],
+        None,
         &public_inputs,
     )
     .expect("verify failed");
