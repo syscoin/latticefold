@@ -593,24 +593,48 @@ where
             cfg_into_iter!(0..m_j).for_each(|out_row| {
                 let i = out_row % lambda_pj;
                 let b = out_row / lambda_pj;
-        let mut h_row = vec![R::BaseRing::ZERO; d];
-                for t in 0..l_h {
-                    let in_row = b * l_h + t;
-            if in_row >= f.len() {
-                continue;
-            }
-            let coef = J[i][t];
-            let coeffs = f[in_row].coeffs();
-            for col in 0..d {
-                h_row[col] += coef * coeffs[col];
-            }
-        }
-                let digits = h_row.decompose_to_vec(d_prime, k_g);
-                for col in 0..d {
+                if const_coeff_fastpath {
+                    // Constant-coeff specialization: only coeff[0] can be nonzero.
+                    let mut h0 = R::BaseRing::ZERO;
+                    for t in 0..l_h {
+                        let in_row = b * l_h + t;
+                        if in_row >= f.len() {
+                            continue;
+                        }
+                        let coef = J[i][t];
+                        h0 += coef * f[in_row].coeffs()[0];
+                    }
+                    // Decompose in the same way as the generic path (paper-faithful), but only
+                    // write the nonzero column (col=0). Other columns remain zero in `digits_flat`.
+                    let mut h_row = vec![R::BaseRing::ZERO; d];
+                    h_row[0] = h0;
+                    let digits = h_row.decompose_to_vec(d_prime, k_g);
                     for dig in 0..k_g {
-                        let idx = (out_row * d + col) * k_g + dig;
+                        let idx = (out_row * d) * k_g + dig; // col=0
                         unsafe {
-                            *(out_ptr as *mut R::BaseRing).add(idx) = digits[col][dig];
+                            *(out_ptr as *mut R::BaseRing).add(idx) = digits[0][dig];
+                        }
+                    }
+                } else {
+                    let mut h_row = vec![R::BaseRing::ZERO; d];
+                    for t in 0..l_h {
+                        let in_row = b * l_h + t;
+                        if in_row >= f.len() {
+                            continue;
+                        }
+                        let coef = J[i][t];
+                        let coeffs = f[in_row].coeffs();
+                        for col in 0..d {
+                            h_row[col] += coef * coeffs[col];
+                        }
+                    }
+                    let digits = h_row.decompose_to_vec(d_prime, k_g);
+                    for col in 0..d {
+                        for dig in 0..k_g {
+                            let idx = (out_row * d + col) * k_g + dig;
+                            unsafe {
+                                *(out_ptr as *mut R::BaseRing).add(idx) = digits[col][dig];
+                            }
                         }
                     }
                 }
@@ -621,22 +645,40 @@ where
             for out_row in 0..m_j {
                 let i = out_row % lambda_pj;
                 let b = out_row / lambda_pj;
-                let mut h_row = vec![R::BaseRing::ZERO; d];
-                for t in 0..l_h {
-                    let in_row = b * l_h + t;
-                    if in_row >= f.len() {
-                        continue;
+                if const_coeff_fastpath {
+                    let mut h0 = R::BaseRing::ZERO;
+                    for t in 0..l_h {
+                        let in_row = b * l_h + t;
+                        if in_row >= f.len() {
+                            continue;
+                        }
+                        let coef = J[i][t];
+                        h0 += coef * f[in_row].coeffs()[0];
                     }
-                    let coef = J[i][t];
-                    let coeffs = f[in_row].coeffs();
-                    for col in 0..d {
-                        h_row[col] += coef * coeffs[col];
-                    }
-                }
-                let digits = h_row.decompose_to_vec(d_prime, k_g);
-                for col in 0..d {
+                    let mut h_row = vec![R::BaseRing::ZERO; d];
+                    h_row[0] = h0;
+                    let digits = h_row.decompose_to_vec(d_prime, k_g);
                     for dig in 0..k_g {
-                        digits_flat[(out_row * d + col) * k_g + dig] = digits[col][dig];
+                        digits_flat[(out_row * d) * k_g + dig] = digits[0][dig];
+                    }
+                } else {
+                    let mut h_row = vec![R::BaseRing::ZERO; d];
+                    for t in 0..l_h {
+                        let in_row = b * l_h + t;
+                        if in_row >= f.len() {
+                            continue;
+                        }
+                        let coef = J[i][t];
+                        let coeffs = f[in_row].coeffs();
+                        for col in 0..d {
+                            h_row[col] += coef * coeffs[col];
+                        }
+                    }
+                    let digits = h_row.decompose_to_vec(d_prime, k_g);
+                    for col in 0..d {
+                        for dig in 0..k_g {
+                            digits_flat[(out_row * d + col) * k_g + dig] = digits[col][dig];
+                        }
                     }
                 }
             }
@@ -1212,25 +1254,47 @@ where
             cfg_into_iter!(0..m_j).for_each(|out_row| {
                 let i = out_row % lambda_pj;
                 let b = out_row / lambda_pj;
-                let mut h_row = vec![R::BaseRing::ZERO; d];
-                for t in 0..l_h {
-                    let in_row = b * l_h + t;
-                    if in_row >= f.len() {
-                        continue;
+                if const_coeff_fastpath {
+                    let mut h0 = R::BaseRing::ZERO;
+                    for t in 0..l_h {
+                        let in_row = b * l_h + t;
+                        if in_row >= f.len() {
+                            continue;
+                        }
+                        let coef = J[i][t];
+                        h0 += coef * f[in_row].coeffs()[0];
                     }
-                    let coef = J[i][t];
-                    let coeffs = f[in_row].coeffs();
-                    for col in 0..d {
-                        h_row[col] += coef * coeffs[col];
-                    }
-                }
-                let digits = h_row.decompose_to_vec(d_prime, k_g);
-                for col in 0..d {
+                    let mut h_row = vec![R::BaseRing::ZERO; d];
+                    h_row[0] = h0;
+                    let digits = h_row.decompose_to_vec(d_prime, k_g);
                     for dig in 0..k_g {
-                        let idx = (out_row * d + col) * k_g + dig;
+                        let idx = (out_row * d) * k_g + dig; // col=0
                         unsafe {
                             let out = (out_ptr as *mut R::BaseRing).add(idx);
-                            *out = digits[col][dig];
+                            *out = digits[0][dig];
+                        }
+                    }
+                } else {
+                    let mut h_row = vec![R::BaseRing::ZERO; d];
+                    for t in 0..l_h {
+                        let in_row = b * l_h + t;
+                        if in_row >= f.len() {
+                            continue;
+                        }
+                        let coef = J[i][t];
+                        let coeffs = f[in_row].coeffs();
+                        for col in 0..d {
+                            h_row[col] += coef * coeffs[col];
+                        }
+                    }
+                    let digits = h_row.decompose_to_vec(d_prime, k_g);
+                    for col in 0..d {
+                        for dig in 0..k_g {
+                            let idx = (out_row * d + col) * k_g + dig;
+                            unsafe {
+                                let out = (out_ptr as *mut R::BaseRing).add(idx);
+                                *out = digits[col][dig];
+                            }
                         }
                     }
                 }
@@ -1241,22 +1305,40 @@ where
             for out_row in 0..m_j {
                 let i = out_row % lambda_pj;
                 let b = out_row / lambda_pj;
-                let mut h_row = vec![R::BaseRing::ZERO; d];
-                for t in 0..l_h {
-                    let in_row = b * l_h + t;
-                    if in_row >= f.len() {
-                        continue;
+                if const_coeff_fastpath {
+                    let mut h0 = R::BaseRing::ZERO;
+                    for t in 0..l_h {
+                        let in_row = b * l_h + t;
+                        if in_row >= f.len() {
+                            continue;
+                        }
+                        let coef = J[i][t];
+                        h0 += coef * f[in_row].coeffs()[0];
                     }
-                    let coef = J[i][t];
-                    let coeffs = f[in_row].coeffs();
-                    for col in 0..d {
-                        h_row[col] += coef * coeffs[col];
-                    }
-                }
-                let digits = h_row.decompose_to_vec(d_prime, k_g);
-                for col in 0..d {
+                    let mut h_row = vec![R::BaseRing::ZERO; d];
+                    h_row[0] = h0;
+                    let digits = h_row.decompose_to_vec(d_prime, k_g);
                     for dig in 0..k_g {
-                        digits_flat[(out_row * d + col) * k_g + dig] = digits[col][dig];
+                        digits_flat[(out_row * d) * k_g + dig] = digits[0][dig];
+                    }
+                } else {
+                    let mut h_row = vec![R::BaseRing::ZERO; d];
+                    for t in 0..l_h {
+                        let in_row = b * l_h + t;
+                        if in_row >= f.len() {
+                            continue;
+                        }
+                        let coef = J[i][t];
+                        let coeffs = f[in_row].coeffs();
+                        for col in 0..d {
+                            h_row[col] += coef * coeffs[col];
+                        }
+                    }
+                    let digits = h_row.decompose_to_vec(d_prime, k_g);
+                    for col in 0..d {
+                        for dig in 0..k_g {
+                            digits_flat[(out_row * d + col) * k_g + dig] = digits[col][dig];
+                        }
                     }
                 }
             }
