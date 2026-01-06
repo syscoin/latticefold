@@ -18,6 +18,7 @@
 //! | m_j/m' MLEs | 2 × k_g × 256MB | Same (complex) |
 
 use ark_std::log2;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use stark_rings::{
@@ -478,14 +479,25 @@ where
     // to avoid an unnecessary ~ℓ× blow-up in streaming evaluation work.
     let mut mles_had: Vec<StreamingMleEnum<R>> = Vec::with_capacity(1 + ell * 3);
     mles_had.push(StreamingMleEnum::eq_base(s_base.clone()));
+    // Cache extracted base-field witnesses by `Arc` pointer so identical witnesses across instances
+    // only incur the O(n_f) coeff[0] scan once (common in SP1 chunking).
+    let mut w0_cache: HashMap<usize, Arc<Vec<R::BaseRing>>> = HashMap::new();
     for inst_idx in 0..ell {
         let w0 = if const_coeff_fastpath {
-            Some(Arc::new(
-                witnesses[inst_idx]
-                    .iter()
-                    .map(|x| x.coeffs()[0])
-                    .collect::<Vec<_>>(),
-            ))
+            let key = Arc::as_ptr(&witnesses[inst_idx]) as usize;
+            Some(
+                w0_cache
+                    .entry(key)
+                    .or_insert_with(|| {
+                        Arc::new(
+                            witnesses[inst_idx]
+                                .iter()
+                                .map(|x| x.coeffs()[0])
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .clone(),
+            )
         } else {
             None
         };
@@ -1194,17 +1206,24 @@ where
     // `eq(s, ·)` is shared across all instances; include it once.
     let mut mles_had: Vec<StreamingMleEnum<R>> = Vec::with_capacity(1 + ell * 3);
     mles_had.push(StreamingMleEnum::eq_base(s_base.clone()));
+    let mut w0_cache: HashMap<usize, Arc<Vec<R::BaseRing>>> = HashMap::new();
     for inst_idx in 0..ell {
         let w0 = if const_coeff_fastpath {
-            let t0 = Instant::now();
-            let out = Some(Arc::new(
-                witnesses[inst_idx]
-                    .iter()
-                    .map(|x| x.coeffs()[0])
-                    .collect::<Vec<_>>(),
-            ));
-            t_w0 += t0.elapsed();
-            out
+            let key = Arc::as_ptr(&witnesses[inst_idx]) as usize;
+            if let Some(v) = w0_cache.get(&key) {
+                Some(v.clone())
+            } else {
+                let t0 = Instant::now();
+                let v = Arc::new(
+                    witnesses[inst_idx]
+                        .iter()
+                        .map(|x| x.coeffs()[0])
+                        .collect::<Vec<_>>(),
+                );
+                t_w0 += t0.elapsed();
+                w0_cache.insert(key, v.clone());
+                Some(v)
+            }
         } else {
             None
         };
