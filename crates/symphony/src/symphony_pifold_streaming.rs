@@ -343,11 +343,13 @@ where
     // -----------------
     // STREAMING Hadamard MLEs
     // -----------------
-    // Key optimization: use sparse mat-vec MLEs instead of materializing y = M*w
-    let mut mles_had: Vec<StreamingMleEnum<R>> = Vec::with_capacity(ell * 4);
-
+    // Key optimization: use sparse mat-vec MLEs instead of materializing y = M*w.
+    //
+    // IMPORTANT: `eq(s, ·)` is shared across all instances (same `s`), so we include it ONCE
+    // to avoid an unnecessary ~ℓ× blow-up in streaming evaluation work.
+    let mut mles_had: Vec<StreamingMleEnum<R>> = Vec::with_capacity(1 + ell * 3);
+    mles_had.push(StreamingMleEnum::eq_base(s_base.clone()));
     for inst_idx in 0..ell {
-        mles_had.push(StreamingMleEnum::eq_base(s_base.clone()));
         for i in 0..3 {
             mles_had.push(StreamingMleEnum::sparse_mat_vec(
                 M[i].clone(),
@@ -359,13 +361,13 @@ where
     // Hadamard combiner (must match Π_had: coefficient-wise constraint with alpha powers)
     let rhos_had = rhos.clone();
     let comb_had = move |vals: &[R]| -> R {
+        let eq = vals[0];
         let mut acc_all = R::ZERO;
         for inst_idx in 0..ell {
-            let base = inst_idx * 4;
-            let eq = vals[base];
-            let y1 = &vals[base + 1];
-            let y2 = &vals[base + 2];
-            let y3 = &vals[base + 3];
+            let base = 1 + inst_idx * 3;
+            let y1 = &vals[base];
+            let y2 = &vals[base + 1];
+            let y3 = &vals[base + 2];
             let mut acc = R::ZERO;
             for j in 0..d {
                 let term = y1.coeffs()[j] * y2.coeffs()[j] - y3.coeffs()[j];
@@ -686,11 +688,11 @@ where
     let mut had_u: Vec<[Vec<R::BaseRing>; 3]> = Vec::with_capacity(ell);
     let had_evals = had_state.final_evals();
     for inst_idx in 0..ell {
-        let base = inst_idx * 4;
-        // MLE order per instance: [eq(s,r), y1, y2, y3]
-        let y1 = had_evals[base + 1];
-        let y2 = had_evals[base + 2];
-        let y3 = had_evals[base + 3];
+        let base = 1 + inst_idx * 3;
+        // MLE order: [eq(s,r)] then per instance: [y1, y2, y3]
+        let y1 = had_evals[base];
+        let y2 = had_evals[base + 1];
+        let y3 = had_evals[base + 2];
 
         let mut U: [Vec<R::BaseRing>; 3] = [Vec::with_capacity(d), Vec::with_capacity(d), Vec::with_capacity(d)];
         U[0].extend_from_slice(y1.coeffs());
@@ -908,9 +910,10 @@ where
     // -----------------
     // STREAMING Hadamard MLEs
     // -----------------
-    let mut mles_had: Vec<StreamingMleEnum<R>> = Vec::with_capacity(ell * 4);
+    // `eq(s, ·)` is shared across all instances; include it once.
+    let mut mles_had: Vec<StreamingMleEnum<R>> = Vec::with_capacity(1 + ell * 3);
+    mles_had.push(StreamingMleEnum::eq_base(s_base.clone()));
     for inst_idx in 0..ell {
-        mles_had.push(StreamingMleEnum::eq_base(s_base.clone()));
         for i in 0..3 {
             mles_had.push(StreamingMleEnum::sparse_mat_vec(
                 Ms[inst_idx][i].clone(),
@@ -921,13 +924,13 @@ where
 
     let rhos_had = rhos.clone();
     let comb_had = move |vals: &[R]| -> R {
+        let eq = vals[0];
         let mut acc_all = R::ZERO;
         for inst_idx in 0..ell {
-            let base = inst_idx * 4;
-            let eq = vals[base];
-            let y1 = &vals[base + 1];
-            let y2 = &vals[base + 2];
-            let y3 = &vals[base + 3];
+            let base = 1 + inst_idx * 3;
+            let y1 = &vals[base];
+            let y2 = &vals[base + 1];
+            let y3 = &vals[base + 2];
             let mut acc = R::ZERO;
             for j in 0..d {
                 let term = y1.coeffs()[j] * y2.coeffs()[j] - y3.coeffs()[j];
@@ -1217,11 +1220,11 @@ where
     let had_evals = had_state.final_evals();
     let mut had_u: Vec<[Vec<R::BaseRing>; 3]> = Vec::with_capacity(ell);
     for inst_idx in 0..ell {
-        // MLE order per instance: [eq(s,r), y1, y2, y3]
-        let base = inst_idx * 4;
-        let y1 = had_evals[base + 1];
-        let y2 = had_evals[base + 2];
-        let y3 = had_evals[base + 3];
+        // MLE order: [eq(s,r)] then per instance: [y1, y2, y3]
+        let base = 1 + inst_idx * 3;
+        let y1 = had_evals[base];
+        let y2 = had_evals[base + 1];
+        let y3 = had_evals[base + 2];
         let mut U: [Vec<R::BaseRing>; 3] =
             [Vec::with_capacity(d), Vec::with_capacity(d), Vec::with_capacity(d)];
         U[0].extend_from_slice(y1.coeffs());
