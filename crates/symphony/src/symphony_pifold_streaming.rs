@@ -715,26 +715,57 @@ where
                 let beta = *beta_i;
                 let dig_local = dig;
                 let digits_flat = digits_flat.clone();
-                cfg_into_iter!(0..m_j).for_each(|out_row| {
-                    for col in 0..d {
-                        let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig_local];
-                        let g = exp::<R>(digit).expect("Exp failed");
-                        let mjv = ev(&g, beta);
-                        let idx = col * m_j + out_row;
+                if const_coeff_fastpath && d > 1 {
+                    // In constant-coeff mode, projected digits are zero in columns 1..d-1.
+                    // So `ev(exp(digit), beta)` is constant for those columns (digit=0).
+                    let g0 = exp::<R>(R::BaseRing::ZERO).expect("Exp failed");
+                    let mjv_zero = ev(&g0, beta);
+                    cfg_into_iter!(0..m_j).for_each(|out_row| {
+                        let digit0 = digits_flat[(out_row * d) * rg_params.k_g + dig_local]; // col=0
+                        let g = exp::<R>(digit0).expect("Exp failed");
+                        let mjv0 = ev(&g, beta);
                         unsafe {
-                            *(out_ptr as *mut R::BaseRing).add(idx) = mjv;
+                            *(out_ptr as *mut R::BaseRing).add(out_row) = mjv0;
                         }
+                    });
+                    for col in 1..d {
+                        mj_compact[col * m_j..(col + 1) * m_j].fill(mjv_zero);
                     }
-                });
+                } else {
+                    cfg_into_iter!(0..m_j).for_each(|out_row| {
+                        for col in 0..d {
+                            let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig_local];
+                            let g = exp::<R>(digit).expect("Exp failed");
+                            let mjv = ev(&g, beta);
+                            let idx = col * m_j + out_row;
+                            unsafe {
+                                *(out_ptr as *mut R::BaseRing).add(idx) = mjv;
+                            }
+                        }
+                    });
+                }
             }
             #[cfg(not(feature = "parallel"))]
             {
-            for out_row in 0..m_j {
-                for col in 0..d {
-                        let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
-                        let g = exp::<R>(digit).expect("Exp failed");
-                        let mjv = ev(&g, *beta_i);
-                        mj_compact[col * m_j + out_row] = mjv;
+                if const_coeff_fastpath && d > 1 {
+                    let g0 = exp::<R>(R::BaseRing::ZERO).expect("Exp failed");
+                    let mjv_zero = ev(&g0, *beta_i);
+                    for out_row in 0..m_j {
+                        let digit0 = digits_flat[(out_row * d) * rg_params.k_g + dig]; // col=0
+                        let g = exp::<R>(digit0).expect("Exp failed");
+                        mj_compact[out_row] = ev(&g, *beta_i);
+                    }
+                    for col in 1..d {
+                        mj_compact[col * m_j..(col + 1) * m_j].fill(mjv_zero);
+                    }
+                } else {
+                    for out_row in 0..m_j {
+                        for col in 0..d {
+                            let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
+                            let g = exp::<R>(digit).expect("Exp failed");
+                            let mjv = ev(&g, *beta_i);
+                            mj_compact[col * m_j + out_row] = mjv;
+                        }
                     }
                 }
             }
@@ -1392,27 +1423,57 @@ where
                 let digits_flat = digits_flat.clone();
                 let beta_i = *beta_i;
                 let dig_local = dig;
-                cfg_into_iter!(0..m_j).for_each(|out_row| {
-                    for col in 0..d {
-                        let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig_local];
-                        let g = exp::<R>(digit).expect("Exp failed");
-                        let mjv = ev(&g, beta_i);
-                        let idx = col * m_j + out_row;
+                if const_coeff_fastpath && d > 1 {
+                    let g0 = exp::<R>(R::BaseRing::ZERO).expect("Exp failed");
+                    let mjv_zero = ev(&g0, beta_i);
+                    cfg_into_iter!(0..m_j).for_each(|out_row| {
+                        let digit0 = digits_flat[(out_row * d) * rg_params.k_g + dig_local]; // col=0
+                        let g = exp::<R>(digit0).expect("Exp failed");
+                        let mjv0 = ev(&g, beta_i);
                         unsafe {
-                            let out = (out_ptr as *mut R::BaseRing).add(idx);
-                            *out = mjv;
+                            let out = (out_ptr as *mut R::BaseRing).add(out_row);
+                            *out = mjv0;
                         }
+                    });
+                    for col in 1..d {
+                        mj_compact[col * m_j..(col + 1) * m_j].fill(mjv_zero);
                     }
-                });
+                } else {
+                    cfg_into_iter!(0..m_j).for_each(|out_row| {
+                        for col in 0..d {
+                            let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig_local];
+                            let g = exp::<R>(digit).expect("Exp failed");
+                            let mjv = ev(&g, beta_i);
+                            let idx = col * m_j + out_row;
+                            unsafe {
+                                let out = (out_ptr as *mut R::BaseRing).add(idx);
+                                *out = mjv;
+                            }
+                        }
+                    });
+                }
             }
             #[cfg(not(feature = "parallel"))]
             {
-                for out_row in 0..m_j {
-                    for col in 0..d {
-                        let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
-                        let g = exp::<R>(digit).expect("Exp failed");
-                        let mjv = ev(&g, *beta_i);
-                        mj_compact[col * m_j + out_row] = mjv;
+                if const_coeff_fastpath && d > 1 {
+                    let g0 = exp::<R>(R::BaseRing::ZERO).expect("Exp failed");
+                    let mjv_zero = ev(&g0, *beta_i);
+                    for out_row in 0..m_j {
+                        let digit0 = digits_flat[(out_row * d) * rg_params.k_g + dig]; // col=0
+                        let g = exp::<R>(digit0).expect("Exp failed");
+                        mj_compact[out_row] = ev(&g, *beta_i);
+                    }
+                    for col in 1..d {
+                        mj_compact[col * m_j..(col + 1) * m_j].fill(mjv_zero);
+                    }
+                } else {
+                    for out_row in 0..m_j {
+                        for col in 0..d {
+                            let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
+                            let g = exp::<R>(digit).expect("Exp failed");
+                            let mjv = ev(&g, *beta_i);
+                            mj_compact[col * m_j + out_row] = mjv;
+                        }
                     }
                 }
             }
