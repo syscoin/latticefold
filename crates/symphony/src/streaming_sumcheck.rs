@@ -46,6 +46,12 @@ where
         evals: Arc<Vec<R::BaseRing>>,
         num_vars: usize,
     },
+    /// Owned base-scalar table used after the first fix so we can fix variables in-place
+    /// (avoids allocating a fresh `Vec` every round).
+    BaseScalarVecOwned {
+        evals: Vec<R::BaseRing>,
+        num_vars: usize,
+    },
     /// A compact base-scalar table that is periodic in the "row" dimension.
 ///
     /// This is tailored for Symphony's monomial side, where `m_j` values repeat across `rep`
@@ -106,6 +112,11 @@ where
         Self::BaseScalarVec { evals, num_vars }
     }
 
+    #[inline]
+    pub fn base_scalar_vec_owned(num_vars: usize, evals: Vec<R::BaseRing>) -> Self {
+        Self::BaseScalarVecOwned { evals, num_vars }
+    }
+
     pub fn periodic_base_scalar_vec(
         num_vars: usize,
         m: usize,
@@ -145,6 +156,7 @@ where
             StreamingMleEnum::SparseMatVec { num_vars, .. } => *num_vars,
             StreamingMleEnum::SparseMatVecConstCoeff { num_vars, .. } => *num_vars,
             StreamingMleEnum::BaseScalarVec { num_vars, .. } => *num_vars,
+            StreamingMleEnum::BaseScalarVecOwned { num_vars, .. } => *num_vars,
             StreamingMleEnum::PeriodicBaseScalarVec { num_vars, .. } => *num_vars,
             StreamingMleEnum::EqBase { r, .. } => r.len(),
         }
@@ -178,6 +190,7 @@ where
                 R::from(sum)
             }
             StreamingMleEnum::BaseScalarVec { evals, .. } => R::from(evals[index]),
+            StreamingMleEnum::BaseScalarVecOwned { evals, .. } => R::from(evals[index]),
             StreamingMleEnum::PeriodicBaseScalarVec {
                 evals,
                 m,
@@ -232,6 +245,7 @@ where
                 sum
             }
             StreamingMleEnum::BaseScalarVec { evals, .. } => evals[index],
+            StreamingMleEnum::BaseScalarVecOwned { evals, .. } => evals[index],
             StreamingMleEnum::PeriodicBaseScalarVec {
                 evals,
                 m,
@@ -299,10 +313,7 @@ where
                         one_minus * f0 + r0 * f1
                     })
                     .collect();
-                StreamingMleEnum::BaseScalarVec {
-                    evals: Arc::new(new_evals),
-                    num_vars: num_vars - 1,
-                }
+                StreamingMleEnum::BaseScalarVecOwned { evals: new_evals, num_vars: num_vars - 1 }
             }
             // Base-scalar table: keep it base-scalar after fixing (critical for memory).
             //
@@ -314,8 +325,20 @@ where
                 let new_evals: Vec<R::BaseRing> = (0..half)
                     .map(|i| one_minus * evals[i << 1] + r0 * evals[(i << 1) | 1])
                     .collect();
-                StreamingMleEnum::BaseScalarVec {
-                    evals: Arc::new(new_evals),
+                StreamingMleEnum::BaseScalarVecOwned { evals: new_evals, num_vars: num_vars - 1 }
+            }
+            StreamingMleEnum::BaseScalarVecOwned { evals, num_vars } => {
+                let r0 = r.coeffs()[0];
+                let one_minus = R::BaseRing::ONE - r0;
+                let mut evals = evals.clone();
+                for i in 0..half {
+                    let a = evals[i << 1];
+                    let b = evals[(i << 1) | 1];
+                    evals[i] = one_minus * a + r0 * b;
+                }
+                evals.truncate(half);
+                StreamingMleEnum::BaseScalarVecOwned {
+                    evals,
                     num_vars: num_vars - 1,
                 }
             }
@@ -430,6 +453,79 @@ where
             }
         }
     }
+
+    /// Fix the next variable (LSB-first) in-place for variants that can reuse buffers.
+    pub fn fix_variable_in_place_base(&mut self, r0: R::BaseRing) {
+        let nv = self.num_vars();
+        assert!(nv > 0);
+        let half = 1 << (nv - 1);
+        let one_minus0 = R::BaseRing::ONE - r0;
+        let r_ring = R::from(r0);
+        match self {
+            StreamingMleEnum::Dense(m) => {
+                let one_minus = R::ONE - r_ring;
+                for i in 0..half {
+                    let a = m.evals[i << 1];
+                    let b = m.evals[(i << 1) | 1];
+                    m.evals[i] = one_minus * a + r_ring * b;
+                }
+                m.evals.truncate(half);
+                m.num_vars -= 1;
+            }
+            StreamingMleEnum::SparseMatVec { .. } => {
+                let new = self.fix_variable(r_ring);
+                *self = new;
+            }
+            StreamingMleEnum::SparseMatVecConstCoeff { .. } => {
+                // Fall back to `fix_variable` (which already does the right thing); we overwrite
+                // `self` afterward so future fixes can be in-place.
+                let next = self.fix_variable(r_ring);
+                *self = next;
+            }
+            StreamingMleEnum::BaseScalarVec { evals, num_vars } => {
+                // Try to take ownership of the backing Vec; fall back to cloning if shared.
+                let owned = match Arc::try_unwrap(evals.clone()) {
+                    Ok(v) => v,
+                    Err(a) => (*a).clone(),
+                };
+                let mut owned = owned;
+                for i in 0..half {
+                    let a = owned[i << 1];
+                    let b = owned[(i << 1) | 1];
+                    owned[i] = one_minus0 * a + r0 * b;
+                }
+                owned.truncate(half);
+                *self = StreamingMleEnum::BaseScalarVecOwned {
+                    evals: owned,
+                    num_vars: *num_vars - 1,
+                };
+            }
+            StreamingMleEnum::BaseScalarVecOwned { evals, num_vars } => {
+                for i in 0..half {
+                    let a = evals[i << 1];
+                    let b = evals[(i << 1) | 1];
+                    evals[i] = one_minus0 * a + r0 * b;
+                }
+                evals.truncate(half);
+                *num_vars -= 1;
+            }
+            StreamingMleEnum::PeriodicBaseScalarVec { .. } => {
+                let new = self.fix_variable(r_ring);
+                *self = new;
+            }
+            StreamingMleEnum::EqBase {
+                scale,
+                r,
+                one_minus_r,
+            } => {
+                let eq_factor = one_minus0 * one_minus_r[0] + r0 * r[0];
+                *scale *= eq_factor;
+                // Keep order; lengths are small (<= ~24), so shifting cost is negligible.
+                r.remove(0);
+                one_minus_r.remove(0);
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -507,8 +603,9 @@ where
             nv == 1,
             "fix_last_variable expects exactly 1 remaining var, got {nv}"
         );
-        let r_ring = R::from(r);
-        self.mles = self.mles.iter().map(|m| m.fix_variable(r_ring)).collect();
+        for m in self.mles.iter_mut() {
+            m.fix_variable_in_place_base(r);
+        }
     }
 
     /// Evaluate all internal MLEs at the fully fixed point (after all variables are fixed).
@@ -559,8 +656,9 @@ impl StreamingSumcheck {
             state.randomness.push(r);
 
             // Fix variable in all MLEs
-            let r_ring = R::from(r);
-            state.mles = state.mles.iter().map(|m| m.fix_variable(r_ring)).collect();
+            for m in state.mles.iter_mut() {
+                m.fix_variable_in_place_base(r);
+            }
         } else {
             assert!(state.round == 0);
         }
@@ -692,8 +790,9 @@ impl StreamingSumcheck {
         if let Some(r) = v_msg {
             assert!(state.round > 0);
             state.randomness.push(r);
-            let r_ring = R::from(r);
-            state.mles = state.mles.iter().map(|m| m.fix_variable(r_ring)).collect();
+            for m in state.mles.iter_mut() {
+                m.fix_variable_in_place_base(r);
+            }
         } else {
             assert!(state.round == 0);
         }
