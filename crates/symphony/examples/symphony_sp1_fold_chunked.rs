@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
+use ark_ff::PrimeField;
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
 use latticefold::commitment::AjtaiCommitmentScheme;
 use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as R;
@@ -380,17 +381,33 @@ fn main() {
             let rate: u64 = 20;
             let absorbed = metrics.absorbed_elems;
             let squeezed = metrics.squeezed_field_elems;
+            let squeezed_bytes = metrics.squeezed_bytes;
             let est_perms_absorb = (absorbed + rate - 1) / rate;
             let est_perms_squeeze = (squeezed + rate - 1) / rate;
+
+            // Roughly estimate extra permutations from `squeeze_bytes`.
+            // We approximate `bytes_per_field_elem = ceil(modulus_bits/8)` for the base prime field.
+            let bits =
+                <<<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField as PrimeField>::MODULUS_BIT_SIZE
+                    as u64;
+            let bytes_per_field_elem = (bits + 7) / 8;
+            let rate_bytes = rate * bytes_per_field_elem;
+            let est_perms_bytes = if rate_bytes == 0 {
+                0
+            } else {
+                (squeezed_bytes + rate_bytes - 1) / rate_bytes
+            };
             eprintln!(
                 "    PoseidonTranscript metrics: absorbed_elems={}, squeezed_field_elems={}, squeezed_bytes={}",
                 metrics.absorbed_elems, metrics.squeezed_field_elems, metrics.squeezed_bytes
             );
             eprintln!(
-                "    PoseidonTranscript est perms: ceil(absorb/20)={} + ceil(squeeze/20)={} => {}",
+                "    PoseidonTranscript est perms: ceil(absorb/20)={} + ceil(squeeze_field/20)={} + ceil(bytes/{})={} => {}",
                 est_perms_absorb,
                 est_perms_squeeze,
-                est_perms_absorb + est_perms_squeeze
+                rate_bytes,
+                est_perms_bytes,
+                est_perms_absorb + est_perms_squeeze + est_perms_bytes
             );
             res.expect("R_WE check failed");
             println!("    ✓ Verified in {:?}", t_v.elapsed());

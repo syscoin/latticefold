@@ -16,6 +16,7 @@ use stark_rings::OverField;
 pub struct PoseidonTranscript<R: OverField> {
     sponge: PoseidonSponge<<R::BaseRing as Field>::BasePrimeField>,
     metrics: PoseidonTranscriptMetrics,
+    scratch: Vec<<R::BaseRing as Field>::BasePrimeField>,
 }
 
 /// Lightweight transcript metrics to estimate Poseidon sponge work in `R_cp` / `R_WE`.
@@ -46,17 +47,21 @@ impl<R: OverField> Transcript<R> for PoseidonTranscript<R> {
 
     fn new(config: &Self::TranscriptConfig) -> Self {
         let sponge = PoseidonSponge::<<R::BaseRing as Field>::BasePrimeField>::new(config);
-        Self { sponge, metrics: PoseidonTranscriptMetrics::default() }
+        Self {
+            sponge,
+            metrics: PoseidonTranscriptMetrics::default(),
+            // Small default; will grow as needed (e.g. absorbing a full ring element).
+            scratch: Vec::with_capacity(64),
+        }
     }
 
     fn absorb(&mut self, v: &R) {
-        let elems = v
-            .coeffs()
-                .iter()
-                .flat_map(|x| x.to_base_prime_field_elements())
-            .collect::<Vec<_>>();
-        self.metrics.absorbed_elems += elems.len() as u64;
-        self.sponge.absorb(&elems);
+        self.scratch.clear();
+        for c in v.coeffs() {
+            self.scratch.extend(c.to_base_prime_field_elements());
+        }
+        self.metrics.absorbed_elems += self.scratch.len() as u64;
+        self.sponge.absorb(&self.scratch);
     }
 
     /// Optimized scalar absorb: absorb just the base field element(s), NOT a full ring element.
@@ -69,9 +74,10 @@ impl<R: OverField> Transcript<R> for PoseidonTranscript<R> {
     ///
     /// For SP1 one-proof mode (ℓ=47, l_h=512): reduces J absorption from ~385k elements to ~24k.
     fn absorb_field_element(&mut self, v: &R::BaseRing) {
-        let elems: Vec<_> = v.to_base_prime_field_elements().collect();
-        self.metrics.absorbed_elems += elems.len() as u64;
-        self.sponge.absorb(&elems);
+        self.scratch.clear();
+        self.scratch.extend(v.to_base_prime_field_elements());
+        self.metrics.absorbed_elems += self.scratch.len() as u64;
+        self.sponge.absorb(&self.scratch);
     }
 
     fn get_challenge(&mut self) -> R::BaseRing {
