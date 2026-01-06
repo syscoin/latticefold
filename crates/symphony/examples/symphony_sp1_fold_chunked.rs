@@ -33,6 +33,50 @@ use symphony::symphony_we_relation::{
     check_r_we_poseidon_fs_hetero_m_with_metrics_result, TrivialRo,
 };
 
+fn is_const_coeff_ring_elem(x: &R) -> bool {
+    // Constant-coefficient embedding means only coeff[0] may be nonzero.
+    x.coeffs()
+        .iter()
+        .skip(1)
+        .all(|c| *c == <R as PolyRing>::BaseRing::ZERO)
+}
+
+fn check_const_coeff_witness(w: &[R], samples: usize) -> (usize, usize) {
+    if w.is_empty() || samples == 0 {
+        return (0, 0);
+    }
+    let step = (w.len() / samples).max(1);
+    let mut checked = 0usize;
+    let mut non_const = 0usize;
+    for i in (0..w.len()).step_by(step) {
+        checked += 1;
+        if !is_const_coeff_ring_elem(&w[i]) {
+            non_const += 1;
+        }
+        if checked >= samples {
+            break;
+        }
+    }
+    (checked, non_const)
+}
+
+fn check_const_coeff_sparse_matrix(m: &stark_rings_linalg::SparseMatrix<R>, max_entries: usize) -> (usize, usize) {
+    let mut checked = 0usize;
+    let mut non_const = 0usize;
+    for row in &m.coeffs {
+        for (coeff, _col) in row {
+            checked += 1;
+            if !is_const_coeff_ring_elem(coeff) {
+                non_const += 1;
+            }
+            if checked >= max_entries {
+                return (checked, non_const);
+            }
+        }
+    }
+    (checked, non_const)
+}
+
 fn parse_bytes32_env(name: &str) -> [u8; 32] {
     let s = std::env::var(name).unwrap_or_else(|_| {
         panic!("Missing required env var {name}. Expected a bytes32 hex string like 0xabc... (64 hex chars).")
@@ -307,6 +351,49 @@ fn main() {
             all_mats.push([Arc::new(m1), Arc::new(m2), Arc::new(m3)]);
         }
         println!("    Loaded {} chunks in {:?}", num_chunks, t_load_all.elapsed());
+
+        // Optional: determine whether all coefficients are constant-coefficient embedded in the ring.
+        //
+        // If true, we can consider a fast-path for Π_had where all intermediate values remain
+        // constant-coefficient (base-field) and the `for j in 0..d` loop can be specialized.
+        let check_const: bool = std::env::var("CHECK_CONST_COEFF")
+            .ok()
+            .as_deref()
+            .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if check_const {
+            let samples: usize = std::env::var("CHECK_CONST_COEFF_WITNESS_SAMPLES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(200_000);
+            let max_entries: usize = std::env::var("CHECK_CONST_COEFF_MATRIX_ENTRIES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(200_000);
+            let assert_ok: bool = std::env::var("ASSERT_CONST_COEFF")
+                .ok()
+                .as_deref()
+                .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+
+            let (w_checked, w_nonconst) = check_const_coeff_witness(&witness, samples);
+            let mut m_checked = 0usize;
+            let mut m_nonconst = 0usize;
+            for mats in &all_mats {
+                for mi in 0..3 {
+                    let (c, nc) = check_const_coeff_sparse_matrix(&mats[mi], max_entries);
+                    m_checked += c;
+                    m_nonconst += nc;
+                }
+            }
+            println!(
+                "    Const-coeff check: witness nonconst {}/{} samples; matrices nonconst {}/{} checked entries",
+                w_nonconst, w_checked, m_nonconst, m_checked
+            );
+            if assert_ok && (w_nonconst != 0 || m_nonconst != 0) {
+                panic!("const-coeff check failed (set CHECK_CONST_COEFF=1 without ASSERT_CONST_COEFF to just measure)");
+            }
+        }
 
         let cms_all: Vec<Vec<R>> = vec![cm_main.clone(); num_chunks];
         let witnesses_all: Vec<Arc<Vec<R>>> = vec![witness.clone(); num_chunks];
