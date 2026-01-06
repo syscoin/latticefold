@@ -633,6 +633,422 @@ where
     verify_pi_fold_batched_and_fold_outputs_with_openings(&mut ts, M, cms, proof, open, cms_openings)
 }
 
+/// Verifier (Poseidon-FS) for a *heterogeneous-matrix* batched Π_fold proof.
+///
+/// This is the O(1)-verification path for SP1 chunking: each instance has its own `(M1,M2,M3)`.
+pub fn verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m<R: CoeffRing, PC>(
+    Ms: &[[&SparseMatrix<R>; 3]],
+    cms: &[Vec<R>],
+    proof: &PiFoldBatchedProof<R>,
+    open: &impl VfyOpen<R>,
+    cms_openings: &[Vec<R>],
+    public_inputs: &[R::BaseRing],
+) -> Result<(SymphonyInstance<R>, SymphonyBatchLin<R>), String>
+where
+    R::BaseRing: Zq + Decompose,
+    PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
+{
+    let mut ts = crate::transcript::PoseidonTranscript::<R>::empty::<PC>();
+    ts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
+    absorb_public_inputs::<R>(&mut ts, public_inputs);
+    verify_pi_fold_batched_and_fold_outputs_with_openings_hetero_m(&mut ts, Ms, cms, proof, open, cms_openings)
+}
+
+pub fn verify_pi_fold_batched_and_fold_outputs_with_openings_hetero_m<R: CoeffRing>(
+    transcript: &mut impl Transcript<R>,
+    Ms: &[[&SparseMatrix<R>; 3]],
+    cms: &[Vec<R>],
+    proof: &PiFoldBatchedProof<R>,
+    open: &impl VfyOpen<R>,
+    cms_openings: &[Vec<R>],
+) -> Result<(SymphonyInstance<R>, SymphonyBatchLin<R>), String>
+where
+    R::BaseRing: Zq + Decompose,
+{
+    verify_pi_fold_batched_and_fold_outputs_with_openings_and_aux_hetero_m(
+        transcript,
+        Ms,
+        cms,
+        proof,
+        open,
+        cms_openings,
+        None,
+    )
+}
+
+/// Heterogeneous-matrix verifier with optional auxiliary witness messages (`had_u`, `mon_b`).
+pub fn verify_pi_fold_batched_and_fold_outputs_with_openings_and_aux_hetero_m<R: CoeffRing>(
+    transcript: &mut impl Transcript<R>,
+    Ms: &[[&SparseMatrix<R>; 3]],
+    cms: &[Vec<R>],
+    proof: &PiFoldBatchedProof<R>,
+    open: &impl VfyOpen<R>,
+    cms_openings: &[Vec<R>],
+    aux: Option<&PiFoldAuxWitness<R>>,
+) -> Result<(SymphonyInstance<R>, SymphonyBatchLin<R>), String>
+where
+    R::BaseRing: Zq + Decompose,
+{
+    if cms.len() != cms_openings.len() {
+        return Err("PiFold: cms/openings length mismatch".to_string());
+    }
+    if cms.len() != Ms.len() {
+        return Err("PiFold: Ms/cms length mismatch".to_string());
+    }
+
+    for (cm, open_val) in cms.iter().zip(cms_openings.iter()) {
+        open.verify_opening(transcript, "cm_witness", cm, &[], open_val, &[])?;
+    }
+
+    let ell = cms.len();
+    if ell == 0 {
+        return Err("PiFold: length mismatch".to_string());
+    }
+    let rg_params = &proof.rg_params;
+
+    let beta_cts = derive_beta_chi::<R>(transcript, ell);
+    let beta_ring = beta_cts.iter().copied().map(R::from).collect::<Vec<R>>();
+
+    let m = Ms[0][0].nrows;
+    if !m.is_power_of_two() {
+        return Err("PiFold: m must be power-of-two".to_string());
+    }
+    for inst_idx in 0..ell {
+        for i in 0..3 {
+            if Ms[inst_idx][i].nrows != m {
+                return Err("PiFold: inconsistent m across instances".to_string());
+            }
+        }
+    }
+
+    let log_m = log2(m) as usize;
+    let d = R::dimension();
+
+    transcript.absorb_field_element(&R::BaseRing::from(0x4c465053_50494841u128)); // "LFPS_PIHA"
+    let s_base = transcript.get_challenges(log_m);
+    let alpha_base = transcript.get_challenge();
+
+    let s_poly: Vec<R> = s_base.iter().copied().map(R::from).collect();
+    let m_j = proof.m_j;
+    if m != proof.m {
+        return Err("PiFold: proof m mismatch".to_string());
+    }
+    if m < m_j || m % m_j != 0 {
+        return Err("PiFold: require m_J<=m".to_string());
+    }
+
+    let g_len = m * d;
+    if !g_len.is_power_of_two() {
+        return Err("PiFold: require m*d power-of-two".to_string());
+    }
+    let g_nvars = log2(g_len) as usize;
+
+    let mut cba_all: Vec<Vec<(Vec<R>, R::BaseRing, R::BaseRing)>> = Vec::with_capacity(ell);
+    let mut rc_all: Vec<Option<R::BaseRing>> = Vec::with_capacity(ell);
+    let mut Js: Vec<Vec<Vec<R::BaseRing>>> = Vec::with_capacity(ell);
+
+    let (_n_f, blocks) = if aux.is_none() {
+        let n_f = cms_openings[0].len();
+        if n_f == 0 || n_f % rg_params.l_h != 0 {
+            return Err("PiFold: invalid witness length".to_string());
+        }
+        for w in cms_openings.iter() {
+            if w.len() != n_f {
+                return Err("PiFold: inconsistent witness lengths".to_string());
+            }
+        }
+        let blocks = n_f / rg_params.l_h;
+        let m_j_expected = blocks * rg_params.lambda_pj;
+        if m_j_expected != m_j {
+            return Err("PiFold: m_J mismatch".to_string());
+        }
+        // Sanity-check witness width matches matrices.
+        for inst_idx in 0..ell {
+            for i in 0..3 {
+                if Ms[inst_idx][i].ncols != n_f {
+                    return Err("PiFold: matrix/witness width mismatch".to_string());
+                }
+            }
+        }
+        (n_f, blocks)
+    } else {
+        (0usize, 0usize)
+    };
+
+    for cm_f in cms.iter() {
+        transcript.absorb_slice(cm_f);
+        let J = derive_J::<R>(transcript, rg_params.lambda_pj, rg_params.l_h);
+        for row in &J {
+            for x in row {
+                transcript.absorb_field_element(x);
+            }
+        }
+        Js.push(J);
+
+        let mut cba: Vec<(Vec<R>, R::BaseRing, R::BaseRing)> = Vec::with_capacity(rg_params.k_g);
+        for _ in 0..rg_params.k_g {
+            let c: Vec<R> = transcript
+                .get_challenges(g_nvars)
+                .into_iter()
+                .map(|x| x.into())
+                .collect();
+            let beta = transcript.get_challenge();
+            let alpha = transcript.get_challenge();
+            cba.push((c, beta, alpha));
+        }
+        let rc: Option<R::BaseRing> = (rg_params.k_g > 1).then(|| transcript.get_challenge());
+        cba_all.push(cba);
+        rc_all.push(rc);
+    }
+
+    let rhos = transcript
+        .get_challenges(ell)
+        .into_iter()
+        .map(R::from)
+        .collect::<Vec<R>>();
+
+    let hook_round = log2(m_j.next_power_of_two()) as usize;
+    let (had_sc, mon_sc) = MLSumcheck::<R, _>::verify_two_as_subprotocol_shared_with_hook(
+        transcript,
+        log_m,
+        3,
+        R::ZERO,
+        &proof.had_sumcheck,
+        g_nvars,
+        3,
+        R::ZERO,
+        &proof.mon_sumcheck,
+        hook_round,
+        |t, _sampled| {
+            for v_i in &proof.v_digits_folded {
+                for x in v_i {
+                    t.absorb_field_element(x);
+                }
+            }
+        },
+    )
+    .map_err(|e| format!("PiFold: sumcheck verify failed: {e}"))?;
+
+    // Recompute the expected hadamard sumcheck evaluation at the had point.
+    let r_had = had_sc.point.clone();
+    let eq_sr = eq_eval(&s_poly, &r_had.iter().copied().map(R::from).collect::<Vec<_>>())
+        .map_err(|e| format!("PiFold: eq_eval failed: {e}"))?;
+
+    let mut pow = R::BaseRing::ONE;
+    let mut alpha_pows = Vec::with_capacity(d);
+    for _ in 0..d {
+        alpha_pows.push(R::from(pow));
+        pow *= alpha_base;
+    }
+
+    let mut lhs = R::ZERO;
+    for inst_idx in 0..ell {
+        let U: [Vec<R::BaseRing>; 3] = if let Some(auxw) = aux {
+            if auxw.had_u.len() != ell {
+                return Err("PiFold: aux.had_u length mismatch".to_string());
+            }
+            auxw.had_u[inst_idx].clone()
+        } else {
+            let y = Ms[inst_idx]
+                .iter()
+                .map(|Mi| Mi.try_mul_vec(&cms_openings[inst_idx]).expect("mat-vec mul failed"))
+                .collect::<Vec<Vec<R>>>();
+
+            let mut U: [Vec<R::BaseRing>; 3] =
+                [Vec::with_capacity(d), Vec::with_capacity(d), Vec::with_capacity(d)];
+            for i in 0..3 {
+                for j in 0..d {
+                    let evals = (0..m)
+                        .map(|row| R::from(y[i][row].coeffs()[j]))
+                        .collect::<Vec<_>>();
+                    let mle = DenseMultilinearExtension::from_evaluations_vec(log_m, evals);
+                    let v = mle
+                        .evaluate(&r_had.iter().copied().map(R::from).collect::<Vec<_>>())
+                        .expect("MLE evaluate returned None");
+                    U[i].push(v.ct());
+                }
+            }
+            U
+        };
+
+        if U[0].len() != d || U[1].len() != d || U[2].len() != d {
+            return Err("PiFold: aux had_U has wrong dimension".to_string());
+        }
+
+        let mut acc = R::ZERO;
+        for j in 0..d {
+            let u1 = R::from(U[0][j]);
+            let u2 = R::from(U[1][j]);
+            let u3 = R::from(U[2][j]);
+            acc += alpha_pows[j] * (u1 * u2 - u3);
+        }
+        lhs += rhos[inst_idx] * (eq_sr * acc);
+
+        for x in &U[0] {
+            transcript.absorb_field_element(x);
+        }
+        for x in &U[1] {
+            transcript.absorb_field_element(x);
+        }
+        for x in &U[2] {
+            transcript.absorb_field_element(x);
+        }
+    }
+    if lhs != had_sc.expected_evaluation {
+        return Err("PiFold: hadamard recomputation mismatch".to_string());
+    }
+
+    // -----------------
+    // Verify the batched Π_mon linkage and folded Π_rg Step-5 check (does not depend on M entries).
+    // -----------------
+    let r_mon_r: Vec<R> = mon_sc.point.iter().copied().map(R::from).collect();
+
+    let mon_b: Vec<Vec<R>> = if let Some(auxw) = aux {
+        if auxw.mon_b.len() != ell {
+            return Err("PiFold: aux.mon_b length mismatch".to_string());
+        }
+        for b_inst in auxw.mon_b.iter() {
+            if b_inst.len() != rg_params.k_g {
+                return Err("PiFold: aux.mon_b wrong k_g".to_string());
+            }
+        }
+        for b_inst in auxw.mon_b.iter() {
+            transcript.absorb_slice(b_inst);
+        }
+        auxw.mon_b.clone()
+    } else {
+        let mut mon_b: Vec<Vec<R>> = Vec::with_capacity(ell);
+        let expand_row = |row: usize| -> usize { row % m_j };
+        for inst_idx in 0..ell {
+            // Build H_digits for this instance (on m_J rows).
+            let f = &cms_openings[inst_idx];
+            let mut H = vec![vec![R::BaseRing::ZERO; d]; m_j];
+            let Jref = &Js[inst_idx];
+            for b in 0..blocks {
+                for i in 0..rg_params.lambda_pj {
+                    let out_row = b * rg_params.lambda_pj + i;
+                    for t in 0..rg_params.l_h {
+                        let in_row = b * rg_params.l_h + t;
+                        let coef = Jref[i][t];
+                        for col in 0..d {
+                            H[out_row][col] += coef * f[in_row].coeffs()[col];
+                        }
+                    }
+                }
+            }
+            let mut H_digits: Vec<Vec<Vec<R::BaseRing>>> =
+                vec![vec![vec![R::BaseRing::ZERO; d]; m_j]; rg_params.k_g];
+            for r in 0..m_j {
+                let row_digits = H[r].decompose_to_vec(rg_params.d_prime, rg_params.k_g);
+                for c in 0..d {
+                    for i in 0..rg_params.k_g {
+                        H_digits[i][r][c] = row_digits[c][i];
+                    }
+                }
+            }
+
+            let mut b_inst = Vec::with_capacity(rg_params.k_g);
+            for dig in 0..rg_params.k_g {
+                let mut gi = Vec::with_capacity(g_len);
+                for c in 0..d {
+                    for r in 0..m {
+                        gi.push(exp::<R>(H_digits[dig][expand_row(r)][c]).expect("Exp failed"));
+                    }
+                }
+                let mle = DenseMultilinearExtension::from_evaluations_vec(g_nvars, gi);
+                b_inst.push(mle.evaluate(&r_mon_r).unwrap());
+            }
+            transcript.absorb_slice(&b_inst);
+            mon_b.push(b_inst);
+        }
+        mon_b
+    };
+
+    let v_expected = mon_sc.expected_evaluation;
+
+    let mut ver = R::ZERO;
+    for inst_idx in 0..ell {
+        let mut inst_acc = R::ZERO;
+        // Precompute rc^dig iteratively to avoid repeated pow().
+        let mut rc_pow = R::BaseRing::ONE;
+        for dig in 0..rg_params.k_g {
+            let (c, beta_i, alpha_i) = &cba_all[inst_idx][dig];
+            let eq = eq_eval(c, &r_mon_r).unwrap();
+            let b_i = mon_b[inst_idx][dig];
+            let ev1 = R::from(ev(&b_i, *beta_i));
+            let ev2 = R::from(ev(&b_i, *beta_i * *beta_i));
+            let b_claim = ev1 * ev1 - ev2;
+            let mut term = eq * R::from(*alpha_i) * b_claim;
+            if let Some(rc) = &rc_all[inst_idx] {
+                term *= R::from(rc_pow);
+                rc_pow *= *rc;
+            }
+            inst_acc += term;
+        }
+        ver += rhos[inst_idx] * inst_acc;
+    }
+
+    if ver != v_expected {
+        return Err("PiFold: batched monomial recomputation mismatch".to_string());
+    }
+
+    // Π_rg Step-5 check on the **folded** values.
+    let log_m = log2(m.next_power_of_two()) as usize;
+    let s_chals = mon_sc.point[log_m..].to_vec();
+    let ts_s_full = ts_weights(&s_chals);
+    let ts_s = &ts_s_full[..d];
+
+    // Fold u*: for each digit, u*(dig) := Σ_i beta_i * u_i(dig)
+    let mut u_folded = vec![R::ZERO; rg_params.k_g];
+    for inst_idx in 0..ell {
+        let b = beta_ring[inst_idx];
+        for dig in 0..rg_params.k_g {
+            u_folded[dig] += b * mon_b[inst_idx][dig];
+        }
+    }
+
+    for dig in 0..rg_params.k_g {
+        let lhs = (psi::<R>() * u_folded[dig]).ct();
+        let rhs = proof.v_digits_folded[dig]
+            .iter()
+            .zip(ts_s.iter())
+            .fold(R::BaseRing::ZERO, |acc, (&vij, &t)| acc + vij * t);
+        if lhs != rhs {
+            return Err(format!("PiFold: folded Step5 mismatch at dig={dig}"));
+        }
+    }
+
+    // Construct folded outputs directly.
+    let mut c_star = vec![R::ZERO; cms[0].len()];
+    for (inst_idx, cm) in cms.iter().enumerate() {
+        for (acc, x) in c_star.iter_mut().zip(cm.iter()) {
+            *acc += beta_ring[inst_idx] * *x;
+        }
+    }
+
+    // r and r' are shared across the batch.
+    let log_mj = log2(m_j.next_power_of_two()) as usize;
+    let r_prime = mon_sc.point.clone();
+    let r_star = r_prime[..log_mj].to_vec();
+
+    // u* is the folded u_folded computed above; v* is composed from folded v_digits.
+    let v_star = compose_v_digits::<R>(&proof.v_digits_folded, rg_params.d_prime);
+
+    let mut v_rq = R::ZERO;
+    for (i, c) in v_star.iter().enumerate() {
+        v_rq.coeffs_mut()[i] = *c;
+    }
+
+    let folded_inst = SymphonyInstance {
+        c: c_star,
+        r: r_star,
+        v: v_rq,
+    };
+    let folded_bat = SymphonyBatchLin { r_prime, u: u_folded };
+
+    Ok((folded_inst, folded_bat))
+}
+
 /// Derive the auxiliary transcript messages (`had_u`, `mon_b`) from witness openings under the
 /// Poseidon-FS transcript schedule (shared-randomness / shared-rounds).
 ///

@@ -150,6 +150,84 @@ where
     Ok(out)
 }
 
+/// Poseidon-FS wrapper for a *heterogeneous-matrix* batched Π_fold prover.
+///
+/// This is the O(1)-verification path for SP1 chunking: each chunk has its own `(M1,M2,M3)` but all
+/// chunks share a witness width and transcript schedule. The prover produces **one** Π_fold proof
+/// for the whole batch.
+pub fn prove_pi_fold_streaming_sumcheck_fs_hetero_m<R: CoeffRing, PC>(
+    Ms: &[[Arc<SparseMatrix<R>>; 3]],
+    cms: &[Vec<R>],
+    witnesses: &[Arc<Vec<R>>],
+    public_inputs: &[R::BaseRing],
+    cfs_had_u_scheme: Option<&AjtaiCommitmentScheme<R>>,
+    cfs_mon_b_scheme: Option<&AjtaiCommitmentScheme<R>>,
+    rg_params: RPParams,
+) -> Result<PiFoldProverOutput<R>, String>
+where
+    R::BaseRing: Zq + Decompose,
+    PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
+{
+    if cms.is_empty() {
+        return Err("PiFold: empty batch".to_string());
+    }
+    if Ms.len() != cms.len() || cms.len() != witnesses.len() {
+        return Err("PiFold: Ms/cms/witnesses length mismatch".to_string());
+    }
+
+    let mut ts = crate::transcript::PoseidonTranscript::<R>::empty::<PC>();
+    let mut rts = RecordingTranscriptRef::<R, _>::new(&mut ts);
+    rts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
+    absorb_public_inputs::<R>(&mut rts, public_inputs);
+
+    let mut out = prove_pi_fold_streaming_hetero_m(&mut rts, Ms, cms, witnesses, rg_params)
+        .map_err(|e| format!("PiFold: poseidon-fs prove failed: {e}"))?;
+
+    out.proof.coins = SymphonyCoins::<R> {
+        challenges: rts.coins_challenges,
+        bytes: rts.coins_bytes,
+        events: rts.events,
+    };
+
+    // Optionally commit to CP transcript witness messages (WE/DPP-facing path).
+    out.cfs_had_u.clear();
+    out.cfs_mon_b.clear();
+    match (cfs_had_u_scheme, cfs_mon_b_scheme) {
+        (Some(had_s), Some(mon_s)) => {
+            out.cfs_had_u = out
+                .aux
+                .had_u
+                .iter()
+                .map(|u| {
+                    had_s
+                        .commit_const_coeff_fast(&encode_had_u_instance::<R>(u))
+                        .map_err(|e| format!("PiFold: cfs_had_u commit failed: {e:?}"))
+                        .map(|c| c.as_ref().to_vec())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            out.cfs_mon_b = out
+                .aux
+                .mon_b
+                .iter()
+                .map(|b| {
+                    mon_s
+                        .commit_const_coeff_fast(b)
+                        .map_err(|e| format!("PiFold: cfs_mon_b commit failed: {e:?}"))
+                        .map(|c| c.as_ref().to_vec())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "PiFold: must provide both cfs_had_u_scheme and cfs_mon_b_scheme or neither".to_string(),
+            );
+        }
+    }
+
+    Ok(out)
+}
+
 /// Streaming Π_fold prover.
 ///
 /// This is a memory-efficient version of `prove_pi_fold_batched_sumcheck` that uses
@@ -692,6 +770,460 @@ where
     if prof {
         eprintln!("[PiFold streaming] aux mon_b done in {:?}", t_aux_mon.elapsed());
         eprintln!("[PiFold streaming] total prove_pi_fold_streaming time {:?}", t_all.elapsed());
+    }
+
+    Ok(PiFoldProverOutput {
+        proof: PiFoldBatchedProof {
+            coins: SymphonyCoins {
+                challenges: vec![],
+                bytes: vec![],
+                events: vec![],
+            },
+            rg_params,
+            m_j,
+            m,
+            v_digits_folded,
+            had_sumcheck,
+            mon_sumcheck,
+        },
+        aux: PiFoldAuxWitness { had_u, mon_b },
+        cfs_had_u: vec![],
+        cfs_mon_b: vec![],
+    })
+}
+
+/// Streaming Π_fold prover where each instance has its own `(M1,M2,M3)`.
+///
+/// This is useful for SP1 chunking where chunks correspond to disjoint row-slices of the full R1CS.
+pub fn prove_pi_fold_streaming_hetero_m<R: CoeffRing>(
+    transcript: &mut impl Transcript<R>,
+    Ms: &[[Arc<SparseMatrix<R>>; 3]],
+    cms: &[Vec<R>],
+    witnesses: &[Arc<Vec<R>>],
+    rg_params: RPParams,
+) -> Result<PiFoldProverOutput<R>, String>
+where
+    R::BaseRing: Zq + Decompose,
+{
+    // Keep this function bit-for-bit aligned with `prove_pi_fold_streaming` except that each
+    // instance pulls y = M*w from its own matrices.
+    let prof = std::env::var("SYMPHONY_PROFILE").ok().as_deref() == Some("1");
+    let t_all = Instant::now();
+    let ell = cms.len();
+    let beta_cts = derive_beta_chi::<R>(transcript, ell);
+    if ell == 0 || witnesses.len() != ell || Ms.len() != ell {
+        return Err("PiFold: length mismatch".to_string());
+    }
+
+    // -----------------
+    // Shared Π_had coins
+    // -----------------
+    let m = Ms[0][0].nrows;
+    if !m.is_power_of_two() {
+        return Err("PiFold: m must be power-of-two".to_string());
+    }
+    for inst_idx in 0..ell {
+        for i in 0..3 {
+            if Ms[inst_idx][i].nrows != m {
+                return Err("PiFold: inconsistent m across instances".to_string());
+            }
+        }
+    }
+    let log_m = log2(m) as usize;
+    let d = R::dimension();
+
+    transcript.absorb_field_element(&R::BaseRing::from(0x4c465053_50494841u128));
+    let s_base = transcript.get_challenges(log_m);
+    let alpha_base = transcript.get_challenge();
+
+    let mut alpha_pows = Vec::with_capacity(d);
+    let mut pow = R::BaseRing::ONE;
+    for _ in 0..d {
+        alpha_pows.push(R::from(pow));
+        pow *= alpha_base;
+    }
+
+    // -----------------
+    // Per-instance coins
+    // -----------------
+    let mut cba_all: Vec<Vec<(Vec<R>, R::BaseRing, R::BaseRing)>> = Vec::with_capacity(ell);
+    let mut rc_all: Vec<Option<R::BaseRing>> = Vec::with_capacity(ell);
+    let mut Js: Vec<Vec<Vec<R::BaseRing>>> = Vec::with_capacity(ell);
+
+    let n_f = witnesses[0].len();
+    if n_f == 0 || n_f % rg_params.l_h != 0 {
+        return Err("PiFold: invalid witness length".to_string());
+    }
+    for w in witnesses.iter() {
+        if w.len() != n_f {
+            return Err("PiFold: inconsistent witness lengths".to_string());
+        }
+    }
+    for inst_idx in 0..ell {
+        for i in 0..3 {
+            if Ms[inst_idx][i].ncols != n_f {
+                return Err("PiFold: matrix/witness width mismatch".to_string());
+            }
+        }
+    }
+
+    let blocks = n_f / rg_params.l_h;
+    let m_j = blocks
+        .checked_mul(rg_params.lambda_pj)
+        .ok_or_else(|| "PiFold: m_J overflow".to_string())?;
+    if m < m_j || m % m_j != 0 {
+        return Err("PiFold: require m_J <= m and m multiple of m_J".to_string());
+    }
+
+    let g_len = m
+        .checked_mul(d)
+        .ok_or_else(|| "PiFold: g_len overflow".to_string())?;
+    if !g_len.is_power_of_two() {
+        return Err("PiFold: require m*d power-of-two".to_string());
+    }
+    let g_nvars = log2(g_len) as usize;
+
+    for cm_f in cms.iter() {
+        transcript.absorb_slice(cm_f);
+        let J = derive_J::<R>(transcript, rg_params.lambda_pj, rg_params.l_h);
+        for row in &J {
+            for x in row {
+                transcript.absorb_field_element(x);
+            }
+        }
+        Js.push(J);
+
+        let mut cba: Vec<(Vec<R>, R::BaseRing, R::BaseRing)> = Vec::with_capacity(rg_params.k_g);
+        for _ in 0..rg_params.k_g {
+            let c: Vec<R> = transcript
+                .get_challenges(g_nvars)
+                .into_iter()
+                .map(|x| x.into())
+                .collect();
+            let beta = transcript.get_challenge();
+            let alpha = transcript.get_challenge();
+            cba.push((c, beta, alpha));
+        }
+        let rc: Option<R::BaseRing> = (rg_params.k_g > 1).then(|| transcript.get_challenge());
+        cba_all.push(cba);
+        rc_all.push(rc);
+    }
+
+    let rhos = transcript
+        .get_challenges(ell)
+        .into_iter()
+        .map(R::from)
+        .collect::<Vec<R>>();
+
+    // -----------------
+    // STREAMING Hadamard MLEs
+    // -----------------
+    let mut mles_had: Vec<StreamingMleEnum<R>> = Vec::with_capacity(ell * 4);
+    for inst_idx in 0..ell {
+        mles_had.push(StreamingMleEnum::eq_base(s_base.clone()));
+        for i in 0..3 {
+            mles_had.push(StreamingMleEnum::sparse_mat_vec(
+                Ms[inst_idx][i].clone(),
+                witnesses[inst_idx].clone(),
+            ));
+        }
+    }
+
+    let rhos_had = rhos.clone();
+    let comb_had = move |vals: &[R]| -> R {
+        let mut acc_all = R::ZERO;
+        for inst_idx in 0..ell {
+            let base = inst_idx * 4;
+            let eq = vals[base];
+            let y1 = &vals[base + 1];
+            let y2 = &vals[base + 2];
+            let y3 = &vals[base + 3];
+            let mut acc = R::ZERO;
+            for j in 0..d {
+                let term = y1.coeffs()[j] * y2.coeffs()[j] - y3.coeffs()[j];
+                acc += alpha_pows[j] * eq * R::from(term);
+            }
+            acc_all += rhos_had[inst_idx] * acc;
+        }
+        acc_all
+    };
+
+    // -----------------
+    // Build monomial side MLEs (identical to shared-M path)
+    // -----------------
+    let mon_mles_per = 3 * rg_params.k_g;
+    let mut mles_mon: Vec<StreamingMleEnum<R>> = Vec::with_capacity(ell * mon_mles_per);
+
+    let alphas_ring = cba_all
+        .iter()
+        .map(|cba| cba.iter().map(|(_, _, a)| R::from(*a)).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+
+    let t_digits = Instant::now();
+    let mut proj_digits_by_inst: Vec<Arc<Vec<R::BaseRing>>> = Vec::with_capacity(ell);
+    for inst_idx in 0..ell {
+        let f: &[R] = &witnesses[inst_idx];
+        let J = &Js[inst_idx];
+        let k_g = rg_params.k_g;
+        let lambda_pj = rg_params.lambda_pj;
+        let l_h = rg_params.l_h;
+        let d_prime = rg_params.d_prime;
+
+        let mut digits_flat = vec![R::BaseRing::ZERO; m_j * d * k_g];
+
+        #[cfg(feature = "parallel")]
+        {
+            use ark_std::cfg_into_iter;
+            let out_ptr = digits_flat.as_mut_ptr() as usize;
+            cfg_into_iter!(0..m_j).for_each(|out_row| {
+                let i = out_row % lambda_pj;
+                let b = out_row / lambda_pj;
+                let mut h_row = vec![R::BaseRing::ZERO; d];
+                for t in 0..l_h {
+                    let in_row = b * l_h + t;
+                    if in_row >= f.len() {
+                        continue;
+                    }
+                    let coef = J[i][t];
+                    let coeffs = f[in_row].coeffs();
+                    for col in 0..d {
+                        h_row[col] += coef * coeffs[col];
+                    }
+                }
+                let digits = h_row.decompose_to_vec(d_prime, k_g);
+                for col in 0..d {
+                    for dig in 0..k_g {
+                        let idx = (out_row * d + col) * k_g + dig;
+                        unsafe {
+                            let out = (out_ptr as *mut R::BaseRing).add(idx);
+                            *out = digits[col][dig];
+                        }
+                    }
+                }
+            });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for out_row in 0..m_j {
+                let i = out_row % lambda_pj;
+                let b = out_row / lambda_pj;
+                let mut h_row = vec![R::BaseRing::ZERO; d];
+                for t in 0..l_h {
+                    let in_row = b * l_h + t;
+                    if in_row >= f.len() {
+                        continue;
+                    }
+                    let coef = J[i][t];
+                    let coeffs = f[in_row].coeffs();
+                    for col in 0..d {
+                        h_row[col] += coef * coeffs[col];
+                    }
+                }
+                let digits = h_row.decompose_to_vec(d_prime, k_g);
+                for col in 0..d {
+                    for dig in 0..k_g {
+                        digits_flat[(out_row * d + col) * k_g + dig] = digits[col][dig];
+                    }
+                }
+            }
+        }
+        proj_digits_by_inst.push(Arc::new(digits_flat));
+    }
+    if prof {
+        eprintln!("[PiFold streaming hetero] proj_digits: {:?}", t_digits.elapsed());
+    }
+
+    let t_mon_build = Instant::now();
+    for inst_idx in 0..ell {
+        let digits_flat = &proj_digits_by_inst[inst_idx];
+        for dig in 0..rg_params.k_g {
+            let (_c, beta_i, _alpha_i) = &cba_all[inst_idx][dig];
+
+            // mj_compact[col*m_j + out_row] := ev(exp(digit), beta_i)
+            let mut mj_compact = vec![R::BaseRing::ZERO; m_j * d];
+            for out_row in 0..m_j {
+                for col in 0..d {
+                    let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
+                    let g = exp::<R>(digit).expect("Exp failed");
+                    let mjv = ev(&g, *beta_i);
+                    mj_compact[col * m_j + out_row] = mjv;
+                }
+            }
+            let mj_compact = Arc::new(mj_compact);
+            mles_mon.push(StreamingMleEnum::periodic_base_scalar_vec(
+                g_nvars,
+                m,
+                m_j,
+                d,
+                mj_compact.clone(),
+                false,
+            ));
+            mles_mon.push(StreamingMleEnum::periodic_base_scalar_vec(
+                g_nvars,
+                m,
+                m_j,
+                d,
+                mj_compact,
+                true,
+            ));
+
+            // eq(c) as streaming MLE.
+            let (c, _beta_i2, _alpha_i2) = &cba_all[inst_idx][dig];
+            let c_base = c.iter().map(|x| x.coeffs()[0]).collect::<Vec<_>>();
+            mles_mon.push(StreamingMleEnum::eq_base(c_base));
+        }
+    }
+    if prof {
+        eprintln!(
+            "[PiFold streaming hetero] built mon MLEs in {:?} (g_len={}, g_nvars={}, k_g={}, ell={})",
+            t_mon_build.elapsed(),
+            g_len,
+            g_nvars,
+            rg_params.k_g,
+            ell
+        );
+    }
+
+    let rc_all_clone = rc_all.clone();
+    let comb_mon = move |vals: &[R]| -> R {
+        let mut acc_all = R::ZERO;
+        for inst_idx in 0..ell {
+            let mut lc = R::ZERO;
+            let mut rc_pow = R::BaseRing::ONE;
+            for dig in 0..rg_params.k_g {
+                let base = inst_idx * mon_mles_per + dig * 3;
+                let b_claim = vals[base] * vals[base] - vals[base + 1];
+                let mut res = b_claim * alphas_ring[inst_idx][dig];
+                res *= vals[base + 2];
+                lc += if let Some(rc) = &rc_all_clone[inst_idx] {
+                    let scaled = res * R::from(rc_pow);
+                    rc_pow *= *rc;
+                    scaled
+                } else {
+                    res
+                };
+            }
+            acc_all += rhos[inst_idx] * lc;
+        }
+        acc_all
+    };
+
+    // -----------------
+    // Run sumchecks with SHARED challenges (must match verifier schedule)
+    // -----------------
+    let hook_round = log2(m_j.next_power_of_two()) as usize;
+    let mut v_digits_folded: Vec<Vec<R::BaseRing>> =
+        vec![vec![R::BaseRing::ZERO; d]; rg_params.k_g];
+
+    transcript.absorb(&R::from(log_m as u128));
+    transcript.absorb(&R::from(3u128));
+    transcript.absorb(&R::from(g_nvars as u128));
+    transcript.absorb(&R::from(3u128));
+
+    let mut had_state = StreamingSumcheck::prover_init(mles_had, log_m, 3);
+    let mut mon_state = StreamingSumcheck::prover_init(mles_mon, g_nvars, 3);
+
+    let mut had_msgs = Vec::with_capacity(log_m);
+    let mut mon_msgs = Vec::with_capacity(g_nvars);
+    let mut sampled: Vec<R::BaseRing> = Vec::with_capacity(log_m.max(g_nvars));
+    let mut v_msg_had: Option<R::BaseRing> = None;
+    let mut v_msg_mon: Option<R::BaseRing> = None;
+
+    let rounds = log_m.max(g_nvars);
+    let t_sumcheck = Instant::now();
+    for round_idx in 0..rounds {
+        if round_idx < log_m {
+            let pm_had = StreamingSumcheck::prove_round(&mut had_state, v_msg_had, &comb_had);
+            transcript.absorb_slice(&pm_had.evaluations);
+            had_msgs.push(pm_had);
+        }
+        if round_idx < g_nvars {
+            let pm_mon = StreamingSumcheck::prove_round(&mut mon_state, v_msg_mon, &comb_mon);
+            transcript.absorb_slice(&pm_mon.evaluations);
+            mon_msgs.push(pm_mon);
+        }
+
+        let r = transcript.get_challenge();
+        transcript.absorb(&R::from(r));
+        sampled.push(r);
+
+        if hook_round != 0 && sampled.len() == hook_round {
+            let ts_r_full = ts_weights(&sampled);
+            let ts_r = &ts_r_full[..m_j];
+            for dig in 0..rg_params.k_g {
+                for col in 0..d {
+                    v_digits_folded[dig][col] = R::BaseRing::ZERO;
+                }
+            }
+            for inst_idx in 0..ell {
+                let b = beta_cts[inst_idx];
+                let digits_flat = &proj_digits_by_inst[inst_idx];
+                for row in 0..m_j {
+                    let w = ts_r[row];
+                    for col in 0..d {
+                        for dig in 0..rg_params.k_g {
+                            let digit = digits_flat[(row * d + col) * rg_params.k_g + dig];
+                            v_digits_folded[dig][col] += b * digit * w;
+                        }
+                    }
+                }
+            }
+            for v_i in &v_digits_folded {
+                for x in v_i {
+                    transcript.absorb_field_element(x);
+                }
+            }
+        }
+
+        v_msg_had = Some(r);
+        v_msg_mon = Some(r);
+    }
+    if prof {
+        eprintln!("[PiFold streaming hetero] sumcheck: {:?}", t_sumcheck.elapsed());
+        eprintln!("[PiFold streaming hetero] total: {:?}", t_all.elapsed());
+    }
+
+    let had_sumcheck = convert_streaming_proof(&StreamingProof(had_msgs));
+    let mon_sumcheck = convert_streaming_proof(&StreamingProof(mon_msgs));
+
+    // -----------------
+    // Auxiliary transcript witness messages (had_u, mon_b)
+    // -----------------
+    // `StreamingSumcheckState` keeps one last variable to be fixed after the final prover round.
+    let had_rand = had_state.randomness.clone();
+    had_state.randomness = had_rand.clone();
+    had_state.fix_last_variable(*had_rand.last().expect("had_rand non-empty"));
+    let had_evals = had_state.final_evals();
+    let mut had_u: Vec<[Vec<R::BaseRing>; 3]> = Vec::with_capacity(ell);
+    for inst_idx in 0..ell {
+        // MLE order per instance: [eq(s,r), y1, y2, y3]
+        let base = inst_idx * 4;
+        let y1 = had_evals[base + 1];
+        let y2 = had_evals[base + 2];
+        let y3 = had_evals[base + 3];
+        let mut U: [Vec<R::BaseRing>; 3] =
+            [Vec::with_capacity(d), Vec::with_capacity(d), Vec::with_capacity(d)];
+        U[0].extend_from_slice(y1.coeffs());
+        U[1].extend_from_slice(y2.coeffs());
+        U[2].extend_from_slice(y3.coeffs());
+        had_u.push(U);
+    }
+
+    let mon_rand = mon_state.randomness.clone();
+    mon_state.randomness = mon_rand.clone();
+    mon_state.fix_last_variable(*mon_rand.last().expect("mon_rand non-empty"));
+    let mon_evals = mon_state.final_evals();
+    let mut mon_b: Vec<Vec<R>> = Vec::with_capacity(ell);
+    for inst_idx in 0..ell {
+        let mut b_inst = Vec::with_capacity(rg_params.k_g);
+        for dig in 0..rg_params.k_g {
+            // base points at mj (not eq); see comb_mon indexing.
+            let base = inst_idx * mon_mles_per + dig * 3;
+            let mj = mon_evals[base];
+            b_inst.push(mj);
+        }
+        transcript.absorb_slice(&b_inst);
+        mon_b.push(b_inst);
     }
 
     Ok(PiFoldProverOutput {

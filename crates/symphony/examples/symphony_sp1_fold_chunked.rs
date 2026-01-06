@@ -25,6 +25,7 @@ use symphony::symphony_sp1_r1cs::open_sp1_r1cs_chunk_cache;
 use symphony::rp_rgchk::RPParams;
 use symphony::symphony_pifold_batched::prove_pi_fold_batched_sumcheck_fs;
 use symphony::symphony_pifold_streaming::prove_pi_fold_streaming_sumcheck_fs;
+use symphony::symphony_pifold_streaming::prove_pi_fold_streaming_sumcheck_fs_hetero_m;
 
 /// BabyBear field element for loading R1CS.
 #[derive(Debug, Clone, Copy, Default)]
@@ -196,6 +197,54 @@ fn main() {
         num_chunks, max_concurrent
     );
     let prove_start = Instant::now();
+
+    // Optional: produce **one** Π_fold proof for all chunks (O(1) verification) by treating each
+    // chunk as a separate instance with its own matrices.
+    //
+    // This currently loads all chunk matrices into memory; it’s a correctness-first path toward a
+    // fully streaming “one proof” accumulator over the chunk cache.
+    let fold_all: bool = std::env::var("FOLD_ALL_CHUNKS")
+        .ok()
+        .as_deref()
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if fold_all {
+        if pifold_mode != "streaming" {
+            eprintln!("FOLD_ALL_CHUNKS=1 currently requires SYMPHONY_PIFOLD_MODE=streaming");
+            std::process::exit(2);
+        }
+        println!("  FOLD_ALL_CHUNKS=1: loading all chunk matrices and proving one batched proof...");
+        let t_load_all = Instant::now();
+        let mut all_mats: Vec<[Arc<stark_rings_linalg::SparseMatrix<R>>; 3]> =
+            Vec::with_capacity(num_chunks);
+        for i in 0..num_chunks {
+            let [m1, m2, m3] = cache.read_chunk(i).expect("read_chunk failed");
+            all_mats.push([Arc::new(m1), Arc::new(m2), Arc::new(m3)]);
+        }
+        println!("    Loaded {} chunks in {:?}", num_chunks, t_load_all.elapsed());
+
+        let cms_all: Vec<Vec<R>> = vec![cm_main.clone(); num_chunks];
+        let witnesses_all: Vec<Arc<Vec<R>>> = vec![witness.clone(); num_chunks];
+
+        let t_one = Instant::now();
+        let out = prove_pi_fold_streaming_sumcheck_fs_hetero_m::<R, PC>(
+            all_mats.as_slice(),
+            &cms_all,
+            &witnesses_all,
+            &public_inputs,
+            Some(scheme_had.as_ref()),
+            Some(scheme_mon.as_ref()),
+            rg_params.clone(),
+        )
+        .expect("prove (hetero M) failed");
+        let proof_bytes = out.proof.coins.bytes.len();
+        println!(
+            "  ✓ One-proof mode: prove time {:?}, proof bytes {}",
+            t_one.elapsed(),
+            proof_bytes
+        );
+        return;
+    }
     
     let mut successes = 0;
     let mut failures = 0;
