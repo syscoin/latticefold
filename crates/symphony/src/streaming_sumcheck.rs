@@ -70,6 +70,17 @@ where
         /// If true, return the square of the looked-up base scalar.
         square: bool,
     },
+    /// Owned version of `PeriodicBaseScalarVec` with a reusable scratch buffer so we can avoid
+    /// allocating a fresh `Vec` on every `fix_variable` call (hot in Π_mon sumcheck rounds).
+    PeriodicBaseScalarVecOwned {
+        evals: Vec<R::BaseRing>,
+        scratch: Vec<R::BaseRing>,
+        num_vars: usize,
+        m: usize,
+        m_j: usize,
+        d: usize,
+        square: bool,
+    },
     /// eq(bits(index), r) evaluated in the base ring, then lifted to R.
     EqBase {
         scale: R::BaseRing,
@@ -158,6 +169,7 @@ where
             StreamingMleEnum::BaseScalarVec { num_vars, .. } => *num_vars,
             StreamingMleEnum::BaseScalarVecOwned { num_vars, .. } => *num_vars,
             StreamingMleEnum::PeriodicBaseScalarVec { num_vars, .. } => *num_vars,
+            StreamingMleEnum::PeriodicBaseScalarVecOwned { num_vars, .. } => *num_vars,
             StreamingMleEnum::EqBase { r, .. } => r.len(),
         }
     }
@@ -192,6 +204,24 @@ where
             StreamingMleEnum::BaseScalarVec { evals, .. } => R::from(evals[index]),
             StreamingMleEnum::BaseScalarVecOwned { evals, .. } => R::from(evals[index]),
             StreamingMleEnum::PeriodicBaseScalarVec {
+                evals,
+                m,
+                m_j,
+                d,
+                square,
+                ..
+            } => {
+                debug_assert_eq!(*m * *d, 1usize << self.num_vars());
+                let col = index / *m;
+                let r = index % *m;
+                let row = if *m_j == 0 { 0 } else { r % *m_j };
+                let mut v = evals[col * *m_j + row];
+                if *square {
+                    v *= v;
+                }
+                R::from(v)
+            }
+            StreamingMleEnum::PeriodicBaseScalarVecOwned {
                 evals,
                 m,
                 m_j,
@@ -247,6 +277,23 @@ where
             StreamingMleEnum::BaseScalarVec { evals, .. } => evals[index],
             StreamingMleEnum::BaseScalarVecOwned { evals, .. } => evals[index],
             StreamingMleEnum::PeriodicBaseScalarVec {
+                evals,
+                m,
+                m_j,
+                d: _d,
+                square,
+                ..
+            } => {
+                let col = index / *m;
+                let r = index % *m;
+                let row = if *m_j == 0 { 0 } else { r % *m_j };
+                let mut v = evals[col * *m_j + row];
+                if *square {
+                    v *= v;
+                }
+                v
+            }
+            StreamingMleEnum::PeriodicBaseScalarVecOwned {
                 evals,
                 m,
                 m_j,
@@ -434,6 +481,27 @@ where
                     }
                 }
             }
+            StreamingMleEnum::PeriodicBaseScalarVecOwned {
+                evals,
+                num_vars,
+                m,
+                m_j,
+                d,
+                square,
+                ..
+            } => {
+                // This variant is intended to be fixed via `fix_variable_in_place_base`.
+                // Implement the immutable API by delegating to the existing periodic logic.
+                StreamingMleEnum::PeriodicBaseScalarVec {
+                    evals: Arc::new(evals.clone()),
+                    num_vars: *num_vars,
+                    m: *m,
+                    m_j: *m_j,
+                    d: *d,
+                    square: *square,
+                }
+                .fix_variable(r)
+            }
             // EqBase: keep structural (base-field) with updated scale and shortened r vector.
             StreamingMleEnum::EqBase {
                 scale,
@@ -510,8 +578,91 @@ where
                 *num_vars -= 1;
             }
             StreamingMleEnum::PeriodicBaseScalarVec { .. } => {
-                let new = self.fix_variable(r_ring);
-                *self = new;
+                // Convert once to owned so subsequent fixes can reuse scratch.
+                // This is especially important for Π_mon where we fix ~log(m_j) row bits.
+                let owned = match self {
+                    StreamingMleEnum::PeriodicBaseScalarVec {
+                        evals,
+                        num_vars,
+                        m,
+                        m_j,
+                        d,
+                        square,
+                    } => {
+                        let evals_owned = match Arc::try_unwrap(evals.clone()) {
+                            Ok(v) => v,
+                            Err(a) => (*a).clone(),
+                        };
+                        StreamingMleEnum::PeriodicBaseScalarVecOwned {
+                            evals: evals_owned,
+                            scratch: Vec::new(),
+                            num_vars: *num_vars,
+                            m: *m,
+                            m_j: *m_j,
+                            d: *d,
+                            square: *square,
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                *self = owned;
+                // Now apply this round's fix in-place (or fall back if in column-bit region).
+                self.fix_variable_in_place_base(r0);
+            }
+            StreamingMleEnum::PeriodicBaseScalarVecOwned {
+                evals,
+                scratch,
+                num_vars,
+                m,
+                m_j,
+                d,
+                square,
+            } => {
+                // Focus on the hot "row bits" case (m>1). Column-bit case is rare (log2(d) rounds)
+                // and correctness-sensitive; fall back to `fix_variable` there.
+                if *m == 1 {
+                    let new = self.fix_variable(r_ring);
+                    *self = new;
+                    return;
+                }
+
+                let new_m = *m / 2;
+                if *m_j > 1 {
+                    let new_mj = *m_j / 2;
+                    scratch.clear();
+                    scratch.resize(new_mj * *d, R::BaseRing::ZERO);
+                    for col in 0..*d {
+                        let base = col * *m_j;
+                        let out_base = col * new_mj;
+                        for i in 0..new_mj {
+                            let mut a = evals[base + (i << 1)];
+                            let mut b = evals[base + (i << 1) | 1];
+                            if *square {
+                                a *= a;
+                                b *= b;
+                            }
+                            scratch[out_base + i] = one_minus0 * a + r0 * b;
+                        }
+                    }
+                    // Swap buffers and update shape.
+                    std::mem::swap(evals, scratch);
+                    evals.truncate(new_mj * *d);
+                    *m = new_m;
+                    *m_j = new_mj;
+                    *num_vars -= 1;
+                    *square = false;
+                } else {
+                    // Independent of row bits: only m shrinks. If we were returning squares-on-demand,
+                    // materialize once so future fixes remain correct.
+                    if *square {
+                        for x in evals.iter_mut() {
+                            *x *= *x;
+                        }
+                        *square = false;
+                    }
+                    *m = new_m;
+                    *num_vars -= 1;
+                }
             }
             StreamingMleEnum::EqBase {
                 scale,
