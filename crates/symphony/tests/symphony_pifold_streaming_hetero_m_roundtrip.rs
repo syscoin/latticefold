@@ -4,7 +4,11 @@ use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing, Rin
 use stark_rings_linalg::SparseMatrix;
 use symphony::rp_rgchk::RPParams;
 use symphony::symphony_open::AjtaiOpenVerifier;
-use symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m;
+use symphony::symphony_open::MultiAjtaiOpenVerifier;
+use symphony::symphony_pifold_batched::{
+    verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m,
+    verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m,
+};
 use symphony::symphony_pifold_streaming::prove_pi_fold_streaming_sumcheck_fs_hetero_m;
 
 const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
@@ -75,13 +79,22 @@ fn test_pifold_streaming_hetero_m_roundtrip() {
     let witnesses = vec![std::sync::Arc::new(f0.clone()), std::sync::Arc::new(f1.clone())];
     let public_inputs: Vec<<R as PolyRing>::BaseRing> = vec![];
 
+    // CP transcript-message commitment schemes (WE/DPP-facing path).
+    let scheme_had = AjtaiCommitmentScheme::<R>::seeded(
+        b"cfs_had_u",
+        MASTER_SEED,
+        2,
+        3 * R::dimension(),
+    );
+    let scheme_mon = AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 2, rg_params.k_g);
+
     let out = prove_pi_fold_streaming_sumcheck_fs_hetero_m::<R, PC>(
         ms.as_slice(),
         &cms,
         &witnesses,
         &public_inputs,
-        None,
-        None,
+        Some(&scheme_had),
+        Some(&scheme_mon),
         rg_params.clone(),
     )
     .expect("prove failed");
@@ -101,5 +114,21 @@ fn test_pifold_streaming_hetero_m_roundtrip() {
         &public_inputs,
     )
     .expect("verify failed");
+
+    // WE/CP-facing verification: verify using CP transcript-message commitments + openings to aux.
+    let open_cfs = MultiAjtaiOpenVerifier::new()
+        .with_scheme("cfs_had_u", scheme_had)
+        .with_scheme("cfs_mon_b", scheme_mon);
+    let _ = verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m::<R, PC>(
+        ms_refs.as_slice(),
+        &cms,
+        &out.proof,
+        &open_cfs,
+        &out.cfs_had_u,
+        &out.cfs_mon_b,
+        &out.aux,
+        &public_inputs,
+    )
+    .expect("cp verify failed");
 }
 
