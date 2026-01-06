@@ -46,12 +46,34 @@ use crate::symphony_pifold_batched::{PiFoldAuxWitness, PiFoldBatchedProof, PiFol
 // Re-export streaming types
 pub use crate::streaming_sumcheck::{StreamingProverMsg, StreamingSumcheckState};
 
-fn env_flag(name: &str, default_on: bool) -> bool {
-    std::env::var(name)
-        .ok()
-        .as_deref()
-        .map(|s| !(s == "0" || s.eq_ignore_ascii_case("false")))
-        .unwrap_or(default_on)
+/// Configuration for the streaming Π_fold prover.
+///
+/// Production note: the symphony library does **not** read environment variables. If you want
+/// runtime configuration, parse env vars in your binary/example and pass them through this struct.
+#[derive(Clone, Debug)]
+pub struct PiFoldStreamingConfig {
+    /// Request the constant-coefficient fast path when inputs appear to be constant-coeff.
+    ///
+    /// Even when `true`, we still run a deterministic sampling check and fall back to the generic
+    /// ring path if the check fails.
+    pub request_const_coeff_fastpath: bool,
+    /// Witness sample count used by the deterministic constant-coeff check.
+    pub const_coeff_witness_samples: usize,
+    /// Matrix nonzero-entry sample budget used by the deterministic constant-coeff check.
+    pub const_coeff_matrix_entries: usize,
+    /// Print internal phase timings (intended for benchmarks/profiling).
+    pub profile: bool,
+}
+
+impl Default for PiFoldStreamingConfig {
+    fn default() -> Self {
+        Self {
+            request_const_coeff_fastpath: true,
+            const_coeff_witness_samples: 1024,
+            const_coeff_matrix_entries: 4096,
+            profile: false,
+        }
+    }
 }
 
 fn is_const_coeff_ring_elem<R: stark_rings::PolyRing>(x: &R) -> bool {
@@ -61,24 +83,14 @@ fn is_const_coeff_ring_elem<R: stark_rings::PolyRing>(x: &R) -> bool {
         .all(|c| *c == <R as stark_rings::PolyRing>::BaseRing::ZERO)
 }
 
-fn const_coeff_fastpath_enabled(default_on: bool) -> bool {
-    env_flag("CONST_COEFF_FASTPATH", default_on)
-}
-
 fn seems_const_coeff_inputs<R: stark_rings::PolyRing>(
     witnesses: &[Arc<Vec<R>>],
     mats_to_check: &[Arc<stark_rings_linalg::SparseMatrix<R>>],
+    w_samples: usize,
+    m_entries: usize,
 ) -> bool {
     // Cheap, deterministic sampling to avoid unsound use of the fast path.
-    // Defaults are tiny vs proving time; override via env if desired.
-    let w_samples: usize = std::env::var("CONST_COEFF_FASTPATH_WITNESS_SAMPLES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1024);
-    let m_entries: usize = std::env::var("CONST_COEFF_FASTPATH_MATRIX_ENTRIES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4096);
+    // Defaults are tiny vs proving time; callers can adjust via `PiFoldStreamingConfig`.
 
     // Witness sample
     if w_samples > 0 {
@@ -116,48 +128,6 @@ fn seems_const_coeff_inputs<R: stark_rings::PolyRing>(
     }
 
     true
-}
-
-fn sparse_mat_vec_const_coeff_dense<R>(
-    matrix: &stark_rings_linalg::SparseMatrix<R>,
-    witness0: &[<R as stark_rings::PolyRing>::BaseRing],
-) -> Vec<<R as stark_rings::PolyRing>::BaseRing>
-where
-    R: CoeffRing + stark_rings::PolyRing,
-    <R as stark_rings::PolyRing>::BaseRing: Zq,
-{
-    let nrows = matrix.nrows;
-    debug_assert!(nrows.is_power_of_two());
-
-    #[cfg(feature = "parallel")]
-    {
-        use ark_std::cfg_into_iter;
-        cfg_into_iter!(0..nrows)
-            .map(|row| {
-                let mut sum = <R as stark_rings::PolyRing>::BaseRing::ZERO;
-                for (coeff, col_idx) in &matrix.coeffs[row] {
-                    if *col_idx < witness0.len() {
-                        sum += coeff.coeffs()[0] * witness0[*col_idx];
-                    }
-                }
-                sum
-            })
-            .collect()
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        let mut out = vec![<R as stark_rings::PolyRing>::BaseRing::ZERO; nrows];
-        for row in 0..nrows {
-            let mut sum = <R as stark_rings::PolyRing>::BaseRing::ZERO;
-            for (coeff, col_idx) in &matrix.coeffs[row] {
-                if *col_idx < witness0.len() {
-                    sum += coeff.coeffs()[0] * witness0[*col_idx];
-                }
-            }
-            out[row] = sum;
-        }
-        out
-    }
 }
 
 fn absorb_public_inputs<R: OverField>(ts: &mut impl Transcript<R>, public_inputs: &[R::BaseRing])
@@ -218,6 +188,81 @@ where
     absorb_public_inputs::<R>(&mut rts, public_inputs);
 
     let mut out = prove_pi_fold_streaming(&mut rts, M, cms, witnesses, rg_params)
+        .map_err(|e| format!("PiFold: poseidon-fs prove failed: {e}"))?;
+
+    out.proof.coins = SymphonyCoins::<R> {
+        challenges: rts.coins_challenges,
+        bytes: rts.coins_bytes,
+        events: rts.events,
+    };
+
+    // Optionally commit to CP transcript witness messages (WE/DPP-facing path).
+    out.cfs_had_u.clear();
+    out.cfs_mon_b.clear();
+    match (cfs_had_u_scheme, cfs_mon_b_scheme) {
+        (Some(had_s), Some(mon_s)) => {
+            out.cfs_had_u = out
+                .aux
+                .had_u
+                .iter()
+                .map(|u| {
+                    had_s
+                        .commit_const_coeff_fast(&encode_had_u_instance::<R>(u))
+                        .map_err(|e| format!("PiFold: cfs_had_u commit failed: {e:?}"))
+                        .map(|c| c.as_ref().to_vec())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            out.cfs_mon_b = out
+                .aux
+                .mon_b
+                .iter()
+                .map(|b| {
+                    mon_s
+                        .commit_const_coeff_fast(b)
+                        .map_err(|e| format!("PiFold: cfs_mon_b commit failed: {e:?}"))
+                        .map(|c| c.as_ref().to_vec())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "PiFold: must provide both cfs_had_u_scheme and cfs_mon_b_scheme or neither".to_string(),
+            );
+        }
+    }
+
+    Ok(out)
+}
+
+/// Same as `prove_pi_fold_streaming_sumcheck_fs`, but allows passing an explicit config.
+pub fn prove_pi_fold_streaming_sumcheck_fs_with_config<R: CoeffRing, PC>(
+    M: [Arc<SparseMatrix<R>>; 3],
+    cms: &[Vec<R>],
+    witnesses: &[Arc<Vec<R>>],
+    public_inputs: &[R::BaseRing],
+    cfs_had_u_scheme: Option<&AjtaiCommitmentScheme<R>>,
+    cfs_mon_b_scheme: Option<&AjtaiCommitmentScheme<R>>,
+    rg_params: RPParams,
+    config: &PiFoldStreamingConfig,
+) -> Result<PiFoldProverOutput<R>, String>
+where
+    R::BaseRing: Zq + Decompose,
+    PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
+{
+    if cms.is_empty() {
+        return Err("PiFold: empty batch".to_string());
+    }
+    if cms.len() != witnesses.len() {
+        return Err("PiFold: cms/witnesses length mismatch".to_string());
+    }
+
+    let mut ts = crate::transcript::PoseidonTranscript::<R>::empty::<PC>();
+    let mut rts = RecordingTranscriptRef::<R, _>::new(&mut ts);
+    rts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
+    absorb_public_inputs::<R>(&mut rts, public_inputs);
+
+    let mut out = prove_pi_fold_streaming_with_config(&mut rts, M, cms, witnesses, rg_params, config)
         .map_err(|e| format!("PiFold: poseidon-fs prove failed: {e}"))?;
 
     out.proof.coins = SymphonyCoins::<R> {
@@ -343,6 +388,82 @@ where
     Ok(out)
 }
 
+/// Same as `prove_pi_fold_streaming_sumcheck_fs_hetero_m`, but allows passing an explicit config.
+pub fn prove_pi_fold_streaming_sumcheck_fs_hetero_m_with_config<R: CoeffRing, PC>(
+    Ms: &[[Arc<SparseMatrix<R>>; 3]],
+    cms: &[Vec<R>],
+    witnesses: &[Arc<Vec<R>>],
+    public_inputs: &[R::BaseRing],
+    cfs_had_u_scheme: Option<&AjtaiCommitmentScheme<R>>,
+    cfs_mon_b_scheme: Option<&AjtaiCommitmentScheme<R>>,
+    rg_params: RPParams,
+    config: &PiFoldStreamingConfig,
+) -> Result<PiFoldProverOutput<R>, String>
+where
+    R::BaseRing: Zq + Decompose,
+    PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
+{
+    if cms.is_empty() {
+        return Err("PiFold: empty batch".to_string());
+    }
+    if Ms.len() != cms.len() || cms.len() != witnesses.len() {
+        return Err("PiFold: Ms/cms/witnesses length mismatch".to_string());
+    }
+
+    let mut ts = crate::transcript::PoseidonTranscript::<R>::empty::<PC>();
+    let mut rts = RecordingTranscriptRef::<R, _>::new(&mut ts);
+    rts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
+    absorb_public_inputs::<R>(&mut rts, public_inputs);
+
+    let mut out =
+        prove_pi_fold_streaming_hetero_m_with_config(&mut rts, Ms, cms, witnesses, rg_params, config)
+            .map_err(|e| format!("PiFold: poseidon-fs prove failed: {e}"))?;
+
+    out.proof.coins = SymphonyCoins::<R> {
+        challenges: rts.coins_challenges,
+        bytes: rts.coins_bytes,
+        events: rts.events,
+    };
+
+    // Optionally commit to CP transcript witness messages (WE/DPP-facing path).
+    out.cfs_had_u.clear();
+    out.cfs_mon_b.clear();
+    match (cfs_had_u_scheme, cfs_mon_b_scheme) {
+        (Some(had_s), Some(mon_s)) => {
+            out.cfs_had_u = out
+                .aux
+                .had_u
+                .iter()
+                .map(|u| {
+                    had_s
+                        .commit_const_coeff_fast(&encode_had_u_instance::<R>(u))
+                        .map_err(|e| format!("PiFold: cfs_had_u commit failed: {e:?}"))
+                        .map(|c| c.as_ref().to_vec())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            out.cfs_mon_b = out
+                .aux
+                .mon_b
+                .iter()
+                .map(|b| {
+                    mon_s
+                        .commit_const_coeff_fast(b)
+                        .map_err(|e| format!("PiFold: cfs_mon_b commit failed: {e:?}"))
+                        .map(|c| c.as_ref().to_vec())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "PiFold: must provide both cfs_had_u_scheme and cfs_mon_b_scheme or neither".to_string(),
+            );
+        }
+    }
+
+    Ok(out)
+}
+
 /// Streaming Π_fold prover.
 ///
 /// This is a memory-efficient version of `prove_pi_fold_batched_sumcheck` that uses
@@ -368,6 +489,35 @@ pub fn prove_pi_fold_streaming<R: CoeffRing>(
 where
     R::BaseRing: Zq + Decompose,
 {
+    let cfg = PiFoldStreamingConfig::default();
+    prove_pi_fold_streaming_with_config(transcript, M, cms, witnesses, rg_params, &cfg)
+}
+
+pub fn prove_pi_fold_streaming_with_config<R: CoeffRing>(
+    transcript: &mut impl Transcript<R>,
+    M: [Arc<SparseMatrix<R>>; 3],
+    cms: &[Vec<R>],
+    witnesses: &[Arc<Vec<R>>],
+    rg_params: RPParams,
+    config: &PiFoldStreamingConfig,
+) -> Result<PiFoldProverOutput<R>, String>
+where
+    R::BaseRing: Zq + Decompose,
+{
+    prove_pi_fold_streaming_impl(transcript, M, cms, witnesses, rg_params, config)
+}
+
+fn prove_pi_fold_streaming_impl<R: CoeffRing>(
+    transcript: &mut impl Transcript<R>,
+    M: [Arc<SparseMatrix<R>>; 3],
+    cms: &[Vec<R>],
+    witnesses: &[Arc<Vec<R>>],
+    rg_params: RPParams,
+    config: &PiFoldStreamingConfig,
+) -> Result<PiFoldProverOutput<R>, String>
+where
+    R::BaseRing: Zq + Decompose,
+{
     // Constant-coefficient fast path: enabled by default.
     //
     // For many real applications (including SP1-style R1CS), matrices and witnesses are base-field
@@ -375,15 +525,16 @@ where
     // `y = M*w` stays constant-coefficient and Π_had can be evaluated mostly in the base ring.
     //
     // Safety: we auto-disable this fast path if a small deterministic sample detects any
-    // non-constant coefficients. Override the default at runtime with `CONST_COEFF_FASTPATH=0/false`.
-    let const_coeff_fastpath_requested = const_coeff_fastpath_enabled(true);
-    let const_coeff_fastpath = const_coeff_fastpath_requested
-        && seems_const_coeff_inputs::<R>(witnesses, &[M[0].clone(), M[1].clone(), M[2].clone()]);
-    // Optional: trade memory for speed by precomputing y=M*w in the base ring.
-    // Default off; enable via `CONST_COEFF_PRECOMPUTE_Y=1`.
-    let const_coeff_precompute_y = const_coeff_fastpath && env_flag("CONST_COEFF_PRECOMPUTE_Y", false);
+    // non-constant coefficients.
+    let const_coeff_fastpath = config.request_const_coeff_fastpath
+        && seems_const_coeff_inputs::<R>(
+            witnesses,
+            &[M[0].clone(), M[1].clone(), M[2].clone()],
+            config.const_coeff_witness_samples,
+            config.const_coeff_matrix_entries,
+        );
 
-    let prof = std::env::var("SYMPHONY_PROFILE").ok().as_deref() == Some("1");
+    let prof = config.profile;
     let t_all = Instant::now();
     let ell = cms.len();
     let beta_cts = derive_beta_chi::<R>(transcript, ell);
@@ -503,15 +654,10 @@ where
         };
         for i in 0..3 {
             if const_coeff_fastpath {
-                if const_coeff_precompute_y {
-                    let y0 = sparse_mat_vec_const_coeff_dense::<R>(&M[i], w0.as_ref().expect("w0 present").as_slice());
-                    mles_had.push(StreamingMleEnum::base_scalar_vec(log_m, Arc::new(y0)));
-                } else {
-                    mles_had.push(StreamingMleEnum::sparse_mat_vec_const_coeff(
-                        M[i].clone(),
-                        w0.as_ref().expect("w0 present").clone(),
-                    ));
-                }
+                mles_had.push(StreamingMleEnum::sparse_mat_vec_const_coeff(
+                    M[i].clone(),
+                    w0.as_ref().expect("w0 present").clone(),
+                ));
             } else {
                 mles_had.push(StreamingMleEnum::sparse_mat_vec(
                 M[i].clone(),
@@ -533,7 +679,7 @@ where
             Some(Box::new(move |vals: &[R::BaseRing]| -> R::BaseRing {
                 let eq0 = vals[0];
                 let mut acc_all0 = R::BaseRing::ZERO;
-                for inst_idx in 0..ell {
+        for inst_idx in 0..ell {
                     let base = 1 + inst_idx * 3;
                     let y10 = vals[base];
                     let y20 = vals[base + 1];
@@ -618,7 +764,7 @@ where
                     }
                     // Decompose exactly as the generic path does, but only
                     // write the nonzero column (col=0). Other columns remain zero in `digits_flat`.
-                    let mut h_row = vec![R::BaseRing::ZERO; d];
+        let mut h_row = vec![R::BaseRing::ZERO; d];
                     h_row[0] = h0;
                     let digits = h_row.decompose_to_vec(d_prime, k_g);
                     for dig in 0..k_g {
@@ -631,15 +777,15 @@ where
                     let mut h_row = vec![R::BaseRing::ZERO; d];
                     for t in 0..l_h {
                         let in_row = b * l_h + t;
-                        if in_row >= f.len() {
-                            continue;
-                        }
-                        let coef = J[i][t];
-                        let coeffs = f[in_row].coeffs();
-                        for col in 0..d {
-                            h_row[col] += coef * coeffs[col];
-                        }
-                    }
+            if in_row >= f.len() {
+                continue;
+            }
+            let coef = J[i][t];
+            let coeffs = f[in_row].coeffs();
+            for col in 0..d {
+                h_row[col] += coef * coeffs[col];
+            }
+        }
                     let digits = h_row.decompose_to_vec(d_prime, k_g);
                     for col in 0..d {
                         for dig in 0..k_g {
@@ -762,7 +908,7 @@ where
                 if const_coeff_fastpath && d > 1 {
                     let g0 = exp::<R>(R::BaseRing::ZERO).expect("Exp failed");
                     let mjv_zero = ev(&g0, *beta_i);
-                    for out_row in 0..m_j {
+            for out_row in 0..m_j {
                         let digit0 = digits_flat[(out_row * d) * rg_params.k_g + dig]; // col=0
                         let g = exp::<R>(digit0).expect("Exp failed");
                         mj_compact[out_row] = ev(&g, *beta_i);
@@ -772,7 +918,7 @@ where
                     }
                 } else {
                     for out_row in 0..m_j {
-                        for col in 0..d {
+                for col in 0..d {
                             let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
                             let g = exp::<R>(digit).expect("Exp failed");
                             let mjv = ev(&g, *beta_i);
@@ -1070,21 +1216,32 @@ pub fn prove_pi_fold_streaming_hetero_m<R: CoeffRing>(
 where
     R::BaseRing: Zq + Decompose,
 {
-    let const_coeff_fastpath_requested = const_coeff_fastpath_enabled(true);
+    let cfg = PiFoldStreamingConfig::default();
+    prove_pi_fold_streaming_hetero_m_with_config(transcript, Ms, cms, witnesses, rg_params, &cfg)
+}
+
+pub fn prove_pi_fold_streaming_hetero_m_with_config<R: CoeffRing>(
+    transcript: &mut impl Transcript<R>,
+    Ms: &[[Arc<SparseMatrix<R>>; 3]],
+    cms: &[Vec<R>],
+    witnesses: &[Arc<Vec<R>>],
+    rg_params: RPParams,
+    config: &PiFoldStreamingConfig,
+) -> Result<PiFoldProverOutput<R>, String>
+where
+    R::BaseRing: Zq + Decompose,
+{
     // Cheap sample: first witness and first instance matrices.
-    let const_coeff_fastpath = const_coeff_fastpath_requested
+    let const_coeff_fastpath = config.request_const_coeff_fastpath
         && seems_const_coeff_inputs::<R>(
             witnesses,
-            &[
-                Ms[0][0].clone(),
-                Ms[0][1].clone(),
-                Ms[0][2].clone(),
-            ],
+            &[Ms[0][0].clone(), Ms[0][1].clone(), Ms[0][2].clone()],
+            config.const_coeff_witness_samples,
+            config.const_coeff_matrix_entries,
         );
-    let const_coeff_precompute_y = const_coeff_fastpath && env_flag("CONST_COEFF_PRECOMPUTE_Y", false);
-    // Keep this function bit-for-bit aligned with `prove_pi_fold_streaming` except that each
+    // Keep this function bit-for-bit aligned with `prove_pi_fold_streaming_impl` except that each
     // instance pulls y = M*w from its own matrices.
-    let prof = std::env::var("SYMPHONY_PROFILE").ok().as_deref() == Some("1");
+    let prof = config.profile;
     let t_all = Instant::now();
     let ell = cms.len();
     let beta_cts = derive_beta_chi::<R>(transcript, ell);
@@ -1202,7 +1359,6 @@ where
     // -----------------
     let t_had_build = Instant::now();
     let mut t_w0 = std::time::Duration::from_secs(0);
-    let mut t_y0 = std::time::Duration::from_secs(0);
     // `eq(s, ·)` is shared across all instances; include it once.
     let mut mles_had: Vec<StreamingMleEnum<R>> = Vec::with_capacity(1 + ell * 3);
     mles_had.push(StreamingMleEnum::eq_base(s_base.clone()));
@@ -1229,20 +1385,10 @@ where
         };
         for i in 0..3 {
             if const_coeff_fastpath {
-                if const_coeff_precompute_y {
-                    let t0 = Instant::now();
-                    let y0 = sparse_mat_vec_const_coeff_dense::<R>(
-                        &Ms[inst_idx][i],
-                        w0.as_ref().expect("w0 present").as_slice(),
-                    );
-                    t_y0 += t0.elapsed();
-                    mles_had.push(StreamingMleEnum::base_scalar_vec(log_m, Arc::new(y0)));
-                } else {
-                    mles_had.push(StreamingMleEnum::sparse_mat_vec_const_coeff(
-                        Ms[inst_idx][i].clone(),
-                        w0.as_ref().expect("w0 present").clone(),
-                    ));
-                }
+                mles_had.push(StreamingMleEnum::sparse_mat_vec_const_coeff(
+                    Ms[inst_idx][i].clone(),
+                    w0.as_ref().expect("w0 present").clone(),
+                ));
             } else {
                 mles_had.push(StreamingMleEnum::sparse_mat_vec(
                     Ms[inst_idx][i].clone(),
@@ -1253,12 +1399,10 @@ where
     }
     if prof {
         eprintln!(
-            "[PiFold streaming hetero] had MLE build: {:?} (w0={:?}, precompute_y={:?}, const_coeff_fastpath={}, precompute_y_enabled={})",
+            "[PiFold streaming hetero] had MLE build: {:?} (w0={:?}, const_coeff_fastpath={})",
             t_had_build.elapsed(),
             t_w0,
-            t_y0,
-            const_coeff_fastpath,
-            const_coeff_precompute_y
+            const_coeff_fastpath
         );
     }
 

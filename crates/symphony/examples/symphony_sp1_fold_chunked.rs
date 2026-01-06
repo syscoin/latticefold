@@ -25,9 +25,11 @@ use stark_rings::Ring;
 use symphony::sp1_r1cs_loader::FieldFromU64;
 use symphony::symphony_sp1_r1cs::open_sp1_r1cs_chunk_cache;
 use symphony::rp_rgchk::RPParams;
-use symphony::symphony_pifold_batched::prove_pi_fold_batched_sumcheck_fs;
-use symphony::symphony_pifold_streaming::prove_pi_fold_streaming_sumcheck_fs;
-use symphony::symphony_pifold_streaming::prove_pi_fold_streaming_sumcheck_fs_hetero_m;
+use symphony::symphony_pifold_streaming::{
+    prove_pi_fold_streaming_sumcheck_fs_hetero_m_with_config,
+    prove_pi_fold_streaming_sumcheck_fs_with_config,
+    PiFoldStreamingConfig,
+};
 use symphony::symphony_open::MultiAjtaiOpenVerifier;
 use symphony::symphony_we_relation::{
     check_r_we_poseidon_fs_hetero_m_with_metrics_result, TrivialRo,
@@ -190,14 +192,17 @@ fn main() {
     println!("Configuration:");
     println!("  Chunk size:     {} (2^{})", chunk_size, chunk_size.trailing_zeros());
     println!("  Max concurrent: {} chunks at once", max_concurrent);
-    let pifold_mode = std::env::var("SYMPHONY_PIFOLD_MODE").unwrap_or_else(|_| "dense".to_string());
-    println!("  PiFold mode:    {pifold_mode}");
+    println!("  PiFold mode:    streaming");
     // We'll use a local rayon pool sized to the chunk-level parallelism to avoid oversubscription.
     let prove_threads: usize = std::env::var("PROVE_THREADS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(max_concurrent);
     println!("  Prove threads:  {prove_threads}\n");
+
+    // Π_fold streaming configuration (library does not read env vars).
+    let mut pifold_cfg = PiFoldStreamingConfig::default();
+    pifold_cfg.profile = std::env::var("SYMPHONY_PROFILE").ok().as_deref() == Some("1");
 
     // Step 1: Load and chunk R1CS (uses cache)
     println!("Step 1: Loading R1CS (chunked)...");
@@ -338,10 +343,6 @@ fn main() {
         .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     if fold_all {
-        if pifold_mode != "streaming" {
-            eprintln!("FOLD_ALL_CHUNKS=1 currently requires SYMPHONY_PIFOLD_MODE=streaming");
-            std::process::exit(2);
-        }
         println!("  FOLD_ALL_CHUNKS=1: loading all chunk matrices and proving one batched proof...");
         let t_load_all = Instant::now();
         let mut all_mats: Vec<[Arc<stark_rings_linalg::SparseMatrix<R>>; 3]> =
@@ -399,7 +400,7 @@ fn main() {
         let witnesses_all: Vec<Arc<Vec<R>>> = vec![witness.clone(); num_chunks];
 
         let t_one = Instant::now();
-        let out = prove_pi_fold_streaming_sumcheck_fs_hetero_m::<R, PC>(
+        let out = prove_pi_fold_streaming_sumcheck_fs_hetero_m_with_config::<R, PC>(
             all_mats.as_slice(),
             &cms_all,
             &witnesses_all,
@@ -407,6 +408,7 @@ fn main() {
             Some(scheme_had.as_ref()),
             Some(scheme_mon.as_ref()),
             rg_params.clone(),
+            &pifold_cfg,
         )
         .expect("prove (hetero M) failed");
         let proof_bytes = out.proof.coins.bytes.len();
@@ -539,37 +541,21 @@ fn main() {
                 .into_par_iter() // <-- parallel over loaded chunks
                 .map(|(i, [m1, m2, m3])| {
                 let chunk_start = Instant::now();
-                let result: Result<usize, String> = if pifold_mode == "streaming" {
-                    prove_pi_fold_streaming_sumcheck_fs::<R, PC>(
+                let result: Result<usize, String> = prove_pi_fold_streaming_sumcheck_fs_with_config::<R, PC>(
                         [Arc::new(m1), Arc::new(m2), Arc::new(m3)],
-                        &[cm_main.clone()],
-                        &[witness.clone()],
-                        &public_inputs,
-                        Some(scheme_had.as_ref()),
-                        Some(scheme_mon.as_ref()),
-                        rg_params.clone(),
-                    )
-                    .map(|out| {
-                        let proof_size = out.proof.coins.bytes.len();
-                        drop(out);
-                        proof_size
-                    })
-                } else {
-                    prove_pi_fold_batched_sumcheck_fs::<R, PC>(
-                        [&m1, &m2, &m3],
                     &[cm_main.clone()],
-                        &[witness.as_ref().as_slice()],
+                        &[witness.clone()],
                     &public_inputs,
                     Some(scheme_had.as_ref()),
                     Some(scheme_mon.as_ref()),
                     rg_params.clone(),
+                        &pifold_cfg,
                     )
                     .map(|out| {
                         let proof_size = out.proof.coins.bytes.len();
                         drop(out);
                         proof_size
-                    })
-                };
+                    });
                 
                 (i, result, chunk_start.elapsed())
             })
