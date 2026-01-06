@@ -211,6 +211,59 @@ where
         }
     }
 
+    /// Evaluate this MLE at `index`, returning only the constant coefficient (base ring element).
+    ///
+    /// Used by the constant-coefficient Π_had fast path to avoid constructing full ring elements
+    /// in the hot sumcheck loop.
+    #[inline]
+    pub fn eval0_at_index(&self, index: usize) -> R::BaseRing {
+        match self {
+            StreamingMleEnum::Dense(m) => m.evals[index].coeffs()[0],
+            StreamingMleEnum::SparseMatVec { .. } => self.eval_at_index(index).coeffs()[0],
+            StreamingMleEnum::SparseMatVecConstCoeff {
+                matrix, witness0, ..
+            } => {
+                let mut sum = R::BaseRing::ZERO;
+                for (coeff, col_idx) in &matrix.coeffs[index] {
+                    if *col_idx < witness0.len() {
+                        sum += coeff.coeffs()[0] * witness0[*col_idx];
+                    }
+                }
+                sum
+            }
+            StreamingMleEnum::BaseScalarVec { evals, .. } => evals[index],
+            StreamingMleEnum::PeriodicBaseScalarVec {
+                evals,
+                m,
+                m_j,
+                d: _d,
+                square,
+                ..
+            } => {
+                let col = index / *m;
+                let r = index % *m;
+                let row = if *m_j == 0 { 0 } else { r % *m_j };
+                let mut v = evals[col * *m_j + row];
+                if *square {
+                    v *= v;
+                }
+                v
+            }
+            StreamingMleEnum::EqBase {
+                scale,
+                r,
+                one_minus_r,
+            } => {
+                let mut prod = R::BaseRing::ONE;
+                for i in 0..r.len() {
+                    let bit = ((index >> i) & 1) == 1;
+                    prod *= if bit { r[i] } else { one_minus_r[i] };
+                }
+                *scale * prod
+            }
+        }
+    }
+
     /// Fix the next variable (LSB-first) and return a new MLE over one fewer variable.
     pub fn fix_variable(&self, r: R) -> StreamingMleEnum<R> {
         let nv = self.num_vars();
@@ -622,6 +675,126 @@ impl StreamingSumcheck {
         };
 
         StreamingProverMsg { evaluations: result }
+    }
+
+    /// Prove one round of sumcheck, specialized for the constant-coefficient (base ring) case.
+    ///
+    /// The combiner operates over base-ring scalars and the produced univariate evaluations are
+    /// lifted back into the ring as constant-coefficient elements.
+    pub fn prove_round_base<R: OverField + PolyRing>(
+        state: &mut StreamingSumcheckState<R>,
+        v_msg: Option<R::BaseRing>,
+        comb_fn0: &(dyn Fn(&[R::BaseRing]) -> R::BaseRing + Sync + Send),
+    ) -> StreamingProverMsg<R>
+    where
+        R::BaseRing: Ring,
+    {
+        if let Some(r) = v_msg {
+            assert!(state.round > 0);
+            state.randomness.push(r);
+            let r_ring = R::from(r);
+            state.mles = state.mles.iter().map(|m| m.fix_variable(r_ring)).collect();
+        } else {
+            assert!(state.round == 0);
+        }
+
+        state.round += 1;
+        assert!(state.round <= state.num_vars);
+
+        let nv = state.mles[0].num_vars();
+        let degree = state.max_degree;
+        let domain_half = 1 << (nv - 1);
+        let num_polys = state.mles.len();
+
+        struct Scratch<F> {
+            evals: Vec<F>,
+            steps: Vec<F>,
+            vals0: Vec<F>,
+            vals1: Vec<F>,
+            vals: Vec<F>,
+            levals: Vec<F>,
+        }
+        let scratch = || Scratch {
+            evals: vec![R::BaseRing::ZERO; degree + 1],
+            steps: vec![R::BaseRing::ZERO; num_polys],
+            vals0: vec![R::BaseRing::ZERO; num_polys],
+            vals1: vec![R::BaseRing::ZERO; num_polys],
+            vals: vec![R::BaseRing::ZERO; num_polys],
+            levals: vec![R::BaseRing::ZERO; degree + 1],
+        };
+
+        #[cfg(not(feature = "parallel"))]
+        let result0 = {
+            let mut s = scratch();
+            for b in 0..domain_half {
+                for (i, mle) in state.mles.iter().enumerate() {
+                    s.vals0[i] = mle.eval0_at_index(b << 1);
+                    s.vals1[i] = mle.eval0_at_index((b << 1) | 1);
+                }
+
+                s.levals[0] = comb_fn0(&s.vals0);
+                s.levals[1] = comb_fn0(&s.vals1);
+
+                for i in 0..num_polys {
+                    s.steps[i] = s.vals1[i] - s.vals0[i];
+                    s.vals[i] = s.vals1[i];
+                }
+
+                for d in 2..=degree {
+                    for i in 0..num_polys {
+                        s.vals[i] += s.steps[i];
+                    }
+                    s.levals[d] = comb_fn0(&s.vals);
+                }
+
+                for (e, l) in s.evals.iter_mut().zip(s.levals.iter()) {
+                    *e += *l;
+                }
+            }
+            s.evals
+        };
+
+        #[cfg(feature = "parallel")]
+        let result0 = {
+            use ark_std::cfg_into_iter;
+            cfg_into_iter!(0..domain_half)
+                .fold(scratch, |mut s, b| {
+                    for (i, mle) in state.mles.iter().enumerate() {
+                        s.vals0[i] = mle.eval0_at_index(b << 1);
+                        s.vals1[i] = mle.eval0_at_index((b << 1) | 1);
+                    }
+                    s.levals[0] = comb_fn0(&s.vals0);
+                    s.levals[1] = comb_fn0(&s.vals1);
+                    for i in 0..num_polys {
+                        s.steps[i] = s.vals1[i] - s.vals0[i];
+                        s.vals[i] = s.vals1[i];
+                    }
+                    for d in 2..=degree {
+                        for i in 0..num_polys {
+                            s.vals[i] += s.steps[i];
+                        }
+                        s.levals[d] = comb_fn0(&s.vals);
+                    }
+                    for (e, l) in s.evals.iter_mut().zip(s.levals.iter()) {
+                        *e += *l;
+                    }
+                    s
+                })
+                .map(|s| s.evals)
+                .reduce(
+                    || vec![R::BaseRing::ZERO; degree + 1],
+                    |mut acc, evals| {
+                        for (a, e) in acc.iter_mut().zip(evals) {
+                            *a += e;
+                        }
+                        acc
+                    },
+                )
+        };
+
+        StreamingProverMsg {
+            evaluations: result0.into_iter().map(R::from).collect(),
+        }
     }
 
     /// Run streaming sumcheck as subprotocol.

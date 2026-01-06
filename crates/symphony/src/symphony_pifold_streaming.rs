@@ -456,44 +456,48 @@ where
     }
 
     // Hadamard combiner (must match Π_had: coefficient-wise constraint with alpha powers)
+    //
+    // When `CONST_COEFF_FASTPATH` is active we additionally provide a base-ring combiner to avoid
+    // allocating/constructing full ring elements in the hot sumcheck loop.
     let rhos_had = rhos.clone();
-    let comb_had: Box<dyn Fn(&[R]) -> R + Sync + Send> = if const_coeff_fastpath {
-        // Constant-coeff specialization: only coeff[0] can be nonzero.
-        // This preserves the Π_had relation when inputs are embedded base-field scalars.
-        Box::new(move |vals: &[R]| -> R {
-            let eq0 = vals[0].coeffs()[0];
-            let mut acc_all0 = R::BaseRing::ZERO;
-        for inst_idx in 0..ell {
-                let base = 1 + inst_idx * 3;
-                let y10 = vals[base].coeffs()[0];
-                let y20 = vals[base + 1].coeffs()[0];
-                let y30 = vals[base + 2].coeffs()[0];
-                let term0 = y10 * y20 - y30;
-                // α_0 is 1 in our construction (pow starts at 1), but keep it explicit.
-                let acc0 = alpha_pows[0].coeffs()[0] * eq0 * term0;
-                acc_all0 += rhos_had[inst_idx].coeffs()[0] * acc0;
-            }
-            R::from(acc_all0)
-        })
-    } else {
-        Box::new(move |vals: &[R]| -> R {
-            let eq = vals[0];
-            let mut acc_all = R::ZERO;
-            for inst_idx in 0..ell {
-                let base = 1 + inst_idx * 3;
-                let y1 = &vals[base];
-                let y2 = &vals[base + 1];
-                let y3 = &vals[base + 2];
-                let mut acc = R::ZERO;
-                for j in 0..d {
-                    let term = y1.coeffs()[j] * y2.coeffs()[j] - y3.coeffs()[j];
-                    acc += alpha_pows[j] * eq * R::from(term);
+    let comb_had0: Option<Box<dyn Fn(&[R::BaseRing]) -> R::BaseRing + Sync + Send>> =
+        if const_coeff_fastpath {
+            let rhos0 = rhos_had.iter().map(|x| x.coeffs()[0]).collect::<Vec<_>>();
+            let alpha0 = alpha_pows[0].coeffs()[0];
+            Some(Box::new(move |vals: &[R::BaseRing]| -> R::BaseRing {
+                let eq0 = vals[0];
+                let mut acc_all0 = R::BaseRing::ZERO;
+                for inst_idx in 0..ell {
+                    let base = 1 + inst_idx * 3;
+                    let y10 = vals[base];
+                    let y20 = vals[base + 1];
+                    let y30 = vals[base + 2];
+                    let term0 = y10 * y20 - y30;
+                    acc_all0 += rhos0[inst_idx] * (alpha0 * eq0 * term0);
                 }
-                acc_all += rhos_had[inst_idx] * acc;
+                acc_all0
+            }))
+        } else {
+            None
+        };
+
+    let comb_had: Box<dyn Fn(&[R]) -> R + Sync + Send> = Box::new(move |vals: &[R]| -> R {
+        let eq = vals[0];
+        let mut acc_all = R::ZERO;
+        for inst_idx in 0..ell {
+            let base = 1 + inst_idx * 3;
+            let y1 = &vals[base];
+            let y2 = &vals[base + 1];
+            let y3 = &vals[base + 2];
+            let mut acc = R::ZERO;
+            for j in 0..d {
+                let term = y1.coeffs()[j] * y2.coeffs()[j] - y3.coeffs()[j];
+                acc += alpha_pows[j] * eq * R::from(term);
             }
-            acc_all
-        })
-    };
+            acc_all += rhos_had[inst_idx] * acc;
+        }
+        acc_all
+    });
 
     // -----------------
     // Monomial MLEs (streaming/compact)
@@ -723,7 +727,15 @@ where
     for round_idx in 0..rounds {
         // Prover messages (in the same order as latticefold's shared schedule)
         if round_idx < log_m {
-            let pm_had = StreamingSumcheck::prove_round(&mut had_state, v_msg_had, comb_had.as_ref());
+            let pm_had = if const_coeff_fastpath {
+                StreamingSumcheck::prove_round_base(
+                    &mut had_state,
+                    v_msg_had,
+                    comb_had0.as_ref().expect("comb_had0").as_ref(),
+                )
+            } else {
+                StreamingSumcheck::prove_round(&mut had_state, v_msg_had, comb_had.as_ref())
+            };
             transcript.absorb_slice(&pm_had.evaluations);
             had_msgs.push(pm_had);
         }
@@ -1068,40 +1080,44 @@ where
     }
 
     let rhos_had = rhos.clone();
-    let comb_had: Box<dyn Fn(&[R]) -> R + Sync + Send> = if const_coeff_fastpath {
-        Box::new(move |vals: &[R]| -> R {
-            let eq0 = vals[0].coeffs()[0];
-            let mut acc_all0 = R::BaseRing::ZERO;
-            for inst_idx in 0..ell {
-                let base = 1 + inst_idx * 3;
-                let y10 = vals[base].coeffs()[0];
-                let y20 = vals[base + 1].coeffs()[0];
-                let y30 = vals[base + 2].coeffs()[0];
-                let term0 = y10 * y20 - y30;
-                let acc0 = alpha_pows[0].coeffs()[0] * eq0 * term0;
-                acc_all0 += rhos_had[inst_idx].coeffs()[0] * acc0;
-            }
-            R::from(acc_all0)
-        })
-    } else {
-        Box::new(move |vals: &[R]| -> R {
-            let eq = vals[0];
-            let mut acc_all = R::ZERO;
-            for inst_idx in 0..ell {
-                let base = 1 + inst_idx * 3;
-                let y1 = &vals[base];
-                let y2 = &vals[base + 1];
-                let y3 = &vals[base + 2];
-                let mut acc = R::ZERO;
-                for j in 0..d {
-                    let term = y1.coeffs()[j] * y2.coeffs()[j] - y3.coeffs()[j];
-                    acc += alpha_pows[j] * eq * R::from(term);
+    let comb_had0: Option<Box<dyn Fn(&[R::BaseRing]) -> R::BaseRing + Sync + Send>> =
+        if const_coeff_fastpath {
+            let rhos0 = rhos_had.iter().map(|x| x.coeffs()[0]).collect::<Vec<_>>();
+            let alpha0 = alpha_pows[0].coeffs()[0];
+            Some(Box::new(move |vals: &[R::BaseRing]| -> R::BaseRing {
+                let eq0 = vals[0];
+                let mut acc_all0 = R::BaseRing::ZERO;
+                for inst_idx in 0..ell {
+                    let base = 1 + inst_idx * 3;
+                    let y10 = vals[base];
+                    let y20 = vals[base + 1];
+                    let y30 = vals[base + 2];
+                    let term0 = y10 * y20 - y30;
+                    acc_all0 += rhos0[inst_idx] * (alpha0 * eq0 * term0);
                 }
-                acc_all += rhos_had[inst_idx] * acc;
+                acc_all0
+            }))
+        } else {
+            None
+        };
+
+    let comb_had: Box<dyn Fn(&[R]) -> R + Sync + Send> = Box::new(move |vals: &[R]| -> R {
+        let eq = vals[0];
+        let mut acc_all = R::ZERO;
+        for inst_idx in 0..ell {
+            let base = 1 + inst_idx * 3;
+            let y1 = &vals[base];
+            let y2 = &vals[base + 1];
+            let y3 = &vals[base + 2];
+            let mut acc = R::ZERO;
+            for j in 0..d {
+                let term = y1.coeffs()[j] * y2.coeffs()[j] - y3.coeffs()[j];
+                acc += alpha_pows[j] * eq * R::from(term);
             }
-            acc_all
-        })
-    };
+            acc_all += rhos_had[inst_idx] * acc;
+        }
+        acc_all
+    });
 
     // -----------------
     // Build monomial side MLEs (identical to shared-M path)
@@ -1311,7 +1327,15 @@ where
     let t_sumcheck = Instant::now();
     for round_idx in 0..rounds {
         if round_idx < log_m {
-            let pm_had = StreamingSumcheck::prove_round(&mut had_state, v_msg_had, comb_had.as_ref());
+            let pm_had = if const_coeff_fastpath {
+                StreamingSumcheck::prove_round_base(
+                    &mut had_state,
+                    v_msg_had,
+                    comb_had0.as_ref().expect("comb_had0").as_ref(),
+                )
+            } else {
+                StreamingSumcheck::prove_round(&mut had_state, v_msg_had, comb_had.as_ref())
+            };
             transcript.absorb_slice(&pm_had.evaluations);
             had_msgs.push(pm_had);
         }
