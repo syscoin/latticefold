@@ -41,6 +41,7 @@ use crate::{
     rp_rgchk::{compose_v_digits, RPParams},
     symphony_cm::SymphonyCoins,
     symphony_fold::{SymphonyBatchLin, SymphonyInstance},
+    transcript::PoseidonTranscriptMetrics,
 };
 
 
@@ -1388,6 +1389,34 @@ where
     R::BaseRing: Zq + Decompose,
     PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
 {
+    verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_with_metrics::<R, PC>(
+        M,
+        cm_f,
+        proof,
+        open,
+        cfs_had_u,
+        cfs_mon_b,
+        aux,
+        public_inputs,
+    )
+    .map(|(out, _metrics)| out)
+}
+
+/// WE/DPP-facing verifier, plus transcript metrics for empirical Poseidon cost estimation.
+pub fn verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_with_metrics<R: CoeffRing, PC>(
+    M: [&SparseMatrix<R>; 3],
+    cm_f: &[Vec<R>],
+    proof: &PiFoldBatchedProof<R>,
+    open: &impl VfyOpen<R>,
+    cfs_had_u: &[Vec<R>],
+    cfs_mon_b: &[Vec<R>],
+    aux: &PiFoldAuxWitness<R>,
+    public_inputs: &[R::BaseRing],
+) -> Result<((SymphonyInstance<R>, SymphonyBatchLin<R>), PoseidonTranscriptMetrics), String>
+where
+    R::BaseRing: Zq + Decompose,
+    PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
+{
     let mut ts = crate::transcript::PoseidonTranscript::<R>::empty::<PC>();
     ts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
     absorb_public_inputs::<R>(&mut ts, public_inputs);
@@ -1412,22 +1441,18 @@ where
         cm_f,
         proof,
         &NoOpen, // cm_f is not opened in CP relation
-        &[], // no witness openings needed; cm_f treated as part of the statement
+        &[],     // no witness openings needed; cm_f treated as part of the statement
         Some(aux),
     )?;
 
     // Verify CP commitment openings (domain-separated by `VfyOpen`).
-    //
-    // Note: we intentionally do NOT absorb `cfs_*` into the Poseidon-FS transcript used by Π_fold:
-    // these messages are post-challenge in the schedule, and hashing them would only add cost
-    // without strengthening soundness for the DPP target.
     for i in 0..ell {
         let had_u_enc = encode_had_u_instance::<R>(&aux.had_u[i]);
         open.verify_opening(&mut ts, "cfs_had_u", &cfs_had_u[i], &[], &had_u_enc, &[])?;
         open.verify_opening(&mut ts, "cfs_mon_b", &cfs_mon_b[i], &[], &aux.mon_b[i], &[])?;
     }
 
-    Ok(out)
+    Ok((out, ts.metrics()))
 }
 
 /// WE/DPP-facing verifier for hetero-M batched Π_fold: check Poseidon-FS proof using CP transcript-message commitments.
@@ -1444,6 +1469,37 @@ pub fn verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m<R: CoeffR
     aux: &PiFoldAuxWitness<R>,
     public_inputs: &[R::BaseRing],
 ) -> Result<(SymphonyInstance<R>, SymphonyBatchLin<R>), String>
+where
+    R::BaseRing: Zq + Decompose,
+    PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
+{
+    verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics::<R, PC>(
+        Ms,
+        cm_f,
+        proof,
+        open,
+        cfs_had_u,
+        cfs_mon_b,
+        aux,
+        public_inputs,
+    )
+    .map(|(out, _metrics)| out)
+}
+
+/// WE/DPP-facing hetero-M verifier, plus transcript metrics for empirical Poseidon cost estimation.
+pub fn verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics<
+    R: CoeffRing,
+    PC,
+>(
+    Ms: &[[&SparseMatrix<R>; 3]],
+    cm_f: &[Vec<R>],
+    proof: &PiFoldBatchedProof<R>,
+    open: &impl VfyOpen<R>,
+    cfs_had_u: &[Vec<R>],
+    cfs_mon_b: &[Vec<R>],
+    aux: &PiFoldAuxWitness<R>,
+    public_inputs: &[R::BaseRing],
+) -> Result<((SymphonyInstance<R>, SymphonyBatchLin<R>), PoseidonTranscriptMetrics), String>
 where
     R::BaseRing: Zq + Decompose,
     PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
@@ -1478,7 +1534,68 @@ where
         open.verify_opening(&mut ts, "cfs_had_u", &cfs_had_u[i], &[], &had_u_enc, &[])?;
         open.verify_opening(&mut ts, "cfs_mon_b", &cfs_mon_b[i], &[], &aux.mon_b[i], &[])?;
     }
-    Ok(out)
+
+    Ok((out, ts.metrics()))
+}
+
+/// Same as `verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics`, but returns
+/// metrics even if verification fails (so callers can measure transcript work empirically on failing
+/// instances / dummy witnesses).
+pub fn verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics_result<
+    R: CoeffRing,
+    PC,
+>(
+    Ms: &[[&SparseMatrix<R>; 3]],
+    cm_f: &[Vec<R>],
+    proof: &PiFoldBatchedProof<R>,
+    open: &impl VfyOpen<R>,
+    cfs_had_u: &[Vec<R>],
+    cfs_mon_b: &[Vec<R>],
+    aux: &PiFoldAuxWitness<R>,
+    public_inputs: &[R::BaseRing],
+) -> (Result<(SymphonyInstance<R>, SymphonyBatchLin<R>), String>, PoseidonTranscriptMetrics)
+where
+    R::BaseRing: Zq + Decompose,
+    PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
+{
+    let mut ts = crate::transcript::PoseidonTranscript::<R>::empty::<PC>();
+    ts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
+    absorb_public_inputs::<R>(&mut ts, public_inputs);
+
+    let res: Result<(SymphonyInstance<R>, SymphonyBatchLin<R>), String> = (|| {
+        if cfs_had_u.len() != cm_f.len() || cfs_mon_b.len() != cm_f.len() {
+            return Err("PiFoldCP: cfs length mismatch".to_string());
+        }
+        let ell = cm_f.len();
+        if ell == 0 {
+            return Err("PiFoldCP: empty batch".to_string());
+        }
+        if aux.had_u.len() != ell || aux.mon_b.len() != ell {
+            return Err("PiFoldCP: aux length mismatch".to_string());
+        }
+
+        let out = verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m::<R, PC>(
+            Ms,
+            cm_f,
+            proof,
+            &NoOpen, // cm_f is not opened in CP relation
+            &[],
+            Some(aux),
+            public_inputs,
+        )?;
+
+        for i in 0..ell {
+            let had_u_enc = encode_had_u_instance::<R>(&aux.had_u[i]);
+            open.verify_opening(&mut ts, "cfs_had_u", &cfs_had_u[i], &[], &had_u_enc, &[])?;
+            open.verify_opening(&mut ts, "cfs_mon_b", &cfs_mon_b[i], &[], &aux.mon_b[i], &[])?;
+        }
+
+        Ok(out)
+    })();
+
+    // Always return metrics, even on failure.
+    let metrics = ts.metrics();
+    (res, metrics)
 }
 
 /// Relation-check style wrapper for GM‑1 / DPP frontends:
