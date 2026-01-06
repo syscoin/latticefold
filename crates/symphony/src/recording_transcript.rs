@@ -43,6 +43,15 @@ impl<R: OverField, T: Transcript<R>> Transcript<R> for RecordingTranscript<R, T>
         self.inner.absorb(v);
     }
 
+    fn absorb_field_element(&mut self, v: &R::BaseRing) {
+        // IMPORTANT: forward to the inner transcript's `absorb_field_element` implementation.
+        //
+        // Some transcripts (e.g. `symphony::PoseidonTranscript`) override `absorb_field_element`
+        // to avoid lifting scalars into full ring elements; using the trait default here would
+        // change the transcript schedule and break FS compatibility.
+        self.inner.absorb_field_element(v);
+    }
+
     fn get_challenge(&mut self) -> R::BaseRing {
         let c = self.inner.get_challenge();
         self.coins_challenges.push(c);
@@ -90,6 +99,11 @@ impl<'a, R: OverField, T: Transcript<R>> Transcript<R> for RecordingTranscriptRe
 
     fn absorb(&mut self, v: &R) {
         self.inner.absorb(v);
+    }
+
+    fn absorb_field_element(&mut self, v: &R::BaseRing) {
+        // See `RecordingTranscript::absorb_field_element`.
+        self.inner.absorb_field_element(v);
     }
 
     fn get_challenge(&mut self) -> R::BaseRing {
