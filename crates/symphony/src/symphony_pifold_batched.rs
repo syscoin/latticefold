@@ -1519,14 +1519,16 @@ where
         return Err("PiFoldCP: aux length mismatch".to_string());
     }
 
-    let out = verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m::<R, PC>(
+    // IMPORTANT: run the core Π_fold verifier using the *same* Poseidon transcript instance `ts`
+    // so metrics include the full FS transcript work (coins + sumcheck transcript).
+    let out = verify_pi_fold_batched_and_fold_outputs_with_openings_and_aux_hetero_m(
+        &mut ts,
         Ms,
         cm_f,
         proof,
         &NoOpen, // cm_f is not opened in CP relation
         &[],
         Some(aux),
-        public_inputs,
     )?;
 
     for i in 0..ell {
@@ -1574,14 +1576,16 @@ where
             return Err("PiFoldCP: aux length mismatch".to_string());
         }
 
-        let out = verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m::<R, PC>(
+        // IMPORTANT: run the core Π_fold verifier using the *same* Poseidon transcript instance `ts`
+        // so metrics include the full FS transcript work (coins + sumcheck transcript).
+        let out = verify_pi_fold_batched_and_fold_outputs_with_openings_and_aux_hetero_m(
+            &mut ts,
             Ms,
             cm_f,
             proof,
             &NoOpen, // cm_f is not opened in CP relation
             &[],
             Some(aux),
-            public_inputs,
         )?;
 
         for i in 0..ell {
