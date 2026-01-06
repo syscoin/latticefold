@@ -19,7 +19,7 @@ use rayon::prelude::*;
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
 use latticefold::commitment::AjtaiCommitmentScheme;
 use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as R;
-use stark_rings::{PolyRing, Ring};
+use stark_rings::PolyRing;
 use symphony::sp1_r1cs_loader::FieldFromU64;
 use symphony::symphony_sp1_r1cs::open_sp1_r1cs_chunk_cache;
 use symphony::rp_rgchk::RPParams;
@@ -30,6 +30,85 @@ use symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_f
 use symphony::symphony_pifold_streaming::prove_pi_fold_streaming_sumcheck_fs;
 use symphony::symphony_pifold_streaming::prove_pi_fold_streaming_sumcheck_fs_hetero_m;
 use symphony::symphony_open::MultiAjtaiOpenVerifier;
+
+fn parse_bytes32_env(name: &str) -> [u8; 32] {
+    let s = std::env::var(name).unwrap_or_else(|_| {
+        panic!("Missing required env var {name}. Expected a bytes32 hex string like 0xabc... (64 hex chars).")
+    });
+    let s = s.strip_prefix("0x").unwrap_or(&s);
+    let bytes = decode_hex(s).unwrap_or_else(|e| panic!("Invalid hex for {name}: {e}"));
+    let len = bytes.len();
+    bytes
+        .try_into()
+        .unwrap_or_else(|_| panic!("{name} must decode to exactly 32 bytes, got {}", len))
+}
+
+fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
+    if s.len() % 2 != 0 {
+        return Err(format!("hex length must be even, got {}", s.len()));
+    }
+    fn nybble(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for i in (0..bytes.len()).step_by(2) {
+        let hi = nybble(bytes[i]).ok_or_else(|| format!("invalid hex at byte {}", i))?;
+        let lo = nybble(bytes[i + 1]).ok_or_else(|| format!("invalid hex at byte {}", i + 1))?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn bytes32_to_u32s_le(x: [u8; 32]) -> [u32; 8] {
+    let mut out = [0u32; 8];
+    for i in 0..8 {
+        let off = 4 * i;
+        out[i] = u32::from_le_bytes([x[off], x[off + 1], x[off + 2], x[off + 3]]);
+    }
+    out
+}
+
+/// Load an SP1 R1CS witness dump as `u32` little-endian words and lift each element to a constant-coeff ring element.
+///
+/// Expected format: exactly `ncols` little-endian `u32` words (so `4*ncols` bytes).
+fn load_witness_u32le(path: &str, ncols: usize) -> Vec<R> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open witness file {path}: {e:?}"));
+    let mut r = std::io::BufReader::with_capacity(256 * 1024 * 1024, file);
+
+    let mut witness: Vec<R> = Vec::with_capacity(ncols);
+    let mut buf = vec![0u8; 4 * 1024 * 1024]; // 4MB
+
+    while witness.len() < ncols {
+        let need_words = ncols - witness.len();
+        let want_words = std::cmp::min(need_words, buf.len() / 4);
+        let want_bytes = want_words * 4;
+
+        r.read_exact(&mut buf[..want_bytes]).unwrap_or_else(|e| {
+            panic!(
+                "read witness file {path}: {e:?} (need {} u32 words total, only got {} so far)",
+                ncols,
+                witness.len()
+            )
+        });
+
+        for w in 0..want_words {
+            let off = 4 * w;
+            let v = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+            let base = <R as PolyRing>::BaseRing::from(v as u128);
+            witness.push(R::from(base));
+        }
+    }
+
+    debug_assert_eq!(witness.len(), ncols);
+    witness
+}
 
 /// BabyBear field element for loading R1CS.
 #[derive(Debug, Clone, Copy, Default)]
@@ -105,9 +184,11 @@ fn main() {
     // Step 2: Create witness (same for all chunks)
     println!("Step 2: Creating witness...");
     let ncols = cache.ncols;
-    let mut witness: Vec<R> = vec![R::ZERO; ncols];
-    witness[0] = R::ONE;
-    let witness = Arc::new(witness);
+    let witness_path =
+        std::env::var("SP1_WITNESS_U32LE").expect("Set SP1_WITNESS_U32LE=/path/to/witness.u32le");
+    let w0 = Instant::now();
+    let witness = Arc::new(load_witness_u32le(&witness_path, ncols));
+    println!("  Loaded witness from {witness_path} in {:?}.", w0.elapsed());
     if ncols.is_power_of_two() {
     println!("  Witness length: {ncols} (2^{})\n", ncols.trailing_zeros());
     } else {
@@ -191,9 +272,17 @@ fn main() {
         rg_params.k_g,
     ));
 
-    let public_inputs: Vec<<R as PolyRing>::BaseRing> = vec![
-        <R as PolyRing>::BaseRing::from(1u128),
-    ];
+    // Public statement binding: SP1 program hash (vk hash) and statement digest (public-values hash).
+    // We represent each bytes32 as 8 little-endian u32 limbs, and absorb all 16 limbs as field elements.
+    let vk_hash_bytes32 = parse_bytes32_env("SP1_VK_HASH_BYTES32");
+    let stmt_digest_bytes32 = parse_bytes32_env("SP1_STATEMENT_DIGEST_BYTES32");
+    let vk_u32s = bytes32_to_u32s_le(vk_hash_bytes32);
+    let stmt_u32s = bytes32_to_u32s_le(stmt_digest_bytes32);
+    let public_inputs: Vec<<R as PolyRing>::BaseRing> = vk_u32s
+        .into_iter()
+        .chain(stmt_u32s.into_iter())
+        .map(|x| <R as PolyRing>::BaseRing::from(x as u128))
+        .collect();
 
     // Step 4: Prove chunks with limited concurrency (actually parallel within batches)
     println!(
