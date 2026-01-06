@@ -24,6 +24,8 @@ use symphony::sp1_r1cs_loader::FieldFromU64;
 use symphony::symphony_sp1_r1cs::open_sp1_r1cs_chunk_cache;
 use symphony::rp_rgchk::RPParams;
 use symphony::symphony_pifold_batched::prove_pi_fold_batched_sumcheck_fs;
+use symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m;
+use symphony::symphony_open::AjtaiOpenVerifier;
 use symphony::symphony_pifold_streaming::prove_pi_fold_streaming_sumcheck_fs;
 use symphony::symphony_pifold_streaming::prove_pi_fold_streaming_sumcheck_fs_hetero_m;
 
@@ -243,6 +245,35 @@ fn main() {
             t_one.elapsed(),
             proof_bytes
         );
+
+        // Optional correctness/soundness sanity-check: run the verifier against the same matrices
+        // and explicit witness openings. This confirms the single proof actually binds to *all*
+        // chunk matrices (not just one of them).
+        let verify_one: bool = std::env::var("VERIFY_ONE_PROOF")
+            .ok()
+            .as_deref()
+            .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if verify_one {
+            println!("  VERIFY_ONE_PROOF=1: verifying the one-proof artifact with explicit openings...");
+            let t_v = Instant::now();
+            let ms_refs: Vec<[&stark_rings_linalg::SparseMatrix<R>; 3]> = all_mats
+                .iter()
+                .map(|m| [&*m[0], &*m[1], &*m[2]])
+                .collect();
+            let open = AjtaiOpenVerifier { scheme: (*scheme_main).clone() };
+            let openings: Vec<Vec<R>> = vec![witness.as_ref().clone(); num_chunks];
+            let _ = verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m::<R, PC>(
+                ms_refs.as_slice(),
+                &cms_all,
+                &out.proof,
+                &open,
+                &openings,
+                &public_inputs,
+            )
+            .expect("one-proof verify failed");
+            println!("    ✓ Verified in {:?}", t_v.elapsed());
+        }
         return;
     }
     
