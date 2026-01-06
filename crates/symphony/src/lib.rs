@@ -31,6 +31,3 @@ pub mod rp_rgchk;
 // Streaming sumcheck (memory-efficient MLE handling)
 pub mod streaming_sumcheck;
 pub mod symphony_pifold_streaming;
-
-// DPP constraint estimation
-pub mod r_we_constraint_counter;
