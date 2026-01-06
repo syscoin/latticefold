@@ -1041,12 +1041,35 @@ where
 
             // mj_compact[col*m_j + out_row] := ev(exp(digit), beta_i)
             let mut mj_compact = vec![R::BaseRing::ZERO; m_j * d];
-            for out_row in 0..m_j {
-                for col in 0..d {
-                    let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
-                    let g = exp::<R>(digit).expect("Exp failed");
-                    let mjv = ev(&g, *beta_i);
-                    mj_compact[col * m_j + out_row] = mjv;
+            #[cfg(feature = "parallel")]
+            {
+                use ark_std::cfg_into_iter;
+                let out_ptr = mj_compact.as_mut_ptr() as usize;
+                let digits_flat = digits_flat.clone();
+                let beta_i = *beta_i;
+                let dig_local = dig;
+                cfg_into_iter!(0..m_j).for_each(|out_row| {
+                    for col in 0..d {
+                        let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig_local];
+                        let g = exp::<R>(digit).expect("Exp failed");
+                        let mjv = ev(&g, beta_i);
+                        let idx = col * m_j + out_row;
+                        unsafe {
+                            let out = (out_ptr as *mut R::BaseRing).add(idx);
+                            *out = mjv;
+                        }
+                    }
+                });
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                for out_row in 0..m_j {
+                    for col in 0..d {
+                        let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
+                        let g = exp::<R>(digit).expect("Exp failed");
+                        let mjv = ev(&g, *beta_i);
+                        mj_compact[col * m_j + out_row] = mjv;
+                    }
                 }
             }
             let mj_compact = Arc::new(mj_compact);
