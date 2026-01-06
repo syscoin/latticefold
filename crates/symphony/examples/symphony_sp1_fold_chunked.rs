@@ -24,6 +24,7 @@ use symphony::sp1_r1cs_loader::FieldFromU64;
 use symphony::symphony_sp1_r1cs::open_sp1_r1cs_chunk_cache;
 use symphony::rp_rgchk::RPParams;
 use symphony::symphony_pifold_batched::prove_pi_fold_batched_sumcheck_fs;
+use symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp;
 use symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m;
 use symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_fs_hetero_m;
 use symphony::symphony_pifold_streaming::prove_pi_fold_streaming_sumcheck_fs;
@@ -352,37 +353,54 @@ fn main() {
                 .into_par_iter() // <-- parallel over loaded chunks
                 .map(|(i, [m1, m2, m3])| {
                 let chunk_start = Instant::now();
-                let result: Result<usize, String> = if pifold_mode == "streaming" {
-                    prove_pi_fold_streaming_sumcheck_fs::<R, PC>(
-                        [Arc::new(m1), Arc::new(m2), Arc::new(m3)],
+                let result: Result<usize, String> = (|| {
+                    // Wrap matrices once so we can use them for both proving (streaming wants `Arc`)
+                    // and verification (needs `&SparseMatrix`).
+                    let m1a = Arc::new(m1);
+                    let m2a = Arc::new(m2);
+                    let m3a = Arc::new(m3);
+
+                    let out = if pifold_mode == "streaming" {
+                        prove_pi_fold_streaming_sumcheck_fs::<R, PC>(
+                            [m1a.clone(), m2a.clone(), m3a.clone()],
+                            &[cm_main.clone()],
+                            &[witness.clone()],
+                            &public_inputs,
+                            Some(scheme_had.as_ref()),
+                            Some(scheme_mon.as_ref()),
+                            rg_params.clone(),
+                        )?
+                    } else {
+                        prove_pi_fold_batched_sumcheck_fs::<R, PC>(
+                            [&*m1a, &*m2a, &*m3a],
+                            &[cm_main.clone()],
+                            &[witness.as_ref().as_slice()],
+                            &public_inputs,
+                            Some(scheme_had.as_ref()),
+                            Some(scheme_mon.as_ref()),
+                            rg_params.clone(),
+                        )?
+                    };
+
+                    // Debugging: verify each chunk proof immediately (ℓ=1), CP/WE-facing path.
+                    let open_cfs = MultiAjtaiOpenVerifier::new()
+                        .with_scheme("cfs_had_u", (*scheme_had).clone())
+                        .with_scheme("cfs_mon_b", (*scheme_mon).clone());
+                    let _ = verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp::<R, PC>(
+                        [&*m1a, &*m2a, &*m3a],
                         &[cm_main.clone()],
-                        &[witness.clone()],
+                        &out.proof,
+                        &open_cfs,
+                        &out.cfs_had_u,
+                        &out.cfs_mon_b,
+                        &out.aux,
                         &public_inputs,
-                        Some(scheme_had.as_ref()),
-                        Some(scheme_mon.as_ref()),
-                        rg_params.clone(),
-                    )
-                    .map(|out| {
-                        let proof_size = out.proof.coins.bytes.len();
-                        drop(out);
-                        proof_size
-                    })
-                } else {
-                    prove_pi_fold_batched_sumcheck_fs::<R, PC>(
-                        [&m1, &m2, &m3],
-                    &[cm_main.clone()],
-                        &[witness.as_ref().as_slice()],
-                    &public_inputs,
-                    Some(scheme_had.as_ref()),
-                    Some(scheme_mon.as_ref()),
-                    rg_params.clone(),
-                    )
-                    .map(|out| {
-                        let proof_size = out.proof.coins.bytes.len();
-                        drop(out);
-                        proof_size
-                    })
-                };
+                    )?;
+
+                    let proof_size = out.proof.coins.bytes.len();
+                    drop(out);
+                    Ok(proof_size)
+                })();
                 
                 (i, result, chunk_start.elapsed())
             })
