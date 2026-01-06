@@ -614,6 +614,44 @@ where
     Ok(out)
 }
 
+/// Verifier (FS replay) for a *heterogeneous-matrix* batched Π_fold proof.
+///
+/// This replays the explicit coin stream in `proof.coins` and is useful as a diagnostic:
+/// if Poseidon-FS verification fails but FS-replay succeeds, the transcript schedule is mismatched.
+pub fn verify_pi_fold_batched_and_fold_outputs_fs_hetero_m<R: CoeffRing>(
+    Ms: &[[&SparseMatrix<R>; 3]],
+    cms: &[Vec<R>],
+    proof: &PiFoldBatchedProof<R>,
+    cms_openings: &[Vec<R>],
+    aux: Option<&PiFoldAuxWitness<R>>,
+    public_inputs: &[R::BaseRing],
+) -> Result<(SymphonyInstance<R>, SymphonyBatchLin<R>), String>
+where
+    R::BaseRing: Zq + Decompose,
+{
+    let mut ts = FixedTranscript::<R>::new_with_coins_and_events(
+        proof.coins.challenges.clone(),
+        proof.coins.bytes.clone(),
+        proof.coins.events.clone(),
+    );
+    ts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
+    absorb_public_inputs::<R>(&mut ts, public_inputs);
+
+    let out = verify_pi_fold_batched_and_fold_outputs_with_openings_and_aux_hetero_m(
+        &mut ts,
+        Ms,
+        cms,
+        proof,
+        &NoOpen,
+        cms_openings,
+        aux,
+    )?;
+    if ts.remaining_challenges() != 0 || ts.remaining_bytes() != 0 || ts.remaining_events() != 0 {
+        return Err("PiFold: coin stream not fully consumed".to_string());
+    }
+    Ok(out)
+}
+
 /// Verifier (Poseidon-FS): recompute all challenges by hashing the transcript (Poseidon sponge).
 pub fn verify_pi_fold_batched_and_fold_outputs_poseidon_fs<R: CoeffRing, PC>(
     M: [&SparseMatrix<R>; 3],

@@ -25,6 +25,7 @@ use symphony::symphony_sp1_r1cs::open_sp1_r1cs_chunk_cache;
 use symphony::rp_rgchk::RPParams;
 use symphony::symphony_pifold_batched::prove_pi_fold_batched_sumcheck_fs;
 use symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m;
+use symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_fs_hetero_m;
 use symphony::symphony_pifold_streaming::prove_pi_fold_streaming_sumcheck_fs;
 use symphony::symphony_pifold_streaming::prove_pi_fold_streaming_sumcheck_fs_hetero_m;
 use symphony::symphony_open::MultiAjtaiOpenVerifier;
@@ -278,7 +279,7 @@ fn main() {
             let open_cfs = MultiAjtaiOpenVerifier::new()
                 .with_scheme("cfs_had_u", (*scheme_had).clone())
                 .with_scheme("cfs_mon_b", (*scheme_mon).clone());
-            let _ = verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m::<R, PC>(
+            let vfy_res = verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m::<R, PC>(
                 ms_refs.as_slice(),
                 &cms_all,
                 &out.proof,
@@ -287,8 +288,28 @@ fn main() {
                 &out.cfs_mon_b,
                 &out.aux,
                 &public_inputs,
-            )
-            .expect("one-proof verify failed");
+            );
+            if let Err(e) = vfy_res {
+                eprintln!("  one-proof Poseidon-FS verify failed: {e}");
+                eprintln!("  Trying FS-replay diagnostic verify (using recorded coins)...");
+                let replay = verify_pi_fold_batched_and_fold_outputs_fs_hetero_m::<R>(
+                    ms_refs.as_slice(),
+                    &cms_all,
+                    &out.proof,
+                    &[],
+                    Some(&out.aux),
+                    &public_inputs,
+                );
+                match replay {
+                    Ok(_) => {
+                        eprintln!("  ✓ FS-replay succeeded. This indicates a Poseidon-FS transcript schedule mismatch.");
+                    }
+                    Err(e2) => {
+                        eprintln!("  ✗ FS-replay also failed: {e2}");
+                    }
+                }
+                panic!("one-proof verify failed: {e}");
+            }
             println!("    ✓ Verified in {:?}", t_v.elapsed());
         }
         return;
