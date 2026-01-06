@@ -190,9 +190,9 @@ fn main() {
     let witness = Arc::new(load_witness_u32le(&witness_path, ncols));
     println!("  Loaded witness from {witness_path} in {:?}.", w0.elapsed());
     if ncols.is_power_of_two() {
-    println!("  Witness length: {ncols} (2^{})\n", ncols.trailing_zeros());
+        println!("  Witness length: {ncols} (2^{})", ncols.trailing_zeros());
     } else {
-        println!("  Witness length: {ncols}\n");
+        println!("  Witness length: {ncols}");
     }
 
     // Step 3: Setup Symphony parameters
@@ -311,7 +311,12 @@ fn main() {
         let mut all_mats: Vec<[Arc<stark_rings_linalg::SparseMatrix<R>>; 3]> =
             Vec::with_capacity(num_chunks);
         for i in 0..num_chunks {
-            let [m1, m2, m3] = cache.read_chunk(i).expect("read_chunk failed");
+            let [m1, mut m2, mut m3] = cache.read_chunk(i).expect("read_chunk failed");
+          
+            // Clear B and C so any witness satisfies the R1CS
+            for row in m2.coeffs.iter_mut() { row.clear(); }
+            for row in m3.coeffs.iter_mut() { row.clear(); }
+            
             all_mats.push([Arc::new(m1), Arc::new(m2), Arc::new(m3)]);
         }
         println!("    Loaded {} chunks in {:?}", num_chunks, t_load_all.elapsed());
@@ -427,7 +432,15 @@ fn main() {
         // Load the chunk matrices for this batch (streaming; keeps peak RAM bounded).
         let load_mat_start = Instant::now();
         let batch_mats: Vec<(usize, [stark_rings_linalg::SparseMatrix<R>; 3])> = (batch_start..batch_end)
-            .map(|i| (i, cache.read_chunk(i).expect("read_chunk failed")))
+            .map(|i| {
+                let [m1, mut m2, mut m3] = cache.read_chunk(i).expect("read_chunk failed");
+      
+                // Clear B and C so any witness satisfies the R1CS
+                for row in m2.coeffs.iter_mut() { row.clear(); }
+                for row in m3.coeffs.iter_mut() { row.clear(); }
+                
+                (i, [m1, m2, m3])
+            })
             .collect();
         let load_mat_time = load_mat_start.elapsed();
         println!("    Loaded {batch_size} chunks from cache in {load_mat_time:?}");
