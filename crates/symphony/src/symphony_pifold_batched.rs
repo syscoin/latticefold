@@ -130,7 +130,7 @@ where
     }
 }
 
-/// Prover (paper-faithful FS): run once under Poseidon-FS and **record** the coin stream.
+/// Prover (Poseidon-FS): run once under Poseidon transcript and **record** the coin stream.
 ///
 /// This avoids the 2× work of `prove_pi_fold_batched_sumcheck_fs` (record + fixed-coin replay),
 /// while keeping a serializable `proof.coins` for WE/DPP frontends.
@@ -614,7 +614,7 @@ where
     Ok(out)
 }
 
-/// Verifier (paper-faithful FS): recompute all challenges by hashing the transcript (Poseidon sponge).
+/// Verifier (Poseidon-FS): recompute all challenges by hashing the transcript (Poseidon sponge).
 pub fn verify_pi_fold_batched_and_fold_outputs_poseidon_fs<R: CoeffRing, PC>(
     M: [&SparseMatrix<R>; 3],
     cms: &[Vec<R>],
@@ -634,7 +634,7 @@ where
 }
 
 /// Derive the auxiliary transcript messages (`had_u`, `mon_b`) from witness openings under the
-/// **paper-faithful** Poseidon-FS transcript schedule.
+/// Poseidon-FS transcript schedule (shared-randomness / shared-rounds).
 ///
 /// This is a helper for WE/DPP frontends: these messages are the “folding transcript witness”
 /// that `R_cp` expects, but production systems would commit to them instead of recomputing them.
@@ -979,7 +979,7 @@ where
 }
 
 /// Relation-check style wrapper for GM‑1 / DPP frontends:
-/// returns `Ok(())` iff the folding verifier accepts under paper-faithful FS (Poseidon transcript).
+/// returns `Ok(())` iff the folding verifier accepts under Poseidon-FS (Poseidon transcript).
 pub fn check_verify_fold_poseidon_fs<R: CoeffRing, PC>(
     M: [&SparseMatrix<R>; 3],
     cms: &[Vec<R>],

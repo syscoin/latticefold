@@ -41,7 +41,7 @@ where
     fn check(public: &FoldedOutput<R>, witness: &Self::Witness) -> Result<(), String>;
 }
 
-/// `R_cp` check: verify the folding proof under paper-faithful FS (Poseidon transcript),
+/// `R_cp` check: verify the folding proof under Poseidon-FS (Poseidon transcript),
 /// including commitment-opening checks via `open`, and return the folded output.
 pub fn check_r_cp_poseidon_fs<R: CoeffRing, PC>(
     M: [&SparseMatrix<R>; 3],

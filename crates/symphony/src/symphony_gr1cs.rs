@@ -6,8 +6,8 @@
 //! - `prove_pi_gr1cs` / `verify_pi_gr1cs_and_output`: correctness-first composition
 //!   (runs the two sumchecks sequentially).
 //! - `prove_pi_gr1cs_shared_sumcheck` / `verify_pi_gr1cs_shared_sumcheck_and_output`:
-//!   **paper-faithful Figure 3 Step-3** composition where Π_had's sumcheck and Π_mon's
-//!   sumcheck are run in parallel with an identical verifier challenge stream prefix.
+//!   shared-sumcheck composition (Figure 3, Step 3): Π_had's sumcheck and Π_mon's sumcheck are run
+//!   in parallel with an identical verifier challenge stream prefix.
 
 use ark_std::log2;
 use crate::symphony_coins::{derive_J, ev, ts_weights};
@@ -145,7 +145,7 @@ where
 /// two output relations (Eq. (24) and Eq. (31)) against the explicit witness `f`.
 ///
 /// This is the analog of `verify_pi_gr1cs_output_relations_with_witness`, but it uses the
-/// paper-faithful shared-sumcheck transcript schedule (Figure 3 Step-3).
+/// shared-sumcheck transcript schedule (Figure 3, Step 3).
 pub fn verify_pi_gr1cs_shared_sumcheck_output_relations_with_witness<R: CoeffRing>(
     transcript: &mut impl Transcript<R>,
     M: [&SparseMatrix<R>; 3],
@@ -174,7 +174,7 @@ where
 }
 
 // -----------------------------------------------------------------------------
-// Paper-faithful Figure 3 Step-3: shared sumcheck challenges (r̄, s̄, s)
+// Figure 3 (Step 3): shared sumcheck challenges (r̄, s̄, s)
 // -----------------------------------------------------------------------------
 
 /// Prove Π_gr1cs with **shared sumcheck challenges** between:

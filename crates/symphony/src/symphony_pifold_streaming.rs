@@ -216,12 +216,16 @@ where
         return Err("PiFold: invalid witness length".to_string());
     }
     let blocks = n_f / rg_params.l_h;
-    let m_j = blocks * rg_params.lambda_pj;
+    let m_j = blocks
+        .checked_mul(rg_params.lambda_pj)
+        .ok_or_else(|| "PiFold: m_J overflow (blocks*lambda_pj)".to_string())?;
     if m < m_j || m % m_j != 0 {
         return Err("PiFold: require m_J <= m and m multiple of m_J".to_string());
     }
 
-    let g_len = m * d;
+    let g_len = m
+        .checked_mul(d)
+        .ok_or_else(|| "PiFold: overflow in g_len=m*d".to_string())?;
     if !g_len.is_power_of_two() {
         return Err("PiFold: require m*d power-of-two".to_string());
     }

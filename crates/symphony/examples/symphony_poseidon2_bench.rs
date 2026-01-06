@@ -82,7 +82,7 @@ fn main() {
 
         // Sweep permutation counts.
         //
-        // With paper-style R1CS witness decomposition enabled unconditionally in this benchmark,
+        // With R1CS witness decomposition enabled unconditionally in this benchmark,
         // we use k_g=3 (Table 1 instantiation).
         let k_list = vec![3usize];
         let perms_list: Vec<usize> = vec![1, 2, 4, 8];
@@ -596,7 +596,7 @@ where
 
     // Commitment setup
     let kappa = 8; // Ajtai commitment rows
-    // Seeded Ajtai is the intended “CRS-as-seed” instantiation (matches the whitepaper).
+    // Seeded Ajtai is the intended “CRS-as-seed” instantiation (public, fixed seed).
     const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
     let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, kappa, n);
     let cm = scheme

@@ -52,7 +52,7 @@ fn main() {
     let max_concurrent: usize = std::env::var("MAX_CONCURRENT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(4); // Default: 4 concurrent chunks
+        .unwrap_or(32); // Default: 32 concurrent chunks
     
     println!("=========================================================");
     println!("Symphony SP1 Chunked Proving (Memory-Controlled)");
@@ -80,8 +80,11 @@ fn main() {
     let l_h: usize = std::env::var("L_H")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(256);
+        .unwrap_or(512);
     // Pad columns to a multiple of l_h to satisfy Π_rg’s block structure.
+    //
+    // Note: Increasing `l_h` also increases the FS coin bytes because `derive_J` squeezes
+    // `lambda_pj*l_h` bytes per instance; this changes the statement/shape but is expected.
     let pad_cols_to_multiple_of = l_h;
     let cache = open_sp1_r1cs_chunk_cache::<R, BabyBear>(&r1cs_path, chunk_size, pad_cols_to_multiple_of)
         .expect("Failed to open/build chunk cache");
@@ -108,7 +111,11 @@ fn main() {
 
     // Step 3: Setup Symphony parameters
     println!("Step 3: Setting up Symphony parameters...");
+    // Ajtai commitment rows. kappa=8 is a prototype security/perf point used throughout the repo.
+    // Treat this (and MASTER_SEED) as part of your public parameters / shape.
     let kappa = 8;
+    // Monomial check count. k_g=3 matches the “Table 1 prototype instantiation” mode used by our
+    // Symphony benchmarks; changing it changes the protocol shape and costs.
     let k_g = 3;
     // Projection dimension for Π_rg (must satisfy: lambda_pj <= l_h and l_h % lambda_pj == 0).
     //

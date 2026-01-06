@@ -239,7 +239,7 @@ where
             //
             // `DenseMultilinearExtension::evaluate` in this codebase treats the first variable as the
             // least-significant bit of the evaluation index. To ensure the "row point" r is sampled
-            // before the "column point" s (WP Figure 2 ordering), we flatten in **column-major**
+            // before the "column point" s (Figure 2 ordering), we flatten in **column-major**
             // order: idx = col * m + row.
             //
             // This makes the low bits correspond to the row index (size m), so the first log(m)
@@ -261,7 +261,7 @@ where
             nvars: g_nvars,
             sets: g.iter().cloned().map(MonomialSet::Vector).collect(),
         };
-        // WP Figure 2: we must send/commit v^{(i)} after r is sampled but before s is sampled.
+        // Figure 2: we must send/commit v^{(i)} after r is sampled but before s is sampled.
         let log_m = log2(m.next_power_of_two()) as usize;
         let log_d = log2(d.next_power_of_two()) as usize;
         assert_eq!(g_nvars, log_m + log_d);
@@ -424,7 +424,7 @@ where
         let _ = i;
     }
 
-    // We standardize the convention to match WP: mon.r = r||s with |s|=log d.
+    // We standardize the convention: mon.r = r||s with |s|=log d.
     let s_chals = proof.mon.r[log_m..].to_vec();
     let ts_s_full = ts_weights(&s_chals);
     let ts_s = &ts_s_full[..d];
@@ -817,7 +817,7 @@ mod tests {
 
     #[test]
     fn test_psi_ct_matches_manual_negacyclic_constant_term() {
-        // This pins the "paper-style ut_1" meaning in *our* concrete ring:
+        // This pins the "ut_1" meaning from the paper's notation into *our* concrete ring:
         // for negacyclic rings R_q = Z_q[X]/(X^d + 1), the constant term of (a*b) is:
         //   ct(a*b) = a0*b0 - Σ_{i=1..d-1} a_i * b_{d-i}.
         //
