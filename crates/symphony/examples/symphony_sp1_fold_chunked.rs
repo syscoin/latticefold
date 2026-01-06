@@ -19,7 +19,7 @@ use rayon::prelude::*;
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
 use latticefold::commitment::AjtaiCommitmentScheme;
 use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as R;
-use stark_rings::PolyRing;
+use stark_rings::{PolyRing, Ring};
 use symphony::sp1_r1cs_loader::FieldFromU64;
 use symphony::symphony_sp1_r1cs::open_sp1_r1cs_chunk_cache;
 use symphony::rp_rgchk::RPParams;
