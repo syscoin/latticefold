@@ -483,12 +483,13 @@ where
                 *self = next;
             }
             StreamingMleEnum::BaseScalarVec { evals, num_vars } => {
-                // Try to take ownership of the backing Vec; fall back to cloning if shared.
-                let owned = match Arc::try_unwrap(evals.clone()) {
+                // Take ownership of the Arc, then try to unwrap; fall back to cloning if shared.
+                let arc = std::mem::take(evals);
+                let nv = *num_vars;
+                let mut owned = match Arc::try_unwrap(arc) {
                     Ok(v) => v,
                     Err(a) => (*a).clone(),
                 };
-                let mut owned = owned;
                 for i in 0..half {
                     let a = owned[i << 1];
                     let b = owned[(i << 1) | 1];
@@ -497,7 +498,7 @@ where
                 owned.truncate(half);
                 *self = StreamingMleEnum::BaseScalarVecOwned {
                     evals: owned,
-                    num_vars: *num_vars - 1,
+                    num_vars: nv - 1,
                 };
             }
             StreamingMleEnum::BaseScalarVecOwned { evals, num_vars } => {
