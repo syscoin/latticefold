@@ -28,6 +28,16 @@ where
         witness: Arc<Vec<R>>,
         num_vars: usize,
     },
+    /// Sparse mat-vec optimized for the case where the matrix is constant-coefficient embedded
+    /// (only coeffs()[0] possibly nonzero) but the witness is a *general* ring vector.
+    ///
+    /// This avoids full ring multiplication in the dot product: multiplying by a constant-coeff
+    /// ring element is a coefficient-wise scalar multiplication.
+    SparseMatVecConstMatrix {
+        matrix: Arc<SparseMatrix<R>>,
+        witness: Arc<Vec<R>>,
+        num_vars: usize,
+    },
     /// Constant-coefficient specialization of `SparseMatVec`.
     ///
     /// When the matrix and witness are embedded base-field scalars inside the ring (i.e., all
@@ -97,6 +107,17 @@ where
         }
     }
 
+    pub fn sparse_mat_vec_const_matrix(matrix: Arc<SparseMatrix<R>>, witness: Arc<Vec<R>>) -> Self {
+        let nrows = matrix.nrows;
+        assert!(nrows.is_power_of_two(), "nrows must be power-of-two");
+        let num_vars = nrows.trailing_zeros() as usize;
+        Self::SparseMatVecConstMatrix {
+            matrix,
+            witness,
+            num_vars,
+        }
+    }
+
     pub fn sparse_mat_vec_const_coeff(matrix: Arc<SparseMatrix<R>>, witness0: Arc<Vec<R::BaseRing>>) -> Self {
         let nrows = matrix.nrows;
         assert!(nrows.is_power_of_two(), "nrows must be power-of-two");
@@ -154,6 +175,7 @@ where
         match self {
             StreamingMleEnum::Dense(m) => m.num_vars,
             StreamingMleEnum::SparseMatVec { num_vars, .. } => *num_vars,
+            StreamingMleEnum::SparseMatVecConstMatrix { num_vars, .. } => *num_vars,
             StreamingMleEnum::SparseMatVecConstCoeff { num_vars, .. } => *num_vars,
             StreamingMleEnum::BaseScalarVec { num_vars, .. } => *num_vars,
             StreamingMleEnum::BaseScalarVecOwned { num_vars, .. } => *num_vars,
@@ -173,6 +195,26 @@ where
                 for (coeff, col_idx) in &matrix.coeffs[index] {
                     if *col_idx < witness.len() {
                         sum += *coeff * witness[*col_idx];
+                    }
+                }
+                sum
+            }
+            StreamingMleEnum::SparseMatVecConstMatrix {
+                matrix, witness, ..
+            } => {
+                // Fast path for constant-coeff matrices: coefficient-wise scaling of witness.
+                let d = R::dimension();
+                let mut sum = R::ZERO;
+                let sum_coeffs = sum.coeffs_mut();
+                debug_assert_eq!(sum_coeffs.len(), d);
+                for (coeff, col_idx) in &matrix.coeffs[index] {
+                    if *col_idx < witness.len() {
+                        let a = coeff.coeffs()[0];
+                        let w = witness[*col_idx].coeffs();
+                        debug_assert_eq!(w.len(), d);
+                        for j in 0..d {
+                            sum_coeffs[j] += a * w[j];
+                        }
                     }
                 }
                 sum
@@ -233,6 +275,7 @@ where
         match self {
             StreamingMleEnum::Dense(m) => m.evals[index].coeffs()[0],
             StreamingMleEnum::SparseMatVec { .. } => self.eval_at_index(index).coeffs()[0],
+            StreamingMleEnum::SparseMatVecConstMatrix { .. } => self.eval_at_index(index).coeffs()[0],
             StreamingMleEnum::SparseMatVecConstCoeff {
                 matrix, witness0, ..
             } => {
@@ -293,6 +336,17 @@ where
             }
             // Sparse mat-vec: materialize to dense once fixed (avoids exponential recursion).
             StreamingMleEnum::SparseMatVec { .. } => {
+                let new_evals: Vec<R> = (0..half)
+                    .map(|i| {
+                        let f0 = self.eval_at_index(i << 1);
+                        let f1 = self.eval_at_index((i << 1) | 1);
+                        (R::ONE - r) * f0 + r * f1
+                    })
+                    .collect();
+                StreamingMleEnum::dense(new_evals)
+            }
+            // Const-matrix sparse mat-vec: same as SparseMatVec, but eval is cheaper.
+            StreamingMleEnum::SparseMatVecConstMatrix { .. } => {
                 let new_evals: Vec<R> = (0..half)
                     .map(|i| {
                         let f0 = self.eval_at_index(i << 1);
@@ -474,6 +528,10 @@ where
                 m.num_vars -= 1;
             }
             StreamingMleEnum::SparseMatVec { .. } => {
+                let new = self.fix_variable(r_ring);
+                *self = new;
+            }
+            StreamingMleEnum::SparseMatVecConstMatrix { .. } => {
                 let new = self.fix_variable(r_ring);
                 *self = new;
             }
@@ -1145,6 +1203,36 @@ mod tests {
         assert_eq!(mle.num_vars(), 2);
         for i in 0..4 {
             assert_eq!(mle.eval_at_index(i), evals[i]);
+        }
+    }
+
+    #[test]
+    fn test_sparse_mat_vec_const_matrix_matches_generic_for_const_matrices() {
+        use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as R;
+        use stark_rings_linalg::SparseMatrix;
+
+        let m = 8usize;
+        let n = 16usize;
+        let mut a = SparseMatrix::<R>::identity(m);
+        a.pad_cols(n);
+
+        // Build a "packed" witness: non-constant coefficients.
+        let d = R::dimension();
+        let mut w = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut x = R::ZERO;
+            for j in 0..d {
+                x.coeffs_mut()[j] = <R as stark_rings::PolyRing>::BaseRing::from(((i + 1) * (j + 3)) as u128);
+            }
+            w.push(x);
+        }
+        let w = Arc::new(w);
+
+        let m_generic = StreamingMleEnum::sparse_mat_vec(Arc::new(a.clone()), w.clone());
+        let m_constm = StreamingMleEnum::sparse_mat_vec_const_matrix(Arc::new(a), w);
+
+        for row in 0..m {
+            assert_eq!(m_constm.eval_at_index(row), m_generic.eval_at_index(row));
         }
     }
 }

@@ -61,6 +61,9 @@ fn main() {
 
     let mut cfg = PiFoldStreamingConfig::default();
     cfg.profile = std::env::var("SYMPHONY_PROFILE").ok().as_deref() == Some("1");
+    if std::env::var("DISABLE_CONST_COEFF_FASTPATH").ok().as_deref() == Some("1") {
+        cfg.request_const_coeff_fastpath = false;
+    }
 
     println!("=========================================================");
     println!("Symphony SP1 One-Proof");
@@ -70,6 +73,10 @@ fn main() {
         "  parallel_feature={}  rayon_threads={}",
         cfg!(feature = "parallel"),
         rayon::current_num_threads()
+    );
+    println!(
+        "  cfg: profile={} request_const_coeff_fastpath={}",
+        cfg.profile, cfg.request_const_coeff_fastpath
     );
 
     let t_load = Instant::now();
@@ -83,9 +90,22 @@ fn main() {
     println!("  chunks={num_chunks} ncols={ncols}");
 
     // Witness (constant-coeff embedded)
+    let pack_witness = std::env::var("PACK_WITNESS").ok().as_deref() == Some("1");
     let mut witness: Vec<R> = vec![R::ZERO; ncols];
     witness[0] = R::ONE;
+    if pack_witness {
+        // Make the witness non-constant-coeff (replicate coeff[0] into all coefficients).
+        // This is a harness knob to exercise packed-lane / non-const witness code paths.
+        let d = R::dimension();
+        for x in witness.iter_mut() {
+            let c0 = x.coeffs()[0];
+            for j in 1..d {
+                x.coeffs_mut()[j] = c0;
+            }
+        }
+    }
     let witness = Arc::new(witness);
+    println!("  PACK_WITNESS={}", pack_witness as u8);
 
     // Params
     let rg_params = RPParams {
@@ -98,11 +118,16 @@ fn main() {
     // Commit
     const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
     let scheme_main = Arc::new(AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 8, ncols));
-    let cm_main = scheme_main
-        .commit_const_coeff_fast(&witness)
-        .unwrap()
-        .as_ref()
-        .to_vec();
+    let cm_main = if pack_witness {
+        // Commitment that matches the packed (general) ring witness.
+        scheme_main.commit(&witness).unwrap().as_ref().to_vec()
+    } else {
+        scheme_main
+            .commit_const_coeff_fast(&witness)
+            .unwrap()
+            .as_ref()
+            .to_vec()
+    };
     let scheme_had = Arc::new(AjtaiCommitmentScheme::<R>::seeded(
         b"cfs_had_u",
         MASTER_SEED,
