@@ -23,7 +23,7 @@ use stark_rings::PolyRing;
 use stark_rings::Ring;
 use symphony::rp_rgchk::RPParams;
 use symphony::symphony_open::MultiAjtaiOpenVerifier;
-use symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics_result;
+use symphony::symphony_we_relation::{check_r_we_poseidon_fs_hetero_m_with_metrics_result, TrivialRo};
 use symphony::sp1_r1cs_loader::FieldFromU64;
 use symphony::symphony_pifold_streaming::{
     prove_pi_fold_poseidon_fs, PiFoldStreamingConfig,
@@ -175,8 +175,7 @@ fn main() {
             .with_scheme("cfs_mon_b", (*scheme_mon).clone());
 
         let t_vfy = Instant::now();
-        let (res, metrics, _trace) =
-            verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics_result::<R, PC>(
+        let (res, metrics) = check_r_we_poseidon_fs_hetero_m_with_metrics_result::<R, PC, TrivialRo>(
                 &ms_ref,
                 &cms_all,
                 &out.proof,
@@ -185,6 +184,7 @@ fn main() {
                 &out.cfs_mon_b,
                 &out.aux,
                 &public_inputs,
+                &(),
             );
         println!("  verify (cp/aux): {:?}", t_vfy.elapsed());
         if let Err(e) = &res {
