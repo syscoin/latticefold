@@ -23,7 +23,7 @@ use stark_rings::PolyRing;
 use stark_rings::Ring;
 use symphony::rp_rgchk::RPParams;
 use symphony::symphony_open::MultiAjtaiOpenVerifier;
-use symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics;
+use symphony::symphony_we_relation::check_r_cp_poseidon_fs_hetero_m_with_metrics;
 use symphony::sp1_r1cs_loader::FieldFromU64;
 use symphony::symphony_pifold_streaming::{
     prove_pi_fold_poseidon_fs, PiFoldStreamingConfig,
@@ -174,18 +174,17 @@ fn main() {
             .with_scheme("cfs_mon_b", (*scheme_mon).clone());
 
         let t_vfy = Instant::now();
-        let (_folded, metrics, _trace) =
-            verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics::<R, PC>(
-                &ms_ref,
-                &cms_all,
-                &out.proof,
-                &open_cfs,
-                &out.cfs_had_u,
-                &out.cfs_mon_b,
-                &out.aux,
-                &public_inputs,
-            )
-            .expect("VERIFY=1: CP/aux verify failed");
+        let (_folded_out, metrics) = check_r_cp_poseidon_fs_hetero_m_with_metrics::<R, PC>(
+            &ms_ref,
+            &cms_all,
+            &out.proof,
+            &open_cfs,
+            &out.cfs_had_u,
+            &out.cfs_mon_b,
+            &out.aux,
+            &public_inputs,
+        )
+        .expect("VERIFY=1: CP/aux verify failed");
         println!("  verify (cp/aux): {:?}", t_vfy.elapsed());
 
         // Same estimator we use in other logs: rate=20 field elems; 160 bytes per perm block.
