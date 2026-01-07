@@ -308,9 +308,8 @@ where
                 let one_minus = R::BaseRing::ONE - r0;
                 let new_evals: Vec<R::BaseRing> = (0..half)
                     .map(|i| {
-                        // Avoid constructing full ring elements; evaluate directly in base ring.
-                        let f0 = self.eval0_at_index(i << 1);
-                        let f1 = self.eval0_at_index((i << 1) | 1);
+                        let f0 = self.eval_at_index(i << 1).coeffs()[0];
+                        let f1 = self.eval_at_index((i << 1) | 1).coeffs()[0];
                         one_minus * f0 + r0 * f1
                     })
                     .collect();
@@ -477,34 +476,11 @@ where
                 let new = self.fix_variable(r_ring);
                 *self = new;
             }
-            StreamingMleEnum::SparseMatVecConstCoeff {
-                matrix,
-                witness0,
-                num_vars,
-            } => {
-                // Compute the next fixed table directly in the base ring (no ring construction).
-                let new_evals: Vec<R::BaseRing> = (0..half)
-                    .map(|i| {
-                        let mut f0 = R::BaseRing::ZERO;
-                        for (coeff, col_idx) in &matrix.coeffs[i << 1] {
-                            if *col_idx < witness0.len() {
-                                f0 += coeff.coeffs()[0] * witness0[*col_idx];
-                            }
-                        }
-                        let mut f1 = R::BaseRing::ZERO;
-                        for (coeff, col_idx) in &matrix.coeffs[(i << 1) | 1] {
-                            if *col_idx < witness0.len() {
-                                f1 += coeff.coeffs()[0] * witness0[*col_idx];
-                            }
-                        }
-                        one_minus0 * f0 + r0 * f1
-                    })
-                    .collect();
-                let nv = *num_vars;
-                *self = StreamingMleEnum::BaseScalarVecOwned {
-                    evals: new_evals,
-                    num_vars: nv - 1,
-                };
+            StreamingMleEnum::SparseMatVecConstCoeff { .. } => {
+                // Fall back to `fix_variable` (which already does the right thing); we overwrite
+                // `self` afterward so future fixes can be in-place.
+                let next = self.fix_variable(r_ring);
+                *self = next;
             }
             StreamingMleEnum::BaseScalarVec { evals, num_vars } => {
                 // Take ownership of the Arc, then try to unwrap; fall back to cloning if shared.
