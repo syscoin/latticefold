@@ -29,49 +29,6 @@ use symphony::symphony_we_relation::{
     check_r_we_poseidon_fs_hetero_m_with_metrics_result, TrivialRo,
 };
 
-fn is_const_coeff_ring_elem(x: &R) -> bool {
-    x.coeffs()
-        .iter()
-        .skip(1)
-        .all(|c| *c == <R as PolyRing>::BaseRing::ZERO)
-}
-
-fn check_const_coeff_witness(w: &[R], samples: usize) -> (usize, usize) {
-    if w.is_empty() || samples == 0 {
-        return (0, 0);
-    }
-    let step = (w.len() / samples).max(1);
-    let mut checked = 0usize;
-    let mut non_const = 0usize;
-    for i in (0..w.len()).step_by(step) {
-        checked += 1;
-        if !is_const_coeff_ring_elem(&w[i]) {
-            non_const += 1;
-        }
-        if checked >= samples {
-            break;
-        }
-    }
-    (checked, non_const)
-}
-
-fn check_const_coeff_sparse_matrix(m: &stark_rings_linalg::SparseMatrix<R>, max_entries: usize) -> (usize, usize) {
-    let mut checked = 0usize;
-    let mut non_const = 0usize;
-    for row in &m.coeffs {
-        for (coeff, _col) in row {
-            checked += 1;
-            if !is_const_coeff_ring_elem(coeff) {
-                non_const += 1;
-            }
-            if checked >= max_entries {
-                return (checked, non_const);
-            }
-        }
-    }
-    (checked, non_const)
-}
-
 /// BabyBear field element for loading R1CS.
 #[derive(Debug, Clone, Copy, Default)]
 struct BabyBear(u64);
