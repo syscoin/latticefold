@@ -1147,4 +1147,59 @@ mod tests {
             assert_eq!(mle.eval_at_index(i), evals[i]);
         }
     }
+
+    #[test]
+    fn test_periodic_base_scalar_vec_square_is_vertex_square_not_eval_square() {
+        // Pins the intended meaning of the `square` flag:
+        //   square=false => evaluates MLE(m)(r)
+        //   square=true  => evaluates MLE(m^{∘2})(r), i.e. squares *vertex values* before interpolation.
+        //
+        // For a non-Boolean point r, we generally have:
+        //   MLE(m)(r)^2 != MLE(m^{∘2})(r)
+        // and this non-commutation is exactly what monomial/set-check tests rely on.
+        use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as R;
+        use stark_rings::PolyRing;
+
+        type F = <R as PolyRing>::BaseRing;
+
+        // One variable: m=2 rows, d=1 column => g_len = m*d = 2 => nvars=1.
+        let m = 2usize;
+        let m_j = 2usize;
+        let d = 1usize;
+        let nvars = 1usize;
+
+        // Vertex values: [a, b]
+        let a = F::from(1u128);
+        let b = F::from(2u128);
+        let evals = Arc::new(vec![a, b]); // length m_j*d = 2
+
+        let mle = StreamingMleEnum::<R>::periodic_base_scalar_vec(nvars, m, m_j, d, evals.clone(), false);
+        let mle_sq = StreamingMleEnum::<R>::periodic_base_scalar_vec(nvars, m, m_j, d, evals, true);
+
+        // Non-Boolean point.
+        let r = F::from(2u128);
+
+        // Evaluate by fixing variables (LSB-first).
+        let eval0 = |mut m: StreamingMleEnum<R>| -> F {
+            m.fix_variable_in_place_base(r);
+            assert_eq!(m.num_vars(), 0);
+            m.eval0_at_index(0)
+        };
+
+        let v = eval0(mle);
+        let v_sq = eval0(mle_sq);
+
+        // Expected:
+        // MLE([a,b])(r) = (1-r)*a + r*b
+        // MLE([a^2,b^2])(r) = (1-r)*a^2 + r*b^2
+        let one_minus = F::ONE - r;
+        let expected = one_minus * a + r * b;
+        let expected_sq = one_minus * (a * a) + r * (b * b);
+
+        assert_eq!(v, expected);
+        assert_eq!(v_sq, expected_sq);
+
+        // And in general, these differ at non-Boolean r.
+        assert_ne!(v_sq, v * v);
+    }
 }
