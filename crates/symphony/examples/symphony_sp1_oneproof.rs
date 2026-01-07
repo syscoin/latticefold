@@ -63,7 +63,7 @@ fn main() {
     cfg.profile = std::env::var("SYMPHONY_PROFILE").ok().as_deref() == Some("1");
 
     println!("=========================================================");
-    println!("Symphony SP1 One-Proof Bench (minimal harness)");
+    println!("Symphony SP1 One-Proof");
     println!("=========================================================");
     println!("  CHUNK_SIZE={chunk_size}  L_H={l_h}  LAMBDA_PJ={lambda_pj}");
     println!(
