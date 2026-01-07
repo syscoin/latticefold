@@ -17,6 +17,7 @@ use std::time::Instant;
 use ark_ff::PrimeField;
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
 use latticefold::commitment::AjtaiCommitmentScheme;
+use rayon::ThreadPoolBuilder;
 use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as R;
 use stark_rings::PolyRing;
 use stark_rings::Ring;
@@ -57,6 +58,11 @@ fn main() {
     println!("=========================================================\n");
     println!("Configuration:");
     println!("  Chunk size: {} (2^{})", chunk_size, chunk_size.trailing_zeros());
+    let prove_threads: usize = std::env::var("PROVE_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+    println!("  Prove threads: {prove_threads}");
 
     // Π_fold streaming configuration (library does not read env vars).
     let mut pifold_cfg = PiFoldStreamingConfig::default();
@@ -175,17 +181,23 @@ fn main() {
     let cms_all: Vec<Vec<R>> = vec![cm_main.clone(); num_chunks];
     let witnesses_all: Vec<Arc<Vec<R>>> = vec![witness.clone(); num_chunks];
 
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(prove_threads)
+        .build()
+        .expect("failed to build local rayon pool");
     let prove_start = Instant::now();
-    let out = prove_pi_fold_poseidon_fs::<R, PC>(
-        all_mats.as_slice(),
-        &cms_all,
-        &witnesses_all,
-        &public_inputs,
-        Some(scheme_had.as_ref()),
-        Some(scheme_mon.as_ref()),
-        rg_params.clone(),
-        &pifold_cfg,
-    )
+    let out = pool.install(|| {
+        prove_pi_fold_poseidon_fs::<R, PC>(
+            all_mats.as_slice(),
+            &cms_all,
+            &witnesses_all,
+            &public_inputs,
+            Some(scheme_had.as_ref()),
+            Some(scheme_mon.as_ref()),
+            rg_params.clone(),
+            &pifold_cfg,
+        )
+    })
     .expect("prove failed");
     let prove_time = prove_start.elapsed();
     let proof_bytes = out.proof.coins.bytes.len();
