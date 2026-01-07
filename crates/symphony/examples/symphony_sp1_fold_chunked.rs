@@ -58,11 +58,21 @@ fn main() {
     println!("=========================================================\n");
     println!("Configuration:");
     println!("  Chunk size: {} (2^{})", chunk_size, chunk_size.trailing_zeros());
-    let prove_threads: usize = std::env::var("PROVE_THREADS")
-        .ok()
+    let prove_threads_env = std::env::var("PROVE_THREADS").ok();
+    let rayon_threads_env = std::env::var("RAYON_NUM_THREADS").ok();
+    let prove_threads: usize = prove_threads_env
+        .as_deref()
         .and_then(|s| s.parse().ok())
+        .or_else(|| rayon_threads_env.as_deref().and_then(|s| s.parse().ok()))
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
-    println!("  Prove threads: {prove_threads}");
+    let prove_threads_src = if prove_threads_env.is_some() {
+        "PROVE_THREADS"
+    } else if rayon_threads_env.is_some() {
+        "RAYON_NUM_THREADS"
+    } else {
+        "available_parallelism"
+    };
+    println!("  Prove threads: {prove_threads} (from {prove_threads_src})");
 
     // Π_fold streaming configuration (library does not read env vars).
     let mut pifold_cfg = PiFoldStreamingConfig::default();
