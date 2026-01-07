@@ -26,7 +26,7 @@ use stark_rings::Ring;
 use symphony::rp_rgchk::RPParams;
 use symphony::sp1_r1cs_loader::FieldFromU64;
 use symphony::symphony_pifold_streaming::{
-    prove_pi_fold_streaming_sumcheck_fs_hetero_m_with_config, PiFoldStreamingConfig,
+    prove_pi_fold_poseidon_fs, PiFoldStreamingConfig,
 };
 use symphony::symphony_sp1_r1cs::open_sp1_r1cs_chunk_cache;
 
@@ -136,7 +136,7 @@ fn main() {
     let witnesses_all: Vec<Arc<Vec<R>>> = vec![witness; num_chunks];
 
     let t_prove = Instant::now();
-    let out = prove_pi_fold_streaming_sumcheck_fs_hetero_m_with_config::<R, PC>(
+    let out = prove_pi_fold_poseidon_fs::<R, PC>(
         all_mats.as_slice(),
         &cms_all,
         &witnesses_all,
