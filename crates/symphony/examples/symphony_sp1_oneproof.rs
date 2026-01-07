@@ -1,19 +1,17 @@
-//! Minimal, apples-to-apples SP1 one-proof benchmark.
+//! Chunked streaming proving for SP1 shrink verifier R1CS.
 //!
-//! This example intentionally does **only**:
+//! This program does the following:
 //! - open/build the SP1 chunk cache
 //! - load all chunk matrices into memory
 //! - run the canonical hetero-M streaming Π_fold prover (`prove_pi_fold_poseidon_fs`)
 //!
-//! Use this when comparing performance across branches/commits: it avoids extra driver logic that
-//! can perturb allocator/NUMA/cache behavior.
+//! Usage:
+//!   SP1_R1CS=/path/to/shrink_verifier.r1cs \
+//!     cargo run -p symphony --example symphony_sp1_fold_chunked --release
 //!
-//! Run:
-//!   SYMPHONY_PROFILE=1 RAYON_NUM_THREADS=96 \
-//!   CHUNK_SIZE=1048576 L_H=256 LAMBDA_PJ=1 \
-//!   SP1_R1CS=~/sp1/shrink.r1cs \
-//!   RUSTFLAGS="-C target-cpu=native" \
-//!   cargo run -p symphony --example symphony_sp1_oneproof_bench --release
+//! To generate the R1CS file, run in the SP1 fork:
+//!   OUT_R1CS=shrink_verifier.r1cs cargo run -p sp1-prover \
+//!     --bin dump_shrink_verify_constraints --release
 
 use std::sync::Arc;
 use std::time::Instant;
