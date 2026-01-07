@@ -308,8 +308,9 @@ where
                 let one_minus = R::BaseRing::ONE - r0;
                 let new_evals: Vec<R::BaseRing> = (0..half)
                     .map(|i| {
-                        let f0 = self.eval_at_index(i << 1).coeffs()[0];
-                        let f1 = self.eval_at_index((i << 1) | 1).coeffs()[0];
+                        // Avoid constructing full ring elements; evaluate directly in base ring.
+                        let f0 = self.eval0_at_index(i << 1);
+                        let f1 = self.eval0_at_index((i << 1) | 1);
                         one_minus * f0 + r0 * f1
                     })
                     .collect();
