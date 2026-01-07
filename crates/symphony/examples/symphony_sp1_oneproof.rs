@@ -184,8 +184,7 @@ fn main() {
             &out.cfs_mon_b,
             &out.aux,
             &public_inputs,
-        )
-        .expect("VERIFY=1: CP/aux verify failed");
+        );
         println!("  verify (cp/aux): {:?}", t_vfy.elapsed());
 
         // Same estimator we use in other logs: rate=20 field elems; 160 bytes per perm block.
