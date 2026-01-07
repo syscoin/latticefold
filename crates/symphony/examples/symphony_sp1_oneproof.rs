@@ -133,7 +133,8 @@ fn main() {
     println!("  load all mats: {:?}", t_mats.elapsed());
 
     let cms_all: Vec<Vec<R>> = vec![cm_main; num_chunks];
-    let witnesses_all: Vec<Arc<Vec<R>>> = vec![witness; num_chunks];
+    // Clone the Arc (refcount bump) so we can still use `witness` later for optional verification.
+    let witnesses_all: Vec<Arc<Vec<R>>> = vec![witness.clone(); num_chunks];
 
     let t_prove = Instant::now();
     let out = prove_pi_fold_poseidon_fs::<R, PC>(
