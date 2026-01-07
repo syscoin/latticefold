@@ -17,7 +17,6 @@ use std::time::Instant;
 use ark_ff::PrimeField;
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
 use latticefold::commitment::AjtaiCommitmentScheme;
-use rayon::ThreadPoolBuilder;
 use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as R;
 use stark_rings::PolyRing;
 use stark_rings::Ring;

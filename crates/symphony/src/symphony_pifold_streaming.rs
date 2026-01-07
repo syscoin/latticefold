@@ -1002,6 +1002,13 @@ where
     // Keep this function bit-for-bit aligned with `prove_pi_fold_streaming_impl` except that each
     // instance pulls y = M*w from its own matrices.
     let prof = config.profile;
+    if prof {
+        eprintln!(
+            "[PiFold streaming hetero] pool: rayon_threads={}, const_coeff_fastpath={}",
+            rayon::current_num_threads(),
+            const_coeff_fastpath
+        );
+    }
     let t_all = Instant::now();
     let ell = cms.len();
     let beta_cts = derive_beta_chi::<R>(transcript, ell);
@@ -1328,7 +1335,12 @@ where
         proj_digits_by_inst.push(Arc::new(digits_flat));
     }
     if prof {
-        eprintln!("[PiFold streaming hetero] proj_digits: {:?}", t_digits.elapsed());
+        eprintln!(
+            "[PiFold streaming hetero] proj_digits: {:?} (rayon_threads={}, const_coeff_fastpath={})",
+            t_digits.elapsed(),
+            rayon::current_num_threads(),
+            const_coeff_fastpath
+        );
     }
 
     let t_mon_build = Instant::now();
@@ -1538,7 +1550,12 @@ where
         v_msg_mon = Some(r);
     }
     if prof {
-        eprintln!("[PiFold streaming hetero] sumcheck: {:?}", t_sumcheck.elapsed());
+        eprintln!(
+            "[PiFold streaming hetero] sumcheck: {:?} (rayon_threads={}, const_coeff_fastpath={})",
+            t_sumcheck.elapsed(),
+            rayon::current_num_threads(),
+            const_coeff_fastpath
+        );
         eprintln!("[PiFold streaming hetero] total: {:?}", t_all.elapsed());
     }
 
