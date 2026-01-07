@@ -1,15 +1,16 @@
-
-
+//! Accumulator tests for Π_fold.
+//!
+//! Tests multi-step accumulator workflow where instances are folded incrementally.
 
 use ark_std::One;
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
+use std::sync::Arc;
 use symphony::symphony_coins::derive_beta_chi;
 use latticefold::transcript::Transcript;
 use symphony::{
     rp_rgchk::RPParams,
-    symphony_pifold_batched::{
-        prove_pi_fold_batched_sumcheck_fs,
-    },
+    symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m,
+    symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig},
     symphony_open::AjtaiOpenVerifier,
 };
 use latticefold::commitment::AjtaiCommitmentScheme;
@@ -27,7 +28,7 @@ fn fold_vec(beta0: R, beta1: R, a: &[R], b: &[R]) -> Vec<R> {
 }
 
 #[test]
-fn test_pifold_batched_accumulator_two_steps() {
+fn test_pifold_accumulator_two_steps() {
     let n = 1 << 10;
     let m = 1 << 10;
 
@@ -44,6 +45,9 @@ fn test_pifold_batched_accumulator_two_steps() {
     for row in m3.coeffs.iter_mut() {
         row.clear();
     }
+    let m1 = Arc::new(m1);
+    let m2 = Arc::new(m2);
+    let m3 = Arc::new(m3);
 
     let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
     let open = AjtaiOpenVerifier { scheme: scheme.clone() };
@@ -63,14 +67,22 @@ fn test_pifold_batched_accumulator_two_steps() {
     let f1 = vec![R::ZERO; n];
     let cm1 = scheme.commit(&f1).unwrap().as_ref().to_vec();
 
-    let pf1_out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
-        [&m1, &m2, &m3],
+    // Build Ms: shared matrices repeated for each instance.
+    let ms = vec![
+        [m1.clone(), m2.clone(), m3.clone()],
+        [m1.clone(), m2.clone(), m3.clone()],
+    ];
+
+    let cfg = PiFoldStreamingConfig::default();
+    let pf1_out = prove_pi_fold_poseidon_fs::<R, PC>(
+        ms.as_slice(),
         &[cm_acc.clone(), cm1.clone()],
-        &[f_acc.as_slice(), f1.as_slice()],
+        &[Arc::new(f_acc.clone()), Arc::new(f1.clone())],
         &[],
         None,
         None,
         rg_params.clone(),
+        &cfg,
     )
     .unwrap();
     let pf1 = pf1_out.proof;
@@ -82,16 +94,25 @@ fn test_pifold_batched_accumulator_two_steps() {
         pf1.coins.events.clone(),
     );
     ts1.absorb_field_element(&<R as stark_rings::PolyRing>::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
+    // absorb public inputs (empty)
+    ts1.absorb_field_element(&<R as stark_rings::PolyRing>::BaseRing::from(0x4c465053_5055424cu128)); // "LFPS_PUBL"
+    ts1.absorb_field_element(&<R as stark_rings::PolyRing>::BaseRing::from(0u128));
     let beta1_cts = derive_beta_chi::<R>(&mut ts1, 2);
     let beta10 = R::from(beta1_cts[0]);
     let beta11 = R::from(beta1_cts[1]);
 
-    let (folded1, _bat1) = symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs::<R, PC>(
+    let ms_refs: Vec<[&SparseMatrix<R>; 3]> = vec![
         [&m1, &m2, &m3],
+        [&m1, &m2, &m3],
+    ];
+
+    let (folded1, _bat1) = verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m::<R, PC>(
+        ms_refs.as_slice(),
         &[cm_acc.clone(), cm1.clone()],
         &pf1,
         &open,
         &[f_acc.clone(), f1.clone()],
+        None,
         &[],
     )
     .unwrap();
@@ -105,14 +126,15 @@ fn test_pifold_batched_accumulator_two_steps() {
     let f2 = vec![R::one(); n];
     let cm2 = scheme.commit(&f2).unwrap().as_ref().to_vec();
 
-    let pf2_out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
-        [&m1, &m2, &m3],
+    let pf2_out = prove_pi_fold_poseidon_fs::<R, PC>(
+        ms.as_slice(),
         &[cm_acc.clone(), cm2.clone()],
-        &[f_acc.as_slice(), f2.as_slice()],
+        &[Arc::new(f_acc.clone()), Arc::new(f2.clone())],
         &[],
         None,
         None,
         rg_params.clone(),
+        &cfg,
     )
     .unwrap();
     let pf2 = pf2_out.proof;
@@ -124,16 +146,20 @@ fn test_pifold_batched_accumulator_two_steps() {
         pf2.coins.events.clone(),
     );
     ts2.absorb_field_element(&<R as stark_rings::PolyRing>::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
+    // absorb public inputs (empty)
+    ts2.absorb_field_element(&<R as stark_rings::PolyRing>::BaseRing::from(0x4c465053_5055424cu128)); // "LFPS_PUBL"
+    ts2.absorb_field_element(&<R as stark_rings::PolyRing>::BaseRing::from(0u128));
     let beta2_cts = derive_beta_chi::<R>(&mut ts2, 2);
     let beta20 = R::from(beta2_cts[0]);
     let beta21 = R::from(beta2_cts[1]);
 
-    let (folded2, _bat2) = symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs::<R, PC>(
-        [&m1, &m2, &m3],
+    let (folded2, _bat2) = verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m::<R, PC>(
+        ms_refs.as_slice(),
         &[cm_acc.clone(), cm2.clone()],
         &pf2,
         &open,
         &[f_acc.clone(), f2.clone()],
+        None,
         &[],
     )
     .unwrap();

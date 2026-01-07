@@ -12,9 +12,9 @@
 //! Run:
 //! - `cargo run -p symphony --example symphony_poseidon2_bench --release
 
+use std::sync::Arc;
 use std::time::Instant;
 use ark_ff::PrimeField;
-use latticefold::transcript::Transcript;
 
 fn main() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -517,15 +517,10 @@ where
 {
     use ark_ff::{BigInteger, Field, PrimeField};
     use latticefold::commitment::AjtaiCommitmentScheme;
-    use std::sync::Arc;
     use symphony::{
-        recording_transcript::RecordingTranscriptRef,
         rp_rgchk::RPParams,
         symphony_open::MultiAjtaiOpenVerifier,
-        symphony_pifold_batched::prove_pi_fold_batched_sumcheck_fs,
-        symphony_pifold_streaming::prove_pi_fold_streaming,
-        symphony_cm::SymphonyCoins,
-        transcript::PoseidonTranscript,
+        symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig},
         symphony_we_relation::check_r_cp_poseidon_fs,
     };
 
@@ -540,7 +535,6 @@ where
     // linear maps so the Hadamard relation is unchanged. This is the Table 1 instantiation setup
     // and is enabled unconditionally in this benchmark.
     // R1CS witness decomposition always enabled in this benchmark
-    let decomp = true;
     println!("  R1CS witness decomposition: ENABLED (k_cs=16, b=2^4)");
     let (m1, m2, m3, witness) =
         r1cs_decompose_witness_and_expand_matrices::<R>(&m1, &m2, &m3, &witness, 16, 16);
@@ -557,7 +551,7 @@ where
 
     // Witness magnitude proxy: maximum bit-length among base-prime-field limbs.
     //
-    // This is not “signed magnitude” in Zq, but it is a useful indicator of whether values
+    // This is not "signed magnitude" in Zq, but it is a useful indicator of whether values
     // are staying tiny vs spanning the full modulus.
     let mut max_bits = 0u32;
     for r in &witness {
@@ -596,7 +590,7 @@ where
 
     // Commitment setup
     let kappa = 8; // Ajtai commitment rows
-    // Seeded Ajtai is the intended “CRS-as-seed” instantiation (public, fixed seed).
+    // Seeded Ajtai is the intended "CRS-as-seed" instantiation (public, fixed seed).
     const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
     let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, kappa, n);
     let cm = scheme
@@ -606,7 +600,7 @@ where
         .to_vec();
 
     // Symphony Π_rg parameters
-    let rg_params = if decomp && k_g == 3 {
+    let rg_params = if k_g == 3 {
         // Paper-style prototype mode:
         // - use d' := d-2 in Eq.(29) / (33)
         // - keep m_J small by using lambda_pj=1 (toy bench knob; paper uses 2^8)
@@ -618,10 +612,10 @@ where
         }
     } else {
         RPParams {
-        l_h: 64,
-        lambda_pj: 32,
+            l_h: 64,
+            lambda_pj: 32,
             k_g,
-        d_prime: (R::dimension() as u128) / 2,
+            d_prime: (R::dimension() as u128) / 2,
         }
     };
 
@@ -642,11 +636,6 @@ where
         .with_scheme("cfs_had_u", scheme_had.clone())
         .with_scheme("cfs_mon_b", scheme_mon.clone());
 
-    // Choose prover mode for A/B comparison:
-    //   SYMPHONY_PIFOLD_MODE=dense|streaming|both   (default: both)
-    let mode = std::env::var("SYMPHONY_PIFOLD_MODE").unwrap_or_else(|_| "both".to_string());
-    println!("  Π_fold mode: {mode}");
-
     // Helper: verify R_cp for a produced output
     let verify = |out: &symphony::symphony_pifold_batched::PiFoldProverOutput<R>| -> Result<_, String> {
         check_r_cp_poseidon_fs::<R, PC>(
@@ -661,121 +650,44 @@ where
         )
     };
 
-    // Dense prover (current default path)
-    let mut dense_metrics = None;
-    if mode == "dense" || mode == "both" {
-        println!("  Π_fold prove (dense): START...");
+    // Streaming prover (canonical path)
+    println!("  Π_fold prove (streaming): START...");
+
+    // Build Ms: single instance
+    let ms = vec![[m1.clone(), m2.clone(), m3.clone()]];
+
+    let cfg = PiFoldStreamingConfig::default();
     let prove_start = Instant::now();
-    let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
-            [m1.as_ref(), m2.as_ref(), m3.as_ref()],
+    let out = prove_pi_fold_poseidon_fs::<R, PC>(
+        ms.as_slice(),
         &[cm.clone()],
-            &[witness.as_ref().as_slice()],
+        &[witness.clone()],
         &public_inputs,
         Some(&scheme_had),
         Some(&scheme_mon),
         rg_params.clone(),
+        &cfg,
     );
     let prove_time = prove_start.elapsed();
     let out = match out {
         Ok(o) => o,
         Err(e) => {
-                println!("  Π_fold prove (dense) FAILED: {e}");
+            println!("  Π_fold prove (streaming) FAILED: {e}");
             return;
         }
     };
-        println!("  Π_fold prove (dense): PASSED ✓ ({prove_time:?})");
+    println!("  Π_fold prove (streaming): PASSED ✓ ({prove_time:?})");
 
-        println!("  R_cp verify (dense): START...");
+    println!("  R_cp verify (streaming): START...");
     let verify_start = Instant::now();
-        match verify(&out) {
-            Ok(_) => {
-    let verify_time = verify_start.elapsed();
-                println!("  R_cp verify (dense): PASSED ✓ ({verify_time:?})");
-                dense_metrics = Some((prove_time, verify_time, out.proof.coins.bytes.len()));
-            }
-            Err(e) => {
-                println!("  R_cp verify (dense) FAILED: {e}");
-                return;
-            }
-        }
-    }
-
-    // Streaming prover (streaming hadamard sumcheck; monomial side still dense)
-    let mut streaming_metrics = None;
-    if mode == "streaming" || mode == "both" {
-        println!("  Π_fold prove (streaming-had): START...");
-
-        // Run under Poseidon-FS and record coins so we can verify with the standard verifier.
-        let prove_start = Instant::now();
-        let mut ts = PoseidonTranscript::<R>::empty::<PC>();
-        let mut rts = RecordingTranscriptRef::<R, _>::new(&mut ts);
-        rts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
-        // absorb_public_inputs (same as symphony_pifold_batched)
-        rts.absorb_field_element(&R::BaseRing::from(0x4c465053_5055424cu128)); // "LFPS_PUBL"
-        rts.absorb_field_element(&R::BaseRing::from(public_inputs.len() as u128));
-        for x in &public_inputs {
-            rts.absorb_field_element(x);
-        }
-
-        let out = prove_pi_fold_streaming::<R>(
-            &mut rts,
-            [m1.clone(), m2.clone(), m3.clone()],
-            &[cm.clone()],
-            &[witness.clone()],
-            rg_params.clone(),
-        );
-        let prove_time = prove_start.elapsed();
-        let mut out = match out {
-            Ok(o) => o,
-            Err(e) => {
-                println!("  Π_fold prove (streaming-had) FAILED: {e}");
-                return;
-            }
-        };
-
-        // Fill in recorded coins for verifier replay.
-        out.proof.coins = SymphonyCoins::<R> {
-            challenges: rts.coins_challenges,
-            bytes: rts.coins_bytes,
-            events: rts.events,
-        };
-
-        // Commit to CP transcript witness messages (cfs_*), matching the dense prover behavior.
-        let d = R::dimension();
-        let encode_had_u = |u: &[Vec<R::BaseRing>; 3]| -> Vec<R> {
-            let mut out = Vec::with_capacity(3 * d);
-            out.extend(u[0].iter().copied().map(R::from));
-            out.extend(u[1].iter().copied().map(R::from));
-            out.extend(u[2].iter().copied().map(R::from));
-            out
-        };
-        out.cfs_had_u = out
-            .aux
-            .had_u
-            .iter()
-            .map(|u| scheme_had.commit(&encode_had_u(u)).unwrap().as_ref().to_vec())
-            .collect();
-        out.cfs_mon_b = out
-            .aux
-            .mon_b
-            .iter()
-            .map(|b| scheme_mon.commit(b).unwrap().as_ref().to_vec())
-            .collect();
-
-        println!("  Π_fold prove (streaming-had): PASSED ✓ ({prove_time:?})");
-
-        println!("  R_cp verify (streaming-had): START...");
-        let verify_start = Instant::now();
-        match verify(&out) {
-            Ok(_) => {
-                let verify_time = verify_start.elapsed();
-                println!("  R_cp verify (streaming-had): PASSED ✓ ({verify_time:?})");
-                streaming_metrics = Some((prove_time, verify_time, out.proof.coins.bytes.len()));
+    match verify(&out) {
+        Ok(_) => {
+            let verify_time = verify_start.elapsed();
+            println!("  R_cp verify (streaming): PASSED ✓ ({verify_time:?})");
         }
         Err(e) => {
-                println!("  R_cp verify (streaming-had) FAILED: {e}");
+            println!("  R_cp verify (streaming) FAILED: {e}");
             return;
-            }
         }
     }
 
@@ -783,10 +695,5 @@ where
     println!("  Permutations: {num_permutations}");
     println!("  Constraints: {actual_constraints} (padded to {m})");
     println!("  Witness size: {n}");
-    if let Some((pt, vt, pb)) = dense_metrics {
-        println!("  Dense:     prove={pt:?}, verify={vt:?}, coins_bytes={pb}");
-    }
-    if let Some((pt, vt, pb)) = streaming_metrics {
-        println!("  Streaming: prove={pt:?}, verify={vt:?}, coins_bytes={pb}");
-    }
+    println!("  Streaming: prove={prove_time:?}, coins_bytes={}", out.proof.coins.bytes.len());
 }

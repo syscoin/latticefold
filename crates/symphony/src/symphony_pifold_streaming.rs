@@ -48,7 +48,7 @@ pub use crate::streaming_sumcheck::{StreamingProverMsg, StreamingSumcheckState};
 
 /// Configuration for the streaming Π_fold prover.
 ///
-/// Production note: the symphony library does **not** read environment variables. If you want
+/// Note: the symphony library does **not** read environment variables. If you want
 /// runtime configuration, parse env vars in your binary/example and pass them through this struct.
 #[derive(Clone, Debug)]
 pub struct PiFoldStreamingConfig {
@@ -157,239 +157,14 @@ where
     out
 }
 
-/// Poseidon-FS wrapper for the streaming Π_fold prover.
+/// Canonical Poseidon-FS prover for Π_fold (streaming sumcheck).
 ///
-/// Produces the same `PiFoldProverOutput` shape as `prove_pi_fold_batched_sumcheck_fs`:
-/// - records transcript coins into `proof.coins`
-/// - optionally commits to CP transcript witness messages (`cfs_*`)
-pub fn prove_pi_fold_streaming_sumcheck_fs<R: CoeffRing, PC>(
-    M: [Arc<SparseMatrix<R>>; 3],
-    cms: &[Vec<R>],
-    witnesses: &[Arc<Vec<R>>],
-    public_inputs: &[R::BaseRing],
-    cfs_had_u_scheme: Option<&AjtaiCommitmentScheme<R>>,
-    cfs_mon_b_scheme: Option<&AjtaiCommitmentScheme<R>>,
-    rg_params: RPParams,
-) -> Result<PiFoldProverOutput<R>, String>
-where
-    R::BaseRing: Zq + Decompose,
-    PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
-{
-    if cms.is_empty() {
-        return Err("PiFold: empty batch".to_string());
-    }
-    if cms.len() != witnesses.len() {
-        return Err("PiFold: cms/witnesses length mismatch".to_string());
-    }
-
-    let mut ts = crate::transcript::PoseidonTranscript::<R>::empty::<PC>();
-    let mut rts = RecordingTranscriptRef::<R, _>::new(&mut ts);
-    rts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
-    absorb_public_inputs::<R>(&mut rts, public_inputs);
-
-    let mut out = prove_pi_fold_streaming(&mut rts, M, cms, witnesses, rg_params)
-        .map_err(|e| format!("PiFold: poseidon-fs prove failed: {e}"))?;
-
-    out.proof.coins = SymphonyCoins::<R> {
-        challenges: rts.coins_challenges,
-        bytes: rts.coins_bytes,
-        events: rts.events,
-    };
-
-    // Optionally commit to CP transcript witness messages (WE/DPP-facing path).
-    out.cfs_had_u.clear();
-    out.cfs_mon_b.clear();
-    match (cfs_had_u_scheme, cfs_mon_b_scheme) {
-        (Some(had_s), Some(mon_s)) => {
-            out.cfs_had_u = out
-                .aux
-                .had_u
-                .iter()
-                .map(|u| {
-                    had_s
-                        .commit_const_coeff_fast(&encode_had_u_instance::<R>(u))
-                        .map_err(|e| format!("PiFold: cfs_had_u commit failed: {e:?}"))
-                        .map(|c| c.as_ref().to_vec())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            out.cfs_mon_b = out
-                .aux
-                .mon_b
-                .iter()
-                .map(|b| {
-                    mon_s
-                        .commit_const_coeff_fast(b)
-                        .map_err(|e| format!("PiFold: cfs_mon_b commit failed: {e:?}"))
-                        .map(|c| c.as_ref().to_vec())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-        }
-        (None, None) => {}
-        _ => {
-            return Err(
-                "PiFold: must provide both cfs_had_u_scheme and cfs_mon_b_scheme or neither".to_string(),
-            );
-        }
-    }
-
-    Ok(out)
-}
-
-/// Same as `prove_pi_fold_streaming_sumcheck_fs`, but allows passing an explicit config.
-pub fn prove_pi_fold_streaming_sumcheck_fs_with_config<R: CoeffRing, PC>(
-    M: [Arc<SparseMatrix<R>>; 3],
-    cms: &[Vec<R>],
-    witnesses: &[Arc<Vec<R>>],
-    public_inputs: &[R::BaseRing],
-    cfs_had_u_scheme: Option<&AjtaiCommitmentScheme<R>>,
-    cfs_mon_b_scheme: Option<&AjtaiCommitmentScheme<R>>,
-    rg_params: RPParams,
-    config: &PiFoldStreamingConfig,
-) -> Result<PiFoldProverOutput<R>, String>
-where
-    R::BaseRing: Zq + Decompose,
-    PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
-{
-    if cms.is_empty() {
-        return Err("PiFold: empty batch".to_string());
-    }
-    if cms.len() != witnesses.len() {
-        return Err("PiFold: cms/witnesses length mismatch".to_string());
-    }
-
-    let mut ts = crate::transcript::PoseidonTranscript::<R>::empty::<PC>();
-    let mut rts = RecordingTranscriptRef::<R, _>::new(&mut ts);
-    rts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
-    absorb_public_inputs::<R>(&mut rts, public_inputs);
-
-    let mut out = prove_pi_fold_streaming_with_config(&mut rts, M, cms, witnesses, rg_params, config)
-        .map_err(|e| format!("PiFold: poseidon-fs prove failed: {e}"))?;
-
-    out.proof.coins = SymphonyCoins::<R> {
-        challenges: rts.coins_challenges,
-        bytes: rts.coins_bytes,
-        events: rts.events,
-    };
-
-    // Optionally commit to CP transcript witness messages (WE/DPP-facing path).
-    out.cfs_had_u.clear();
-    out.cfs_mon_b.clear();
-    match (cfs_had_u_scheme, cfs_mon_b_scheme) {
-        (Some(had_s), Some(mon_s)) => {
-            out.cfs_had_u = out
-                .aux
-                .had_u
-                .iter()
-                .map(|u| {
-                    had_s
-                        .commit_const_coeff_fast(&encode_had_u_instance::<R>(u))
-                        .map_err(|e| format!("PiFold: cfs_had_u commit failed: {e:?}"))
-                        .map(|c| c.as_ref().to_vec())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            out.cfs_mon_b = out
-                .aux
-                .mon_b
-                .iter()
-                .map(|b| {
-                    mon_s
-                        .commit_const_coeff_fast(b)
-                        .map_err(|e| format!("PiFold: cfs_mon_b commit failed: {e:?}"))
-                        .map(|c| c.as_ref().to_vec())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-        }
-        (None, None) => {}
-        _ => {
-            return Err(
-                "PiFold: must provide both cfs_had_u_scheme and cfs_mon_b_scheme or neither".to_string(),
-            );
-        }
-    }
-
-    Ok(out)
-}
-
-/// Poseidon-FS wrapper for a *heterogeneous-matrix* batched Π_fold prover.
+/// This is the canonical prover entrypoint. It batches
+/// a list of instances where each instance can have its own matrices `(M1,M2,M3)` (hetero-M).
 ///
-/// This is the O(1)-verification path for SP1 chunking: each chunk has its own `(M1,M2,M3)` but all
-/// chunks share a witness width and transcript schedule. The prover produces **one** Π_fold proof
-/// for the whole batch.
-pub fn prove_pi_fold_streaming_sumcheck_fs_hetero_m<R: CoeffRing, PC>(
-    Ms: &[[Arc<SparseMatrix<R>>; 3]],
-    cms: &[Vec<R>],
-    witnesses: &[Arc<Vec<R>>],
-    public_inputs: &[R::BaseRing],
-    cfs_had_u_scheme: Option<&AjtaiCommitmentScheme<R>>,
-    cfs_mon_b_scheme: Option<&AjtaiCommitmentScheme<R>>,
-    rg_params: RPParams,
-) -> Result<PiFoldProverOutput<R>, String>
-where
-    R::BaseRing: Zq + Decompose,
-    PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
-{
-    if cms.is_empty() {
-        return Err("PiFold: empty batch".to_string());
-    }
-    if Ms.len() != cms.len() || cms.len() != witnesses.len() {
-        return Err("PiFold: Ms/cms/witnesses length mismatch".to_string());
-    }
-
-    let mut ts = crate::transcript::PoseidonTranscript::<R>::empty::<PC>();
-    let mut rts = RecordingTranscriptRef::<R, _>::new(&mut ts);
-    rts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
-    absorb_public_inputs::<R>(&mut rts, public_inputs);
-
-    let mut out = prove_pi_fold_streaming_hetero_m(&mut rts, Ms, cms, witnesses, rg_params)
-        .map_err(|e| format!("PiFold: poseidon-fs prove failed: {e}"))?;
-
-    out.proof.coins = SymphonyCoins::<R> {
-        challenges: rts.coins_challenges,
-        bytes: rts.coins_bytes,
-        events: rts.events,
-    };
-
-    // Optionally commit to CP transcript witness messages (WE/DPP-facing path).
-    out.cfs_had_u.clear();
-    out.cfs_mon_b.clear();
-    match (cfs_had_u_scheme, cfs_mon_b_scheme) {
-        (Some(had_s), Some(mon_s)) => {
-            out.cfs_had_u = out
-                .aux
-                .had_u
-                .iter()
-                .map(|u| {
-                    had_s
-                        .commit_const_coeff_fast(&encode_had_u_instance::<R>(u))
-                        .map_err(|e| format!("PiFold: cfs_had_u commit failed: {e:?}"))
-                        .map(|c| c.as_ref().to_vec())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            out.cfs_mon_b = out
-                .aux
-                .mon_b
-                .iter()
-                .map(|b| {
-                    mon_s
-                        .commit_const_coeff_fast(b)
-                        .map_err(|e| format!("PiFold: cfs_mon_b commit failed: {e:?}"))
-                        .map(|c| c.as_ref().to_vec())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-        }
-        (None, None) => {}
-        _ => {
-            return Err(
-                "PiFold: must provide both cfs_had_u_scheme and cfs_mon_b_scheme or neither".to_string(),
-            );
-        }
-    }
-
-    Ok(out)
-}
-
-/// Same as `prove_pi_fold_streaming_sumcheck_fs_hetero_m`, but allows passing an explicit config.
-pub fn prove_pi_fold_streaming_sumcheck_fs_hetero_m_with_config<R: CoeffRing, PC>(
+/// (If you have a shared matrix across all instances, pass the same `(M1,M2,M3)` for each
+/// instance by cloning the `Arc`s.)
+pub fn prove_pi_fold_poseidon_fs<R: CoeffRing, PC>(
     Ms: &[[Arc<SparseMatrix<R>>; 3]],
     cms: &[Vec<R>],
     witnesses: &[Arc<Vec<R>>],
@@ -415,9 +190,8 @@ where
     rts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
     absorb_public_inputs::<R>(&mut rts, public_inputs);
 
-    let mut out =
-        prove_pi_fold_streaming_hetero_m_with_config(&mut rts, Ms, cms, witnesses, rg_params, config)
-            .map_err(|e| format!("PiFold: poseidon-fs prove failed: {e}"))?;
+    let mut out = prove_pi_fold_streaming_hetero_m_with_config(&mut rts, Ms, cms, witnesses, rg_params, config)
+        .map_err(|e| format!("PiFold: poseidon-fs prove failed: {e}"))?;
 
     out.proof.coins = SymphonyCoins::<R> {
         challenges: rts.coins_challenges,
@@ -465,20 +239,6 @@ where
 }
 
 /// Streaming Π_fold prover.
-///
-/// This is a memory-efficient version of `prove_pi_fold_batched_sumcheck` that uses
-/// streaming MLEs for the Hadamard side. The monomial side still uses dense MLEs
-/// due to the complexity of the digit decomposition.
-///
-/// ## When to Use
-///
-/// Use this when:
-/// - Memory is constrained (< 32GB for large instances)
-/// - The sparse matrices are very sparse (most rows have few nonzeros)
-///
-/// Use the dense version when:
-/// - Memory is plentiful
-/// - Maximum throughput is needed (dense has better cache locality)
 pub fn prove_pi_fold_streaming<R: CoeffRing>(
     transcript: &mut impl Transcript<R>,
     M: [Arc<SparseMatrix<R>>; 3],

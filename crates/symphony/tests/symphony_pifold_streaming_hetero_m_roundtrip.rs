@@ -9,7 +9,7 @@ use symphony::symphony_pifold_batched::{
     verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m,
     verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m,
 };
-use symphony::symphony_pifold_streaming::prove_pi_fold_streaming_sumcheck_fs_hetero_m;
+use symphony::symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig};
 
 const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
 
@@ -88,7 +88,8 @@ fn test_pifold_streaming_hetero_m_roundtrip() {
     );
     let scheme_mon = AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 2, rg_params.k_g);
 
-    let out = prove_pi_fold_streaming_sumcheck_fs_hetero_m::<R, PC>(
+    let cfg = PiFoldStreamingConfig::default();
+    let out = prove_pi_fold_poseidon_fs::<R, PC>(
         ms.as_slice(),
         &cms,
         &witnesses,
@@ -96,6 +97,7 @@ fn test_pifold_streaming_hetero_m_roundtrip() {
         Some(&scheme_had),
         Some(&scheme_mon),
         rg_params.clone(),
+        &cfg,
     )
     .expect("prove failed");
 
