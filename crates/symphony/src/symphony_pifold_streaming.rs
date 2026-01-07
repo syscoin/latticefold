@@ -293,10 +293,6 @@ where
             config.const_coeff_witness_samples,
             config.const_coeff_matrix_entries,
         );
-    // Matrix-only constant-coeff optimization: useful when the witness is *not* constant-coeff
-    // (e.g. packing many base-field lanes across coefficients), but matrices are still scalar-embedded.
-    let const_matrix_only = !const_coeff_fastpath
-        && seems_const_coeff_inputs::<R>(&[], &[M[0].clone(), M[1].clone(), M[2].clone()], 0, config.const_coeff_matrix_entries);
 
     let prof = config.profile;
     let t_all = Instant::now();
@@ -421,11 +417,6 @@ where
                 mles_had.push(StreamingMleEnum::sparse_mat_vec_const_coeff(
                     M[i].clone(),
                     w0.as_ref().expect("w0 present").clone(),
-                ));
-            } else if const_matrix_only {
-                mles_had.push(StreamingMleEnum::sparse_mat_vec_const_matrix(
-                    M[i].clone(),
-                    witnesses[inst_idx].clone(),
                 ));
             } else {
                 mles_had.push(StreamingMleEnum::sparse_mat_vec(
@@ -1008,13 +999,6 @@ where
             config.const_coeff_witness_samples,
             config.const_coeff_matrix_entries,
         );
-    let const_matrix_only = !const_coeff_fastpath
-        && seems_const_coeff_inputs::<R>(
-            &[],
-            &[Ms[0][0].clone(), Ms[0][1].clone(), Ms[0][2].clone()],
-            0,
-            config.const_coeff_matrix_entries,
-        );
     // Keep this function bit-for-bit aligned with `prove_pi_fold_streaming_impl` except that each
     // instance pulls y = M*w from its own matrices.
     let prof = config.profile;
@@ -1171,11 +1155,6 @@ where
                 mles_had.push(StreamingMleEnum::sparse_mat_vec_const_coeff(
                     Ms[inst_idx][i].clone(),
                     w0.as_ref().expect("w0 present").clone(),
-                ));
-            } else if const_matrix_only {
-                mles_had.push(StreamingMleEnum::sparse_mat_vec_const_matrix(
-                    Ms[inst_idx][i].clone(),
-                    witnesses[inst_idx].clone(),
                 ));
             } else {
                 mles_had.push(StreamingMleEnum::sparse_mat_vec(
