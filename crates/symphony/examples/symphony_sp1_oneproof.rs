@@ -7,7 +7,7 @@
 //!
 //! Usage:
 //!   SP1_R1CS=/path/to/shrink_verifier.r1cs \
-//!     cargo run -p symphony --example symphony_sp1_fold_chunked --release
+//!     cargo run -p symphony --example symphony_sp1_oneproof --release
 //!
 //! To generate the R1CS file, run in the SP1 fork:
 //!   OUT_R1CS=shrink_verifier.r1cs cargo run -p sp1-prover \
