@@ -22,6 +22,8 @@ use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as R;
 use stark_rings::PolyRing;
 use stark_rings::Ring;
 use symphony::rp_rgchk::RPParams;
+use symphony::symphony_open::MultiAjtaiOpenVerifier;
+use symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics;
 use symphony::sp1_r1cs_loader::FieldFromU64;
 use symphony::symphony_pifold_streaming::{
     prove_pi_fold_poseidon_fs, PiFoldStreamingConfig,
@@ -150,5 +152,70 @@ fn main() {
         t_prove.elapsed(),
         out.proof.coins.bytes.len()
     );
+
+    // Optional: verify with transcript metrics (useful to estimate DPP-friendly cost).
+    //
+    // This runs the CP/aux verifier path:
+    // - Poseidon-FS for challenges/bytes (records metrics + trace)
+    // - verifies CP commitments `cfs_*` open to `aux`
+    // - runs the core algebraic checks using `aux` (does NOT require full witness openings)
+    //
+    // Enable with:
+    //   VERIFY=1 cargo run -p symphony --example symphony_sp1_oneproof --release
+    if std::env::var("VERIFY").ok().as_deref() == Some("1") {
+        let ms_ref: Vec<[&stark_rings_linalg::SparseMatrix<R>; 3]> = all_mats
+            .iter()
+            .map(|ms| [&*ms[0], &*ms[1], &*ms[2]])
+            .collect();
+
+        // Opening verifier for CP transcript-message commitments.
+        let open_cfs = MultiAjtaiOpenVerifier::<R>::new()
+            .with_scheme("cfs_had_u", (*scheme_had).clone())
+            .with_scheme("cfs_mon_b", (*scheme_mon).clone());
+
+        let t_vfy = Instant::now();
+        let (_folded, metrics, _trace) =
+            verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics::<R, PC>(
+                &ms_ref,
+                &cms_all,
+                &out.proof,
+                &open_cfs,
+                &out.cfs_had_u,
+                &out.cfs_mon_b,
+                &out.aux,
+                &public_inputs,
+            )
+            .expect("VERIFY=1: CP/aux verify failed");
+        println!("  verify (cp/aux): {:?}", t_vfy.elapsed());
+
+        // Same estimator we use in other logs: rate=20 field elems; 160 bytes per perm block.
+        let perms_absorb = (metrics.absorbed_elems + 19) / 20;
+        let perms_squeeze_field = (metrics.squeezed_field_elems + 19) / 20;
+        let perms_squeeze_bytes = (metrics.squeezed_bytes + 159) / 160;
+        println!(
+            "  transcript metrics: absorbed_elems={} squeezed_field_elems={} squeezed_bytes={}",
+            metrics.absorbed_elems, metrics.squeezed_field_elems, metrics.squeezed_bytes
+        );
+        println!(
+            "  est poseidon perms: ceil(absorb/20)={} + ceil(sq_field/20)={} + ceil(bytes/160)={} => {}",
+            perms_absorb,
+            perms_squeeze_field,
+            perms_squeeze_bytes,
+            perms_absorb + perms_squeeze_field + perms_squeeze_bytes
+        );
+
+        // Extra: time the Ajtai binding check for cm_f against the witness (linear work, no extra hashes).
+        //
+        // This is a proxy for the “bind cm_f to witness” part of the WE predicate; it’s O(ncols)
+        // but avoids materializing witness openings per chunk (we reuse the same witness here).
+        let t_cm = Instant::now();
+        let cm_re = scheme_main
+            .commit_const_coeff_fast(&witness)
+            .expect("commit_const_coeff_fast")
+            .as_ref()
+            .to_vec();
+        assert_eq!(cm_re, cms_all[0], "cm_f binding mismatch");
+        println!("  ajtai cm_f recompute: {:?}", t_cm.elapsed());
+    }
 }
 

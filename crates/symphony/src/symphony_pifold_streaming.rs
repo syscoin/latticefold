@@ -476,6 +476,12 @@ where
     //
     // Critical: avoid materializing the huge dense eq(c) MLE tables (size = m*d ring elements).
     // We keep m_j/m' as base-ring scalars (compact), and make eq(c) fully streaming.
+    //
+    // IMPORTANT (soundness): the monomial-side check relies on the standard identity
+    //   ev(b, β)^2 == ev(b, β^2)
+    // which is nontrivial exactly because squaring does not commute with multilinear interpolation.
+    // In particular, `PeriodicBaseScalarVec(square=true)` must represent vertex-wise squares
+    // (MLE(m^{∘2})) rather than squaring-after-eval.
     // -----------------
     let mon_mles_per = 3 * rg_params.k_g;
     let mut mles_mon: Vec<StreamingMleEnum<R>> = Vec::with_capacity(ell * mon_mles_per);

@@ -67,7 +67,15 @@ where
         m_j: usize,
         /// Current number of columns (power-of-two).
         d: usize,
-        /// If true, return the square of the looked-up base scalar.
+        /// If true, this MLE represents **vertex-wise squares**:
+        /// it evaluates \(\mathrm{MLE}(m^{\circ 2})(r)\), where \(m^{\circ 2}\) denotes squaring
+        /// each hypercube vertex value before multilinear interpolation.
+        ///
+        /// This is intentionally **not** the same as \(\mathrm{MLE}(m)(r)^2\) at non-Boolean points,
+        /// and the non-commutation is exactly what monomial/set-check style claims rely on.
+        ///
+        /// Implementation detail: we square at lookup for unfixed variables, and when fixing variables
+        /// we square the paired vertex values *before* combining (see `fix_variable`).
         square: bool,
     },
     /// eq(bits(index), r) evaluated in the base ring, then lifted to R.
