@@ -14,6 +14,8 @@ pub mod recording_transcript;
 // Symphony protocol modules
 pub mod symphony_cm;
 pub mod symphony_fold;
+pub mod symphony_had;
+pub mod symphony_gr1cs;
 pub mod symphony_coins;
 pub mod symphony_open;
 pub mod symphony_pifold_batched;

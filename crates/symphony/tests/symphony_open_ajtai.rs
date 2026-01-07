@@ -4,8 +4,10 @@ use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
 use symphony::{
     rp_rgchk::RPParams,
     symphony_open::AjtaiOpenVerifier,
-    symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_with_openings,
-    symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig},
+    symphony_pifold_batched::{
+        prove_pi_fold_batched_sumcheck_fs,
+        verify_pi_fold_batched_and_fold_outputs_with_openings,
+    },
 };
 use latticefold::commitment::AjtaiCommitmentScheme;
 use latticefold::transcript::Transcript;
@@ -50,29 +52,15 @@ fn test_ajtai_openings_for_cms_are_verified() {
         d_prime: (R::dimension() as u128) / 2,
     };
 
-    // Prove (Poseidon-FS).
-    let cfg = PiFoldStreamingConfig::default();
-    let ms = vec![
-        [
-            std::sync::Arc::new(m1.clone()),
-            std::sync::Arc::new(m2.clone()),
-            std::sync::Arc::new(m3.clone()),
-        ],
-        [
-            std::sync::Arc::new(m1.clone()),
-            std::sync::Arc::new(m2.clone()),
-            std::sync::Arc::new(m3.clone()),
-        ],
-    ];
-    let out = prove_pi_fold_poseidon_fs::<R, PC>(
-        ms.as_slice(),
+    // Prove (FS coins recorded and replayed internally).
+    let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
+        [&m1, &m2, &m3],
         &[cm0.clone(), cm1.clone()],
-        &[std::sync::Arc::new(f0.clone()), std::sync::Arc::new(f1.clone())],
+        &[f0.as_slice(), f1.as_slice()],
         &[],
         None,
         None,
         rg_params,
-        &cfg,
     )
     .unwrap();
     let proof = out.proof;

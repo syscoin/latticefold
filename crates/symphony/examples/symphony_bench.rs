@@ -4,7 +4,6 @@
 //! measure how Π_fold proving/verifying scales with batch size ℓ under the current implementation,
 //! including Ajtai opening checks for CP transcript-message commitments (`cfs_*`).
 
-use std::sync::Arc;
 use std::time::Instant;
 
 fn main() {
@@ -13,13 +12,13 @@ fn main() {
     use symphony::{
         rp_rgchk::RPParams,
         symphony_open::MultiAjtaiOpenVerifier,
-        symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig},
+        symphony_pifold_batched::prove_pi_fold_batched_sumcheck_fs,
         symphony_we_relation::{check_r_cp_poseidon_fs, TrivialRo},
     };
     use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing, Ring};
     use stark_rings_linalg::SparseMatrix;
 
-    // Keep these at the test-friendly "toy" scale for interactive runs. Increase if you want.
+    // Keep these at the test-friendly “toy” scale for interactive runs. Increase if you want.
     let n = 1 << 10;
     let m = 1 << 10;
 
@@ -30,9 +29,6 @@ fn main() {
     m1.pad_cols(n);
     m2.pad_cols(n);
     m3.pad_cols(n);
-    let m1 = Arc::new(m1);
-    let m2 = Arc::new(m2);
-    let m3 = Arc::new(m3);
 
     let rg_params = RPParams {
         l_h: 64,
@@ -41,7 +37,7 @@ fn main() {
         d_prime: (R::dimension() as u128) / 2,
     };
 
-    // "Statement binding" placeholder (e.g. vk hash + claim digest).
+    // “Statement binding” placeholder (e.g. vk hash + claim digest).
     let public_inputs: Vec<<R as PolyRing>::BaseRing> = vec![
         <R as PolyRing>::BaseRing::from(123u128),
         <R as PolyRing>::BaseRing::from(456u128),
@@ -54,7 +50,7 @@ fn main() {
     // Try a few batch sizes ℓ.
     for &ell in &[2usize, 4, 8] {
         // Build witnesses: alternate 1 and 0 (both idempotent).
-        let mut witnesses: Vec<Arc<Vec<R>>> = Vec::with_capacity(ell);
+        let mut witnesses: Vec<Vec<R>> = Vec::with_capacity(ell);
         let mut cm_f: Vec<Vec<R>> = Vec::with_capacity(ell);
         for i in 0..ell {
             let f = if i % 2 == 0 {
@@ -63,14 +59,10 @@ fn main() {
                 vec![R::ZERO; n]
             };
             let cm = scheme_f.commit(&f).unwrap().as_ref().to_vec();
-            witnesses.push(Arc::new(f));
+            witnesses.push(f);
             cm_f.push(cm);
         }
-
-        // Build Ms: shared matrices repeated for each instance.
-        let ms: Vec<[Arc<SparseMatrix<R>>; 3]> = (0..ell)
-            .map(|_| [m1.clone(), m2.clone(), m3.clone()])
-            .collect();
+        let witness_slices: Vec<&[R]> = witnesses.iter().map(|w| w.as_slice()).collect();
 
         // CP commitments for aux messages (cfs_*). Use a larger row count so we can see the
         // Ajtai-open verification cost.
@@ -79,17 +71,15 @@ fn main() {
         let scheme_mon =
             AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 32, rg_params.k_g);
 
-        let cfg = PiFoldStreamingConfig::default();
         let prove_start = Instant::now();
-        let out = prove_pi_fold_poseidon_fs::<R, PC>(
-            ms.as_slice(),
+        let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
+            [&m1, &m2, &m3],
             &cm_f,
-            &witnesses,
+            &witness_slices,
             &public_inputs,
             Some(&scheme_had),
             Some(&scheme_mon),
             rg_params.clone(),
-            &cfg,
         )
         .unwrap();
         let prove_time = prove_start.elapsed();
@@ -112,7 +102,7 @@ fn main() {
         .unwrap();
         let verify_time = verify_start.elapsed();
 
-        // Sanity: `TrivialRo` exists just to show how R_WE would be checked; we don't benchmark it.
+        // Sanity: `TrivialRo` exists just to show how R_WE would be checked; we don’t benchmark it.
         let _: Result<(), String> = <TrivialRo as symphony::symphony_we_relation::ReducedRelation<R>>::check(
             &_out_folded,
             &(),
@@ -126,3 +116,4 @@ fn main() {
         );
     }
 }
+

@@ -6,7 +6,7 @@ use latticefold::commitment::AjtaiCommitmentScheme;
 use symphony::{
     rp_rgchk::RPParams,
     symphony_open::MultiAjtaiOpenVerifier,
-    symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig},
+    symphony_pifold_batched::{prove_pi_fold_batched_sumcheck_fs},
     symphony_we_relation::{check_r_we_poseidon_fs, ReducedRelation},
 };
 use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing, Ring, Zq};
@@ -72,20 +72,14 @@ fn test_r_we_conjunction_ok() {
     let scheme_mon =
         AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 2, rg_params.k_g);
 
-    let cfg = PiFoldStreamingConfig::default();
-    let ms = vec![
-        [std::sync::Arc::new(m1.clone()), std::sync::Arc::new(m2.clone()), std::sync::Arc::new(m3.clone())],
-        [std::sync::Arc::new(m1.clone()), std::sync::Arc::new(m2.clone()), std::sync::Arc::new(m3.clone())],
-    ];
-    let out = prove_pi_fold_poseidon_fs::<R, PC>(
-        ms.as_slice(),
+    let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
+        [&m1, &m2, &m3],
         &[cm0.clone(), cm1.clone()],
-        &[std::sync::Arc::new(f0.clone()), std::sync::Arc::new(f1.clone())],
+        &[f0.as_slice(), f1.as_slice()],
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),
         rg_params,
-        &cfg,
     )
     .unwrap();
     let proof = out.proof;
@@ -164,20 +158,14 @@ fn test_r_we_conjunction_rejects_bad_ro_witness() {
     let scheme_mon =
         AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 2, rg_params.k_g);
 
-    let cfg = PiFoldStreamingConfig::default();
-    let ms = vec![
-        [std::sync::Arc::new(m1.clone()), std::sync::Arc::new(m2.clone()), std::sync::Arc::new(m3.clone())],
-        [std::sync::Arc::new(m1.clone()), std::sync::Arc::new(m2.clone()), std::sync::Arc::new(m3.clone())],
-    ];
-    let out = prove_pi_fold_poseidon_fs::<R, PC>(
-        ms.as_slice(),
+    let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
+        [&m1, &m2, &m3],
         &[cm0.clone(), cm1.clone()],
-        &[std::sync::Arc::new(f0.clone()), std::sync::Arc::new(f1.clone())],
+        &[f0.as_slice(), f1.as_slice()],
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),
         rg_params,
-        &cfg,
     )
     .unwrap();
     let proof = out.proof;
@@ -248,20 +236,14 @@ fn test_r_cp_poseidon_fs_rejects_tampered_commitment() {
     let scheme_mon =
         AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 2, rg_params.k_g);
 
-    let cfg = PiFoldStreamingConfig::default();
-    let ms = vec![
-        [std::sync::Arc::new(m1.clone()), std::sync::Arc::new(m2.clone()), std::sync::Arc::new(m3.clone())],
-        [std::sync::Arc::new(m1.clone()), std::sync::Arc::new(m2.clone()), std::sync::Arc::new(m3.clone())],
-    ];
-    let out = prove_pi_fold_poseidon_fs::<R, PC>(
-        ms.as_slice(),
+    let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
+        [&m1, &m2, &m3],
         &[cm0.clone(), cm1.clone()],
-        &[std::sync::Arc::new(f0.clone()), std::sync::Arc::new(f1.clone())],
+        &[f0.as_slice(), f1.as_slice()],
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),
         rg_params,
-        &cfg,
     )
     .unwrap();
     let proof = out.proof;
@@ -332,20 +314,14 @@ fn test_r_cp_poseidon_fs_rejects_tampered_cfs_commitment() {
     let scheme_mon =
         AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 2, rg_params.k_g);
 
-    let cfg = PiFoldStreamingConfig::default();
-    let ms = vec![
-        [std::sync::Arc::new(m1.clone()), std::sync::Arc::new(m2.clone()), std::sync::Arc::new(m3.clone())],
-        [std::sync::Arc::new(m1.clone()), std::sync::Arc::new(m2.clone()), std::sync::Arc::new(m3.clone())],
-    ];
-    let out = prove_pi_fold_poseidon_fs::<R, PC>(
-        ms.as_slice(),
+    let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
+        [&m1, &m2, &m3],
         &[cm0.clone(), cm1.clone()],
-        &[std::sync::Arc::new(f0.clone()), std::sync::Arc::new(f1.clone())],
+        &[f0.as_slice(), f1.as_slice()],
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),
         rg_params,
-        &cfg,
     )
     .unwrap();
     let proof = out.proof;
@@ -414,20 +390,14 @@ fn test_r_we_nonvacuous_had_identity_passes() {
     let scheme_mon =
         AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 32, rg_params.k_g);
 
-    let cfg = PiFoldStreamingConfig::default();
-    let m1a = std::sync::Arc::new(m1.clone());
-    let m2a = std::sync::Arc::new(m2.clone());
-    let m3a = std::sync::Arc::new(m3.clone());
-    let ms = vec![[m1a.clone(), m2a.clone(), m3a.clone()], [m1a, m2a, m3a]];
-    let out = prove_pi_fold_poseidon_fs::<R, PC>(
-        ms.as_slice(),
+    let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
+        [&m1, &m2, &m3],
         &[cm0.clone(), cm1.clone()],
-        &[std::sync::Arc::new(f0.clone()), std::sync::Arc::new(f1.clone())],
+        &[f0.as_slice(), f1.as_slice()],
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),
         rg_params,
-        &cfg,
     )
     .unwrap();
 
@@ -499,20 +469,14 @@ fn test_r_we_nonvacuous_had_identity_rejects_non_idempotent_witness() {
     let scheme_mon =
         AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 16, rg_params.k_g);
 
-    let cfg = PiFoldStreamingConfig::default();
-    let m1a = std::sync::Arc::new(m1.clone());
-    let m2a = std::sync::Arc::new(m2.clone());
-    let m3a = std::sync::Arc::new(m3.clone());
-    let ms = vec![[m1a.clone(), m2a.clone(), m3a.clone()], [m1a, m2a, m3a]];
-    let out = prove_pi_fold_poseidon_fs::<R, PC>(
-        ms.as_slice(),
+    let out = prove_pi_fold_batched_sumcheck_fs::<R, PC>(
+        [&m1, &m2, &m3],
         &[cm0.clone(), cm1.clone()],
-        &[std::sync::Arc::new(f0.clone()), std::sync::Arc::new(f1.clone())],
+        &[f0.as_slice(), f1.as_slice()],
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),
         rg_params,
-        &cfg,
     )
     .unwrap();
 

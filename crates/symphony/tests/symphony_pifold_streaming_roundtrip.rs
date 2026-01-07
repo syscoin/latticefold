@@ -3,7 +3,7 @@ use latticefold::commitment::AjtaiCommitmentScheme;
 use symphony::{
     rp_rgchk::RPParams,
     symphony_open::MultiAjtaiOpenVerifier,
-    symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig},
+    symphony_pifold_streaming::prove_pi_fold_streaming_sumcheck_fs,
     symphony_we_relation::check_r_cp_poseidon_fs,
 };
 use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing, Ring};
@@ -62,20 +62,14 @@ fn test_streaming_pifold_fs_roundtrip_verifies() {
         .with_scheme("cfs_had_u", scheme_had.clone())
         .with_scheme("cfs_mon_b", scheme_mon.clone());
 
-    let cfg = PiFoldStreamingConfig::default();
-    let ms = vec![
+    let out = prove_pi_fold_streaming_sumcheck_fs::<R, PC>(
         [m1.clone(), m2.clone(), m3.clone()],
-        [m1.clone(), m2.clone(), m3.clone()],
-    ];
-    let out = prove_pi_fold_poseidon_fs::<R, PC>(
-        ms.as_slice(),
         &[cm0.clone(), cm1.clone()],
         &[f0.clone(), f1.clone()],
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),
         rg_params,
-        &cfg,
     )
     .unwrap();
 
