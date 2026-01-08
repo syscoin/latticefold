@@ -491,7 +491,7 @@ where
         .collect::<Vec<R>>();
 
     let hook_round = log2(m_j.next_power_of_two()) as usize;
-    let sumcheck_res = MLSumcheck::<R, _>::verify_two_as_subprotocol_shared_with_hook(
+    let (had_sc, mon_sc) = MLSumcheck::<R, _>::verify_two_as_subprotocol_shared_with_hook(
         transcript,
         log_m,
         3,
@@ -509,43 +509,8 @@ where
                 }
             }
         },
-    );
-    let (had_sc, mon_sc) = match sumcheck_res {
-        Ok(v) => v,
-        Err(e) => {
-            // IMPORTANT (metrics/DPP tracing):
-            // Even when sumcheck arithmetic fails (e.g. dummy witness runs), we still want
-            // transcript metrics/trace for the *full* Π_fold schedule.
-            //
-            // Π_fold prover messages after sumcheck:
-            // - had_u (absorbed as base-field elements)
-            // - mon_b (now bound via mon_b_agg)
-            //
-            // This does NOT make verification succeed; we still return an error.
-            if aux.is_some() {
-                // Absorb had_u messages exactly as in the successful path.
-                let d = R::dimension();
-                let auxw = aux.expect("aux present");
-                if auxw.had_u.len() == ell {
-                    for inst_idx in 0..ell {
-                        let U = &auxw.had_u[inst_idx];
-                        if U[0].len() == d && U[1].len() == d && U[2].len() == d {
-                            for x in &U[0] { transcript.absorb_field_element(x); }
-                            for x in &U[1] { transcript.absorb_field_element(x); }
-                            for x in &U[2] { transcript.absorb_field_element(x); }
-                        }
-                    }
-                }
-                // Bind mon_b via the aggregate (matches prover schedule since `agg mon_b`).
-                if auxw.mon_b.len() == ell {
-                    if let Ok(mon_b_agg) = compute_mon_b_aggregate(&auxw.mon_b, kappa) {
-                        transcript.absorb_slice(&mon_b_agg);
-                    }
-                }
-            }
-            return Err(format!("PiFold: sumcheck verify failed: {e}"));
-        }
-    };
+    )
+    .map_err(|e| format!("PiFold: sumcheck verify failed: {e}"))?;
 
     // Recompute the expected hadamard sumcheck evaluation at the had point.
     let r_had = had_sc.point.clone();
@@ -602,9 +567,15 @@ where
         }
         lhs += rhos[inst_idx] * (eq_sr * acc);
 
-        for x in &U[0] { transcript.absorb_field_element(x); }
-        for x in &U[1] { transcript.absorb_field_element(x); }
-        for x in &U[2] { transcript.absorb_field_element(x); }
+        for x in &U[0] {
+            transcript.absorb_field_element(x);
+        }
+        for x in &U[1] {
+            transcript.absorb_field_element(x);
+        }
+        for x in &U[2] {
+            transcript.absorb_field_element(x);
+        }
     }
     if lhs != had_sc.expected_evaluation {
         return Err("PiFold: hadamard recomputation mismatch".to_string());
@@ -917,7 +888,7 @@ where
 
     // Verify the two batched sumchecks with shared challenges.
     let hook_round = log2(m_j.next_power_of_two()) as usize;
-    let sumcheck_res = MLSumcheck::<R, _>::verify_two_as_subprotocol_shared_with_hook(
+    let (had_sc, mon_sc) = MLSumcheck::<R, _>::verify_two_as_subprotocol_shared_with_hook(
         transcript,
         log_m,
         3,
@@ -930,39 +901,13 @@ where
         hook_round,
         |t, _sampled| {
             for v_i in &proof.v_digits_folded {
-                for x in v_i {
-                    t.absorb_field_element(x);
+                    for x in v_i {
+                        t.absorb_field_element(x);
                 }
             }
         },
-    );
-    let (had_sc, mon_sc) = match sumcheck_res {
-        Ok(v) => v,
-        Err(e) => {
-            // IMPORTANT (metrics/DPP tracing): continue transcript binding for the full Π_fold schedule
-            // even if sumcheck arithmetic fails, so transcript metrics/trace reflect the full cost.
-            if aux.is_some() {
-                let d = R::dimension();
-                let auxw = aux.expect("aux present");
-                if auxw.had_u.len() == ell {
-                    for inst_idx in 0..ell {
-                        let U = &auxw.had_u[inst_idx];
-                        if U[0].len() == d && U[1].len() == d && U[2].len() == d {
-                            for x in &U[0] { transcript.absorb_field_element(x); }
-                            for x in &U[1] { transcript.absorb_field_element(x); }
-                            for x in &U[2] { transcript.absorb_field_element(x); }
-                        }
-                    }
-                }
-                if auxw.mon_b.len() == ell {
-                    if let Ok(mon_b_agg) = compute_mon_b_aggregate(&auxw.mon_b, kappa) {
-                        transcript.absorb_slice(&mon_b_agg);
-                    }
-                }
-            }
-            return Err(format!("PiFold: sumcheck verify failed: {e}"));
-        }
-    };
+    )
+    .map_err(|e| format!("PiFold: sumcheck verify failed: {e}"))?;
 
     // Batched Eq.(26) check for Π_had.
     // If `aux` is present, use it and avoid recomputing U from the full witness opening.
