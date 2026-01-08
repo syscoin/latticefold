@@ -48,7 +48,7 @@ use crate::dpp_pifold_math::pifold_verifier_math_dr1cs;
 use crate::public_coin_transcript::FixedTranscript;
 use crate::symphony_coins::{derive_beta_chi, derive_J};
 use crate::symphony_pifold_batched::{PiFoldAuxWitness, PiFoldBatchedProof};
-use crate::symphony_pifold_streaming::CM_G_AGG_SEED;
+use crate::symphony_pifold_streaming::{CM_G_AGG_SEED, MON_B_AGG_SEED};
 use crate::transcript::PoseidonTraceOp;
 
 pub struct WeGateDr1csBuilder;
@@ -249,6 +249,29 @@ impl WeGateDr1csBuilder {
             ajtai_open_dr1cs_from_scheme_full::<R>(&cm_g_agg_scheme, &cm_g_flat, &cm_g_agg)?;
         parts.push((cm_g_agg_inst, cm_g_agg_asg));
 
+        // Flatten mon_b: concat_{inst, dig} mon_b[inst][dig]
+        let mut mon_b_flat: Vec<R> = Vec::new();
+        for inst in aux.mon_b.iter() {
+            mon_b_flat.extend(inst.iter().copied());
+        }
+        let n_mon_b_agg = mon_b_flat.len();
+
+        // Create the aggregate scheme for mon_b (same as used in compute_mon_b_aggregate).
+        let mon_b_agg_scheme =
+            AjtaiCommitmentScheme::<R>::seeded(b"mon_b_agg", MON_B_AGG_SEED, kappa, n_mon_b_agg);
+
+        // Compute the expected aggregate (verifier-side recomputation).
+        let mon_b_agg = mon_b_agg_scheme
+            .commit(&mon_b_flat)
+            .map_err(|e| format!("WeGateDr1csBuilder: mon_b_agg commit failed: {e:?}"))?
+            .as_ref()
+            .to_vec();
+
+        // Enforce: A_agg · mon_b_flat = mon_b_agg (linear constraints).
+        let (mon_b_agg_inst, mon_b_agg_asg) =
+            ajtai_open_dr1cs_from_scheme_full::<R>(&mon_b_agg_scheme, &mon_b_flat, &mon_b_agg)?;
+        parts.push((mon_b_agg_inst, mon_b_agg_asg));
+
         // ---------------------------------------------------------------------
         // Extract the Π_fold verifier coin pieces from the proof's recorded coin stream
         // and compute rs_shared via sumcheck verification replay.
@@ -381,8 +404,8 @@ impl WeGateDr1csBuilder {
         }
 
         // Build glue list in local indices: (part_a, var_a, part_b, var_b).
-        // part 0 = poseidon, part 1 = cfs-openings, part 2 = cm_g_agg, part 3 = pifold-math
-        const PIFOLD_PART: usize = 3;
+        // part 0 = poseidon, part 1 = cfs-openings, part 2 = cm_g_agg, part 3 = mon_b_agg, part 4 = pifold-math
+        const PIFOLD_PART: usize = 4;
         let mut glue: Vec<(usize, usize, usize, usize)> = Vec::new();
 
         let mut ch = 0usize;

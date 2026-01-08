@@ -35,7 +35,7 @@ use stark_rings_poly::mle::DenseMultilinearExtension;
 use crate::{
     symphony_coins::{derive_beta_chi, derive_J, ev, ts_weights},
     symphony_open::{NoOpen, VfyOpen},
-    symphony_pifold_streaming::compute_cm_g_aggregate,
+    symphony_pifold_streaming::{compute_cm_g_aggregate, compute_mon_b_aggregate},
     rp_rgchk::{compose_v_digits, RPParams},
     symphony_cm::SymphonyCoins,
     symphony_fold::{SymphonyBatchLin, SymphonyInstance},
@@ -595,9 +595,6 @@ where
                 return Err("PiFold: aux.mon_b wrong k_g".to_string());
             }
         }
-        for b_inst in auxw.mon_b.iter() {
-            transcript.absorb_slice(b_inst);
-        }
         auxw.mon_b.clone()
     } else {
         let mut mon_b: Vec<Vec<R>> = Vec::with_capacity(ell);
@@ -641,11 +638,15 @@ where
                 let mle = DenseMultilinearExtension::from_evaluations_vec(g_nvars, gi);
                 b_inst.push(mle.evaluate(&r_mon_r).unwrap());
             }
-            transcript.absorb_slice(&b_inst);
             mon_b.push(b_inst);
         }
         mon_b
     };
+
+    // Aggregate mon_b absorption: bind all mon_b values into transcript via a single
+    // short Ajtai commitment (reduces Poseidon permutations from O(ell*k_g) to O(kappa)).
+    let mon_b_agg = compute_mon_b_aggregate(&mon_b, kappa)?;
+    transcript.absorb_slice(&mon_b_agg);
 
     let v_expected = mon_sc.expected_evaluation;
 
@@ -986,9 +987,6 @@ where
                 return Err("PiFold: aux.mon_b wrong k_g".to_string());
             }
         }
-        for b_inst in auxw.mon_b.iter() {
-            transcript.absorb_slice(b_inst);
-        }
         auxw.mon_b.clone()
     } else {
         let mut mon_b: Vec<Vec<R>> = Vec::with_capacity(ell);
@@ -1032,11 +1030,15 @@ where
                 let mle = DenseMultilinearExtension::from_evaluations_vec(g_nvars, gi);
                 b_inst.push(mle.evaluate(&r_mon_r).unwrap());
             }
-            transcript.absorb_slice(&b_inst);
             mon_b.push(b_inst);
         }
         mon_b
     };
+
+    // Aggregate mon_b absorption: bind all mon_b values into transcript via a single
+    // short Ajtai commitment (reduces Poseidon permutations from O(ell*k_g) to O(kappa)).
+    let mon_b_agg = compute_mon_b_aggregate(&mon_b, kappa)?;
+    transcript.absorb_slice(&mon_b_agg);
 
     let v_expected = mon_sc.expected_evaluation;
 

@@ -47,6 +47,10 @@ use crate::symphony_pifold_batched::{PiFoldAuxWitness, PiFoldBatchedProof, PiFol
 /// This derives a dedicated Ajtai matrix for binding all cm_g commitments into a single short value.
 pub const CM_G_AGG_SEED: [u8; 32] = *b"SYMPHONY_CM_G_AGG_V1_0000000000_";
 
+/// Fixed seed for the mon_b aggregate commitment scheme.
+/// This derives a dedicated Ajtai matrix for binding all mon_b values into a single short value.
+pub const MON_B_AGG_SEED: [u8; 32] = *b"SYMPHONY_MON_B_AGG_V1_000000000_";
+
 /// Compute the aggregate commitment for all cm_g values.
 ///
 /// This flattens `cm_g[inst][dig][*]` into a single vector and commits via a dedicated
@@ -101,6 +105,52 @@ where
     let c_agg = agg_scheme
         .commit(&cm_g_flat)
         .map_err(|e| format!("cm_g_aggregate: commit failed: {e:?}"))?;
+    Ok(c_agg.as_ref().to_vec())
+}
+
+/// Compute the aggregate commitment for all mon_b values.
+///
+/// This flattens `mon_b[inst][*]` into a single vector and commits via a dedicated
+/// Ajtai scheme. The result is a short commitment that binds all mon_b values, reducing
+/// Poseidon absorption from O(ell * k_g) ring elements to O(kappa).
+pub fn compute_mon_b_aggregate<R: CoeffRing>(
+    mon_b: &[Vec<R>],
+    kappa: usize,
+) -> Result<Vec<R>, String>
+where
+    R::BaseRing: Zq + stark_rings::balanced_decomposition::Decompose,
+{
+    if mon_b.is_empty() {
+        return Err("mon_b_aggregate: empty mon_b".to_string());
+    }
+    if kappa == 0 {
+        return Err("mon_b_aggregate: kappa=0 is invalid".to_string());
+    }
+    let k_g = mon_b[0].len();
+    if k_g == 0 {
+        return Err("mon_b_aggregate: k_g=0 (no digits) is invalid".to_string());
+    }
+    // Flatten: concat_{inst, dig} mon_b[inst][dig]
+    let mut mon_b_flat: Vec<R> = Vec::new();
+    for (inst_idx, inst) in mon_b.iter().enumerate() {
+        if inst.len() != k_g {
+            return Err(format!(
+                "mon_b_aggregate: mon_b[{inst_idx}] digit count mismatch (got {}, expected {k_g})",
+                inst.len()
+            ));
+        }
+        mon_b_flat.extend(inst.iter().copied());
+    }
+    let n = mon_b_flat.len();
+    if n == 0 {
+        return Err("mon_b_aggregate: flattened mon_b is empty".to_string());
+    }
+    
+    // Create the aggregate scheme with the dedicated domain and seed.
+    let agg_scheme = AjtaiCommitmentScheme::<R>::seeded(b"mon_b_agg", MON_B_AGG_SEED, kappa, n);
+    let c_agg = agg_scheme
+        .commit(&mon_b_flat)
+        .map_err(|e| format!("mon_b_aggregate: commit failed: {e:?}"))?;
     Ok(c_agg.as_ref().to_vec())
 }
 
@@ -1058,9 +1108,15 @@ where
             };
             b_inst.push(acc);
         }
-        transcript.absorb_slice(&b_inst);
         mon_b.push(b_inst);
     }
+
+    // -----------------------------------------------------------------------
+    // Aggregate mon_b absorption: bind all mon_b values into transcript via a single
+    // short Ajtai commitment (reduces Poseidon permutations from O(ell*k_g) to O(kappa)).
+    // -----------------------------------------------------------------------
+    let mon_b_agg = compute_mon_b_aggregate(&mon_b, kappa)?;
+    transcript.absorb_slice(&mon_b_agg);
 
     Ok(PiFoldProverOutput {
         proof: PiFoldBatchedProof {
