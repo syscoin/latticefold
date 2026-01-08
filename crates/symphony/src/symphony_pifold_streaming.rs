@@ -442,13 +442,13 @@ where
         #[cfg(feature = "parallel")]
         use rayon::prelude::*;
 
+        // Phase 1: compute per-instance J and projected digits (parallel).
         let per_inst = (0..ell)
             .into_par_iter()
             .map(|inst_idx| {
                 let cm_f = &cms[inst_idx];
                 let f: &[R] = &witnesses[inst_idx];
 
-                // Phase 1 seed: depends only on cm_f (commit-before-J).
                 let mut h = Sha256::new();
                 h.update(b"SYMPHONY_EXPERIMENTAL_PI_FOLD_COINS_V2");
                 h.update(b"PHASE1_J_FROM_CMF");
@@ -458,7 +458,6 @@ where
                 let seed1: [u8; 32] = h.finalize().into();
                 let mut rng1 = StdRng::from_seed(seed1);
 
-                // J: lambda_pj x l_h
                 let mut J: Vec<Vec<R::BaseRing>> = Vec::with_capacity(rg_params.lambda_pj);
                 for _ in 0..rg_params.lambda_pj {
                     let mut row = Vec::with_capacity(rg_params.l_h);
@@ -468,191 +467,117 @@ where
                     J.push(row);
                 }
 
-                // We'll derive Π_mon coins in Phase 2 after cm_g is computed (commit-before-coins).
-
-                // Projected digits (either full or col0-only)
                 let k_g = rg_params.k_g;
                 let lambda_pj = rg_params.lambda_pj;
                 let l_h = rg_params.l_h;
                 let d_prime = rg_params.d_prime;
-                let proj: ProjDigits<R> = if const_coeff_fastpath {
-                    let mut digits0 = vec![<R::BaseRing as Field>::ZERO; m_j * k_g];
-                    #[cfg(feature = "parallel")]
-                    {
-                        use rayon::prelude::*;
-                        digits0
-                            .par_chunks_mut(k_g)
-                            .enumerate()
-                            .for_each(|(out_row, chunk)| {
-                                let i = out_row % lambda_pj;
-                                let b = out_row / lambda_pj;
-                                let mut h0 = <R::BaseRing as Field>::ZERO;
-                                for t in 0..l_h {
-                                    let in_row = b * l_h + t;
-                                    if in_row >= f.len() {
-                                        continue;
-                                    }
-                                    let coef = J[i][t];
-                                    h0 += coef * f[in_row].coeffs()[0];
-                                }
-                                let mut h_row = vec![<R::BaseRing as Field>::ZERO; d];
-                                h_row[0] = h0;
-                                let digits = h_row.decompose_to_vec(d_prime, k_g);
-                                chunk.copy_from_slice(&digits[0][..k_g]);
-                            });
-                    }
-                    #[cfg(not(feature = "parallel"))]
-                    {
-                        for out_row in 0..m_j {
-                            let i = out_row % lambda_pj;
-                            let b = out_row / lambda_pj;
-                            let mut h0 = <R::BaseRing as Field>::ZERO;
-                            for t in 0..l_h {
-                                let in_row = b * l_h + t;
-                                if in_row >= f.len() {
-                                    continue;
-                                }
-                                let coef = J[i][t];
-                                h0 += coef * f[in_row].coeffs()[0];
-                            }
-                            let mut h_row = vec![<R::BaseRing as Field>::ZERO; d];
-                            h_row[0] = h0;
-                            let digits = h_row.decompose_to_vec(d_prime, k_g);
-                            digits0[out_row * k_g..(out_row + 1) * k_g].copy_from_slice(&digits[0][..k_g]);
-                        }
-                    }
-                    ProjDigits::Col0(Arc::new(digits0))
-                } else {
-                    let mut digits_flat = vec![<R::BaseRing as Field>::ZERO; m_j * d * k_g];
-                    #[cfg(feature = "parallel")]
-                    {
-                        use rayon::prelude::*;
-                        digits_flat
-                            .par_chunks_mut(d * k_g)
-                            .enumerate()
-                            .for_each(|(out_row, chunk)| {
-                                let i = out_row % lambda_pj;
-                                let b = out_row / lambda_pj;
-                                let mut h_row = vec![<R::BaseRing as Field>::ZERO; d];
-                                for t in 0..l_h {
-                                    let in_row = b * l_h + t;
-                                    if in_row >= f.len() {
-                                        continue;
-                                    }
-                                    let coef = J[i][t];
-                                    let coeffs = f[in_row].coeffs();
-                                    for col in 0..d {
-                                        h_row[col] += coef * coeffs[col];
-                                    }
-                                }
-                                let digits = h_row.decompose_to_vec(d_prime, k_g);
-                                for col in 0..d {
-                                    let dst = &mut chunk[col * k_g..(col + 1) * k_g];
-                                    dst.copy_from_slice(&digits[col][..k_g]);
-                                }
-                            });
-                    }
-                    #[cfg(not(feature = "parallel"))]
-                    {
-                        for out_row in 0..m_j {
-                            let i = out_row % lambda_pj;
-                            let b = out_row / lambda_pj;
-                            let mut h_row = vec![<R::BaseRing as Field>::ZERO; d];
-                            for t in 0..l_h {
-                                let in_row = b * l_h + t;
-                                if in_row >= f.len() {
-                                    continue;
-                                }
-                                let coef = J[i][t];
-                                let coeffs = f[in_row].coeffs();
-                                for col in 0..d {
-                                    h_row[col] += coef * coeffs[col];
-                                }
-                            }
-                            let digits = h_row.decompose_to_vec(d_prime, k_g);
-                            for col in 0..d {
-                                for dig in 0..k_g {
-                                    digits_flat[(out_row * d + col) * k_g + dig] = digits[col][dig];
-                                }
-                            }
-                        }
-                    }
-                    ProjDigits::Full(Arc::new(digits_flat))
-                };
 
-                // cm_g commitments (serial inner loop; outer parallel across instances)
-                let n = m * d;
-                let g0 = exp::<R>(<R::BaseRing as Field>::ZERO).expect("Exp failed");
-                let commits = cm_g_scheme
-                    .commit_many_with_serial(n, k_g, |j, out: &mut [R]| {
-                        let col = j / m;
-                        let row = j - col * m;
-                        let out_row = row % m_j;
-                        for dig in 0..k_g {
-                            if const_coeff_fastpath && col != 0 {
-                                out[dig] = g0;
-                            } else {
-                                let digit = proj.digit(m_j, d, k_g, out_row, col, dig);
-                                out[dig] = exp::<R>(digit).expect("Exp failed");
+                // For SP1-style const-coeff inputs, only col=0 digits matter; we store Col0 always here.
+                let mut digits0 = vec![<R::BaseRing as Field>::ZERO; m_j * k_g];
+                digits0
+                    .par_chunks_mut(k_g)
+                    .enumerate()
+                    .for_each(|(out_row, chunk)| {
+                        let i = out_row % lambda_pj;
+                        let b = out_row / lambda_pj;
+                        let mut h0 = <R::BaseRing as Field>::ZERO;
+                        for t in 0..l_h {
+                            let in_row = b * l_h + t;
+                            if in_row >= f.len() {
+                                continue;
                             }
+                            let coef = J[i][t];
+                            h0 += coef * f[in_row].coeffs()[0];
                         }
-                    })
-                    .map_err(|e| format!("PiFold: cm_g commit failed: {e:?}"))?;
-                let cm_g_inst = commits.into_iter().map(|c| c.as_ref().to_vec()).collect::<Vec<_>>();
+                        let mut h_row = vec![<R::BaseRing as Field>::ZERO; d];
+                        h_row[0] = h0;
+                        let digits = h_row.decompose_to_vec(d_prime, k_g);
+                        chunk.copy_from_slice(&digits[0][..k_g]);
+                    });
 
-                // Phase 2: derive Π_mon coins from (cm_f, cm_g, inst_idx).
-                let mut h2 = Sha256::new();
-                h2.update(b"SYMPHONY_EXPERIMENTAL_PI_FOLD_COINS_V2");
-                h2.update(b"PHASE2_MON_COINS_FROM_CMF_CMG");
-                h2.update(&(inst_idx as u64).to_le_bytes());
-                h2.update(&cm_f_digest);
-                let cm_g_digest: [u8; 32] = {
-                    let mut hh = Sha256::new();
-                    hh.update(b"cm_g");
-                    hh.update(&(cm_g_inst.len() as u64).to_le_bytes());
-                    for row in &cm_g_inst {
-                        hh.update(&(row.len() as u64).to_le_bytes());
-                        for x in row {
-                            for c in x.coeffs() {
-                                for fp in c.to_base_prime_field_elements() {
-                                    hh.update(fp.into_bigint().to_bytes_le());
-                                }
-                            }
-                        }
-                    }
-                    hh.finalize().into()
-                };
-                h2.update(&cm_g_digest);
-                let seed2: [u8; 32] = h2.finalize().into();
-                let mut rng2 = StdRng::from_seed(seed2);
-
-                let mut cba: Vec<(Vec<R>, R::BaseRing, R::BaseRing)> = Vec::with_capacity(rg_params.k_g);
-                for _ in 0..rg_params.k_g {
-                    // c is a random point (embedded scalars), consistent with how eq(c) is used.
-                    let mut c: Vec<R> = Vec::with_capacity(g_nvars);
-                    for _ in 0..g_nvars {
-                        let x = <R::BaseRing as Field>::BasePrimeField::rand(&mut rng2);
-                        c.push(R::from(<R::BaseRing as Field>::from_base_prime_field(x)));
-                    }
-                    // beta/alpha/rc are sampled small to mimic low-norm scalars.
-                    let beta = sample_small_base::<R, _>(&mut rng2);
-                    let alpha = sample_small_base::<R, _>(&mut rng2);
-                    cba.push((c, beta, alpha));
-                }
-                let rc: Option<R::BaseRing> = (rg_params.k_g > 1).then(|| sample_small_base::<R, _>(&mut rng2));
-
-                Ok::<_, String>((inst_idx, J, cba, rc, proj, cm_g_inst))
+                Ok::<_, String>((inst_idx, cm_f_digest, J, ProjDigits::Col0(Arc::new(digits0))))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut per_inst = per_inst;
-        per_inst.sort_by_key(|(i, _, _, _, _, _)| *i);
-        for (_i, J, cba, rc, proj, cmg) in per_inst {
-            Js.push(J);
+        per_inst.sort_by_key(|(i, _, _, _)| *i);
+        let cm_f_digests = per_inst.iter().map(|(_, d, _, _)| *d).collect::<Vec<_>>();
+        for (_, _d, J, proj) in &per_inst {
+            Js.push(J.clone());
+            proj_digits_by_inst.push(proj.clone());
+        }
+
+        // Global batched commit for all (inst, dig) pairs: t = ell * k_g.
+        // This reuses seeded Ajtai column RNG once across all instances.
+        let t_vecs = ell * rg_params.k_g;
+        let g0 = exp::<R>(<R::BaseRing as Field>::ZERO).expect("Exp failed");
+        let n = m * d;
+        let digits0_all = per_inst
+            .iter()
+            .map(|(_, _, _, proj)| match proj {
+                ProjDigits::Col0(v) => v.clone(),
+                _ => unreachable!("experimental uses Col0"),
+            })
+            .collect::<Vec<_>>();
+        let commits_all = cm_g_scheme
+            .commit_many_with(n, t_vecs, move |j, out: &mut [R]| {
+                let col = j / m;
+                let row = j - col * m;
+                let out_row = row % m_j;
+                if col != 0 {
+                    // constant-coeff fast path: nonzero columns are exp(0).
+                    for slot in out.iter_mut() {
+                        *slot = g0;
+                    }
+                    return;
+                }
+                // col=0: out[inst*k_g + dig] = exp(digit(inst,out_row,dig))
+                for inst_idx in 0..ell {
+                    let digits0 = &digits0_all[inst_idx];
+                    for dig in 0..rg_params.k_g {
+                        let digit = digits0[out_row * rg_params.k_g + dig];
+                        out[inst_idx * rg_params.k_g + dig] = exp::<R>(digit).expect("Exp failed");
+                    }
+                }
+            })
+            .map_err(|e| format!("PiFold: cm_g commit failed: {e:?}"))?;
+
+        // Reshape commits into cm_g[ell][k_g] and derive Phase-2 Π_mon coins.
+        for inst_idx in 0..ell {
+            let mut cm_g_inst: Vec<Vec<R>> = Vec::with_capacity(rg_params.k_g);
+            for dig in 0..rg_params.k_g {
+                let c = &commits_all[inst_idx * rg_params.k_g + dig];
+                cm_g_inst.push(c.as_ref().to_vec());
+            }
+            cm_g.push(cm_g_inst);
+        }
+
+        // Phase 2: coins per instance depend on (cm_f_digest, cm_g_digest).
+        for inst_idx in 0..ell {
+            let mut h2 = Sha256::new();
+            h2.update(b"SYMPHONY_EXPERIMENTAL_PI_FOLD_COINS_V2");
+            h2.update(b"PHASE2_MON_COINS_FROM_CMF_CMG");
+            h2.update(&(inst_idx as u64).to_le_bytes());
+            h2.update(&cm_f_digests[inst_idx]);
+            let cm_g_digest: [u8; 32] = sha256_ring_vec::<R>(b"cm_g", &cm_g[inst_idx].concat());
+            h2.update(&cm_g_digest);
+            let seed2: [u8; 32] = h2.finalize().into();
+            let mut rng2 = StdRng::from_seed(seed2);
+
+            let mut cba: Vec<(Vec<R>, R::BaseRing, R::BaseRing)> = Vec::with_capacity(rg_params.k_g);
+            for _ in 0..rg_params.k_g {
+                let mut c: Vec<R> = Vec::with_capacity(g_nvars);
+                for _ in 0..g_nvars {
+                    let x = <R::BaseRing as Field>::BasePrimeField::rand(&mut rng2);
+                    c.push(R::from(<R::BaseRing as Field>::from_base_prime_field(x)));
+                }
+                let beta = sample_small_base::<R, _>(&mut rng2);
+                let alpha = sample_small_base::<R, _>(&mut rng2);
+                cba.push((c, beta, alpha));
+            }
+            let rc: Option<R::BaseRing> = (rg_params.k_g > 1).then(|| sample_small_base::<R, _>(&mut rng2));
             cba_all.push(cba);
             rc_all.push(rc);
-            proj_digits_by_inst.push(proj);
-            cm_g.push(cmg);
         }
     } else {
         for (inst_idx, cm_f) in cms.iter().enumerate() {
