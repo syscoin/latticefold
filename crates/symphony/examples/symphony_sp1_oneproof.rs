@@ -132,6 +132,10 @@ fn main() {
     }
     println!("  load all mats: {:?}", t_mats.elapsed());
 
+    // Commitment scheme for the monomial vectors g^(i): length = m*d, kappa matches other schemes.
+    let m = all_mats[0][0].nrows;
+    let scheme_g = AjtaiCommitmentScheme::<R>::seeded(b"cm_g", MASTER_SEED, 8, m * R::dimension());
+
     let cms_all: Vec<Vec<R>> = vec![cm_main; num_chunks];
     // Clone the Arc (refcount bump) so we can still use `witness` later for optional verification.
     let witnesses_all: Vec<Arc<Vec<R>>> = vec![witness.clone(); num_chunks];
@@ -144,6 +148,7 @@ fn main() {
         &public_inputs,
         Some(scheme_had.as_ref()),
         Some(scheme_mon.as_ref()),
+        &scheme_g,
         rg_params,
         &cfg,
     )

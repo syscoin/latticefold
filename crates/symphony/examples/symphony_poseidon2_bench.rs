@@ -623,6 +623,7 @@ where
     let scheme_had =
         AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, kappa, 3 * R::dimension());
     let scheme_mon = AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, kappa, rg_params.k_g);
+    let scheme_g = AjtaiCommitmentScheme::<R>::seeded(b"cm_g", MASTER_SEED, kappa, m * R::dimension());
 
     // Public inputs (statement binding)
     let public_inputs: Vec<R::BaseRing> = vec![
@@ -667,6 +668,7 @@ where
         &public_inputs,
         Some(&scheme_had),
         Some(&scheme_mon),
+        &scheme_g,
         rg_params.clone(),
         &cfg,
     );

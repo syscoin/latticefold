@@ -63,6 +63,7 @@ fn test_pifold_accumulator_two_steps() {
         AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, 2, 3 * R::dimension());
     let scheme_mon =
         AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 2, rg_params.k_g);
+    let scheme_g = AjtaiCommitmentScheme::<R>::seeded(b"cm_g", MASTER_SEED, 2, m * R::dimension());
     let open_cfs = MultiAjtaiOpenVerifier::<R>::new()
         .with_scheme("cfs_had_u", scheme_had.clone())
         .with_scheme("cfs_mon_b", scheme_mon.clone());
@@ -89,6 +90,7 @@ fn test_pifold_accumulator_two_steps() {
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),
+        &scheme_g,
         rg_params.clone(),
         &cfg,
     )
@@ -137,6 +139,7 @@ fn test_pifold_accumulator_two_steps() {
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),
+        &scheme_g,
         rg_params.clone(),
         &cfg,
     )

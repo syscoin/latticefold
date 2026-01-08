@@ -85,6 +85,7 @@ fn test_pifold_streaming_hetero_m_roundtrip() {
         3 * R::dimension(),
     );
     let scheme_mon = AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 2, rg_params.k_g);
+    let scheme_g = AjtaiCommitmentScheme::<R>::seeded(b"cm_g", MASTER_SEED, 2, m * R::dimension());
 
     let cfg = PiFoldStreamingConfig::default();
     let out = prove_pi_fold_poseidon_fs::<R, PC>(
@@ -94,6 +95,7 @@ fn test_pifold_streaming_hetero_m_roundtrip() {
         &public_inputs,
         Some(&scheme_had),
         Some(&scheme_mon),
+        &scheme_g,
         rg_params.clone(),
         &cfg,
     )

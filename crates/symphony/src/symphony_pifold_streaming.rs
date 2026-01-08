@@ -171,6 +171,7 @@ pub fn prove_pi_fold_poseidon_fs<R: CoeffRing, PC>(
     public_inputs: &[R::BaseRing],
     cfs_had_u_scheme: Option<&AjtaiCommitmentScheme<R>>,
     cfs_mon_b_scheme: Option<&AjtaiCommitmentScheme<R>>,
+    cm_g_scheme: &AjtaiCommitmentScheme<R>,
     rg_params: RPParams,
     config: &PiFoldStreamingConfig,
 ) -> Result<PiFoldProverOutput<R>, String>
@@ -190,7 +191,15 @@ where
     rts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
     absorb_public_inputs::<R>(&mut rts, public_inputs);
 
-    let mut out = prove_pi_fold_streaming_hetero_m_with_config(&mut rts, Ms, cms, witnesses, rg_params, config)
+    let mut out = prove_pi_fold_streaming_hetero_m_with_config(
+        &mut rts,
+        Ms,
+        cms,
+        witnesses,
+        rg_params,
+        config,
+        cm_g_scheme,
+    )
         .map_err(|e| format!("PiFold: poseidon-fs prove failed: {e}"))?;
 
     out.proof.coins = SymphonyCoins::<R> {
@@ -238,753 +247,6 @@ where
     Ok(out)
 }
 
-/// Streaming Π_fold prover.
-pub fn prove_pi_fold_streaming<R: CoeffRing>(
-    transcript: &mut impl Transcript<R>,
-    M: [Arc<SparseMatrix<R>>; 3],
-    cms: &[Vec<R>],
-    witnesses: &[Arc<Vec<R>>],
-    rg_params: RPParams,
-) -> Result<PiFoldProverOutput<R>, String>
-where
-    R::BaseRing: Zq + Decompose,
-{
-    let cfg = PiFoldStreamingConfig::default();
-    prove_pi_fold_streaming_with_config(transcript, M, cms, witnesses, rg_params, &cfg)
-}
-
-pub fn prove_pi_fold_streaming_with_config<R: CoeffRing>(
-    transcript: &mut impl Transcript<R>,
-    M: [Arc<SparseMatrix<R>>; 3],
-    cms: &[Vec<R>],
-    witnesses: &[Arc<Vec<R>>],
-    rg_params: RPParams,
-    config: &PiFoldStreamingConfig,
-) -> Result<PiFoldProverOutput<R>, String>
-where
-    R::BaseRing: Zq + Decompose,
-{
-    prove_pi_fold_streaming_impl(transcript, M, cms, witnesses, rg_params, config)
-}
-
-fn prove_pi_fold_streaming_impl<R: CoeffRing>(
-    transcript: &mut impl Transcript<R>,
-    M: [Arc<SparseMatrix<R>>; 3],
-    cms: &[Vec<R>],
-    witnesses: &[Arc<Vec<R>>],
-    rg_params: RPParams,
-    config: &PiFoldStreamingConfig,
-) -> Result<PiFoldProverOutput<R>, String>
-where
-    R::BaseRing: Zq + Decompose,
-{
-    // Constant-coefficient fast path: enabled by default.
-    //
-    // For many real applications (including SP1-style R1CS), matrices and witnesses are base-field
-    // scalars embedded into the ring as constant-coefficient polynomials. In that common case,
-    // `y = M*w` stays constant-coefficient and Π_had can be evaluated mostly in the base ring.
-    //
-    // Safety: we auto-disable this fast path if a small deterministic sample detects any
-    // non-constant coefficients.
-    let const_coeff_fastpath = config.request_const_coeff_fastpath
-        && seems_const_coeff_inputs::<R>(
-            witnesses,
-            &[M[0].clone(), M[1].clone(), M[2].clone()],
-            config.const_coeff_witness_samples,
-            config.const_coeff_matrix_entries,
-        );
-
-    let prof = config.profile;
-    let t_all = Instant::now();
-    let ell = cms.len();
-    let beta_cts = derive_beta_chi::<R>(transcript, ell);
-    if ell == 0 || witnesses.len() != ell {
-        return Err("PiFold: length mismatch".to_string());
-    }
-
-    // -----------------
-    // Shared Π_had coins
-    // -----------------
-    let m = M[0].nrows;
-    if !m.is_power_of_two() {
-        return Err("PiFold: m must be power-of-two".to_string());
-    }
-    let log_m = log2(m) as usize;
-    let d = R::dimension();
-
-    transcript.absorb_field_element(&R::BaseRing::from(0x4c465053_50494841u128));
-    let s_base = transcript.get_challenges(log_m);
-    let alpha_base = transcript.get_challenge();
-
-    let mut alpha_pows = Vec::with_capacity(d);
-    let mut pow = R::BaseRing::ONE;
-    for _ in 0..d {
-        alpha_pows.push(R::from(pow));
-        pow *= alpha_base;
-    }
-
-    // -----------------
-    // Per-instance coins
-    // -----------------
-    let mut cba_all: Vec<Vec<(Vec<R>, R::BaseRing, R::BaseRing)>> = Vec::with_capacity(ell);
-    let mut rc_all: Vec<Option<R::BaseRing>> = Vec::with_capacity(ell);
-    let mut Js: Vec<Vec<Vec<R::BaseRing>>> = Vec::with_capacity(ell);
-
-    let n_f = witnesses[0].len();
-    if n_f == 0 || n_f % rg_params.l_h != 0 {
-        return Err("PiFold: invalid witness length".to_string());
-    }
-    let blocks = n_f / rg_params.l_h;
-    let m_j = blocks
-        .checked_mul(rg_params.lambda_pj)
-        .ok_or_else(|| "PiFold: m_J overflow (blocks*lambda_pj)".to_string())?;
-    if m < m_j || m % m_j != 0 {
-        return Err("PiFold: require m_J <= m and m multiple of m_J".to_string());
-    }
-
-    let g_len = m
-        .checked_mul(d)
-        .ok_or_else(|| "PiFold: overflow in g_len=m*d".to_string())?;
-    if !g_len.is_power_of_two() {
-        return Err("PiFold: require m*d power-of-two".to_string());
-    }
-    let g_nvars = log2(g_len) as usize;
-
-    for (cm_f, f) in cms.iter().zip(witnesses.iter()) {
-        if f.len() != n_f {
-            return Err("PiFold: inconsistent witness lengths".to_string());
-        }
-
-        transcript.absorb_slice(cm_f);
-        let J = derive_J::<R>(transcript, rg_params.lambda_pj, rg_params.l_h);
-        Js.push(J);
-
-        let mut cba: Vec<(Vec<R>, R::BaseRing, R::BaseRing)> = Vec::with_capacity(rg_params.k_g);
-        for _ in 0..rg_params.k_g {
-            let c: Vec<R> = transcript
-                .get_challenges(g_nvars)
-                .into_iter()
-                .map(|x| x.into())
-                .collect();
-            let beta = transcript.get_challenge();
-            let alpha = transcript.get_challenge();
-            cba.push((c, beta, alpha));
-        }
-        let rc: Option<R::BaseRing> = (rg_params.k_g > 1).then(|| transcript.get_challenge());
-        cba_all.push(cba);
-        rc_all.push(rc);
-    }
-
-    let rhos = transcript
-        .get_challenges(ell)
-        .into_iter()
-        .map(R::from)
-        .collect::<Vec<R>>();
-
-    // -----------------
-    // STREAMING Hadamard MLEs
-    // -----------------
-    // Key optimization: use sparse mat-vec MLEs instead of materializing y = M*w.
-    //
-    // IMPORTANT: `eq(s, ·)` is shared across all instances (same `s`), so we include it ONCE
-    // to avoid an unnecessary ~ℓ× blow-up in streaming evaluation work.
-    let mut mles_had: Vec<StreamingMleEnum<R>> = Vec::with_capacity(1 + ell * 3);
-    mles_had.push(StreamingMleEnum::eq_base(s_base.clone()));
-    // Cache extracted base-field witnesses by `Arc` pointer so identical witnesses across instances
-    // only incur the O(n_f) coeff[0] scan once (common in SP1 chunking).
-    let mut w0_cache: HashMap<usize, Arc<Vec<R::BaseRing>>> = HashMap::new();
-    for inst_idx in 0..ell {
-        let w0 = if const_coeff_fastpath {
-            let key = Arc::as_ptr(&witnesses[inst_idx]) as usize;
-            Some(
-                w0_cache
-                    .entry(key)
-                    .or_insert_with(|| {
-                        Arc::new(
-                            witnesses[inst_idx]
-                                .iter()
-                                .map(|x| x.coeffs()[0])
-                                .collect::<Vec<_>>(),
-                        )
-                    })
-                    .clone(),
-            )
-        } else {
-            None
-        };
-        for i in 0..3 {
-            if const_coeff_fastpath {
-                mles_had.push(StreamingMleEnum::sparse_mat_vec_const_coeff(
-                    M[i].clone(),
-                    w0.as_ref().expect("w0 present").clone(),
-                ));
-            } else {
-                mles_had.push(StreamingMleEnum::sparse_mat_vec(
-                M[i].clone(),
-                witnesses[inst_idx].clone(),
-                ));
-            }
-        }
-    }
-
-    // Hadamard combiner (must match Π_had: coefficient-wise constraint with alpha powers)
-    //
-    // When `CONST_COEFF_FASTPATH` is active we additionally provide a base-ring combiner to avoid
-    // allocating/constructing full ring elements in the hot sumcheck loop.
-    let rhos_had = rhos.clone();
-    let comb_had0: Option<Box<dyn Fn(&[R::BaseRing]) -> R::BaseRing + Sync + Send>> =
-        if const_coeff_fastpath {
-            let rhos0 = rhos_had.iter().map(|x| x.coeffs()[0]).collect::<Vec<_>>();
-            let alpha0 = alpha_pows[0].coeffs()[0];
-            Some(Box::new(move |vals: &[R::BaseRing]| -> R::BaseRing {
-                let eq0 = vals[0];
-                let mut acc_all0 = R::BaseRing::ZERO;
-        for inst_idx in 0..ell {
-                    let base = 1 + inst_idx * 3;
-                    let y10 = vals[base];
-                    let y20 = vals[base + 1];
-                    let y30 = vals[base + 2];
-                    let term0 = y10 * y20 - y30;
-                    acc_all0 += rhos0[inst_idx] * (alpha0 * eq0 * term0);
-                }
-                acc_all0
-            }))
-        } else {
-            None
-        };
-
-    let comb_had: Box<dyn Fn(&[R]) -> R + Sync + Send> = Box::new(move |vals: &[R]| -> R {
-        let eq = vals[0];
-        let mut acc_all = R::ZERO;
-        for inst_idx in 0..ell {
-            let base = 1 + inst_idx * 3;
-            let y1 = &vals[base];
-            let y2 = &vals[base + 1];
-            let y3 = &vals[base + 2];
-            let mut acc = R::ZERO;
-            for j in 0..d {
-                let term = y1.coeffs()[j] * y2.coeffs()[j] - y3.coeffs()[j];
-                acc += alpha_pows[j] * eq * R::from(term);
-            }
-            acc_all += rhos_had[inst_idx] * acc;
-        }
-        acc_all
-    });
-
-    // -----------------
-    // Monomial MLEs (streaming/compact)
-    //
-    // Critical: avoid materializing the huge dense eq(c) MLE tables (size = m*d ring elements).
-    // We keep m_j/m' as base-ring scalars (compact), and make eq(c) fully streaming.
-    //
-    // IMPORTANT (soundness): the monomial-side check relies on the standard identity
-    //   ev(b, β)^2 == ev(b, β^2)
-    // which is nontrivial exactly because squaring does not commute with multilinear interpolation.
-    // In particular, `PeriodicBaseScalarVec(square=true)` must represent vertex-wise squares
-    // (MLE(m^{∘2})) rather than squaring-after-eval.
-    // -----------------
-    let mon_mles_per = 3 * rg_params.k_g;
-    let mut mles_mon: Vec<StreamingMleEnum<R>> = Vec::with_capacity(ell * mon_mles_per);
-
-    let alphas_ring = cba_all
-        .iter()
-        .map(|cba| cba.iter().map(|(_, _, a)| R::from(*a)).collect::<Vec<_>>())
-        .collect::<Vec<_>>();
-
-    let reps = m / m_j;
-
-    // Precompute projected digits once per instance.
-    // Layout: digits[(row * d + col) * k_g + dig] where
-    // - row ∈ [0, m_j)
-    // - col ∈ [0, d)
-    // - dig ∈ [0, k_g)
-    let t_digits = Instant::now();
-    let mut proj_digits_by_inst: Vec<Arc<Vec<R::BaseRing>>> = Vec::with_capacity(ell);
-    for inst_idx in 0..ell {
-        let f: &[R] = &witnesses[inst_idx];
-        let J = &Js[inst_idx];
-        let k_g = rg_params.k_g;
-        let lambda_pj = rg_params.lambda_pj;
-        let l_h = rg_params.l_h;
-        let d_prime = rg_params.d_prime;
-
-        let mut digits_flat = vec![R::BaseRing::ZERO; m_j * d * k_g];
-
-        #[cfg(feature = "parallel")]
-        {
-            use ark_std::cfg_into_iter;
-            let out_ptr = digits_flat.as_mut_ptr() as usize;
-            cfg_into_iter!(0..m_j).for_each(|out_row| {
-                let i = out_row % lambda_pj;
-                let b = out_row / lambda_pj;
-                if const_coeff_fastpath {
-                    // Constant-coeff specialization: only coeff[0] can be nonzero.
-                    let mut h0 = R::BaseRing::ZERO;
-                    for t in 0..l_h {
-                        let in_row = b * l_h + t;
-                        if in_row >= f.len() {
-                            continue;
-                        }
-                        let coef = J[i][t];
-                        h0 += coef * f[in_row].coeffs()[0];
-                    }
-                    // Decompose exactly as the generic path does, but only
-                    // write the nonzero column (col=0). Other columns remain zero in `digits_flat`.
-        let mut h_row = vec![R::BaseRing::ZERO; d];
-                    h_row[0] = h0;
-                    let digits = h_row.decompose_to_vec(d_prime, k_g);
-                    for dig in 0..k_g {
-                        let idx = (out_row * d) * k_g + dig; // col=0
-                        unsafe {
-                            *(out_ptr as *mut R::BaseRing).add(idx) = digits[0][dig];
-                        }
-                    }
-                } else {
-                    let mut h_row = vec![R::BaseRing::ZERO; d];
-                    for t in 0..l_h {
-                        let in_row = b * l_h + t;
-            if in_row >= f.len() {
-                continue;
-            }
-            let coef = J[i][t];
-            let coeffs = f[in_row].coeffs();
-            for col in 0..d {
-                h_row[col] += coef * coeffs[col];
-            }
-        }
-                    let digits = h_row.decompose_to_vec(d_prime, k_g);
-                    for col in 0..d {
-                        for dig in 0..k_g {
-                            let idx = (out_row * d + col) * k_g + dig;
-                            unsafe {
-                                *(out_ptr as *mut R::BaseRing).add(idx) = digits[col][dig];
-                            }
-                        }
-                    }
-                }
-            });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for out_row in 0..m_j {
-                let i = out_row % lambda_pj;
-                let b = out_row / lambda_pj;
-                if const_coeff_fastpath {
-                    let mut h0 = R::BaseRing::ZERO;
-                    for t in 0..l_h {
-                        let in_row = b * l_h + t;
-                        if in_row >= f.len() {
-                            continue;
-                        }
-                        let coef = J[i][t];
-                        h0 += coef * f[in_row].coeffs()[0];
-                    }
-                    let mut h_row = vec![R::BaseRing::ZERO; d];
-                    h_row[0] = h0;
-                    let digits = h_row.decompose_to_vec(d_prime, k_g);
-                    for dig in 0..k_g {
-                        digits_flat[(out_row * d) * k_g + dig] = digits[0][dig];
-                    }
-                } else {
-                    let mut h_row = vec![R::BaseRing::ZERO; d];
-                    for t in 0..l_h {
-                        let in_row = b * l_h + t;
-                        if in_row >= f.len() {
-                            continue;
-                        }
-                        let coef = J[i][t];
-                        let coeffs = f[in_row].coeffs();
-                        for col in 0..d {
-                            h_row[col] += coef * coeffs[col];
-                        }
-                    }
-                    let digits = h_row.decompose_to_vec(d_prime, k_g);
-                    for col in 0..d {
-                        for dig in 0..k_g {
-                            digits_flat[(out_row * d + col) * k_g + dig] = digits[col][dig];
-                        }
-                    }
-                }
-            }
-        }
-
-        proj_digits_by_inst.push(Arc::new(digits_flat));
-    }
-    if prof {
-        eprintln!(
-            "[PiFold streaming] precomputed proj digits in {:?} (ell={}, m_j={}, d={}, k_g={})",
-            t_digits.elapsed(),
-            ell,
-            m_j,
-            d,
-            rg_params.k_g
-        );
-    }
-
-    let t_mon_build = Instant::now();
-    for inst_idx in 0..ell {
-        let digits_flat = proj_digits_by_inst[inst_idx].clone();
-
-        for dig in 0..rg_params.k_g {
-            let (c, beta_i, _a) = &cba_all[inst_idx][dig];
-
-            // Compact m_j values as base-ring scalars over only m_j rows (periodic over m).
-            // Store column-major: mj_compact[col * m_j + out_row].
-            let mut mj_compact: Vec<R::BaseRing> = vec![R::BaseRing::ZERO; m_j * d];
-
-            #[cfg(feature = "parallel")]
-            {
-                use ark_std::cfg_into_iter;
-                let out_ptr = mj_compact.as_mut_ptr() as usize;
-                let beta = *beta_i;
-                let dig_local = dig;
-                let digits_flat = digits_flat.clone();
-                if const_coeff_fastpath && d > 1 {
-                    // In constant-coeff mode, projected digits are zero in columns 1..d-1.
-                    // So `ev(exp(digit), beta)` is constant for those columns (digit=0).
-                    let g0 = exp::<R>(R::BaseRing::ZERO).expect("Exp failed");
-                    let mjv_zero = ev(&g0, beta);
-                    cfg_into_iter!(0..m_j).for_each(|out_row| {
-                        let digit0 = digits_flat[(out_row * d) * rg_params.k_g + dig_local]; // col=0
-                        let g = exp::<R>(digit0).expect("Exp failed");
-                        let mjv0 = ev(&g, beta);
-                        unsafe {
-                            *(out_ptr as *mut R::BaseRing).add(out_row) = mjv0;
-                        }
-                    });
-                    for col in 1..d {
-                        mj_compact[col * m_j..(col + 1) * m_j].fill(mjv_zero);
-                    }
-                } else {
-                    cfg_into_iter!(0..m_j).for_each(|out_row| {
-                        for col in 0..d {
-                            let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig_local];
-                            let g = exp::<R>(digit).expect("Exp failed");
-                            let mjv = ev(&g, beta);
-                            let idx = col * m_j + out_row;
-                            unsafe {
-                                *(out_ptr as *mut R::BaseRing).add(idx) = mjv;
-                            }
-                        }
-                    });
-                }
-            }
-            #[cfg(not(feature = "parallel"))]
-            {
-                if const_coeff_fastpath && d > 1 {
-                    let g0 = exp::<R>(R::BaseRing::ZERO).expect("Exp failed");
-                    let mjv_zero = ev(&g0, *beta_i);
-            for out_row in 0..m_j {
-                        let digit0 = digits_flat[(out_row * d) * rg_params.k_g + dig]; // col=0
-                        let g = exp::<R>(digit0).expect("Exp failed");
-                        mj_compact[out_row] = ev(&g, *beta_i);
-                    }
-                    for col in 1..d {
-                        mj_compact[col * m_j..(col + 1) * m_j].fill(mjv_zero);
-                    }
-                } else {
-                    for out_row in 0..m_j {
-                for col in 0..d {
-                            let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
-                            let g = exp::<R>(digit).expect("Exp failed");
-                            let mjv = ev(&g, *beta_i);
-                            mj_compact[col * m_j + out_row] = mjv;
-                        }
-                    }
-                }
-            }
-
-            let mj_compact = Arc::new(mj_compact);
-            mles_mon.push(StreamingMleEnum::periodic_base_scalar_vec(
-                g_nvars,
-                m,
-                m_j,
-                d,
-                mj_compact.clone(),
-                false,
-            ));
-            mles_mon.push(StreamingMleEnum::periodic_base_scalar_vec(
-                g_nvars,
-                m,
-                m_j,
-                d,
-                mj_compact,
-                true,
-            ));
-            // eq(c) as streaming MLE (no 2^n table).
-            let c_base = c.iter().map(|x| x.coeffs()[0]).collect::<Vec<_>>();
-            mles_mon.push(StreamingMleEnum::eq_base(c_base));
-        }
-    }
-    if prof {
-        eprintln!(
-            "[PiFold streaming] built mon MLEs in {:?} (g_len={}, g_nvars={}, k_g={}, ell={})",
-            t_mon_build.elapsed(),
-            g_len,
-            g_nvars,
-            rg_params.k_g,
-            ell
-        );
-    }
-
-    let rc_all_clone = rc_all.clone();
-    let comb_mon = move |vals: &[R]| -> R {
-        let mut acc_all = R::ZERO;
-        for inst_idx in 0..ell {
-            let mut lc = R::ZERO;
-            let mut rc_pow = R::BaseRing::ONE;
-            for dig in 0..rg_params.k_g {
-                let base = inst_idx * mon_mles_per + dig * 3;
-                let b_claim = vals[base] * vals[base] - vals[base + 1];
-                let mut res = b_claim * alphas_ring[inst_idx][dig];
-                res *= vals[base + 2];
-                lc += if let Some(rc) = &rc_all_clone[inst_idx] {
-                    let scaled = res * R::from(rc_pow);
-                    rc_pow *= *rc;
-                    scaled
-                } else {
-                    res
-                };
-            }
-            acc_all += rhos[inst_idx] * lc;
-        }
-        acc_all
-    };
-
-    // -----------------
-    // Run sumchecks with SHARED challenges (must match verifier schedule)
-    // -----------------
-    let hook_round = log2(m_j.next_power_of_two()) as usize;
-    let mut v_digits_folded: Vec<Vec<R::BaseRing>> =
-        vec![vec![R::BaseRing::ZERO; d]; rg_params.k_g];
-
-    // Sumcheck transcript header (matches latticefold verify_two_as_subprotocol_shared_with_hook)
-    transcript.absorb(&R::from(log_m as u128));
-    transcript.absorb(&R::from(3u128));
-    transcript.absorb(&R::from(g_nvars as u128));
-    transcript.absorb(&R::from(3u128));
-
-    let mut had_state = StreamingSumcheck::prover_init(mles_had, log_m, 3);
-    let mut mon_state = StreamingSumcheck::prover_init(mles_mon, g_nvars, 3);
-
-    let mut had_msgs = Vec::with_capacity(log_m);
-    let mut mon_msgs = Vec::with_capacity(g_nvars);
-    let mut sampled: Vec<R::BaseRing> = Vec::with_capacity(log_m.max(g_nvars));
-    let mut v_msg_had: Option<R::BaseRing> = None;
-    let mut v_msg_mon: Option<R::BaseRing> = None;
-
-    let rounds = log_m.max(g_nvars);
-    let t_sumcheck = Instant::now();
-    for round_idx in 0..rounds {
-        // Prover messages (in the same order as latticefold's shared schedule)
-        if round_idx < log_m {
-            let pm_had = if const_coeff_fastpath {
-                StreamingSumcheck::prove_round_base(
-                    &mut had_state,
-                    v_msg_had,
-                    comb_had0.as_ref().expect("comb_had0").as_ref(),
-                )
-            } else {
-                StreamingSumcheck::prove_round(&mut had_state, v_msg_had, comb_had.as_ref())
-            };
-            transcript.absorb_slice(&pm_had.evaluations);
-            had_msgs.push(pm_had);
-        }
-        if round_idx < g_nvars {
-            let pm_mon = StreamingSumcheck::prove_round(&mut mon_state, v_msg_mon, &comb_mon);
-            transcript.absorb_slice(&pm_mon.evaluations);
-            mon_msgs.push(pm_mon);
-        }
-
-        // Shared verifier randomness
-        let r = transcript.get_challenge();
-        transcript.absorb(&R::from(r));
-        sampled.push(r);
-
-        if hook_round != 0 && sampled.len() == hook_round {
-            // Bind folded v_digits* after |r̄| challenges, before continuing.
-            let ts_r_full = ts_weights(&sampled);
-            let ts_r = &ts_r_full[..m_j];
-            for dig in 0..rg_params.k_g {
-                for col in 0..d {
-                    v_digits_folded[dig][col] = R::BaseRing::ZERO;
-                }
-            }
-            for inst_idx in 0..ell {
-                let b = beta_cts[inst_idx];
-                let digits_flat = &proj_digits_by_inst[inst_idx];
-                for row in 0..m_j {
-                    let w = ts_r[row];
-                    for col in 0..d {
-                        for dig in 0..rg_params.k_g {
-                            let digit = digits_flat[(row * d + col) * rg_params.k_g + dig];
-                            v_digits_folded[dig][col] += b * digit * w;
-                        }
-                    }
-                }
-            }
-            for v_i in &v_digits_folded {
-                for x in v_i {
-                    transcript.absorb_field_element(x);
-                }
-            }
-        }
-
-        v_msg_had = Some(r);
-        v_msg_mon = Some(r);
-    }
-    if prof {
-        eprintln!(
-            "[PiFold streaming] sumchecks done in {:?} (log_m={}, g_nvars={}, rounds={})",
-            t_sumcheck.elapsed(),
-            log_m,
-        g_nvars,
-            rounds
-        );
-    }
-
-    // Final randomness vectors for each sumcheck (same convention as latticefold sumcheck state)
-    let had_rand = sampled[..log_m].to_vec();
-    let mon_rand = sampled[..g_nvars].to_vec();
-    had_state.randomness = had_rand.clone();
-    mon_state.randomness = mon_rand.clone();
-
-    // The streaming sumcheck round driver fixes variables using the *previous* round's challenge.
-    // After the last round we have one remaining variable that must be fixed by the final sampled r.
-    if log_m > 0 {
-        had_state.fix_last_variable(*had_rand.last().expect("had_rand non-empty"));
-    }
-    if g_nvars > 0 {
-        mon_state.fix_last_variable(*mon_rand.last().expect("mon_rand non-empty"));
-    }
-
-    let had_sumcheck = convert_streaming_proof(&StreamingProof(had_msgs));
-    let mon_sumcheck = convert_streaming_proof(&StreamingProof(mon_msgs));
-
-    // -----------------
-    // Compute aux witness
-    // -----------------
-    let t_aux_had = Instant::now();
-    let mut had_u: Vec<[Vec<R::BaseRing>; 3]> = Vec::with_capacity(ell);
-    let had_evals = had_state.final_evals();
-    for inst_idx in 0..ell {
-        let base = 1 + inst_idx * 3;
-        // MLE order: [eq(s,r)] then per instance: [y1, y2, y3]
-        let y1 = had_evals[base];
-        let y2 = had_evals[base + 1];
-        let y3 = had_evals[base + 2];
-
-        let mut U: [Vec<R::BaseRing>; 3] = [Vec::with_capacity(d), Vec::with_capacity(d), Vec::with_capacity(d)];
-        U[0].extend_from_slice(y1.coeffs());
-        U[1].extend_from_slice(y2.coeffs());
-        U[2].extend_from_slice(y3.coeffs());
-
-        for x in &U[0] {
-            transcript.absorb_field_element(x);
-        }
-        for x in &U[1] {
-            transcript.absorb_field_element(x);
-        }
-        for x in &U[2] {
-            transcript.absorb_field_element(x);
-        }
-        had_u.push(U);
-    }
-    if prof {
-        eprintln!("[PiFold streaming] aux had_u done in {:?}", t_aux_had.elapsed());
-    }
-
-    let ts_r_mon = ts_weights(&mon_rand);
-
-    let t_aux_mon = Instant::now();
-    let mut mon_b: Vec<Vec<R>> = Vec::with_capacity(ell);
-    for inst_idx in 0..ell {
-        let mut b_inst = Vec::with_capacity(rg_params.k_g);
-        let digits_flat = proj_digits_by_inst[inst_idx].clone();
-        for dig in 0..rg_params.k_g {
-            #[cfg(feature = "parallel")]
-            let acc = {
-                use ark_std::cfg_into_iter;
-                let dig_local = dig;
-                let digits_flat = digits_flat.clone();
-                cfg_into_iter!(0..m_j)
-                    .map(|out_row| {
-                        let mut local = R::ZERO;
-                        for col in 0..d {
-                            let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig_local];
-                            let g = exp::<R>(digit).expect("Exp failed");
-                            for rep in 0..reps {
-                                let r = out_row + rep * m_j;
-                                let idx = col * m + r;
-                                local += R::from(ts_r_mon[idx]) * g;
-                            }
-                        }
-                        local
-                    })
-                    .reduce(|| R::ZERO, |a, b| a + b)
-            };
-            #[cfg(not(feature = "parallel"))]
-            let acc = {
-                let mut acc = R::ZERO;
-                for out_row in 0..m_j {
-                    for col in 0..d {
-                        let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
-                        let g = exp::<R>(digit).expect("Exp failed");
-                        for rep in 0..reps {
-                            let r = out_row + rep * m_j;
-                            let idx = col * m + r;
-                            acc += R::from(ts_r_mon[idx]) * g;
-                        }
-                    }
-                }
-                acc
-            };
-            b_inst.push(acc);
-        }
-        transcript.absorb_slice(&b_inst);
-        mon_b.push(b_inst);
-    }
-    if prof {
-        eprintln!("[PiFold streaming] aux mon_b done in {:?}", t_aux_mon.elapsed());
-        eprintln!("[PiFold streaming] total prove_pi_fold_streaming time {:?}", t_all.elapsed());
-    }
-
-    Ok(PiFoldProverOutput {
-        proof: PiFoldBatchedProof {
-            coins: SymphonyCoins {
-                challenges: vec![],
-                bytes: vec![],
-                events: vec![],
-            },
-            rg_params,
-            m_j,
-            m,
-            v_digits_folded,
-            had_sumcheck,
-            mon_sumcheck,
-        },
-        aux: PiFoldAuxWitness { had_u, mon_b },
-        cfs_had_u: vec![],
-        cfs_mon_b: vec![],
-    })
-}
-
-/// Streaming Π_fold prover where each instance has its own `(M1,M2,M3)`.
-///
-/// This is useful for SP1 chunking where chunks correspond to disjoint row-slices of the full R1CS.
-pub fn prove_pi_fold_streaming_hetero_m<R: CoeffRing>(
-    transcript: &mut impl Transcript<R>,
-    Ms: &[[Arc<SparseMatrix<R>>; 3]],
-    cms: &[Vec<R>],
-    witnesses: &[Arc<Vec<R>>],
-    rg_params: RPParams,
-) -> Result<PiFoldProverOutput<R>, String>
-where
-    R::BaseRing: Zq + Decompose,
-{
-    let cfg = PiFoldStreamingConfig::default();
-    prove_pi_fold_streaming_hetero_m_with_config(transcript, Ms, cms, witnesses, rg_params, &cfg)
-}
 
 pub fn prove_pi_fold_streaming_hetero_m_with_config<R: CoeffRing>(
     transcript: &mut impl Transcript<R>,
@@ -993,6 +255,7 @@ pub fn prove_pi_fold_streaming_hetero_m_with_config<R: CoeffRing>(
     witnesses: &[Arc<Vec<R>>],
     rg_params: RPParams,
     config: &PiFoldStreamingConfig,
+    cm_g_scheme: &AjtaiCommitmentScheme<R>,
 ) -> Result<PiFoldProverOutput<R>, String>
 where
     R::BaseRing: Zq + Decompose,
@@ -1051,11 +314,18 @@ where
     }
 
     // -----------------
-    // Per-instance coins
+    // Per-instance prover messages + coins
     // -----------------
+    //
+    // Ordering (Figure 2 / Figure 4):
+    // - absorb cm_f, derive J
+    // - compute g^(i) and commit c(i)=Commit(g^(i)); absorb c(i)
+    // - derive Π_mon coins (c,beta,alpha,...) that depend on the commitments
     let mut cba_all: Vec<Vec<(Vec<R>, R::BaseRing, R::BaseRing)>> = Vec::with_capacity(ell);
     let mut rc_all: Vec<Option<R::BaseRing>> = Vec::with_capacity(ell);
     let mut Js: Vec<Vec<Vec<R::BaseRing>>> = Vec::with_capacity(ell);
+    let mut proj_digits_by_inst: Vec<Arc<Vec<R::BaseRing>>> = Vec::with_capacity(ell);
+    let mut cm_g: Vec<Vec<Vec<R>>> = Vec::with_capacity(ell);
     let t_coins = Instant::now();
 
     let n_f = witnesses[0].len();
@@ -1091,10 +361,143 @@ where
     }
     let g_nvars = log2(g_len) as usize;
 
-    for cm_f in cms.iter() {
+    for (inst_idx, cm_f) in cms.iter().enumerate() {
+        let f: &[R] = &witnesses[inst_idx];
+
         transcript.absorb_slice(cm_f);
         let J = derive_J::<R>(transcript, rg_params.lambda_pj, rg_params.l_h);
-        Js.push(J);
+        Js.push(J.clone());
+
+        // Precompute projected digits once per instance.
+        // Layout: digits[(row * d + col) * k_g + dig] where
+        // - row ∈ [0, m_j)
+        // - col ∈ [0, d)
+        // - dig ∈ [0, k_g)
+        let k_g = rg_params.k_g;
+        let lambda_pj = rg_params.lambda_pj;
+        let l_h = rg_params.l_h;
+        let d_prime = rg_params.d_prime;
+
+        let mut digits_flat = vec![R::BaseRing::ZERO; m_j * d * k_g];
+
+        #[cfg(feature = "parallel")]
+        {
+            use ark_std::cfg_into_iter;
+            let out_ptr = digits_flat.as_mut_ptr() as usize;
+            cfg_into_iter!(0..m_j).for_each(|out_row| {
+                let i = out_row % lambda_pj;
+                let b = out_row / lambda_pj;
+                if const_coeff_fastpath {
+                    // Constant-coeff specialization: only coeff[0] can be nonzero.
+                    let mut h0 = R::BaseRing::ZERO;
+                    for t in 0..l_h {
+                        let in_row = b * l_h + t;
+                        if in_row >= f.len() {
+                            continue;
+                        }
+                        let coef = J[i][t];
+                        h0 += coef * f[in_row].coeffs()[0];
+                    }
+                    let mut h_row = vec![R::BaseRing::ZERO; d];
+                    h_row[0] = h0;
+                    let digits = h_row.decompose_to_vec(d_prime, k_g);
+                    for dig in 0..k_g {
+                        let idx = (out_row * d) * k_g + dig; // col=0
+                        unsafe {
+                            *(out_ptr as *mut R::BaseRing).add(idx) = digits[0][dig];
+                        }
+                    }
+                } else {
+                    let mut h_row = vec![R::BaseRing::ZERO; d];
+                    for t in 0..l_h {
+                        let in_row = b * l_h + t;
+                        if in_row >= f.len() {
+                            continue;
+                        }
+                        let coef = J[i][t];
+                        let coeffs = f[in_row].coeffs();
+                        for col in 0..d {
+                            h_row[col] += coef * coeffs[col];
+                        }
+                    }
+                    let digits = h_row.decompose_to_vec(d_prime, k_g);
+                    for col in 0..d {
+                        for dig in 0..k_g {
+                            let idx = (out_row * d + col) * k_g + dig;
+                            unsafe {
+                                *(out_ptr as *mut R::BaseRing).add(idx) = digits[col][dig];
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for out_row in 0..m_j {
+                let i = out_row % lambda_pj;
+                let b = out_row / lambda_pj;
+                if const_coeff_fastpath {
+                    let mut h0 = R::BaseRing::ZERO;
+                    for t in 0..l_h {
+                        let in_row = b * l_h + t;
+                        if in_row >= f.len() {
+                            continue;
+                        }
+                        let coef = J[i][t];
+                        h0 += coef * f[in_row].coeffs()[0];
+                    }
+                    let mut h_row = vec![R::BaseRing::ZERO; d];
+                    h_row[0] = h0;
+                    let digits = h_row.decompose_to_vec(d_prime, k_g);
+                    for dig in 0..k_g {
+                        digits_flat[(out_row * d) * k_g + dig] = digits[0][dig];
+                    }
+                } else {
+                    let mut h_row = vec![R::BaseRing::ZERO; d];
+                    for t in 0..l_h {
+                        let in_row = b * l_h + t;
+                        if in_row >= f.len() {
+                            continue;
+                        }
+                        let coef = J[i][t];
+                        let coeffs = f[in_row].coeffs();
+                        for col in 0..d {
+                            h_row[col] += coef * coeffs[col];
+                        }
+                    }
+                    let digits = h_row.decompose_to_vec(d_prime, k_g);
+                    for col in 0..d {
+                        for dig in 0..k_g {
+                            digits_flat[(out_row * d + col) * k_g + dig] = digits[col][dig];
+                        }
+                    }
+                }
+            }
+        }
+
+        let digits_flat = Arc::new(digits_flat);
+        proj_digits_by_inst.push(digits_flat.clone());
+
+        // Commit to g^(i) and bind commitments into the transcript before Π_mon challenges.
+        let mut cm_g_inst: Vec<Vec<R>> = Vec::with_capacity(rg_params.k_g);
+        for dig in 0..rg_params.k_g {
+            let mut g_vec: Vec<R> = Vec::with_capacity(m * d);
+            for col in 0..d {
+                for row in 0..m {
+                    let out_row = row % m_j;
+                    let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
+                    g_vec.push(exp::<R>(digit).expect("Exp failed"));
+                }
+            }
+            let c = cm_g_scheme
+                .commit(&g_vec)
+                .map_err(|e| format!("PiFold: cm_g commit failed: {e:?}"))?;
+            let c_vec = c.as_ref().to_vec();
+            transcript.absorb_slice(&c_vec);
+            cm_g_inst.push(c_vec);
+        }
+        cm_g.push(cm_g_inst);
 
         let mut cba: Vec<(Vec<R>, R::BaseRing, R::BaseRing)> = Vec::with_capacity(rg_params.k_g);
         for _ in 0..rg_params.k_g {
@@ -1230,124 +633,8 @@ where
         .map(|cba| cba.iter().map(|(_, _, a)| R::from(*a)).collect::<Vec<_>>())
         .collect::<Vec<_>>();
 
-    let t_digits = Instant::now();
-    let mut proj_digits_by_inst: Vec<Arc<Vec<R::BaseRing>>> = Vec::with_capacity(ell);
-    for inst_idx in 0..ell {
-            let f: &[R] = &witnesses[inst_idx];
-            let J = &Js[inst_idx];
-        let k_g = rg_params.k_g;
-        let lambda_pj = rg_params.lambda_pj;
-        let l_h = rg_params.l_h;
-        let d_prime = rg_params.d_prime;
-
-        let mut digits_flat = vec![R::BaseRing::ZERO; m_j * d * k_g];
-
-        #[cfg(feature = "parallel")]
-        {
-            use ark_std::cfg_into_iter;
-            let out_ptr = digits_flat.as_mut_ptr() as usize;
-            cfg_into_iter!(0..m_j).for_each(|out_row| {
-                let i = out_row % lambda_pj;
-                let b = out_row / lambda_pj;
-                if const_coeff_fastpath {
-                    let mut h0 = R::BaseRing::ZERO;
-                    for t in 0..l_h {
-                        let in_row = b * l_h + t;
-                        if in_row >= f.len() {
-                            continue;
-                        }
-                        let coef = J[i][t];
-                        h0 += coef * f[in_row].coeffs()[0];
-                    }
-                    let mut h_row = vec![R::BaseRing::ZERO; d];
-                    h_row[0] = h0;
-                    let digits = h_row.decompose_to_vec(d_prime, k_g);
-                    for dig in 0..k_g {
-                        let idx = (out_row * d) * k_g + dig; // col=0
-                        unsafe {
-                            let out = (out_ptr as *mut R::BaseRing).add(idx);
-                            *out = digits[0][dig];
-                        }
-                    }
-                } else {
-                    let mut h_row = vec![R::BaseRing::ZERO; d];
-                    for t in 0..l_h {
-                        let in_row = b * l_h + t;
-                        if in_row >= f.len() {
-                            continue;
-                        }
-                        let coef = J[i][t];
-                        let coeffs = f[in_row].coeffs();
-                        for col in 0..d {
-                            h_row[col] += coef * coeffs[col];
-                        }
-                    }
-                    let digits = h_row.decompose_to_vec(d_prime, k_g);
-                    for col in 0..d {
-                        for dig in 0..k_g {
-                            let idx = (out_row * d + col) * k_g + dig;
-                            unsafe {
-                                let out = (out_ptr as *mut R::BaseRing).add(idx);
-                                *out = digits[col][dig];
-                            }
-                        }
-                    }
-                }
-            });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for out_row in 0..m_j {
-                let i = out_row % lambda_pj;
-                let b = out_row / lambda_pj;
-                if const_coeff_fastpath {
-                    let mut h0 = R::BaseRing::ZERO;
-                    for t in 0..l_h {
-                        let in_row = b * l_h + t;
-                        if in_row >= f.len() {
-                            continue;
-                        }
-                        let coef = J[i][t];
-                        h0 += coef * f[in_row].coeffs()[0];
-                    }
-                    let mut h_row = vec![R::BaseRing::ZERO; d];
-                    h_row[0] = h0;
-                    let digits = h_row.decompose_to_vec(d_prime, k_g);
-                    for dig in 0..k_g {
-                        digits_flat[(out_row * d) * k_g + dig] = digits[0][dig];
-                    }
-                } else {
-                    let mut h_row = vec![R::BaseRing::ZERO; d];
-                    for t in 0..l_h {
-                        let in_row = b * l_h + t;
-                        if in_row >= f.len() {
-                            continue;
-                        }
-                        let coef = J[i][t];
-                        let coeffs = f[in_row].coeffs();
-                        for col in 0..d {
-                            h_row[col] += coef * coeffs[col];
-                        }
-                    }
-                    let digits = h_row.decompose_to_vec(d_prime, k_g);
-                    for col in 0..d {
-                        for dig in 0..k_g {
-                            digits_flat[(out_row * d + col) * k_g + dig] = digits[col][dig];
-                        }
-                    }
-                }
-            }
-        }
-        proj_digits_by_inst.push(Arc::new(digits_flat));
-    }
-    if prof {
-        eprintln!(
-            "[PiFold streaming hetero] proj_digits: {:?} (rayon_threads={}, const_coeff_fastpath={})",
-            t_digits.elapsed(),
-            rayon::current_num_threads(),
-            const_coeff_fastpath
-        );
-    }
+    // NOTE: projected digits and cm_g commitments were computed above, and cm_g commitments were
+    // absorbed into the transcript before Π_mon coins were derived.
 
     let t_mon_build = Instant::now();
     for inst_idx in 0..ell {
@@ -1659,6 +946,7 @@ where
             rg_params,
             m_j,
             m,
+            cm_g,
             v_digits_folded,
             had_sumcheck,
             mon_sumcheck,

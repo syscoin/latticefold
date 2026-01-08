@@ -57,6 +57,7 @@ fn test_streaming_pifold_fs_roundtrip_verifies() {
         AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, kappa, 3 * R::dimension());
     let scheme_mon =
         AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, kappa, rg_params.k_g);
+    let scheme_g = AjtaiCommitmentScheme::<R>::seeded(b"cm_g", MASTER_SEED, kappa, m * R::dimension());
 
     let open = MultiAjtaiOpenVerifier::<R>::new()
         .with_scheme("cfs_had_u", scheme_had.clone())
@@ -74,6 +75,7 @@ fn test_streaming_pifold_fs_roundtrip_verifies() {
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),
+        &scheme_g,
         rg_params,
         &cfg,
     )

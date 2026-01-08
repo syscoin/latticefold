@@ -90,6 +90,17 @@ where
     /// m used by Π_mon (row-domain size).
     pub m: usize,
 
+    /// Per-instance monomial commitment vectors `c(i)` (Figure 2 Step 3), i.e. Ajtai commitments to
+    /// the large monomial vectors `g^(i)`.
+    ///
+    /// Shape: `[ell][k_g][kappa]`.
+    ///
+    /// Notes:
+    /// - These are prover messages that must be fixed **before** the Π_mon challenges are derived.
+    /// - We do not open them in `R_cp`; they are part of the reduced/output relation `R_o`
+    ///   (paper `R_batchlin`) and will be proved succinctly by `π_lin`.
+    pub cm_g: Vec<Vec<Vec<R>>>,
+
     /// Folded Π_rg hook message v_digits* (k_g × d), using scalar β (constants in the base field).
     pub v_digits_folded: Vec<Vec<R::BaseRing>>,
 
@@ -429,10 +440,23 @@ where
         (0usize, 0usize)
     };
 
-    for cm_f in cms.iter() {
+    if proof.cm_g.len() != ell {
+        return Err("PiFold: cm_g length mismatch".to_string());
+    }
+
+    for (inst_idx, cm_f) in cms.iter().enumerate() {
         transcript.absorb_slice(cm_f);
         let J = derive_J::<R>(transcript, rg_params.lambda_pj, rg_params.l_h);
         Js.push(J);
+
+        // Bind the monomial commitments c(i) into the transcript before deriving Π_mon coins.
+        // (These are prover messages in Figure 2 Step 3.)
+        if proof.cm_g[inst_idx].len() != rg_params.k_g {
+            return Err("PiFold: cm_g k_g mismatch".to_string());
+        }
+        for dig in 0..rg_params.k_g {
+            transcript.absorb_slice(&proof.cm_g[inst_idx][dig]);
+        }
 
         let mut cba: Vec<(Vec<R>, R::BaseRing, R::BaseRing)> = Vec::with_capacity(rg_params.k_g);
         for _ in 0..rg_params.k_g {
@@ -693,7 +717,19 @@ where
         r: r_star,
         v: v_rq,
     };
-    let folded_bat = SymphonyBatchLin { r_prime, u: u_folded };
+    // Fold commitments c*(i) := Σ beta_j * c_j(i).
+    let kappa = proof.cm_g[0][0].len();
+    let mut c_g_folded = vec![vec![R::ZERO; kappa]; rg_params.k_g];
+    for inst_idx in 0..ell {
+        let b = beta_ring[inst_idx];
+        for dig in 0..rg_params.k_g {
+            for j in 0..kappa {
+                c_g_folded[dig][j] += b * proof.cm_g[inst_idx][dig][j];
+            }
+        }
+    }
+
+    let folded_bat = SymphonyBatchLin { r_prime, c_g: c_g_folded, u: u_folded };
 
     Ok((folded_inst, folded_bat))
 }
@@ -791,10 +827,22 @@ where
         (0usize, 0usize)
     };
 
-    for cm_f in cms.iter() {
+    if proof.cm_g.len() != ell {
+        return Err("PiFold: cm_g length mismatch".to_string());
+    }
+
+    for (inst_idx, cm_f) in cms.iter().enumerate() {
         transcript.absorb_slice(cm_f);
         let J = derive_J::<R>(transcript, rg_params.lambda_pj, rg_params.l_h);
         Js.push(J);
+
+        // Bind the monomial commitments c(i) into the transcript before deriving Π_mon coins.
+        if proof.cm_g[inst_idx].len() != rg_params.k_g {
+            return Err("PiFold: cm_g k_g mismatch".to_string());
+        }
+        for dig in 0..rg_params.k_g {
+            transcript.absorb_slice(&proof.cm_g[inst_idx][dig]);
+        }
 
         let mut cba: Vec<(Vec<R>, R::BaseRing, R::BaseRing)> = Vec::with_capacity(rg_params.k_g);
         for _ in 0..rg_params.k_g {
@@ -1051,7 +1099,18 @@ where
     }
 
     let folded_inst = SymphonyInstance { c: c_star, r: r_star, v: v_rq };
-    let folded_bat = SymphonyBatchLin { r_prime, u: u_folded };
+    // Fold commitments c*(i) := Σ beta_j * c_j(i).
+    let kappa = proof.cm_g[0][0].len();
+    let mut c_g_folded = vec![vec![R::ZERO; kappa]; rg_params.k_g];
+    for inst_idx in 0..ell {
+        let b = beta_ring[inst_idx];
+        for dig in 0..rg_params.k_g {
+            for j in 0..kappa {
+                c_g_folded[dig][j] += b * proof.cm_g[inst_idx][dig][j];
+            }
+        }
+    }
+    let folded_bat = SymphonyBatchLin { r_prime, c_g: c_g_folded, u: u_folded };
 
     Ok((folded_inst, folded_bat))
 }

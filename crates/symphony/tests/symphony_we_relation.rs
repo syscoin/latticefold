@@ -35,6 +35,7 @@ fn setup_two_instances_any_witness_holds() -> (
     RPParams,
     AjtaiCommitmentScheme<R>,
     AjtaiCommitmentScheme<R>,
+    AjtaiCommitmentScheme<R>,
 ) {
     let n = 1 << 10;
     let m = 1 << 10;
@@ -73,13 +74,22 @@ fn setup_two_instances_any_witness_holds() -> (
         3 * R::dimension(),
     );
     let scheme_mon = AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 2, rg_params.k_g);
+    let scheme_g = AjtaiCommitmentScheme::<R>::seeded(b"cm_g", MASTER_SEED, 2, m * R::dimension());
 
-    ([m1, m2, m3], vec![cm0, cm1], vec![f0, f1], rg_params, scheme_had, scheme_mon)
+    (
+        [m1, m2, m3],
+        vec![cm0, cm1],
+        vec![f0, f1],
+        rg_params,
+        scheme_had,
+        scheme_mon,
+        scheme_g,
+    )
 }
 
 #[test]
 fn test_cp_verify_accepts_and_ro_check_accepts() {
-    let (mats, cms, witnesses, rg_params, scheme_had, scheme_mon) =
+    let (mats, cms, witnesses, rg_params, scheme_had, scheme_mon, scheme_g) =
         setup_two_instances_any_witness_holds();
     let [m1, m2, m3] = mats;
 
@@ -95,6 +105,7 @@ fn test_cp_verify_accepts_and_ro_check_accepts() {
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),
+        &scheme_g,
         rg_params,
         &cfg,
     )
@@ -126,7 +137,7 @@ fn test_cp_verify_accepts_and_ro_check_accepts() {
 
 #[test]
 fn test_ro_check_rejects_bad_witness() {
-    let (mats, cms, witnesses, rg_params, scheme_had, scheme_mon) =
+    let (mats, cms, witnesses, rg_params, scheme_had, scheme_mon, scheme_g) =
         setup_two_instances_any_witness_holds();
     let [m1, m2, m3] = mats;
 
@@ -140,6 +151,7 @@ fn test_ro_check_rejects_bad_witness() {
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),
+        &scheme_g,
         rg_params,
         &PiFoldStreamingConfig::default(),
     )
@@ -172,7 +184,7 @@ fn test_ro_check_rejects_bad_witness() {
 
 #[test]
 fn test_cp_verify_rejects_tampered_cfs_commitment() {
-    let (mats, cms, witnesses, rg_params, scheme_had, scheme_mon) =
+    let (mats, cms, witnesses, rg_params, scheme_had, scheme_mon, scheme_g) =
         setup_two_instances_any_witness_holds();
     let [m1, m2, m3] = mats;
 
@@ -186,6 +198,7 @@ fn test_cp_verify_rejects_tampered_cfs_commitment() {
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),
+        &scheme_g,
         rg_params,
         &PiFoldStreamingConfig::default(),
     )

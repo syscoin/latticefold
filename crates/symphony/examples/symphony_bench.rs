@@ -79,6 +79,8 @@ fn main() {
             AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, 32, 3 * R::dimension());
         let scheme_mon =
             AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 32, rg_params.k_g);
+        let scheme_g =
+            AjtaiCommitmentScheme::<R>::seeded(b"cm_g", MASTER_SEED, 32, m * R::dimension());
 
         let cfg = PiFoldStreamingConfig::default();
         let prove_start = Instant::now();
@@ -89,6 +91,7 @@ fn main() {
             &public_inputs,
             Some(&scheme_had),
             Some(&scheme_mon),
+            &scheme_g,
             rg_params.clone(),
             &cfg,
         )
