@@ -361,6 +361,9 @@ where
     }
     let g_nvars = log2(g_len) as usize;
 
+    // Const-coeff cm_g optimization caches A·1 once (it is independent of the instance).
+    let mut a1_cached: Option<Vec<R>> = None;
+
     for (inst_idx, cm_f) in cms.iter().enumerate() {
         let f: &[R] = &witnesses[inst_idx];
 
@@ -491,12 +494,15 @@ where
         let n = m * d;
         let g0 = exp::<R>(R::BaseRing::ZERO).expect("Exp failed");
         let cm_g_inst: Vec<Vec<R>> = if const_coeff_fastpath && d > 1 {
-            // Precompute Commit(1) once per scheme and reuse across all instances/digits.
-            // NOTE: This is the same for all digits/instances because the Ajtai matrix is fixed.
-            let a1 = cm_g_scheme
-                .commit_many_with(n, 1, |_j, out: &mut [R]| out[0] = R::ONE)
-                .map_err(|e| format!("PiFold: cm_g commit(A·1) failed: {e:?}"))?;
-            let base = a1[0].as_ref().iter().map(|x| *x * g0).collect::<Vec<_>>();
+            // Compute A·1 once (shared across instances). Then scale by g0 per proof.
+            if a1_cached.is_none() {
+                let a1 = cm_g_scheme
+                    .commit_many_with(n, 1, |_j, out: &mut [R]| out[0] = R::ONE)
+                    .map_err(|e| format!("PiFold: cm_g commit(A·1) failed: {e:?}"))?;
+                a1_cached = Some(a1[0].as_ref().to_vec());
+            }
+            let a1_vec = a1_cached.as_ref().expect("a1_cached present");
+            let base = a1_vec.iter().map(|x| *x * g0).collect::<Vec<_>>();
 
             // Commit the correction Δ over only the col=0 range j ∈ [0, m).
             let digits_flat_for_commit = digits_flat.clone();
