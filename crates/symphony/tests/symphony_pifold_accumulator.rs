@@ -9,9 +9,9 @@ use symphony::symphony_coins::derive_beta_chi;
 use latticefold::transcript::Transcript;
 use symphony::{
     rp_rgchk::RPParams,
-    symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m,
+    symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices},
     symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig},
-    symphony_open::AjtaiOpenVerifier,
+    symphony_open::MultiAjtaiOpenVerifier,
 };
 use latticefold::commitment::AjtaiCommitmentScheme;
 use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing, Ring};
@@ -50,7 +50,6 @@ fn test_pifold_accumulator_two_steps() {
     let m3 = Arc::new(m3);
 
     let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
-    let open = AjtaiOpenVerifier { scheme: scheme.clone() };
 
     let rg_params = RPParams {
         l_h: 64,
@@ -58,6 +57,15 @@ fn test_pifold_accumulator_two_steps() {
         k_g: 4,
         d_prime: (R::dimension() as u128) / 2,
     };
+
+    // CP commitment schemes for aux messages (needed for the canonical verifier API).
+    let scheme_had =
+        AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, 2, 3 * R::dimension());
+    let scheme_mon =
+        AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 2, rg_params.k_g);
+    let open_cfs = MultiAjtaiOpenVerifier::<R>::new()
+        .with_scheme("cfs_had_u", scheme_had.clone())
+        .with_scheme("cfs_mon_b", scheme_mon.clone());
 
     // Accumulator starts at f_acc = 1.
     let mut f_acc = vec![R::one(); n];
@@ -79,8 +87,8 @@ fn test_pifold_accumulator_two_steps() {
         &[cm_acc.clone(), cm1.clone()],
         &[Arc::new(f_acc.clone()), Arc::new(f1.clone())],
         &[],
-        None,
-        None,
+        Some(&scheme_had),
+        Some(&scheme_mon),
         rg_params.clone(),
         &cfg,
     )
@@ -101,21 +109,17 @@ fn test_pifold_accumulator_two_steps() {
     let beta10 = R::from(beta1_cts[0]);
     let beta11 = R::from(beta1_cts[1]);
 
-    let ms_refs: Vec<[&SparseMatrix<R>; 3]> = vec![
-        [&m1, &m2, &m3],
-        [&m1, &m2, &m3],
-    ];
-
-    let (folded1, _bat1) = verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m::<R, PC>(
-        ms_refs.as_slice(),
+    let attempt1 = verify_pi_fold_cp_poseidon_fs::<R, PC>(
+        PiFoldMatrices::Shared([&*m1, &*m2, &*m3]),
         &[cm_acc.clone(), cm1.clone()],
         &pf1,
-        &open,
-        &[f_acc.clone(), f1.clone()],
-        None,
+        &open_cfs,
+        &pf1_out.cfs_had_u,
+        &pf1_out.cfs_mon_b,
+        &pf1_out.aux,
         &[],
-    )
-    .unwrap();
+    );
+    let (folded1, _bat1) = attempt1.result.unwrap();
 
     // Update explicit accumulator witness and commitment.
     f_acc = fold_vec(beta10, beta11, &f_acc, &f1);
@@ -131,8 +135,8 @@ fn test_pifold_accumulator_two_steps() {
         &[cm_acc.clone(), cm2.clone()],
         &[Arc::new(f_acc.clone()), Arc::new(f2.clone())],
         &[],
-        None,
-        None,
+        Some(&scheme_had),
+        Some(&scheme_mon),
         rg_params.clone(),
         &cfg,
     )
@@ -153,16 +157,17 @@ fn test_pifold_accumulator_two_steps() {
     let beta20 = R::from(beta2_cts[0]);
     let beta21 = R::from(beta2_cts[1]);
 
-    let (folded2, _bat2) = verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m::<R, PC>(
-        ms_refs.as_slice(),
+    let attempt2 = verify_pi_fold_cp_poseidon_fs::<R, PC>(
+        PiFoldMatrices::Shared([&*m1, &*m2, &*m3]),
         &[cm_acc.clone(), cm2.clone()],
         &pf2,
-        &open,
-        &[f_acc.clone(), f2.clone()],
-        None,
+        &open_cfs,
+        &pf2_out.cfs_had_u,
+        &pf2_out.cfs_mon_b,
+        &pf2_out.aux,
         &[],
-    )
-    .unwrap();
+    );
+    let (folded2, _bat2) = attempt2.result.unwrap();
 
     f_acc = fold_vec(beta20, beta21, &f_acc, &f2);
     cm_acc = scheme.commit(&f_acc).unwrap().as_ref().to_vec();

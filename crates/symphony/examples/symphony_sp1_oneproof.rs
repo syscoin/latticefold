@@ -23,7 +23,7 @@ use stark_rings::PolyRing;
 use stark_rings::Ring;
 use symphony::rp_rgchk::RPParams;
 use symphony::symphony_open::MultiAjtaiOpenVerifier;
-use symphony::symphony_we_relation::{check_r_we_poseidon_fs_hetero_m_with_metrics_result, TrivialRo};
+use symphony::symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices};
 use symphony::sp1_r1cs_loader::FieldFromU64;
 use symphony::symphony_pifold_streaming::{
     prove_pi_fold_poseidon_fs, PiFoldStreamingConfig,
@@ -175,17 +175,18 @@ fn main() {
             .with_scheme("cfs_mon_b", (*scheme_mon).clone());
 
         let t_vfy = Instant::now();
-        let (res, metrics) = check_r_we_poseidon_fs_hetero_m_with_metrics_result::<R, PC, TrivialRo>(
-                &ms_ref,
-                &cms_all,
-                &out.proof,
-                &open_cfs,
-                &out.cfs_had_u,
-                &out.cfs_mon_b,
-                &out.aux,
-                &public_inputs,
-                &(),
-            );
+        let attempt = verify_pi_fold_cp_poseidon_fs::<R, PC>(
+            PiFoldMatrices::Hetero(ms_ref.as_slice()),
+            &cms_all,
+            &out.proof,
+            &open_cfs,
+            &out.cfs_had_u,
+            &out.cfs_mon_b,
+            &out.aux,
+            &public_inputs,
+        );
+        let res = attempt.result;
+        let metrics = attempt.metrics;
         println!("  verify (cp/aux): {:?}", t_vfy.elapsed());
         if let Err(e) = &res {
             println!("  verify (cp/aux) failed (expected with dummy witness): {e}");

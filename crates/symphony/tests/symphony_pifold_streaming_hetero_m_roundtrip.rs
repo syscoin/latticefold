@@ -3,12 +3,9 @@ use latticefold::commitment::AjtaiCommitmentScheme;
 use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing, Ring};
 use stark_rings_linalg::SparseMatrix;
 use symphony::rp_rgchk::RPParams;
-use symphony::symphony_open::AjtaiOpenVerifier;
 use symphony::symphony_open::MultiAjtaiOpenVerifier;
 use symphony::symphony_pifold_batched::{
-    verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m,
-    verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics,
-    verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m,
+    verify_pi_fold_cp_poseidon_fs, PiFoldMatrices,
 };
 use symphony::poseidon_trace::replay_poseidon_transcript_trace;
 use symphony::symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig};
@@ -70,7 +67,6 @@ fn test_pifold_streaming_hetero_m_roundtrip() {
     };
 
     let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
-    let open = AjtaiOpenVerifier { scheme: scheme.clone() };
 
     let f0 = vec![R::ONE; n];
     let f1 = (0..n).map(|i| if i % 2 == 0 { R::ONE } else { R::ZERO }).collect::<Vec<_>>();
@@ -103,41 +99,18 @@ fn test_pifold_streaming_hetero_m_roundtrip() {
     )
     .expect("prove failed");
 
-    // Verify using openings (correctness-first path).
     let ms_refs: Vec<[&SparseMatrix<R>; 3]> = vec![
         [&a0, &b0, &c0],
         [&a1, &b1, &c1],
     ];
-    let (_folded_inst, _folded_bat) = verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m::<R, PC>(
-        ms_refs.as_slice(),
-        &cms,
-        &out.proof,
-        &open,
-        &[f0, f1],
-        None,
-        &public_inputs,
-    )
-    .expect("verify failed");
 
-    // WE/CP-facing verification: verify using CP transcript-message commitments + openings to aux.
+    // Canonical CP-style verification: verify using transcript-message commitments + openings to aux.
     let open_cfs = MultiAjtaiOpenVerifier::new()
         .with_scheme("cfs_had_u", scheme_had)
         .with_scheme("cfs_mon_b", scheme_mon);
-    let _ = verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m::<R, PC>(
-        ms_refs.as_slice(),
-        &cms,
-        &out.proof,
-        &open_cfs,
-        &out.cfs_had_u,
-        &out.cfs_mon_b,
-        &out.aux,
-        &public_inputs,
-    )
-    .expect("cp verify failed");
 
-    // Trace harness: ensure trace lengths match metrics counters.
-    let (_out2, metrics, trace) = verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics::<R, PC>(
-        ms_refs.as_slice(),
+    let attempt = verify_pi_fold_cp_poseidon_fs::<R, PC>(
+        PiFoldMatrices::Hetero(ms_refs.as_slice()),
         &cms,
         &out.proof,
         &open_cfs,
@@ -145,8 +118,10 @@ fn test_pifold_streaming_hetero_m_roundtrip() {
         &out.cfs_mon_b,
         &out.aux,
         &public_inputs,
-    )
-    .expect("cp verify (metrics) failed");
+    );
+    attempt.result.expect("cp verify failed");
+    let metrics = attempt.metrics;
+    let trace = attempt.trace;
 
     assert_eq!(metrics.absorbed_elems as usize, trace.absorbed.len());
     assert_eq!(metrics.squeezed_field_elems as usize, trace.squeezed_field.len());

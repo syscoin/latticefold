@@ -8,7 +8,7 @@ use symphony::we_gate_arith::WeGateDr1csBuilder;
 use symphony::poseidon_trace::replay_poseidon_transcript_trace;
 use symphony::rp_rgchk::RPParams;
 use symphony::symphony_open::MultiAjtaiOpenVerifier;
-use symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics;
+use symphony::symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices};
 use symphony::symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig};
 use dpp::{
     dr1cs_flpcp::{Dr1csInstanceSparse as DppDr1csInstanceSparse, RsDr1csFlpcpSparse, RsDr1csNpFlpcpSparse},
@@ -121,18 +121,19 @@ fn test_poseidon_trace_arithmetization_roundtrip_real_verifier() {
     let open_cfs = MultiAjtaiOpenVerifier::new()
         .with_scheme("cfs_had_u", scheme_had)
         .with_scheme("cfs_mon_b", scheme_mon);
-    let (_folded_out, metrics, trace) =
-        verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics::<R, PC>(
-            ms_refs.as_slice(),
-            &cms,
-            &out.proof,
-            &open_cfs,
-            &out.cfs_had_u,
-            &out.cfs_mon_b,
-            &out.aux,
-            &public_inputs,
-        )
-        .expect("cp verify failed");
+    let attempt = verify_pi_fold_cp_poseidon_fs::<R, PC>(
+        PiFoldMatrices::Hetero(ms_refs.as_slice()),
+        &cms,
+        &out.proof,
+        &open_cfs,
+        &out.cfs_had_u,
+        &out.cfs_mon_b,
+        &out.aux,
+        &public_inputs,
+    );
+    attempt.result.expect("cp verify failed");
+    let metrics = attempt.metrics;
+    let trace = attempt.trace;
 
     assert_eq!(metrics.absorbed_elems as usize, trace.absorbed.len());
     assert_eq!(metrics.squeezed_field_elems as usize, trace.squeezed_field.len());
@@ -269,18 +270,18 @@ fn test_poseidon_trace_sparse_dpp_end_to_end_accepts() {
     let open_cfs = MultiAjtaiOpenVerifier::new()
         .with_scheme("cfs_had_u", scheme_had.clone())
         .with_scheme("cfs_mon_b", scheme_mon.clone());
-    let (_folded_out, _metrics, trace) =
-        verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics::<R, PC>(
-            ms_refs.as_slice(),
-            &cms,
-            &out.proof,
-            &open_cfs,
-            &out.cfs_had_u,
-            &out.cfs_mon_b,
-            &out.aux,
-            &public_inputs,
-        )
-        .expect("cp verify failed");
+    let attempt = verify_pi_fold_cp_poseidon_fs::<R, PC>(
+        PiFoldMatrices::Hetero(ms_refs.as_slice()),
+        &cms,
+        &out.proof,
+        &open_cfs,
+        &out.cfs_had_u,
+        &out.cfs_mon_b,
+        &out.aux,
+        &public_inputs,
+    );
+    attempt.result.expect("cp verify failed");
+    let trace = attempt.trace;
 
     // IMPORTANT: for this DPP integration test we only take a short prefix of the transcript ops,
     // to keep the resulting dR1CS small (and thus keep the RS FLPCP proof length `m=2k` small).
@@ -524,18 +525,18 @@ fn test_poseidon_trace_rs_flpcp_full_trace_honest_accepts() {
     let open_cfs = MultiAjtaiOpenVerifier::new()
         .with_scheme("cfs_had_u", scheme_had)
         .with_scheme("cfs_mon_b", scheme_mon);
-    let (_folded_out, _metrics, trace) =
-        verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics::<R, PC>(
-            ms_refs.as_slice(),
-            &cms,
-            &out.proof,
-            &open_cfs,
-            &out.cfs_had_u,
-            &out.cfs_mon_b,
-            &out.aux,
-            &public_inputs,
-        )
-        .expect("cp verify failed");
+    let attempt = verify_pi_fold_cp_poseidon_fs::<R, PC>(
+        PiFoldMatrices::Hetero(ms_refs.as_slice()),
+        &cms,
+        &out.proof,
+        &open_cfs,
+        &out.cfs_had_u,
+        &out.cfs_mon_b,
+        &out.aux,
+        &public_inputs,
+    );
+    attempt.result.expect("cp verify failed");
+    let trace = attempt.trace;
 
     // Arithmetize the FULL trace into sparse dR1CS.
     type BF = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
@@ -646,18 +647,18 @@ fn test_poseidon_trace_full_dpp_end_to_end_no_boolean_full_trace() {
     let open_cfs = MultiAjtaiOpenVerifier::new()
         .with_scheme("cfs_had_u", scheme_had)
         .with_scheme("cfs_mon_b", scheme_mon);
-    let (_folded_out, _metrics, trace) =
-        verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics::<R, PC>(
-            ms_refs.as_slice(),
-            &cms,
-            &out.proof,
-            &open_cfs,
-            &out.cfs_had_u,
-            &out.cfs_mon_b,
-            &out.aux,
-            &public_inputs,
-        )
-        .expect("cp verify failed");
+    let attempt = verify_pi_fold_cp_poseidon_fs::<R, PC>(
+        PiFoldMatrices::Hetero(ms_refs.as_slice()),
+        &cms,
+        &out.proof,
+        &open_cfs,
+        &out.cfs_had_u,
+        &out.cfs_mon_b,
+        &out.aux,
+        &public_inputs,
+    );
+    attempt.result.expect("cp verify failed");
+    let trace = attempt.trace;
 
     // Arithmetize FULL trace to sparse dR1CS.
     type BF = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;

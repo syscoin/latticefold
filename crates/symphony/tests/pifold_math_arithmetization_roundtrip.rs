@@ -11,7 +11,7 @@ use symphony::public_coin_transcript::FixedTranscript;
 use symphony::rp_rgchk::RPParams;
 use symphony::symphony_coins::{derive_J, derive_beta_chi};
 use symphony::symphony_open::MultiAjtaiOpenVerifier;
-use symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics;
+use symphony::symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices};
 use symphony::symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig};
 use latticefold::commitment::AjtaiCommitmentScheme;
 
@@ -119,18 +119,17 @@ fn test_pifold_math_dr1cs_roundtrip_satisfiable_and_tamper_fails() {
     let open_cfs = MultiAjtaiOpenVerifier::new()
         .with_scheme("cfs_had_u", scheme_had)
         .with_scheme("cfs_mon_b", scheme_mon);
-    let (_folded_out, _metrics, _trace) =
-        verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics::<R, PC>(
-            ms_refs.as_slice(),
-            &cms,
-            &out.proof,
-            &open_cfs,
-            &out.cfs_had_u,
-            &out.cfs_mon_b,
-            &out.aux,
-            &public_inputs,
-        )
-        .expect("cp verify failed");
+    let attempt = verify_pi_fold_cp_poseidon_fs::<R, PC>(
+        PiFoldMatrices::Hetero(ms_refs.as_slice()),
+        &cms,
+        &out.proof,
+        &open_cfs,
+        &out.cfs_had_u,
+        &out.cfs_mon_b,
+        &out.aux,
+        &public_inputs,
+    );
+    attempt.result.expect("cp verify failed");
 
     // ---------------------------------------------------------------------
     // Re-extract the verifier coin pieces by replaying the exact verifier schedule

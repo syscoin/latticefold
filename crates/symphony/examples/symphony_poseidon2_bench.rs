@@ -520,8 +520,8 @@ where
     use symphony::{
         rp_rgchk::RPParams,
         symphony_open::MultiAjtaiOpenVerifier,
+        symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices},
         symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig},
-        symphony_we_relation::check_r_cp_poseidon_fs,
     };
 
     println!("\n=== Testing Symphony Poseidon2 with {} permutation(s), k_g={} ===", num_permutations, k_g);
@@ -637,9 +637,9 @@ where
         .with_scheme("cfs_mon_b", scheme_mon.clone());
 
     // Helper: verify R_cp for a produced output
-    let verify = |out: &symphony::symphony_pifold_batched::PiFoldProverOutput<R>| -> Result<_, String> {
-        check_r_cp_poseidon_fs::<R, PC>(
-            [m1.as_ref(), m2.as_ref(), m3.as_ref()],
+    let verify = |out: &symphony::symphony_pifold_batched::PiFoldProverOutput<R>| -> Result<(), String> {
+        let attempt = verify_pi_fold_cp_poseidon_fs::<R, PC>(
+            PiFoldMatrices::Shared([m1.as_ref(), m2.as_ref(), m3.as_ref()]),
             &[cm.clone()],
             &out.proof,
             &open,
@@ -647,7 +647,9 @@ where
             &out.cfs_mon_b,
             &out.aux,
             &public_inputs,
-        )
+        );
+        let _ = attempt.result?;
+        Ok(())
     };
 
     // Streaming prover (canonical path)

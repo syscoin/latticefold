@@ -3,8 +3,8 @@ use latticefold::commitment::AjtaiCommitmentScheme;
 use symphony::{
     rp_rgchk::RPParams,
     symphony_open::MultiAjtaiOpenVerifier,
+    symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices},
     symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig},
-    symphony_we_relation::check_r_cp_poseidon_fs,
 };
 use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing, Ring};
 use stark_rings_linalg::SparseMatrix;
@@ -79,9 +79,9 @@ fn test_streaming_pifold_fs_roundtrip_verifies() {
     )
     .unwrap();
 
-    // Standard CP verifier path should accept.
-    check_r_cp_poseidon_fs::<R, PC>(
-        [&m1, &m2, &m3],
+    // Canonical CP verifier path should accept.
+    let attempt = verify_pi_fold_cp_poseidon_fs::<R, PC>(
+        PiFoldMatrices::Shared([&*m1, &*m2, &*m3]),
         &[cm0, cm1],
         &out.proof,
         &open,
@@ -89,7 +89,7 @@ fn test_streaming_pifold_fs_roundtrip_verifies() {
         &out.cfs_mon_b,
         &out.aux,
         &[],
-    )
-    .unwrap();
+    );
+    attempt.result.unwrap();
 }
 

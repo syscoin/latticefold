@@ -48,6 +48,10 @@ pub struct WeGateInventory {
     /// This is the “auxcs_lin × batchlin” layer from the paper: linear/evaluation constraints that
     /// ensure `aux.had_u` and `aux.mon_b` are the correct derived/evaluated values from the committed
     /// witness.
+    ///
+    /// Important: the intended production path is **not** to include full openings (`f`, `g^{(i)}`)
+    /// as part of the outer DPP witness; instead we plan to add a second folding proof (`π_lin`)
+    /// whose verified statement is `R_o := R_auxcs_lin × R_batchlin`.
     pub missing_aux_to_cm_f_binding: bool,
 }
 

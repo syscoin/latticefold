@@ -1,4 +1,4 @@
-//! Micro-benchmark for Symphony Π_fold / WE-facing `R_cp` checks.
+//! Micro-benchmark for Symphony Π_fold CP-style verification (Poseidon-FS).
 //!
 //! This is intentionally lightweight (no criterion) and meant for quick GM-style sanity checks:
 //! measure how Π_fold proving/verifying scales with batch size ℓ under the current implementation,
@@ -13,8 +13,9 @@ fn main() {
     use symphony::{
         rp_rgchk::RPParams,
         symphony_open::MultiAjtaiOpenVerifier,
+        symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices},
         symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig},
-        symphony_we_relation::{check_r_cp_poseidon_fs, TrivialRo},
+        symphony_we_relation::{FoldedOutput, TrivialRo},
     };
     use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing, Ring};
     use stark_rings_linalg::SparseMatrix;
@@ -99,8 +100,8 @@ fn main() {
             .with_scheme("cfs_mon_b", scheme_mon);
 
         let verify_start = Instant::now();
-        let _out_folded = check_r_cp_poseidon_fs::<R, PC>(
-            [&m1, &m2, &m3],
+        let attempt = verify_pi_fold_cp_poseidon_fs::<R, PC>(
+            PiFoldMatrices::Shared([&*m1, &*m2, &*m3]),
             &cm_f,
             &out.proof,
             &open,
@@ -109,14 +110,17 @@ fn main() {
             &out.aux,
             &public_inputs,
         )
-        .unwrap();
+        ;
+        let (folded_inst, folded_bat) = attempt.result.unwrap();
         let verify_time = verify_start.elapsed();
 
         // Sanity: `TrivialRo` exists just to show how R_WE would be checked; we don't benchmark it.
-        let _: Result<(), String> = <TrivialRo as symphony::symphony_we_relation::ReducedRelation<R>>::check(
-            &_out_folded,
-            &(),
-        );
+        let folded_out = FoldedOutput {
+            folded_inst,
+            folded_bat,
+        };
+        let _: Result<(), String> =
+            <TrivialRo as symphony::symphony_we_relation::ReducedRelation<R>>::check(&folded_out, &());
 
         println!(
             "ℓ={ell:>2} | Π_fold prove: {:>8.3}s | R_cp verify: {:>8.3}s | proof bytes: {}",

@@ -1,13 +1,11 @@
-
-
-use ark_std::One;
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
 use latticefold::commitment::AjtaiCommitmentScheme;
 use symphony::{
     rp_rgchk::RPParams,
     symphony_open::MultiAjtaiOpenVerifier,
+    symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices},
     symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig},
-    symphony_we_relation::{check_r_we_poseidon_fs, ReducedRelation},
+    symphony_we_relation::{FoldedOutput, ReducedRelation},
 };
 use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing, Ring, Zq};
 use stark_rings_linalg::SparseMatrix;
@@ -22,10 +20,7 @@ where
 {
     type Witness = Vec<R>;
 
-    fn check(
-        public: &symphony::symphony_we_relation::FoldedOutput<R>,
-        witness: &Self::Witness,
-    ) -> Result<(), String> {
+    fn check(public: &FoldedOutput<R>, witness: &Self::Witness) -> Result<(), String> {
         if public.folded_inst.c != *witness {
             return Err("Ro: c mismatch".to_string());
         }
@@ -33,8 +28,14 @@ where
     }
 }
 
-#[test]
-fn test_r_we_conjunction_ok() {
+fn setup_two_instances_any_witness_holds() -> (
+    [SparseMatrix<R>; 3],
+    Vec<Vec<R>>,
+    Vec<std::sync::Arc<Vec<R>>>,
+    RPParams,
+    AjtaiCommitmentScheme<R>,
+    AjtaiCommitmentScheme<R>,
+) {
     let n = 1 << 10;
     let m = 1 << 10;
 
@@ -52,273 +53,11 @@ fn test_r_we_conjunction_ok() {
         row.clear();
     }
 
-    const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
-    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
-
-    let f0 = vec![R::one(); n];
-    let f1 = vec![R::ZERO; n];
-    let cm0 = scheme.commit(&f0).unwrap().as_ref().to_vec();
-    let cm1 = scheme.commit(&f1).unwrap().as_ref().to_vec();
-
-    let rg_params = RPParams {
-        l_h: 64,
-        lambda_pj: 32,
-        k_g: 4,
-        d_prime: (R::dimension() as u128) / 2,
-    };
-
-    let scheme_had =
-        AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, 2, 3 * R::dimension());
-    let scheme_mon =
-        AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 2, rg_params.k_g);
-
-    let cfg = PiFoldStreamingConfig::default();
-    let ms = vec![
-        [std::sync::Arc::new(m1.clone()), std::sync::Arc::new(m2.clone()), std::sync::Arc::new(m3.clone())],
-        [std::sync::Arc::new(m1.clone()), std::sync::Arc::new(m2.clone()), std::sync::Arc::new(m3.clone())],
-    ];
-    let out = prove_pi_fold_poseidon_fs::<R, PC>(
-        ms.as_slice(),
-        &[cm0.clone(), cm1.clone()],
-        &[std::sync::Arc::new(f0.clone()), std::sync::Arc::new(f1.clone())],
-        &[],
-        Some(&scheme_had),
-        Some(&scheme_mon),
-        rg_params,
-        &cfg,
-    )
-    .unwrap();
-    let proof = out.proof;
-
-    // Prover-produced CP transcript witness (aux messages).
-    let aux = out.aux;
-
-    let cfs_had_u = out.cfs_had_u.clone();
-    let cfs_mon_b = out.cfs_mon_b.clone();
-
-    let open = MultiAjtaiOpenVerifier::<R>::new()
-        .with_scheme("cfs_had_u", scheme_had)
-        .with_scheme("cfs_mon_b", scheme_mon);
-
-    // Compute expected folded output commitment via the reference verifier (no CP commitments).
-    let (folded_inst, _folded_bat) =
-        symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs::<R, PC>(
-            [&m1, &m2, &m3],
-            &[cm0.clone(), cm1.clone()],
-            &proof,
-            &symphony::symphony_open::NoOpen,
-            &[f0.clone(), f1.clone()],
-            &[],
-        )
-        .unwrap();
-
-    check_r_we_poseidon_fs::<R, PC, RoCheckCEquals>(
-        [&m1, &m2, &m3],
-        &[cm0, cm1],
-        &proof,
-        &open,
-        &cfs_had_u,
-        &cfs_mon_b,
-        &aux,
-        &[],
-        &folded_inst.c,
-    )
-    .unwrap();
-}
-
-#[test]
-fn test_r_we_conjunction_rejects_bad_ro_witness() {
-    let n = 1 << 10;
-    let m = 1 << 10;
-
-    // Matrices so Π_had holds for any witness: M1=I, M2=0, M3=0.
-    let mut m1 = SparseMatrix::<R>::identity(m);
-    let mut m2 = SparseMatrix::<R>::identity(m);
-    let mut m3 = SparseMatrix::<R>::identity(m);
-    m1.pad_cols(n);
-    m2.pad_cols(n);
-    m3.pad_cols(n);
-    for row in m2.coeffs.iter_mut() {
-        row.clear();
-    }
-    for row in m3.coeffs.iter_mut() {
-        row.clear();
-    }
-
-    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
-
-    let f0 = vec![R::one(); n];
-    let f1 = vec![R::ZERO; n];
-    let cm0 = scheme.commit(&f0).unwrap().as_ref().to_vec();
-    let cm1 = scheme.commit(&f1).unwrap().as_ref().to_vec();
-
-    let rg_params = RPParams {
-        l_h: 64,
-        lambda_pj: 32,
-        k_g: 4,
-        d_prime: (R::dimension() as u128) / 2,
-    };
-
-    let scheme_had =
-        AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, 2, 3 * R::dimension());
-    let scheme_mon =
-        AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 2, rg_params.k_g);
-
-    let cfg = PiFoldStreamingConfig::default();
-    let ms = vec![
-        [std::sync::Arc::new(m1.clone()), std::sync::Arc::new(m2.clone()), std::sync::Arc::new(m3.clone())],
-        [std::sync::Arc::new(m1.clone()), std::sync::Arc::new(m2.clone()), std::sync::Arc::new(m3.clone())],
-    ];
-    let out = prove_pi_fold_poseidon_fs::<R, PC>(
-        ms.as_slice(),
-        &[cm0.clone(), cm1.clone()],
-        &[std::sync::Arc::new(f0.clone()), std::sync::Arc::new(f1.clone())],
-        &[],
-        Some(&scheme_had),
-        Some(&scheme_mon),
-        rg_params,
-        &cfg,
-    )
-    .unwrap();
-    let proof = out.proof;
-
-    let aux = out.aux;
-
-    let cfs_had_u = out.cfs_had_u.clone();
-    let cfs_mon_b = out.cfs_mon_b.clone();
-
-    let open = MultiAjtaiOpenVerifier::<R>::new()
-        .with_scheme("cfs_had_u", scheme_had)
-        .with_scheme("cfs_mon_b", scheme_mon);
-
-    // Intentionally wrong R_o witness.
-    let bad = vec![R::ONE; cm0.len()];
-
-    let err = check_r_we_poseidon_fs::<R, PC, RoCheckCEquals>(
-        [&m1, &m2, &m3],
-        &[cm0, cm1],
-        &proof,
-        &open,
-        &cfs_had_u,
-        &cfs_mon_b,
-        &aux,
-        &[],
-        &bad,
-    )
-    .unwrap_err();
-
-    assert!(err.contains("Ro:"), "unexpected error: {err}");
-}
-
-#[test]
-fn test_r_cp_poseidon_fs_rejects_tampered_commitment() {
-    let n = 1 << 10;
-    let m = 1 << 10;
-
-    // Matrices so Π_had holds for any witness: M1=I, M2=0, M3=0.
-    let mut m1 = SparseMatrix::<R>::identity(m);
-    let mut m2 = SparseMatrix::<R>::identity(m);
-    let mut m3 = SparseMatrix::<R>::identity(m);
-    m1.pad_cols(n);
-    m2.pad_cols(n);
-    m3.pad_cols(n);
-    for row in m2.coeffs.iter_mut() {
-        row.clear();
-    }
-    for row in m3.coeffs.iter_mut() {
-        row.clear();
-    }
-
-    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
-
-    let f0 = vec![R::one(); n];
-    let f1 = vec![R::ZERO; n];
-    let mut cm0 = scheme.commit(&f0).unwrap().as_ref().to_vec();
-    let cm1 = scheme.commit(&f1).unwrap().as_ref().to_vec();
-
-    let rg_params = RPParams {
-        l_h: 64,
-        lambda_pj: 32,
-        k_g: 4,
-        d_prime: (R::dimension() as u128) / 2,
-    };
-
-    let scheme_had =
-        AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, 2, 3 * R::dimension());
-    let scheme_mon =
-        AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 2, rg_params.k_g);
-
-    let cfg = PiFoldStreamingConfig::default();
-    let ms = vec![
-        [std::sync::Arc::new(m1.clone()), std::sync::Arc::new(m2.clone()), std::sync::Arc::new(m3.clone())],
-        [std::sync::Arc::new(m1.clone()), std::sync::Arc::new(m2.clone()), std::sync::Arc::new(m3.clone())],
-    ];
-    let out = prove_pi_fold_poseidon_fs::<R, PC>(
-        ms.as_slice(),
-        &[cm0.clone(), cm1.clone()],
-        &[std::sync::Arc::new(f0.clone()), std::sync::Arc::new(f1.clone())],
-        &[],
-        Some(&scheme_had),
-        Some(&scheme_mon),
-        rg_params,
-        &cfg,
-    )
-    .unwrap();
-    let proof = out.proof;
-
-    let aux = out.aux;
-
-    let cfs_had_u = out.cfs_had_u.clone();
-    let cfs_mon_b = out.cfs_mon_b.clone();
-    let open = MultiAjtaiOpenVerifier::<R>::new()
-        .with_scheme("cfs_had_u", scheme_had)
-        .with_scheme("cfs_mon_b", scheme_mon);
-
-    // Tamper with commitment after proof was created. FS transcript binding should reject.
-    cm0[0] += R::ONE;
-
-    let err =
-        symphony::symphony_we_relation::check_r_cp_poseidon_fs::<R, PC>(
-            [&m1, &m2, &m3],
-            &[cm0, cm1],
-            &proof,
-            &open,
-            &cfs_had_u,
-            &cfs_mon_b,
-            &aux,
-            &[],
-        )
-        .unwrap_err();
-
-    // We don't rely on an exact string, but it should fail somewhere early in transcript-dependent checks.
-    assert!(err.contains("m") || err.contains("PiFold") || err.contains("AjtaiOpen"), "unexpected error: {err}");
-}
-
-#[test]
-fn test_r_cp_poseidon_fs_rejects_tampered_cfs_commitment() {
-    let n = 1 << 10;
-    let m = 1 << 10;
-
-    // Matrices so Π_had holds for any witness: M1=I, M2=0, M3=0.
-    let mut m1 = SparseMatrix::<R>::identity(m);
-    let mut m2 = SparseMatrix::<R>::identity(m);
-    let mut m3 = SparseMatrix::<R>::identity(m);
-    m1.pad_cols(n);
-    m2.pad_cols(n);
-    m3.pad_cols(n);
-    for row in m2.coeffs.iter_mut() {
-        row.clear();
-    }
-    for row in m3.coeffs.iter_mut() {
-        row.clear();
-    }
-
-    // Underlying witness commitments (cm_f) used by Π_fold (not opened in CP relation).
     let scheme_f = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
-    let f0 = vec![R::one(); n];
-    let f1 = vec![R::ZERO; n];
-    let cm0 = scheme_f.commit(&f0).unwrap().as_ref().to_vec();
-    let cm1 = scheme_f.commit(&f1).unwrap().as_ref().to_vec();
+    let f0 = std::sync::Arc::new(vec![R::ONE; n]);
+    let f1 = std::sync::Arc::new(vec![R::ZERO; n]);
+    let cm0 = scheme_f.commit(f0.as_ref()).unwrap().as_ref().to_vec();
+    let cm1 = scheme_f.commit(f1.as_ref()).unwrap().as_ref().to_vec();
 
     let rg_params = RPParams {
         l_h: 64,
@@ -327,10 +66,22 @@ fn test_r_cp_poseidon_fs_rejects_tampered_cfs_commitment() {
         d_prime: (R::dimension() as u128) / 2,
     };
 
-    let scheme_had =
-        AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, 2, 3 * R::dimension());
-    let scheme_mon =
-        AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 2, rg_params.k_g);
+    let scheme_had = AjtaiCommitmentScheme::<R>::seeded(
+        b"cfs_had_u",
+        MASTER_SEED,
+        2,
+        3 * R::dimension(),
+    );
+    let scheme_mon = AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 2, rg_params.k_g);
+
+    ([m1, m2, m3], vec![cm0, cm1], vec![f0, f1], rg_params, scheme_had, scheme_mon)
+}
+
+#[test]
+fn test_cp_verify_accepts_and_ro_check_accepts() {
+    let (mats, cms, witnesses, rg_params, scheme_had, scheme_mon) =
+        setup_two_instances_any_witness_holds();
+    let [m1, m2, m3] = mats;
 
     let cfg = PiFoldStreamingConfig::default();
     let ms = vec![
@@ -339,175 +90,8 @@ fn test_r_cp_poseidon_fs_rejects_tampered_cfs_commitment() {
     ];
     let out = prove_pi_fold_poseidon_fs::<R, PC>(
         ms.as_slice(),
-        &[cm0.clone(), cm1.clone()],
-        &[std::sync::Arc::new(f0.clone()), std::sync::Arc::new(f1.clone())],
-        &[],
-        Some(&scheme_had),
-        Some(&scheme_mon),
-        rg_params,
-        &cfg,
-    )
-    .unwrap();
-    let proof = out.proof;
-
-    let aux = out.aux;
-    let mut cfs_had_u = out.cfs_had_u;
-    let cfs_mon_b = out.cfs_mon_b;
-
-    // Tamper with a CP commitment after computing it; opening verification must fail.
-    cfs_had_u[0][0] += R::ONE;
-
-    let open = MultiAjtaiOpenVerifier::<R>::new()
-        .with_scheme("cfs_had_u", scheme_had)
-        .with_scheme("cfs_mon_b", scheme_mon);
-
-    let err = symphony::symphony_we_relation::check_r_cp_poseidon_fs::<R, PC>(
-        [&m1, &m2, &m3],
-        &[cm0, cm1],
-        &proof,
-        &open,
-        &cfs_had_u,
-        &cfs_mon_b,
-        &aux,
-        &[],
-    )
-    .unwrap_err();
-
-    assert!(
-        err.contains("AjtaiOpen") || err.contains("commitment mismatch"),
-        "unexpected error: {err}"
-    );
-}
-
-#[test]
-fn test_r_we_nonvacuous_had_identity_passes() {
-    let n = 1 << 10;
-    let m = 1 << 10;
-
-    // Non-vacuous Π_had: M1=M2=M3=I, so y3 = y1 ⊙ y2 requires f ⊙ f = f entrywise.
-    let mut m1 = SparseMatrix::<R>::identity(m);
-    let mut m2 = SparseMatrix::<R>::identity(m);
-    let mut m3 = SparseMatrix::<R>::identity(m);
-    m1.pad_cols(n);
-    m2.pad_cols(n);
-    m3.pad_cols(n);
-
-    // Use an idempotent witness: f[i] = 1, so 1*1 = 1.
-    let f0 = vec![R::ONE; n];
-    let f1 = vec![R::ZERO; n];
-
-    // Commitments to f (cm_f).
-    let scheme_f = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 8, n);
-    let cm0 = scheme_f.commit(&f0).unwrap().as_ref().to_vec();
-    let cm1 = scheme_f.commit(&f1).unwrap().as_ref().to_vec();
-
-    let rg_params = RPParams {
-        l_h: 64,
-        lambda_pj: 32,
-        k_g: 4,
-        d_prime: (R::dimension() as u128) / 2,
-    };
-
-    // CP commitment schemes for aux messages (bigger row-count than other tests).
-    let scheme_had =
-        AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, 32, 3 * R::dimension());
-    let scheme_mon =
-        AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 32, rg_params.k_g);
-
-    let cfg = PiFoldStreamingConfig::default();
-    let m1a = std::sync::Arc::new(m1.clone());
-    let m2a = std::sync::Arc::new(m2.clone());
-    let m3a = std::sync::Arc::new(m3.clone());
-    let ms = vec![[m1a.clone(), m2a.clone(), m3a.clone()], [m1a, m2a, m3a]];
-    let out = prove_pi_fold_poseidon_fs::<R, PC>(
-        ms.as_slice(),
-        &[cm0.clone(), cm1.clone()],
-        &[std::sync::Arc::new(f0.clone()), std::sync::Arc::new(f1.clone())],
-        &[],
-        Some(&scheme_had),
-        Some(&scheme_mon),
-        rg_params,
-        &cfg,
-    )
-    .unwrap();
-
-    let proof = out.proof;
-    let aux = out.aux;
-    let cfs_had_u = out.cfs_had_u;
-    let cfs_mon_b = out.cfs_mon_b;
-
-    let open = MultiAjtaiOpenVerifier::<R>::new()
-        .with_scheme("cfs_had_u", scheme_had)
-        .with_scheme("cfs_mon_b", scheme_mon);
-
-    // Compute expected folded commitment via reference verifier (no CP commitments).
-    let (folded_inst, _bat) =
-        symphony::symphony_pifold_batched::verify_pi_fold_batched_and_fold_outputs_poseidon_fs::<R, PC>(
-            [&m1, &m2, &m3],
-            &[cm0.clone(), cm1.clone()],
-            &proof,
-            &symphony::symphony_open::NoOpen,
-            &[f0, f1],
-            &[],
-        )
-        .unwrap();
-
-    check_r_we_poseidon_fs::<R, PC, RoCheckCEquals>(
-        [&m1, &m2, &m3],
-        &[scheme_f.commit(&vec![R::ONE; n]).unwrap().as_ref().to_vec(), scheme_f.commit(&vec![R::ZERO; n]).unwrap().as_ref().to_vec()],
-        &proof,
-        &open,
-        &cfs_had_u,
-        &cfs_mon_b,
-        &aux,
-        &[],
-        &folded_inst.c,
-    )
-    .unwrap();
-}
-
-#[test]
-fn test_r_we_nonvacuous_had_identity_rejects_non_idempotent_witness() {
-    let n = 1 << 10;
-    let m = 1 << 10;
-
-    // M1=M2=M3=I as above, but use f=2 so f⊙f != f.
-    let mut m1 = SparseMatrix::<R>::identity(m);
-    let mut m2 = SparseMatrix::<R>::identity(m);
-    let mut m3 = SparseMatrix::<R>::identity(m);
-    m1.pad_cols(n);
-    m2.pad_cols(n);
-    m3.pad_cols(n);
-
-    let two = R::from(2u128);
-    let f0 = vec![two; n];
-    let f1 = vec![R::ZERO; n];
-
-    let scheme_f = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 8, n);
-    let cm0 = scheme_f.commit(&f0).unwrap().as_ref().to_vec();
-    let cm1 = scheme_f.commit(&f1).unwrap().as_ref().to_vec();
-
-    let rg_params = RPParams {
-        l_h: 64,
-        lambda_pj: 32,
-        k_g: 4,
-        d_prime: (R::dimension() as u128) / 2,
-    };
-
-    let scheme_had =
-        AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, 16, 3 * R::dimension());
-    let scheme_mon =
-        AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, 16, rg_params.k_g);
-
-    let cfg = PiFoldStreamingConfig::default();
-    let m1a = std::sync::Arc::new(m1.clone());
-    let m2a = std::sync::Arc::new(m2.clone());
-    let m3a = std::sync::Arc::new(m3.clone());
-    let ms = vec![[m1a.clone(), m2a.clone(), m3a.clone()], [m1a, m2a, m3a]];
-    let out = prove_pi_fold_poseidon_fs::<R, PC>(
-        ms.as_slice(),
-        &[cm0.clone(), cm1.clone()],
-        &[std::sync::Arc::new(f0.clone()), std::sync::Arc::new(f1.clone())],
+        &cms,
+        &witnesses,
         &[],
         Some(&scheme_had),
         Some(&scheme_mon),
@@ -520,10 +104,9 @@ fn test_r_we_nonvacuous_had_identity_rejects_non_idempotent_witness() {
         .with_scheme("cfs_had_u", scheme_had)
         .with_scheme("cfs_mon_b", scheme_mon);
 
-    // Even with valid cfs commitments/openings, Π_had should reject because the underlying had relation is false.
-    let err = symphony::symphony_we_relation::check_r_cp_poseidon_fs::<R, PC>(
-        [&m1, &m2, &m3],
-        &[cm0, cm1],
+    let attempt = verify_pi_fold_cp_poseidon_fs::<R, PC>(
+        PiFoldMatrices::Shared([&m1, &m2, &m3]),
+        &cms,
         &out.proof,
         &open,
         &out.cfs_had_u,
@@ -531,10 +114,103 @@ fn test_r_we_nonvacuous_had_identity_rejects_non_idempotent_witness() {
         &out.aux,
         &[],
     )
-    .unwrap_err();
+    ;
+    let (folded_inst, folded_bat) = attempt.result.unwrap();
 
-    assert!(
-        err.contains("PiFold") || err.contains("Eq(26)") || err.contains("sumcheck"),
-        "unexpected error: {err}"
-    );
+    let folded = FoldedOutput {
+        folded_inst: folded_inst.clone(),
+        folded_bat,
+    };
+    RoCheckCEquals::check(&folded, &folded_inst.c).unwrap();
 }
+
+#[test]
+fn test_ro_check_rejects_bad_witness() {
+    let (mats, cms, witnesses, rg_params, scheme_had, scheme_mon) =
+        setup_two_instances_any_witness_holds();
+    let [m1, m2, m3] = mats;
+
+    let out = prove_pi_fold_poseidon_fs::<R, PC>(
+        &[
+            [std::sync::Arc::new(m1.clone()), std::sync::Arc::new(m2.clone()), std::sync::Arc::new(m3.clone())],
+            [std::sync::Arc::new(m1.clone()), std::sync::Arc::new(m2.clone()), std::sync::Arc::new(m3.clone())],
+        ],
+        &cms,
+        &witnesses,
+        &[],
+        Some(&scheme_had),
+        Some(&scheme_mon),
+        rg_params,
+        &PiFoldStreamingConfig::default(),
+    )
+    .unwrap();
+
+    let open = MultiAjtaiOpenVerifier::<R>::new()
+        .with_scheme("cfs_had_u", scheme_had)
+        .with_scheme("cfs_mon_b", scheme_mon);
+    let attempt = verify_pi_fold_cp_poseidon_fs::<R, PC>(
+        PiFoldMatrices::Shared([&m1, &m2, &m3]),
+        &cms,
+        &out.proof,
+        &open,
+        &out.cfs_had_u,
+        &out.cfs_mon_b,
+        &out.aux,
+        &[],
+    )
+    ;
+    let (folded_inst, folded_bat) = attempt.result.unwrap();
+
+    let folded = FoldedOutput {
+        folded_inst: folded_inst.clone(),
+        folded_bat,
+    };
+    let bad = vec![R::ONE; folded_inst.c.len()];
+    let err = RoCheckCEquals::check(&folded, &bad).unwrap_err();
+    assert!(err.contains("Ro:"), "unexpected error: {err}");
+}
+
+#[test]
+fn test_cp_verify_rejects_tampered_cfs_commitment() {
+    let (mats, cms, witnesses, rg_params, scheme_had, scheme_mon) =
+        setup_two_instances_any_witness_holds();
+    let [m1, m2, m3] = mats;
+
+    let out = prove_pi_fold_poseidon_fs::<R, PC>(
+        &[
+            [std::sync::Arc::new(m1.clone()), std::sync::Arc::new(m2.clone()), std::sync::Arc::new(m3.clone())],
+            [std::sync::Arc::new(m1.clone()), std::sync::Arc::new(m2.clone()), std::sync::Arc::new(m3.clone())],
+        ],
+        &cms,
+        &witnesses,
+        &[],
+        Some(&scheme_had),
+        Some(&scheme_mon),
+        rg_params,
+        &PiFoldStreamingConfig::default(),
+    )
+    .unwrap();
+
+    let open = MultiAjtaiOpenVerifier::<R>::new()
+        .with_scheme("cfs_had_u", scheme_had)
+        .with_scheme("cfs_mon_b", scheme_mon);
+
+    // Tamper with a CP commitment after computing it; opening verification must fail.
+    let mut bad_cfs_had_u = out.cfs_had_u.clone();
+    bad_cfs_had_u[0][0] += R::ONE;
+
+    let err = verify_pi_fold_cp_poseidon_fs::<R, PC>(
+        PiFoldMatrices::Shared([&m1, &m2, &m3]),
+        &cms,
+        &out.proof,
+        &open,
+        &bad_cfs_had_u,
+        &out.cfs_mon_b,
+        &out.aux,
+        &[],
+    )
+    .result
+    .unwrap_err();
+    assert!(err.contains("AjtaiOpen") || err.contains("commitment"), "unexpected error: {err}");
+}
+

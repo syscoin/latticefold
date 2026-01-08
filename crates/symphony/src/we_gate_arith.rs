@@ -18,6 +18,12 @@
 //! messages (`cfs_*`). However, binding `aux` to `cm_f` in the paper’s style requires additional
 //! linear/evaluation constraints (the “auxcs_lin × batchlin” layer) that we still need to design.
 //!
+//! **Clarification (this is the intended production direction):**
+//! - We do **not** want to put the full witness openings (`f`, `g^{(i)}`) into the *outer* DPP witness.
+//! - Instead, the intended production path is a second folding proof `π_lin` whose verified statement
+//!   is exactly `R_o := R_auxcs_lin × R_batchlin`. The outer gate verifies `π_lin` succinctly, while
+//!   `π_lin`’s prover uses the large openings internally.
+//!
 //! The helper `poseidon_plus_cfs_plus_cm_f_openings` below is a **bring-up strategy** that includes
 //! full witness openings `f` and checks `AjtaiOpen(cm_f, f)` inside the dR1CS. This is correct, but
 //! it is **not production-shape for SP1**, because it would bake an enormous dense linear system.
