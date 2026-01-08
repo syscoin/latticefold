@@ -480,19 +480,26 @@ where
         proj_digits_by_inst.push(digits_flat.clone());
 
         // Commit to g^(i) and bind commitments into the transcript before Π_mon challenges.
-        let mut cm_g_inst: Vec<Vec<R>> = Vec::with_capacity(rg_params.k_g);
-        for dig in 0..rg_params.k_g {
-            let mut g_vec: Vec<R> = Vec::with_capacity(m * d);
-            for col in 0..d {
-                for row in 0..m {
-                    let out_row = row % m_j;
-                    let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig];
-                    g_vec.push(exp::<R>(digit).expect("Exp failed"));
+        //
+        // Performance: do this as a *batched* Ajtai commit so we reuse the per-column RNG for all digits.
+        let digits_flat_for_commit = digits_flat.clone();
+        let k_g = rg_params.k_g;
+        let n = m * d;
+        let commits = cm_g_scheme
+            .commit_many_with(n, k_g, move |j, out: &mut [R]| {
+                // out[dig] = g^(dig)[j]
+                let col = j / m;
+                let row = j - col * m;
+                let out_row = row % m_j;
+                for dig in 0..k_g {
+                    let digit = digits_flat_for_commit[(out_row * d + col) * k_g + dig];
+                    out[dig] = exp::<R>(digit).expect("Exp failed");
                 }
-            }
-            let c = cm_g_scheme
-                .commit(&g_vec)
-                .map_err(|e| format!("PiFold: cm_g commit failed: {e:?}"))?;
+            })
+            .map_err(|e| format!("PiFold: cm_g commit failed: {e:?}"))?;
+
+        let mut cm_g_inst: Vec<Vec<R>> = Vec::with_capacity(k_g);
+        for c in commits {
             let c_vec = c.as_ref().to_vec();
             transcript.absorb_slice(&c_vec);
             cm_g_inst.push(c_vec);

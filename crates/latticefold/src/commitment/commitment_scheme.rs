@@ -152,6 +152,117 @@ impl<R: Ring> AjtaiCommitmentScheme<R> {
         }
     }
 
+    
+    /// Commit to `t` witnesses of length `n` provided implicitly.
+    ///
+    /// This computes `t` commitments under the same Ajtai matrix, reusing the per-column randomness
+    /// generation for all `t` vectors.
+    pub fn commit_many_with<F>(
+        &self,
+        n: usize,
+        t: usize,
+        fill_values_at: F,
+    ) -> Result<Vec<Commitment<R>>, CommitmentError>
+    where
+        F: Fn(usize, &mut [R]) + Sync,
+        R: Send + Sync + Copy,
+    {
+        if t == 0 {
+            return Ok(vec![]);
+        }
+        match &self.matrix {
+            AjtaiMatrix::Explicit(matrix) => {
+                if n != matrix.ncols {
+                    return Err(CommitmentError::WrongWitnessLength(n, matrix.ncols));
+                }
+                // Fallback: materialize each vector and call `commit()`.
+                let mut outs = Vec::with_capacity(t);
+                let mut tmp = vec![R::ZERO; n];
+                for which in 0..t {
+                    for j in 0..n {
+                        // Fill a length-`t` scratch and take the `which` slot.
+                        let mut scratch = vec![R::ZERO; t];
+                        fill_values_at(j, &mut scratch);
+                        tmp[j] = scratch[which];
+                    }
+                    outs.push(self.commit(&tmp)?);
+                }
+                Ok(outs)
+            }
+            AjtaiMatrix::Seeded { seed, domain, kappa, n: n_expected } => {
+                if n != *n_expected {
+                    return Err(CommitmentError::WrongWitnessLength(n, *n_expected));
+                }
+                #[cfg(feature = "parallel")]
+                {
+                    let kappa = *kappa;
+                    let domain = domain.as_slice();
+                    let seed = *seed;
+                    let acc = cfg_into_iter!(0..n)
+                        .fold(
+                            || (vec![vec![R::ZERO; kappa]; t], vec![R::ZERO; t]),
+                            |(mut local, mut scratch), j| {
+                                scratch.fill(R::ZERO);
+                                fill_values_at(j, &mut scratch);
+                                if scratch.iter().all(|x| *x == R::ZERO) {
+                                    return (local, scratch);
+                                }
+                                let col_seed = Self::derive_col_seed(domain, &seed, j as u64);
+                                let mut rng = ChaCha20Rng::from_seed(col_seed);
+                                for i in 0..kappa {
+                                    let aij = R::rand(&mut rng);
+                                    for which in 0..t {
+                                        let fj = scratch[which];
+                                        if fj != R::ZERO {
+                                            local[which][i] += aij * fj;
+                                        }
+                                    }
+                                }
+                                (local, scratch)
+                            },
+                        )
+                        .reduce(
+                            || (vec![vec![R::ZERO; kappa]; t], vec![R::ZERO; t]),
+                            |(mut a, scratch_a), (b, _scratch_b)| {
+                                for which in 0..t {
+                                    for i in 0..kappa {
+                                        a[which][i] += b[which][i];
+                                    }
+                                }
+                                (a, scratch_a)
+                            },
+                        )
+                        .0;
+                    Ok(acc.into_iter().map(Commitment::from_vec_raw).collect())
+                }
+                #[cfg(not(feature = "parallel"))]
+                {
+                    let mut acc = vec![vec![R::ZERO; *kappa]; t];
+                    let mut scratch = vec![R::ZERO; t];
+                    for j in 0..n {
+                        scratch.fill(R::ZERO);
+                        fill_values_at(j, &mut scratch);
+                        if scratch.iter().all(|x| *x == R::ZERO) {
+                            continue;
+                        }
+                        let col_seed = Self::derive_col_seed(domain, seed, j as u64);
+                        let mut rng = ChaCha20Rng::from_seed(col_seed);
+                        for i in 0..*kappa {
+                            let aij = R::rand(&mut rng);
+                            for which in 0..t {
+                                let fj = scratch[which];
+                                if fj != R::ZERO {
+                                    acc[which][i] += aij * fj;
+                                }
+                            }
+                        }
+                    }
+                    Ok(acc.into_iter().map(Commitment::from_vec_raw).collect())
+                }
+            }
+        }
+    }
+
     /// Commit to a witness, using a fast-path when all witness entries are *constant-coefficient*
     /// ring elements (i.e., elements embedded from the base ring).
     ///
