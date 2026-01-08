@@ -22,6 +22,11 @@ where
     R::BaseRing: Ring,
 {
     Dense(DenseStreamingMle<R>),
+    /// Arc-wrapped dense table - avoids cloning when sharing across multiple consumers.
+    DenseArc {
+        evals: Arc<Vec<R>>,
+        num_vars: usize,
+    },
     /// y[row] = (M * w)[row], computed from sparse rows (only used before the first fix).
     SparseMatVec {
         matrix: Arc<SparseMatrix<R>>,
@@ -84,6 +89,27 @@ where
         r: Vec<R::BaseRing>,
         one_minus_r: Vec<R::BaseRing>,
     },
+    /// Seeded Ajtai column: a_ρ[j] = ⟨ρ, A[:,j]⟩ computed on-demand via PRG.
+    /// 
+    /// This avoids materializing the O(n) table upfront. Instead, each `eval_at_index`
+    /// call computes the value via κ PRG evaluations.
+    /// 
+    /// **Const-coeff optimization**: `rho_ring` stores precomputed `R::from(rho0[i])` to
+    /// avoid repeated lifting in the hot loop. The multiplication is still O(d) because
+    /// `rho_ring[i]` is a constant-coefficient ring element.
+    /// 
+    /// Uses Arc to avoid per-digit cloning (κ is small, but Arc is cleaner).
+    /// 
+    /// After the first `fix_variable`, this transitions to `Dense` (since we need to
+    /// actually combine paired values, which requires materializing).
+    AjtaiRho {
+        domain: Vec<u8>,
+        seed: [u8; 32],
+        kappa: usize,
+        /// Precomputed ring elements: rho_ring[i] = R::from(rho0[i])
+        rho_ring: Arc<Vec<R>>,
+        num_vars: usize,
+    },
 }
 
 impl<R: OverField + PolyRing> StreamingMleEnum<R>
@@ -92,6 +118,14 @@ where
 {
     pub fn dense(evals: Vec<R>) -> Self {
         Self::Dense(DenseStreamingMle::new(evals))
+    }
+
+    /// Create a dense MLE from an Arc-wrapped vector (avoids cloning for shared data).
+    pub fn dense_arc(evals: Arc<Vec<R>>) -> Self {
+        let len = evals.len();
+        assert!(len.is_power_of_two(), "Length must be power of 2");
+        let num_vars = len.trailing_zeros() as usize;
+        Self::DenseArc { evals, num_vars }
     }
 
     pub fn sparse_mat_vec(matrix: Arc<SparseMatrix<R>>, witness: Arc<Vec<R>>) -> Self {
@@ -157,16 +191,39 @@ where
         }
     }
 
+    /// Create a streaming MLE for `a_ρ[j] = ⟨ρ, A[:,j]⟩` where A is a seeded Ajtai matrix.
+    /// 
+    /// This computes values on-demand via PRG, avoiding O(n) memory allocation upfront.
+    /// After the first variable fix, it transitions to dense (required for combining pairs).
+    /// 
+    /// **Const-coeff optimization**: takes `rho0: Arc<Vec<R::BaseRing>>` and precomputes
+    /// `rho_ring = R::from(rho0[i])` once to avoid repeated lifting in `eval_at_index`.
+    /// Arc avoids per-digit cloning.
+    pub fn ajtai_rho(domain: Vec<u8>, seed: [u8; 32], kappa: usize, rho0: Arc<Vec<R::BaseRing>>, num_vars: usize) -> Self {
+        debug_assert_eq!(rho0.len(), kappa);
+        // Precompute rho_ring once here (κ is small, ~8 elements)
+        let rho_ring: Vec<R> = rho0.iter().map(|&r| R::from(r)).collect();
+        Self::AjtaiRho {
+            domain,
+            seed,
+            kappa,
+            rho_ring: Arc::new(rho_ring),
+            num_vars,
+        }
+    }
+
     #[inline]
     pub fn num_vars(&self) -> usize {
         match self {
             StreamingMleEnum::Dense(m) => m.num_vars,
+            StreamingMleEnum::DenseArc { num_vars, .. } => *num_vars,
             StreamingMleEnum::SparseMatVec { num_vars, .. } => *num_vars,
             StreamingMleEnum::SparseMatVecConstCoeff { num_vars, .. } => *num_vars,
             StreamingMleEnum::BaseScalarVec { num_vars, .. } => *num_vars,
             StreamingMleEnum::BaseScalarVecOwned { num_vars, .. } => *num_vars,
             StreamingMleEnum::PeriodicBaseScalarVec { num_vars, .. } => *num_vars,
             StreamingMleEnum::EqBase { r, .. } => r.len(),
+            StreamingMleEnum::AjtaiRho { num_vars, .. } => *num_vars,
         }
     }
 
@@ -174,6 +231,7 @@ where
     pub fn eval_at_index(&self, index: usize) -> R {
         match self {
             StreamingMleEnum::Dense(m) => m.evals[index],
+            StreamingMleEnum::DenseArc { evals, .. } => evals[index],
             StreamingMleEnum::SparseMatVec {
                 matrix, witness, ..
             } => {
@@ -229,6 +287,32 @@ where
                 }
                 R::from(*scale * prod)
             }
+            StreamingMleEnum::AjtaiRho {
+                domain,
+                seed,
+                kappa,
+                rho_ring,
+                ..
+            } => {
+                // Compute a_ρ[index] = ⟨ρ, A[:,index]⟩ on-demand via PRG
+                // rho_ring[row] is const-coeff (= R::from(scalar)), so this multiplication
+                // is inherently O(d) not O(d²) in coefficient complexity
+                use rand::SeedableRng;
+                use rand_chacha::ChaCha20Rng;
+                use latticefold::commitment::AjtaiCommitmentScheme;
+                
+                let col_seed = AjtaiCommitmentScheme::<R>::derive_col_seed(domain, seed, index as u64);
+                let mut rng = ChaCha20Rng::from_seed(col_seed);
+                
+                let mut sum = R::ZERO;
+                for row in 0..*kappa {
+                    let aij = R::rand(&mut rng);
+                    // const-coeff × ring: even if ring impl doesn't optimize,
+                    // the convolution naturally skips non-contributing terms
+                    sum += rho_ring[row] * aij;
+                }
+                sum
+            }
         }
     }
 
@@ -240,6 +324,7 @@ where
     pub fn eval0_at_index(&self, index: usize) -> R::BaseRing {
         match self {
             StreamingMleEnum::Dense(m) => m.evals[index].coeffs()[0],
+            StreamingMleEnum::DenseArc { evals, .. } => evals[index].coeffs()[0],
             StreamingMleEnum::SparseMatVec { .. } => self.eval_at_index(index).coeffs()[0],
             StreamingMleEnum::SparseMatVecConstCoeff {
                 matrix, witness0, ..
@@ -283,6 +368,10 @@ where
                 }
                 *scale * prod
             }
+            StreamingMleEnum::AjtaiRho { .. } => {
+                // AjtaiRho produces full ring elements, take constant coefficient
+                self.eval_at_index(index).coeffs()[0]
+            }
         }
     }
 
@@ -296,6 +385,13 @@ where
             StreamingMleEnum::Dense(m) => {
                 let new_evals: Vec<R> = (0..half)
                     .map(|i| (R::ONE - r) * m.evals[i << 1] + r * m.evals[(i << 1) | 1])
+                    .collect();
+                StreamingMleEnum::dense(new_evals)
+            }
+            // DenseArc: same as Dense, but read from Arc
+            StreamingMleEnum::DenseArc { evals, .. } => {
+                let new_evals: Vec<R> = (0..half)
+                    .map(|i| (R::ONE - r) * evals[i << 1] + r * evals[(i << 1) | 1])
                     .collect();
                 StreamingMleEnum::dense(new_evals)
             }
@@ -460,6 +556,18 @@ where
                     one_minus_r: new_om,
                 }
             }
+            // AjtaiRho: materialize to dense after first fix (no nice structural property)
+            StreamingMleEnum::AjtaiRho { .. } => {
+                // Materialize all values, then combine pairs
+                let new_evals: Vec<R> = (0..half)
+                    .map(|i| {
+                        let v0 = self.eval_at_index(i << 1);
+                        let v1 = self.eval_at_index((i << 1) | 1);
+                        (R::ONE - r) * v0 + r * v1
+                    })
+                    .collect();
+                StreamingMleEnum::dense(new_evals)
+            }
         }
     }
 
@@ -480,6 +588,11 @@ where
                 }
                 m.evals.truncate(half);
                 m.num_vars -= 1;
+            }
+            StreamingMleEnum::DenseArc { .. } => {
+                // Can't modify Arc in-place; fall back to fix_variable
+                let new = self.fix_variable(r_ring);
+                *self = new;
             }
             StreamingMleEnum::SparseMatVec { .. } => {
                 let new = self.fix_variable(r_ring);
@@ -533,6 +646,11 @@ where
                 // Keep order; lengths are small (<= ~24), so shifting cost is negligible.
                 r.remove(0);
                 one_minus_r.remove(0);
+            }
+            StreamingMleEnum::AjtaiRho { .. } => {
+                // Materialize to dense after first fix
+                let new = self.fix_variable(r_ring);
+                *self = new;
             }
         }
     }

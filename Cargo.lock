@@ -1196,6 +1196,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rand",
+ "rand_chacha",
  "rayon",
  "serde",
  "serde_json",

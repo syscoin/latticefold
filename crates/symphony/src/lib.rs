@@ -37,3 +37,6 @@ pub mod rp_rgchk;
 // Streaming sumcheck (memory-efficient MLE handling)
 pub mod streaming_sumcheck;
 pub mod symphony_pifold_streaming;
+
+// Phase 2: π_lin reduced relation
+pub mod symphony_pilin;

@@ -68,7 +68,11 @@ impl<R: Ring> AjtaiCommitmentScheme<R> {
         }
     }
 
-    fn derive_col_seed(domain: &[u8], seed: &[u8; 32], col: u64) -> [u8; 32] {
+    /// Derive the seed for generating a specific Ajtai matrix column.
+    ///
+    /// This is a deterministic function of `(domain, seed, col)` used to generate
+    /// column `col` of the Ajtai matrix on-the-fly.
+    pub fn derive_col_seed(domain: &[u8], seed: &[u8; 32], col: u64) -> [u8; 32] {
         let mut h = Sha256::new();
         h.update(b"AJTAI_COL_V1");
         h.update((domain.len() as u64).to_le_bytes());
