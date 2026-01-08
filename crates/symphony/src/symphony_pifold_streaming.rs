@@ -43,6 +43,67 @@ use crate::symphony_cm::SymphonyCoins;
 use crate::symphony_coins::{derive_beta_chi, derive_J, ev, ts_weights};
 use crate::symphony_pifold_batched::{PiFoldAuxWitness, PiFoldBatchedProof, PiFoldProverOutput};
 
+/// Fixed seed for the cm_g aggregate commitment scheme.
+/// This derives a dedicated Ajtai matrix for binding all cm_g commitments into a single short value.
+pub const CM_G_AGG_SEED: [u8; 32] = *b"SYMPHONY_CM_G_AGG_V1_0000000000_";
+
+/// Compute the aggregate commitment for all cm_g values.
+///
+/// This flattens `cm_g[inst][dig][*]` into a single vector and commits via a dedicated
+/// Ajtai scheme. The result is a short commitment that binds all cm_g values, reducing
+/// Poseidon absorption from O(ell * k_g * kappa) field elements to O(kappa).
+pub fn compute_cm_g_aggregate<R: CoeffRing>(
+    cm_g: &[Vec<Vec<R>>],
+    kappa: usize,
+) -> Result<Vec<R>, String>
+where
+    R::BaseRing: Zq + stark_rings::balanced_decomposition::Decompose,
+{
+    if cm_g.is_empty() {
+        return Err("cm_g_aggregate: empty cm_g".to_string());
+    }
+    if kappa == 0 {
+        return Err("cm_g_aggregate: kappa=0 is invalid".to_string());
+    }
+    let k_g = cm_g[0].len();
+    if k_g == 0 {
+        return Err("cm_g_aggregate: k_g=0 (no digits) is invalid".to_string());
+    }
+    // Flatten: concat_{inst, dig, j} cm_g[inst][dig][j]
+    let mut cm_g_flat: Vec<R> = Vec::new();
+    for (inst_idx, inst) in cm_g.iter().enumerate() {
+        if inst.is_empty() {
+            return Err(format!("cm_g_aggregate: empty cm_g[{inst_idx}]"));
+        }
+        if inst.len() != k_g {
+            return Err(format!(
+                "cm_g_aggregate: cm_g[{inst_idx}] digit count mismatch (got {}, expected {k_g})",
+                inst.len()
+            ));
+        }
+        for (dig_idx, dig) in inst.iter().enumerate() {
+            if dig.len() != kappa {
+                return Err(format!(
+                    "cm_g_aggregate: cm_g[{inst_idx}][{dig_idx}] len mismatch (got {}, expected {kappa})",
+                    dig.len()
+                ));
+            }
+            cm_g_flat.extend(dig.iter().copied());
+        }
+    }
+    let n = cm_g_flat.len();
+    if n == 0 {
+        return Err("cm_g_aggregate: flattened cm_g is empty".to_string());
+    }
+    
+    // Create the aggregate scheme with the dedicated domain and seed.
+    let agg_scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_g_agg", CM_G_AGG_SEED, kappa, n);
+    let c_agg = agg_scheme
+        .commit(&cm_g_flat)
+        .map_err(|e| format!("cm_g_aggregate: commit failed: {e:?}"))?;
+    Ok(c_agg.as_ref().to_vec())
+}
+
 // Re-export streaming types
 pub use crate::streaming_sumcheck::{StreamingProverMsg, StreamingSumcheckState};
 
@@ -546,11 +607,22 @@ where
                 .collect::<Vec<_>>()
         };
 
-        for c_vec in &cm_g_inst {
-            transcript.absorb_slice(c_vec);
-        }
+        // Store cm_g for this instance (absorption happens after all instances computed).
         cm_g.push(cm_g_inst);
+    }
 
+    // -----------------------------------------------------------------------
+    // Aggregate cm_g absorption: bind all cm_g commitments into transcript via a single
+    // short Ajtai commitment (reduces Poseidon permutations from O(ell*k_g*kappa) to O(kappa)).
+    // -----------------------------------------------------------------------
+    let kappa = cm_g_scheme.kappa();
+    let cm_g_agg = compute_cm_g_aggregate(&cm_g, kappa)?;
+    transcript.absorb_slice(&cm_g_agg);
+
+    // -----------------------------------------------------------------------
+    // Phase 2: Derive Π_mon coins for all instances (now bound to the aggregate).
+    // -----------------------------------------------------------------------
+    for _inst_idx in 0..ell {
         let mut cba: Vec<(Vec<R>, R::BaseRing, R::BaseRing)> = Vec::with_capacity(rg_params.k_g);
         for _ in 0..rg_params.k_g {
             let c: Vec<R> = transcript
@@ -566,9 +638,10 @@ where
         cba_all.push(cba);
         rc_all.push(rc);
     }
+
     if prof {
         eprintln!(
-            "[PiFold streaming hetero] coins+J: {:?} (ell={}, k_g={}, g_nvars={})",
+            "[PiFold streaming hetero] coins+J+agg: {:?} (ell={}, k_g={}, g_nvars={})",
             t_coins.elapsed(),
             ell,
             rg_params.k_g,

@@ -12,7 +12,7 @@ use symphony::rp_rgchk::RPParams;
 use symphony::symphony_coins::{derive_J, derive_beta_chi};
 use symphony::symphony_open::MultiAjtaiOpenVerifier;
 use symphony::symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices};
-use symphony::symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig};
+use symphony::symphony_pifold_streaming::{compute_cm_g_aggregate, prove_pi_fold_poseidon_fs, PiFoldStreamingConfig};
 use latticefold::commitment::AjtaiCommitmentScheme;
 
 const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
@@ -164,9 +164,19 @@ fn test_pifold_math_dr1cs_roundtrip_satisfiable_and_tamper_fails() {
     let mut cba_all_bf: Vec<Vec<(Vec<BF>, BF, BF)>> = Vec::with_capacity(ell);
     let mut rc_all_bf: Vec<Option<BF>> = Vec::with_capacity(ell);
 
+    // Phase 1: absorb cm_f and derive J for each instance.
     for cm_f in &cms {
         ts.absorb_slice(cm_f);
         let _j = derive_J::<R>(&mut ts, rg_params.lambda_pj, rg_params.l_h);
+    }
+
+    // Aggregate cm_g absorption (matches prover/verifier schedule).
+    let kappa = out.proof.cm_g[0][0].len();
+    let cm_g_agg = compute_cm_g_aggregate(&out.proof.cm_g, kappa).expect("cm_g_agg failed");
+    ts.absorb_slice(&cm_g_agg);
+
+    // Phase 2: derive coins for each instance.
+    for _ in 0..ell {
         let mut cba = Vec::with_capacity(rg_params.k_g);
         for _ in 0..rg_params.k_g {
             let c = ts.get_challenges(g_nvars);

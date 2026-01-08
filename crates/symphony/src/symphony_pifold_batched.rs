@@ -35,6 +35,7 @@ use stark_rings_poly::mle::DenseMultilinearExtension;
 use crate::{
     symphony_coins::{derive_beta_chi, derive_J, ev, ts_weights},
     symphony_open::{NoOpen, VfyOpen},
+    symphony_pifold_streaming::compute_cm_g_aggregate,
     rp_rgchk::{compose_v_digits, RPParams},
     symphony_cm::SymphonyCoins,
     symphony_fold::{SymphonyBatchLin, SymphonyInstance},
@@ -444,20 +445,29 @@ where
         return Err("PiFold: cm_g length mismatch".to_string());
     }
 
+    // Phase 1: Absorb cm_f and derive J for each instance; validate cm_g structure.
     for (inst_idx, cm_f) in cms.iter().enumerate() {
         transcript.absorb_slice(cm_f);
         let J = derive_J::<R>(transcript, rg_params.lambda_pj, rg_params.l_h);
         Js.push(J);
 
-        // Bind the monomial commitments c(i) into the transcript before deriving Π_mon coins.
-        // (These are prover messages in Figure 2 Step 3.)
         if proof.cm_g[inst_idx].len() != rg_params.k_g {
             return Err("PiFold: cm_g k_g mismatch".to_string());
         }
-        for dig in 0..rg_params.k_g {
-            transcript.absorb_slice(&proof.cm_g[inst_idx][dig]);
-        }
+    }
 
+    // Aggregate cm_g absorption: bind all cm_g commitments via a single short Ajtai commit.
+    // Determine kappa from the first commitment (all should have same length).
+    let kappa = if !proof.cm_g.is_empty() && !proof.cm_g[0].is_empty() {
+        proof.cm_g[0][0].len()
+    } else {
+        return Err("PiFold: empty cm_g".to_string());
+    };
+    let cm_g_agg = compute_cm_g_aggregate(&proof.cm_g, kappa)?;
+    transcript.absorb_slice(&cm_g_agg);
+
+    // Phase 2: Derive Π_mon coins for all instances (now bound to the aggregate).
+    for _inst_idx in 0..ell {
         let mut cba: Vec<(Vec<R>, R::BaseRing, R::BaseRing)> = Vec::with_capacity(rg_params.k_g);
         for _ in 0..rg_params.k_g {
             let c: Vec<R> = transcript
@@ -831,19 +841,28 @@ where
         return Err("PiFold: cm_g length mismatch".to_string());
     }
 
+    // Phase 1: Absorb cm_f and derive J for each instance; validate cm_g structure.
     for (inst_idx, cm_f) in cms.iter().enumerate() {
         transcript.absorb_slice(cm_f);
         let J = derive_J::<R>(transcript, rg_params.lambda_pj, rg_params.l_h);
         Js.push(J);
 
-        // Bind the monomial commitments c(i) into the transcript before deriving Π_mon coins.
         if proof.cm_g[inst_idx].len() != rg_params.k_g {
             return Err("PiFold: cm_g k_g mismatch".to_string());
         }
-        for dig in 0..rg_params.k_g {
-            transcript.absorb_slice(&proof.cm_g[inst_idx][dig]);
-        }
+    }
 
+    // Aggregate cm_g absorption: bind all cm_g commitments via a single short Ajtai commit.
+    let kappa = if !proof.cm_g.is_empty() && !proof.cm_g[0].is_empty() {
+        proof.cm_g[0][0].len()
+    } else {
+        return Err("PiFold: empty cm_g".to_string());
+    };
+    let cm_g_agg = compute_cm_g_aggregate(&proof.cm_g, kappa)?;
+    transcript.absorb_slice(&cm_g_agg);
+
+    // Phase 2: Derive Π_mon coins for all instances (now bound to the aggregate).
+    for _inst_idx in 0..ell {
         let mut cba: Vec<(Vec<R>, R::BaseRing, R::BaseRing)> = Vec::with_capacity(rg_params.k_g);
         for _ in 0..rg_params.k_g {
             let c: Vec<R> = transcript

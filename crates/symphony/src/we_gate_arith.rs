@@ -34,7 +34,7 @@ use ark_std::log2;
 use latticefold::transcript::Transcript;
 use latticefold::utils::sumcheck::MLSumcheck;
 use latticefold::commitment::AjtaiCommitmentScheme;
-use stark_rings::{OverField, PolyRing, Ring, Zq};
+use stark_rings::{balanced_decomposition::Decompose, OverField, PolyRing, Ring, Zq};
 
 use crate::dpp_ajtai::{ajtai_open_dr1cs_from_scheme, ajtai_open_dr1cs_from_scheme_full};
 use crate::dpp_poseidon::{
@@ -48,6 +48,7 @@ use crate::dpp_pifold_math::pifold_verifier_math_dr1cs;
 use crate::public_coin_transcript::FixedTranscript;
 use crate::symphony_coins::{derive_beta_chi, derive_J};
 use crate::symphony_pifold_batched::{PiFoldAuxWitness, PiFoldBatchedProof};
+use crate::symphony_pifold_streaming::CM_G_AGG_SEED;
 use crate::transcript::PoseidonTraceOp;
 
 pub struct WeGateDr1csBuilder;
@@ -160,7 +161,7 @@ impl WeGateDr1csBuilder {
     >
     where
         R: OverField + Ring + PolyRing,
-        R::BaseRing: Zq + Field,
+        R::BaseRing: Zq + Field + Decompose,
     {
         if cms.len() != aux.had_u.len()
             || cms.len() != aux.mon_b.len()
@@ -214,6 +215,41 @@ impl WeGateDr1csBuilder {
         parts.push((cfs_inst, cfs_asg));
 
         // ---------------------------------------------------------------------
+        // Ajtai-open check for cm_g aggregate: enforce c_agg = A_agg · cm_g_flat.
+        // This binds the aggregate (absorbed into transcript) to the individual cm_g values.
+        // ---------------------------------------------------------------------
+        let kappa = if !proof.cm_g.is_empty() && !proof.cm_g[0].is_empty() {
+            proof.cm_g[0][0].len()
+        } else {
+            return Err("WeGateDr1csBuilder: empty cm_g for aggregate".to_string());
+        };
+
+        // Flatten cm_g: concat_{inst, dig, j} cm_g[inst][dig][j]
+        let mut cm_g_flat: Vec<R> = Vec::new();
+        for inst in proof.cm_g.iter() {
+            for dig in inst.iter() {
+                cm_g_flat.extend(dig.iter().copied());
+            }
+        }
+        let n_agg = cm_g_flat.len();
+
+        // Create the aggregate scheme (same as used in compute_cm_g_aggregate).
+        let cm_g_agg_scheme =
+            AjtaiCommitmentScheme::<R>::seeded(b"cm_g_agg", CM_G_AGG_SEED, kappa, n_agg);
+
+        // Compute the expected aggregate (verifier-side recomputation).
+        let cm_g_agg = cm_g_agg_scheme
+            .commit(&cm_g_flat)
+            .map_err(|e| format!("WeGateDr1csBuilder: cm_g_agg commit failed: {e:?}"))?
+            .as_ref()
+            .to_vec();
+
+        // Enforce: A_agg · cm_g_flat = cm_g_agg (linear constraints).
+        let (cm_g_agg_inst, cm_g_agg_asg) =
+            ajtai_open_dr1cs_from_scheme_full::<R>(&cm_g_agg_scheme, &cm_g_flat, &cm_g_agg)?;
+        parts.push((cm_g_agg_inst, cm_g_agg_asg));
+
+        // ---------------------------------------------------------------------
         // Extract the Π_fold verifier coin pieces from the proof's recorded coin stream
         // and compute rs_shared via sumcheck verification replay.
         // ---------------------------------------------------------------------
@@ -243,9 +279,18 @@ impl WeGateDr1csBuilder {
             Vec::with_capacity(ell);
         let mut rc_all_bf: Vec<Option<<R::BaseRing as Field>::BasePrimeField>> =
             Vec::with_capacity(ell);
+
+        // Phase 1: absorb cm_f and derive J for each instance.
         for cm_f in cms {
             ts.absorb_slice(cm_f);
             let _j = derive_J::<R>(&mut ts, proof.rg_params.lambda_pj, proof.rg_params.l_h);
+        }
+
+        // Aggregate cm_g absorption (reuse cm_g_agg computed above for Ajtai check).
+        ts.absorb_slice(&cm_g_agg);
+
+        // Phase 2: derive coins for each instance.
+        for _ in 0..ell {
             let mut cba = Vec::with_capacity(k_g);
             for _dig in 0..k_g {
                 let c = ts
@@ -336,45 +381,46 @@ impl WeGateDr1csBuilder {
         }
 
         // Build glue list in local indices: (part_a, var_a, part_b, var_b).
-        // part 0 = poseidon, part 1 = cfs-openings, part 2 = pifold-math
+        // part 0 = poseidon, part 1 = cfs-openings, part 2 = cm_g_agg, part 3 = pifold-math
+        const PIFOLD_PART: usize = 3;
         let mut glue: Vec<(usize, usize, usize, usize)> = Vec::new();
 
         let mut ch = 0usize;
         // s_base
         for (j, &v) in pifold_wiring.s_base.iter().enumerate() {
             let _ = j;
-            glue.push((2, v, 0, wiring.squeeze_field_vars[ch]));
+            glue.push((PIFOLD_PART, v, 0, wiring.squeeze_field_vars[ch]));
             ch += 1;
         }
         // alpha_base
-        glue.push((2, pifold_wiring.alpha_base, 0, wiring.squeeze_field_vars[ch]));
+        glue.push((PIFOLD_PART, pifold_wiring.alpha_base, 0, wiring.squeeze_field_vars[ch]));
         ch += 1;
         // per-instance per-digit: c vector, beta, alpha, optional rc
         for inst_idx in 0..ell {
             for dig in 0..k_g {
                 let idx_flat = inst_idx * k_g + dig;
                 for &cv in &pifold_wiring.c_all[idx_flat] {
-                    glue.push((2, cv, 0, wiring.squeeze_field_vars[ch]));
+                    glue.push((PIFOLD_PART, cv, 0, wiring.squeeze_field_vars[ch]));
                     ch += 1;
                 }
-                glue.push((2, pifold_wiring.beta_i_all[idx_flat], 0, wiring.squeeze_field_vars[ch]));
+                glue.push((PIFOLD_PART, pifold_wiring.beta_i_all[idx_flat], 0, wiring.squeeze_field_vars[ch]));
                 ch += 1;
-                glue.push((2, pifold_wiring.alpha_i_all[idx_flat], 0, wiring.squeeze_field_vars[ch]));
+                glue.push((PIFOLD_PART, pifold_wiring.alpha_i_all[idx_flat], 0, wiring.squeeze_field_vars[ch]));
                 ch += 1;
             }
             if let Some(rcv) = pifold_wiring.rc_all[inst_idx] {
-                glue.push((2, rcv, 0, wiring.squeeze_field_vars[ch]));
+                glue.push((PIFOLD_PART, rcv, 0, wiring.squeeze_field_vars[ch]));
                 ch += 1;
             }
         }
         // rhos
         for &rv in &pifold_wiring.rhos {
-            glue.push((2, rv, 0, wiring.squeeze_field_vars[ch]));
+            glue.push((PIFOLD_PART, rv, 0, wiring.squeeze_field_vars[ch]));
             ch += 1;
         }
         // rs_shared
         for &rv in &pifold_wiring.rs_shared {
-            glue.push((2, rv, 0, wiring.squeeze_field_vars[ch]));
+            glue.push((PIFOLD_PART, rv, 0, wiring.squeeze_field_vars[ch]));
             ch += 1;
         }
         debug_assert_eq!(ch, total_challenges);
