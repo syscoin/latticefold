@@ -63,13 +63,6 @@ fn main() {
 
     let mut cfg = PiFoldStreamingConfig::default();
     cfg.profile = std::env::var("SYMPHONY_PROFILE").ok().as_deref() == Some("1");
-    cfg.experimental_instance_local_coins =
-        std::env::var("EXPERIMENTAL_INSTANCE_LOCAL_COINS").ok().as_deref() == Some("1");
-    if cfg.experimental_instance_local_coins {
-        println!(
-            "WARNING: EXPERIMENTAL_INSTANCE_LOCAL_COINS=1 enabled (prover-only experiment). Proofs will NOT verify."
-        );
-    }
 
     println!("=========================================================");
     println!("Symphony SP1 One-Proof");
