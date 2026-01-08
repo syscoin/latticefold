@@ -82,7 +82,14 @@ fn main() {
         let scheme_g =
             AjtaiCommitmentScheme::<R>::seeded(b"cm_g", MASTER_SEED, 32, m * R::dimension());
 
-        let cfg = PiFoldStreamingConfig::default();
+        let mut cfg = PiFoldStreamingConfig::default();
+        cfg.experimental_instance_local_coins =
+            std::env::var("EXPERIMENTAL_INSTANCE_LOCAL_COINS").ok().as_deref() == Some("1");
+        if cfg.experimental_instance_local_coins {
+            println!(
+                "WARNING: EXPERIMENTAL_INSTANCE_LOCAL_COINS=1 enabled (prover-only experiment). Proofs will NOT verify."
+            );
+        }
         let prove_start = Instant::now();
         let out = prove_pi_fold_poseidon_fs::<R, PC>(
             ms.as_slice(),
