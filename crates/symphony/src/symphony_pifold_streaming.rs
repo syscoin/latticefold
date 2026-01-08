@@ -485,6 +485,8 @@ where
         let digits_flat_for_commit = digits_flat.clone();
         let k_g = rg_params.k_g;
         let n = m * d;
+        let g0 = exp::<R>(R::BaseRing::ZERO).expect("Exp failed");
+        let const_coeff = const_coeff_fastpath;
         let commits = cm_g_scheme
             .commit_many_with(n, k_g, move |j, out: &mut [R]| {
                 // out[dig] = g^(dig)[j]
@@ -492,8 +494,14 @@ where
                 let row = j - col * m;
                 let out_row = row % m_j;
                 for dig in 0..k_g {
-                    let digit = digits_flat_for_commit[(out_row * d + col) * k_g + dig];
-                    out[dig] = exp::<R>(digit).expect("Exp failed");
+                    if const_coeff && col != 0 {
+                        // In const-coeff fast path, projected digits are zero for columns 1..d-1,
+                        // so g^(dig)[j] = exp(0) is constant for those columns.
+                        out[dig] = g0;
+                    } else {
+                        let digit = digits_flat_for_commit[(out_row * d + col) * k_g + dig];
+                        out[dig] = exp::<R>(digit).expect("Exp failed");
+                    }
                 }
             })
             .map_err(|e| format!("PiFold: cm_g commit failed: {e:?}"))?;
