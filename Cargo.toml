@@ -1,6 +1,7 @@
 [workspace] 
 members = [
     "crates/cyclotomic-rings",
+    "crates/dpp",
     "crates/latticefold",
     "crates/latticefold-plus",
     "crates/symphony",

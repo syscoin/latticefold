@@ -39,6 +39,7 @@ stark-rings = { workspace = true }
 stark-rings-linalg = { workspace = true }
 stark-rings-poly = { workspace = true }
 thiserror = { workspace = true }
+dpp = { path = "../dpp" }
 
 [build-dependencies]
 proc-macro2 = { workspace = true }

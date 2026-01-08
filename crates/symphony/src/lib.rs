@@ -18,6 +18,14 @@ pub mod symphony_coins;
 pub mod symphony_open;
 pub mod symphony_pifold_batched;
 pub mod symphony_we_relation;
+pub mod we_statement;
+pub mod poseidon_trace;
+pub mod dpp_poseidon;
+pub mod dpp_ajtai;
+pub mod we_gate_arith;
+pub mod we_gate_inventory;
+pub mod dpp_sumcheck;
+pub mod dpp_pifold_math;
 
 // SP1 R1CS integration
 pub mod sp1_r1cs_loader;

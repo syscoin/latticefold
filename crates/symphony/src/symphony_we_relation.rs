@@ -92,7 +92,7 @@ where
     R::BaseRing: Zq + Decompose,
     PC: cyclotomic_rings::rings::GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
 {
-    let ((folded_inst, folded_bat), metrics) =
+    let ((folded_inst, folded_bat), metrics, _trace) =
         verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_with_metrics::<R, PC>(
             M,
             cm_f,
@@ -187,7 +187,7 @@ where
     R::BaseRing: Zq + Decompose,
     PC: cyclotomic_rings::rings::GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
 {
-    let ((folded_inst, folded_bat), metrics) =
+    let ((folded_inst, folded_bat), metrics, _trace) =
         verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics::<R, PC>(
             Ms,
             cm_f,
@@ -283,7 +283,7 @@ where
     R::BaseRing: Zq + Decompose,
     PC: cyclotomic_rings::rings::GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
 {
-    let (rcp_res, metrics) =
+    let (rcp_res, metrics, _trace) =
         verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics_result::<R, PC>(
             Ms,
             cm_f,

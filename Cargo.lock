@@ -500,6 +500,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "dpp"
+version = "0.1.0"
+dependencies = [
+ "ark-ff",
+ "ark-poly",
+ "ark-std",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+ "rand",
+ "rand_chacha",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1172,6 +1188,7 @@ dependencies = [
  "ark-std",
  "criterion",
  "cyclotomic-rings",
+ "dpp",
  "hashbrown 0.15.5",
  "latticefold",
  "num-bigint",

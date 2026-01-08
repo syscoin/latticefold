@@ -932,10 +932,10 @@ where
         aux,
         public_inputs,
     )
-    .map(|(out, _metrics)| out)
+    .map(|(out, _metrics, _trace)| out)
 }
 
-/// WE/DPP-facing verifier, plus transcript metrics for empirical Poseidon cost estimation.
+/// WE/DPP-facing verifier, plus transcript metrics (and full trace) for algebraic/DPP frontends.
 pub fn verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_with_metrics<R: CoeffRing, PC>(
     M: [&SparseMatrix<R>; 3],
     cm_f: &[Vec<R>],
@@ -945,12 +945,19 @@ pub fn verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_with_metrics<R: Co
     cfs_mon_b: &[Vec<R>],
     aux: &PiFoldAuxWitness<R>,
     public_inputs: &[R::BaseRing],
-) -> Result<((SymphonyInstance<R>, SymphonyBatchLin<R>), PoseidonTranscriptMetrics), String>
+) -> Result<
+    (
+        (SymphonyInstance<R>, SymphonyBatchLin<R>),
+        PoseidonTranscriptMetrics,
+        crate::transcript::PoseidonTranscriptTrace<<R::BaseRing as ark_ff::Field>::BasePrimeField>,
+    ),
+    String,
+>
 where
     R::BaseRing: Zq + Decompose,
     PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
 {
-    let mut ts = crate::transcript::PoseidonTranscript::<R>::empty::<PC>();
+    let mut ts = crate::transcript::TracePoseidonTranscript::<R>::empty::<PC>();
     ts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
     absorb_public_inputs::<R>(&mut ts, public_inputs);
 
@@ -985,7 +992,7 @@ where
         open.verify_opening(&mut ts, "cfs_mon_b", &cfs_mon_b[i], &[], &aux.mon_b[i], &[])?;
     }
 
-    Ok((out, ts.metrics()))
+    Ok((out, ts.metrics(), ts.trace().clone()))
 }
 
 /// WE/DPP-facing verifier for hetero-M batched Π_fold: check Poseidon-FS proof using CP transcript-message commitments.
@@ -1016,10 +1023,10 @@ where
         aux,
         public_inputs,
     )
-    .map(|(out, _metrics)| out)
+    .map(|(out, _metrics, _trace)| out)
 }
 
-/// WE/DPP-facing hetero-M verifier, plus transcript metrics for empirical Poseidon cost estimation.
+/// WE/DPP-facing hetero-M verifier, plus transcript metrics (and full trace) for algebraic/DPP frontends.
 pub fn verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics<
     R: CoeffRing,
     PC,
@@ -1032,12 +1039,19 @@ pub fn verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metr
     cfs_mon_b: &[Vec<R>],
     aux: &PiFoldAuxWitness<R>,
     public_inputs: &[R::BaseRing],
-) -> Result<((SymphonyInstance<R>, SymphonyBatchLin<R>), PoseidonTranscriptMetrics), String>
+) -> Result<
+    (
+        (SymphonyInstance<R>, SymphonyBatchLin<R>),
+        PoseidonTranscriptMetrics,
+        crate::transcript::PoseidonTranscriptTrace<<R::BaseRing as ark_ff::Field>::BasePrimeField>,
+    ),
+    String,
+>
 where
     R::BaseRing: Zq + Decompose,
     PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
 {
-    let mut ts = crate::transcript::PoseidonTranscript::<R>::empty::<PC>();
+    let mut ts = crate::transcript::TracePoseidonTranscript::<R>::empty::<PC>();
     ts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
     absorb_public_inputs::<R>(&mut ts, public_inputs);
 
@@ -1070,7 +1084,7 @@ where
         open.verify_opening(&mut ts, "cfs_mon_b", &cfs_mon_b[i], &[], &aux.mon_b[i], &[])?;
     }
 
-    Ok((out, ts.metrics()))
+    Ok((out, ts.metrics(), ts.trace().clone()))
 }
 
 /// Same as `verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics`, but returns
@@ -1088,12 +1102,16 @@ pub fn verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metr
     cfs_mon_b: &[Vec<R>],
     aux: &PiFoldAuxWitness<R>,
     public_inputs: &[R::BaseRing],
-) -> (Result<(SymphonyInstance<R>, SymphonyBatchLin<R>), String>, PoseidonTranscriptMetrics)
+) -> (
+    Result<(SymphonyInstance<R>, SymphonyBatchLin<R>), String>,
+    PoseidonTranscriptMetrics,
+    crate::transcript::PoseidonTranscriptTrace<<R::BaseRing as ark_ff::Field>::BasePrimeField>,
+)
 where
     R::BaseRing: Zq + Decompose,
     PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
 {
-    let mut ts = crate::transcript::PoseidonTranscript::<R>::empty::<PC>();
+    let mut ts = crate::transcript::TracePoseidonTranscript::<R>::empty::<PC>();
     ts.absorb_field_element(&R::BaseRing::from(0x4c465053_50494250u128)); // "LFPS_PIBP"
     absorb_public_inputs::<R>(&mut ts, public_inputs);
 
@@ -1132,7 +1150,8 @@ where
 
     // Always return metrics, even on failure.
     let metrics = ts.metrics();
-    (res, metrics)
+    let trace = ts.trace().clone();
+    (res, metrics, trace)
 }
 
 /// Relation-check style wrapper for GM‑1 / DPP frontends:

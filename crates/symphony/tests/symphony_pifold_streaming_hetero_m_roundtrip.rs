@@ -7,8 +7,10 @@ use symphony::symphony_open::AjtaiOpenVerifier;
 use symphony::symphony_open::MultiAjtaiOpenVerifier;
 use symphony::symphony_pifold_batched::{
     verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m,
+    verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics,
     verify_pi_fold_batched_and_fold_outputs_poseidon_fs_hetero_m,
 };
+use symphony::poseidon_trace::replay_poseidon_transcript_trace;
 use symphony::symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig};
 
 const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
@@ -132,5 +134,28 @@ fn test_pifold_streaming_hetero_m_roundtrip() {
         &public_inputs,
     )
     .expect("cp verify failed");
+
+    // Trace harness: ensure trace lengths match metrics counters.
+    let (_out2, metrics, trace) = verify_pi_fold_batched_and_fold_outputs_poseidon_fs_cp_hetero_m_with_metrics::<R, PC>(
+        ms_refs.as_slice(),
+        &cms,
+        &out.proof,
+        &open_cfs,
+        &out.cfs_had_u,
+        &out.cfs_mon_b,
+        &out.aux,
+        &public_inputs,
+    )
+    .expect("cp verify (metrics) failed");
+
+    assert_eq!(metrics.absorbed_elems as usize, trace.absorbed.len());
+    assert_eq!(metrics.squeezed_field_elems as usize, trace.squeezed_field.len());
+    assert_eq!(metrics.squeezed_bytes as usize, trace.squeezed_bytes.len());
+
+    // Replay the trace to ensure it is a complete Poseidon transcript witness.
+    let cfg = <PC as cyclotomic_rings::rings::GetPoseidonParams<<<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField>>::get_poseidon_config();
+    let replay = replay_poseidon_transcript_trace(&cfg, &trace).expect("poseidon trace replay failed");
+    // Sanity: permutation count should match simple upper-bound estimate order of magnitude.
+    assert!(replay.permutes.len() > 10);
 }
 
