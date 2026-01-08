@@ -914,8 +914,9 @@ impl StreamingSumcheck {
         degree: usize,
         comb_fn: impl Fn(&[R]) -> R + Sync + Send,
     ) -> (StreamingProof<R>, Vec<R::BaseRing>) {
-        transcript.absorb(&R::from(nvars as u128));
-        transcript.absorb(&R::from(degree as u128));
+        // Use absorb_field_element for scalars (saves ~(d-1) base-field absorbs each).
+        transcript.absorb_field_element(&R::BaseRing::from(nvars as u128));
+        transcript.absorb_field_element(&R::BaseRing::from(degree as u128));
 
         let mut state = Self::prover_init(mles, nvars, degree);
         let mut msgs = Vec::with_capacity(nvars);
@@ -927,7 +928,7 @@ impl StreamingSumcheck {
             msgs.push(pm);
 
             let r = transcript.get_challenge();
-            transcript.absorb(&R::from(r));
+            transcript.absorb_field_element(&r);  // scalar absorb
             v_msg = Some(r);
         }
 
@@ -947,8 +948,9 @@ impl StreamingSumcheck {
     ) -> (StreamingProof<R>, Vec<R::BaseRing>) {
         assert!(hook_round <= nvars);
 
-        transcript.absorb(&R::from(nvars as u128));
-        transcript.absorb(&R::from(degree as u128));
+        // Use absorb_field_element for scalars (saves ~(d-1) base-field absorbs each).
+        transcript.absorb_field_element(&R::BaseRing::from(nvars as u128));
+        transcript.absorb_field_element(&R::BaseRing::from(degree as u128));
 
         let mut state = Self::prover_init(mles, nvars, degree);
         let mut msgs = Vec::with_capacity(nvars);
@@ -961,7 +963,7 @@ impl StreamingSumcheck {
             msgs.push(pm);
 
             let r = transcript.get_challenge();
-            transcript.absorb(&R::from(r));
+            transcript.absorb_field_element(&r);  // scalar absorb
             sampled.push(r);
 
             if hook_round != 0 && sampled.len() == hook_round {
@@ -998,10 +1000,11 @@ impl StreamingSumcheck {
         assert!(nvars_a > 0 && nvars_b > 0);
         assert!(hook_round <= nvars_b);
 
-        transcript.absorb(&R::from(nvars_a as u128));
-        transcript.absorb(&R::from(degree_a as u128));
-        transcript.absorb(&R::from(nvars_b as u128));
-        transcript.absorb(&R::from(degree_b as u128));
+        // Use absorb_field_element for scalars (saves ~(d-1) base-field absorbs each).
+        transcript.absorb_field_element(&R::BaseRing::from(nvars_a as u128));
+        transcript.absorb_field_element(&R::BaseRing::from(degree_a as u128));
+        transcript.absorb_field_element(&R::BaseRing::from(nvars_b as u128));
+        transcript.absorb_field_element(&R::BaseRing::from(degree_b as u128));
 
         let mut state_a = Self::prover_init(mles_a, nvars_a, degree_a);
         let mut state_b = Self::prover_init(mles_b, nvars_b, degree_b);
@@ -1027,7 +1030,7 @@ impl StreamingSumcheck {
 
             // Sample shared randomness
             let r = transcript.get_challenge();
-            transcript.absorb(&R::from(r));
+            transcript.absorb_field_element(&r);  // scalar absorb
             sampled.push(r);
 
             if hook_round != 0 && sampled.len() == hook_round {

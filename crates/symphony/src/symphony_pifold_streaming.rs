@@ -896,10 +896,11 @@ where
     let mut v_digits_folded: Vec<Vec<R::BaseRing>> =
         vec![vec![R::BaseRing::ZERO; d]; rg_params.k_g];
 
-    transcript.absorb(&R::from(log_m as u128));
-    transcript.absorb(&R::from(3u128));
-    transcript.absorb(&R::from(g_nvars as u128));
-    transcript.absorb(&R::from(3u128));
+    // Use absorb_field_element for scalars (saves ~(d-1) base-field absorbs each).
+    transcript.absorb_field_element(&R::BaseRing::from(log_m as u128));
+    transcript.absorb_field_element(&R::BaseRing::from(3u128));
+    transcript.absorb_field_element(&R::BaseRing::from(g_nvars as u128));
+    transcript.absorb_field_element(&R::BaseRing::from(3u128));
 
     let mut had_state = StreamingSumcheck::prover_init(mles_had, log_m, 3);
     let mut mon_state = StreamingSumcheck::prover_init(mles_mon, g_nvars, 3);
@@ -933,7 +934,7 @@ where
         }
 
         let r = transcript.get_challenge();
-        transcript.absorb(&R::from(r));
+        transcript.absorb_field_element(&r);  // scalar absorb (saves ~(d-1) per round)
         sampled.push(r);
 
         if hook_round != 0 && sampled.len() == hook_round {
