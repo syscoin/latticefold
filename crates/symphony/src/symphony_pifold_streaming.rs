@@ -481,36 +481,67 @@ where
 
         // Commit to g^(i) and bind commitments into the transcript before Π_mon challenges.
         //
-        // Performance: do this as a *batched* Ajtai commit so we reuse the per-column RNG for all digits.
-        let digits_flat_for_commit = digits_flat.clone();
+        // Const-coeff fast path optimization:
+        // - for col != 0, digits are 0 so g^(dig)[j] = exp(0) is a constant g0
+        // - write g = g0 * 1 + Δ where Δ is supported only on col=0
+        // - then Commit(g) = g0*Commit(1) + Commit(Δ)
+        //
+        // This reduces the expensive Ajtai matvec from n=m*d positions to just m positions.
         let k_g = rg_params.k_g;
         let n = m * d;
         let g0 = exp::<R>(R::BaseRing::ZERO).expect("Exp failed");
-        let const_coeff = const_coeff_fastpath;
-        let commits = cm_g_scheme
-            .commit_many_with(n, k_g, move |j, out: &mut [R]| {
-                // out[dig] = g^(dig)[j]
-                let col = j / m;
-                let row = j - col * m;
-                let out_row = row % m_j;
-                for dig in 0..k_g {
-                    if const_coeff && col != 0 {
-                        // In const-coeff fast path, projected digits are zero for columns 1..d-1,
-                        // so g^(dig)[j] = exp(0) is constant for those columns.
-                        out[dig] = g0;
-                    } else {
+        let cm_g_inst: Vec<Vec<R>> = if const_coeff_fastpath && d > 1 {
+            // Precompute Commit(1) once per scheme and reuse across all instances/digits.
+            // NOTE: This is the same for all digits/instances because the Ajtai matrix is fixed.
+            let a1 = cm_g_scheme
+                .commit_many_with(n, 1, |_j, out: &mut [R]| out[0] = R::ONE)
+                .map_err(|e| format!("PiFold: cm_g commit(A·1) failed: {e:?}"))?;
+            let base = a1[0].as_ref().iter().map(|x| *x * g0).collect::<Vec<_>>();
+
+            // Commit the correction Δ over only the col=0 range j ∈ [0, m).
+            let digits_flat_for_commit = digits_flat.clone();
+            let delta = cm_g_scheme
+                .commit_many_with_range(n, k_g, 0, m, move |j, out: &mut [R]| {
+                    let out_row = j % m_j; // since col=0, row=j
+                    for dig in 0..k_g {
+                        let digit0 = digits_flat_for_commit[(out_row * d) * k_g + dig]; // col=0
+                        out[dig] = exp::<R>(digit0).expect("Exp failed") - g0;
+                    }
+                })
+                .map_err(|e| format!("PiFold: cm_g commit(Δ) failed: {e:?}"))?;
+
+            // Add base + delta.
+            delta
+                .into_iter()
+                .map(|c| {
+                    let mut v = base.clone();
+                    for (acc, x) in v.iter_mut().zip(c.as_ref().iter()) {
+                        *acc += *x;
+                    }
+                    v
+                })
+                .collect::<Vec<_>>()
+        } else {
+            // Generic path: commit the full g^(i) vectors.
+            let digits_flat_for_commit = digits_flat.clone();
+            cm_g_scheme
+                .commit_many_with(n, k_g, move |j, out: &mut [R]| {
+                    let col = j / m;
+                    let row = j - col * m;
+                    let out_row = row % m_j;
+                    for dig in 0..k_g {
                         let digit = digits_flat_for_commit[(out_row * d + col) * k_g + dig];
                         out[dig] = exp::<R>(digit).expect("Exp failed");
                     }
-                }
-            })
-            .map_err(|e| format!("PiFold: cm_g commit failed: {e:?}"))?;
+                })
+                .map_err(|e| format!("PiFold: cm_g commit failed: {e:?}"))?
+                .into_iter()
+                .map(|c| c.as_ref().to_vec())
+                .collect::<Vec<_>>()
+        };
 
-        let mut cm_g_inst: Vec<Vec<R>> = Vec::with_capacity(k_g);
-        for c in commits {
-            let c_vec = c.as_ref().to_vec();
-            transcript.absorb_slice(&c_vec);
-            cm_g_inst.push(c_vec);
+        for c_vec in &cm_g_inst {
+            transcript.absorb_slice(c_vec);
         }
         cm_g.push(cm_g_inst);
 
