@@ -38,5 +38,5 @@ pub mod rp_rgchk;
 pub mod streaming_sumcheck;
 pub mod symphony_pifold_streaming;
 
-// Phase 2: π_lin reduced relation
-pub mod symphony_pilin;
+// Polynomial Commitment Scheme (PCS) + dR1CS arithmetization (for aux → cm_f binding)
+pub mod pcs;

@@ -1152,29 +1152,3 @@ pub fn convert_streaming_proof<R: OverField>(
             .collect(),
     )
 }
-
-/// Build streaming MLEs for Hadamard (helper for custom usage).
-///
-/// NOTE: `s_r` must be constant-coefficient ring elements (embedded base-ring scalars),
-/// because we evaluate `eq(s, r)` in the base ring for performance.
-pub fn build_hadamard_streaming_mles<R: OverField + stark_rings::PolyRing>(
-    matrices: [Arc<SparseMatrix<R>>; 3],
-    witnesses: &[Arc<Vec<R>>],
-    s_r: Vec<R>,
-) -> Vec<StreamingMleEnum<R>> {
-    let ell = witnesses.len();
-    let mut mles: Vec<StreamingMleEnum<R>> = Vec::with_capacity(ell * 4);
-
-    for inst_idx in 0..ell {
-        let s_base = s_r.iter().map(|x| x.coeffs()[0]).collect::<Vec<_>>();
-        mles.push(StreamingMleEnum::eq_base(s_base));
-        for i in 0..3 {
-            mles.push(StreamingMleEnum::sparse_mat_vec(
-                matrices[i].clone(),
-                witnesses[inst_idx].clone(),
-            ));
-        }
-    }
-
-    mles
-}

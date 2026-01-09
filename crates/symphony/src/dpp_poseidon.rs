@@ -440,6 +440,15 @@ pub struct PoseidonDr1csWiring {
     pub squeeze_field_ranges: Vec<(usize, usize)>,
 }
 
+/// Wiring for `SqueezeBytes` outputs.
+#[derive(Clone, Debug, Default)]
+pub struct PoseidonByteWiring {
+    /// Flattened variable indices for all squeezed bytes (BF variables) in trace order.
+    pub squeeze_byte_vars: Vec<usize>,
+    /// For each `SqueezeBytes` op, `(start, len)` into `squeeze_byte_vars`.
+    pub squeeze_byte_ranges: Vec<(usize, usize)>,
+}
+
 /// Build a dR1CS instance for the *entire* Poseidon sponge transcript trace, including:
 /// - permutation constraints,
 /// - absorb updates (linear constraints),
@@ -478,6 +487,47 @@ pub fn poseidon_sponge_dr1cs_from_trace_with_wiring<F: PrimeField>(
     ),
     ReplayErr,
 > {
+    poseidon_sponge_dr1cs_from_trace_impl(cfg, ops, false).map(|(inst, asg, replay, bytes, wiring, _bw)| {
+        (inst, asg, replay, bytes, wiring)
+    })
+}
+
+/// Like `poseidon_sponge_dr1cs_from_trace_with_wiring`, but also **arithmetizes `SqueezeBytes`**:
+/// - allocates byte variables,
+/// - constrains each byte is 8-bit,
+/// - links bytes to the underlying squeezed field elements via radix-256 decomposition.
+pub fn poseidon_sponge_dr1cs_from_trace_with_wiring_and_bytes<F: PrimeField>(
+    cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+    ops: &[PoseidonTraceOp<F>],
+) -> Result<
+    (
+        SparseDr1csInstance<F>,
+        Vec<F>,
+        PoseidonSpongeReplayResult<F>,
+        Vec<ByteSqueezeWitness>,
+        PoseidonDr1csWiring,
+        PoseidonByteWiring,
+    ),
+    ReplayErr,
+> {
+    poseidon_sponge_dr1cs_from_trace_impl(cfg, ops, true)
+}
+
+fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
+    cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+    ops: &[PoseidonTraceOp<F>],
+    with_bytes: bool,
+) -> Result<
+    (
+        SparseDr1csInstance<F>,
+        Vec<F>,
+        PoseidonSpongeReplayResult<F>,
+        Vec<ByteSqueezeWitness>,
+        PoseidonDr1csWiring,
+        PoseidonByteWiring,
+    ),
+    ReplayErr,
+> {
     // First replay to ensure the ops are consistent and to get permute boundaries.
     let replay = replay_ops(cfg, ops)?;
 
@@ -499,6 +549,7 @@ pub fn poseidon_sponge_dr1cs_from_trace_with_wiring<F: PrimeField>(
 
     let mut byte_witnesses: Vec<ByteSqueezeWitness> = Vec::new();
     let mut wiring = PoseidonDr1csWiring::default();
+    let mut byte_wiring = PoseidonByteWiring::default();
 
     // Helper: apply a Poseidon permutation to the current `state_vars`.
     let mut permute_ptr: usize = 0;
@@ -718,9 +769,101 @@ pub fn poseidon_sponge_dr1cs_from_trace_with_wiring<F: PrimeField>(
                 byte_witnesses.push(ByteSqueezeWitness {
                     n: *n,
                     usable_bytes,
-                    src_elems: src_vars,
+                    src_elems: src_vars.clone(),
                     out: out.clone(),
                 });
+
+                if with_bytes {
+                    // Allocate and constrain byte vars + link to src elements.
+                    //
+                    // We allocate the **full** usable_bytes*num_elements bytes (even if n truncates
+                    // mid-element) so that every src element is linked to its low bytes.
+                    let range_start = byte_wiring.squeeze_byte_vars.len();
+                    let full_len = usable_bytes * num_elements;
+
+                    // Build full bytes from current witness values (untruncated).
+                    let mut full_bytes: Vec<u8> = Vec::with_capacity(full_len);
+                    for &v in &src_vars {
+                        let elem_bytes = b.assignment[v].into_bigint().to_bytes_le();
+                        full_bytes.extend_from_slice(&elem_bytes[..usable_bytes]);
+                    }
+                    debug_assert_eq!(full_bytes.len(), full_len);
+
+                    // Allocate byte variables in the same order as `full_bytes`.
+                    // We will expose the first `n` bytes as transcript output vars (linked to state).
+                    let mut op_byte_vars: Vec<usize> = Vec::with_capacity(full_len);
+
+                    // Constants for radix-256 recomposition.
+                    let mut pow256: Vec<F> = Vec::with_capacity(usable_bytes);
+                    let mut acc = F::ONE;
+                    let base = F::from(256u64);
+                    for _ in 0..usable_bytes {
+                        pow256.push(acc);
+                        acc *= base;
+                    }
+                    let pow256k = acc; // 256^{usable_bytes}
+
+                    for e in 0..num_elements {
+                        // Allocate byte vars for this element.
+                        let mut byte_vars: Vec<usize> = Vec::with_capacity(usable_bytes);
+                        for i in 0..usable_bytes {
+                            let bval = F::from(full_bytes[e * usable_bytes + i] as u64);
+                            let bv = b.new_var(bval);
+                            b.enforce_var_eq_const(bv, bval);
+                            byte_vars.push(bv);
+                            op_byte_vars.push(bv);
+
+                            // Decompose into 8 bits to enforce 0..255 and bind bits to bv.
+                            let mut bits: Vec<usize> = Vec::with_capacity(8);
+                            for bi in 0..8 {
+                                let bit = ((full_bytes[e * usable_bytes + i] >> bi) & 1) as u64;
+                                let vbit = b.new_var(if bit == 1 { F::ONE } else { F::ZERO });
+                                // boolean: vbit*(1-vbit)=0
+                                let one_minus = b.new_var(F::ONE - b.assignment[vbit]);
+                                b.enforce_lc_times_one_eq_var(
+                                    vec![(F::ONE, one), (-F::ONE, vbit)],
+                                    one_minus,
+                                );
+                                b.add_constraint(vec![(F::ONE, vbit)], vec![(F::ONE, one_minus)], vec![(F::ZERO, one)]);
+                                bits.push(vbit);
+                            }
+                            // bv == Σ 2^j * bits[j]
+                            let mut lc: Vec<(F, usize)> = Vec::with_capacity(8);
+                            let mut p2 = F::ONE;
+                            for &vbit in &bits {
+                                lc.push((p2, vbit));
+                                p2 = p2.double();
+                            }
+                            b.enforce_lc_times_one_eq_var(lc, bv);
+                        }
+
+                        // Link src element: src = Σ 256^i * byte_i + 256^k * high
+                        let src = src_vars[e];
+                        let mut low = F::ZERO;
+                        for i in 0..usable_bytes {
+                            low += pow256[i] * b.assignment[byte_vars[i]];
+                        }
+                        let high_val = (b.assignment[src] - low) * pow256k.inverse().unwrap();
+                        let high = b.new_var(high_val);
+                        // src - Σ 256^i*byte_i - 256^k*high = 0
+                        let mut lc: Vec<(F, usize)> = Vec::with_capacity(2 + usable_bytes);
+                        lc.push((F::ONE, src));
+                        for i in 0..usable_bytes {
+                            lc.push((-pow256[i], byte_vars[i]));
+                        }
+                        lc.push((-pow256k, high));
+                        let z = b.new_var(F::ZERO);
+                        b.enforce_var_eq_const(z, F::ZERO);
+                        b.enforce_lc_times_one_eq_var(lc, z);
+                    }
+
+                    // Expose only the first n bytes in trace order (truncated), as transcript output vars.
+                    // These are already linked to the squeezed field elements through the constraints above.
+                    for i in 0..*n {
+                        byte_wiring.squeeze_byte_vars.push(op_byte_vars[i]);
+                    }
+                    byte_wiring.squeeze_byte_ranges.push((range_start, *n));
+                }
 
                 mode = ark_crypto_primitives::sponge::DuplexSpongeMode::Squeezing {
                     next_squeeze_index: squeeze_index,
@@ -737,7 +880,7 @@ pub fn poseidon_sponge_dr1cs_from_trace_with_wiring<F: PrimeField>(
     }
 
     let (inst, assignment) = b.into_sparse_instance();
-    Ok((inst, assignment, replay, byte_witnesses, wiring))
+    Ok((inst, assignment, replay, byte_witnesses, wiring, byte_wiring))
 }
 
 #[cfg(test)]

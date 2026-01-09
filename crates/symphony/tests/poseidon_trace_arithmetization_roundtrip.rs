@@ -10,6 +10,12 @@ use symphony::rp_rgchk::RPParams;
 use symphony::symphony_open::MultiAjtaiOpenVerifier;
 use symphony::symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices};
 use symphony::symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig};
+use symphony::transcript::PoseidonTraceOp;
+use symphony::pcs::dpp_folding_pcs_l2::folding_pcs_l2_params;
+use symphony::pcs::folding_pcs_l2::{
+    kron_ct_in_mul, kron_i_a_mul, BinMatrix, DenseMatrix, FoldingPcsL2ProofCore,
+    verify_folding_pcs_l2_with_c_matrices,
+};
 use dpp::{
     dr1cs_flpcp::{Dr1csInstanceSparse as DppDr1csInstanceSparse, RsDr1csFlpcpSparse, RsDr1csNpFlpcpSparse},
     embedding::EmbeddingParams,
@@ -17,8 +23,8 @@ use dpp::{
     sparse::SparseVec,
     pipeline::build_rev2_dpp_sparse_boolean,
 };
-use ark_ff::{BigInteger, Fp, Fp256, MontBackend, MontConfig, PrimeField};
-use rand::{rngs::StdRng, SeedableRng};
+use ark_ff::{BigInteger, Field, Fp, Fp256, MontBackend, MontConfig, PrimeField};
+use rand::{rngs::StdRng, SeedableRng, RngCore};
 
 const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
 
@@ -361,26 +367,107 @@ fn test_poseidon_trace_sparse_dpp_end_to_end_accepts() {
         assert!(bad_merged.check(&bad_asg).is_err(), "tampered Ajtai-open should be UNSAT");
     }
 
-    // Bring-up binding: additionally enforce AjtaiOpen(cm_f, f) inside the merged system.
-    // This is NOT production-shape for SP1, but it validates that the gate can bind the witness
-    // when the witness is explicitly present.
-    let f_openings = vec![(*witnesses[0]).clone(), (*witnesses[1]).clone()];
-    let (merged2, merged2_asg) = WeGateDr1csBuilder::poseidon_plus_cfs_plus_cm_f_openings::<R>(
+    // Production-shape binding (current architecture): use PCS-in-gate instead of AjtaiOpen(cm_f, f).
+    // Here we attach a small FoldingPCS(ℓ=2) instance, and derive its `C1/C2` coins from the *real*
+    // verifier transcript trace via `SqueezeBytes` (glued inside the merged system).
+    let squeeze_bytes: Vec<Vec<u8>> = trace
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            PoseidonTraceOp::SqueezeBytes { out, .. } => Some(out.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !squeeze_bytes.is_empty(),
+        "expected verifier trace to contain at least one SqueezeBytes op"
+    );
+    let pcs_coin_squeeze_idx = 0usize;
+    let c_bytes = &squeeze_bytes[pcs_coin_squeeze_idx];
+    // Little-endian bits per byte (same convention as `bytes_to_bitstream_le_dr1cs`).
+    let mut bits = Vec::with_capacity(c_bytes.len() * 8);
+    for &b in c_bytes {
+        for i in 0..8 {
+            bits.push(((b >> i) & 1) == 1);
+        }
+    }
+    // Choose tiny PCS dimensions for a cheap integration check. Extra bytes are ignored.
+    let r = 1usize;
+    let kappa = 2usize;
+    let pcs_n = 4usize;
+    let delta = 4u64;
+    let alpha = 1usize;
+    let beta0 = 1u64 << 10;
+    let beta1 = 2 * beta0;
+    let beta2 = 2 * beta1;
+    // C1,C2 each use (r*kappa)*kappa bits.
+    let c1 = BinMatrix {
+        rows: r * kappa,
+        cols: kappa,
+        data: (0..(r * kappa * kappa))
+            .map(|i| if bits[i] { BF::ONE } else { BF::ZERO })
+            .collect(),
+    };
+    let c2 = BinMatrix {
+        rows: r * kappa,
+        cols: kappa,
+        data: (0..(r * kappa * kappa))
+            .map(|i| if bits[(r * kappa * kappa) + i] { BF::ONE } else { BF::ZERO })
+            .collect(),
+    };
+    // A = I_{pcs_n}.
+    let mut a_data = vec![BF::ZERO; pcs_n * (r * pcs_n * alpha)];
+    for i in 0..pcs_n {
+        a_data[i * (r * pcs_n * alpha) + i] = BF::ONE;
+    }
+    let a = DenseMatrix::new(pcs_n, r * pcs_n * alpha, a_data);
+    let pcs_params = folding_pcs_l2_params(r, kappa, pcs_n, delta, alpha, beta0, beta1, beta2, a);
+
+    let x0 = vec![BF::ONE; r];
+    let x1 = vec![BF::ONE; r];
+    let x2 = vec![BF::ONE; r];
+    let mut pcs_rng = StdRng::seed_from_u64(0xC0FFEE_u64);
+    let mut y0 = Vec::with_capacity(pcs_params.y0_len());
+    for _ in 0..pcs_params.y0_len() {
+        let mag = (pcs_rng.next_u64() % (beta0 + 1)) as u64;
+        let sign = (pcs_rng.next_u64() & 1) == 1;
+        let v = BF::from(mag);
+        y0.push(if sign { -v } else { v });
+    }
+    let y1 = kron_ct_in_mul(&c1, pcs_n, &y0);
+    let y2 = kron_ct_in_mul(&c2, pcs_n, &y1);
+    let t_pcs = kron_i_a_mul(&pcs_params.a, pcs_params.kappa, pcs_params.r * pcs_params.n * pcs_params.alpha, &y0);
+    let v0 = y0.clone();
+    let v1 = y1.clone();
+    let v2 = y2.clone();
+    let u_pcs = v0.clone();
+    let pcs_core = FoldingPcsL2ProofCore { y0, v0, y1, v1, y2, v2 };
+    verify_folding_pcs_l2_with_c_matrices(&pcs_params, &t_pcs, &x0, &x1, &x2, &u_pcs, &pcs_core, &c1, &c2)
+        .expect("native folding PCS sanity check failed");
+
+    let (merged3, merged3_asg) = WeGateDr1csBuilder::poseidon_plus_pifold_plus_cfs_plus_pcs::<R>(
         &poseidon_cfg,
-        ops,
-        &scheme,
+        &trace.ops,
         &cms,
-        &f_openings,
+        &out.proof,
         &scheme_had,
         &scheme_mon,
         &out.aux,
         &out.cfs_had_u,
         &out.cfs_mon_b,
+        &pcs_params,
+        &t_pcs,
+        &x0,
+        &x1,
+        &x2,
+        &u_pcs,
+        &pcs_core,
+        pcs_coin_squeeze_idx,
     )
-    .expect("build merged (poseidon+cfs+cm_f openings) failed");
-    merged2
-        .check(&merged2_asg)
-        .expect("merged (poseidon+cfs+cm_f openings) dr1cs unsat");
+    .expect("build merged (poseidon+pifold-math+cfs+pcs) failed");
+    merged3
+        .check(&merged3_asg)
+        .expect("merged (poseidon+pifold-math+cfs+pcs) dr1cs unsat");
 
     // Convert Symphony sparse dR1CS to DPP sparse dR1CS rows.
     //
