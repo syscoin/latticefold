@@ -1004,11 +1004,29 @@ where
             let t4 = Instant::now();
             let mut rng = StdRng::seed_from_u64(12345);
             let q = dpp.sample_query(&mut rng, &x_large).expect("sample_query");
-            // Run verification inside an explicit pool so we don't accidentally end up with a
-            // 1-thread global pool (which makes this look single-core).
-            let ok = pool
-                .install(|| dpp.verify_with_query(&x_large, &pi_large, &q))
-                .expect("verify_with_query");
+            println!(
+                "    DPP: query stats: k={}, q_terms={}",
+                q.w.len(),
+                q.q.terms.len()
+            );
+
+            // Split verification timing into:
+            // - packed dot-product
+            // - bounded decoding + predicate
+            let (a, t_dot) = {
+                let t = Instant::now();
+                let a = pool.install(|| q.q.dot_two_slices(&x_large, &pi_large));
+                (a, t.elapsed())
+            };
+            println!("    DPP: packed dot: {:?}", t_dot);
+
+            let (ok, t_dec) = {
+                let t = Instant::now();
+                let ok = dpp.verify_packed_answer(&a, &q);
+                (ok, t.elapsed())
+            };
+            let ok = ok.expect("verify_packed_answer");
+            println!("    DPP: decode+pred: {:?}", t_dec);
             let t4e = t4.elapsed();
             println!("    DPP: verify_with_query: {:?} (ok={})", t4e, ok);
         }
