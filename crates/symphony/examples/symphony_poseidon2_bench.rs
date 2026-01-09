@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 use std::time::Instant;
-use ark_ff::{Field, PrimeField};
+use ark_ff::{Field, Fp256, MontBackend, MontConfig, PrimeField};
 
 fn main() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -118,6 +118,14 @@ fn main() {
 
 /// Helper alias: Poseidon's base prime field for a given ring `R`.
 type BF<R> = <<R as stark_rings::PolyRing>::BaseRing as Field>::BasePrimeField;
+
+// 256-bit prime field for the large-field embedding/packing path (Rev2).
+// secp256k1 prime: 2^256 - 2^32 - 977
+#[derive(MontConfig)]
+#[modulus = "115792089237316195423570985008687907852837564279074904382605163141518161494337"]
+#[generator = "7"]
+pub struct Secp256k1Config;
+type FLarge = Fp256<MontBackend<Secp256k1Config, 4>>;
 
 /// Build Poseidon2 Hadamard relation matrices (M1, M2, M3) for Symphony.
 ///
@@ -842,6 +850,90 @@ where
             full.nvars.saturating_sub(rcp.nvars),
             full.constraints.len().saturating_sub(rcp.constraints.len()),
         );
+
+        // Optional: run the *actual DPP proving + verify-with-query* over the full gate dR1CS.
+        //
+        // Enable on a fast machine:
+        //   DPP=1 cargo run -p symphony --example symphony_poseidon2_bench --release
+        //
+        // This is intentionally not CI-friendly (can be very slow for large gates).
+        if std::env::var("DPP").ok().as_deref() == Some("1") {
+            use dpp::{
+                dr1cs_flpcp::Dr1csInstanceSparse as DppDr1csInstanceSparse,
+                dr1cs_flpcp::RsDr1csNpFlpcpSparse,
+                embedding::EmbeddingParams,
+                pipeline::build_rev2_dpp_sparse_boolean_auto,
+                sparse::SparseVec,
+                BooleanProofFlpcpSparse,
+            };
+            use rand::{rngs::StdRng, SeedableRng};
+
+            println!("    DPP: building sparse Dr1csInstance for full gate...");
+            let t0 = Instant::now();
+            let k = full.constraints.len();
+            let nvars = full.nvars;
+            let mut a_rows = Vec::with_capacity(k);
+            let mut b_rows = Vec::with_capacity(k);
+            let mut c_rows = Vec::with_capacity(k);
+            for row in &full.constraints {
+                a_rows.push(SparseVec::new(row.a.clone()));
+                b_rows.push(SparseVec::new(row.b.clone()));
+                c_rows.push(SparseVec::new(row.c.clone()));
+            }
+            let dr1cs = DppDr1csInstanceSparse::<BF<R>> { n: nvars, a: a_rows, b: b_rows, c: c_rows };
+            println!("    DPP: dr1cs build: {:?} (nvars={}, k={})", t0.elapsed(), nvars, k);
+
+            // NP-style RS FLPCP over BF: x=[] (public), witness z_w = full assignment.
+            let ell = 2 * k;
+            let flpcp = RsDr1csNpFlpcpSparse::<BF<R>>::new(dr1cs, 0, ell);
+            let x_small: Vec<BF<R>> = vec![];
+
+            println!("    DPP: RS-FLPCP prove: START...");
+            let t1 = Instant::now();
+            let pi_field = flpcp.prove(&x_small, &full_asg);
+            let t1e = t1.elapsed();
+            println!(
+                "    DPP: RS-FLPCP prove: {:?} (pi_field_len={})",
+                t1e,
+                pi_field.len()
+            );
+
+            println!("    DPP: booleanize + embed/pack: START...");
+            let t2 = Instant::now();
+            let boolized = BooleanProofFlpcpSparse::<BF<R>, _>::new(flpcp.clone());
+            let pi_bits = boolized.encode_proof_bits(&pi_field);
+            let dpp = build_rev2_dpp_sparse_boolean_auto::<BF<R>, FLarge, _>(
+                flpcp,
+                EmbeddingParams { gamma: 2, assume_boolean_proof: true, k_prime: 0 },
+            )
+            .expect("build_rev2_dpp_sparse_boolean_auto");
+            let t2e = t2.elapsed();
+            println!(
+                "    DPP: booleanize+build: {:?} (pi_bits_len={})",
+                t2e,
+                pi_bits.len()
+            );
+
+            // Lift x and π into FLarge.
+            println!("    DPP: lift proof to large field: START...");
+            let t3 = Instant::now();
+            let x_large: Vec<FLarge> = vec![];
+            let pi_large = pi_bits
+                .iter()
+                .map(|wi| FLarge::from_le_bytes_mod_order(&wi.into_bigint().to_bytes_le()))
+                .collect::<Vec<_>>();
+            let t3e = t3.elapsed();
+            println!("    DPP: lift: {:?} (pi_large_len={})", t3e, pi_large.len());
+
+            // Sample query and verify.
+            println!("    DPP: verify_with_query: START...");
+            let t4 = Instant::now();
+            let mut rng = StdRng::seed_from_u64(12345);
+            let q = dpp.sample_query(&mut rng, &x_large).expect("sample_query");
+            let ok = dpp.verify_with_query(&x_large, &pi_large, &q).expect("verify_with_query");
+            let t4e = t4.elapsed();
+            println!("    DPP: verify_with_query: {:?} (ok={})", t4e, ok);
+        }
     }
 
     println!("\n  === RESULTS ===");
