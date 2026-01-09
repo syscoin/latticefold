@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 use std::time::Instant;
-use ark_ff::PrimeField;
+use ark_ff::{Field, PrimeField};
 
 fn main() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -115,6 +115,9 @@ fn main() {
 
     // All printing is done inside `run_for_ring`.
 }
+
+/// Helper alias: Poseidon's base prime field for a given ring `R`.
+type BF<R> = <<R as stark_rings::PolyRing>::BaseRing as Field>::BasePrimeField;
 
 /// Build Poseidon2 Hadamard relation matrices (M1, M2, M3) for Symphony.
 ///
@@ -518,11 +521,19 @@ where
     use ark_ff::{BigInteger, Field, PrimeField};
     use latticefold::commitment::AjtaiCommitmentScheme;
     use symphony::{
+        pcs::dpp_folding_pcs_l2::folding_pcs_l2_params,
+        pcs::folding_pcs_l2::{
+            kron_ct_in_mul, kron_i_a_mul, BinMatrix, DenseMatrix, FoldingPcsL2ProofCore,
+            verify_folding_pcs_l2_with_c_matrices,
+        },
         rp_rgchk::RPParams,
         symphony_open::MultiAjtaiOpenVerifier,
         symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices},
         symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig},
+        transcript::PoseidonTraceOp,
+        we_gate_arith::WeGateDr1csBuilder,
     };
+    use cyclotomic_rings::rings::GetPoseidonParams;
 
     println!("\n=== Testing Symphony Poseidon2 with {} permutation(s), k_g={} ===", num_permutations, k_g);
 
@@ -693,6 +704,144 @@ where
             println!("  R_cp verify (streaming) FAILED: {e}");
             return;
         }
+    }
+
+    // Gate dR1CS size report (R_cp vs full with PCS delta), using the *real verifier trace*.
+    let poseidon_cfg = <PC as GetPoseidonParams<BF<R>>>::get_poseidon_config();
+    let attempt = verify_pi_fold_cp_poseidon_fs::<R, PC>(
+        PiFoldMatrices::Shared([m1.as_ref(), m2.as_ref(), m3.as_ref()]),
+        &[cm.clone()],
+        &out.proof,
+        &open,
+        &out.cfs_had_u,
+        &out.cfs_mon_b,
+        &out.aux,
+        &public_inputs,
+    );
+    let _ = attempt
+        .result
+        .expect("unexpected verify failure when extracting trace for dr1cs sizing");
+    let trace = attempt.trace;
+
+    let (rcp, rcp_asg) = WeGateDr1csBuilder::r_cp_poseidon_pifold_math_and_cfs_openings::<R>(
+        &poseidon_cfg,
+        &trace.ops,
+        &[cm.clone()],
+        &out.proof,
+        &scheme_had,
+        &scheme_mon,
+        &out.aux,
+        &out.cfs_had_u,
+        &out.cfs_mon_b,
+    )
+    .expect("build r_cp dr1cs failed");
+    rcp.check(&rcp_asg).expect("r_cp dr1cs unsat");
+
+    let squeeze_bytes: Vec<Vec<u8>> = trace
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            PoseidonTraceOp::SqueezeBytes { out, .. } => Some(out.clone()),
+            _ => None,
+        })
+        .collect();
+    if squeeze_bytes.is_empty() {
+        println!(
+            "    gate dr1cs: r_cp(nvars={}, constraints={}) (no SqueezeBytes => skip full pcs)",
+            rcp.nvars,
+            rcp.constraints.len()
+        );
+    } else {
+        let pcs_coin_squeeze_idx = 0usize;
+        let c_bytes = &squeeze_bytes[pcs_coin_squeeze_idx];
+        let mut bits = Vec::with_capacity(c_bytes.len() * 8);
+        for &b in c_bytes {
+            for i in 0..8 {
+                bits.push(((b >> i) & 1) == 1);
+            }
+        }
+
+        // Tiny PCS instance (plumbing + delta measurement; not the full Poseidon2 witness PCS yet).
+        let r = 1usize;
+        let kappa_pcs = 2usize;
+        let pcs_n = 4usize;
+        let delta = 4u64;
+        let alpha = 1usize;
+        let beta0 = 1u64 << 10;
+        let beta1 = 2 * beta0;
+        let beta2 = 2 * beta1;
+        let c1 = BinMatrix {
+            rows: r * kappa_pcs,
+            cols: kappa_pcs,
+            data: (0..(r * kappa_pcs * kappa_pcs))
+                .map(|i| if bits[i] { <BF<R> as Field>::ONE } else { <BF<R> as Field>::ZERO })
+                .collect(),
+        };
+        let c2 = BinMatrix {
+            rows: r * kappa_pcs,
+            cols: kappa_pcs,
+            data: (0..(r * kappa_pcs * kappa_pcs))
+                .map(|i| {
+                    if bits[(r * kappa_pcs * kappa_pcs) + i] {
+                        <BF<R> as Field>::ONE
+                    } else {
+                        <BF<R> as Field>::ZERO
+                    }
+                })
+                .collect(),
+        };
+        let mut a_data = vec![<BF<R> as Field>::ZERO; pcs_n * (r * pcs_n * alpha)];
+        for i in 0..pcs_n {
+            a_data[i * (r * pcs_n * alpha) + i] = <BF<R> as Field>::ONE;
+        }
+        let a = DenseMatrix::new(pcs_n, r * pcs_n * alpha, a_data);
+        let pcs_params = folding_pcs_l2_params(r, kappa_pcs, pcs_n, delta, alpha, beta0, beta1, beta2, a);
+        let x0 = vec![<BF<R> as Field>::ONE; r];
+        let x1 = vec![<BF<R> as Field>::ONE; r];
+        let x2 = vec![<BF<R> as Field>::ONE; r];
+        let y0 = vec![<BF<R> as Field>::ONE; pcs_params.y0_len()];
+        let y1 = kron_ct_in_mul(&c1, pcs_n, &y0);
+        let y2 = kron_ct_in_mul(&c2, pcs_n, &y1);
+        let t_pcs = kron_i_a_mul(&pcs_params.a, pcs_params.kappa, pcs_params.r * pcs_params.n * pcs_params.alpha, &y0);
+        let v0 = y0.clone();
+        let v1 = y1.clone();
+        let v2 = y2.clone();
+        let u_pcs = v0.clone();
+        let pcs_core = FoldingPcsL2ProofCore { y0, v0, y1, v1, y2, v2 };
+        verify_folding_pcs_l2_with_c_matrices(&pcs_params, &t_pcs, &x0, &x1, &x2, &u_pcs, &pcs_core, &c1, &c2)
+            .expect("native folding pcs sanity failed");
+
+        let (full, full_asg) = WeGateDr1csBuilder::poseidon_plus_pifold_plus_cfs_plus_pcs::<R>(
+            &poseidon_cfg,
+            &trace.ops,
+            &[cm.clone()],
+            &out.proof,
+            &scheme_had,
+            &scheme_mon,
+            &out.aux,
+            &out.cfs_had_u,
+            &out.cfs_mon_b,
+            &pcs_params,
+            &t_pcs,
+            &x0,
+            &x1,
+            &x2,
+            &u_pcs,
+            &pcs_core,
+            pcs_coin_squeeze_idx,
+        )
+        .expect("build full gate dr1cs failed");
+        full.check(&full_asg).expect("full gate dr1cs unsat");
+
+        println!(
+            "    gate dr1cs: r_cp(nvars={}, constraints={})  full(nvars={}, constraints={})  delta(nvars={}, constraints={})",
+            rcp.nvars,
+            rcp.constraints.len(),
+            full.nvars,
+            full.constraints.len(),
+            full.nvars.saturating_sub(rcp.nvars),
+            full.constraints.len().saturating_sub(rcp.constraints.len()),
+        );
     }
 
     println!("\n  === RESULTS ===");
