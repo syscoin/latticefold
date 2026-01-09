@@ -564,8 +564,15 @@ where
     let (m1, m2, m3, witness) =
         r1cs_decompose_witness_and_expand_matrices::<R>(&m1, &m2, &m3, &witness, 16, 16);
 
+    // After witness decomposition, the witness length grows by k_cs, which increases m_J.
+    // Π_fold requires: m_J <= m and m multiple of m_J, and also requires m*d is a power-of-two.
+    // This benchmark pads the matrices with empty rows to satisfy these shape constraints.
+    let mut m1 = m1;
+    let mut m2 = m2;
+    let mut m3 = m3;
+
     let n = witness.len();
-    let m = m1.nrows;
+    let mut m = m1.nrows;
 
     println!("  Hadamard matrices built:");
     println!("    Permutations: {num_permutations}");
@@ -573,6 +580,47 @@ where
     println!("    Matrix rows (m): {m}");
     println!("    Witness length (n): {n}");
     println!("    Build time: {build_time:?}");
+
+    // Build `rg_params` early so we can compute the required m_J for this run.
+    let rg_params = if k_g == 3 {
+        // Paper-style prototype mode:
+        // - use d' := d-2 in Eq.(29) / (33)
+        // - keep m_J small by using lambda_pj=1 (toy bench knob; paper uses 2^8)
+        RPParams {
+            l_h: 64,
+            lambda_pj: 1,
+            k_g,
+            d_prime: (R::dimension() as u128) - 2,
+        }
+    } else {
+        RPParams {
+            l_h: 64,
+            lambda_pj: 32,
+            k_g,
+            d_prime: (R::dimension() as u128) / 2,
+        }
+    };
+
+    let blocks = n / rg_params.l_h;
+    let m_j = blocks
+        .checked_mul(rg_params.lambda_pj)
+        .expect("m_J overflow");
+    if m < m_j || m % m_j != 0 {
+        let m_new = (m.max(m_j)).next_power_of_two();
+        println!(
+            "  !! Padding matrices: m={} -> {} to satisfy m_J={} (l_h={}, lambda_pj={})",
+            m, m_new, m_j, rg_params.l_h, rg_params.lambda_pj
+        );
+        // Extend coefficient rows with empties (zero rows).
+        m1.coeffs.resize(m_new, Vec::new());
+        m2.coeffs.resize(m_new, Vec::new());
+        m3.coeffs.resize(m_new, Vec::new());
+        m1.nrows = m_new;
+        m2.nrows = m_new;
+        m3.nrows = m_new;
+        m = m_new;
+        println!("    Matrix rows (m): {m} (padded)");
+    }
 
     // Witness magnitude proxy: maximum bit-length among base-prime-field limbs.
     //
@@ -624,25 +672,7 @@ where
         .as_ref()
         .to_vec();
 
-    // Symphony Π_rg parameters
-    let rg_params = if k_g == 3 {
-        // Paper-style prototype mode:
-        // - use d' := d-2 in Eq.(29) / (33)
-        // - keep m_J small by using lambda_pj=1 (toy bench knob; paper uses 2^8)
-        RPParams {
-            l_h: 64,
-            lambda_pj: 1,
-            k_g,
-            d_prime: (R::dimension() as u128) - 2,
-        }
-    } else {
-        RPParams {
-            l_h: 64,
-            lambda_pj: 32,
-            k_g,
-            d_prime: (R::dimension() as u128) / 2,
-        }
-    };
+    // Symphony Π_rg parameters (defined above, after decomposition so it matches padded shapes).
 
     // CP commitment schemes for aux messages
     let scheme_had =
