@@ -100,8 +100,16 @@ fn main() {
                 let r = catch_unwind(AssertUnwindSafe(|| {
                     test_symphony_poseidon2_folding::<R, PC>(num_perms, k_g);
                 }));
-                if let Err(_) = r {
-                    println!("  !! PANIC: decomposition overflow for perms={num_perms}, k_g={k_g}");
+                if let Err(e) = r {
+                    // Print panic payload to distinguish decomposition overflow from other issues.
+                    let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                        *s
+                    } else if let Some(s) = e.downcast_ref::<String>() {
+                        s.as_str()
+                    } else {
+                        "<non-string panic payload>"
+                    };
+                    println!("  !! PANIC for perms={num_perms}, k_g={k_g}: {msg}");
                 }
             }
         }
