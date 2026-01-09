@@ -255,6 +255,20 @@ fn ntt(a: &mut [u32], invert: bool, modulus: u32, primitive_root: u32) {
     let root = pow_mod_u32(primitive_root, (modulus - 1) / (n as u32), modulus);
     let root_inv = inv_mod_u32(root, modulus);
 
+    // Stage-parallel NTT:
+    // For a fixed stage length `len`, the butterflies operate independently on each
+    // contiguous block of `len` coefficients. So we can parallelize over blocks via
+    // `par_chunks_mut(len)` safely.
+    //
+    // Threshold:
+    // Parallelizing very small stages (`len=2,4,8,...`) creates huge rayon overhead (many tiny tasks)
+    // and can slow down large NTTs. We therefore only parallelize once blocks are reasonably sized.
+    const PAR_NTT_MIN_LEN: usize = 1 << 10; // 1024
+    let use_par = rayon::current_num_threads() > 1;
+
+    // Reuse twiddle buffer to avoid per-stage allocations.
+    let mut twiddles: Vec<u32> = Vec::new();
+
     let mut len = 2usize;
     while len <= n {
         let wlen = if invert {
@@ -262,14 +276,31 @@ fn ntt(a: &mut [u32], invert: bool, modulus: u32, primitive_root: u32) {
         } else {
             pow_mod_u32(root, (n / len) as u32, modulus)
         };
-        for i in (0..n).step_by(len) {
-            let mut w: u32 = 1;
-            for j in 0..(len / 2) {
-                let u = a[i + j];
-                let v = mul_mod_u32(a[i + j + len / 2], w, modulus);
-                a[i + j] = add_mod_u32(u, v, modulus);
-                a[i + j + len / 2] = sub_mod_u32(u, v, modulus);
-                w = mul_mod_u32(w, wlen, modulus);
+        // Precompute twiddles for this stage: tw[j] = wlen^j.
+        twiddles.resize(len / 2, 0u32);
+        twiddles[0] = 1u32;
+        for j in 1..(len / 2) {
+            twiddles[j] = mul_mod_u32(twiddles[j - 1], wlen, modulus);
+        }
+
+        if use_par && len >= PAR_NTT_MIN_LEN {
+            a.par_chunks_mut(len).for_each(|chunk| {
+                debug_assert_eq!(chunk.len(), len);
+                for j in 0..(len / 2) {
+                    let u = chunk[j];
+                    let v = mul_mod_u32(chunk[j + len / 2], twiddles[j], modulus);
+                    chunk[j] = add_mod_u32(u, v, modulus);
+                    chunk[j + len / 2] = sub_mod_u32(u, v, modulus);
+                }
+            });
+        } else {
+            for i in (0..n).step_by(len) {
+                for j in 0..(len / 2) {
+                    let u = a[i + j];
+                    let v = mul_mod_u32(a[i + j + len / 2], twiddles[j], modulus);
+                    a[i + j] = add_mod_u32(u, v, modulus);
+                    a[i + j + len / 2] = sub_mod_u32(u, v, modulus);
+                }
             }
         }
         len <<= 1;
@@ -277,8 +308,14 @@ fn ntt(a: &mut [u32], invert: bool, modulus: u32, primitive_root: u32) {
 
     if invert {
         let n_inv = inv_mod_u32(n as u32, modulus);
-        for x in a.iter_mut() {
-            *x = mul_mod_u32(*x, n_inv, modulus);
+        if use_par {
+            a.par_iter_mut().for_each(|x| {
+                *x = mul_mod_u32(*x, n_inv, modulus);
+            });
+        } else {
+            for x in a.iter_mut() {
+                *x = mul_mod_u32(*x, n_inv, modulus);
+            }
         }
     }
 }
