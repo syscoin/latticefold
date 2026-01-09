@@ -15,7 +15,6 @@
 use std::sync::Arc;
 use std::time::Instant;
 use ark_ff::{Field, Fp384, MontBackend, MontConfig, PrimeField};
-use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use dpp::BoundedFlpcpSparse;
 
@@ -977,8 +976,8 @@ where
             );
 
             // Lift x into FLarge (empty for NP mode).
-            let x_large: Vec<FLarge> = vec![];
-            let pi_bits_len = boolized.m_bits();
+            let _x_large: Vec<FLarge> = vec![];
+            let _pi_bits_len = boolized.m_bits();
 
             // Sample query and verify.
             println!("    DPP: verify_with_query: START...");
