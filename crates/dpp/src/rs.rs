@@ -302,9 +302,15 @@ fn convolution_ntt_mod(a: &[u32], b: &[u32], out_len: usize, size: usize, modulu
 /// Uses 5 NTT-friendly 32-bit primes whose product is ~155 bits, enough to reconstruct
 /// coefficients bounded by `O(n * p^2)` for our RS extrapolation use-case at ~1e6 scale.
 fn convolution_crt_ntt<F: PrimeField>(a: &[F], b: &[F], out_len: usize, size: usize) -> Vec<F> {
-    const K: usize = 7;
+    // Number of CRT moduli we use for the NTT-based convolution fallback.
+    //
+    // Note: This must be large enough that the product of moduli exceeds the worst-case integer
+    // coefficient growth in RS extrapolation (roughly O(n * p^2) where p is the prime modulus of F).
+    //
+    // For ~64-bit prime fields at ~2^22 scale, 6 moduli (~180 bits product) is ample.
+    const K: usize = 6;
     // NTT-friendly primes with primitive root 3 for these common choices.
-    // All have at least 2^21 | (p-1).
+    // All have at least 2^22 | (p-1) (i.e. support NTT sizes up to 2^22 and beyond).
     // Each modulus must support size=next_power_of_two(out_len), i.e. have v2(mod-1) >= log2(size).
     // We use a few standard NTT primes (cp-algorithms style). Product is ~230 bits, giving ample
     // headroom for exact reconstruction of large integer convolution coefficients before reducing mod p.
@@ -313,11 +319,10 @@ fn convolution_crt_ntt<F: PrimeField>(a: &[F], b: &[F], out_len: usize, size: us
         754_974_721,   // v2=24, primitive root 11
         998_244_353,   // v2=23, primitive root 3
         469_762_049,   // v2=26, primitive root 3
-        1_004_535_809, // v2=21, primitive root 3
         935_329_793,   // v2=22, primitive root 3
         2_013_265_921, // v2=27, primitive root 31
     ];
-    const ROOTS: [u32; K] = [3, 11, 3, 3, 3, 3, 31];
+    const ROOTS: [u32; K] = [3, 11, 3, 3, 3, 31];
 
     // Extract modulus of F as u64 (Frog prime fits in u64).
     let p_bytes = F::MODULUS.to_bytes_le();
