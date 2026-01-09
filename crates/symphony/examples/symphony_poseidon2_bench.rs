@@ -949,7 +949,7 @@ where
                 .num_threads(avail)
                 .build()
                 .expect("build rayon threadpool");
-            let pi_field = pool.install(|| flpcp.prove(&x_small, &full_asg));
+            let (pi_field, cw) = pool.install(|| flpcp.prove_with_codewords(&x_small, &full_asg));
             let t1e = t1.elapsed();
             println!(
                 "    DPP: RS-FLPCP prove: {:?} (pi_field_len={})",
@@ -1001,13 +1001,11 @@ where
                 ),
             };
 
-            // Sample the RS-FLPCP coins/queries from the *unbooleanized* inner FLPCP.
-            let (_qs, _pred_small) = dpp
-                .flpcp
-                .inner
-                .inner
-                .sample_queries_and_predicate_sparse(&mut rng, &x_small)
-                .expect("sample_queries_and_predicate_sparse (small)");
+            // Sample RS-FLPCP verifier coins (idx, lambda) directly.
+            let k = cw.y_a.len();
+            let ell = 2 * k;
+            let idx = (rng.next_u64() as usize) % ell;
+            let lambda_small = BF::<R>::from(rng.next_u64());
 
             // Split verification timing into:
             // - compute k answers a_i = <q_i, v>
@@ -1015,13 +1013,31 @@ where
             // - bounded decoding + predicate
             let (a, t_dot) = {
                 let t = Instant::now();
-                // Evaluate the 3-query RS-FLPCP answers directly against the BF proof (no bits).
-                // v = (x || pi_field); x is empty in this benchmark.
-                let ans_small: Vec<BF<R>> = _qs.iter().map(|q| q.dot(&pi_field)).collect();
-                let ans_field: Vec<FLarge> = ans_small
-                    .iter()
-                    .map(|a| FLarge::from_le_bytes_mod_order(&a.into_bigint().to_bytes_le()))
-                    .collect();
+                // Evaluate the 3-query RS-FLPCP answers in coin form, by indexing codewords.
+                let (a_small, b_small, c_small) = {
+                    if idx < k {
+                        let a = cw.y_a[idx];
+                        let b = cw.y_b[idx];
+                        let wv = cw.w[idx];
+                        let cx_minus = cw.y_c[idx] - wv;
+                        let c = wv + lambda_small * cx_minus;
+                        (a, b, c)
+                    } else {
+                        let j = idx - k;
+                        let a = cw.y_a_tail[j];
+                        let b = cw.y_b_tail[j];
+                        let wv = cw.w[idx];
+                        let cx_minus = cw.y_c_tail[j]; // subtract 0 for the tail half
+                        let c = wv + lambda_small * cx_minus;
+                        (a, b, c)
+                    }
+                };
+
+                let ans_field: [FLarge; 3] = [
+                    FLarge::from_le_bytes_mod_order(&a_small.into_bigint().to_bytes_le()),
+                    FLarge::from_le_bytes_mod_order(&b_small.into_bigint().to_bytes_le()),
+                    FLarge::from_le_bytes_mod_order(&c_small.into_bigint().to_bytes_le()),
+                ];
 
                 // Pack into one integer a_int = Σ w_i * [ans_i]_centered, then reduce to field.
                 let mut a_int = num_bigint::BigInt::from(0);

@@ -335,6 +335,21 @@ pub struct RsDr1csNpFlpcpSparse<F: PrimeField + FftField> {
     ws_2k: Vec<F>,
 }
 
+/// Auxiliary RS codeword data for coin-form query evaluation.
+///
+/// This is NOT part of the published proof; it is prover-side cached data useful for answering
+/// many locks (queries) efficiently after proving.
+#[derive(Clone, Debug)]
+pub struct RsNpCodewords<F: PrimeField> {
+    pub y_a: Vec<F>,      // values at points 1..k
+    pub y_a_tail: Vec<F>, // values at points k+1..2k
+    pub y_b: Vec<F>,
+    pub y_b_tail: Vec<F>,
+    pub y_c: Vec<F>,
+    pub y_c_tail: Vec<F>,
+    pub w: Vec<F>, // length 2k: w[i]=y_a_full[i]*y_b_full[i]
+}
+
 impl<F: PrimeField + FftField> RsDr1csNpFlpcpSparse<F> {
     pub fn new(inst: Dr1csInstanceSparse<F>, l: usize, ell: usize) -> Self {
         let k = inst.k();
@@ -376,6 +391,57 @@ impl<F: PrimeField + FftField> RsDr1csNpFlpcpSparse<F> {
         pi.extend_from_slice(z_w);
         pi.extend_from_slice(&w);
         pi
+    }
+
+    /// Prover + cache: output π = (z_w || w) and also return the RS codeword values needed to
+    /// answer verifier coins `(idx, λ)` in **O(1)** time (by indexing), assuming `ell == 2k`.
+    pub fn prove_with_codewords(&self, x: &[F], z_w: &[F]) -> (Vec<F>, RsNpCodewords<F>) {
+        assert_eq!(x.len(), self.l);
+        assert_eq!(z_w.len(), self.inst.n - self.l);
+        let k = self.inst.k();
+        // Compute y_a, y_b, y_c concurrently.
+        let (y_a, (y_b, y_c)) = join(
+            || mat_vec_sparse_np(&self.inst.a, x, z_w, self.l),
+            || join(
+                || mat_vec_sparse_np(&self.inst.b, x, z_w, self.l),
+                || mat_vec_sparse_np(&self.inst.c, x, z_w, self.l),
+            ),
+        );
+        // Compute tails concurrently.
+        let (y_a_tail, (y_b_tail, y_c_tail)) = join(
+            || extrapolate_consecutive_next_block::<F>(&y_a),
+            || join(
+                || extrapolate_consecutive_next_block::<F>(&y_b),
+                || extrapolate_consecutive_next_block::<F>(&y_c),
+            ),
+        );
+
+        // Build w (length 2k).
+        let mut w = Vec::with_capacity(2 * k);
+        for i in 0..k {
+            w.push(y_a[i] * y_b[i]);
+        }
+        for i in 0..k {
+            w.push(y_a_tail[i] * y_b_tail[i]);
+        }
+
+        // Proof π = (z_w || w).
+        let mut pi = Vec::with_capacity(z_w.len() + w.len());
+        pi.extend_from_slice(z_w);
+        pi.extend_from_slice(&w);
+
+        (
+            pi,
+            RsNpCodewords {
+                y_a,
+                y_a_tail,
+                y_b,
+                y_b_tail,
+                y_c,
+                y_c_tail,
+                w,
+            },
+        )
     }
 
     fn map_z_index_to_v(&self, idx: usize) -> (bool, usize) {
