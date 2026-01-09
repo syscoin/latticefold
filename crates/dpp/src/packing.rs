@@ -390,8 +390,8 @@ impl<F: PrimeField, V: BoundedFlpcp<F>> DppFromBoundedFlpcp<F, V> {
         if query.q.len() != self.flpcp.n() + self.flpcp.m() {
             return Err(PackingError::InvalidParams);
         }
-        let v = [x, pi].concat();
-        let a = dot::<F>(&query.q, &v);
+        // Avoid allocating/copying a huge `(x||pi)` vector; compute the dot directly.
+        let a = dot_two_slices::<F>(&query.q, x, pi);
         self.verify_packed_answer(&a, query)
     }
 
@@ -408,8 +408,8 @@ impl<F: PrimeField, V: BoundedFlpcp<F>> DppFromBoundedFlpcp<F, V> {
             return Err(PackingError::InvalidParams);
         }
         let (q, w, pred, _q_mat) = self.sample_packed_query(rng, x)?;
-        let v = [x, pi].concat();
-        let a = dot::<F>(&q, &v);
+        // Avoid allocating/copying a huge `(x||pi)` vector; compute the dot directly.
+        let a = dot_two_slices::<F>(&q, x, pi);
         let a_int = field_to_centered_bigint::<F>(&a);
 
         // Decode a_int as <ans, w> with bounds b.
@@ -590,9 +590,56 @@ impl<F: PrimeField, V: BoundedFlpcpSparse<F>> DppFromBoundedFlpcpSparse<F, V> {
         if x.len() != self.flpcp.n() || pi.len() != self.flpcp.m() {
             return Err(PackingError::InvalidParams);
         }
-        let v = [x, pi].concat();
-        let a = query.q.dot(&v);
+        // Avoid allocating/copying a huge `(x||pi)` vector; compute the sparse dot directly.
+        let a = query.q.dot_two_slices(x, pi);
         self.verify_packed_answer(&a, query)
+    }
+}
+
+impl<F: PrimeField> SparseVec<F> {
+    /// Dot-product against a concatenation `(x || pi)` without allocating/copying it.
+    #[inline]
+    pub fn dot_two_slices(&self, x: &[F], pi: &[F]) -> F {
+        const PAR_SPARSE_DOT_MIN_TERMS: usize = 2048;
+        let n = x.len();
+        let m = pi.len();
+        if self.terms.iter().any(|(_, idx)| *idx >= n + m) {
+            // Keep this as a debug assertion to avoid overhead in optimized builds.
+            debug_assert!(false, "SparseVec::dot_two_slices: index out of range");
+        }
+        if self.terms.len() >= PAR_SPARSE_DOT_MIN_TERMS {
+            self.terms
+                .par_iter()
+                .map(|(c, idx)| {
+                    let v = if *idx < n { x[*idx] } else { pi[*idx - n] };
+                    *c * v
+                })
+                .reduce(|| F::ZERO, |acc, t| acc + t)
+        } else {
+            self.terms.iter().fold(F::ZERO, |acc, (c, idx)| {
+                let v = if *idx < n { x[*idx] } else { pi[*idx - n] };
+                acc + (*c * v)
+            })
+        }
+    }
+}
+
+fn dot_two_slices<F: PrimeField>(q: &[F], x: &[F], pi: &[F]) -> F {
+    debug_assert_eq!(q.len(), x.len() + pi.len());
+    let n = x.len();
+    if q.len() >= PAR_DENSE_DOT_MIN_LEN {
+        q.par_iter()
+            .enumerate()
+            .map(|(i, qi)| {
+                let vi = if i < n { x[i] } else { pi[i - n] };
+                *qi * vi
+            })
+            .reduce(|| F::ZERO, |acc, t| acc + t)
+    } else {
+        q.iter().enumerate().fold(F::ZERO, |acc, (i, qi)| {
+            let vi = if i < n { x[i] } else { pi[i - n] };
+            acc + (*qi * vi)
+        })
     }
 }
 
@@ -624,9 +671,11 @@ fn sample_uniform_below(rng: &mut dyn RngCore, n: &BigUint) -> BigUint {
     }
 }
 
+// NOTE: keep the old dense dot helper around for tests/bench experiments.
+// (Currently unused in production paths; we use `dot_two_slices` to avoid allocating `(x||pi)`.)
+#[allow(dead_code)]
 fn dot<F: PrimeField>(a: &[F], b: &[F]) -> F {
     debug_assert_eq!(a.len(), b.len());
-    // Used by packed DPP verification: this can dominate for large (n+m).
     if a.len() >= PAR_DENSE_DOT_MIN_LEN {
         a.par_iter()
             .zip(b.par_iter())

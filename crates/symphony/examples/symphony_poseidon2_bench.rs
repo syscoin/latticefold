@@ -15,6 +15,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 use ark_ff::{Field, Fp384, MontBackend, MontConfig, PrimeField};
+use rayon::prelude::*;
 
 fn main() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -969,9 +970,23 @@ where
             println!("    DPP: lift proof to large field: START...");
             let t3 = Instant::now();
             let x_large: Vec<FLarge> = vec![];
+            // This is performance-critical for large witnesses: do it in parallel.
+            //
+            // Note: `pi_bits` entries should be 0/1; use the fast path (avoid bigint/bytes).
+            let one_small = BF::<R>::ONE;
+            let zero_small = BF::<R>::ZERO;
             let pi_large = pi_bits
-                .iter()
-                .map(|wi| FLarge::from_le_bytes_mod_order(&wi.into_bigint().to_bytes_le()))
+                .par_iter()
+                .map(|wi| {
+                    if *wi == zero_small {
+                        FLarge::ZERO
+                    } else if *wi == one_small {
+                        FLarge::ONE
+                    } else {
+                        // Defensive fallback (should never happen if Booleanization is correct).
+                        FLarge::from_le_bytes_mod_order(&wi.into_bigint().to_bytes_le())
+                    }
+                })
                 .collect::<Vec<_>>();
             let t3e = t3.elapsed();
             println!("    DPP: lift: {:?} (pi_large_len={})", t3e, pi_large.len());

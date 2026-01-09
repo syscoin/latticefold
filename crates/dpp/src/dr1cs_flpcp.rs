@@ -342,11 +342,11 @@ impl<F: PrimeField + FftField> RsDr1csNpFlpcpSparse<F> {
     pub fn prove(&self, x: &[F], z_w: &[F]) -> Vec<F> {
         assert_eq!(x.len(), self.l);
         assert_eq!(z_w.len(), self.inst.n - self.l);
-        let z = [x, z_w].concat();
-
         let k = self.inst.k();
-        let y_a = mat_vec_sparse(&self.inst.a, &z);
-        let y_b = mat_vec_sparse(&self.inst.b, &z);
+        // IMPORTANT: avoid materializing z = (x || z_w) for large instances (multi-million entries).
+        // This copy can dominate runtime and look “single-threaded”.
+        let y_a = mat_vec_sparse_np(&self.inst.a, x, z_w, self.l);
+        let y_b = mat_vec_sparse_np(&self.inst.b, x, z_w, self.l);
 
         let y_a_tail = extrapolate_consecutive_next_block::<F>(&y_a);
         let y_b_tail = extrapolate_consecutive_next_block::<F>(&y_b);
@@ -357,7 +357,11 @@ impl<F: PrimeField + FftField> RsDr1csNpFlpcpSparse<F> {
         for i in 0..k {
             w.push(y_a_tail[i] * y_b_tail[i]);
         }
-        [z_w, w.as_slice()].concat()
+        // Output π = (z_w || w) without an extra concat allocation.
+        let mut pi = Vec::with_capacity(z_w.len() + w.len());
+        pi.extend_from_slice(z_w);
+        pi.extend_from_slice(&w);
+        pi
     }
 
     fn map_z_index_to_v(&self, idx: usize) -> (bool, usize) {
@@ -482,6 +486,30 @@ fn mat_vec_sparse<F: PrimeField>(m: &[SparseVec<F>], x: &[F]) -> Vec<F> {
         m.par_iter().map(|row| row.dot(x)).collect()
     } else {
         m.iter().map(|row| row.dot(x)).collect()
+    }
+}
+
+fn mat_vec_sparse_np<F: PrimeField>(m: &[SparseVec<F>], x: &[F], z_w: &[F], l: usize) -> Vec<F> {
+    debug_assert_eq!(x.len(), l);
+    debug_assert_eq!(l + z_w.len(), m.first().map(|_| l + z_w.len()).unwrap_or(l + z_w.len()));
+    if m.len() >= 256 {
+        m.par_iter()
+            .map(|row| {
+                row.terms.iter().fold(F::ZERO, |acc, (c, idx)| {
+                    let v = if *idx < l { x[*idx] } else { z_w[*idx - l] };
+                    acc + (*c * v)
+                })
+            })
+            .collect()
+    } else {
+        m.iter()
+            .map(|row| {
+                row.terms.iter().fold(F::ZERO, |acc, (c, idx)| {
+                    let v = if *idx < l { x[*idx] } else { z_w[*idx - l] };
+                    acc + (*c * v)
+                })
+            })
+            .collect()
     }
 }
 
