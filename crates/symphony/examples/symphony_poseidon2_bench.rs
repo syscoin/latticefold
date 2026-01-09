@@ -82,9 +82,15 @@ fn main() {
 
         // Sweep permutation counts.
         //
-        // With R1CS witness decomposition enabled unconditionally in this benchmark,
-        // we use k_g=3 (Table 1 instantiation).
-        let k_list = vec![3usize];
+        // IMPORTANT:
+        // This benchmark stresses witness magnitudes; for Frog (~64-bit modulus) and small ring dim,
+        // a tiny k_g (like 3) will often overflow balanced decomposition. We therefore default to
+        // the computed `k_suggest` unless overridden via `K_G`.
+        let k_list = if let Ok(s) = std::env::var("K_G") {
+            vec![s.parse::<usize>().expect("K_G must be a usize")]
+        } else {
+            vec![k_suggest.max(3)]
+        };
         let perms_list: Vec<usize> = vec![1, 2, 4, 8];
         for &k_g in &k_list {
             for &num_perms in &perms_list {
