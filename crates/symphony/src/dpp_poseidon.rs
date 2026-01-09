@@ -31,9 +31,9 @@ impl<F: PrimeField> SparseDr1csInstance<F> {
                 .map(|(c, idx)| *c * assignment[*idx])
                 .reduce(|| F::ZERO, |a, b| a + b)
         } else {
-            terms
-                .iter()
-                .fold(F::ZERO, |acc, (c, idx)| acc + (*c * assignment[*idx]))
+        terms
+            .iter()
+            .fold(F::ZERO, |acc, (c, idx)| acc + (*c * assignment[*idx]))
         }
     }
 
@@ -54,7 +54,7 @@ impl<F: PrimeField> SparseDr1csInstance<F> {
         });
         
         if let Some((i, _)) = failed {
-            return Err(format!("constraint {i} failed"));
+                return Err(format!("constraint {i} failed"));
         }
         Ok(())
     }
@@ -65,18 +65,18 @@ impl<F: PrimeField> SparseDr1csInstance<F> {
         
         let rows: Vec<(Vec<F>, Vec<F>, Vec<F>)> = self.constraints.par_iter()
             .map(|row| {
-                let mut ra = vec![F::ZERO; n];
-                let mut rb = vec![F::ZERO; n];
-                let mut rc = vec![F::ZERO; n];
-                for (coeff, idx) in &row.a {
-                    ra[*idx] += *coeff;
-                }
-                for (coeff, idx) in &row.b {
-                    rb[*idx] += *coeff;
-                }
-                for (coeff, idx) in &row.c {
-                    rc[*idx] += *coeff;
-                }
+            let mut ra = vec![F::ZERO; n];
+            let mut rb = vec![F::ZERO; n];
+            let mut rc = vec![F::ZERO; n];
+            for (coeff, idx) in &row.a {
+                ra[*idx] += *coeff;
+            }
+            for (coeff, idx) in &row.b {
+                rb[*idx] += *coeff;
+            }
+            for (coeff, idx) in &row.c {
+                rc[*idx] += *coeff;
+            }
                 (ra, rb, rc)
             })
             .collect();
@@ -84,9 +84,9 @@ impl<F: PrimeField> SparseDr1csInstance<F> {
         let (a, b, c): (Vec<_>, Vec<_>, Vec<_>) = rows.into_iter()
             .map(|(ra, rb, rc)| (ra, rb, rc))
             .fold((Vec::new(), Vec::new(), Vec::new()), |(mut a, mut b, mut c), (ra, rb, rc)| {
-                a.push(ra);
-                b.push(rb);
-                c.push(rc);
+            a.push(ra);
+            b.push(rb);
+            c.push(rc);
                 (a, b, c)
             });
         

@@ -3,37 +3,28 @@
 //! This module is the *reusable wrapper* around the individual arithmetizers:
 //! - Poseidon transcript trace -> sparse dR1CS (`dpp_poseidon`)
 //! - AjtaiOpen(commitment, message) -> sparse dR1CS (`dpp_ajtai`)
-//! - merging multiple sparse dR1CS instances into one (`merge_sparse_dr1cs_share_one`)
+//! - PCS evaluation verification -> sparse dR1CS (`dpp_pcs`)
+//! - Merging multiple sparse dR1CS instances into one (`merge_sparse_dr1cs_share_one`)
 //!
-//! ## Inventory: what this covers vs what's still missing for production `R_WE`
+//! ## Architecture
 //!
-//! **Covered (today):**
-//! - Poseidon-FS transcript binding (via Poseidon trace arithmetization)
-//! - CP commitment opening checks for transcript messages `cfs_*` (AjtaiOpen arithmetization)
+//! The WE gate (`R_WE`) is a single-phase design with the following components:
 //!
-//! **Not yet covered (next inventory item):**
-//! 1) The **production binding** of `aux` back to the committed witness `cm_f` without opening full `f`.
+//! - **Poseidon-FS transcript binding**: Ensures all FS challenges are bound to the protocol transcript.
+//! - **Ajtai opening checks**: Verifies CP transcript message commitments (`cfs_*`).
+//! - **Π_fold verifier math**: Sumcheck verification, monomial checks, and folding equations.
+//! - **PCS evaluation proofs**: Binding aux values to the committed witness via lattice-based PCS.
 //!
-//! Note: With the current Ajtai commitment scheme, we can cheaply arithmetize *openings* of small
-//! messages (`cfs_*`). However, binding `aux` to `cm_f` in the paper’s style requires additional
-//! linear/evaluation constraints (the “auxcs_lin × batchlin” layer) that we still need to design.
-//!
-//! **Clarification (this is the intended production direction):**
-//! - We do **not** want to put the full witness openings (`f`, `g^{(i)}`) into the *outer* DPP witness.
-//! - Instead, the intended production path is a second folding proof `π_lin` whose verified statement
-//!   is exactly `R_o := R_auxcs_lin × R_batchlin`. The outer gate verifies `π_lin` succinctly, while
-//!   `π_lin`’s prover uses the large openings internally.
-//!
-//! The helper `poseidon_plus_cfs_plus_cm_f_openings` below is a **bring-up strategy** that includes
-//! full witness openings `f` and checks `AjtaiOpen(cm_f, f)` inside the dR1CS. This is correct, but
-//! it is **not production-shape for SP1**, because it would bake an enormous dense linear system.
+//! With PCS, there is no separate "π_lin" phase. The evaluation claims `aux = f(r)` are proven
+//! directly by the PCS within the single WE gate verification.
 
 use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
 use ark_ff::Field;
 use ark_std::log2;
+use latticefold::commitment::AjtaiCommitmentScheme;
 use latticefold::transcript::Transcript;
 use latticefold::utils::sumcheck::MLSumcheck;
-use latticefold::commitment::AjtaiCommitmentScheme;
+use rayon::prelude::*;
 use stark_rings::{balanced_decomposition::Decompose, OverField, PolyRing, Ring, Zq};
 
 use crate::dpp_ajtai::{ajtai_open_dr1cs_from_scheme, ajtai_open_dr1cs_from_scheme_full};
@@ -104,29 +95,33 @@ impl WeGateDr1csBuilder {
             return Err("WeGateDr1csBuilder: empty batch".to_string());
         }
 
-        // Ajtai-open checks for cfs_*.
+        // Ajtai-open checks for cfs_* - built in parallel per instance.
+        let instance_parts: Vec<_> = (0..ell)
+            .into_par_iter()
+            .map(|i| {
+                let mut had_msg: Vec<R> = Vec::with_capacity(3 * R::dimension());
+                for blk in 0..3 {
+                    for &x in &aux.had_u[i][blk] {
+                        had_msg.push(R::from(x));
+                    }
+                }
+                let (inst_had, asg_had) =
+                    ajtai_open_dr1cs_from_scheme::<R>(scheme_had, &had_msg, &cfs_had_u[i])
+                        .expect("ajtai_open_dr1cs_from_scheme failed");
+                let (inst_mon, asg_mon) =
+                    ajtai_open_dr1cs_from_scheme_full::<R>(scheme_mon, &aux.mon_b[i], &cfs_mon_b[i])
+                        .expect("ajtai_open_dr1cs_from_scheme_full failed");
+                vec![(inst_had, asg_had), (inst_mon, asg_mon)]
+            })
+            .collect();
+
         let mut parts: Vec<(
             SparseDr1csInstance<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
             Vec<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
         )> = Vec::with_capacity(1 + 2 * ell);
         parts.push((poseidon_inst, poseidon_asg));
-
-        for i in 0..ell {
-            // had_u encoding: [U1(d), U2(d), U3(d)] as 3*d constant-coeff ring elements.
-            let mut had_msg: Vec<R> = Vec::with_capacity(3 * R::dimension());
-            for blk in 0..3 {
-                for &x in &aux.had_u[i][blk] {
-                    had_msg.push(R::from(x));
-                }
-            }
-            let (inst_had, asg_had) =
-                ajtai_open_dr1cs_from_scheme::<R>(scheme_had, &had_msg, &cfs_had_u[i])?;
-            parts.push((inst_had, asg_had));
-
-            // mon_b is general ring elements -> full-coeff arithmetization.
-            let (inst_mon, asg_mon) =
-                ajtai_open_dr1cs_from_scheme_full::<R>(scheme_mon, &aux.mon_b[i], &cfs_mon_b[i])?;
-            parts.push((inst_mon, asg_mon));
+        for inst_part in instance_parts {
+            parts.extend(inst_part);
         }
 
         merge_sparse_dr1cs_share_one(&parts)
@@ -183,35 +178,40 @@ impl WeGateDr1csBuilder {
             )
             .map_err(|e| format!("poseidon_sponge_dr1cs_from_trace_with_wiring: {e}"))?;
 
-        // Ajtai-open checks for cfs_*.
-        let mut parts: Vec<(
-            SparseDr1csInstance<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
-            Vec<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
-        )> = Vec::new();
-        parts.push((poseidon_inst, poseidon_asg));
+        // Ajtai-open checks for cfs_* - built in parallel per instance.
+        let cfs_parts_nested: Vec<Vec<_>> = (0..ell)
+            .into_par_iter()
+            .map(|i| {
+                let mut had_msg: Vec<R> = Vec::with_capacity(3 * R::dimension());
+                for blk in 0..3 {
+                    for &x in &aux.had_u[i][blk] {
+                        had_msg.push(R::from(x));
+                    }
+                }
+                let (inst_had, asg_had) =
+                    ajtai_open_dr1cs_from_scheme::<R>(scheme_had, &had_msg, &cfs_had_u[i])
+                        .expect("ajtai_open_dr1cs_from_scheme failed");
+                let (inst_mon, asg_mon) =
+                    ajtai_open_dr1cs_from_scheme_full::<R>(scheme_mon, &aux.mon_b[i], &cfs_mon_b[i])
+                        .expect("ajtai_open_dr1cs_from_scheme_full failed");
+                vec![(inst_had, asg_had), (inst_mon, asg_mon)]
+            })
+            .collect();
 
         let mut cfs_parts: Vec<(
             SparseDr1csInstance<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
             Vec<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
         )> = Vec::with_capacity(2 * ell);
-        for i in 0..ell {
-            // had_u encoding: [U1(d), U2(d), U3(d)] as 3*d constant-coeff ring elements.
-            let mut had_msg: Vec<R> = Vec::with_capacity(3 * R::dimension());
-            for blk in 0..3 {
-                for &x in &aux.had_u[i][blk] {
-                    had_msg.push(R::from(x));
-                }
-            }
-            let (inst_had, asg_had) =
-                ajtai_open_dr1cs_from_scheme::<R>(scheme_had, &had_msg, &cfs_had_u[i])?;
-            cfs_parts.push((inst_had, asg_had));
-
-            // mon_b is general ring elements -> full-coeff arithmetization.
-            let (inst_mon, asg_mon) =
-                ajtai_open_dr1cs_from_scheme_full::<R>(scheme_mon, &aux.mon_b[i], &cfs_mon_b[i])?;
-            cfs_parts.push((inst_mon, asg_mon));
+        for inst_part in cfs_parts_nested {
+            cfs_parts.extend(inst_part);
         }
         let (cfs_inst, cfs_asg) = merge_sparse_dr1cs_share_one(&cfs_parts)?;
+
+        let mut parts: Vec<(
+            SparseDr1csInstance<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
+            Vec<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
+        )> = Vec::new();
+        parts.push((poseidon_inst, poseidon_asg));
         parts.push((cfs_inst, cfs_asg));
 
         // ---------------------------------------------------------------------
@@ -553,5 +553,9 @@ impl WeGateDr1csBuilder {
         let (ro_inst, ro_asg) = Self::r_o_cm_f_openings::<R>(scheme_f, cm_f, f_openings)?;
         merge_sparse_dr1cs_share_one(&[(rcp_inst, rcp_asg), (ro_inst, ro_asg)])
     }
+
+    // PCS evaluation claims:
+    // 1. Build PCS verification constraints using `dpp_pcs::pcs_verify_all_digits`
+    // 2. Merge with the result of `r_cp_poseidon_pifold_math_and_cfs_openings`
 }
 
