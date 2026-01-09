@@ -9,6 +9,8 @@ use num_bigint::BigInt;
 use num_traits::One;
 use rand::RngCore;
 
+use rayon::prelude::*;
+
 use crate::packing::{BoundedFlpcp, BoundedFlpcpSparse, FlpcpPredicate};
 use crate::rs::{barycentric_weights_consecutive, extrapolate_consecutive_next_block, lagrange_coeffs_at};
 use crate::sparse::SparseVec;
@@ -463,18 +465,40 @@ impl<F: PrimeField + FftField> BoundedFlpcpSparse<F> for RsDr1csNpFlpcpSparse<F>
 }
 
 fn mat_vec<F: Field>(m: &[Vec<F>], x: &[F]) -> Vec<F> {
-    m.iter()
-        .map(|row| row.iter().zip(x.iter()).fold(F::ZERO, |acc, (a, b)| acc + (*a * *b)))
-        .collect()
+    // Hot path for large dR1CS instances: each row dot is independent.
+    if m.len() >= 256 {
+        m.par_iter()
+            .map(|row| row.iter().zip(x.iter()).fold(F::ZERO, |acc, (a, b)| acc + (*a * *b)))
+            .collect()
+    } else {
+        m.iter()
+            .map(|row| row.iter().zip(x.iter()).fold(F::ZERO, |acc, (a, b)| acc + (*a * *b)))
+            .collect()
+    }
 }
 
 fn mat_vec_sparse<F: PrimeField>(m: &[SparseVec<F>], x: &[F]) -> Vec<F> {
-    m.iter().map(|row| row.dot(x)).collect()
+    if m.len() >= 256 {
+        m.par_iter().map(|row| row.dot(x)).collect()
+    } else {
+        m.iter().map(|row| row.dot(x)).collect()
+    }
 }
 
 fn lin_combo_rows<F: Field>(m: &[Vec<F>], coeffs: &[F]) -> Vec<F> {
     let n = m.first().map(|r| r.len()).unwrap_or(0);
     let mut out = vec![F::ZERO; n];
+    // This is a matrix-transpose times vector. Parallelize over columns (independent outputs).
+    if n >= 1024 && m.len() >= 64 {
+        out.par_iter_mut().enumerate().for_each(|(j, out_j)| {
+            let mut acc = F::ZERO;
+            for (row, c) in m.iter().zip(coeffs.iter()) {
+                acc += *c * row[j];
+            }
+            *out_j = acc;
+        });
+        return out;
+    }
     for (row, c) in m.iter().zip(coeffs.iter()) {
         for j in 0..n {
             out[j] += *c * row[j];

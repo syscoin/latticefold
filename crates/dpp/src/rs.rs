@@ -8,6 +8,8 @@
 use ark_ff::{BigInteger, Field, FftField, PrimeField};
 use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
 
+use rayon::prelude::*;
+
 /// Compute barycentric weights for distinct points `xs`.
 ///
 /// w_i = 1 / ∏_{j≠i} (x_i - x_j)
@@ -300,12 +302,13 @@ fn convolution_ntt_mod(a: &[u32], b: &[u32], out_len: usize, size: usize, modulu
 /// Uses 5 NTT-friendly 32-bit primes whose product is ~155 bits, enough to reconstruct
 /// coefficients bounded by `O(n * p^2)` for our RS extrapolation use-case at ~1e6 scale.
 fn convolution_crt_ntt<F: PrimeField>(a: &[F], b: &[F], out_len: usize, size: usize) -> Vec<F> {
+    const K: usize = 7;
     // NTT-friendly primes with primitive root 3 for these common choices.
     // All have at least 2^21 | (p-1).
     // Each modulus must support size=next_power_of_two(out_len), i.e. have v2(mod-1) >= log2(size).
     // We use a few standard NTT primes (cp-algorithms style). Product is ~230 bits, giving ample
     // headroom for exact reconstruction of large integer convolution coefficients before reducing mod p.
-    const MODS: [u32; 7] = [
+    const MODS: [u32; K] = [
         167_772_161,   // v2=25, primitive root 3
         754_974_721,   // v2=24, primitive root 11
         998_244_353,   // v2=23, primitive root 3
@@ -314,7 +317,7 @@ fn convolution_crt_ntt<F: PrimeField>(a: &[F], b: &[F], out_len: usize, size: us
         935_329_793,   // v2=22, primitive root 3
         2_013_265_921, // v2=27, primitive root 31
     ];
-    const ROOTS: [u32; 7] = [3, 11, 3, 3, 3, 3, 31];
+    const ROOTS: [u32; K] = [3, 11, 3, 3, 3, 3, 31];
 
     // Extract modulus of F as u64 (Frog prime fits in u64).
     let p_bytes = F::MODULUS.to_bytes_le();
@@ -334,23 +337,30 @@ fn convolution_crt_ntt<F: PrimeField>(a: &[F], b: &[F], out_len: usize, size: us
         v % p_u64
     };
 
-    let a_u = a.iter().map(to_u64).collect::<Vec<_>>();
-    let b_u = b.iter().map(to_u64).collect::<Vec<_>>();
+    let a_u = a.par_iter().map(to_u64).collect::<Vec<_>>();
+    let b_u = b.par_iter().map(to_u64).collect::<Vec<_>>();
 
     // For each modulus, reduce inputs and convolve.
-    let mut residues: Vec<Vec<u32>> = Vec::with_capacity(MODS.len());
-    for (modulus, root) in MODS.iter().zip(ROOTS.iter()) {
-        assert!(((modulus - 1) as usize) % size == 0, "NTT modulus does not support size {size}");
-        let aa = a_u.iter().map(|&v| (v % (*modulus as u64)) as u32).collect::<Vec<_>>();
-        let bb = b_u.iter().map(|&v| (v % (*modulus as u64)) as u32).collect::<Vec<_>>();
-        residues.push(convolution_ntt_mod(&aa, &bb, out_len, size, *modulus, *root));
-    }
+    let residues_vec: Vec<Vec<u32>> = (0..K)
+        .into_par_iter()
+        .map(|i| {
+            let modulus = MODS[i];
+            let root = ROOTS[i];
+            assert!(((modulus - 1) as usize) % size == 0, "NTT modulus does not support size {size}");
+            let aa = a_u.iter().map(|&v| (v % (modulus as u64)) as u32).collect::<Vec<_>>();
+            let bb = b_u.iter().map(|&v| (v % (modulus as u64)) as u32).collect::<Vec<_>>();
+            convolution_ntt_mod(&aa, &bb, out_len, size, modulus, root)
+        })
+        .collect();
+
+    let residues: [Vec<u32>; K] = residues_vec
+        .try_into()
+        .expect("residues_vec length matches CRT modulus count");
 
     // Precompute prefix products modulo each modulus and modulo p.
-    let k = MODS.len();
-    let mut prefix_mod = vec![vec![0u32; k]; k];
-    let mut inv_prefix = vec![0u32; k];
-    for i in 0..k {
+    let mut prefix_mod = [[0u32; K]; K];
+    let mut inv_prefix = [0u32; K];
+    for i in 0..K {
         let mi = MODS[i];
         let mut prod: u64 = 1;
         for j in 0..i {
@@ -360,36 +370,39 @@ fn convolution_crt_ntt<F: PrimeField>(a: &[F], b: &[F], out_len: usize, size: us
         let prod_i = (prod % (mi as u64)) as u32;
         inv_prefix[i] = inv_mod_u32(prod_i, mi);
     }
-    let mut prefix_p = vec![0u64; k];
+    let mut prefix_p = [0u64; K];
     prefix_p[0] = 1;
-    for i in 1..k {
+    for i in 1..K {
         prefix_p[i] = (((prefix_p[i - 1] as u128) * (MODS[i - 1] as u128)) % (p_u64 as u128)) as u64;
     }
 
     // Garner reconstruction per coefficient, then reduce mod p and map back to F.
-    let mut out = Vec::with_capacity(out_len);
-    for t in 0..out_len {
-        // mixed radix digits c[i] in [0, MODS[i])
-        let mut c = vec![0u32; k];
-        c[0] = residues[0][t];
-        for i in 1..k {
-            let mi = MODS[i];
-            let mut acc = residues[i][t];
-            for j in 0..i {
-                let term = mul_mod_u32(c[j], prefix_mod[i][j], mi);
-                acc = sub_mod_u32(acc, term, mi);
+    let out: Vec<F> = (0..out_len)
+        .into_par_iter()
+        .map(|t| {
+            // mixed radix digits c[i] in [0, MODS[i])
+            let mut c = [0u32; K];
+            c[0] = residues[0][t];
+            for i in 1..K {
+                let mi = MODS[i];
+                let mut acc = residues[i][t];
+                for j in 0..i {
+                    let term = mul_mod_u32(c[j], prefix_mod[i][j], mi);
+                    acc = sub_mod_u32(acc, term, mi);
+                }
+                c[i] = mul_mod_u32(acc, inv_prefix[i], mi);
             }
-            c[i] = mul_mod_u32(acc, inv_prefix[i], mi);
-        }
 
-        // x mod p
-        let mut x_mod_p: u64 = 0;
-        for i in 0..k {
-            let add = (((c[i] as u128) * (prefix_p[i] as u128)) % (p_u64 as u128)) as u64;
-            x_mod_p = (((x_mod_p as u128) + (add as u128)) % (p_u64 as u128)) as u64;
-        }
-        out.push(F::from_le_bytes_mod_order(&x_mod_p.to_le_bytes()));
-    }
+            // x mod p
+            let mut x_mod_p: u64 = 0;
+            for i in 0..K {
+                let add = (((c[i] as u128) * (prefix_p[i] as u128)) % (p_u64 as u128)) as u64;
+                x_mod_p = (((x_mod_p as u128) + (add as u128)) % (p_u64 as u128)) as u64;
+            }
+            F::from_le_bytes_mod_order(&x_mod_p.to_le_bytes())
+        })
+        .collect();
+
     out
 }
 

@@ -10,6 +10,7 @@
 
 use ark_ff::Field;
 use latticefold::commitment::AjtaiCommitmentScheme;
+use rayon::prelude::*;
 use stark_rings::{OverField, PolyRing, Ring};
 
 use crate::dpp_poseidon::{Constraint, SparseDr1csInstance};
@@ -69,22 +70,22 @@ where
         assignment.push(fp);
     }
 
-    // Precompute A columns by committing to basis vectors (cheap for small n).
-    //
-    // Because `AjtaiCommitmentScheme::commit` is linear and deterministic, committing to e_j
-    // reveals the j-th column of the implicit Ajtai matrix (as ring elements).
-    let mut cols: Vec<Vec<R>> = Vec::with_capacity(n);
-    for j in 0..n {
-        let mut basis = vec![R::ZERO; n];
-        basis[j] = R::ONE;
-        let col = scheme
-            .commit(&basis)
-            .map_err(|e| format!("Ajtai dR1CS: commit(basis) failed: {e:?}"))?
-            .as_ref()
-            .to_vec();
-        debug_assert_eq!(col.len(), kappa);
-        cols.push(col);
-    }
+    // Precompute A columns by committing to basis vectors.
+    // Parallelized: each column is independent.
+    let cols: Vec<Vec<R>> = (0..n)
+        .into_par_iter()
+        .map(|j| {
+            let mut basis = vec![R::ZERO; n];
+            basis[j] = R::ONE;
+            let col = scheme
+                .commit(&basis)
+                .expect("Ajtai dR1CS: commit(basis) failed")
+                .as_ref()
+                .to_vec();
+            debug_assert_eq!(col.len(), kappa);
+            col
+        })
+        .collect();
 
     // Build linear constraints.
     // Variable indices: 0 is 1, and 1+j is msg[j].
@@ -186,30 +187,30 @@ where
         }
     }
 
-    // Precompute columns for each (j,lane) basis coefficient:
-    // set message[j] = X^lane and others 0.
-    let mut cols: Vec<Vec<R>> = Vec::with_capacity(n * d);
-    for j in 0..n {
-        for lane in 0..d {
+    // Precompute columns for each (j,lane) basis coefficient.
+    // Parallelized: each (j,lane) combination is independent.
+    let cols: Vec<Vec<R>> = (0..(n * d))
+        .into_par_iter()
+        .map(|idx| {
+            let j = idx / d;
+            let lane = idx % d;
             let mut coeffs = vec![<<R as PolyRing>::BaseRing as Field>::ZERO; d];
             coeffs[lane] = <<R as PolyRing>::BaseRing as Field>::ONE;
             let mono_vec = R::promote_from_coeffs(coeffs)
-                .ok_or_else(|| "Ajtai dR1CS(full): promote_from_coeffs failed".to_string())?;
-            if mono_vec.len() != 1 {
-                return Err("Ajtai dR1CS(full): expected single ring element from promote_from_coeffs".to_string());
-            }
+                .expect("Ajtai dR1CS(full): promote_from_coeffs failed");
+            assert_eq!(mono_vec.len(), 1, "Ajtai dR1CS(full): expected single ring element");
             let mono = mono_vec[0];
             let mut basis = vec![R::ZERO; n];
             basis[j] = mono;
             let col = scheme
                 .commit(&basis)
-                .map_err(|e| format!("Ajtai dR1CS(full): commit(basis) failed: {e:?}"))?
+                .expect("Ajtai dR1CS(full): commit(basis) failed")
                 .as_ref()
                 .to_vec();
             debug_assert_eq!(col.len(), kappa);
-            cols.push(col);
-        }
-    }
+            col
+        })
+        .collect();
 
     // Constraints: for each commitment row i and output coeff lane_out:
     // Σ_{j,lane_in} coeff(j,lane_in -> lane_out) * msg[j][lane_in] = commitment[i][lane_out]

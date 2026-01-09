@@ -160,9 +160,9 @@ where
         return Err("pifold math dr1cs: rs_shared length mismatch".to_string());
     }
 
-    // Allocate witness vars for all "coin" values we use in arithmetic.
-    let beta_vars = beta_cts.iter().copied().map(|x| b.new_var(x)).collect::<Vec<_>>();
-    let s_vars = s_base.iter().copied().map(|x| b.new_var(x)).collect::<Vec<_>>();
+    // Allocate witness vars for coin values. Sequential allocation required.
+    let beta_vars: Vec<_> = beta_cts.iter().copied().map(|x| b.new_var(x)).collect();
+    let s_vars: Vec<_> = s_base.iter().copied().map(|x| b.new_var(x)).collect();
     let alpha_base_var = b.new_var(alpha_base);
 
     let mut c_all: Vec<Vec<usize>> = Vec::with_capacity(ell * k_g);

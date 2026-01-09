@@ -8,11 +8,17 @@ use ark_ff::{BigInteger, PrimeField};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, Signed, Zero};
 use rand::RngCore;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
+
+use rayon::prelude::*;
 
 use crate::subset_sum::{decode_bounded_subset_sum, SubsetSumError};
 use crate::sparse::SparseVec;
+
+const PAR_SPARSE_PACKING_MIN_TOTAL_TERMS: usize = 4096;
+const PAR_SPARSE_PACKING_MIN_K: usize = 8;
+const PAR_DENSE_DOT_MIN_LEN: usize = 8192;
 
 #[derive(Debug, Error)]
 pub enum PackingError {
@@ -250,15 +256,29 @@ impl<F: PrimeField, V: BoundedFlpcp<F>> DppFromBoundedFlpcp<F, V> {
 
         // Compute packed query coefficients: q = Q^T w over integers, then reduce mod p.
         let len = self.flpcp.n() + self.flpcp.m();
-        let mut q: Vec<F> = Vec::with_capacity(len);
-        for j in 0..len {
-            let mut acc = BigInt::zero();
-            for i in 0..k {
-                let qij = field_to_centered_bigint::<F>(&q_mat[i][j]);
-                acc += &w[i] * qij;
+        // This is typically the dominant cost for large instances (len = n+m can be huge).
+        // Parallelize over output coordinates (each j is independent).
+        let p_mod = modulus_bigint::<F>();
+        let half = (&p_mod - BigInt::one()) / BigInt::from(2u64);
+        let field_to_centered_bigint_fast = |x: &F| -> BigInt {
+            let mut t = BigInt::from_bytes_le(num_bigint::Sign::Plus, &x.into_bigint().to_bytes_le());
+            if t > half {
+                t -= &p_mod;
             }
-            q.push(centered_bigint_to_field::<F>(&acc));
-        }
+            t
+        };
+
+        let q: Vec<F> = (0..len)
+            .into_par_iter()
+            .map(|j| {
+                let mut acc = BigInt::zero();
+                for i in 0..k {
+                    let qij = field_to_centered_bigint_fast(&q_mat[i][j]);
+                    acc += &w[i] * qij;
+                }
+                centered_bigint_to_field::<F>(&acc)
+            })
+            .collect();
 
         Ok((q, w, pred, q_mat))
     }
@@ -407,17 +427,64 @@ impl<F: PrimeField, V: BoundedFlpcpSparse<F>> DppFromBoundedFlpcpSparse<F, V> {
         }
 
         // Compute packed query coefficients q = Σ_i w_i * q_i over integers, then reduce mod p.
-        let mut acc: BTreeMap<usize, BigInt> = BTreeMap::new();
-        for i in 0..k {
-            let wi = &w[i];
-            for (coeff, idx) in &q_mat[i].terms {
-                let cij = field_to_centered_bigint::<F>(coeff);
-                let entry = acc.entry(*idx).or_insert_with(BigInt::zero);
-                *entry += wi * cij;
+        let p_mod = modulus_bigint::<F>();
+        let half = (&p_mod - BigInt::one()) / BigInt::from(2u64);
+        let field_to_centered_bigint_fast = |x: &F| -> BigInt {
+            let mut t = BigInt::from_bytes_le(num_bigint::Sign::Plus, &x.into_bigint().to_bytes_le());
+            if t > half {
+                t -= &p_mod;
             }
-        }
-        let mut terms: Vec<(F, usize)> = Vec::with_capacity(acc.len());
-        for (idx, z) in acc {
+            t
+        };
+
+        let total_terms: usize = q_mat.iter().map(|row| row.terms.len()).sum();
+        let use_par = k >= PAR_SPARSE_PACKING_MIN_K && total_terms >= PAR_SPARSE_PACKING_MIN_TOTAL_TERMS;
+
+        let mut acc_items: Vec<(usize, BigInt)> = if use_par {
+            let merged: HashMap<usize, BigInt> = q_mat
+                .par_iter()
+                .enumerate()
+                .fold(
+                    || HashMap::<usize, BigInt>::new(),
+                    |mut local, (i, row)| {
+                        let wi = &w[i];
+                        for (coeff, idx) in &row.terms {
+                            let cij = field_to_centered_bigint_fast(coeff);
+                            let entry = local.entry(*idx).or_insert_with(BigInt::zero);
+                            *entry += wi * cij;
+                        }
+                        local
+                    },
+                )
+                .reduce(
+                    || HashMap::<usize, BigInt>::new(),
+                    |mut a, b| {
+                        for (idx, z) in b {
+                            let entry = a.entry(idx).or_insert_with(BigInt::zero);
+                            *entry += z;
+                        }
+                        a
+                    },
+                );
+            merged.into_iter().collect()
+        } else {
+            // Small instances: avoid Rayon/HashMap overhead.
+            let mut acc: BTreeMap<usize, BigInt> = BTreeMap::new();
+            for i in 0..k {
+                let wi = &w[i];
+                for (coeff, idx) in &q_mat[i].terms {
+                    let cij = field_to_centered_bigint_fast(coeff);
+                    let entry = acc.entry(*idx).or_insert_with(BigInt::zero);
+                    *entry += wi * cij;
+                }
+            }
+            acc.into_iter().collect()
+        };
+
+        // Make output stable/deterministic regardless of parallel merging order.
+        acc_items.sort_by_key(|(idx, _)| *idx);
+        let mut terms: Vec<(F, usize)> = Vec::with_capacity(acc_items.len());
+        for (idx, z) in acc_items {
             let f = centered_bigint_to_field::<F>(&z);
             if !f.is_zero() {
                 terms.push((f, idx));
@@ -486,7 +553,15 @@ fn sample_uniform_below(rng: &mut dyn RngCore, n: &BigUint) -> BigUint {
 
 fn dot<F: PrimeField>(a: &[F], b: &[F]) -> F {
     debug_assert_eq!(a.len(), b.len());
-    a.iter().zip(b.iter()).fold(F::zero(), |acc, (x, y)| acc + (*x * *y))
+    // Used by packed DPP verification: this can dominate for large (n+m).
+    if a.len() >= PAR_DENSE_DOT_MIN_LEN {
+        a.par_iter()
+            .zip(b.par_iter())
+            .map(|(x, y)| *x * *y)
+            .reduce(|| F::ZERO, |acc, t| acc + t)
+    } else {
+        a.iter().zip(b.iter()).fold(F::ZERO, |acc, (x, y)| acc + (*x * *y))
+    }
 }
 
 /// Map a field element to its centered integer representative in [-(p-1)/2, (p-1)/2].
@@ -531,6 +606,7 @@ impl ModFloor for BigInt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ark_ff::Field;
     use ark_ff::{Fp64, MontBackend, MontConfig};
     use rand_chacha::ChaCha20Rng;
     use rand::SeedableRng;
@@ -618,6 +694,94 @@ mod tests {
         let q = dpp.sample_query(&mut rng, &x).unwrap();
         let ok = dpp.verify_with_query(&x, &[], &q).unwrap();
         assert!(ok);
+    }
+
+    // Large prime field to keep the modulus condition (Claim 5.22) satisfied even for k>=8.
+    #[derive(MontConfig)]
+    #[modulus = "18446744069414584321"]
+    #[generator = "7"]
+    pub struct FBigConfig;
+    type FBig = Fp64<MontBackend<FBigConfig, 1>>;
+
+    #[derive(Clone, Debug)]
+    struct BigSparseFlpcp {
+        n: usize,
+        k: usize,
+    }
+
+    impl BoundedFlpcpSparse<FBig> for BigSparseFlpcp {
+        fn n(&self) -> usize {
+            self.n
+        }
+        fn m(&self) -> usize {
+            0
+        }
+        fn k(&self) -> usize {
+            self.k
+        }
+        fn bounds_b(&self) -> Vec<BigInt> {
+            // Tight bounds to keep packing weights small.
+            vec![BigInt::from(2u64); self.k]
+        }
+
+        fn sample_queries_and_predicate_sparse(
+            &self,
+            _rng: &mut dyn RngCore,
+            _x: &[FBig],
+        ) -> Result<(Vec<SparseVec<FBig>>, FlpcpPredicate<FBig>), String> {
+            // Deterministic, dense-ish sparse queries:
+            // every query row includes every index with coefficient 1.
+            let mut rows = Vec::with_capacity(self.k);
+            let terms = (0..self.n).map(|idx| (FBig::ONE, idx)).collect::<Vec<_>>();
+            for _ in 0..self.k {
+                rows.push(SparseVec::new(terms.clone()));
+            }
+            Ok((rows, FlpcpPredicate::AllZero))
+        }
+    }
+
+    #[test]
+    fn test_sparse_packed_query_matches_manual_reference_on_large_terms() {
+        // Force the parallel sparse accumulation path by using many terms.
+        let flpcp = BigSparseFlpcp { n: 8192, k: 8 };
+        let dpp = DppFromBoundedFlpcpSparse::<FBig, _>::new(flpcp.clone(), PackedDppParams { ell: 2 });
+        let mut rng = ChaCha20Rng::seed_from_u64(4242);
+
+        let x: Vec<FBig> = vec![FBig::ONE; flpcp.n()];
+        let query = dpp.sample_query(&mut rng, &x).unwrap();
+
+        // Recompute packed q sequentially from the (deterministic) q_mat and sampled w.
+        let (q_mat, _pred) = flpcp
+            .sample_queries_and_predicate_sparse(&mut rng, &x)
+            .expect("deterministic q_mat");
+        let k = flpcp.k();
+
+        let mut acc: BTreeMap<usize, BigInt> = BTreeMap::new();
+        for i in 0..k {
+            let wi = &query.w[i];
+            for (coeff, idx) in &q_mat[i].terms {
+                let cij = field_to_centered_bigint::<FBig>(coeff);
+                let entry = acc.entry(*idx).or_insert_with(BigInt::zero);
+                *entry += wi * cij;
+            }
+        }
+        let mut exp_terms: Vec<(FBig, usize)> = acc
+            .into_iter()
+            .filter_map(|(idx, z)| {
+                let f = centered_bigint_to_field::<FBig>(&z);
+                if f.is_zero() {
+                    None
+                } else {
+                    Some((f, idx))
+                }
+            })
+            .collect();
+        exp_terms.sort_by_key(|(_, idx)| *idx);
+
+        let mut got_terms = query.q.terms.clone();
+        got_terms.sort_by_key(|(_, idx)| *idx);
+
+        assert_eq!(got_terms, exp_terms);
     }
 }
 

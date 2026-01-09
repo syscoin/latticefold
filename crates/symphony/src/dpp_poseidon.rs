@@ -4,6 +4,7 @@
 //! we first arithmetize the Poseidon permutation(s) used by the transcript.
 
 use ark_ff::{BigInteger, PrimeField};
+use rayon::prelude::*;
 
 use crate::poseidon_trace::{permute_with_round_trace, PoseidonReplayError};
 use crate::poseidon_trace::{replay_ops, PoseidonReplayError as ReplayErr, PoseidonSpongeReplayResult};
@@ -24,9 +25,16 @@ pub struct SparseDr1csInstance<F: PrimeField> {
 
 impl<F: PrimeField> SparseDr1csInstance<F> {
     pub fn eval_lc(terms: &[(F, usize)], assignment: &[F]) -> F {
-        terms
-            .iter()
-            .fold(F::ZERO, |acc, (c, idx)| acc + (*c * assignment[*idx]))
+        if terms.len() > 64 {
+            terms
+                .par_iter()
+                .map(|(c, idx)| *c * assignment[*idx])
+                .reduce(|| F::ZERO, |a, b| a + b)
+        } else {
+            terms
+                .iter()
+                .fold(F::ZERO, |acc, (c, idx)| acc + (*c * assignment[*idx]))
+        }
     }
 
     pub fn check(&self, assignment: &[F]) -> Result<(), String> {
@@ -37,43 +45,51 @@ impl<F: PrimeField> SparseDr1csInstance<F> {
                 assignment.len()
             ));
         }
-        for (i, row) in self.constraints.iter().enumerate() {
+        
+        let failed = self.constraints.par_iter().enumerate().find_any(|(_, row)| {
             let a = Self::eval_lc(&row.a, assignment);
             let b = Self::eval_lc(&row.b, assignment);
             let c = Self::eval_lc(&row.c, assignment);
-            if a * b != c {
-                return Err(format!("constraint {i} failed"));
-            }
+            a * b != c
+        });
+        
+        if let Some((i, _)) = failed {
+            return Err(format!("constraint {i} failed"));
         }
         Ok(())
     }
 
     /// Convert to the dense dR1CS format used by the prototype RS FLPCP.
-    ///
-    /// WARNING: this is **not** efficient for large instances.
     pub fn to_dense(&self) -> dpp::dr1cs_flpcp::Dr1csInstance<F> {
         let n = self.nvars;
-        let k = self.constraints.len();
-        let mut a = Vec::with_capacity(k);
-        let mut b = Vec::with_capacity(k);
-        let mut c = Vec::with_capacity(k);
-        for row in &self.constraints {
-            let mut ra = vec![F::ZERO; n];
-            let mut rb = vec![F::ZERO; n];
-            let mut rc = vec![F::ZERO; n];
-            for (coeff, idx) in &row.a {
-                ra[*idx] += *coeff;
-            }
-            for (coeff, idx) in &row.b {
-                rb[*idx] += *coeff;
-            }
-            for (coeff, idx) in &row.c {
-                rc[*idx] += *coeff;
-            }
-            a.push(ra);
-            b.push(rb);
-            c.push(rc);
-        }
+        
+        let rows: Vec<(Vec<F>, Vec<F>, Vec<F>)> = self.constraints.par_iter()
+            .map(|row| {
+                let mut ra = vec![F::ZERO; n];
+                let mut rb = vec![F::ZERO; n];
+                let mut rc = vec![F::ZERO; n];
+                for (coeff, idx) in &row.a {
+                    ra[*idx] += *coeff;
+                }
+                for (coeff, idx) in &row.b {
+                    rb[*idx] += *coeff;
+                }
+                for (coeff, idx) in &row.c {
+                    rc[*idx] += *coeff;
+                }
+                (ra, rb, rc)
+            })
+            .collect();
+        
+        let (a, b, c): (Vec<_>, Vec<_>, Vec<_>) = rows.into_iter()
+            .map(|(ra, rb, rc)| (ra, rb, rc))
+            .fold((Vec::new(), Vec::new(), Vec::new()), |(mut a, mut b, mut c), (ra, rb, rc)| {
+                a.push(ra);
+                b.push(rb);
+                c.push(rc);
+                (a, b, c)
+            });
+        
         dpp::dr1cs_flpcp::Dr1csInstance { a, b, c }
     }
 }
