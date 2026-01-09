@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 use std::time::Instant;
-use ark_ff::{Field, Fp256, MontBackend, MontConfig, PrimeField};
+use ark_ff::{Field, Fp384, MontBackend, MontConfig, PrimeField};
 
 fn main() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -133,13 +133,20 @@ fn main() {
 /// Helper alias: Poseidon's base prime field for a given ring `R`.
 type BF<R> = <<R as stark_rings::PolyRing>::BaseRing as Field>::BasePrimeField;
 
-// 256-bit prime field for the large-field embedding/packing path (Rev2).
-// secp256k1 prime: 2^256 - 2^32 - 977
+// Large prime field for the large-field embedding/packing path (Rev2).
+//
+// IMPORTANT:
+// With Frog (~64-bit modulus) and multi-million-length witness vectors, the Rev2 packing step
+// (Construction 5.21) can require a modulus larger than 256 bits under the conservative bounds.
+// A 256-bit field (like secp256k1) can therefore fail with `PackingError::ModulusTooSmall`.
+//
+// We use the NIST P-384 prime here:
+//   p = 2^384 - 2^128 - 2^96 + 2^32 - 1
 #[derive(MontConfig)]
-#[modulus = "115792089237316195423570985008687907852837564279074904382605163141518161494337"]
-#[generator = "7"]
-pub struct Secp256k1Config;
-type FLarge = Fp256<MontBackend<Secp256k1Config, 4>>;
+#[modulus = "39402006196394479212279040100143613805079739270465446667948293404245721771496870329047266088258938001861606973112319"]
+#[generator = "2"]
+pub struct Secp384r1Config;
+type FLarge = Fp384<MontBackend<Secp384r1Config, 6>>;
 
 /// Build Poseidon2 Hadamard relation matrices (M1, M2, M3) for Symphony.
 ///
