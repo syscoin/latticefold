@@ -12,7 +12,10 @@ use ark_ff::PrimeField;
 use crate::{
     boolean_proof::{BooleanProofFlpcp, BooleanProofFlpcpSparse},
     embedding::{EmbeddedFlpcp, EmbeddedFlpcpSparse, EmbeddingParams},
-    packing::{BoundedFlpcp, BoundedFlpcpSparse, DppFromBoundedFlpcp, DppFromBoundedFlpcpSparse, PackedDppParams},
+    packing::{
+        BoundedFlpcp, BoundedFlpcpSparse, DppFromBoundedFlpcp, DppFromBoundedFlpcpSparse, PackedDppParams,
+        PackingError,
+    },
 };
 
 /// Build the Rev2 “Booleanize → Embed → Pack” DPP verifier.
@@ -49,6 +52,52 @@ pub fn build_rev2_dpp_sparse_boolean<
     let boolized = BooleanProofFlpcpSparse::<FSmall, V>::new(flpcp);
     let embedded = EmbeddedFlpcpSparse::<FSmall, FLarge, _>::new(boolized, embed);
     DppFromBoundedFlpcpSparse::<FLarge, _>::new(embedded, pack)
+}
+
+/// Build the Rev2 “Booleanize → Embed → Pack” DPP verifier, choosing `PackedDppParams`
+/// automatically from the resulting bounded FLPCP’s bounds and the target field modulus.
+///
+/// This removes ad-hoc `ell` tuning and uses the deterministic safe upper bound derived
+/// from Construction 5.21’s weight ranges (see `PackedDppParams::from_bounds_max`).
+pub fn build_rev2_dpp_auto<FSmall: PrimeField, FLarge: PrimeField, V: BoundedFlpcp<FSmall>>(
+    flpcp: V,
+    embed: EmbeddingParams,
+) -> Result<
+    DppFromBoundedFlpcp<FLarge, EmbeddedFlpcp<FSmall, FLarge, BooleanProofFlpcp<FSmall, V>>>,
+    PackingError,
+> {
+    let boolized = BooleanProofFlpcp::<FSmall, V>::new(flpcp);
+    let embedded = EmbeddedFlpcp::<FSmall, FLarge, _>::new(boolized, embed);
+    let pack = PackedDppParams::from_bounds_max::<FLarge>(&embedded.bounds_b())?;
+    Ok(DppFromBoundedFlpcp::<FLarge, _>::new(embedded, pack))
+}
+
+/// Sparse-query version of `build_rev2_dpp_auto` (no Booleanization).
+pub fn build_rev2_dpp_sparse_auto<FSmall: PrimeField, FLarge: PrimeField, V: BoundedFlpcpSparse<FSmall>>(
+    flpcp: V,
+    embed: EmbeddingParams,
+) -> Result<DppFromBoundedFlpcpSparse<FLarge, EmbeddedFlpcpSparse<FSmall, FLarge, V>>, PackingError> {
+    let embedded = EmbeddedFlpcpSparse::<FSmall, FLarge, _>::new(flpcp, embed);
+    let pack = PackedDppParams::from_bounds_max::<FLarge>(&embedded.bounds_b())?;
+    Ok(DppFromBoundedFlpcpSparse::<FLarge, _>::new(embedded, pack))
+}
+
+/// Sparse-query version of `build_rev2_dpp_auto` with Booleanization.
+pub fn build_rev2_dpp_sparse_boolean_auto<
+    FSmall: PrimeField,
+    FLarge: PrimeField,
+    V: BoundedFlpcpSparse<FSmall>,
+>(
+    flpcp: V,
+    embed: EmbeddingParams,
+) -> Result<
+    DppFromBoundedFlpcpSparse<FLarge, EmbeddedFlpcpSparse<FSmall, FLarge, BooleanProofFlpcpSparse<FSmall, V>>>,
+    PackingError,
+> {
+    let boolized = BooleanProofFlpcpSparse::<FSmall, V>::new(flpcp);
+    let embedded = EmbeddedFlpcpSparse::<FSmall, FLarge, _>::new(boolized, embed);
+    let pack = PackedDppParams::from_bounds_max::<FLarge>(&embedded.bounds_b())?;
+    Ok(DppFromBoundedFlpcpSparse::<FLarge, _>::new(embedded, pack))
 }
 
 /// Helper: choose k' such that (0.51)^{k'} <= 2^{-security_bits}.

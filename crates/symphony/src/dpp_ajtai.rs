@@ -75,14 +75,14 @@ where
     let cols: Vec<Vec<R>> = (0..n)
         .into_par_iter()
         .map(|j| {
-            let mut basis = vec![R::ZERO; n];
-            basis[j] = R::ONE;
-            let col = scheme
-                .commit(&basis)
+        let mut basis = vec![R::ZERO; n];
+        basis[j] = R::ONE;
+        let col = scheme
+            .commit(&basis)
                 .expect("Ajtai dR1CS: commit(basis) failed")
-                .as_ref()
-                .to_vec();
-            debug_assert_eq!(col.len(), kappa);
+            .as_ref()
+            .to_vec();
+        debug_assert_eq!(col.len(), kappa);
             col
         })
         .collect();

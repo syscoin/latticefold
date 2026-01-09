@@ -6,7 +6,7 @@
 
 use ark_ff::{BigInteger, PrimeField};
 use num_bigint::{BigInt, BigUint};
-use num_traits::{One, Signed, Zero};
+use num_traits::{One, Signed, ToPrimitive, Zero};
 use rand::RngCore;
 use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
@@ -142,6 +142,74 @@ impl<F: PrimeField> FlpcpPredicate<F> {
 pub struct PackedDppParams {
     /// ℓ (denoted `ell` in paper): the per-coordinate sampling range size.
     pub ell: u64,
+}
+
+impl PackedDppParams {
+    /// Compute a **deterministic safe upper bound** on ℓ that guarantees the packing
+    /// “no wrap” condition (Claim 5.22 style) for **all** possible sampled weights `w`
+    /// from Construction 5.21.
+    ///
+    /// In the construction, weights satisfy:
+    /// - Let `B = max_i b_i` and `two_b = 2B`.
+    /// - For i=0..k-1, sampled `w_i ∈ [ (two_b^i - 1) * ℓ + 1 , two_b^i * ℓ ]`.
+    ///
+    /// Therefore, for any sample, we have the worst-case bound:
+    ///   <b-1, w> ≤ ℓ * Σ_i (b_i - 1) * two_b^i.
+    ///
+    /// To guarantee `p > 2 * <b-1, w>` for all samples, it suffices to choose:
+    ///   ℓ ≤ floor( (p-1) / ( 2 * Σ_i (b_i - 1) * two_b^i ) ).
+    ///
+    /// Returns `None` if parameters are invalid or no positive ℓ exists.
+    pub fn max_ell_for_bounds<F: PrimeField>(b: &[BigInt]) -> Option<u64> {
+        if b.is_empty() {
+            return None;
+        }
+
+        // B = max_i b_i
+        let mut b_max = BigInt::zero();
+        for bi in b {
+            if bi > &b_max {
+                b_max = bi.clone();
+            }
+        }
+        if b_max <= BigInt::one() {
+            return None;
+        }
+        let two_b = BigInt::from(2u64) * b_max;
+
+        // denom = 2 * Σ_i (b_i - 1) * (two_b^i)
+        let mut denom = BigInt::zero();
+        let mut pow = BigInt::one(); // two_b^0
+        for bi in b {
+            let bound_i = bi - BigInt::one();
+            if bound_i.is_negative() {
+                return None;
+            }
+            denom += &bound_i * &pow;
+            pow *= &two_b;
+        }
+        denom *= BigInt::from(2u64);
+        if denom.is_zero() {
+            return None;
+        }
+
+        // ell_max = floor((p-1)/denom)
+        let p = modulus_bigint::<F>();
+        let num = p - BigInt::one();
+        let ell_max = &num / denom;
+        if ell_max <= BigInt::zero() {
+            return None;
+        }
+
+        // Clamp to u64 (the current PackedDppParams type).
+        ell_max.to_u64()
+    }
+
+    /// Construct params picking the maximum safe ℓ (clamped to u64).
+    pub fn from_bounds_max<F: PrimeField>(b: &[BigInt]) -> Result<Self, PackingError> {
+        let ell = Self::max_ell_for_bounds::<F>(b).ok_or(PackingError::ModulusTooSmall)?;
+        Ok(Self { ell })
+    }
 }
 
 /// A packed DPP verifier built from a bounded FLPCP via Construction 5.21.
@@ -610,6 +678,7 @@ mod tests {
     use ark_ff::{Fp64, MontBackend, MontConfig};
     use rand_chacha::ChaCha20Rng;
     use rand::SeedableRng;
+    use num_traits::ToPrimitive;
 
     // Small prime field for tests.
     #[derive(MontConfig)]
@@ -782,6 +851,38 @@ mod tests {
         got_terms.sort_by_key(|(_, idx)| *idx);
 
         assert_eq!(got_terms, exp_terms);
+    }
+
+    #[test]
+    fn test_max_ell_for_bounds_is_sound_for_worst_case_weights() {
+        // Use a large 64-bit-ish prime field so ell_max is nontrivial.
+        type F = FBig;
+
+        // Example bounds vector (k = 8), with small b to keep ell reasonably large.
+        let k = 8usize;
+        let b = vec![BigInt::from(3u64); k]; // |ans_i| <= 2
+
+        let ell = PackedDppParams::max_ell_for_bounds::<F>(&b).expect("ell exists");
+        assert!(ell >= 1);
+
+        // Verify the sufficient condition derived in max_ell_for_bounds:
+        // p > 2 * ell * Σ_i (b_i-1) * (2B)^i
+        let p = modulus_bigint::<F>();
+        let b_max = BigInt::from(3u64);
+        let two_b = BigInt::from(2u64) * b_max;
+        let mut sum = BigInt::zero();
+        let mut pow = BigInt::one();
+        for _ in 0..k {
+            sum += BigInt::from(2u64) * &pow; // (b_i-1)=2
+            pow *= &two_b;
+        }
+        let rhs = BigInt::from(2u64) * BigInt::from(ell) * sum;
+        assert!(
+            p > rhs,
+            "p={} should be > rhs={}",
+            p.to_u128().unwrap_or(0),
+            rhs.to_u128().unwrap_or(0)
+        );
     }
 }
 
