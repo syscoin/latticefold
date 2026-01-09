@@ -260,11 +260,12 @@ fn ntt(a: &mut [u32], invert: bool, modulus: u32, primitive_root: u32) {
     // contiguous block of `len` coefficients. So we can parallelize over blocks via
     // `par_chunks_mut(len)` safely.
     //
-    // Threshold:
-    // Parallelizing very small stages (`len=2,4,8,...`) creates huge rayon overhead (many tiny tasks)
-    // and can slow down large NTTs. We therefore only parallelize once blocks are reasonably sized.
+    // Thresholds:
+    // - for small sizes, rayon overhead outweighs benefit
+    // - for large sizes (our RS extrapolation), this unlocks multi-core scaling
+    const PAR_NTT_MIN_N: usize = 1 << 18; // 262k
     const PAR_NTT_MIN_LEN: usize = 1 << 10; // 1024
-    let use_par = rayon::current_num_threads() > 1;
+    let use_par = n >= PAR_NTT_MIN_N && rayon::current_num_threads() > 1;
 
     // Reuse twiddle buffer to avoid per-stage allocations.
     let mut twiddles: Vec<u32> = Vec::new();
