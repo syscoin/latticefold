@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use ark_ff::{Field, Fp384, MontBackend, MontConfig, PrimeField};
 use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 
 fn main() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -993,10 +994,21 @@ where
 
             // Sample query and verify.
             println!("    DPP: verify_with_query: START...");
+            let avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+            println!("    DPP: rayon available_parallelism={avail}");
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(avail)
+                .build()
+                .expect("build rayon threadpool");
+
             let t4 = Instant::now();
             let mut rng = StdRng::seed_from_u64(12345);
             let q = dpp.sample_query(&mut rng, &x_large).expect("sample_query");
-            let ok = dpp.verify_with_query(&x_large, &pi_large, &q).expect("verify_with_query");
+            // Run verification inside an explicit pool so we don't accidentally end up with a
+            // 1-thread global pool (which makes this look single-core).
+            let ok = pool
+                .install(|| dpp.verify_with_query(&x_large, &pi_large, &q))
+                .expect("verify_with_query");
             let t4e = t4.elapsed();
             println!("    DPP: verify_with_query: {:?} (ok={})", t4e, ok);
         }

@@ -607,18 +607,32 @@ impl<F: PrimeField> SparseVec<F> {
             // Keep this as a debug assertion to avoid overhead in optimized builds.
             debug_assert!(false, "SparseVec::dot_two_slices: index out of range");
         }
+        // Fast path for Boolean witnesses: if v ∈ {0,1}, then c*v is either 0 or c.
+        // This is a big win for large `FLarge` (e.g. 384-bit) fields.
         if self.terms.len() >= PAR_SPARSE_DOT_MIN_TERMS {
             self.terms
                 .par_iter()
                 .map(|(c, idx)| {
                     let v = if *idx < n { x[*idx] } else { pi[*idx - n] };
-                    *c * v
+                    if v.is_zero() {
+                        F::ZERO
+                    } else if v == F::ONE {
+                        *c
+                    } else {
+                        *c * v
+                    }
                 })
                 .reduce(|| F::ZERO, |acc, t| acc + t)
         } else {
             self.terms.iter().fold(F::ZERO, |acc, (c, idx)| {
                 let v = if *idx < n { x[*idx] } else { pi[*idx - n] };
-                acc + (*c * v)
+                if v.is_zero() {
+                    acc
+                } else if v == F::ONE {
+                    acc + *c
+                } else {
+                    acc + (*c * v)
+                }
             })
         }
     }
