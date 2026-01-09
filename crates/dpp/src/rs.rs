@@ -9,6 +9,8 @@ use ark_ff::{BigInteger, Field, FftField, PrimeField};
 use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
 
 use rayon::prelude::*;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 /// Compute barycentric weights for distinct points `xs`.
 ///
@@ -302,27 +304,21 @@ fn convolution_ntt_mod(a: &[u32], b: &[u32], out_len: usize, size: usize, modulu
 /// Uses 5 NTT-friendly 32-bit primes whose product is ~155 bits, enough to reconstruct
 /// coefficients bounded by `O(n * p^2)` for our RS extrapolation use-case at ~1e6 scale.
 fn convolution_crt_ntt<F: PrimeField>(a: &[F], b: &[F], out_len: usize, size: usize) -> Vec<F> {
-    // Number of CRT moduli we use for the NTT-based convolution fallback.
+    // IMPORTANT:
+    // RS extrapolation wants a convolution length `size` which can be as large as 2^24 and beyond.
+    // Hardcoding a small set of “popular” NTT primes is brittle: some support only up to 2^22/2^23.
     //
-    // Note: This must be large enough that the product of moduli exceeds the worst-case integer
-    // coefficient growth in RS extrapolation (roughly O(n * p^2) where p is the prime modulus of F).
+    // Instead, we *deterministically synthesize* a set of 32-bit primes p ≡ 1 (mod size) at runtime,
+    // find a primitive root for each, and use them for CRT+NTT convolution.
     //
-    // For ~64-bit prime fields at ~2^22 scale, 6 moduli (~180 bits product) is ample.
-    const K: usize = 6;
-    // NTT-friendly primes with primitive root 3 for these common choices.
-    // All have at least 2^22 | (p-1) (i.e. support NTT sizes up to 2^22 and beyond).
-    // Each modulus must support size=next_power_of_two(out_len), i.e. have v2(mod-1) >= log2(size).
-    // We use a few standard NTT primes (cp-algorithms style). Product is ~230 bits, giving ample
-    // headroom for exact reconstruction of large integer convolution coefficients before reducing mod p.
-    const MODS: [u32; K] = [
-        167_772_161,   // v2=25, primitive root 3
-        754_974_721,   // v2=24, primitive root 11
-        998_244_353,   // v2=23, primitive root 3
-        469_762_049,   // v2=26, primitive root 3
-        935_329_793,   // v2=22, primitive root 3
-        2_013_265_921, // v2=27, primitive root 31
-    ];
-    const ROOTS: [u32; K] = [3, 11, 3, 3, 3, 31];
+    // This keeps the fallback working as we change parameters, and avoids coupling correctness to
+    // an ad-hoc modulus list.
+    let (mods, roots) = ntt_moduli_for_size(size, /*target_count=*/ 8);
+    let k = mods.len();
+    assert!(
+        k >= 4,
+        "CRT+NTT requires several NTT primes; got {k} for size={size}"
+    );
 
     // Extract modulus of F as u64 (Frog prime fits in u64).
     let p_bytes = F::MODULUS.to_bytes_le();
@@ -346,39 +342,41 @@ fn convolution_crt_ntt<F: PrimeField>(a: &[F], b: &[F], out_len: usize, size: us
     let b_u = b.par_iter().map(to_u64).collect::<Vec<_>>();
 
     // For each modulus, reduce inputs and convolve.
-    let residues_vec: Vec<Vec<u32>> = (0..K)
+    let residues_vec: Vec<Vec<u32>> = (0..k)
         .into_par_iter()
         .map(|i| {
-            let modulus = MODS[i];
-            let root = ROOTS[i];
-            assert!(((modulus - 1) as usize) % size == 0, "NTT modulus does not support size {size}");
+            let modulus = mods[i];
+            let root = roots[i];
+            debug_assert!(
+                ((modulus - 1) as usize) % size == 0,
+                "internal: synthesized NTT modulus does not support size {size}"
+            );
             let aa = a_u.iter().map(|&v| (v % (modulus as u64)) as u32).collect::<Vec<_>>();
             let bb = b_u.iter().map(|&v| (v % (modulus as u64)) as u32).collect::<Vec<_>>();
             convolution_ntt_mod(&aa, &bb, out_len, size, modulus, root)
         })
         .collect();
 
-    let residues: [Vec<u32>; K] = residues_vec
-        .try_into()
-        .expect("residues_vec length matches CRT modulus count");
+    let residues = residues_vec;
 
     // Precompute prefix products modulo each modulus and modulo p.
-    let mut prefix_mod = [[0u32; K]; K];
-    let mut inv_prefix = [0u32; K];
-    for i in 0..K {
-        let mi = MODS[i];
+    let mut prefix_mod = vec![vec![0u32; k]; k];
+    let mut inv_prefix = vec![0u32; k];
+    for i in 0..k {
+        let mi = mods[i];
         let mut prod: u64 = 1;
         for j in 0..i {
             prefix_mod[i][j] = (prod % (mi as u64)) as u32;
-            prod = (prod * MODS[j] as u64) % (mi as u64);
+            prod = (prod * mods[j] as u64) % (mi as u64);
         }
         let prod_i = (prod % (mi as u64)) as u32;
         inv_prefix[i] = inv_mod_u32(prod_i, mi);
     }
-    let mut prefix_p = [0u64; K];
+    let mut prefix_p = vec![0u64; k];
     prefix_p[0] = 1;
-    for i in 1..K {
-        prefix_p[i] = (((prefix_p[i - 1] as u128) * (MODS[i - 1] as u128)) % (p_u64 as u128)) as u64;
+    for i in 1..k {
+        prefix_p[i] =
+            (((prefix_p[i - 1] as u128) * (mods[i - 1] as u128)) % (p_u64 as u128)) as u64;
     }
 
     // Garner reconstruction per coefficient, then reduce mod p and map back to F.
@@ -386,10 +384,10 @@ fn convolution_crt_ntt<F: PrimeField>(a: &[F], b: &[F], out_len: usize, size: us
         .into_par_iter()
         .map(|t| {
             // mixed radix digits c[i] in [0, MODS[i])
-            let mut c = [0u32; K];
+            let mut c = vec![0u32; k];
             c[0] = residues[0][t];
-            for i in 1..K {
-                let mi = MODS[i];
+            for i in 1..k {
+                let mi = mods[i];
                 let mut acc = residues[i][t];
                 for j in 0..i {
                     let term = mul_mod_u32(c[j], prefix_mod[i][j], mi);
@@ -400,7 +398,7 @@ fn convolution_crt_ntt<F: PrimeField>(a: &[F], b: &[F], out_len: usize, size: us
 
             // x mod p
             let mut x_mod_p: u64 = 0;
-            for i in 0..K {
+            for i in 0..k {
                 let add = (((c[i] as u128) * (prefix_p[i] as u128)) % (p_u64 as u128)) as u64;
                 x_mod_p = (((x_mod_p as u128) + (add as u128)) % (p_u64 as u128)) as u64;
             }
@@ -409,6 +407,149 @@ fn convolution_crt_ntt<F: PrimeField>(a: &[F], b: &[F], out_len: usize, size: us
         .collect();
 
     out
+}
+
+/// Deterministically synthesize `target_count` 32-bit primes p such that `p ≡ 1 (mod size)`,
+/// along with a primitive root for each prime.
+///
+/// This is used for the CRT+NTT convolution fallback when the base field `F` is not FFT-friendly.
+fn ntt_moduli_for_size(size: usize, target_count: usize) -> (Vec<u32>, Vec<u32>) {
+    assert!(size.is_power_of_two(), "NTT size must be power-of-two");
+    assert!(size >= 2, "NTT size too small");
+
+    // Cache per size so RS extrapolation doesn't repeatedly search primes.
+    // This function is called from performance-critical code paths.
+    static CACHE: OnceLock<Mutex<HashMap<usize, (Vec<u32>, Vec<u32>)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = cache.lock().ok().and_then(|m| m.get(&size).cloned()) {
+        return v;
+    }
+
+    let mut mods = Vec::<u32>::new();
+    let mut roots = Vec::<u32>::new();
+
+    // Search primes of the form p = m*size + 1.
+    // We only consider odd multipliers so p is odd (size is power-of-two).
+    let mut m: u64 = 3;
+    while mods.len() < target_count {
+        let p_u64 = m.saturating_mul(size as u64).saturating_add(1);
+        if p_u64 >= (u32::MAX as u64) {
+            break;
+        }
+        let p = p_u64 as u32;
+        if is_prime_u32(p) {
+            let g = primitive_root_u32(p, size as u32)
+                .unwrap_or_else(|| panic!("failed to find primitive root for prime p={p}"));
+            mods.push(p);
+            roots.push(g);
+        }
+        m += 2;
+    }
+    assert!(
+        !mods.is_empty(),
+        "failed to find any NTT primes for size={size}"
+    );
+    let out = (mods, roots);
+    if let Ok(mut m) = cache.lock() {
+        m.insert(size, out.clone());
+    }
+    out
+}
+
+fn is_prime_u32(n: u32) -> bool {
+    if n < 2 {
+        return false;
+    }
+    if n % 2 == 0 {
+        return n == 2;
+    }
+    if n % 3 == 0 {
+        return n == 3;
+    }
+    // Deterministic Miller-Rabin for 32-bit integers.
+    // Bases {2,3,5,7,11} are sufficient for n < 2^32.
+    const BASES: [u32; 5] = [2, 3, 5, 7, 11];
+    let d = n - 1;
+    let s = d.trailing_zeros();
+    let d_odd = d >> s;
+    'outer: for &a in &BASES {
+        if a % n == 0 {
+            continue;
+        }
+        let mut x = pow_mod_u64(a as u64, d_odd as u64, n as u64) as u64;
+        if x == 1 || x == (n as u64 - 1) {
+            continue;
+        }
+        for _ in 1..s {
+            x = (x * x) % (n as u64);
+            if x == (n as u64 - 1) {
+                continue 'outer;
+            }
+        }
+        return false;
+    }
+    true
+}
+
+fn pow_mod_u64(mut a: u64, mut e: u64, m: u64) -> u64 {
+    let mut r: u64 = 1;
+    while e > 0 {
+        if (e & 1) == 1 {
+            r = (r * a) % m;
+        }
+        a = (a * a) % m;
+        e >>= 1;
+    }
+    r
+}
+
+/// Find a primitive root mod prime `p` (generator of F_p^*), returning it if found.
+///
+/// `size_pow2` is the target NTT size; we use it to make factoring `p-1` cheap (we know it has a
+/// large 2-power factor), but the result is a *full* primitive root.
+fn primitive_root_u32(p: u32, size_pow2: u32) -> Option<u32> {
+    debug_assert!(p >= 3);
+    debug_assert!(((p - 1) as usize) % (size_pow2 as usize) == 0);
+
+    let mut factors: Vec<u32> = Vec::new();
+    factors.push(2);
+
+    // Factor the odd part of (p-1). Since p = m*size + 1 with size a large power-of-two,
+    // the odd part m is typically small (<= 2^32 / size).
+    let mut m = (p - 1) / size_pow2;
+    let mut d = 3u32;
+    while (d as u64) * (d as u64) <= (m as u64) {
+        if m % d == 0 {
+            factors.push(d);
+            while m % d == 0 {
+                m /= d;
+            }
+        }
+        d += 2;
+    }
+    if m > 1 {
+        factors.push(m);
+    }
+    factors.sort_unstable();
+    factors.dedup();
+
+    let p_u64 = p as u64;
+    let order = (p - 1) as u64;
+    for g in 2u32..(p - 1) {
+        let g_u64 = g as u64;
+        let mut ok = true;
+        for &q in &factors {
+            let e = order / (q as u64);
+            if pow_mod_u64(g_u64, e, p_u64) == 1 {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return Some(g);
+        }
+    }
+    None
 }
 
 /// Extrapolate a degree < n polynomial given its values at 0..n-1 to its values at n..2n-1.
