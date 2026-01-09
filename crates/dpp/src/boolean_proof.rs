@@ -153,6 +153,30 @@ impl<F: PrimeField, V: BoundedFlpcpSparse<F>> BooleanProofFlpcpSparse<F, V> {
         }
         out
     }
+
+    /// Encode proof into a **bitpacked** byte array (little-endian bits within each proof element).
+    ///
+    /// This is a memory-critical optimization for large instances: the unpacked `Vec<F>` form uses
+    /// one full field element per bit, which explodes RAM in benchmarks.
+    pub fn encode_proof_bits_packed(&self, pi: &[F]) -> Vec<u8> {
+        assert_eq!(pi.len(), self.inner.m());
+        let nbits = self.m_bits();
+        let nbytes = (nbits + 7) / 8;
+        let mut out = vec![0u8; nbytes];
+        let mut bit_pos = 0usize;
+        for x in pi {
+            let bytes = x.into_bigint().to_bytes_le();
+            for i in 0..self.bit_len {
+                let b = (bytes.get(i / 8).copied().unwrap_or(0) >> (i % 8)) & 1;
+                if b == 1 {
+                    out[bit_pos / 8] |= 1u8 << (bit_pos % 8);
+                }
+                bit_pos += 1;
+            }
+        }
+        debug_assert_eq!(bit_pos, nbits);
+        out
+    }
 }
 
 impl<F: PrimeField, V: BoundedFlpcpSparse<F>> BoundedFlpcpSparse<F> for BooleanProofFlpcpSparse<F, V> {

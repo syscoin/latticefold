@@ -954,7 +954,8 @@ where
             println!("    DPP: booleanize + embed/pack: START...");
             let t2 = Instant::now();
             let boolized = BooleanProofFlpcpSparse::<BF<R>, _>::new(flpcp.clone());
-            let pi_bits = boolized.encode_proof_bits(&pi_field);
+            // Use bitpacked Boolean proof to avoid multi-GB allocations.
+            let pi_bits_packed = boolized.encode_proof_bits_packed(&pi_field);
             let dpp = build_rev2_dpp_sparse_boolean_auto::<BF<R>, FLarge, _>(
                 flpcp,
                 EmbeddingParams { gamma: 2, assume_boolean_proof: true, k_prime: 0 },
@@ -962,35 +963,15 @@ where
             .expect("build_rev2_dpp_sparse_boolean_auto");
             let t2e = t2.elapsed();
             println!(
-                "    DPP: booleanize+build: {:?} (pi_bits_len={})",
+                "    DPP: booleanize+build: {:?} (pi_bits_len={}, packed_bytes={})",
                 t2e,
-                pi_bits.len()
+                boolized.m_bits(),
+                pi_bits_packed.len()
             );
 
-            // Lift x and π into FLarge.
-            println!("    DPP: lift proof to large field: START...");
-            let t3 = Instant::now();
+            // Lift x into FLarge (empty for NP mode).
             let x_large: Vec<FLarge> = vec![];
-            // This is performance-critical for large witnesses: do it in parallel.
-            //
-            // Note: `pi_bits` entries should be 0/1; use the fast path (avoid bigint/bytes).
-            let one_small = BF::<R>::ONE;
-            let zero_small = BF::<R>::ZERO;
-            let pi_large = pi_bits
-                .par_iter()
-                .map(|wi| {
-                    if *wi == zero_small {
-                        FLarge::ZERO
-                    } else if *wi == one_small {
-                        FLarge::ONE
-                    } else {
-                        // Defensive fallback (should never happen if Booleanization is correct).
-                        FLarge::from_le_bytes_mod_order(&wi.into_bigint().to_bytes_le())
-                    }
-                })
-                .collect::<Vec<_>>();
-            let t3e = t3.elapsed();
-            println!("    DPP: lift: {:?} (pi_large_len={})", t3e, pi_large.len());
+            let pi_bits_len = boolized.m_bits();
 
             // Sample query and verify.
             println!("    DPP: verify_with_query: START...");
@@ -1015,7 +996,24 @@ where
             // - bounded decoding + predicate
             let (a, t_dot) = {
                 let t = Instant::now();
-                let a = pool.install(|| q.q.dot_two_slices(&x_large, &pi_large));
+                // Compute the packed answer directly against the bitpacked Boolean proof, without
+                // materializing a gigantic `Vec<FLarge>` witness.
+                let a = pool.install(|| {
+                    q.q.terms
+                        .par_iter()
+                        .map(|(c, idx)| {
+                            // x is empty in this benchmark; everything is in π bits.
+                            let j = *idx;
+                            if j >= pi_bits_len {
+                                // Out of range => treat as 0 (should not happen for well-formed queries).
+                                return FLarge::ZERO;
+                            }
+                            let byte = pi_bits_packed[j / 8];
+                            let bit = (byte >> (j % 8)) & 1;
+                            if bit == 1 { *c } else { FLarge::ZERO }
+                        })
+                        .reduce(|| FLarge::ZERO, |acc, t| acc + t)
+                });
                 (a, t.elapsed())
             };
             println!("    DPP: packed dot: {:?}", t_dot);
