@@ -127,9 +127,15 @@ pub fn replay_ops<F: PrimeField>(
                 match mode {
                     DuplexSpongeMode::Absorbing { .. } => {
                         permute_in_place_with_record(cfg, &mut state, &mut permutes);
-                        squeeze_internal(cfg, &mut state, 0, &mut squeezed);
+                        let next = squeeze_internal_with_record(
+                            cfg,
+                            &mut state,
+                            &mut permutes,
+                            0,
+                            &mut squeezed,
+                        );
                         mode = DuplexSpongeMode::Squeezing {
-                            next_squeeze_index: out.len().min(cfg.rate),
+                            next_squeeze_index: next,
                         };
                     }
                     DuplexSpongeMode::Squeezing { next_squeeze_index } => {
@@ -138,9 +144,15 @@ pub fn replay_ops<F: PrimeField>(
                             permute_in_place_with_record(cfg, &mut state, &mut permutes);
                             squeeze_index = 0;
                         }
-                        squeeze_internal(cfg, &mut state, squeeze_index, &mut squeezed);
+                        let next = squeeze_internal_with_record(
+                            cfg,
+                            &mut state,
+                            &mut permutes,
+                            squeeze_index,
+                            &mut squeezed,
+                        );
                         mode = DuplexSpongeMode::Squeezing {
-                            next_squeeze_index: squeeze_index + out.len(),
+                            next_squeeze_index: next,
                         };
                     }
                 }
@@ -170,9 +182,15 @@ pub fn replay_ops<F: PrimeField>(
                 match mode {
                     DuplexSpongeMode::Absorbing { .. } => {
                         permute_in_place_with_record(cfg, &mut state, &mut permutes);
-                        squeeze_internal(cfg, &mut state, 0, &mut src_elements);
+                        let next = squeeze_internal_with_record(
+                            cfg,
+                            &mut state,
+                            &mut permutes,
+                            0,
+                            &mut src_elements,
+                        );
                         mode = DuplexSpongeMode::Squeezing {
-                            next_squeeze_index: num_elements.min(cfg.rate),
+                            next_squeeze_index: next,
                         };
                     }
                     DuplexSpongeMode::Squeezing { next_squeeze_index } => {
@@ -181,9 +199,15 @@ pub fn replay_ops<F: PrimeField>(
                             permute_in_place_with_record(cfg, &mut state, &mut permutes);
                             squeeze_index = 0;
                         }
-                        squeeze_internal(cfg, &mut state, squeeze_index, &mut src_elements);
+                        let next = squeeze_internal_with_record(
+                            cfg,
+                            &mut state,
+                            &mut permutes,
+                            squeeze_index,
+                            &mut src_elements,
+                        );
                         mode = DuplexSpongeMode::Squeezing {
-                            next_squeeze_index: squeeze_index + num_elements,
+                            next_squeeze_index: next,
                         };
                     }
                 }
@@ -235,31 +259,33 @@ fn absorb_internal_with_record<F: PrimeField>(
     }
 }
 
-fn squeeze_internal<F: PrimeField>(
+/// Squeeze `output` field elements starting from `rate_start_index`, recording any intermediate
+/// permutations into `permutes`. Returns the next squeeze index (in `0..=rate`).
+fn squeeze_internal_with_record<F: PrimeField>(
     cfg: &PoseidonConfig<F>,
     state: &mut [F],
+    permutes: &mut Vec<PoseidonPermutationTrace<F>>,
     mut rate_start_index: usize,
     output: &mut [F],
-) {
-    let mut out_rem = output;
-    loop {
-        if rate_start_index + out_rem.len() <= cfg.rate {
-            out_rem.clone_from_slice(
-                &state[cfg.capacity + rate_start_index
-                    ..(cfg.capacity + out_rem.len() + rate_start_index)],
-            );
-            return;
+) -> usize {
+    let mut out_pos = 0usize;
+    while out_pos < output.len() {
+        if rate_start_index == cfg.rate {
+            permute_in_place_with_record(cfg, state, permutes);
+            rate_start_index = 0;
         }
-        let num_squeeze = cfg.rate - rate_start_index;
-        out_rem[..num_squeeze].clone_from_slice(
-            &state[cfg.capacity + rate_start_index..(cfg.capacity + num_squeeze + rate_start_index)],
+        let take = core::cmp::min(cfg.rate - rate_start_index, output.len() - out_pos);
+        output[out_pos..out_pos + take].clone_from_slice(
+            &state[cfg.capacity + rate_start_index..(cfg.capacity + rate_start_index + take)],
         );
-        if out_rem.len() != cfg.rate {
-            permute_in_place(cfg, state);
+        out_pos += take;
+        rate_start_index += take;
+        if out_pos < output.len() && rate_start_index == cfg.rate {
+            permute_in_place_with_record(cfg, state, permutes);
+            rate_start_index = 0;
         }
-        out_rem = &mut out_rem[num_squeeze..];
-        rate_start_index = 0;
     }
+    rate_start_index
 }
 
 fn permute_in_place_with_record<F: PrimeField>(
