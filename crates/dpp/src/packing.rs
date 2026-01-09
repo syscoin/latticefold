@@ -201,8 +201,13 @@ impl PackedDppParams {
             return None;
         }
 
-        // Clamp to u64 (the current PackedDppParams type).
-        ell_max.to_u64()
+        // Clamp to u64 (the current `PackedDppParams` type).
+        //
+        // IMPORTANT:
+        // If the computed safe upper bound exceeds `u64::MAX`, that does *not* mean the modulus
+        // is too small — it means the safe range is “effectively unbounded” for our `u64`-typed ℓ.
+        // In that case we should saturate, not error (otherwise callers see `ModulusTooSmall`).
+        ell_max.to_u64().or(Some(u64::MAX))
     }
 
     /// Construct params picking the maximum safe ℓ (clamped to u64).
