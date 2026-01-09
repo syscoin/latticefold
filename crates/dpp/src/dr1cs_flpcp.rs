@@ -10,6 +10,7 @@ use num_traits::One;
 use rand::RngCore;
 
 use rayon::prelude::*;
+use rayon::join;
 
 use crate::packing::{BoundedFlpcp, BoundedFlpcpSparse, FlpcpPredicate};
 use crate::rs::{barycentric_weights_consecutive, extrapolate_consecutive_next_block, lagrange_coeffs_at};
@@ -65,15 +66,17 @@ impl<F: PrimeField + FftField> RsDr1csFlpcp<F> {
         let k = self.inst.k();
         assert_eq!(x.len(), self.inst.n());
 
-        // Compute yA = A x, yB = B x (length k).
-        let y_a = mat_vec(&self.inst.a, x);
-        let y_b = mat_vec(&self.inst.b, x);
+        // Compute yA = A x, yB = B x (length k). Independent: run concurrently.
+        let (y_a, y_b) = join(|| mat_vec(&self.inst.a, x), || mat_vec(&self.inst.b, x));
 
         // Fast systematic RS extrapolation on consecutive points:
         // - we already have f(1..k) as y_*
         // - compute f(k+1..2k) in O(k log k) via one convolution
-        let y_a_tail = extrapolate_consecutive_next_block::<F>(&y_a);
-        let y_b_tail = extrapolate_consecutive_next_block::<F>(&y_b);
+        // The two extrapolations are independent and tend to dominate runtime; run concurrently.
+        let (y_a_tail, y_b_tail) = join(
+            || extrapolate_consecutive_next_block::<F>(&y_a),
+            || extrapolate_consecutive_next_block::<F>(&y_b),
+        );
         debug_assert_eq!(y_a_tail.len(), k);
         debug_assert_eq!(y_b_tail.len(), k);
 
@@ -222,10 +225,16 @@ impl<F: PrimeField + FftField> RsDr1csFlpcpSparse<F> {
     pub fn prove(&self, x: &[F]) -> Vec<F> {
         let k = self.inst.k();
         assert_eq!(x.len(), self.inst.n);
-        let y_a = mat_vec_sparse(&self.inst.a, x);
-        let y_b = mat_vec_sparse(&self.inst.b, x);
-        let y_a_tail = extrapolate_consecutive_next_block::<F>(&y_a);
-        let y_b_tail = extrapolate_consecutive_next_block::<F>(&y_b);
+        // A and B mat-vecs are independent: run concurrently.
+        let (y_a, y_b) = join(
+            || mat_vec_sparse(&self.inst.a, x),
+            || mat_vec_sparse(&self.inst.b, x),
+        );
+        // Extrapolations are independent and often dominate: run concurrently.
+        let (y_a_tail, y_b_tail) = join(
+            || extrapolate_consecutive_next_block::<F>(&y_a),
+            || extrapolate_consecutive_next_block::<F>(&y_b),
+        );
         let mut w = Vec::with_capacity(2 * k);
         for i in 0..k {
             w.push(y_a[i] * y_b[i]);
@@ -345,11 +354,16 @@ impl<F: PrimeField + FftField> RsDr1csNpFlpcpSparse<F> {
         let k = self.inst.k();
         // IMPORTANT: avoid materializing z = (x || z_w) for large instances (multi-million entries).
         // This copy can dominate runtime and look “single-threaded”.
-        let y_a = mat_vec_sparse_np(&self.inst.a, x, z_w, self.l);
-        let y_b = mat_vec_sparse_np(&self.inst.b, x, z_w, self.l);
-
-        let y_a_tail = extrapolate_consecutive_next_block::<F>(&y_a);
-        let y_b_tail = extrapolate_consecutive_next_block::<F>(&y_b);
+        // A and B mat-vecs are independent: run concurrently.
+        let (y_a, y_b) = join(
+            || mat_vec_sparse_np(&self.inst.a, x, z_w, self.l),
+            || mat_vec_sparse_np(&self.inst.b, x, z_w, self.l),
+        );
+        // Extrapolations are independent and often dominate: run concurrently.
+        let (y_a_tail, y_b_tail) = join(
+            || extrapolate_consecutive_next_block::<F>(&y_a),
+            || extrapolate_consecutive_next_block::<F>(&y_b),
+        );
         let mut w = Vec::with_capacity(2 * k);
         for i in 0..k {
             w.push(y_a[i] * y_b[i]);
