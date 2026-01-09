@@ -919,7 +919,7 @@ where
                 sparse::SparseVec,
                 BooleanProofFlpcpSparse,
             };
-            use rand::{rngs::StdRng, SeedableRng};
+            use rand::{rngs::StdRng, RngCore, SeedableRng};
 
             println!("    DPP: building sparse Dr1csInstance for full gate...");
             let t0 = Instant::now();
