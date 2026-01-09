@@ -17,6 +17,7 @@ use std::time::Instant;
 use ark_ff::{Field, Fp384, MontBackend, MontConfig, PrimeField};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
+use dpp::BoundedFlpcpSparse;
 
 fn main() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -984,17 +985,28 @@ where
 
             let t4 = Instant::now();
             let mut rng = StdRng::seed_from_u64(12345);
-            // NOTE: avoid building the packed query vector q (can be ~80M terms and 90GB+ RAM).
-            // Instead compute the packed answer as Σ_i w_i * <q_i, v> in integers (no-wrap holds),
-            // then run the same bounded decoding + predicate check.
-            let (q_mat, w, b, pred) = dpp
-                .sample_query_components(&mut rng, &x_large)
-                .expect("sample_query_components");
-            println!(
-                "    DPP: query stats: k={}, q_terms_total_unpacked={}",
-                w.len(),
-                q_mat.iter().map(|row| row.terms.len()).sum::<usize>()
-            );
+            // NOTE: Avoid building booleanized query vectors (which explode to 100M+ terms).
+            // For lock evaluation, we can sample the *base* 3-query RS-FLPCP query over BF<R>,
+            // compute its 3 answers against the BF witness/proof, then pack those answers with `w`.
+            //
+            // This models the intended WE flow: locks are published as coins, not expanded vectors.
+            let b = dpp.flpcp.bounds_b();
+            let w = dpp::packing::sample_packing_weights::<FLarge>(&mut rng, dpp.params.ell, &b)
+                .expect("sample_packing_weights");
+            let pred = dpp::packing::FlpcpPredicate::MulEqModP {
+                p_small: num_bigint::BigInt::from_bytes_le(
+                    num_bigint::Sign::Plus,
+                    &BF::<R>::MODULUS.to_bytes_le(),
+                ),
+            };
+
+            // Sample the RS-FLPCP coins/queries from the *unbooleanized* inner FLPCP.
+            let (_qs, _pred_small) = dpp
+                .flpcp
+                .inner
+                .inner
+                .sample_queries_and_predicate_sparse(&mut rng, &x_small)
+                .expect("sample_queries_and_predicate_sparse (small)");
 
             // Split verification timing into:
             // - compute k answers a_i = <q_i, v>
@@ -1002,23 +1014,12 @@ where
             // - bounded decoding + predicate
             let (a, t_dot) = {
                 let t = Instant::now();
-                // Evaluate each query row against the packed Boolean proof bits (parallel across rows).
-                let ans_field: Vec<FLarge> = q_mat
-                    .par_iter()
-                    .map(|row| {
-                        row.terms
-                            .par_iter()
-                            .map(|(c, idx)| {
-                                let j = *idx; // x is empty here
-                                if j >= pi_bits_len {
-                                    return FLarge::ZERO;
-                                }
-                                let byte = pi_bits_packed[j / 8];
-                                let bit = (byte >> (j % 8)) & 1;
-                                if bit == 1 { *c } else { FLarge::ZERO }
-                            })
-                            .reduce(|| FLarge::ZERO, |acc, t| acc + t)
-                    })
+                // Evaluate the 3-query RS-FLPCP answers directly against the BF proof (no bits).
+                // v = (x || pi_field); x is empty in this benchmark.
+                let ans_small: Vec<BF<R>> = _qs.iter().map(|q| q.dot(&pi_field)).collect();
+                let ans_field: Vec<FLarge> = ans_small
+                    .iter()
+                    .map(|a| FLarge::from_le_bytes_mod_order(&a.into_bigint().to_bytes_le()))
                     .collect();
 
                 // Pack into one integer a_int = Σ w_i * [ans_i]_centered, then reduce to field.

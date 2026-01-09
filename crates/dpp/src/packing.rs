@@ -217,6 +217,64 @@ impl PackedDppParams {
     }
 }
 
+/// Sample packing weights `w` as in Construction 5.21, and enforce the Claim 5.22 “no wrap”
+/// condition `p > 2 * <b-1, w>`.
+///
+/// This is the heavy-hitter metadata needed for decoding, but does **not** require building the
+/// packed query vector `q = Q^T w`.
+pub fn sample_packing_weights<F: PrimeField>(
+    rng: &mut dyn RngCore,
+    ell: u64,
+    b: &[BigInt],
+) -> Result<Vec<BigInt>, PackingError> {
+    let k = b.len();
+    if k == 0 {
+        return Err(PackingError::InvalidParams);
+    }
+    let mut b_max = BigInt::zero();
+    for bi in b {
+        if bi > &b_max {
+            b_max = bi.clone();
+        }
+    }
+    if b_max <= BigInt::one() {
+        return Err(PackingError::InvalidParams);
+    }
+
+    let ell = BigInt::from(ell);
+    if ell.is_zero() {
+        return Err(PackingError::InvalidParams);
+    }
+    let two_b = BigInt::from(2u64) * &b_max;
+    let mut w: Vec<BigInt> = Vec::with_capacity(k);
+    let mut pow = BigInt::one();
+    for _i in 0..k {
+        let low = (&pow - BigInt::one()) * &ell + BigInt::one();
+        let high = &pow * &ell;
+        let span = (&high - &low) + BigInt::one();
+        let span_u = big_int_to_big_uint(&span).ok_or(PackingError::InvalidParams)?;
+        let r_u = sample_uniform_below(rng, &span_u);
+        let samp = &low + BigInt::from(r_u);
+        w.push(samp);
+        pow *= &two_b;
+    }
+
+    let p_mod = modulus_bigint::<F>();
+    let mut bw = BigInt::zero();
+    for i in 0..k {
+        let bound_i = &b[i] - BigInt::one();
+        if bound_i.is_negative() {
+            return Err(PackingError::InvalidParams);
+        }
+        bw += bound_i * &w[i];
+    }
+    if p_mod <= BigInt::from(2u64) * bw {
+        return Err(PackingError::ModulusTooSmall);
+    }
+
+    Ok(w)
+}
+
 /// A packed DPP verifier built from a bounded FLPCP via Construction 5.21.
 #[derive(Clone, Debug)]
 pub struct DppFromBoundedFlpcp<F: PrimeField, V: BoundedFlpcp<F>> {
