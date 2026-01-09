@@ -944,7 +944,13 @@ where
 
             println!("    DPP: RS-FLPCP prove: START...");
             let t1 = Instant::now();
-            let pi_field = flpcp.prove(&x_small, &full_asg);
+            // Run inside an explicit pool to ensure we actually use all cores for the heavy steps.
+            let avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(avail)
+                .build()
+                .expect("build rayon threadpool");
+            let pi_field = pool.install(|| flpcp.prove(&x_small, &full_asg));
             let t1e = t1.elapsed();
             println!(
                 "    DPP: RS-FLPCP prove: {:?} (pi_field_len={})",
@@ -956,7 +962,7 @@ where
             let t2 = Instant::now();
             let boolized = BooleanProofFlpcpSparse::<BF<R>, _>::new(flpcp.clone());
             // Use bitpacked Boolean proof to avoid multi-GB allocations.
-            let pi_bits_packed = boolized.encode_proof_bits_packed(&pi_field);
+            let pi_bits_packed = pool.install(|| boolized.encode_proof_bits_packed(&pi_field));
             let dpp = build_rev2_dpp_sparse_boolean_auto::<BF<R>, FLarge, _>(
                 flpcp,
                 EmbeddingParams { gamma: 2, assume_boolean_proof: true, k_prime: 0 },
@@ -976,12 +982,8 @@ where
 
             // Sample query and verify.
             println!("    DPP: verify_with_query: START...");
-            let avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
             println!("    DPP: rayon available_parallelism={avail}");
-            let _pool = ThreadPoolBuilder::new()
-                .num_threads(avail)
-                .build()
-                .expect("build rayon threadpool");
+            let _pool = pool; // keep pool alive for the remainder of the DPP section
 
             let t4 = Instant::now();
             let mut rng = StdRng::seed_from_u64(12345);

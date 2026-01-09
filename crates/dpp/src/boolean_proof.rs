@@ -11,6 +11,7 @@ use ark_ff::{BigInteger, PrimeField};
 use num_bigint::BigInt;
 use num_traits::One;
 use rand::RngCore;
+use rayon::prelude::*;
 
 use crate::packing::{BoundedFlpcp, BoundedFlpcpSparse, FlpcpPredicate};
 use crate::sparse::SparseVec;
@@ -160,6 +161,24 @@ impl<F: PrimeField, V: BoundedFlpcpSparse<F>> BooleanProofFlpcpSparse<F, V> {
     /// one full field element per bit, which explodes RAM in benchmarks.
     pub fn encode_proof_bits_packed(&self, pi: &[F]) -> Vec<u8> {
         assert_eq!(pi.len(), self.inner.m());
+        // Fast path: bit_len is a multiple of 8 (true for BF=64-bit, FLarge=384-bit, etc).
+        // Then bitpacking is just a fixed-width little-endian byte encoding per element.
+        if self.bit_len % 8 == 0 {
+            let bytes_per = self.bit_len / 8;
+            let mut out = vec![0u8; pi.len() * bytes_per];
+            out.par_chunks_mut(bytes_per)
+                .zip(pi.par_iter())
+                .for_each(|(chunk, x)| {
+                    // Ensure fixed-width output: pad with zeros if bigint encoding is shorter.
+                    chunk.fill(0);
+                    let xb = x.into_bigint().to_bytes_le();
+                    let take = core::cmp::min(bytes_per, xb.len());
+                    chunk[..take].copy_from_slice(&xb[..take]);
+                });
+            return out;
+        }
+
+        // Generic slow path (non-byte-aligned bit_len): keep for completeness.
         let nbits = self.m_bits();
         let nbytes = (nbits + 7) / 8;
         let mut out = vec![0u8; nbytes];
