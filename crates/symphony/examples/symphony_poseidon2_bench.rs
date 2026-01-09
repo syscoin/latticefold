@@ -977,50 +977,71 @@ where
             println!("    DPP: verify_with_query: START...");
             let avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
             println!("    DPP: rayon available_parallelism={avail}");
-            let pool = ThreadPoolBuilder::new()
+            let _pool = ThreadPoolBuilder::new()
                 .num_threads(avail)
                 .build()
                 .expect("build rayon threadpool");
 
             let t4 = Instant::now();
             let mut rng = StdRng::seed_from_u64(12345);
-            let q = dpp.sample_query(&mut rng, &x_large).expect("sample_query");
+            // NOTE: avoid building the packed query vector q (can be ~80M terms and 90GB+ RAM).
+            // Instead compute the packed answer as Σ_i w_i * <q_i, v> in integers (no-wrap holds),
+            // then run the same bounded decoding + predicate check.
+            let (q_mat, w, b, pred) = dpp
+                .sample_query_components(&mut rng, &x_large)
+                .expect("sample_query_components");
             println!(
-                "    DPP: query stats: k={}, q_terms={}",
-                q.w.len(),
-                q.q.terms.len()
+                "    DPP: query stats: k={}, q_terms_total_unpacked={}",
+                w.len(),
+                q_mat.iter().map(|row| row.terms.len()).sum::<usize>()
             );
 
             // Split verification timing into:
-            // - packed dot-product
+            // - compute k answers a_i = <q_i, v>
+            // - pack a = <a, w> (integers) and reduce to field
             // - bounded decoding + predicate
             let (a, t_dot) = {
                 let t = Instant::now();
-                // Compute the packed answer directly against the bitpacked Boolean proof, without
-                // materializing a gigantic `Vec<FLarge>` witness.
-                let a = pool.install(|| {
-                    q.q.terms
-                        .par_iter()
-                        .map(|(c, idx)| {
-                            // x is empty in this benchmark; everything is in π bits.
-                            let j = *idx;
-                            if j >= pi_bits_len {
-                                // Out of range => treat as 0 (should not happen for well-formed queries).
-                                return FLarge::ZERO;
-                            }
-                            let byte = pi_bits_packed[j / 8];
-                            let bit = (byte >> (j % 8)) & 1;
-                            if bit == 1 { *c } else { FLarge::ZERO }
-                        })
-                        .reduce(|| FLarge::ZERO, |acc, t| acc + t)
-                });
+                // Evaluate each query row against the packed Boolean proof bits (parallel across rows).
+                let ans_field: Vec<FLarge> = q_mat
+                    .par_iter()
+                    .map(|row| {
+                        row.terms
+                            .par_iter()
+                            .map(|(c, idx)| {
+                                let j = *idx; // x is empty here
+                                if j >= pi_bits_len {
+                                    return FLarge::ZERO;
+                                }
+                                let byte = pi_bits_packed[j / 8];
+                                let bit = (byte >> (j % 8)) & 1;
+                                if bit == 1 { *c } else { FLarge::ZERO }
+                            })
+                            .reduce(|| FLarge::ZERO, |acc, t| acc + t)
+                    })
+                    .collect();
+
+                // Pack into one integer a_int = Σ w_i * [ans_i]_centered, then reduce to field.
+                let mut a_int = num_bigint::BigInt::from(0);
+                for (wi, ai) in w.iter().zip(ans_field.iter()) {
+                    let ai_int = dpp::packing::field_to_centered_bigint::<FLarge>(ai);
+                    a_int += wi * ai_int;
+                }
+                let a = dpp::packing::centered_bigint_to_field::<FLarge>(&a_int);
                 (a, t.elapsed())
             };
-            println!("    DPP: packed dot: {:?}", t_dot);
+            println!("    DPP: unpacked-dot+pack: {:?}", t_dot);
 
             let (ok, t_dec) = {
                 let t = Instant::now();
-                let ok = dpp.verify_packed_answer(&a, &q);
+                // Use the same decoding + predicate as the packed DPP verifier.
+                let q_meta = dpp::packing::PackedDppQuerySparse {
+                    q: dpp::sparse::SparseVec::default(),
+                    w,
+                    b,
+                    pred,
+                };
+                let ok = dpp.verify_packed_answer(&a, &q_meta);
                 (ok, t.elapsed())
             };
             let ok = ok.expect("verify_packed_answer");

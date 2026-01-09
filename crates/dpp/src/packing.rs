@@ -567,6 +567,76 @@ impl<F: PrimeField, V: BoundedFlpcpSparse<F>> DppFromBoundedFlpcpSparse<F, V> {
         Ok(PackedDppQuerySparse { q: SparseVec::new(terms), w, b, pred })
     }
 
+    /// Sample packing metadata (q_i queries, weights w, bounds b, predicate), but **do not**
+    /// build the packed query vector `q = Q^T w`.
+    ///
+    /// This is useful for benchmarking/decapper-side evaluation where we want the packed answer
+    /// `a = <q, v>` but do not want to allocate a gigantic packed query vector.
+    pub fn sample_query_components(
+        &self,
+        rng: &mut dyn RngCore,
+        x: &[F],
+    ) -> Result<(Vec<SparseVec<F>>, Vec<BigInt>, Vec<BigInt>, FlpcpPredicate<F>), PackingError> {
+        let k = self.flpcp.k();
+        let b = self.flpcp.bounds_b();
+        if k == 0 || b.len() != k || x.len() != self.flpcp.n() {
+            return Err(PackingError::InvalidParams);
+        }
+        let (q_mat, pred) = self
+            .flpcp
+            .sample_queries_and_predicate_sparse(rng, x)
+            .map_err(|_| PackingError::InvalidParams)?;
+        if q_mat.len() != k {
+            return Err(PackingError::InvalidParams);
+        }
+
+        // Choose scalar b_max = max_i b_i (as BigInt).
+        let mut b_max = BigInt::zero();
+        for bi in &b {
+            if bi > &b_max {
+                b_max = bi.clone();
+            }
+        }
+        if b_max <= BigInt::one() {
+            return Err(PackingError::InvalidParams);
+        }
+
+        // Sample w as in Construction 5.21 (integer ranges).
+        let ell = BigInt::from(self.params.ell);
+        if ell.is_zero() {
+            return Err(PackingError::InvalidParams);
+        }
+        let two_b = BigInt::from(2u64) * &b_max;
+        let mut w: Vec<BigInt> = Vec::with_capacity(k);
+        let mut pow = BigInt::one(); // (2b)^(i-1)
+        for _i in 0..k {
+            let low = (&pow - BigInt::one()) * &ell + BigInt::one();
+            let high = &pow * &ell;
+            let span = (&high - &low) + BigInt::one();
+            let span_u = big_int_to_big_uint(&span).ok_or(PackingError::InvalidParams)?;
+            let r_u = sample_uniform_below(rng, &span_u);
+            let samp = &low + BigInt::from(r_u);
+            w.push(samp);
+            pow *= &two_b;
+        }
+
+        // Ensure the field modulus is large enough so that bounded answers do not wrap mod p.
+        let p_mod = modulus_bigint::<F>();
+        let mut bw = BigInt::zero();
+        for i in 0..k {
+            let bound_i = &b[i] - BigInt::one();
+            if bound_i.is_negative() {
+                return Err(PackingError::InvalidParams);
+            }
+            bw += bound_i * &w[i];
+        }
+        if p_mod <= BigInt::from(2u64) * bw {
+            return Err(PackingError::ModulusTooSmall);
+        }
+
+        Ok((q_mat, w, b, pred))
+    }
+
     pub fn verify_packed_answer(
         &self,
         a: &F,
@@ -701,7 +771,7 @@ fn dot<F: PrimeField>(a: &[F], b: &[F]) -> F {
 }
 
 /// Map a field element to its centered integer representative in [-(p-1)/2, (p-1)/2].
-fn field_to_centered_bigint<F: PrimeField>(x: &F) -> BigInt {
+pub fn field_to_centered_bigint<F: PrimeField>(x: &F) -> BigInt {
     let p = modulus_bigint::<F>();
     let half = (&p - BigInt::one()) / BigInt::from(2u64);
     let mut t = BigInt::from_bytes_le(num_bigint::Sign::Plus, &x.into_bigint().to_bytes_le());
@@ -713,7 +783,7 @@ fn field_to_centered_bigint<F: PrimeField>(x: &F) -> BigInt {
 }
 
 /// Reduce an integer (centered or not) into the field.
-fn centered_bigint_to_field<F: PrimeField>(z: &BigInt) -> F {
+pub fn centered_bigint_to_field<F: PrimeField>(z: &BigInt) -> F {
     // Convert via modular reduction into [0,p).
     let p = modulus_bigint::<F>();
     let mut t = z.mod_floor(&p);
