@@ -80,8 +80,8 @@ fn test_pifold_accumulator_two_steps() {
         let flat_len = n * R::dimension();
         cmf_pcs::cmf_pcs_params_for_flat_len::<BF>(flat_len, kappa_cm_f).expect("cm_f pcs params")
     };
-    let mut cm_acc = {
-        let flat: Vec<BF> = f_acc
+    let commit_cmf = |f: &[R]| -> Vec<R> {
+        let flat: Vec<BF> = f
             .iter()
             .flat_map(|re| {
                 re.coeffs()
@@ -92,6 +92,9 @@ fn test_pifold_accumulator_two_steps() {
         let f_pcs = cmf_pcs::pad_flat_message(&pcs_params_f, &flat);
         let (t, _s) = folding_pcs_l2::commit(&pcs_params_f, &f_pcs).expect("cm_f pcs commit");
         cmf_pcs::pack_t_as_ring::<R>(&t)
+    };
+    let mut cm_acc = {
+        commit_cmf(&f_acc)
     };
 
     // Step 1: fold in f1 = 0.
@@ -159,12 +162,12 @@ fn test_pifold_accumulator_two_steps() {
 
     // Update explicit accumulator witness and commitment.
     f_acc = fold_vec(beta10, beta11, &f_acc, &f1);
-    cm_acc = scheme.commit(&f_acc).unwrap().as_ref().to_vec();
+    cm_acc = commit_cmf(&f_acc);
     assert_eq!(folded1.c, cm_acc);
 
     // Step 2: fold in f2 = 1.
     let f2 = vec![R::one(); n];
-    let cm2 = scheme.commit(&f2).unwrap().as_ref().to_vec();
+    let cm2 = commit_cmf(&f2);
 
     let pf2_out = prove_pi_fold_poseidon_fs::<R, PC>(
         ms.as_slice(),
@@ -207,7 +210,7 @@ fn test_pifold_accumulator_two_steps() {
     let (folded2, _bat2) = attempt2.result.unwrap();
 
     f_acc = fold_vec(beta20, beta21, &f_acc, &f2);
-    cm_acc = scheme.commit(&f_acc).unwrap().as_ref().to_vec();
+    cm_acc = commit_cmf(&f_acc);
 
     assert_eq!(folded2.c, cm_acc);
     assert!(!folded2.r.is_empty());

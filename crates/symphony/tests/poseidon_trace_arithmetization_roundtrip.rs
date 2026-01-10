@@ -1,3 +1,5 @@
+#![allow(non_local_definitions)]
+
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
 use latticefold::commitment::AjtaiCommitmentScheme;
 use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing};
@@ -183,7 +185,6 @@ fn test_poseidon_trace_arithmetization_roundtrip_real_verifier() {
     assert_eq!(metrics.squeezed_bytes as usize, trace.squeezed_bytes.len());
 
     // Replay check: the trace must be a valid Poseidon transcript witness.
-    type BF = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
     let poseidon_cfg =
         <PC as cyclotomic_rings::rings::GetPoseidonParams<BF>>::get_poseidon_config();
     let _replay = replay_poseidon_transcript_trace(&poseidon_cfg, &trace)
@@ -364,7 +365,6 @@ fn test_poseidon_trace_sparse_dpp_end_to_end_accepts() {
     let ops = &trace.ops[..take_ops];
 
     // Arithmetize the trace prefix into sparse dR1CS (over BF).
-    type BF = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
     let poseidon_cfg =
         <PC as cyclotomic_rings::rings::GetPoseidonParams<BF>>::get_poseidon_config();
 
@@ -767,7 +767,6 @@ fn test_poseidon_trace_rs_flpcp_full_trace_honest_accepts() {
     let trace = attempt.trace;
 
     // Arithmetize the FULL trace into sparse dR1CS.
-    type BF = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
     let poseidon_cfg = <PC as cyclotomic_rings::rings::GetPoseidonParams<BF>>::get_poseidon_config();
     let (inst, assignment, _replay2, _byte_wit) =
         poseidon_sponge_dr1cs_from_trace::<BF>(&poseidon_cfg, &trace.ops).expect("build dr1cs failed");
@@ -920,7 +919,6 @@ fn test_poseidon_trace_full_dpp_end_to_end_no_boolean_full_trace() {
     let trace = attempt.trace;
 
     // Arithmetize FULL trace to sparse dR1CS.
-    type BF = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
     let poseidon_cfg = <PC as cyclotomic_rings::rings::GetPoseidonParams<BF>>::get_poseidon_config();
     let (inst, assignment, _replay2, _byte_wit) =
         poseidon_sponge_dr1cs_from_trace::<BF>(&poseidon_cfg, &trace.ops).expect("build dr1cs failed");

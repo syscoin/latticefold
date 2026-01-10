@@ -7,6 +7,7 @@ use symphony::{
     symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices},
     symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig},
 };
+use ark_ff::Field;
 use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing, Ring};
 use stark_rings_linalg::SparseMatrix;
 use std::sync::Arc;

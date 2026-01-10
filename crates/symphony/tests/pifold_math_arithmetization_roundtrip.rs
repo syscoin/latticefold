@@ -175,8 +175,6 @@ fn test_pifold_math_dr1cs_roundtrip_satisfiable_and_tamper_fails() {
         out.proof.coins.events.clone(),
     );
 
-    type BF = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
-
     let ell = cms.len();
     let beta_cts = derive_beta_chi::<R>(&mut ts, ell);
     let beta_cts_bf = beta_cts.iter().copied().map(bf::<R>).collect::<Vec<_>>();

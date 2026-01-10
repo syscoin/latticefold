@@ -189,7 +189,6 @@ fn we_gate_constraint_counts_real_pcs_in_gate() {
     attempt.result.expect("cp verify failed");
     let trace = attempt.trace;
 
-    type BF = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
     let poseidon_cfg = <PC as cyclotomic_rings::rings::GetPoseidonParams<BF>>::get_poseidon_config();
 
     // ------------------------
