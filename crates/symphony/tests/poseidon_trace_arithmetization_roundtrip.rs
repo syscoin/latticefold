@@ -2,7 +2,6 @@
 
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
 use latticefold::commitment::AjtaiCommitmentScheme;
-use latticefold::transcript::Transcript;
 use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing};
 use stark_rings_linalg::SparseMatrix;
 

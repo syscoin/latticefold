@@ -793,7 +793,7 @@ where
     transcript.absorb_field_element(&R::BaseRing::from(BATCHLIN_PCS_DOMAIN_SEP));
     // Batch scalar γ used for digit batching in PCS#2. This is transcript-derived and must be
     // sampled at a fixed point in the schedule (after `r'` and `u_*` are fixed, before PCS coins).
-    let gamma = transcript.get_challenge();
+    transcript.get_challenge();
     // NOTE: `get_challenge()` already re-absorbs internally (Poseidon transcript); no extra absorb.
     transcript.absorb_field_element(&R::BaseRing::from(proof.batchlin_pcs_t.len() as u128));
     for dig in 0..proof.batchlin_pcs_t.len() {
@@ -1214,7 +1214,7 @@ where
         return Err("PiFold: batchlin_pcs_t expected len=1 (batched scalar PCS)".to_string());
     }
     transcript.absorb_field_element(&R::BaseRing::from(BATCHLIN_PCS_DOMAIN_SEP));
-    let _gamma = transcript.get_challenge();
+    transcript.get_challenge();
     transcript.absorb_field_element(&R::BaseRing::from(proof.batchlin_pcs_t.len() as u128));
     for dig in 0..proof.batchlin_pcs_t.len() {
         if proof.batchlin_pcs_t[dig].is_empty() {

@@ -664,27 +664,18 @@ impl WeGateDr1csBuilder {
                                 pcs_coin_squeeze_idx: usize|
          -> Result<(usize, crate::pcs::dpp_folding_pcs_l2::FoldingPcsL2Wiring), String> {
             if pcs_coin_squeeze_idx >= squeeze_outs.len() {
-                return Err(format!(
-                    "WeGateDr1csBuilder: pcs_coin_squeeze_idx out of range: idx={} num_squeezes={}",
-                    pcs_coin_squeeze_idx,
-                    squeeze_outs.len()
-                ));
+                return Err(format!("{label}: pcs_coin_squeeze_idx out of range: idx={} num_squeezes={}",
+                    pcs_coin_squeeze_idx, squeeze_outs.len()));
             }
             if pcs_coin_squeeze_idx >= byte_wiring.squeeze_byte_ranges.len() {
-                return Err(format!(
-                    "WeGateDr1csBuilder: Poseidon byte wiring missing squeeze idx {} (have {})",
-                    pcs_coin_squeeze_idx,
-                    byte_wiring.squeeze_byte_ranges.len()
-                ));
+                return Err(format!("{label}: Poseidon byte wiring missing squeeze idx {} (have {})",
+                    pcs_coin_squeeze_idx, byte_wiring.squeeze_byte_ranges.len()));
             }
             let c_bytes = &squeeze_outs[pcs_coin_squeeze_idx];
             let (byte_start, byte_len) = byte_wiring.squeeze_byte_ranges[pcs_coin_squeeze_idx];
             if byte_len != c_bytes.len() {
-                return Err(format!(
-                    "WeGateDr1csBuilder: pcs coin byte length mismatch: poseidon_wiring_len={} ops_len={}",
-                    byte_len,
-                    c_bytes.len()
-                ));
+                return Err(format!("{label}: pcs coin byte length mismatch: poseidon_wiring_len={byte_len} ops_len={}", 
+                    byte_len, c_bytes.len()));
             }
             let pose_byte_vars =
                 &byte_wiring.squeeze_byte_vars[byte_start..byte_start + byte_len];
