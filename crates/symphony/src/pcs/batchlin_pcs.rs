@@ -36,7 +36,10 @@ use crate::symphony_coins::ts_weights;
 pub struct BatchlinPcsConfig {
     /// Log2 of the vector length n = m*d.
     pub log_n: usize,
-    /// Branching factor r for ℓ=2 folding. Must satisfy r^3 = n.
+    /// Branching factor r for ℓ=2 folding.
+    ///
+    /// We allow padding: we choose `r` as a power-of-two such that `r^3 >= 2^{log_n}`.
+    /// This removes the hard `log_n % 3 == 0` restriction while keeping the ℓ=2 PCS core unchanged.
     pub r: usize,
     /// Security parameter κ.
     pub kappa: usize,
@@ -47,15 +50,11 @@ pub struct BatchlinPcsConfig {
 impl BatchlinPcsConfig {
     /// Create config for standard SP1 parameters.
     pub fn for_sp1(log_n: usize, kappa: usize, k_g: usize) -> Result<Self, String> {
-        // For ℓ=2, we need r^3 = n = 2^{log_n}
-        // So log2(r) = log_n / 3
-        if log_n % 3 != 0 {
-            return Err(format!(
-                "log_n={log_n} is not divisible by 3; need r^3 = n for ℓ=2 PCS"
-            ));
-        }
-        let log_r = log_n / 3;
-        let r = 1 << log_r;
+        // For ℓ=2, the PCS core expects a cubic domain of size r^3, with x0,x1,x2 each length r.
+        // We choose the smallest power-of-two r such that r^3 >= 2^{log_n} and treat the message
+        // as zero-padded on the larger domain.
+        let log_r = (log_n + 2) / 3; // ceil(log_n/3)
+        let r = 1usize << log_r;
         Ok(Self { log_n, r, kappa, k_g })
     }
 
@@ -66,7 +65,7 @@ impl BatchlinPcsConfig {
 
     /// Number of coordinates in each block (log_r = log_n / 3).
     pub fn log_r(&self) -> usize {
-        self.log_n / 3
+        (self.log_n + 2) / 3
     }
 }
 
@@ -88,11 +87,22 @@ pub fn mle_point_to_tensor<F: PrimeField>(
     let log_r = config.log_r();
     let r = config.r;
 
+    // If log_n is not divisible by 3, we conceptually extend the MLE to log_n' = 3*log_r variables
+    // by padding the evaluation table with zeros on the extra dimensions, and we evaluate at
+    // extra coordinates fixed to 0.
+    //
+    // Equivalently: embed f: {0,1}^{log_n} -> F into f': {0,1}^{log_n'} -> F where
+    // f'(x, y) = f(x) if y == 0...0 else 0, and evaluate at (r', 0...0).
+    let need = 3 * log_r;
+    let mut r_ext: Vec<F> = Vec::with_capacity(need);
+    r_ext.extend_from_slice(r_prime);
+    r_ext.resize(need, F::ZERO);
+
     // Split r' into three blocks (in protocol order) and convert using the same
     // tensor-weight convention as the rest of this codebase (`ts_weights`).
-    let r0 = &r_prime[0..log_r];
-    let r1 = &r_prime[log_r..2 * log_r];
-    let r2 = &r_prime[2 * log_r..3 * log_r];
+    let r0 = &r_ext[0..log_r];
+    let r1 = &r_ext[log_r..2 * log_r];
+    let r2 = &r_ext[2 * log_r..3 * log_r];
 
     let x0 = ts_weights(r0);
     let x1 = ts_weights(r1);
@@ -185,10 +195,7 @@ pub const BATCHLIN_PCS_DOMAIN_SEP: u128 = 0x4241_5443_484C_494E_5F50_4353_5F56_3
 /// - This is a *benchmark/prototype* parameter generator: it derives A from a fixed seed + log_n.
 /// - `delta,alpha` are chosen so `delta^alpha >= modulus` for 64-bit-ish prime fields (Frog).
 pub fn batchlin_scalar_pcs_params<F: PrimeField>(log_n: usize) -> Result<FoldingPcsL2Params<F>, String> {
-    if log_n % 3 != 0 {
-        return Err(format!("batchlin_scalar_pcs_params: log_n={log_n} not divisible by 3"));
-    }
-    let log_r = log_n / 3;
+    let log_r = (log_n + 2) / 3; // ceil(log_n/3)
     let r = 1usize << log_r;
     let kappa = 1usize;
     let n = 1usize;
