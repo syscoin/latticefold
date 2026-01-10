@@ -554,8 +554,7 @@ where
     use symphony::{
         pcs::dpp_folding_pcs_l2::folding_pcs_l2_params,
         pcs::folding_pcs_l2::{
-            gadget_apply_digits, kron_ct_in_mul, kron_i_a_mul, kron_ikn_xt_mul, BinMatrix,
-            DenseMatrix, FoldingPcsL2ProofCore, verify_folding_pcs_l2_with_c_matrices,
+            BinMatrix, DenseMatrix, verify_folding_pcs_l2_with_c_matrices,
         },
         rp_rgchk::RPParams,
         symphony_open::MultiAjtaiOpenVerifier,
@@ -707,6 +706,7 @@ where
     // Symphony Π_rg parameters (defined above, after decomposition so it matches padded shapes).
 
     // CP commitment schemes for aux messages
+    const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
     let scheme_had =
         AjtaiCommitmentScheme::<R>::seeded(b"cfs_had_u", MASTER_SEED, kappa, 3 * R::dimension());
     let scheme_mon = AjtaiCommitmentScheme::<R>::seeded(b"cfs_mon_b", MASTER_SEED, kappa, rg_params.k_g);

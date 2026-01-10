@@ -41,7 +41,6 @@ use symphony::symphony_sp1_r1cs::open_sp1_r1cs_chunk_cache;
 use symphony::transcript::PoseidonTraceOp;
 use symphony::poseidon_trace::find_squeeze_bytes_idx_after_absorb_marker;
 use symphony::we_gate_arith::WeGateDr1csBuilder;
-use ark_ff::Field;
 
 /// BabyBear field element for loading R1CS.
 #[derive(Debug, Clone, Copy, Default)]
@@ -237,18 +236,23 @@ fn main() {
             perms_absorb + perms_squeeze_field + perms_squeeze_bytes
         );
 
-        // Extra: time the Ajtai binding check for cm_f against the witness (linear work, no extra hashes).
-        //
-        // This is a proxy for the “bind cm_f to witness” part of the WE predicate; it’s O(ncols)
-        // but avoids materializing witness openings per chunk (we reuse the same witness here).
+        // Extra: time the cm_f PCS recompute against the witness (linear work in witness size).
         let t_cm = Instant::now();
-        let cm_re = scheme_main
-            .commit_const_coeff_fast(&witness)
-            .expect("commit_const_coeff_fast")
-            .as_ref()
-            .to_vec();
+        let cm_re = {
+            let flat_witness: Vec<BF> = witness
+                .iter()
+                .flat_map(|re| {
+                    re.coeffs()
+                        .iter()
+                        .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+                })
+                .collect();
+            let f_pcs = cmf_pcs::pad_flat_message(&pcs_params_f, &flat_witness);
+            let (t, _s) = folding_pcs_l2::commit(&pcs_params_f, &f_pcs).expect("cm_f pcs commit");
+            cmf_pcs::pack_t_as_ring::<R>(&t)
+        };
         assert_eq!(cm_re, cms_all[0], "cm_f binding mismatch");
-        println!("  ajtai cm_f recompute: {:?}", t_cm.elapsed());
+        println!("  cm_f pcs recompute: {:?}", t_cm.elapsed());
 
         // ---------------------------------------------------------------------
         // dR1CS constraint counts for the WE gate (R_cp and full with PCS).
