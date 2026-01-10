@@ -15,6 +15,7 @@ use symphony::symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMat
 use symphony::symphony_pifold_streaming::{compute_cm_g_aggregate, prove_pi_fold_poseidon_fs, PiFoldStreamingConfig};
 use latticefold::commitment::AjtaiCommitmentScheme;
 use symphony::pcs::{cmf_pcs, folding_pcs_l2};
+use symphony::pcs::cmf_pcs::CMF_PCS_DOMAIN_SEP;
 
 const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
 
@@ -84,7 +85,10 @@ fn test_pifold_math_dr1cs_roundtrip_satisfiable_and_tamper_fails() {
         d_prime: (R::dimension() as u128) - 2,
     };
 
-    let kappa_cm_f = 2usize;
+    // cm_f is passed through Π_fold as `Vec<R>` (ring elements). To keep the PCS params derivable
+    // from the public `cm_f` surface without ambiguity, we set kappa_commit in **base-field elems**
+    // to a multiple of d=R::dimension() so `pack_t_as_ring` does not introduce unused coefficient padding.
+    let kappa_cm_f = R::dimension();
     let f0 = vec![<R as stark_rings::Ring>::ONE; n];
     let f1 = (0..n)
         .map(|i| if i % 2 == 0 { <R as stark_rings::Ring>::ONE } else { <R as stark_rings::Ring>::ZERO })
@@ -194,9 +198,19 @@ fn test_pifold_math_dr1cs_roundtrip_satisfiable_and_tamper_fails() {
     let mut cba_all_bf: Vec<Vec<(Vec<BF>, BF, BF)>> = Vec::with_capacity(ell);
     let mut rc_all_bf: Vec<Option<BF>> = Vec::with_capacity(ell);
 
-    // Phase 1: absorb cm_f and derive J for each instance.
+    // Phase 1: absorb cm_f, do the PCS#1 coin splice (domain sep + SqueezeBytes(N)),
+    // then derive J for each instance (matches the prover/verifier schedule).
     for cm_f in &cms {
         ts.absorb_slice(cm_f);
+        ts.absorb_field_element(&<R as PolyRing>::BaseRing::from(CMF_PCS_DOMAIN_SEP));
+        let flat_len = n * d;
+        let kappa_commit = cm_f.len() * d;
+        let pcs_params_cmf = cmf_pcs::cmf_pcs_params_for_flat_len::<
+            <R as PolyRing>::BaseRing,
+        >(flat_len, kappa_commit)
+        .expect("cm_f pcs params");
+        let n_bytes_cmf = cmf_pcs::cmf_pcs_coin_bytes_len(&pcs_params_cmf);
+        let _ = ts.squeeze_bytes(n_bytes_cmf);
         let _j = derive_J::<R>(&mut ts, rg_params.lambda_pj, rg_params.l_h);
     }
 

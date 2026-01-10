@@ -12,6 +12,8 @@
 //! Run:
 //! - `cargo run -p symphony --example symphony_poseidon2_bench --release
 
+#![allow(non_local_definitions)]
+
 use std::sync::Arc;
 use std::time::Instant;
 use ark_ff::{Field, Fp384, MontBackend, MontConfig, PrimeField};
@@ -683,7 +685,6 @@ where
     // We commit to the **flattened witness coefficients** (Option A) using FoldingPCS(ℓ=2),
     // and treat the commitment surface `t` as the public `cm_f` object that is absorbed into Π_fold.
     let kappa = 8; // PCS commitment length (t_len)
-    let d = R::dimension();
     let flat_witness: Vec<BF<R>> = witness
         .iter()
         .flat_map(|re| {
@@ -698,7 +699,7 @@ where
     )
     .expect("cm_f pcs params");
     let f_pcs_f = symphony::pcs::cmf_pcs::pad_flat_message(&pcs_params_f, &flat_witness);
-    let (t_pcs_f, s_pcs_f) = symphony::pcs::folding_pcs_l2::commit(&pcs_params_f, &f_pcs_f)
+    let (t_pcs_f, _s_pcs_f) = symphony::pcs::folding_pcs_l2::commit(&pcs_params_f, &f_pcs_f)
         .expect("cm_f pcs commit failed");
     // Pack the PCS commitment surface into ring elements for Π_fold plumbing (fills coefficients).
     let cm = symphony::pcs::cmf_pcs::pack_t_as_ring::<R>(&t_pcs_f);
