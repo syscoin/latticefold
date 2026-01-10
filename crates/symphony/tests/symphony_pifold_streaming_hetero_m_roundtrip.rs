@@ -14,7 +14,8 @@ const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
 
 #[test]
 fn test_pifold_streaming_hetero_m_roundtrip() {
-    let n = 1 << 4; // 16 vars
+    // Keep n >= m so SparseMatrix::pad_cols(n) doesn't need to "shrink" identity matrices.
+    let n = 1 << 5; // 32 vars
     // NOTE: batchlin PCS (ℓ=2) currently requires log2(m*d) divisible by 3.
     // For Frog, d=16, so pick m=32 => m*d=512 => log2=9.
     let m = 1 << 5; // 32 rows per chunk/instance
