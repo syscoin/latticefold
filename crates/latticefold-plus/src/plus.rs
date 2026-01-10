@@ -218,28 +218,45 @@ mod tests {
         // log_kappa for tensor status printing (kappa already defined above)
         let log_kappa = ark_std::log2(kappa) as usize;
         
-        let transcript = PoseidonTranscript::empty::<PC>();
-        let mut verifier = PlusVerifier::init(A, M, pparams, transcript);
+        // Run verification twice: once optimized, once dense, to compare
+        use crate::tensor_eval::{set_force_dense, print_tensor_optimization_status};
         
-        // Time verification
+        // OPTIMIZED run
+        set_force_dense(false);
+        let transcript = PoseidonTranscript::empty::<PC>();
+        let mut verifier = PlusVerifier::init(A.clone(), M.clone(), pparams.clone(), transcript);
         let start = std::time::Instant::now();
         verifier.verify(&proof);
-        let verify_time = start.elapsed();
+        let optimized_time = start.elapsed();
         
-        // Print transcript metrics for DPP cost estimation
+        // DENSE (forced) run
+        set_force_dense(true);
+        let transcript = PoseidonTranscript::empty::<PC>();
+        let mut verifier = PlusVerifier::init(A, M, pparams, transcript);
+        let start = std::time::Instant::now();
+        verifier.verify(&proof);
+        let dense_time = start.elapsed();
+        set_force_dense(false); // Reset
+        
+        // Print comparison
         println!("\n=== LF+ Verifier Metrics (n={}) ===", n);
         println!("  Ring dimension d = {}", R::dimension());
-        println!("  Decomposition k = {}, l = {} (padded to {})", k, l, l.next_power_of_two());
+        println!("  Decomposition k = {}, l = {}", k, l);
         println!("  Folding instances L = {}", L);
-        println!("  Verification time: {:?}", verify_time);
+        println!("\n=== Tensor Evaluation Benchmark ===");
+        println!("  OPTIMIZED time: {:?}", optimized_time);
+        println!("  DENSE time:     {:?}", dense_time);
+        let speedup = dense_time.as_secs_f64() / optimized_time.as_secs_f64();
+        println!("  Speedup:        {:.2}x", speedup);
+        println!("===================================");
+        
         verifier.transcript().print_metrics();
         
         // Print tensor optimization status
-        use crate::tensor_eval::print_tensor_optimization_status;
         print_tensor_optimization_status(
             log_kappa,
             k * R::dimension(),
-            l.next_power_of_two(),
+            l,
             R::dimension(),
         );
     }

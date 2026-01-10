@@ -235,6 +235,21 @@ pub fn print_tensor_optimization_status(
     println!("======================================");
 }
 
+/// Global flag to force dense evaluation for benchmarking
+/// Set to true to disable optimization and measure dense performance
+pub static FORCE_DENSE_EVAL: std::sync::atomic::AtomicBool = 
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set whether to force dense evaluation (for benchmarking)
+pub fn set_force_dense(force: bool) {
+    FORCE_DENSE_EVAL.store(force, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Check if dense evaluation is forced
+pub fn is_force_dense() -> bool {
+    FORCE_DENSE_EVAL.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Evaluate `t(z) = tensor(c_z) ⊗ s' ⊗ d_powers ⊗ x_powers` at a point.
 ///
 /// This is the optimized version of the calculation in `cm.rs`.
@@ -294,8 +309,8 @@ pub fn eval_t_z_optimized<F: OverField>(
         && is_power_of_two(d_prime_powers.len())
         && is_power_of_two(x_powers.len());
     
-    if !all_pow2 {
-        // Fall back to dense evaluation when factors aren't all powers of 2
+    // Fall back to dense if not all powers of 2 OR if forced for benchmarking
+    if !all_pow2 || is_force_dense() {
         return eval_t_z_dense(&tensor_c_z, s_prime, d_prime_powers, x_powers, r);
     }
     
