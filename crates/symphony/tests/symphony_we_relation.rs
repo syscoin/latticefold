@@ -38,7 +38,9 @@ fn setup_two_instances_any_witness_holds() -> (
     AjtaiCommitmentScheme<R>,
 ) {
     let n = 1 << 10;
-    let m = 1 << 10;
+    // NOTE: batchlin PCS (ℓ=2) currently requires log2(m*d) divisible by 3.
+    // For Frog, d=16, so pick m=256 => m*d=4096 => log_n=12.
+    let m = 1 << 8;
 
     // Matrices so Π_had holds for any witness: M1=I, M2=0, M3=0.
     let mut m1 = SparseMatrix::<R>::identity(m);
@@ -62,7 +64,9 @@ fn setup_two_instances_any_witness_holds() -> (
 
     let rg_params = RPParams {
         l_h: 64,
-        lambda_pj: 32,
+        // Ensure m_J = (n/l_h)*lambda_pj <= m and m multiple of m_J.
+        // Here blocks=(1024/64)=16, so lambda_pj=16 gives m_J=256 == m.
+        lambda_pj: 16,
         k_g: 4,
         d_prime: (R::dimension() as u128) / 2,
     };
