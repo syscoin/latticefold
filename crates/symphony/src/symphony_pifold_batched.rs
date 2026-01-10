@@ -537,10 +537,9 @@ where
         &proof.mon_sumcheck,
         hook_round,
         |t, _sampled| {
+            // Match prover schedule: absorb v_digits_folded as ring elements (one per digit).
             for v_i in &proof.v_digits_folded {
-                for x in v_i {
-                    t.absorb_field_element(x);
-                }
+                t.absorb(&R::from(v_i.clone()));
             }
         },
     )
@@ -794,7 +793,8 @@ where
     transcript.absorb_field_element(&R::BaseRing::from(BATCHLIN_PCS_DOMAIN_SEP));
     // Batch scalar γ used for digit batching in PCS#2. This is transcript-derived and must be
     // sampled at a fixed point in the schedule (after `r'` and `u_*` are fixed, before PCS coins).
-    let _gamma = transcript.get_challenge();
+    let gamma = transcript.get_challenge();
+    // NOTE: `get_challenge()` already re-absorbs internally (Poseidon transcript); no extra absorb.
     transcript.absorb_field_element(&R::BaseRing::from(proof.batchlin_pcs_t.len() as u128));
     for dig in 0..proof.batchlin_pcs_t.len() {
         if proof.batchlin_pcs_t[dig].is_empty() {
@@ -973,9 +973,7 @@ where
         hook_round,
         |t, _sampled| {
             for v_i in &proof.v_digits_folded {
-                    for x in v_i {
-                        t.absorb_field_element(x);
-                }
+                t.absorb(&R::from(v_i.clone()));
             }
         },
     )
@@ -1216,7 +1214,8 @@ where
         return Err("PiFold: batchlin_pcs_t expected len=1 (batched scalar PCS)".to_string());
     }
     transcript.absorb_field_element(&R::BaseRing::from(BATCHLIN_PCS_DOMAIN_SEP));
-    let _gamma = transcript.get_challenge();
+    let gamma = transcript.get_challenge();
+    // NOTE: `get_challenge()` already re-absorbs internally (Poseidon transcript); no extra absorb.
     transcript.absorb_field_element(&R::BaseRing::from(proof.batchlin_pcs_t.len() as u128));
     for dig in 0..proof.batchlin_pcs_t.len() {
         if proof.batchlin_pcs_t[dig].is_empty() {

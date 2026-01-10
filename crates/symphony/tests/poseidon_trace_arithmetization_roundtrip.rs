@@ -2,6 +2,7 @@
 
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
 use latticefold::commitment::AjtaiCommitmentScheme;
+use latticefold::transcript::Transcript;
 use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing};
 use stark_rings_linalg::SparseMatrix;
 
@@ -15,11 +16,8 @@ use symphony::symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMat
 use symphony::symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig};
 use symphony::transcript::PoseidonTraceOp;
 use symphony::pcs::cmf_pcs::CMF_PCS_DOMAIN_SEP;
-use symphony::pcs::dpp_folding_pcs_l2::folding_pcs_l2_params;
 use symphony::pcs::folding_pcs_l2::{
-    gadget_apply_digits, kron_ct_in_mul, kron_i_a_mul, kron_ikn_xt_mul, BinMatrix, DenseMatrix,
-    FoldingPcsL2ProofCore,
-    verify_folding_pcs_l2_with_c_matrices,
+    BinMatrix, verify_folding_pcs_l2_with_c_matrices,
 };
 use symphony::pcs::{cmf_pcs, folding_pcs_l2};
 use dpp::{
@@ -30,7 +28,7 @@ use dpp::{
     pipeline::build_rev2_dpp_sparse_boolean,
 };
 use ark_ff::{BigInteger, Field, Fp, Fp256, MontBackend, MontConfig, PrimeField};
-use rand::{rngs::StdRng, SeedableRng, RngCore};
+use rand::{rngs::StdRng, SeedableRng};
 
 const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
 
@@ -96,7 +94,11 @@ fn test_poseidon_trace_arithmetization_roundtrip_real_verifier() {
         d_prime: (R::dimension() as u128) - 2,
     };
 
-    let kappa_cm_f = 2usize;
+    // Choose `kappa_commit` in base-field elements (not ring elements) to match the packed `cm_f`
+    // surface length used in the transcript: `kappa_commit = cm_f.len() * d`.
+    // Since `cm_f` is packed into ring elements of dimension d, using `kappa_commit=d` keeps
+    // the `cm_f` surface unambiguous (no trailing zero coefficient padding).
+    let kappa_cm_f = R::dimension();
     let f0 = vec![<R as stark_rings::Ring>::ONE; n];
     let f1 = (0..n)
         .map(|i| if i % 2 == 0 { <R as stark_rings::Ring>::ONE } else { <R as stark_rings::Ring>::ZERO })
@@ -356,6 +358,8 @@ fn test_poseidon_trace_sparse_dpp_end_to_end_accepts() {
     attempt.result.expect("cp verify failed");
     let trace = attempt.trace;
 
+    // (debug-only prover/vfy transcript alignment checks removed)
+
     // IMPORTANT: for this DPP integration test we only take a short prefix of the transcript ops,
     // to keep the resulting dR1CS small (and thus keep the RS FLPCP proof length `m=2k` small).
     //
@@ -409,8 +413,10 @@ fn test_poseidon_trace_sparse_dpp_end_to_end_accepts() {
     }
 
     // Production-shape binding (current architecture): use PCS-in-gate instead of AjtaiOpen(cm_f, f).
-    // Here we attach a small FoldingPCS(ℓ=2) instance, and derive its `C1/C2` coins from the *real*
-    // verifier transcript trace via `SqueezeBytes` (glued inside the merged system).
+    //
+    // For this integration test we build a **real cm_f PCS opening** for the first instance,
+    // and take its `C1/C2` coins from the *real* verifier transcript:
+    //   `CMF_PCS_DOMAIN_SEP` -> `SqueezeBytes(n_bytes_cmf)`.
     let squeeze_bytes: Vec<Vec<u8>> = trace
         .ops
         .iter()
@@ -436,16 +442,29 @@ fn test_poseidon_trace_sparse_dpp_end_to_end_accepts() {
             bits.push(((b >> i) & 1) == 1);
         }
     }
-    // Choose tiny PCS dimensions for a cheap integration check. Extra bytes are ignored.
-    let r = 1usize;
-    let kappa = 2usize;
-    let pcs_n = 4usize;
-    let delta = 4u64;
-    let alpha = 1usize;
-    let beta0 = 1u64 << 10;
-    let beta1 = 2 * beta0;
-    let beta2 = 2 * beta1;
-    // C1,C2 each use (r*kappa)*kappa bits.
+
+    // Recompute the cm_f PCS commitment surface for the first instance and generate a valid opening.
+    let flat0: Vec<BF> = witnesses[0]
+        .iter()
+        .flat_map(|re| {
+            re.coeffs()
+                .iter()
+                .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+        })
+        .collect();
+    let f_pcs0 = cmf_pcs::pad_flat_message(&pcs_params_f, &flat0);
+    let (t_pcs, s_pcs) = folding_pcs_l2::commit(&pcs_params_f, &f_pcs0).expect("cm_f pcs commit");
+
+    let r = pcs_params_f.r;
+    let kappa = pcs_params_f.kappa;
+
+    let need_bits = 2usize * r * kappa * kappa;
+    assert!(
+        bits.len() >= need_bits,
+        "expected {} bits for cm_f PCS C1/C2, got {}",
+        need_bits,
+        bits.len()
+    );
     let c1 = BinMatrix {
         rows: r * kappa,
         cols: kappa,
@@ -460,42 +479,25 @@ fn test_poseidon_trace_sparse_dpp_end_to_end_accepts() {
             .map(|i| if bits[(r * kappa * kappa) + i] { BF::ONE } else { BF::ZERO })
             .collect(),
     };
-    // A = I_{pcs_n}.
-    let mut a_data = vec![BF::ZERO; pcs_n * (r * pcs_n * alpha)];
-    for i in 0..pcs_n {
-        a_data[i * (r * pcs_n * alpha) + i] = BF::ONE;
-    }
-    let a = DenseMatrix::new(pcs_n, r * pcs_n * alpha, a_data);
-    let pcs_params = folding_pcs_l2_params(r, kappa, pcs_n, delta, alpha, beta0, beta1, beta2, a);
 
     let x0 = vec![BF::ONE; r];
     let x1 = vec![BF::ONE; r];
     let x2 = vec![BF::ONE; r];
-    let mut pcs_rng = StdRng::seed_from_u64(0xC0FFEE_u64);
-    let mut y0 = Vec::with_capacity(pcs_params.y0_len());
-    for _ in 0..pcs_params.y0_len() {
-        let mag = (pcs_rng.next_u64() % (beta0 + 1)) as u64;
-        let sign = (pcs_rng.next_u64() & 1) == 1;
-        let v = BF::from(mag);
-        y0.push(if sign { -v } else { v });
-    }
-    let y1 = kron_ct_in_mul(&c1, pcs_n, &y0);
-    let y2 = kron_ct_in_mul(&c2, pcs_n, &y1);
-    let t_pcs = kron_i_a_mul(&pcs_params.a, pcs_params.kappa, pcs_params.r * pcs_params.n * pcs_params.alpha, &y0);
-    let mut delta_pows = Vec::with_capacity(alpha);
-    let mut acc = BF::ONE;
-    let delta_f = BF::from(delta);
-    for _ in 0..alpha {
-        delta_pows.push(acc);
-        acc *= delta_f;
-    }
-    let v0 = gadget_apply_digits(&delta_pows, r * kappa * pcs_n, &y0);
-    let v1 = gadget_apply_digits(&delta_pows, r * kappa * pcs_n, &y1);
-    let v2 = gadget_apply_digits(&delta_pows, r * kappa * pcs_n, &y2);
-    let u_pcs = kron_ikn_xt_mul(&x2, kappa, pcs_n, &v0);
-    let pcs_core = FoldingPcsL2ProofCore { y0, v0, y1, v1, y2, v2 };
-    verify_folding_pcs_l2_with_c_matrices(&pcs_params, &t_pcs, &x0, &x1, &x2, &u_pcs, &pcs_core, &c1, &c2)
-        .expect("native folding PCS sanity check failed");
+    let (u_pcs, pcs_core) =
+        folding_pcs_l2::open(&pcs_params_f, &f_pcs0, &s_pcs, &x0, &x1, &x2, &c1, &c2)
+            .expect("cm_f pcs open");
+    verify_folding_pcs_l2_with_c_matrices(
+        &pcs_params_f,
+        &t_pcs,
+        &x0,
+        &x1,
+        &x2,
+        &u_pcs,
+        &pcs_core,
+        &c1,
+        &c2,
+    )
+    .expect("native cm_f pcs sanity check failed");
 
     // PCS#2 (batchlin) uses a real prover-produced commitment surface + proof core.
     use symphony::pcs::batchlin_pcs::{batchlin_scalar_pcs_params, BATCHLIN_PCS_DOMAIN_SEP};
@@ -523,7 +525,7 @@ fn test_poseidon_trace_sparse_dpp_end_to_end_accepts() {
         &out.aux,
         &out.cfs_had_u,
         &out.cfs_mon_b,
-        &pcs_params,
+        &pcs_params_f,
         &t_pcs,
         &x0,
         &x1,

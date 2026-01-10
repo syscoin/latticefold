@@ -508,54 +508,54 @@ where
         let d_prime = rg_params.d_prime;
 
         let mut digits_flat = vec![R::BaseRing::ZERO; m_j * d * k_g];
-        let out_ptr = digits_flat.as_mut_ptr() as usize;
+            let out_ptr = digits_flat.as_mut_ptr() as usize;
         (0..m_j).into_par_iter().for_each(|out_row| {
-            let i = out_row % lambda_pj;
-            let b = out_row / lambda_pj;
-            if const_coeff_fastpath {
-                // Constant-coeff specialization: only coeff[0] can be nonzero.
-                let mut h0 = R::BaseRing::ZERO;
-                for t in 0..l_h {
-                    let in_row = b * l_h + t;
-                    if in_row >= f.len() {
-                        continue;
+                let i = out_row % lambda_pj;
+                let b = out_row / lambda_pj;
+                if const_coeff_fastpath {
+                    // Constant-coeff specialization: only coeff[0] can be nonzero.
+                    let mut h0 = R::BaseRing::ZERO;
+                    for t in 0..l_h {
+                        let in_row = b * l_h + t;
+                        if in_row >= f.len() {
+                            continue;
+                        }
+                        let coef = J[i][t];
+                        h0 += coef * f[in_row].coeffs()[0];
                     }
-                    let coef = J[i][t];
-                    h0 += coef * f[in_row].coeffs()[0];
-                }
-                let mut h_row = vec![R::BaseRing::ZERO; d];
-                h_row[0] = h0;
-                let digits = h_row.decompose_to_vec(d_prime, k_g);
-                for dig in 0..k_g {
-                    let idx = (out_row * d) * k_g + dig; // col=0
-                    unsafe {
-                        *(out_ptr as *mut R::BaseRing).add(idx) = digits[0][dig];
-                    }
-                }
-            } else {
-                let mut h_row = vec![R::BaseRing::ZERO; d];
-                for t in 0..l_h {
-                    let in_row = b * l_h + t;
-                    if in_row >= f.len() {
-                        continue;
-                    }
-                    let coef = J[i][t];
-                    let coeffs = f[in_row].coeffs();
-                    for col in 0..d {
-                        h_row[col] += coef * coeffs[col];
-                    }
-                }
-                let digits = h_row.decompose_to_vec(d_prime, k_g);
-                for col in 0..d {
+                    let mut h_row = vec![R::BaseRing::ZERO; d];
+                    h_row[0] = h0;
+                    let digits = h_row.decompose_to_vec(d_prime, k_g);
                     for dig in 0..k_g {
-                        let idx = (out_row * d + col) * k_g + dig;
+                        let idx = (out_row * d) * k_g + dig; // col=0
                         unsafe {
-                            *(out_ptr as *mut R::BaseRing).add(idx) = digits[col][dig];
+                            *(out_ptr as *mut R::BaseRing).add(idx) = digits[0][dig];
+                        }
+                    }
+                } else {
+                    let mut h_row = vec![R::BaseRing::ZERO; d];
+                    for t in 0..l_h {
+                        let in_row = b * l_h + t;
+                        if in_row >= f.len() {
+                            continue;
+                        }
+                        let coef = J[i][t];
+                        let coeffs = f[in_row].coeffs();
+                        for col in 0..d {
+                            h_row[col] += coef * coeffs[col];
+                        }
+                    }
+                    let digits = h_row.decompose_to_vec(d_prime, k_g);
+                    for col in 0..d {
+                        for dig in 0..k_g {
+                            let idx = (out_row * d + col) * k_g + dig;
+                            unsafe {
+                                *(out_ptr as *mut R::BaseRing).add(idx) = digits[col][dig];
+                            }
                         }
                     }
                 }
-            }
-        });
+            });
 
         let digits_flat = Arc::new(digits_flat);
         proj_digits_by_inst.push(digits_flat.clone());
@@ -786,38 +786,38 @@ where
 
             // mj_compact[col*m_j + out_row] := ev(exp(digit), beta_i)
             let mut mj_compact = vec![R::BaseRing::ZERO; m_j * d];
-            let out_ptr = mj_compact.as_mut_ptr() as usize;
-            let digits_flat = digits_flat.clone();
-            let beta_i = *beta_i;
-            let dig_local = dig;
-            if const_coeff_fastpath && d > 1 {
-                let g0 = exp::<R>(R::BaseRing::ZERO).expect("Exp failed");
-                let mjv_zero = ev(&g0, beta_i);
+                let out_ptr = mj_compact.as_mut_ptr() as usize;
+                let digits_flat = digits_flat.clone();
+                let beta_i = *beta_i;
+                let dig_local = dig;
+                if const_coeff_fastpath && d > 1 {
+                    let g0 = exp::<R>(R::BaseRing::ZERO).expect("Exp failed");
+                    let mjv_zero = ev(&g0, beta_i);
                 (0..m_j).into_par_iter().for_each(|out_row| {
-                    let digit0 = digits_flat[(out_row * d) * rg_params.k_g + dig_local]; // col=0
-                    let g = exp::<R>(digit0).expect("Exp failed");
-                    let mjv0 = ev(&g, beta_i);
-                    unsafe {
-                        let out = (out_ptr as *mut R::BaseRing).add(out_row);
-                        *out = mjv0;
-                    }
-                });
-                for col in 1..d {
-                    mj_compact[col * m_j..(col + 1) * m_j].fill(mjv_zero);
-                }
-            } else {
-                (0..m_j).into_par_iter().for_each(|out_row| {
-                    for col in 0..d {
-                        let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig_local];
-                        let g = exp::<R>(digit).expect("Exp failed");
-                        let mjv = ev(&g, beta_i);
-                        let idx = col * m_j + out_row;
+                        let digit0 = digits_flat[(out_row * d) * rg_params.k_g + dig_local]; // col=0
+                        let g = exp::<R>(digit0).expect("Exp failed");
+                        let mjv0 = ev(&g, beta_i);
                         unsafe {
-                            let out = (out_ptr as *mut R::BaseRing).add(idx);
-                            *out = mjv;
+                            let out = (out_ptr as *mut R::BaseRing).add(out_row);
+                            *out = mjv0;
                         }
+                    });
+                    for col in 1..d {
+                        mj_compact[col * m_j..(col + 1) * m_j].fill(mjv_zero);
                     }
-                });
+                } else {
+                (0..m_j).into_par_iter().for_each(|out_row| {
+                        for col in 0..d {
+                            let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig_local];
+                            let g = exp::<R>(digit).expect("Exp failed");
+                            let mjv = ev(&g, beta_i);
+                            let idx = col * m_j + out_row;
+                            unsafe {
+                                let out = (out_ptr as *mut R::BaseRing).add(idx);
+                                *out = mjv;
+                            }
+                        }
+                    });
             }
             let mj_compact = Arc::new(mj_compact);
             mles_mon.push(StreamingMleEnum::periodic_base_scalar_vec(
@@ -947,10 +947,10 @@ where
                     }
                 }
             }
+            // Absorb v_digits_folded as ring elements (one per digit) for a canonical, compact schedule.
+            // This must match the verifier schedule.
             for v_i in &v_digits_folded {
-                for x in v_i {
-                    transcript.absorb_field_element(x);
-                }
+                transcript.absorb(&R::from(v_i.clone()));
             }
         }
 
@@ -1001,6 +1001,23 @@ where
         had_u.push(U);
     }
 
+    // IMPORTANT: transcript schedule alignment with verifier.
+    //
+    // The verifier absorbs the hadamard-evaluated U vectors (or aux-provided U) into the transcript
+    // before proceeding to Π_mon / batchlin PCS. Without this, the transcript diverges and the
+    // batchlin PCS coins will mismatch (making PCS#2 UNSAT in-gate).
+    for U in &had_u {
+        for x in &U[0] {
+            transcript.absorb_field_element(x);
+        }
+        for x in &U[1] {
+            transcript.absorb_field_element(x);
+        }
+        for x in &U[2] {
+            transcript.absorb_field_element(x);
+        }
+    }
+
     let reps = m / m_j;
     let ts_r_mon = ts_weights(&mon_rand);
     let mut mon_b: Vec<Vec<R>> = Vec::with_capacity(ell);
@@ -1008,23 +1025,23 @@ where
         let mut b_inst = Vec::with_capacity(rg_params.k_g);
         let digits_flat = proj_digits_by_inst[inst_idx].clone();
         for dig in 0..rg_params.k_g {
-            let dig_local = dig;
-            let digits_flat = digits_flat.clone();
+                let dig_local = dig;
+                let digits_flat = digits_flat.clone();
             let acc = (0..m_j)
                 .into_par_iter()
-                .map(|out_row| {
-                    let mut local = R::ZERO;
-                    for col in 0..d {
-                        let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig_local];
-                        let g = exp::<R>(digit).expect("Exp failed");
-                        for rep in 0..reps {
-                            let r = out_row + rep * m_j;
-                            let idx = col * m + r;
-                            local += R::from(ts_r_mon[idx]) * g;
+                    .map(|out_row| {
+                        let mut local = R::ZERO;
+                        for col in 0..d {
+                            let digit = digits_flat[(out_row * d + col) * rg_params.k_g + dig_local];
+                            let g = exp::<R>(digit).expect("Exp failed");
+                            for rep in 0..reps {
+                                let r = out_row + rep * m_j;
+                                let idx = col * m + r;
+                                local += R::from(ts_r_mon[idx]) * g;
+                            }
                         }
-                    }
-                    local
-                })
+                        local
+                    })
                 .reduce(|| R::ZERO, |a, b| a + b);
             b_inst.push(acc);
         }
@@ -1067,9 +1084,9 @@ where
         let mut acc = psi_coeffs[0] * coeffs[0];
         for i_c in 1..d {
             acc -= psi_coeffs[i_c] * coeffs[d - i_c];
-        }
-        acc
-    };
+            }
+                acc
+            };
 
     let beta_sum = beta_cts.iter().copied().fold(R::BaseRing::ZERO, |a, b| a + b);
     let k_g = rg_params.k_g;
@@ -1123,10 +1140,15 @@ where
     let (t_vec, s_open) = pcs_commit::<R::BaseRing>(&pcs_params, &f_batch)?;
 
     // Bind commitment surface into transcript (required by verifier schedule).
+    //
+    // IMPORTANT: must match `symphony_pifold_batched` verifier schedule exactly:
+    // absorb outer len, inner len, then absorb all elements of t.
     let batchlin_pcs_t: Vec<Vec<R::BaseRing>> = vec![t_vec.clone()];
     transcript.absorb_field_element(&R::BaseRing::from(batchlin_pcs_t.len() as u128));
     transcript.absorb_field_element(&R::BaseRing::from(batchlin_pcs_t[0].len() as u128));
-    transcript.absorb_field_element(&batchlin_pcs_t[0][0]);
+    for x in &batchlin_pcs_t[0] {
+        transcript.absorb_field_element(x);
+    }
 
     // Derive PCS coins from transcript bytes (C1/C2 bits).
     let c_bytes = transcript.squeeze_bytes(64);

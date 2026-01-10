@@ -43,6 +43,7 @@ use crate::symphony_coins::{derive_beta_chi, derive_J};
 use crate::symphony_pifold_batched::{PiFoldAuxWitness, PiFoldBatchedProof};
 use crate::symphony_pifold_streaming::{CM_G_AGG_SEED, MON_B_AGG_SEED};
 use crate::pcs::batchlin_pcs::BATCHLIN_PCS_DOMAIN_SEP;
+use crate::pcs::cmf_pcs::{cmf_pcs_coin_bytes_len, cmf_pcs_params_for_flat_len, CMF_PCS_DOMAIN_SEP};
 use crate::transcript::PoseidonTraceOp;
 
 pub struct WeGateDr1csBuilder;
@@ -234,14 +235,38 @@ impl WeGateDr1csBuilder {
         let g_nvars = log2(g_len) as usize;
         let k_g = proof.rg_params.k_g;
 
+        // Reconstruct witness length `n_f` from `m_j = (n_f/l_h) * lambda_pj`.
+        // This is needed to deterministically parameterize the cm_f PCS coin splice.
+        let lambda_pj = proof.rg_params.lambda_pj;
+        let l_h = proof.rg_params.l_h;
+        if lambda_pj == 0 || l_h == 0 {
+            return Err(
+                "WeGateDr1csBuilder: invalid rg params (lambda_pj/l_h must be > 0)".to_string(),
+            );
+        }
+        if proof.m_j % lambda_pj != 0 {
+            return Err("WeGateDr1csBuilder: m_j not divisible by lambda_pj".to_string());
+        }
+        let blocks = proof.m_j / lambda_pj;
+        let n_f = blocks * l_h;
+
         let mut cba_all_bf: Vec<Vec<(Vec<<R::BaseRing as Field>::BasePrimeField>, _, _)>> =
             Vec::with_capacity(ell);
         let mut rc_all_bf: Vec<Option<<R::BaseRing as Field>::BasePrimeField>> =
             Vec::with_capacity(ell);
 
-        // Phase 1: absorb cm_f and derive J for each instance.
+        // Phase 1: absorb cm_f, do the cm_f PCS coin splice, then derive J for each instance.
         for cm_f in cms {
             ts.absorb_slice(cm_f);
+            // PCS#1 (cm_f PCS) coin splice: bind to cm_f surface and derive C1/C2 bytes.
+            // Deterministically parameterized by (n_f, cm_f surface length).
+            ts.absorb_field_element(&R::BaseRing::from(CMF_PCS_DOMAIN_SEP));
+            let flat_len = n_f * d;
+            let kappa_commit = cm_f.len() * d;
+            let pcs_params_cmf =
+                cmf_pcs_params_for_flat_len::<R::BaseRing>(flat_len, kappa_commit)?;
+            let n_bytes_cmf = cmf_pcs_coin_bytes_len(&pcs_params_cmf);
+            let _ = ts.squeeze_bytes(n_bytes_cmf);
             let _j = derive_J::<R>(&mut ts, proof.rg_params.lambda_pj, proof.rg_params.l_h);
         }
 
@@ -286,9 +311,7 @@ impl WeGateDr1csBuilder {
             hook_round,
             |t, _sampled| {
                 for v_i in &proof.v_digits_folded {
-                    for x in v_i {
-                        t.absorb_field_element(x);
-                    }
+                    t.absorb(&R::from(v_i.clone()));
                 }
             },
         )
@@ -631,7 +654,8 @@ impl WeGateDr1csBuilder {
         // ---------------------------------------------------------------------
         let squeeze_outs = Self::squeeze_bytes_outputs(ops);
 
-        let mut add_pcs_part = |pcs_params: &FoldingPcsL2Params<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
+        let mut add_pcs_part = |label: &str,
+                                pcs_params: &FoldingPcsL2Params<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
                                 pcs_t: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
                                 pcs_x0: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
                                 pcs_x1: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
@@ -695,6 +719,7 @@ impl WeGateDr1csBuilder {
         };
 
         let (pcs_f_part_idx, pcs_f_wiring) = add_pcs_part(
+            "cm_f",
             pcs_f_params,
             pcs_f_t,
             pcs_f_x0,
@@ -704,6 +729,7 @@ impl WeGateDr1csBuilder {
             pcs_f_coin_squeeze_idx,
         )?;
         let (pcs_g_part_idx, pcs_g_wiring) = add_pcs_part(
+            "batchlin",
             pcs_g_params,
             pcs_g_t,
             pcs_g_x0,
@@ -716,13 +742,19 @@ impl WeGateDr1csBuilder {
         // ---------------------------------------------------------------------
         // PCS_f commitment binding:
         //
-        // `cm_f` is absorbed as ring elements early in Π_fold. Each ring absorb is `d` base-field elems.
-        // We glue only those `d`-sized absorbs (skipping 1-sized domain separators) and take the first
-        // `t_len = pcs_f_wiring.t_vars.len()` elements as the cm_f commitment surface.
+        // `cm_f` is absorbed as ring elements, followed immediately by `CMF_PCS_DOMAIN_SEP`.
+        //
+        // We locate the **contiguous block** of `d`-sized Absorb ops immediately preceding the
+        // first `Absorb([CMF_PCS_DOMAIN_SEP])`, and glue the first `t_len` base-field elements from
+        // that block to the PCS_f commitment variables.
         // ---------------------------------------------------------------------
         let d = R::dimension();
-        let mut absorbed_cmf_vars: Vec<usize> = Vec::with_capacity(pcs_f_wiring.t_vars.len());
+        let marker_cmf = <<<R as PolyRing>::BaseRing as Field>::BasePrimeField as From<u128>>::from(
+            CMF_PCS_DOMAIN_SEP,
+        );
         let mut absorb_op_idx = 0usize;
+        let mut cmf_block_vars: Vec<usize> = Vec::new();
+        let mut found_marker = false;
         for op in ops {
             if let PoseidonTraceOp::Absorb(elems) = op {
                 let (start, len) = pose_wiring
@@ -734,20 +766,26 @@ impl WeGateDr1csBuilder {
                 if len != elems.len() {
                     return Err("WeGateDr1csBuilder: poseidon absorb wiring length mismatch".to_string());
                 }
-                if elems.len() != d {
-                    continue;
-                }
                 let vars = &pose_wiring.absorb_vars[start..start + len];
-                absorbed_cmf_vars.extend_from_slice(vars);
-                if absorbed_cmf_vars.len() >= pcs_f_wiring.t_vars.len() {
+                if elems.len() == 1 && elems[0] == marker_cmf {
+                    found_marker = true;
                     break;
+                }
+                if elems.len() == d {
+                    cmf_block_vars.extend_from_slice(vars);
+                } else {
+                    // Break contiguity: the cm_f block must be immediately before the marker.
+                    cmf_block_vars.clear();
                 }
             }
         }
-        if absorbed_cmf_vars.len() < pcs_f_wiring.t_vars.len() {
+        if !found_marker {
+            return Err("WeGateDr1csBuilder: failed to locate CMF_PCS_DOMAIN_SEP absorb op".to_string());
+        }
+        if cmf_block_vars.len() < pcs_f_wiring.t_vars.len() {
             return Err("WeGateDr1csBuilder: failed to locate enough cm_f absorb vars to glue pcs_f_t".to_string());
         }
-        for (&pv, &tv) in absorbed_cmf_vars[..pcs_f_wiring.t_vars.len()]
+        for (&pv, &tv) in cmf_block_vars[..pcs_f_wiring.t_vars.len()]
             .iter()
             .zip(pcs_f_wiring.t_vars.iter())
         {
@@ -786,10 +824,10 @@ impl WeGateDr1csBuilder {
                 // Marker absorb is always a single field element.
                 if elems.len() == 1 && elems[0] == marker_bf {
                     after_marker = true;
-                    // After the marker, `get_challenge()` performs:
-                    // - SqueezeField(gamma)
-                    // - Absorb(gamma)   <-- counts as 1 absorbed element for base fields
-                    // Then we absorb two length tags (outer len, inner len), before the t elements.
+                    // After the marker, we perform:
+                    // - get_challenge(): SqueezeField(gamma) then Absorb(gamma)
+                    // - absorb two length tags (outer len, inner len)
+                    // before the t elements.
                     skip_after_marker = 3;
                     continue;
                 }
