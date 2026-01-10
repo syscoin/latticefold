@@ -224,6 +224,9 @@ where
     ts.absorb_field_element(&R::BaseRing::from(DS_PI_FOLD));
     absorb_public_inputs::<R>(ts, public_inputs);
 
+    if Ms.len() != cm_f.len() {
+        return Err("PiFoldCP: Ms length mismatch".to_string());
+    }
     if cfs_had_u.len() != cm_f.len() || cfs_mon_b.len() != cm_f.len() {
         return Err("PiFoldCP: cfs length mismatch".to_string());
     }
