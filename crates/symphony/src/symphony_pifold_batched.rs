@@ -12,6 +12,7 @@
 //! - Full paper compression replaces these with commitment+opening checks (`VfyOpen`).
 
 use ark_std::log2;
+use ark_ff::PrimeField;
 use cyclotomic_rings::rings::GetPoseidonParams;
 use latticefold::{
     transcript::Transcript,
@@ -36,6 +37,8 @@ use crate::{
     symphony_coins::{derive_beta_chi, derive_J, ev, ts_weights},
     symphony_open::{NoOpen, VfyOpen},
     symphony_pifold_streaming::{compute_cm_g_aggregate, compute_mon_b_aggregate},
+    pcs::batchlin_pcs::BATCHLIN_PCS_DOMAIN_SEP,
+    pcs::folding_pcs_l2::FoldingPcsL2ProofCore,
     rp_rgchk::{compose_v_digits, RPParams},
     symphony_cm::SymphonyCoins,
     symphony_fold::{SymphonyBatchLin, SymphonyInstance},
@@ -81,7 +84,7 @@ where
 #[derive(Clone, Debug)]
 pub struct PiFoldBatchedProof<R: OverField>
 where
-    R::BaseRing: Zq,
+    R::BaseRing: Zq + PrimeField,
 {
     pub coins: SymphonyCoins<R>,
     pub rg_params: RPParams,
@@ -102,6 +105,27 @@ where
     ///   (paper `R_batchlin`) and will be proved succinctly by `π_lin`.
     pub cm_g: Vec<Vec<Vec<R>>>,
 
+    /// Stage-1 (PCS batchlin): PCS commitment(s) for the **folded** batchlin object `g_*^{(dig)}`.
+    ///
+    /// This is *not yet* verified by Π_fold itself; it is intended to be verified in the WE gate
+    /// via the second PCS instance, after `r'` and `u_*` are fixed.
+    ///
+    /// Shape: `[k_g][t_len]` where `t_len` is the PCS commitment length for a single digit.
+    pub batchlin_pcs_t: Vec<Vec<R::BaseRing>>,
+
+    /// Stage-1 (PCS batchlin): tensor eval vectors derived from `r'` (length r each).
+    ///
+    /// For the batched (single-proof) variant we commit to a *single* scalar-valued MLE, so these
+    /// are shared across all digits and are public transcript-bound values.
+    pub batchlin_pcs_x0: Vec<R::BaseRing>,
+    pub batchlin_pcs_x1: Vec<R::BaseRing>,
+    pub batchlin_pcs_x2: Vec<R::BaseRing>,
+
+    /// Stage-1 (PCS batchlin): PCS proof core for the **batched scalar** commitment.
+    ///
+    /// This is verified in the WE gate as PCS#2.
+    pub batchlin_pcs_core: FoldingPcsL2ProofCore<R::BaseRing>,
+
     /// Folded Π_rg hook message v_digits* (k_g × d), using scalar β (constants in the base field).
     pub v_digits_folded: Vec<Vec<R::BaseRing>>,
 
@@ -118,7 +142,7 @@ where
 #[derive(Clone, Debug)]
 pub struct PiFoldProverOutput<R: OverField>
 where
-    R::BaseRing: Zq,
+    R::BaseRing: Zq + PrimeField,
 {
     pub proof: PiFoldBatchedProof<R>,
     pub aux: PiFoldAuxWitness<R>,
@@ -137,7 +161,7 @@ where
 #[derive(Clone, Debug)]
 pub struct PiFoldAuxWitness<R: OverField>
 where
-    R::BaseRing: Zq,
+    R::BaseRing: Zq + PrimeField,
 {
     /// Per-instance Π_had “U” message at the had-sumcheck evaluation point:
     /// for each instance i: U[i] = [U1(d), U2(d), U3(d)] where each is length `d = dim(R)`.
@@ -196,7 +220,7 @@ fn verify_pi_fold_cp_in_transcript_hetero_m<R: CoeffRing>(
     public_inputs: &[R::BaseRing],
 ) -> Result<(SymphonyInstance<R>, SymphonyBatchLin<R>), String>
 where
-    R::BaseRing: Zq + Decompose,
+    R::BaseRing: Zq + Decompose + PrimeField,
 {
     ts.absorb_field_element(&R::BaseRing::from(DS_PI_FOLD));
     absorb_public_inputs::<R>(ts, public_inputs);
@@ -248,7 +272,7 @@ fn verify_pi_fold_cp_in_transcript<R: CoeffRing>(
     public_inputs: &[R::BaseRing],
 ) -> Result<(SymphonyInstance<R>, SymphonyBatchLin<R>), String>
 where
-    R::BaseRing: Zq + Decompose,
+    R::BaseRing: Zq + Decompose + PrimeField,
 {
     ts.absorb_field_element(&R::BaseRing::from(DS_PI_FOLD));
     absorb_public_inputs::<R>(ts, public_inputs);
@@ -302,7 +326,7 @@ pub fn verify_pi_fold_cp_poseidon_fs<R: CoeffRing, PC>(
     public_inputs: &[R::BaseRing],
 ) -> PiFoldCpPoseidonFsAttempt<R>
 where
-    R::BaseRing: Zq + Decompose,
+    R::BaseRing: Zq + Decompose + PrimeField,
     PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
 {
     let mut ts = crate::transcript::TracePoseidonTranscript::<R>::empty::<PC>();
@@ -350,7 +374,7 @@ fn verify_pi_fold_batched_and_fold_outputs_with_openings_and_aux_hetero_m<R: Coe
     aux: Option<&PiFoldAuxWitness<R>>,
 ) -> Result<(SymphonyInstance<R>, SymphonyBatchLin<R>), String>
 where
-    R::BaseRing: Zq + Decompose,
+    R::BaseRing: Zq + Decompose + PrimeField,
 {
     if cms.len() != Ms.len() {
         return Err("PiFold: Ms/cms length mismatch".to_string());
@@ -742,6 +766,37 @@ where
 
     let folded_bat = SymphonyBatchLin { r_prime, c_g: c_g_folded, u: u_folded };
 
+    // -----------------------------------------------------------------------
+    // Stage-1 Batchlin PCS transcript splice (domain-separated):
+    //
+    // If the proof includes a PCS commitment surface for the folded batchlin object, bind it
+    // into the Poseidon transcript *after* `r'` and `u_*` are fixed, and then squeeze bytes to
+    // provide transcript-derived coins for the in-gate PCS verifier.
+    //
+
+    if proof.batchlin_pcs_t.is_empty() {
+        return Err("PiFold: missing batchlin_pcs_t (batchlin PCS commitment surface)".to_string());
+    }
+    // Batched batchlin PCS: single commitment (len=1).
+    if proof.batchlin_pcs_t.len() != 1 {
+        return Err("PiFold: batchlin_pcs_t expected len=1 (batched scalar PCS)".to_string());
+    }
+    transcript.absorb_field_element(&R::BaseRing::from(BATCHLIN_PCS_DOMAIN_SEP));
+    // Batch scalar γ used for digit batching in PCS#2. This is transcript-derived and must be
+    // sampled at a fixed point in the schedule (after `r'` and `u_*` are fixed, before PCS coins).
+    let _gamma = transcript.get_challenge();
+    transcript.absorb_field_element(&R::BaseRing::from(proof.batchlin_pcs_t.len() as u128));
+    for dig in 0..proof.batchlin_pcs_t.len() {
+        if proof.batchlin_pcs_t[dig].is_empty() {
+            return Err(format!("PiFold: empty batchlin_pcs_t[{dig}]"));
+        }
+        transcript.absorb_field_element(&R::BaseRing::from(proof.batchlin_pcs_t[dig].len() as u128));
+        for x in &proof.batchlin_pcs_t[dig] {
+            transcript.absorb_field_element(x);
+        }
+    }
+    let _ = transcript.squeeze_bytes(64);
+
     Ok((folded_inst, folded_bat))
 }
 
@@ -759,7 +814,7 @@ fn verify_pi_fold_batched_and_fold_outputs_with_openings_and_aux<R: CoeffRing>(
     aux: Option<&PiFoldAuxWitness<R>>,
 ) -> Result<(SymphonyInstance<R>, SymphonyBatchLin<R>), String>
 where
-    R::BaseRing: Zq + Decompose,
+    R::BaseRing: Zq + Decompose + PrimeField,
 {
     // Commitment-opening layer is verified **outside** the transcript schedule used for the
     // folding/sumcheck subprotocols.
@@ -1132,6 +1187,30 @@ where
         }
     }
     let folded_bat = SymphonyBatchLin { r_prime, c_g: c_g_folded, u: u_folded };
+
+    // -----------------------------------------------------------------------
+    // Stage-1 Batchlin PCS transcript splice (domain-separated). See the hetero-M variant.
+    // -----------------------------------------------------------------------
+    // Batchlin PCS transcript splice (REQUIRED). See hetero-M variant for rationale.
+    if proof.batchlin_pcs_t.is_empty() {
+        return Err("PiFold: missing batchlin_pcs_t (batchlin PCS commitment surface)".to_string());
+    }
+    if proof.batchlin_pcs_t.len() != 1 {
+        return Err("PiFold: batchlin_pcs_t expected len=1 (batched scalar PCS)".to_string());
+    }
+    transcript.absorb_field_element(&R::BaseRing::from(BATCHLIN_PCS_DOMAIN_SEP));
+    let _gamma = transcript.get_challenge();
+    transcript.absorb_field_element(&R::BaseRing::from(proof.batchlin_pcs_t.len() as u128));
+    for dig in 0..proof.batchlin_pcs_t.len() {
+        if proof.batchlin_pcs_t[dig].is_empty() {
+            return Err(format!("PiFold: empty batchlin_pcs_t[{dig}]"));
+        }
+        transcript.absorb_field_element(&R::BaseRing::from(proof.batchlin_pcs_t[dig].len() as u128));
+        for x in &proof.batchlin_pcs_t[dig] {
+            transcript.absorb_field_element(x);
+        }
+    }
+    let _ = transcript.squeeze_bytes(64);
 
     Ok((folded_inst, folded_bat))
 }

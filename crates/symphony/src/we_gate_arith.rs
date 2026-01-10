@@ -42,6 +42,7 @@ use crate::public_coin_transcript::FixedTranscript;
 use crate::symphony_coins::{derive_beta_chi, derive_J};
 use crate::symphony_pifold_batched::{PiFoldAuxWitness, PiFoldBatchedProof};
 use crate::symphony_pifold_streaming::{CM_G_AGG_SEED, MON_B_AGG_SEED};
+use crate::pcs::batchlin_pcs::BATCHLIN_PCS_DOMAIN_SEP;
 use crate::transcript::PoseidonTraceOp;
 
 pub struct WeGateDr1csBuilder;
@@ -79,17 +80,19 @@ impl WeGateDr1csBuilder {
     ) -> Result<
         (
             Vec<(
-                SparseDr1csInstance<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
-                Vec<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
+            SparseDr1csInstance<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
+            Vec<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
             )>,
             Vec<(usize, usize, usize, usize)>,
             crate::dpp_poseidon::PoseidonByteWiring,
+            crate::dpp_poseidon::PoseidonDr1csWiring,
+            crate::dpp_pifold_math::PiFoldMathWiring,
         ),
         String,
     >
     where
         R: OverField + Ring + PolyRing,
-        R::BaseRing: Zq + Field + Decompose,
+        R::BaseRing: Zq + Field + Decompose + PrimeField,
     {
         if cms.len() != aux.had_u.len()
             || cms.len() != aux.mon_b.len()
@@ -298,6 +301,29 @@ impl WeGateDr1csBuilder {
             .map(to_bf::<R>)
             .collect::<Vec<_>>();
 
+        // ---------------------------------------------------------------------
+        // Stage-1 Batchlin PCS transcript splice (domain-separated):
+        // ---------------------------------------------------------------------
+        if proof.batchlin_pcs_t.is_empty() {
+            return Err("WeGateDr1csBuilder: missing batchlin_pcs_t".to_string());
+        }
+        if proof.batchlin_pcs_t.len() != 1 {
+            return Err("WeGateDr1csBuilder: batchlin_pcs_t expected len=1 (batched scalar PCS)".to_string());
+        }
+        if proof.batchlin_pcs_t[0].is_empty() {
+            return Err("WeGateDr1csBuilder: empty batchlin_pcs_t[0]".to_string());
+        }
+        ts.absorb_field_element(&R::BaseRing::from(BATCHLIN_PCS_DOMAIN_SEP));
+        let _gamma = ts.get_challenge();
+        ts.absorb_field_element(&R::BaseRing::from(proof.batchlin_pcs_t.len() as u128));
+        for dig in 0..proof.batchlin_pcs_t.len() {
+            ts.absorb_field_element(&R::BaseRing::from(proof.batchlin_pcs_t[dig].len() as u128));
+            for x in &proof.batchlin_pcs_t[dig] {
+                ts.absorb_field_element(x);
+            }
+        }
+        let _ = ts.squeeze_bytes(64);
+
         // Ensure we consumed the entire provided coin stream.
         if ts.remaining_challenges() != 0 || ts.remaining_bytes() != 0 || ts.remaining_events() != 0 {
             return Err(format!(
@@ -325,12 +351,16 @@ impl WeGateDr1csBuilder {
         // ---------------------------------------------------------------------
         // Glue Π_fold challenge variables to Poseidon squeeze-field variables.
         // ---------------------------------------------------------------------
-        // Expected number of `get_challenge` outputs for Π_fold verifier schedule:
+        // Expected number of `get_challenge` outputs for Π_fold verifier schedule.
+        //
+        // Note: The transcript may contain **additional** challenges after Π_fold completes
+        // (e.g. batchlin PCS batching γ). We only require Poseidon provided at least the prefix
+        // needed by Π_fold.
         let per_inst = k_g * (g_nvars + 2) + if k_g > 1 { 1 } else { 0 };
         let total_challenges = log_m + 1 + ell * per_inst + ell + g_nvars;
-        if wiring.squeeze_field_vars.len() != total_challenges {
+        if wiring.squeeze_field_vars.len() < total_challenges {
             return Err(format!(
-                "WeGateDr1csBuilder: poseidon wiring squeeze_field_vars len mismatch: got {} expected {}",
+                "WeGateDr1csBuilder: poseidon wiring squeeze_field_vars too short: got {} need_at_least {}",
                 wiring.squeeze_field_vars.len(),
                 total_challenges
             ));
@@ -390,7 +420,7 @@ impl WeGateDr1csBuilder {
         }
         debug_assert_eq!(ch, total_challenges);
 
-        Ok((parts, glue, byte_wiring))
+        Ok((parts, glue, byte_wiring, wiring, pifold_wiring))
     }
 
     /// Build the current arithmetized **R_cp** fragment:
@@ -415,7 +445,7 @@ impl WeGateDr1csBuilder {
     >
     where
         R: OverField + Ring + PolyRing,
-        R::BaseRing: Zq + Field,
+        R::BaseRing: Zq + Field + PrimeField,
     {
         // Poseidon trace -> dR1CS.
         let (poseidon_inst, poseidon_asg, _replay2, _byte_wit) =
@@ -495,9 +525,9 @@ impl WeGateDr1csBuilder {
     >
     where
         R: OverField + Ring + PolyRing,
-        R::BaseRing: Zq + Field + Decompose,
+        R::BaseRing: Zq + Field + Decompose + PrimeField,
     {
-        let (parts, glue, _byte_wiring) = Self::build_r_cp_poseidon_pifold_math_and_cfs_parts::<R>(
+        let (parts, glue, _byte_wiring, _pose_wiring, _pifold_wiring) = Self::build_r_cp_poseidon_pifold_math_and_cfs_parts::<R>(
             poseidon_cfg,
             ops,
             cms,
@@ -534,18 +564,19 @@ impl WeGateDr1csBuilder {
     where
         R: OverField + Ring,
         R: PolyRing,
-        R::BaseRing: Zq + Field,
+        R::BaseRing: Zq + Field + PrimeField,
     {
         Self::r_cp_poseidon_and_cfs_openings::<R>(
             poseidon_cfg, ops, scheme_had, scheme_mon, aux, cfs_had_u, cfs_mon_b,
         )
     }
 
-    /// Build **R_cp × R_pifold × R_cfs × R_pcs**:
+    /// Build **R_cp × R_pifold × R_cfs × R_pcs_f × R_pcs_g**:
     /// - transcript binding (Poseidon trace)
     /// - Π_fold verifier math
     /// - CP message openings (`cfs_*`)
-    /// - PCS evaluation proof verification (folding PCS ℓ=2), with `C1/C2` coins derived from Poseidon `SqueezeBytes`
+    /// - two PCS evaluation proof verifications (folding PCS ℓ=2), intended for
+    ///   `R_o = R_auxcs_lin × R_batchlin`, with `C1/C2` coins derived from Poseidon `SqueezeBytes`
     ///   and glued by variable-equality constraints inside the merged system.
     pub fn poseidon_plus_pifold_plus_cfs_plus_pcs<R>(
         poseidon_cfg: &PoseidonConfig<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
@@ -557,14 +588,20 @@ impl WeGateDr1csBuilder {
         aux: &PiFoldAuxWitness<R>,
         cfs_had_u: &[Vec<R>],
         cfs_mon_b: &[Vec<R>],
-        pcs_params: &FoldingPcsL2Params<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
-        pcs_t: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
-        pcs_x0: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
-        pcs_x1: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
-        pcs_x2: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
-        pcs_u: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
-        pcs_proof: &FoldingPcsL2ProofCore<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
-        pcs_coin_squeeze_idx: usize,
+        pcs_f_params: &FoldingPcsL2Params<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
+        pcs_f_t: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
+        pcs_f_x0: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
+        pcs_f_x1: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
+        pcs_f_x2: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
+        pcs_f_proof: &FoldingPcsL2ProofCore<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
+        pcs_f_coin_squeeze_idx: usize,
+        pcs_g_params: &FoldingPcsL2Params<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
+        pcs_g_t: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
+        pcs_g_x0: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
+        pcs_g_x1: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
+        pcs_g_x2: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
+        pcs_g_proof: &FoldingPcsL2ProofCore<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
+        pcs_g_coin_squeeze_idx: usize,
     ) -> Result<
         (
             SparseDr1csInstance<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
@@ -574,9 +611,9 @@ impl WeGateDr1csBuilder {
     >
     where
         R: OverField + Ring + PolyRing,
-        R::BaseRing: Zq + Field + Decompose,
+        R::BaseRing: Zq + Field + Decompose + PrimeField,
     {
-        let (mut parts, mut glue, byte_wiring) = Self::build_r_cp_poseidon_pifold_math_and_cfs_parts::<R>(
+        let (mut parts, mut glue, byte_wiring, pose_wiring, pifold_wiring) = Self::build_r_cp_poseidon_pifold_math_and_cfs_parts::<R>(
             poseidon_cfg,
             ops,
             cms,
@@ -590,64 +627,226 @@ impl WeGateDr1csBuilder {
 
         // ---------------------------------------------------------------------
         // PCS verifier dR1CS (folding PCS ℓ=2), with `C1/C2` derived from Poseidon `SqueezeBytes`.
+        // We wire TWO PCS verifiers (auxcs_lin + batchlin).
         // ---------------------------------------------------------------------
         let squeeze_outs = Self::squeeze_bytes_outputs(ops);
-        if pcs_coin_squeeze_idx >= squeeze_outs.len() {
-            return Err(format!(
-                "WeGateDr1csBuilder: pcs_coin_squeeze_idx out of range: idx={} num_squeezes={}",
-                pcs_coin_squeeze_idx,
-                squeeze_outs.len()
-            ));
-        }
-        if pcs_coin_squeeze_idx >= byte_wiring.squeeze_byte_ranges.len() {
-            return Err(format!(
-                "WeGateDr1csBuilder: Poseidon byte wiring missing squeeze idx {} (have {})",
-                pcs_coin_squeeze_idx,
-                byte_wiring.squeeze_byte_ranges.len()
-            ));
-        }
-        let c_bytes = &squeeze_outs[pcs_coin_squeeze_idx];
-        let (byte_start, byte_len) = byte_wiring.squeeze_byte_ranges[pcs_coin_squeeze_idx];
-        if byte_len != c_bytes.len() {
-            return Err(format!(
-                "WeGateDr1csBuilder: pcs coin byte length mismatch: poseidon_wiring_len={} ops_len={}",
-                byte_len,
-                c_bytes.len()
-            ));
-        }
-        let pose_byte_vars =
-            &byte_wiring.squeeze_byte_vars[byte_start..byte_start + byte_len];
 
-        let mut b = crate::dpp_sumcheck::Dr1csBuilder::<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>::new();
-        let pcs_byte_vars: Vec<usize> = c_bytes
-            .iter()
-            .map(|&by| {
-                b.new_var(
-                    <<<R as PolyRing>::BaseRing as Field>::BasePrimeField as From<u64>>::from(by as u64),
-                )
-            })
-            .collect();
-        let _pcs_wiring = folding_pcs_l2_verify_dr1cs_with_c_bytes(
-            &mut b,
-            pcs_params,
-            pcs_t,
-            pcs_x0,
-            pcs_x1,
-            pcs_x2,
-            pcs_u,
-            pcs_proof,
-            &pcs_byte_vars,
+        let mut add_pcs_part = |pcs_params: &FoldingPcsL2Params<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
+                                pcs_t: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
+                                pcs_x0: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
+                                pcs_x1: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
+                                pcs_x2: &[<<R as PolyRing>::BaseRing as Field>::BasePrimeField],
+                                pcs_proof: &FoldingPcsL2ProofCore<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
+                                pcs_coin_squeeze_idx: usize|
+         -> Result<(usize, crate::pcs::dpp_folding_pcs_l2::FoldingPcsL2Wiring), String> {
+            if pcs_coin_squeeze_idx >= squeeze_outs.len() {
+                return Err(format!(
+                    "WeGateDr1csBuilder: pcs_coin_squeeze_idx out of range: idx={} num_squeezes={}",
+                    pcs_coin_squeeze_idx,
+                    squeeze_outs.len()
+                ));
+            }
+            if pcs_coin_squeeze_idx >= byte_wiring.squeeze_byte_ranges.len() {
+                return Err(format!(
+                    "WeGateDr1csBuilder: Poseidon byte wiring missing squeeze idx {} (have {})",
+                    pcs_coin_squeeze_idx,
+                    byte_wiring.squeeze_byte_ranges.len()
+                ));
+            }
+            let c_bytes = &squeeze_outs[pcs_coin_squeeze_idx];
+            let (byte_start, byte_len) = byte_wiring.squeeze_byte_ranges[pcs_coin_squeeze_idx];
+            if byte_len != c_bytes.len() {
+                return Err(format!(
+                    "WeGateDr1csBuilder: pcs coin byte length mismatch: poseidon_wiring_len={} ops_len={}",
+                    byte_len,
+                    c_bytes.len()
+                ));
+            }
+            let pose_byte_vars =
+                &byte_wiring.squeeze_byte_vars[byte_start..byte_start + byte_len];
+
+            let mut b = crate::dpp_sumcheck::Dr1csBuilder::<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>::new();
+            let pcs_byte_vars: Vec<usize> = c_bytes
+                .iter()
+                .map(|&by| {
+                    b.new_var(
+                        <<<R as PolyRing>::BaseRing as Field>::BasePrimeField as From<u64>>::from(by as u64),
+                    )
+                })
+                .collect();
+            let pcs_wiring = folding_pcs_l2_verify_dr1cs_with_c_bytes(
+                &mut b,
+                pcs_params,
+                pcs_t,
+                pcs_x0,
+                pcs_x1,
+                pcs_x2,
+                pcs_proof,
+                &pcs_byte_vars,
+            )?;
+            let (pcs_inst, pcs_asg) = b.into_instance();
+            let pcs_part_idx = parts.len();
+            parts.push((pcs_inst, pcs_asg));
+
+            for (&pv, &cv) in pose_byte_vars.iter().zip(pcs_byte_vars.iter()) {
+                glue.push((0, pv, pcs_part_idx, cv));
+            }
+            Ok((pcs_part_idx, pcs_wiring))
+        };
+
+        let (_pcs_f_part_idx, _pcs_f_wiring) = add_pcs_part(
+            pcs_f_params,
+            pcs_f_t,
+            pcs_f_x0,
+            pcs_f_x1,
+            pcs_f_x2,
+            pcs_f_proof,
+            pcs_f_coin_squeeze_idx,
         )?;
-        let (pcs_inst, pcs_asg) = b.into_instance();
-        parts.push((pcs_inst, pcs_asg));
+        let (pcs_g_part_idx, pcs_g_wiring) = add_pcs_part(
+            pcs_g_params,
+            pcs_g_t,
+            pcs_g_x0,
+            pcs_g_x1,
+            pcs_g_x2,
+            pcs_g_proof,
+            pcs_g_coin_squeeze_idx,
+        )?;
 
         // ---------------------------------------------------------------------
-        // Glue PCS coin bytes to Poseidon squeeze-byte variables.
+        // Batchlin PCS binding:
+        //
+        // Bind PCS_g to Π_fold Step-5 scalars and transcript absorption.
+        // - Glue PCS_g commitment vector `t_vars` to the Poseidon `Absorb` vars for `batchlin_pcs_t`.
+        // - Glue PCS_g computed evaluation `u_re_vars[0]` to a batched linear combination of
+        //   Π_fold Step-5 LHS scalars `lhs_ct[dig] = ct(psi*u_folded[dig])` with batching scalar γ
+        //   derived from the transcript after the batchlin PCS splice.
         // ---------------------------------------------------------------------
-        const PCS_PART: usize = 5;
-        for (&pv, &cv) in pose_byte_vars.iter().zip(pcs_byte_vars.iter()) {
-            glue.push((0, pv, PCS_PART, cv));
+        // Locate the Poseidon absorb vars for `batchlin_pcs_t` by replaying the absorb element stream:
+        // after the marker, skip 2 length elements, then take `t_len` elements.
+        let marker_bf = <<<R as PolyRing>::BaseRing as Field>::BasePrimeField as From<u128>>::from(BATCHLIN_PCS_DOMAIN_SEP);
+        let mut absorb_op_idx = 0usize;
+        let mut after_marker = false;
+        let mut skip_after_marker = 0usize;
+        let mut t_absorb_vars: Vec<usize> = Vec::new();
+        for op in ops {
+            if let PoseidonTraceOp::Absorb(elems) = op {
+                let (start, len) = pose_wiring
+                    .absorb_ranges
+                    .get(absorb_op_idx)
+                    .copied()
+                    .unwrap_or((0, 0));
+                absorb_op_idx += 1;
+                if len != elems.len() {
+                    return Err("WeGateDr1csBuilder: poseidon absorb wiring length mismatch".to_string());
+                }
+                let vars = &pose_wiring.absorb_vars[start..start + len];
+
+                // Marker absorb is always a single field element.
+                if elems.len() == 1 && elems[0] == marker_bf {
+                    after_marker = true;
+                    // After the marker, `get_challenge()` performs:
+                    // - SqueezeField(gamma)
+                    // - Absorb(gamma)   <-- counts as 1 absorbed element for base fields
+                    // Then we absorb two length tags (outer len, inner len), before the t elements.
+                    skip_after_marker = 3;
+                    continue;
+                }
+                if after_marker {
+                    for (e_idx, _e) in elems.iter().enumerate() {
+                        if skip_after_marker > 0 {
+                            skip_after_marker -= 1;
+                            continue;
+                        }
+                        t_absorb_vars.push(vars[e_idx]);
+                        if t_absorb_vars.len() == pcs_g_wiring.t_vars.len() {
+                            break;
+                        }
+                    }
+                    if t_absorb_vars.len() == pcs_g_wiring.t_vars.len() {
+                        break;
+                    }
+                }
+            }
         }
+        if t_absorb_vars.len() != pcs_g_wiring.t_vars.len() {
+            return Err("WeGateDr1csBuilder: failed to locate batchlin_pcs_t absorb vars for glue".to_string());
+        }
+        for (&pv, &tv) in t_absorb_vars.iter().zip(pcs_g_wiring.t_vars.iter()) {
+            glue.push((0, pv, pcs_g_part_idx, tv));
+        }
+
+        // Glue gamma_local to the first SqueezeField output after the batchlin PCS marker absorb.
+        let mut squeeze_idx = 0usize;
+        let mut saw_marker2 = false;
+        let mut gamma_pose_var: Option<usize> = None;
+        for op in ops {
+            match op {
+                PoseidonTraceOp::Absorb(elems) => {
+                    if elems.len() == 1 && elems[0] == marker_bf {
+                        saw_marker2 = true;
+                    }
+                }
+                PoseidonTraceOp::SqueezeField(out) => {
+                    if saw_marker2 && !out.is_empty() {
+                        gamma_pose_var = Some(pose_wiring.squeeze_field_vars[squeeze_idx]);
+                        break;
+                    }
+                    squeeze_idx += out.len();
+                }
+                _ => {}
+            }
+        }
+        let gamma_pose_var = gamma_pose_var.ok_or_else(|| {
+            "WeGateDr1csBuilder: missing gamma SqueezeField after batchlin PCS splice".to_string()
+        })?;
+        let gamma_val = parts[0].1[gamma_pose_var];
+
+        // Build a tiny binding sub-system: u_re == Σ_dig γ^dig * lhs_ct[dig]
+        let mut bb = crate::dpp_sumcheck::Dr1csBuilder::<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>::new();
+        let bf_zero = <<<R as PolyRing>::BaseRing as Field>::BasePrimeField as ark_ff::Field>::ZERO;
+        let bf_one = <<<R as PolyRing>::BaseRing as Field>::BasePrimeField as ark_ff::Field>::ONE;
+        // Allocate local vars with correct initial values so glue constraints are satisfied.
+        let gamma_local = bb.new_var(gamma_val);
+        let pcs_g_asg = &parts[pcs_g_part_idx].1;
+        let u_val = pcs_g_asg[pcs_g_wiring.u_re_vars[0]];
+        let u_local = bb.new_var(u_val);
+        let pifold_asg = &parts[PIFOLD_PART].1;
+        let mut lhs_locals: Vec<usize> = Vec::with_capacity(pifold_wiring.step5_lhs_ct.len());
+        for &pv in &pifold_wiring.step5_lhs_ct {
+            lhs_locals.push(bb.new_var(pifold_asg[pv]));
+        }
+        // Enforce u_local = Σ gamma^i * lhs_i
+        let mut acc = bb.new_var(bf_zero);
+        bb.enforce_var_eq_const(acc, bf_zero);
+        let mut gamma_pow = bb.new_var(bf_one);
+        bb.enforce_var_eq_const(gamma_pow, bf_one);
+        for &lhs in &lhs_locals {
+            let term = bb.new_var(bb.assignment[lhs] * bb.assignment[gamma_pow]);
+            bb.enforce_mul(lhs, gamma_pow, term);
+            let new_acc = bb.new_var(bb.assignment[acc] + bb.assignment[term]);
+            bb.add_constraint(vec![(bf_one, acc), (bf_one, term)], vec![(bf_one, bb.one())], vec![(bf_one, new_acc)]);
+            acc = new_acc;
+            let new_pow = bb.new_var(bb.assignment[gamma_pow] * bb.assignment[gamma_local]);
+            bb.enforce_mul(gamma_pow, gamma_local, new_pow);
+            gamma_pow = new_pow;
+        }
+        bb.enforce_lc_times_one_eq_const(vec![(bf_one, acc), (-bf_one, u_local)]);
+        let (bind_inst, bind_asg) = bb.into_instance();
+        let bind_part_idx = parts.len();
+        parts.push((bind_inst, bind_asg));
+
+        // Glue u_local to PCS_g u_re (scalar).
+        if pcs_g_wiring.u_re_vars.len() != 1 {
+            return Err("WeGateDr1csBuilder: PCS_g expected scalar u_re (kappa*n=1)".to_string());
+        }
+        glue.push((pcs_g_part_idx, pcs_g_wiring.u_re_vars[0], bind_part_idx, u_local));
+        // Glue lhs locals to Π_fold Step-5 lhs vars.
+        const PIFOLD_PART: usize = 4;
+        for (&pv, &lv) in pifold_wiring.step5_lhs_ct.iter().zip(lhs_locals.iter()) {
+            glue.push((PIFOLD_PART, pv, bind_part_idx, lv));
+        }
+        glue.push((0, gamma_pose_var, bind_part_idx, gamma_local));
 
         merge_sparse_dr1cs_share_one_with_glue(&parts, &glue)
     }

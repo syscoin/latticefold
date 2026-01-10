@@ -5,7 +5,8 @@ use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing};
 use symphony::dpp_sumcheck::Dr1csBuilder;
 use symphony::pcs::dpp_folding_pcs_l2::{folding_pcs_l2_params, folding_pcs_l2_verify_dr1cs_with_c_bits};
 use symphony::pcs::folding_pcs_l2::{
-    verify_folding_pcs_l2_with_c_matrices, BinMatrix, DenseMatrix, FoldingPcsL2ProofCore,
+    gadget_apply_digits, kron_ikn_xt_mul, verify_folding_pcs_l2_with_c_matrices, BinMatrix,
+    DenseMatrix, FoldingPcsL2ProofCore,
 };
 
 // Match the rest of Symphony's DPP tests: arithmetize over Frog's base prime field.
@@ -39,6 +40,12 @@ fn alloc_c_bits<Ff: PrimeField>(b: &mut Dr1csBuilder<Ff>, c: &BinMatrix<Ff>) -> 
         out.push(v);
     }
     out
+}
+
+fn enforce_eq_const<Ff: PrimeField>(b: &mut Dr1csBuilder<Ff>, var: usize, c: Ff) {
+    let cv = b.new_var(c);
+    b.enforce_var_eq_const(cv, c);
+    b.enforce_lc_times_one_eq_const(vec![(Ff::ONE, var), (-Ff::ONE, cv)]);
 }
 
 #[test]
@@ -88,12 +95,17 @@ fn folding_pcs_l2_dr1cs_roundtrip_small() {
     // Compute t from (I_k ⊗ A) y0.
     let t = symphony::pcs::folding_pcs_l2::kron_i_a_mul(&p.a, p.kappa, p.r * p.n * p.alpha, &y0);
 
-    // Choose v0=y0, v1=y1, v2=y2, u=v0.
-    // With r=1 and x0=x1=x2=[1], the (I_{kappa*n} ⊗ x^T) maps are identities.
-    let v0 = y0.clone();
-    let v1 = y1.clone();
-    let v2 = y2.clone();
-    let u = v0.clone();
+    let mut delta_pows = Vec::with_capacity(alpha);
+    let mut acc = F::ONE;
+    let delta_f = F::from(delta);
+    for _ in 0..alpha {
+        delta_pows.push(acc);
+        acc *= delta_f;
+    }
+    let v0 = gadget_apply_digits(&delta_pows, r * kappa * n, &y0);
+    let v1 = gadget_apply_digits(&delta_pows, r * kappa * n, &y1);
+    let v2 = gadget_apply_digits(&delta_pows, r * kappa * n, &y2);
+    let u = kron_ikn_xt_mul(&x2, kappa, n, &v0);
 
     let core = FoldingPcsL2ProofCore { y0, v0, y1, v1, y2, v2 };
 
@@ -104,7 +116,14 @@ fn folding_pcs_l2_dr1cs_roundtrip_small() {
     let mut b = Dr1csBuilder::<F>::new();
     let c1_bits = alloc_c_bits(&mut b, &c1);
     let c2_bits = alloc_c_bits(&mut b, &c2);
-    folding_pcs_l2_verify_dr1cs_with_c_bits(&mut b, &p, &t, &x0, &x1, &x2, &u, &core, &c1_bits, &c2_bits).unwrap();
+    let wiring =
+        folding_pcs_l2_verify_dr1cs_with_c_bits(&mut b, &p, &t, &x0, &x1, &x2, &core, &c1_bits, &c2_bits)
+            .unwrap();
+    // Bind u_re to expected u constants.
+    assert_eq!(wiring.u_re_vars.len(), u.len());
+    for (v, c) in wiring.u_re_vars.iter().copied().zip(u.iter().copied()) {
+        enforce_eq_const(&mut b, v, c);
+    }
     let (inst, asg) = b.into_instance();
     inst.check(&asg).unwrap();
 
@@ -114,7 +133,12 @@ fn folding_pcs_l2_dr1cs_roundtrip_small() {
     c1_bad.data[0] = if c1_bad.data[0] == F::ZERO { F::ONE } else { F::ZERO };
     let c1_bits_bad = alloc_c_bits(&mut b2, &c1_bad);
     let c2_bits_bad = alloc_c_bits(&mut b2, &c2);
-    folding_pcs_l2_verify_dr1cs_with_c_bits(&mut b2, &p, &t, &x0, &x1, &x2, &u, &core, &c1_bits_bad, &c2_bits_bad).unwrap();
+    let wiring_bad =
+        folding_pcs_l2_verify_dr1cs_with_c_bits(&mut b2, &p, &t, &x0, &x1, &x2, &core, &c1_bits_bad, &c2_bits_bad)
+            .unwrap();
+    for (v, c) in wiring_bad.u_re_vars.iter().copied().zip(u.iter().copied()) {
+        enforce_eq_const(&mut b2, v, c);
+    }
     let (inst2, asg2) = b2.into_instance();
     assert!(inst2.check(&asg2).is_err());
 }
@@ -184,13 +208,19 @@ fn folding_pcs_l2_dr1cs_roundtrip_r2_nontrivial() {
     // Compute t from (I_k ⊗ A) y0.
     let t = symphony::pcs::folding_pcs_l2::kron_i_a_mul(&p.a, p.kappa, p.r * p.n * p.alpha, &y0);
 
-    // Set v0=y0, v1=y1, v2=y2 so the remaining equations align.
-    let v0 = y0.clone();
-    let v1 = y1.clone();
-    let v2 = y2.clone();
+    let mut delta_pows = Vec::with_capacity(alpha);
+    let mut acc = F::ONE;
+    let delta_f = F::from(delta);
+    for _ in 0..alpha {
+        delta_pows.push(acc);
+        acc *= delta_f;
+    }
+    let v0 = gadget_apply_digits(&delta_pows, r * kappa * n, &y0);
+    let v1 = gadget_apply_digits(&delta_pows, r * kappa * n, &y1);
+    let v2 = gadget_apply_digits(&delta_pows, r * kappa * n, &y2);
 
-    // u = (I_{kappa*n} ⊗ x2^T) v0 (i.e., select first lane).
-    let u = symphony::pcs::folding_pcs_l2::kron_ikn_xt_mul(&x2, kappa, n, &v0);
+    // u = (I_{kappa*n} ⊗ x2^T) v0.
+    let u = kron_ikn_xt_mul(&x2, kappa, n, &v0);
 
     let core = FoldingPcsL2ProofCore { y0, v0, y1, v1, y2, v2 };
 
@@ -201,7 +231,13 @@ fn folding_pcs_l2_dr1cs_roundtrip_r2_nontrivial() {
     let mut b = Dr1csBuilder::<F>::new();
     let c1_bits = alloc_c_bits(&mut b, &c1);
     let c2_bits = alloc_c_bits(&mut b, &c2);
-    folding_pcs_l2_verify_dr1cs_with_c_bits(&mut b, &p, &t, &x0, &x1, &x2, &u, &core, &c1_bits, &c2_bits).unwrap();
+    let wiring =
+        folding_pcs_l2_verify_dr1cs_with_c_bits(&mut b, &p, &t, &x0, &x1, &x2, &core, &c1_bits, &c2_bits)
+            .unwrap();
+    assert_eq!(wiring.u_re_vars.len(), u.len());
+    for (v, c) in wiring.u_re_vars.iter().copied().zip(u.iter().copied()) {
+        enforce_eq_const(&mut b, v, c);
+    }
     let (inst, asg) = b.into_instance();
     inst.check(&asg).unwrap();
 
@@ -211,7 +247,12 @@ fn folding_pcs_l2_dr1cs_roundtrip_r2_nontrivial() {
     c2_bad.data[0] = if c2_bad.data[0] == F::ZERO { F::ONE } else { F::ZERO };
     let c1_bits_bad = alloc_c_bits(&mut b2, &c1);
     let c2_bits_bad = alloc_c_bits(&mut b2, &c2_bad);
-    folding_pcs_l2_verify_dr1cs_with_c_bits(&mut b2, &p, &t, &x0, &x1, &x2, &u, &core, &c1_bits_bad, &c2_bits_bad).unwrap();
+    let wiring_bad =
+        folding_pcs_l2_verify_dr1cs_with_c_bits(&mut b2, &p, &t, &x0, &x1, &x2, &core, &c1_bits_bad, &c2_bits_bad)
+            .unwrap();
+    for (v, c) in wiring_bad.u_re_vars.iter().copied().zip(u.iter().copied()) {
+        enforce_eq_const(&mut b2, v, c);
+    }
     let (inst2, asg2) = b2.into_instance();
     assert!(inst2.check(&asg2).is_err());
 }
@@ -251,10 +292,17 @@ fn folding_pcs_l2_dr1cs_norm_violation_fails() {
     let y2 = symphony::pcs::folding_pcs_l2::kron_ct_in_mul(&c2, n, &y1);
 
     let t = symphony::pcs::folding_pcs_l2::kron_i_a_mul(&p.a, p.kappa, p.r * p.n * p.alpha, &y0);
-    let v0 = y0.clone();
-    let v1 = y1.clone();
-    let v2 = y2.clone();
-    let u = v0.clone();
+    let mut delta_pows = Vec::with_capacity(alpha);
+    let mut acc = F::ONE;
+    let delta_f = F::from(delta);
+    for _ in 0..alpha {
+        delta_pows.push(acc);
+        acc *= delta_f;
+    }
+    let v0 = gadget_apply_digits(&delta_pows, r * kappa * n, &y0);
+    let v1 = gadget_apply_digits(&delta_pows, r * kappa * n, &y1);
+    let v2 = gadget_apply_digits(&delta_pows, r * kappa * n, &y2);
+    let u = kron_ikn_xt_mul(&x2, kappa, n, &v0);
 
     let core = FoldingPcsL2ProofCore { y0, v0, y1, v1, y2, v2 };
 
@@ -265,7 +313,12 @@ fn folding_pcs_l2_dr1cs_norm_violation_fails() {
     let mut b = Dr1csBuilder::<F>::new();
     let c1_bits = alloc_c_bits(&mut b, &c1);
     let c2_bits = alloc_c_bits(&mut b, &c2);
-    folding_pcs_l2_verify_dr1cs_with_c_bits(&mut b, &p, &t, &x0, &x1, &x2, &u, &core, &c1_bits, &c2_bits).unwrap();
+    let wiring =
+        folding_pcs_l2_verify_dr1cs_with_c_bits(&mut b, &p, &t, &x0, &x1, &x2, &core, &c1_bits, &c2_bits)
+            .unwrap();
+    for (v, c) in wiring.u_re_vars.iter().copied().zip(u.iter().copied()) {
+        enforce_eq_const(&mut b, v, c);
+    }
     let (inst, asg) = b.into_instance();
     assert!(inst.check(&asg).is_err());
 }

@@ -18,6 +18,7 @@
 //! | m_j/m' MLEs | 2 × k_g × 256MB | Same (complex) |
 
 use ark_std::log2;
+use ark_ff::PrimeField;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -42,6 +43,9 @@ use crate::streaming_sumcheck::{StreamingMleEnum, StreamingProof, StreamingSumch
 use crate::symphony_cm::SymphonyCoins;
 use crate::symphony_coins::{derive_beta_chi, derive_J, ev, ts_weights};
 use crate::symphony_pifold_batched::{PiFoldAuxWitness, PiFoldBatchedProof, PiFoldProverOutput};
+use crate::pcs::batchlin_pcs::BATCHLIN_PCS_DOMAIN_SEP;
+use crate::pcs::batchlin_pcs::{batchlin_scalar_pcs_params, BatchlinPcsConfig, mle_point_to_tensor};
+use crate::pcs::folding_pcs_l2::{commit as pcs_commit, open as pcs_open, BinMatrix};
 
 /// Fixed seed for the cm_g aggregate commitment scheme.
 /// This derives a dedicated Ajtai matrix for binding all cm_g commitments into a single short value.
@@ -287,7 +291,7 @@ pub fn prove_pi_fold_poseidon_fs<R: CoeffRing, PC>(
     config: &PiFoldStreamingConfig,
 ) -> Result<PiFoldProverOutput<R>, String>
 where
-    R::BaseRing: Zq + Decompose,
+    R::BaseRing: Zq + Decompose + PrimeField,
     PC: GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
 {
     if cms.is_empty() {
@@ -369,7 +373,7 @@ pub fn prove_pi_fold_streaming_hetero_m_with_config<R: CoeffRing>(
     cm_g_scheme: &AjtaiCommitmentScheme<R>,
 ) -> Result<PiFoldProverOutput<R>, String>
 where
-    R::BaseRing: Zq + Decompose,
+    R::BaseRing: Zq + Decompose + PrimeField,
 {
     // Cheap sample: first witness and first instance matrices.
     let const_coeff_fastpath = config.request_const_coeff_fastpath
@@ -1118,6 +1122,165 @@ where
     let mon_b_agg = compute_mon_b_aggregate(&mon_b, kappa)?;
     transcript.absorb_slice(&mon_b_agg);
 
+    // -----------------------------------------------------------------------
+    // Stage-1 Batchlin PCS transcript splice (domain-separated):
+    //
+    // Mirror the verifier schedule in `symphony_pifold_batched` so the PCS coin material is
+    // transcript-bound and cannot be prover-optional.
+    //
+    // NOTE: This is still a placeholder commitment surface until the real batchlin PCS prover
+    // is implemented; however, the *transcript schedule* must already be fixed.
+    // -----------------------------------------------------------------------
+    // Batched scalar PCS:
+    // - We commit to a single scalar-valued MLE f[j] = Σ_dig γ^dig * ct(psi * g_folded^{(dig)}[j]).
+    // - The gate binds the PCS evaluation to the Π_fold Step-5 scalars via batching with the same γ.
+    transcript.absorb_field_element(&R::BaseRing::from(BATCHLIN_PCS_DOMAIN_SEP));
+    let gamma = transcript.get_challenge();
+
+    // Build x0,x1,x2 from r' (monomial sumcheck point).
+    let log_n = g_nvars;
+    let cfg_pcs = BatchlinPcsConfig::for_sp1(log_n, 1, rg_params.k_g)?;
+    let (x0, x1, x2) = mle_point_to_tensor::<R::BaseRing>(&mon_rand, &cfg_pcs)?;
+
+    // Compute f_batch (length 2^{log_n}) over the base field.
+    // Use the same column-major layout as cm_g commit: idx = col*m + row.
+    let psi_poly = stark_rings::psi::<R>();
+    let psi_coeffs = psi_poly.coeffs().to_vec();
+    let ctpsi = |g: &R| -> R::BaseRing {
+        let coeffs = g.coeffs();
+        let mut acc = psi_coeffs[0] * coeffs[0];
+        for i_c in 1..d {
+            acc -= psi_coeffs[i_c] * coeffs[d - i_c];
+        }
+        acc
+    };
+
+    let beta_sum = beta_cts.iter().copied().fold(R::BaseRing::ZERO, |a, b| a + b);
+    let k_g = rg_params.k_g;
+
+    // Precompute Σ_{dig=0..k_g-1} gamma^dig
+    let mut gamma_pow = R::BaseRing::ONE;
+    let mut gamma_series = R::BaseRing::ZERO;
+    for _ in 0..k_g {
+        gamma_series += gamma_pow;
+        gamma_pow *= gamma;
+    }
+
+    let g0 = exp::<R>(R::BaseRing::ZERO).expect("Exp failed");
+    let ctpsi_g0 = ctpsi(&g0);
+
+    let mut f_batch = vec![R::BaseRing::ZERO; g_len];
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        f_batch
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(j, slot)| {
+                let col = j / m;
+                if const_coeff_fastpath && d > 1 && col != 0 {
+                    // All digits are 0 => g is constant exp(0).
+                    *slot = beta_sum * ctpsi_g0 * gamma_series;
+                    return;
+                }
+                let row = j - col * m;
+                let out_row = row % m_j;
+                let mut acc = R::BaseRing::ZERO;
+                let mut gamma_pow = R::BaseRing::ONE;
+                for dig in 0..k_g {
+                    let mut dig_acc = R::BaseRing::ZERO;
+                    for inst_idx in 0..ell {
+                        let digits_flat = &proj_digits_by_inst[inst_idx];
+                        let digit = digits_flat[(out_row * d + col) * k_g + dig];
+                        let g = exp::<R>(digit).expect("Exp failed");
+                        let v = ctpsi(&g);
+                        dig_acc += beta_cts[inst_idx] * v;
+                    }
+                    acc += gamma_pow * dig_acc;
+                    gamma_pow *= gamma;
+                }
+                *slot = acc;
+            });
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        for j in 0..g_len {
+            let col = j / m;
+            if const_coeff_fastpath && d > 1 && col != 0 {
+                f_batch[j] = beta_sum * ctpsi_g0 * gamma_series;
+                continue;
+            }
+            let row = j - col * m;
+            let out_row = row % m_j;
+            let mut acc = R::BaseRing::ZERO;
+            let mut gamma_pow = R::BaseRing::ONE;
+            for dig in 0..k_g {
+                let mut dig_acc = R::BaseRing::ZERO;
+                for inst_idx in 0..ell {
+                    let digits_flat = &proj_digits_by_inst[inst_idx];
+                    let digit = digits_flat[(out_row * d + col) * k_g + dig];
+                    let g = exp::<R>(digit).expect("Exp failed");
+                    let v = ctpsi(&g);
+                    dig_acc += beta_cts[inst_idx] * v;
+                }
+                acc += gamma_pow * dig_acc;
+                gamma_pow *= gamma;
+            }
+            f_batch[j] = acc;
+        }
+    }
+
+    // PCS params and commitment/opening.
+    let pcs_params = batchlin_scalar_pcs_params::<R::BaseRing>(log_n)?;
+    if pcs_params.f_len() != g_len {
+        return Err("PiFold: batchlin scalar pcs params mismatch".to_string());
+    }
+    let (t_vec, s_open) = pcs_commit::<R::BaseRing>(&pcs_params, &f_batch)?;
+
+    // Bind commitment surface into transcript (required by verifier schedule).
+    let batchlin_pcs_t: Vec<Vec<R::BaseRing>> = vec![t_vec.clone()];
+    transcript.absorb_field_element(&R::BaseRing::from(batchlin_pcs_t.len() as u128));
+    transcript.absorb_field_element(&R::BaseRing::from(batchlin_pcs_t[0].len() as u128));
+    transcript.absorb_field_element(&batchlin_pcs_t[0][0]);
+
+    // Derive PCS coins from transcript bytes (C1/C2 bits).
+    let c_bytes = transcript.squeeze_bytes(64);
+    let mut bits = Vec::with_capacity(c_bytes.len() * 8);
+    for &b in &c_bytes {
+        for i in 0..8 {
+            bits.push(((b >> i) & 1) == 1);
+        }
+    }
+    let r_pcs = pcs_params.r;
+    let c1 = BinMatrix {
+        rows: r_pcs * pcs_params.kappa,
+        cols: pcs_params.kappa,
+        data: (0..(r_pcs * pcs_params.kappa * pcs_params.kappa))
+            .map(|i| if bits[i] { R::BaseRing::ONE } else { R::BaseRing::ZERO })
+            .collect(),
+    };
+    let c2 = BinMatrix {
+        rows: r_pcs * pcs_params.kappa,
+        cols: pcs_params.kappa,
+        data: (0..(r_pcs * pcs_params.kappa * pcs_params.kappa))
+            .map(|i| if bits[(r_pcs * pcs_params.kappa * pcs_params.kappa) + i] { R::BaseRing::ONE } else { R::BaseRing::ZERO })
+            .collect(),
+    };
+    let (_u_scalar, batchlin_pcs_core) = pcs_open::<R::BaseRing>(&pcs_params, &f_batch, &s_open, &x0, &x1, &x2, &c1, &c2)?;
+
+    // Sanity: native verify should pass.
+    crate::pcs::folding_pcs_l2::verify_folding_pcs_l2_with_c_matrices(
+        &pcs_params,
+        &t_vec,
+        &x0,
+        &x1,
+        &x2,
+        &vec![crate::pcs::folding_pcs_l2::kron_ikn_xt_mul(&x2, pcs_params.kappa, pcs_params.n, &batchlin_pcs_core.v0)[0]],
+        &batchlin_pcs_core,
+        &c1,
+        &c2,
+    ).map_err(|e| format!("PiFold: batchlin PCS native verify failed: {e}"))?;
+
     Ok(PiFoldProverOutput {
         proof: PiFoldBatchedProof {
             coins: SymphonyCoins {
@@ -1129,6 +1292,11 @@ where
             m_j,
             m,
             cm_g,
+            batchlin_pcs_t,
+            batchlin_pcs_x0: x0,
+            batchlin_pcs_x1: x1,
+            batchlin_pcs_x2: x2,
+            batchlin_pcs_core,
             v_digits_folded,
             had_sumcheck,
             mon_sumcheck,

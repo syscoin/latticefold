@@ -30,7 +30,9 @@ fn fold_vec(beta0: R, beta1: R, a: &[R], b: &[R]) -> Vec<R> {
 #[test]
 fn test_pifold_accumulator_two_steps() {
     let n = 1 << 10;
-    let m = 1 << 10;
+    // NOTE: batchlin PCS (ℓ=2, r^3=n) currently requires log2(m*d) divisible by 3.
+    // For Frog, d=16, so pick m=256 => m*d=4096 => log2=12.
+    let m = 1 << 8;
 
     // Choose matrices so Π_had holds for any witness: M1=I, M2=0, M3=0.
     let mut m1 = SparseMatrix::<R>::identity(m);
@@ -53,7 +55,8 @@ fn test_pifold_accumulator_two_steps() {
 
     let rg_params = RPParams {
         l_h: 64,
-        lambda_pj: 32,
+        // Keep m_J = (n/l_h)*lambda_pj <= m and m multiple of m_J for this small test.
+        lambda_pj: 16,
         k_g: 4,
         d_prime: (R::dimension() as u128) / 2,
     };

@@ -298,3 +298,241 @@ pub fn verify_folding_pcs_l2_with_c_matrices<F: PrimeField>(
 // NOTE: We intentionally do NOT provide a wrapper that takes prover-supplied `C1/C2`.
 // In this setting, `C1/C2` must be derived from the transcript and provided explicitly.
 
+// ============================================================================
+// PROVER FUNCTIONS
+// ============================================================================
+
+#[derive(Clone, Debug)]
+struct GadgetExactParams {
+    delta: u64,
+    alpha: usize,
+    delta_big: BigUint,
+    modulus: BigUint,
+    half_modulus: BigUint,
+    delta_pow_alpha: BigUint,
+}
+
+fn gadget_exact_params<F: PrimeField>(delta: u64, alpha: usize) -> Result<GadgetExactParams, String> {
+    if delta < 2 {
+        return Err("gadget params: require delta>=2".to_string());
+    }
+    if alpha == 0 {
+        return Err("gadget params: require alpha>=1".to_string());
+    }
+    let modulus = BigUint::from_bytes_le(&F::MODULUS.to_bytes_le());
+    let half_modulus = &modulus >> 1;
+    let delta_big = BigUint::from(delta);
+    let delta_pow_alpha = delta_big.pow(alpha as u32);
+    if delta_pow_alpha < modulus {
+        return Err(format!(
+            "gadget params: delta^alpha too small (delta={delta}, alpha={alpha}); need delta^alpha >= modulus"
+        ));
+    }
+    Ok(GadgetExactParams {
+        delta,
+        alpha,
+        delta_big,
+        modulus,
+        half_modulus,
+        delta_pow_alpha,
+    })
+}
+
+fn gadget_decompose_checked_with_params<F: PrimeField>(
+    x: &[F],
+    gp: &GadgetExactParams,
+) -> Result<Vec<F>, String> {
+    let len = x.len();
+    let alpha = gp.alpha;
+    let mut y = vec![F::ZERO; len * alpha];
+
+    y.par_chunks_mut(alpha)
+        .enumerate()
+        .try_for_each(|(i, digits)| -> Result<(), String> {
+            let val_bytes = x[i].into_bigint().to_bytes_le();
+            let mut val = BigUint::from_bytes_le(&val_bytes);
+
+            let is_negative = val > gp.half_modulus;
+            if is_negative {
+                val = &gp.modulus - &val;
+            }
+
+            for j in 0..alpha {
+                let digit = (&val % &gp.delta_big).to_u64().unwrap_or(0);
+                val /= &gp.delta_big;
+                if is_negative && digit > 0 {
+                    digits[j] = -F::from(digit);
+                } else {
+                    digits[j] = F::from(digit);
+                }
+            }
+
+            // Critical soundness guard: reject truncation.
+            if val != BigUint::ZERO {
+                return Err(format!(
+                    "gadget_decompose_checked: truncation at coord i={i} (delta={}, alpha={}, delta^alpha_bits={}, remaining_bits={})",
+                    gp.delta,
+                    gp.alpha,
+                    gp.delta_pow_alpha.bits(),
+                    val.bits(),
+                ));
+            }
+            Ok(())
+        })?;
+
+    Ok(y)
+}
+
+fn hash_level<F: PrimeField>(
+    p: &FoldingPcsL2Params<F>,
+    gp: &GadgetExactParams,
+    cur: &[F],
+    groups: usize,
+) -> Result<(Vec<F>, Vec<F>), String> {
+    // Input is `groups` blocks of length r*n.
+    let in_block = p.r * p.n;
+    if cur.len() != groups * in_block {
+        return Err("commit: hash_level dim mismatch".to_string());
+    }
+
+    // For each group, compute s = G^{-1}(x) and then y = A*s.
+    let per_group = (0..groups)
+        .into_par_iter()
+        .map(|gidx| {
+            let x = &cur[gidx * in_block..(gidx + 1) * in_block];
+            let s = gadget_decompose_checked_with_params::<F>(x, gp)?;
+            let y = p.a.mul_vec_par(&s);
+            Ok::<_, String>((y, s))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let mut next = Vec::with_capacity(groups * p.n);
+    let mut s_all = Vec::with_capacity(cur.len() * p.alpha);
+    for (y, s) in per_group {
+        next.extend_from_slice(&y);
+        s_all.extend_from_slice(&s);
+    }
+    Ok((next, s_all))
+}
+
+/// Commit to a vector `f` using the ℓ=2 folding PCS (paper 2024-281, Fig. 5).
+///
+/// Returns `(t, s)` where:
+/// - `t` is the public commitment (length κ*n)
+/// - `s = [s0, s1, s2]` are the nested gadget openings (digits), used by `open`.
+pub fn commit<F: PrimeField>(
+    p: &FoldingPcsL2Params<F>,
+    f: &[F],
+) -> Result<(Vec<F>, [Vec<F>; 3]), String> {
+    if f.len() != p.f_len() {
+        return Err(format!("commit: f length {} != f_len {}", f.len(), p.f_len()));
+    }
+
+    let r = p.r;
+    let kappa = p.kappa;
+    // Precompute and validate gadget params once (avoid per-block BigUint pow/modulus work).
+    let gp = gadget_exact_params::<F>(p.delta, p.alpha)?;
+
+    // Level-2: f -> t2
+    let (t2, s2) = hash_level(p, &gp, f, r * r * kappa)?;
+    // Level-1: t2 -> t1
+    let (t1, s1) = hash_level(p, &gp, &t2, r * kappa)?;
+    // Level-0: t1 -> t
+    let (t, s0) = hash_level(p, &gp, &t1, kappa)?;
+
+    Ok((t, [s0, s1, s2]))
+}
+
+/// Open a PCS commitment at evaluation point `(x0, x1, x2)` with folding challenges `C1, C2`.
+///
+/// Returns `(u, proof)` where:
+/// - `u` is the claimed evaluation (length κ*n)
+/// - `proof` is the opening proof
+pub fn open<F: PrimeField>(
+    p: &FoldingPcsL2Params<F>,
+    f: &[F],
+    s: &[Vec<F>; 3],
+    x0: &[F],
+    x1: &[F],
+    x2: &[F],
+    c1: &BinMatrix<F>,
+    c2: &BinMatrix<F>,
+) -> Result<(Vec<F>, FoldingPcsL2ProofCore<F>), String> {
+    if f.len() != p.f_len() {
+        return Err("open: f length mismatch".to_string());
+    }
+    if x0.len() != p.r || x1.len() != p.r || x2.len() != p.r {
+        return Err("open: x dimension mismatch".to_string());
+    }
+
+    // Openings must be present (these are the nested gadget digits produced by `commit`).
+    let s0 = &s[0];
+    let s1 = &s[1];
+    let s2 = &s[2];
+    if s0.len() != p.y0_len() {
+        return Err("open: s0 length mismatch".to_string());
+    }
+    if s1.len() != (p.r * p.r * p.kappa * p.n * p.alpha) {
+        return Err("open: s1 length mismatch".to_string());
+    }
+    if s2.len() != (p.f_len() * p.alpha) {
+        return Err("open: s2 length mismatch".to_string());
+    }
+
+    let r = p.r;
+    let n = p.n;
+    let kappa = p.kappa;
+    let alpha = p.alpha;
+
+    // Prover messages y0, v0.
+    let y0 = s0.clone();
+    let tmp0 = kron_ikn_xt_mul(x0, r * r * kappa, n, f); // len r^2 κ n
+    let v0 = kron_ikn_xt_mul(x1, r * kappa, n, &tmp0); // len r κ n
+    let u = kron_ikn_xt_mul(x2, kappa, n, &v0); // len κ n
+
+    // y1, v1.
+    let y1 = kron_ct_in_mul(c1, r * n * alpha, s1);
+    let t_c1_f = kron_ct_in_mul(c1, r * r * n, f);
+    let v1 = kron_ikn_xt_mul(x0, r * kappa, n, &t_c1_f);
+
+    // y2, v2.
+    let t_c1_s2 = kron_ct_in_mul(c1, r * r * n * alpha, s2);
+    let y2 = kron_ct_in_mul(c2, r * n * alpha, &t_c1_s2);
+    let v2 = kron_ct_in_mul(c2, r * n, &t_c1_f);
+
+    let proof = FoldingPcsL2ProofCore {
+        y0,
+        v0,
+        y1,
+        v1,
+        y2,
+        v2,
+    };
+
+    Ok((u, proof))
+}
+
+/// Compute MLE evaluation at point using tensor-product structure.
+///
+/// For a vector `f` of length `r^3`, interprets it as an MLE and evaluates at `(x0, x1, x2)`.
+/// This is: `⟨x0 ⊗ x1 ⊗ x2, f⟩ = Σ_{a,b,c} x0[a] * x1[b] * x2[c] * f[a*r^2 + b*r + c]`
+pub fn eval_mle_tensor<F: PrimeField>(f: &[F], x0: &[F], x1: &[F], x2: &[F]) -> F {
+    let r = x0.len();
+    assert_eq!(x1.len(), r);
+    assert_eq!(x2.len(), r);
+    assert_eq!(f.len(), r * r * r);
+
+    (0..r)
+        .into_par_iter()
+        .map(|a| {
+            let mut sum_bc = F::ZERO;
+            for b in 0..r {
+                for c in 0..r {
+                    let idx = a * r * r + b * r + c;
+                    sum_bc += x1[b] * x2[c] * f[idx];
+                }
+            }
+            x0[a] * sum_bc
+        })
+        .sum()
+}

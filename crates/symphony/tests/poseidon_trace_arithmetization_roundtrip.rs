@@ -13,7 +13,8 @@ use symphony::symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStrea
 use symphony::transcript::PoseidonTraceOp;
 use symphony::pcs::dpp_folding_pcs_l2::folding_pcs_l2_params;
 use symphony::pcs::folding_pcs_l2::{
-    kron_ct_in_mul, kron_i_a_mul, BinMatrix, DenseMatrix, FoldingPcsL2ProofCore,
+    gadget_apply_digits, kron_ct_in_mul, kron_i_a_mul, kron_ikn_xt_mul, BinMatrix, DenseMatrix,
+    FoldingPcsL2ProofCore,
     verify_folding_pcs_l2_with_c_matrices,
 };
 use dpp::{
@@ -35,8 +36,10 @@ const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
 /// sparse frontend, it should be fast enough to run normally.
 #[test]
 fn test_poseidon_trace_arithmetization_roundtrip_real_verifier() {
-    let n = 1 << 4; // 16 vars
-    let m = 1 << 3; // 8 rows per chunk/instance
+    // NOTE: batchlin PCS (ℓ=2, r^3=n) currently requires log2(m*d) divisible by 3.
+    // For Frog, d=16, so pick m=32 => m*d=512 => log2=9.
+    let n = 1 << 5; // 32 vars
+    let m = 1 << 5; // 32 rows per chunk/instance
 
     // Two different A-matrices; B=C=0 so A*f ∘ B*f - C*f == 0 holds for any witness.
     let mut a0 = SparseMatrix::<R>::identity(m);
@@ -190,8 +193,8 @@ type FPack521 = Fp<MontBackend<P521Config, 9>, 9>;
 fn test_poseidon_trace_sparse_dpp_end_to_end_accepts() {
     // Reuse the existing harness to produce a real Poseidon transcript trace.
     // (We keep parameters tiny so this runs in CI.)
-    let n = 1 << 4;
-    let m = 1 << 3;
+    let n = 1 << 5;
+    let m = 1 << 5;
 
     let mut a0 = SparseMatrix::<R>::identity(m);
     let mut b0 = SparseMatrix::<R>::identity(m);
@@ -325,27 +328,6 @@ fn test_poseidon_trace_sparse_dpp_end_to_end_accepts() {
     .expect("build merged (poseidon+ajtai-open) dr1cs failed");
     merged.check(&merged_asg).expect("merged (poseidon+ajtai) dr1cs unsat");
 
-    // Full R_cp arithmetization: Poseidon trace + Π_fold verifier math + Ajtai-open(cfs_*),
-    // with glue tying Π_fold challenge vars to Poseidon SqueezeField vars.
-    //
-    // This must use the *full* verifier trace (not the truncated `ops` prefix above).
-    let (merged_math, merged_math_asg) =
-        WeGateDr1csBuilder::r_cp_poseidon_pifold_math_and_cfs_openings::<R>(
-            &poseidon_cfg,
-            &trace.ops,
-            &cms,
-            &out.proof,
-            &scheme_had,
-            &scheme_mon,
-            &out.aux,
-            &out.cfs_had_u,
-            &out.cfs_mon_b,
-        )
-        .expect("build merged (poseidon+pifold-math+cfs) dr1cs failed");
-    merged_math
-        .check(&merged_math_asg)
-        .expect("merged (poseidon+pifold-math+cfs) dr1cs unsat");
-
     // Negative test: tamper with a CP commitment (but keep the same opened message).
     // The resulting merged system must become unsatisfiable.
     if !cms.is_empty() {
@@ -437,13 +419,57 @@ fn test_poseidon_trace_sparse_dpp_end_to_end_accepts() {
     let y1 = kron_ct_in_mul(&c1, pcs_n, &y0);
     let y2 = kron_ct_in_mul(&c2, pcs_n, &y1);
     let t_pcs = kron_i_a_mul(&pcs_params.a, pcs_params.kappa, pcs_params.r * pcs_params.n * pcs_params.alpha, &y0);
-    let v0 = y0.clone();
-    let v1 = y1.clone();
-    let v2 = y2.clone();
-    let u_pcs = v0.clone();
+    let mut delta_pows = Vec::with_capacity(alpha);
+    let mut acc = BF::ONE;
+    let delta_f = BF::from(delta);
+    for _ in 0..alpha {
+        delta_pows.push(acc);
+        acc *= delta_f;
+    }
+    let v0 = gadget_apply_digits(&delta_pows, r * kappa * pcs_n, &y0);
+    let v1 = gadget_apply_digits(&delta_pows, r * kappa * pcs_n, &y1);
+    let v2 = gadget_apply_digits(&delta_pows, r * kappa * pcs_n, &y2);
+    let u_pcs = kron_ikn_xt_mul(&x2, kappa, pcs_n, &v0);
     let pcs_core = FoldingPcsL2ProofCore { y0, v0, y1, v1, y2, v2 };
     verify_folding_pcs_l2_with_c_matrices(&pcs_params, &t_pcs, &x0, &x1, &x2, &u_pcs, &pcs_core, &c1, &c2)
         .expect("native folding PCS sanity check failed");
+
+    // PCS#2 (batchlin) uses a real prover-produced commitment surface + proof core.
+    use symphony::pcs::batchlin_pcs::{batchlin_scalar_pcs_params, BATCHLIN_PCS_DOMAIN_SEP};
+    let log_n = ((out.proof.m * R::dimension()) as f64).log2() as usize;
+    let pcs_params_g = batchlin_scalar_pcs_params::<BF>(log_n).expect("batchlin pcs params");
+    let t_pcs_g = &out.proof.batchlin_pcs_t[0];
+    let x0_g = &out.proof.batchlin_pcs_x0;
+    let x1_g = &out.proof.batchlin_pcs_x1;
+    let x2_g = &out.proof.batchlin_pcs_x2;
+    let pcs_core_g = &out.proof.batchlin_pcs_core;
+
+    // Find the SqueezeBytes index that follows `BATCHLIN_PCS_DOMAIN_SEP` absorption.
+    let mut pcs_coin_squeeze_idx2: Option<usize> = None;
+    {
+        let marker = BF::from(BATCHLIN_PCS_DOMAIN_SEP);
+        let mut squeeze_idx = 0usize;
+        let mut saw_marker = false;
+        for op in &trace.ops {
+            match op {
+                PoseidonTraceOp::Absorb(v) => {
+                    if v.len() == 1 && v[0] == marker {
+                        saw_marker = true;
+                    }
+                }
+                PoseidonTraceOp::SqueezeBytes { .. } => {
+                    if saw_marker {
+                        pcs_coin_squeeze_idx2 = Some(squeeze_idx);
+                        break;
+                    }
+                    squeeze_idx += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    let pcs_coin_squeeze_idx2 = pcs_coin_squeeze_idx2
+        .expect("missing SqueezeBytes after BATCHLIN_PCS_DOMAIN_SEP (PCS#2 coin source)");
 
     let (merged3, merged3_asg) = WeGateDr1csBuilder::poseidon_plus_pifold_plus_cfs_plus_pcs::<R>(
         &poseidon_cfg,
@@ -460,14 +486,52 @@ fn test_poseidon_trace_sparse_dpp_end_to_end_accepts() {
         &x0,
         &x1,
         &x2,
-        &u_pcs,
         &pcs_core,
         pcs_coin_squeeze_idx,
+        &pcs_params_g,
+        t_pcs_g,
+        x0_g,
+        x1_g,
+        x2_g,
+        pcs_core_g,
+        pcs_coin_squeeze_idx2,
     )
     .expect("build merged (poseidon+pifold-math+cfs+pcs) failed");
-    merged3
-        .check(&merged3_asg)
-        .expect("merged (poseidon+pifold-math+cfs+pcs) dr1cs unsat");
+    if let Err(e) = merged3.check(&merged3_asg) {
+        // Helpful debug on failures: print the failing constraint and its evaluated values.
+        let idx = e
+            .split_whitespace()
+            .find_map(|tok| tok.parse::<usize>().ok())
+            .unwrap_or(0);
+        let row = &merged3.constraints[idx];
+        let eval_lc = |lc: &Vec<(BF, usize)>| -> BF {
+            lc.iter().fold(BF::ZERO, |acc, (c, i)| acc + (*c) * merged3_asg[*i])
+        };
+        let a = eval_lc(&row.a);
+        let b = eval_lc(&row.b);
+        let c = eval_lc(&row.c);
+        let a_terms = row
+            .a
+            .iter()
+            .take(8)
+            .map(|(coef, vi)| format!("({coef:?} * asg[{vi}]={:?})", merged3_asg[*vi]))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let c_terms = row
+            .c
+            .iter()
+            .take(8)
+            .map(|(coef, vi)| format!("({coef:?} * asg[{vi}]={:?})", merged3_asg[*vi]))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        panic!(
+            "merged (poseidon+pifold-math+cfs+pcs) dr1cs unsat: {e}\n  idx={idx}\n  a={a:?}\n  b={b:?}\n  c={c:?}\n  a*b={ab:?}\n  row.a.len={la} row.b.len={lb} row.c.len={lc}\n  row.a(head)={a_terms}\n  row.c(head)={c_terms}",
+            ab = a * b,
+            la = row.a.len(),
+            lb = row.b.len(),
+            lc = row.c.len(),
+        );
+    }
 
     // Convert Symphony sparse dR1CS to DPP sparse dR1CS rows.
     //
@@ -557,8 +621,8 @@ fn test_poseidon_trace_sparse_dpp_end_to_end_accepts() {
 #[ignore]
 fn test_poseidon_trace_rs_flpcp_full_trace_honest_accepts() {
     // Produce a real verifier trace (same harness as the other tests).
-    let n = 1 << 4;
-    let m = 1 << 3;
+    let n = 1 << 5;
+    let m = 1 << 5;
 
     let mut a0 = SparseMatrix::<R>::identity(m);
     let mut b0 = SparseMatrix::<R>::identity(m);
@@ -681,8 +745,8 @@ fn test_poseidon_trace_rs_flpcp_full_trace_honest_accepts() {
 #[ignore]
 fn test_poseidon_trace_full_dpp_end_to_end_no_boolean_full_trace() {
     // Same real-trace harness.
-    let n = 1 << 4;
-    let m = 1 << 3;
+    let n = 1 << 5;
+    let m = 1 << 5;
 
     let mut a0 = SparseMatrix::<R>::identity(m);
     let mut b0 = SparseMatrix::<R>::identity(m);

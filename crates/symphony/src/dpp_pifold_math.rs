@@ -39,6 +39,11 @@ pub struct PiFoldMathWiring {
     pub rc_all: Vec<Option<usize>>,
     pub rhos: Vec<usize>,
     pub rs_shared: Vec<usize>,
+    /// Step-5 folded scalar LHS per digit: lhs_ct[dig] = ct(psi * u_folded[dig]).
+    ///
+    /// This is the exact scalar that the Π_fold verifier checks against `dot(v_digits_folded[dig], ts_s)`.
+    /// Exposing it enables batching / binding checks in higher layers (e.g. batchlin PCS).
+    pub step5_lhs_ct: Vec<usize>,
 }
 
 type BF<R> = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
@@ -129,7 +134,7 @@ pub fn pifold_verifier_math_dr1cs<R>(
 where
     R: PolyRing,
     R: stark_rings::OverField,
-    R::BaseRing: Zq + Field,
+    R::BaseRing: Zq + Field + PrimeField,
 {
     let d = R::dimension();
     let ell = aux.had_u.len();
@@ -192,17 +197,7 @@ where
     // Step5 uses s_chals = mon_point[log_m..] where mon_point = rs_shared (length g_nvars)
     let s_chals = &rs_vars[log_m..];
 
-    let wiring = PiFoldMathWiring {
-        beta_cts: beta_vars.clone(),
-        s_base: s_vars.clone(),
-        alpha_base: alpha_base_var,
-        c_all: c_all.clone(),
-        beta_i_all: beta_i_all.clone(),
-        alpha_i_all: alpha_i_all.clone(),
-        rc_all: rc_vars.clone(),
-        rhos: rho_vars.clone(),
-        rs_shared: rs_vars.clone(),
-    };
+    let mut step5_lhs_ct_vars: Vec<usize> = Vec::with_capacity(k_g);
 
     // -------------------------------------------------------------------------
     // Sumcheck verification (degree 3): enforce transcript consistency g(0)+g(1)=claim and update.
@@ -483,7 +478,21 @@ where
 
         // lhs_ct == rhs
         b.enforce_lc_times_one_eq_const(vec![(BF::<R>::ONE, lhs_ct), (-BF::<R>::ONE, rhs)]);
+        step5_lhs_ct_vars.push(lhs_ct);
     }
+
+    let wiring = PiFoldMathWiring {
+        beta_cts: beta_vars.clone(),
+        s_base: s_vars.clone(),
+        alpha_base: alpha_base_var,
+        c_all: c_all.clone(),
+        beta_i_all: beta_i_all.clone(),
+        alpha_i_all: alpha_i_all.clone(),
+        rc_all: rc_vars.clone(),
+        rhos: rho_vars.clone(),
+        rs_shared: rs_vars.clone(),
+        step5_lhs_ct: step5_lhs_ct_vars,
+    };
 
     let (inst, assignment) = b.into_instance();
     Ok((inst, assignment, wiring))

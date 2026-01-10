@@ -29,8 +29,10 @@ where
 
 #[test]
 fn test_pifold_math_dr1cs_roundtrip_satisfiable_and_tamper_fails() {
-    let n = 1 << 4; // 16 vars
-    let m = 1 << 3; // 8 rows per chunk/instance
+    // NOTE: batchlin PCS (ℓ=2, r^3=n) currently requires log2(m*d) divisible by 3.
+    // For Frog, d=16, so pick m=32 => m*d=512 => log2=9.
+    let n = 1 << 5; // 32 vars
+    let m = 1 << 5; // 32 rows per chunk/instance
 
     // Two different A-matrices; B=C=0 so A*f ∘ B*f - C*f == 0 holds for any witness.
     let mut a0 = SparseMatrix::<R>::identity(m);

@@ -23,7 +23,6 @@ pub mod poseidon_trace;
 pub mod dpp_poseidon;
 pub mod dpp_ajtai;
 pub mod we_gate_arith;
-pub mod we_gate_inventory;
 pub mod dpp_sumcheck;
 pub mod dpp_pifold_math;
 

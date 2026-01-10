@@ -1,9 +1,11 @@
 //! Helpers to bind WE locks to a Symphony statement.
 //!
-//! In Architecture‑T, the armer derives per-lock queries from a **statement hash** that binds:
+//! In Architecture‑T (statement-only arming), the armer derives per-lock queries from a
+//! **statement hash** that binds:
 //! - the SP1 verifier key / program id (vk hash),
-//! - the public statement values,
-//! - and the public folding-layer statement artifacts (commitments).
+//! - the SP1 R1CS digest,
+//! - the WE gate digest (exact gate relation version),
+//! - and the public inputs.
 //!
 //! This module provides a canonical `sha256` hash for the **public** portion of `R_WE`.
 
@@ -16,19 +18,21 @@ use stark_rings::OverField;
 /// This intentionally does **not** include the folding proof (`PiFoldBatchedProof`) nor auxiliary
 /// witness messages (`aux`) nor reduced witness (`ro_witness`): those are witnesses to the relation.
 ///
-/// Callers should include:
+/// Callers should include **only statement-defined values**:
 /// - `vk_hash`: a 32-byte digest identifying the SP1 shrink verifier circuit/version.
 /// - `r1cs_digest`: a 32-byte digest identifying the SP1 R1CS being folded (from SP1 R1CS header).
+/// - `gate_digest`: a 32-byte digest identifying the **exact** WE gate relation `R_WE`
+///   (i.e., the dR1CS constraint system / verifier circuit shape the DPP targets).
 /// - `public_inputs`: the public inputs absorbed by the Poseidon transcript.
-/// - `cm_f`: commitment vectors (one per chunk/instance).
-/// - `cfs_had_u`, `cfs_mon_b`: CP transcript-message commitment vectors (one per chunk/instance).
+///
+/// NOTE: This intentionally does NOT include prover-chosen proof artifacts (e.g. `cm_f`, `cfs_*`),
+/// because locks must be armable without observing a particular proving run. Those objects are
+/// checked in-gate as part of the witness to `R_WE`, but are not statement-defining here.
 pub fn we_statement_hash_hetero_m<R: OverField>(
     vk_hash: [u8; 32],
     r1cs_digest: [u8; 32],
+    gate_digest: [u8; 32],
     public_inputs: &[R::BaseRing],
-    cm_f: &[Vec<R>],
-    cfs_had_u: &[Vec<R>],
-    cfs_mon_b: &[Vec<R>],
 ) -> [u8; 32]
 where
     R::BaseRing: Field,
@@ -37,6 +41,7 @@ where
     h.update(b"SYMPHONY_WE_STATEMENT_V1");
     h.update(&vk_hash);
     h.update(&r1cs_digest);
+    h.update(&gate_digest);
 
     // Public inputs (base field elements).
     h.update(&(public_inputs.len() as u64).to_le_bytes());
@@ -44,38 +49,7 @@ where
         absorb_field_elem::<R>(x, &mut h);
     }
 
-    // Commitment vectors; bind lengths to avoid ambiguity.
-    absorb_vecvec_ring::<R>(b"cm_f", cm_f, &mut h);
-    absorb_vecvec_ring::<R>(b"cfs_had_u", cfs_had_u, &mut h);
-    absorb_vecvec_ring::<R>(b"cfs_mon_b", cfs_mon_b, &mut h);
-
     h.finalize().into()
-}
-
-fn absorb_vecvec_ring<R: OverField>(tag: &[u8], v: &[Vec<R>], h: &mut Sha256)
-where
-    R::BaseRing: Field,
-{
-    h.update(tag);
-    h.update(&(v.len() as u64).to_le_bytes());
-    for row in v {
-        h.update(&(row.len() as u64).to_le_bytes());
-        for x in row {
-            absorb_ring_elem::<R>(x, h);
-        }
-    }
-}
-
-fn absorb_ring_elem<R: OverField>(x: &R, h: &mut Sha256)
-where
-    R::BaseRing: Field,
-{
-    // Canonicalize by hashing the base-prime-field decomposition of all coefficients.
-    for c in x.coeffs() {
-        for fp in c.to_base_prime_field_elements() {
-            h.update(fp.into_bigint().to_bytes_le());
-        }
-    }
 }
 
 fn absorb_field_elem<R: OverField>(x: &R::BaseRing, h: &mut Sha256)
@@ -90,19 +64,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing, Ring};
+    use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing};
 
     #[test]
     fn test_statement_hash_deterministic() {
         let vk = [1u8; 32];
         let r1cs = [2u8; 32];
+        let gate = [3u8; 32];
         let public_inputs: Vec<<R as PolyRing>::BaseRing> = vec![<R as PolyRing>::BaseRing::from(5u128)];
-        let cm_f: Vec<Vec<R>> = vec![vec![R::ONE; 2]];
-        let cfs_had_u: Vec<Vec<R>> = vec![vec![R::ONE; 3]];
-        let cfs_mon_b: Vec<Vec<R>> = vec![vec![R::ONE; 4]];
 
-        let a = we_statement_hash_hetero_m::<R>(vk, r1cs, &public_inputs, &cm_f, &cfs_had_u, &cfs_mon_b);
-        let b = we_statement_hash_hetero_m::<R>(vk, r1cs, &public_inputs, &cm_f, &cfs_had_u, &cfs_mon_b);
+        let a = we_statement_hash_hetero_m::<R>(vk, r1cs, gate, &public_inputs);
+        let b = we_statement_hash_hetero_m::<R>(vk, r1cs, gate, &public_inputs);
         assert_eq!(a, b);
     }
 
@@ -110,14 +82,25 @@ mod tests {
     fn test_statement_hash_changes_on_public_inputs() {
         let vk = [1u8; 32];
         let r1cs = [2u8; 32];
-        let cm_f: Vec<Vec<R>> = vec![vec![R::ONE; 2]];
-        let cfs_had_u: Vec<Vec<R>> = vec![vec![R::ONE; 3]];
-        let cfs_mon_b: Vec<Vec<R>> = vec![vec![R::ONE; 4]];
+        let gate = [3u8; 32];
 
         let p0: Vec<<R as PolyRing>::BaseRing> = vec![<R as PolyRing>::BaseRing::from(5u128)];
         let p1: Vec<<R as PolyRing>::BaseRing> = vec![<R as PolyRing>::BaseRing::from(6u128)];
-        let a = we_statement_hash_hetero_m::<R>(vk, r1cs, &p0, &cm_f, &cfs_had_u, &cfs_mon_b);
-        let b = we_statement_hash_hetero_m::<R>(vk, r1cs, &p1, &cm_f, &cfs_had_u, &cfs_mon_b);
+        let a = we_statement_hash_hetero_m::<R>(vk, r1cs, gate, &p0);
+        let b = we_statement_hash_hetero_m::<R>(vk, r1cs, gate, &p1);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_statement_hash_changes_on_gate_digest() {
+        let vk = [1u8; 32];
+        let r1cs = [2u8; 32];
+        let gate0 = [3u8; 32];
+        let gate1 = [4u8; 32];
+        let public_inputs: Vec<<R as PolyRing>::BaseRing> = vec![<R as PolyRing>::BaseRing::from(5u128)];
+
+        let a = we_statement_hash_hetero_m::<R>(vk, r1cs, gate0, &public_inputs);
+        let b = we_statement_hash_hetero_m::<R>(vk, r1cs, gate1, &public_inputs);
         assert_ne!(a, b);
     }
 }

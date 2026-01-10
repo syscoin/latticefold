@@ -12,7 +12,8 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 use symphony::pcs::dpp_folding_pcs_l2::folding_pcs_l2_verify_dr1cs_with_c_bytes;
 use symphony::pcs::dpp_folding_pcs_l2::folding_pcs_l2_params;
 use symphony::pcs::folding_pcs_l2::{
-    kron_ct_in_mul, kron_i_a_mul, BinMatrix, DenseMatrix, FoldingPcsL2ProofCore,
+    gadget_apply_digits, kron_ct_in_mul, kron_i_a_mul, kron_ikn_xt_mul, BinMatrix, DenseMatrix,
+    FoldingPcsL2ProofCore,
     verify_folding_pcs_l2_with_c_matrices,
 };
 use symphony::transcript::PoseidonTraceOp;
@@ -46,6 +47,12 @@ fn rand_small_signed_vec(len: usize, beta: u64, rng: &mut impl rand::RngCore) ->
             if sign { -v } else { v }
         })
         .collect()
+}
+
+fn enforce_eq_const(b: &mut Dr1csBuilder<BF>, var: usize, c: BF) {
+    let cv = b.new_var(c);
+    b.enforce_var_eq_const(cv, c);
+    b.enforce_lc_times_one_eq_const(vec![(BF::ONE, var), (-BF::ONE, cv)]);
 }
 
 #[test]
@@ -105,10 +112,17 @@ fn folding_pcs_l2_poseidon_derived_c_matrices_bind() {
     let y2 = kron_ct_in_mul(&c2, n, &y1);
 
     let t = kron_i_a_mul(&p.a, p.kappa, p.r * p.n * p.alpha, &y0);
-    let v0 = y0.clone();
-    let v1 = y1.clone();
-    let v2 = y2.clone();
-    let u = v0.clone();
+    let mut delta_pows = Vec::with_capacity(alpha);
+    let mut acc = BF::ONE;
+    let delta_f = BF::from(delta);
+    for _ in 0..alpha {
+        delta_pows.push(acc);
+        acc *= delta_f;
+    }
+    let v0 = gadget_apply_digits(&delta_pows, r * kappa * n, &y0);
+    let v1 = gadget_apply_digits(&delta_pows, r * kappa * n, &y1);
+    let v2 = gadget_apply_digits(&delta_pows, r * kappa * n, &y2);
+    let u = kron_ikn_xt_mul(&x2, kappa, n, &v0);
 
     let core = FoldingPcsL2ProofCore { y0, v0, y1, v1, y2, v2 };
     // Native sanity check with explicit C matrices.
@@ -122,18 +136,22 @@ fn folding_pcs_l2_poseidon_derived_c_matrices_bind() {
         .map(|&by| b_pcs.new_var(BF::from(by as u64)))
         .collect();
 
-    let _pcs_wiring = folding_pcs_l2_verify_dr1cs_with_c_bytes(
+    let pcs_wiring = folding_pcs_l2_verify_dr1cs_with_c_bytes(
         &mut b_pcs,
         &p,
         &t,
         &x0,
         &x1,
         &x2,
-        &u,
         &core,
         &pcs_byte_vars,
     )
     .expect("pcs dr1cs build failed");
+    // Bind u_re to the expected u constants.
+    assert_eq!(pcs_wiring.u_re_vars.len(), u.len());
+    for (v, c) in pcs_wiring.u_re_vars.iter().copied().zip(u.iter().copied()) {
+        enforce_eq_const(&mut b_pcs, v, c);
+    }
     let (pcs_inst, pcs_asg) = b_pcs.into_instance();
 
     // 5) Merge Poseidon + PCS instances and glue the byte vars together.

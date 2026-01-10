@@ -13,7 +13,8 @@ fn main() {
     use symphony::{
         pcs::dpp_folding_pcs_l2::folding_pcs_l2_params,
         pcs::folding_pcs_l2::{
-            kron_ct_in_mul, kron_i_a_mul, BinMatrix, DenseMatrix, FoldingPcsL2ProofCore,
+            gadget_apply_digits, kron_ct_in_mul, kron_i_a_mul, kron_ikn_xt_mul, BinMatrix,
+            DenseMatrix, FoldingPcsL2ProofCore,
             verify_folding_pcs_l2_with_c_matrices,
         },
         rp_rgchk::RPParams,
@@ -224,10 +225,17 @@ fn main() {
         let y1 = kron_ct_in_mul(&c1, pcs_n, &y0);
         let y2 = kron_ct_in_mul(&c2, pcs_n, &y1);
         let t_pcs = kron_i_a_mul(&pcs_params.a, pcs_params.kappa, pcs_params.r * pcs_params.n * pcs_params.alpha, &y0);
-        let v0 = y0.clone();
-        let v1 = y1.clone();
-        let v2 = y2.clone();
-        let u_pcs = v0.clone();
+        let mut delta_pows = Vec::with_capacity(alpha);
+        let mut acc = <BF as Field>::ONE;
+        let delta_f = <BF as From<u64>>::from(delta);
+        for _ in 0..alpha {
+            delta_pows.push(acc);
+            acc *= delta_f;
+        }
+        let v0 = gadget_apply_digits(&delta_pows, r * kappa * pcs_n, &y0);
+        let v1 = gadget_apply_digits(&delta_pows, r * kappa * pcs_n, &y1);
+        let v2 = gadget_apply_digits(&delta_pows, r * kappa * pcs_n, &y2);
+        let u_pcs = kron_ikn_xt_mul(&x2, kappa, pcs_n, &v0);
         let pcs_core = FoldingPcsL2ProofCore { y0, v0, y1, v1, y2, v2 };
         verify_folding_pcs_l2_with_c_matrices(&pcs_params, &t_pcs, &x0, &x1, &x2, &u_pcs, &pcs_core, &c1, &c2)
             .expect("native folding pcs sanity failed");
@@ -247,9 +255,15 @@ fn main() {
             &x0,
             &x1,
             &x2,
-            &u_pcs,
             &pcs_core,
             pcs_coin_squeeze_idx,
+            &pcs_params,
+            &t_pcs,
+            &x0,
+            &x1,
+            &x2,
+            &pcs_core,
+            pcs_coin_squeeze_idx.saturating_add(1),
         )
         .expect("build full gate dr1cs failed");
         full.check(&full_asg).expect("full gate unsat");

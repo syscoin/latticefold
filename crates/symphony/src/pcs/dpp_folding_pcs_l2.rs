@@ -176,15 +176,6 @@ fn enforce_vec_eq<F: PrimeField>(b: &mut Dr1csBuilder<F>, lhs: &[usize], rhs: &[
     Ok(())
 }
 
-fn enforce_vec_eq_const<F: PrimeField>(b: &mut Dr1csBuilder<F>, lhs: &[usize], rhs: &[F]) -> Result<(), String> {
-    if lhs.len() != rhs.len() {
-        return Err("len mismatch".to_string());
-    }
-    for (&a, &c) in lhs.iter().zip(rhs.iter()) {
-        b.enforce_lc_times_one_eq_const(vec![(F::ONE, a), (-c, b.one())]);
-    }
-    Ok(())
-}
 
 /// out = (I_kappa ⊗ A) * y, where y is kappa blocks of length in_block_len.
 fn kron_i_a_mul_dr1cs<F: PrimeField>(
@@ -341,6 +332,10 @@ fn kron_ikn_xt_mul_dr1cs<F: PrimeField>(
 pub struct FoldingPcsL2Wiring {
     pub c1_bits: Vec<usize>,
     pub c2_bits: Vec<usize>,
+    /// Witness variables for the public commitment vector `t` (so callers can glue it to Poseidon Absorb).
+    pub t_vars: Vec<usize>,
+    /// Witness variables for the computed evaluation `u_re = (I_{κn} ⊗ x2^T) v0`.
+    pub u_re_vars: Vec<usize>,
 }
 
 /// Build a row-major bit-matrix (flattened) from a bitstream.
@@ -399,7 +394,6 @@ pub fn folding_pcs_l2_verify_dr1cs_with_c_bits<F: PrimeField>(
     x0: &[F],
     x1: &[F],
     x2: &[F],
-    u: &[F],
     proof: &FoldingPcsL2ProofCore<F>,
     c1_bits: &[usize], // length (r*kappa)*kappa
     c2_bits: &[usize], // length (r*kappa)*kappa
@@ -410,6 +404,7 @@ pub fn folding_pcs_l2_verify_dr1cs_with_c_bits<F: PrimeField>(
     let v0 = alloc_vec(b, &proof.v0);
     let v1 = alloc_vec(b, &proof.v1);
     let v2 = alloc_vec(b, &proof.v2);
+    let t_vars = alloc_vec(b, t);
 
     if c1_bits.len() != (p.r * p.kappa) * p.kappa {
         return Err("C1 bits length mismatch".to_string());
@@ -427,13 +422,16 @@ pub fn folding_pcs_l2_verify_dr1cs_with_c_bits<F: PrimeField>(
     constrain_vec_signed_bounds::<F>(b, &y2, p.beta2)?;
 
     let lhs0 = kron_i_a_mul_dr1cs(b, &p.a, p.kappa, p.r * p.n * p.alpha, &y0)?;
-    enforce_vec_eq_const(b, &lhs0, t)?;
+    enforce_vec_eq(b, &lhs0, &t_vars)?;
 
+    // NOTE: In Fig. 5, v0 is *not* required to equal G(y0).
+    // It is a prover message that is later tied to u / v1 / v2 via the eval-chain checks.
     let gy0 = gadget_apply_digits_dr1cs(b, p.delta, p.alpha, &y0)?;
     let rhs1 = kron_ct_in_mul_dr1cs(b, p.r * p.kappa, p.kappa, &c1_bits, p.n, &gy0)?;
     let lhs1 = kron_i_a_mul_dr1cs(b, &p.a, p.kappa, p.r * p.n * p.alpha, &y1)?;
     enforce_vec_eq(b, &lhs1, &rhs1)?;
 
+    // NOTE: In Fig. 5, v1 is *not* required to equal G(y1).
     let gy1 = gadget_apply_digits_dr1cs(b, p.delta, p.alpha, &y1)?;
     let rhs2 = kron_ct_in_mul_dr1cs(b, p.r * p.kappa, p.kappa, &c2_bits, p.n, &gy1)?;
     let lhs2 = kron_i_a_mul_dr1cs(b, &p.a, p.kappa, p.r * p.n * p.alpha, &y2)?;
@@ -443,7 +441,6 @@ pub fn folding_pcs_l2_verify_dr1cs_with_c_bits<F: PrimeField>(
     enforce_vec_eq(b, &gy2, &v2)?;
 
     let u_re = kron_ikn_xt_mul_dr1cs(b, x2, p.kappa, p.n, &v0)?;
-    enforce_vec_eq_const(b, &u_re, u)?;
 
     let lhs_v1 = kron_ikn_xt_mul_dr1cs(b, x1, p.kappa, p.n, &v1)?;
     let rhs_v1 = kron_ct_in_mul_dr1cs(b, p.r * p.kappa, p.kappa, &c1_bits, p.n, &v0)?;
@@ -453,7 +450,12 @@ pub fn folding_pcs_l2_verify_dr1cs_with_c_bits<F: PrimeField>(
     let rhs_v2 = kron_ct_in_mul_dr1cs(b, p.r * p.kappa, p.kappa, &c2_bits, p.n, &v1)?;
     enforce_vec_eq(b, &lhs_v2, &rhs_v2)?;
 
-    Ok(FoldingPcsL2Wiring { c1_bits: c1_bits.to_vec(), c2_bits: c2_bits.to_vec() })
+    Ok(FoldingPcsL2Wiring {
+        c1_bits: c1_bits.to_vec(),
+        c2_bits: c2_bits.to_vec(),
+        t_vars,
+        u_re_vars: u_re,
+    })
 }
 
 /// Convenience wrapper: derive `C1/C2` from a provided byte stream (little-endian bits),
@@ -468,7 +470,6 @@ pub fn folding_pcs_l2_verify_dr1cs_with_c_bytes<F: PrimeField>(
     x0: &[F],
     x1: &[F],
     x2: &[F],
-    u: &[F],
     proof: &FoldingPcsL2ProofCore<F>,
     c_bytes: &[usize],
 ) -> Result<FoldingPcsL2Wiring, String> {
@@ -476,7 +477,7 @@ pub fn folding_pcs_l2_verify_dr1cs_with_c_bytes<F: PrimeField>(
     let need = (p.r * p.kappa) * p.kappa;
     let c1_bits = bin_matrix_bits_from_stream::<F>(&bits, p.r * p.kappa, p.kappa)?;
     let c2_bits = bin_matrix_bits_from_stream::<F>(&bits[need..], p.r * p.kappa, p.kappa)?;
-    folding_pcs_l2_verify_dr1cs_with_c_bits(b, p, t, x0, x1, x2, u, proof, &c1_bits, &c2_bits)
+    folding_pcs_l2_verify_dr1cs_with_c_bits(b, p, t, x0, x1, x2, proof, &c1_bits, &c2_bits)
 }
 
 // NOTE: no wrapper that takes prover-supplied `C1/C2` — coins must come from transcript.

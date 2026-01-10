@@ -434,6 +434,10 @@ pub struct ByteSqueezeWitness {
 /// specific squeezed field elements (e.g., Fiat–Shamir challenges) as variables.
 #[derive(Clone, Debug, Default)]
 pub struct PoseidonDr1csWiring {
+    /// Flattened variable indices for all absorbed field elements (BF variables) in trace order.
+    pub absorb_vars: Vec<usize>,
+    /// For each `Absorb` op, `(start, len)` into `absorb_vars`.
+    pub absorb_ranges: Vec<(usize, usize)>,
     /// Flattened variable indices for all `SqueezeField` outputs in trace order.
     pub squeeze_field_vars: Vec<usize>,
     /// For each `SqueezeField` op, `(start, len)` into `squeeze_field_vars`.
@@ -646,6 +650,8 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                 if elems.is_empty() {
                     continue;
                 }
+                let range_start = wiring.absorb_vars.len();
+                let mut range_len = 0usize;
                 for &e in elems {
                     // If we were squeezing, permute first.
                     if matches!(mode, ark_crypto_primitives::sponge::DuplexSpongeMode::Squeezing { .. }) {
@@ -664,6 +670,8 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                     // Materialize element as a fixed var (so it can be part of the witness vector).
                     let e_var = b.new_var(e);
                     b.enforce_var_eq_const(e_var, e);
+                    wiring.absorb_vars.push(e_var);
+                    range_len += 1;
 
                     // Update one state slot: state[cap + absorb_index] += e
                     let pos = cfg.capacity + absorb_index;
@@ -676,6 +684,7 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                         next_absorb_index: absorb_index + 1,
                     };
                 }
+                wiring.absorb_ranges.push((range_start, range_len));
             }
             PoseidonTraceOp::SqueezeField(out) => {
                 if out.is_empty() {
