@@ -1133,9 +1133,16 @@ where
         });
 
     // PCS params and commitment/opening.
+    //
+    // NOTE: We may pad the batchlin PCS domain to the next cube power (r^3 >= 2^{log_n}).
+    // `mle_point_to_tensor` already extends the evaluation point with zeros accordingly.
     let pcs_params = batchlin_scalar_pcs_params::<R::BaseRing>(log_n)?;
+    if pcs_params.f_len() < g_len {
+        return Err("PiFold: batchlin scalar pcs params mismatch (f_len < g_len)".to_string());
+    }
     if pcs_params.f_len() != g_len {
-        return Err("PiFold: batchlin scalar pcs params mismatch".to_string());
+        // Zero-pad f_batch on the larger domain.
+        f_batch.resize(pcs_params.f_len(), R::BaseRing::ZERO);
     }
     let (t_vec, s_open) = pcs_commit::<R::BaseRing>(&pcs_params, &f_batch)?;
 
