@@ -15,6 +15,7 @@ use symphony::symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMat
 use symphony::symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig};
 use symphony::transcript::PoseidonTraceOp;
 use symphony::we_gate_arith::WeGateDr1csBuilder;
+use symphony::pcs::batchlin_pcs::{batchlin_scalar_pcs_params, BATCHLIN_PCS_DOMAIN_SEP};
 
 use ark_ff::Field;
 
@@ -256,6 +257,42 @@ fn we_gate_constraint_counts_real_pcs_in_gate() {
     .expect("native folding PCS sanity check failed");
 
     // Use the full trace ops here (production-shape).
+    // PCS#2 (batchlin) must use the prover-produced commitment surface and transcript-bound coins.
+    let log_n = ((out.proof.m * R::dimension()) as f64).log2() as usize;
+    let pcs_params_g = batchlin_scalar_pcs_params::<BF>(log_n).expect("batchlin pcs params");
+    let t_pcs_g = &out.proof.batchlin_pcs_t[0];
+    let x0_g = &out.proof.batchlin_pcs_x0;
+    let x1_g = &out.proof.batchlin_pcs_x1;
+    let x2_g = &out.proof.batchlin_pcs_x2;
+    let pcs_core_g = &out.proof.batchlin_pcs_core;
+
+    // Find the SqueezeBytes index that follows `BATCHLIN_PCS_DOMAIN_SEP` absorption.
+    let mut pcs_coin_squeeze_idx2: Option<usize> = None;
+    {
+        let marker = BF::from(BATCHLIN_PCS_DOMAIN_SEP);
+        let mut squeeze_idx = 0usize;
+        let mut saw_marker = false;
+        for op in &trace.ops {
+            match op {
+                PoseidonTraceOp::Absorb(v) => {
+                    if v.len() == 1 && v[0] == marker {
+                        saw_marker = true;
+                    }
+                }
+                PoseidonTraceOp::SqueezeBytes { .. } => {
+                    if saw_marker {
+                        pcs_coin_squeeze_idx2 = Some(squeeze_idx);
+                        break;
+                    }
+                    squeeze_idx += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    let pcs_coin_squeeze_idx2 =
+        pcs_coin_squeeze_idx2.expect("missing SqueezeBytes after BATCHLIN_PCS_DOMAIN_SEP");
+
     let (full, full_asg) = WeGateDr1csBuilder::poseidon_plus_pifold_plus_cfs_plus_pcs::<R>(
         &poseidon_cfg,
         &trace.ops,
@@ -273,13 +310,13 @@ fn we_gate_constraint_counts_real_pcs_in_gate() {
         &x2,
         &pcs_core,
         pcs_coin_squeeze_idx,
-        &pcs_params,
-        &t_pcs,
-        &x0,
-        &x1,
-        &x2,
-        &pcs_core,
-        pcs_coin_squeeze_idx.saturating_add(1),
+        &pcs_params_g,
+        t_pcs_g,
+        x0_g,
+        x1_g,
+        x2_g,
+        pcs_core_g,
+        pcs_coin_squeeze_idx2,
     )
     .expect("build full gate dr1cs failed");
     full.check(&full_asg).expect("full gate unsat");
