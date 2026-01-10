@@ -522,6 +522,13 @@ where
         .map(R::from)
         .collect::<Vec<R>>();
 
+    // Transcript compression: bind v_digits_folded via a short aggregate commitment.
+    let v_digits_agg =
+        crate::symphony_pifold_streaming::compute_v_digits_folded_aggregate::<R>(
+            &proof.v_digits_folded,
+            kappa,
+        )?;
+
     let hook_round = log2(m_j.next_power_of_two()) as usize;
     let (had_sc, mon_sc) = MLSumcheck::<R, _>::verify_two_as_subprotocol_shared_with_hook(
         transcript,
@@ -535,11 +542,7 @@ where
         &proof.mon_sumcheck,
         hook_round,
         |t, _sampled| {
-            for v_i in &proof.v_digits_folded {
-                for x in v_i {
-                    t.absorb_field_element(x);
-                }
-            }
+            t.absorb_slice(&v_digits_agg);
         },
     )
     .map_err(|e| format!("PiFold: sumcheck verify failed: {e}"))?;
@@ -957,6 +960,13 @@ where
         .map(R::from)
         .collect::<Vec<R>>();
 
+    // Transcript compression: bind v_digits_folded via a short aggregate commitment.
+    let v_digits_agg =
+        crate::symphony_pifold_streaming::compute_v_digits_folded_aggregate::<R>(
+            &proof.v_digits_folded,
+            kappa,
+        )?;
+
     // Verify the two batched sumchecks with shared challenges.
     let hook_round = log2(m_j.next_power_of_two()) as usize;
     let (had_sc, mon_sc) = MLSumcheck::<R, _>::verify_two_as_subprotocol_shared_with_hook(
@@ -971,11 +981,7 @@ where
         &proof.mon_sumcheck,
         hook_round,
         |t, _sampled| {
-            for v_i in &proof.v_digits_folded {
-                    for x in v_i {
-                        t.absorb_field_element(x);
-                }
-            }
+            t.absorb_slice(&v_digits_agg);
         },
     )
     .map_err(|e| format!("PiFold: sumcheck verify failed: {e}"))?;

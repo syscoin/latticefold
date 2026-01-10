@@ -41,7 +41,7 @@ use crate::pcs::folding_pcs_l2::{FoldingPcsL2Params, FoldingPcsL2ProofCore};
 use crate::public_coin_transcript::FixedTranscript;
 use crate::symphony_coins::{derive_beta_chi, derive_J};
 use crate::symphony_pifold_batched::{PiFoldAuxWitness, PiFoldBatchedProof};
-use crate::symphony_pifold_streaming::{CM_G_AGG_SEED, MON_B_AGG_SEED};
+use crate::symphony_pifold_streaming::{CM_G_AGG_SEED, MON_B_AGG_SEED, V_DIGITS_AGG_SEED};
 use crate::pcs::batchlin_pcs::BATCHLIN_PCS_DOMAIN_SEP;
 use crate::pcs::cmf_pcs::{cmf_pcs_coin_bytes_len, cmf_pcs_params_for_flat_len, CMF_PCS_DOMAIN_SEP};
 use crate::transcript::PoseidonTraceOp;
@@ -210,6 +210,54 @@ impl WeGateDr1csBuilder {
         parts.push((mon_b_agg_inst, mon_b_agg_asg));
 
         // ---------------------------------------------------------------------
+        // Ajtai-open check for v_digits_folded aggregate: enforce c_agg = A_agg · v_digits_flat.
+        // This binds the (compressed) hook message absorbed into transcript to the actual
+        // v_digits_folded values used by Π_fold math.
+        // ---------------------------------------------------------------------
+        let k_g = proof.rg_params.k_g;
+        if proof.v_digits_folded.len() != k_g {
+            return Err(format!(
+                "WeGateDr1csBuilder: v_digits_folded len mismatch (got {}, expected k_g={k_g})",
+                proof.v_digits_folded.len()
+            ));
+        }
+        let d = R::dimension();
+        for (dig, v) in proof.v_digits_folded.iter().enumerate() {
+            if v.len() != d {
+                return Err(format!(
+                    "WeGateDr1csBuilder: v_digits_folded[{dig}] len mismatch (got {}, expected d={d})",
+                    v.len()
+                ));
+            }
+        }
+
+        // Flatten v_digits_folded as constant-coefficient ring elements.
+        let mut v_digits_flat: Vec<R> = Vec::with_capacity(k_g * d);
+        for v_i in &proof.v_digits_folded {
+            for &x in v_i {
+                v_digits_flat.push(R::from(x));
+            }
+        }
+        let n_v_digits_agg = v_digits_flat.len();
+        let v_digits_agg_scheme = AjtaiCommitmentScheme::<R>::seeded(
+            b"v_digits_agg",
+            V_DIGITS_AGG_SEED,
+            kappa,
+            n_v_digits_agg,
+        );
+        let v_digits_agg = v_digits_agg_scheme
+            .commit_const_coeff_fast(&v_digits_flat)
+            .map_err(|e| format!("WeGateDr1csBuilder: v_digits_agg commit failed: {e:?}"))?
+            .as_ref()
+            .to_vec();
+        let (v_digits_agg_inst, v_digits_agg_asg) = ajtai_open_dr1cs_from_scheme_full::<R>(
+            &v_digits_agg_scheme,
+            &v_digits_flat,
+            &v_digits_agg,
+        )?;
+        parts.push((v_digits_agg_inst, v_digits_agg_asg));
+
+        // ---------------------------------------------------------------------
         // Extract the Π_fold verifier coin pieces from the proof's recorded coin stream
         // and compute rs_shared via sumcheck verification replay.
         // ---------------------------------------------------------------------
@@ -233,7 +281,7 @@ impl WeGateDr1csBuilder {
         let d = R::dimension();
         let g_len = m * d;
         let g_nvars = log2(g_len) as usize;
-        let k_g = proof.rg_params.k_g;
+        // k_g already checked above for v_digits_folded aggregation.
 
         // Reconstruct witness length `n_f` from `m_j = (n_f/l_h) * lambda_pj`.
         // This is needed to deterministically parameterize the cm_f PCS coin splice.
@@ -392,8 +440,9 @@ impl WeGateDr1csBuilder {
         }
 
         // Build glue list in local indices: (part_a, var_a, part_b, var_b).
-        // part 0 = poseidon, part 1 = cfs-openings, part 2 = cm_g_agg, part 3 = mon_b_agg, part 4 = pifold-math
-        const PIFOLD_PART: usize = 4;
+        // part 0 = poseidon, part 1 = cfs-openings, part 2 = cm_g_agg, part 3 = mon_b_agg,
+        // part 4 = v_digits_agg, part 5 = pifold-math
+        const PIFOLD_PART: usize = 5;
         let mut glue: Vec<(usize, usize, usize, usize)> = Vec::new();
 
         let mut ch = 0usize;
@@ -922,7 +971,7 @@ impl WeGateDr1csBuilder {
         }
         glue.push((pcs_g_part_idx, pcs_g_wiring.u_re_vars[0], bind_part_idx, u_local));
         // Glue lhs locals to Π_fold Step-5 lhs vars.
-        const PIFOLD_PART: usize = 4;
+        const PIFOLD_PART: usize = 5;
         for (&pv, &lv) in pifold_wiring.step5_lhs_ct.iter().zip(lhs_locals.iter()) {
             glue.push((PIFOLD_PART, pv, bind_part_idx, lv));
         }

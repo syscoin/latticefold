@@ -53,6 +53,10 @@ pub const CM_G_AGG_SEED: [u8; 32] = *b"SYMPHONY_CM_G_AGG_V1_0000000000_";
 /// This derives a dedicated Ajtai matrix for binding all mon_b values into a single short value.
 pub const MON_B_AGG_SEED: [u8; 32] = *b"SYMPHONY_MON_B_AGG_V1_000000000_";
 
+/// Fixed seed for the v_digits_folded aggregate commitment scheme.
+/// This derives a dedicated Ajtai matrix for binding the hook message `v_digits_folded` into a short value.
+pub const V_DIGITS_AGG_SEED: [u8; 32] = *b"SYMPHONY_VDIGITS_AGG_V1_00000000";
+
 /// Compute the aggregate commitment for all cm_g values.
 ///
 /// This flattens `cm_g[inst][dig][*]` into a single vector and commits via a dedicated
@@ -153,6 +157,56 @@ where
     let c_agg = agg_scheme
         .commit(&mon_b_flat)
         .map_err(|e| format!("mon_b_aggregate: commit failed: {e:?}"))?;
+    Ok(c_agg.as_ref().to_vec())
+}
+
+/// Compute an aggregate commitment for `v_digits_folded` (shape k_g × d, base-ring scalars).
+///
+/// The scalars are embedded into the ring as constant-coefficient elements and committed via a
+/// dedicated Ajtai scheme. This is used as a **transcript compression**: absorb only `kappa` ring
+/// elements instead of `k_g*d` scalars.
+pub fn compute_v_digits_folded_aggregate<R: CoeffRing>(
+    v_digits_folded: &[Vec<R::BaseRing>],
+    kappa: usize,
+) -> Result<Vec<R>, String>
+where
+    R::BaseRing: Zq + stark_rings::balanced_decomposition::Decompose,
+    R: From<R::BaseRing>,
+{
+    if v_digits_folded.is_empty() {
+        return Err("v_digits_aggregate: empty v_digits_folded".to_string());
+    }
+    if kappa == 0 {
+        return Err("v_digits_aggregate: kappa=0 is invalid".to_string());
+    }
+    let d = v_digits_folded[0].len();
+    if d == 0 {
+        return Err("v_digits_aggregate: d=0 is invalid".to_string());
+    }
+    for (dig, v) in v_digits_folded.iter().enumerate() {
+        if v.len() != d {
+            return Err(format!(
+                "v_digits_aggregate: v_digits_folded[{dig}] len mismatch (got {}, expected {d})",
+                v.len()
+            ));
+        }
+    }
+
+    // Flatten as constant-coefficient ring elements.
+    let mut flat: Vec<R> = Vec::with_capacity(v_digits_folded.len() * d);
+    for v in v_digits_folded {
+        for &x in v {
+            flat.push(R::from(x));
+        }
+    }
+    let n = flat.len();
+    if n == 0 {
+        return Err("v_digits_aggregate: empty flattened vector".to_string());
+    }
+    let agg_scheme = AjtaiCommitmentScheme::<R>::seeded(b"v_digits_agg", V_DIGITS_AGG_SEED, kappa, n);
+    let c_agg = agg_scheme
+        .commit_const_coeff_fast(&flat)
+        .map_err(|e| format!("v_digits_aggregate: commit failed: {e:?}"))?;
     Ok(c_agg.as_ref().to_vec())
 }
 
@@ -947,11 +1001,11 @@ where
                     }
                 }
             }
-            for v_i in &v_digits_folded {
-                for x in v_i {
-                    transcript.absorb_field_element(x);
-                }
-            }
+            // Transcript compression: absorb a short aggregate commitment to v_digits_folded
+            // (instead of k_g*d scalar absorbs).
+            let v_digits_agg =
+                compute_v_digits_folded_aggregate::<R>(&v_digits_folded, kappa)?;
+            transcript.absorb_slice(&v_digits_agg);
         }
 
         v_msg_had = Some(r);
