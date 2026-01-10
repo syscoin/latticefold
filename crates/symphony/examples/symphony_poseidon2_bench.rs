@@ -861,8 +861,9 @@ where
             let r = 1usize;
             let kappa_pcs = kappa; // match cm_f row count
             let pcs_n = R::dimension(); // match ring dimension d
-            let delta = 4u64;
-            let alpha = 1usize;
+            // Must satisfy delta^alpha >= modulus (enforced by folding_pcs_l2 exactness guard).
+            let delta = 1u64 << 32;
+            let alpha = 2usize;
             // Large per-coordinate signed bounds so the synthetic proof doesn't trip range checks.
             let beta0 = 1u64 << 63;
             let beta1 = beta0;
@@ -873,8 +874,8 @@ where
             let r = 1usize;
             let kappa_pcs = 2usize;
             let pcs_n = 4usize;
-            let delta = 4u64;
-            let alpha = 1usize;
+            let delta = 1u64 << 32;
+            let alpha = 2usize;
             let beta0 = 1u64 << 10;
             let beta1 = 2 * beta0;
             let beta2 = 2 * beta1;
