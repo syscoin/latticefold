@@ -140,6 +140,11 @@ where
             .verify(&proof.linb2x.cm_g, &proof.linb2x.vo, self.params.B);
         true
     }
+
+    /// Get reference to transcript (for metrics after verification)
+    pub fn transcript(&self) -> &TS {
+        &self.transcript
+    }
 }
 
 #[cfg(test)]
@@ -213,6 +218,13 @@ mod tests {
         let transcript = PoseidonTranscript::empty::<PC>();
         let mut verifier = PlusVerifier::init(A, M, pparams, transcript);
         verifier.verify(&proof);
+        
+        // Print transcript metrics for DPP cost estimation
+        println!("\n=== LF+ Verifier Transcript Metrics (n={}) ===", n);
+        println!("  Ring dimension d = {}", R::dimension());
+        println!("  Decomposition k = {}, l = {}", k, l);
+        println!("  Folding instances L = {}", L);
+        verifier.transcript().print_metrics();
     }
 
     #[test]

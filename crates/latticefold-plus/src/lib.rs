@@ -10,5 +10,6 @@ pub mod plus;
 pub mod r1cs;
 pub mod rgchk;
 pub mod setchk;
+pub mod tensor_eval;
 pub mod transcript;
 pub mod utils;

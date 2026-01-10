@@ -480,16 +480,13 @@ where
 
                 let r: Vec<R> = self.dcom.out.r.iter().map(|x| R::from(*x)).collect();
                 let ro: Vec<R> = subclaim.point.into_iter().map(|x| x.into()).collect();
-                let t0 = DenseMultilinearExtension::from_evaluations_vec(
-                    nvars,
-                    calculate_t_z(&c[0], &s_prime_flat, &dpp, &xp),
-                );
-                let t0_ro = t0.evaluate(&ro).unwrap();
-                let t1 = DenseMultilinearExtension::from_evaluations_vec(
-                    nvars,
-                    calculate_t_z(&c[1], &s_prime_flat, &dpp, &xp),
-                );
-                let t1_ro = t1.evaluate(&ro).unwrap();
+                
+                // OPTIMIZED: Use tensor structure for O(small) evaluation instead of O(n)
+                // The tensor product t(z) = tensor(c_z) ⊗ s' ⊗ d_powers ⊗ x_powers
+                // can be evaluated factor-by-factor in O(κ + k*d + ℓ + d) time.
+                use crate::tensor_eval::eval_t_z_optimized;
+                let t0_ro = eval_t_z_optimized(&c[0], &s_prime_flat, &dpp, &xp, &ro);
+                let t1_ro = eval_t_z_optimized(&c[1], &s_prime_flat, &dpp, &xp, &ro);
 
                 let expected_eval = subclaim.expected_evaluation;
 
