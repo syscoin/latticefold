@@ -11,12 +11,8 @@ fn main() {
     use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
     use latticefold::commitment::AjtaiCommitmentScheme;
     use symphony::{
-        pcs::dpp_folding_pcs_l2::folding_pcs_l2_params,
-        pcs::folding_pcs_l2::{
-            gadget_apply_digits, kron_ct_in_mul, kron_i_a_mul, kron_ikn_xt_mul, BinMatrix,
-            DenseMatrix, FoldingPcsL2ProofCore,
-            verify_folding_pcs_l2_with_c_matrices,
-        },
+        pcs::batchlin_pcs::{batchlin_scalar_pcs_params, BATCHLIN_PCS_DOMAIN_SEP},
+        pcs::folding_pcs_l2::{BinMatrix, verify_folding_pcs_l2_with_c_matrices},
         pcs::{cmf_pcs, folding_pcs_l2},
         rp_rgchk::RPParams,
         symphony_open::MultiAjtaiOpenVerifier,
@@ -69,13 +65,18 @@ fn main() {
         // Build witnesses: alternate 1 and 0 (both idempotent).
         let mut witnesses: Vec<Arc<Vec<R>>> = Vec::with_capacity(ell);
         let mut cm_f: Vec<Vec<R>> = Vec::with_capacity(ell);
+        type BF = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
+        // Save PCS#1 (cm_f PCS) material for instance 0 so the full WE gate can bind it.
+        let mut pcs_params_f0: Option<symphony::pcs::folding_pcs_l2::FoldingPcsL2Params<BF>> = None;
+        let mut f_pcs_f0: Option<Vec<BF>> = None;
+        let mut s_pcs_f0: Option<[Vec<BF>; 3]> = None;
+        let mut t_pcs_f0: Option<Vec<BF>> = None;
         for i in 0..ell {
             let f = if i % 2 == 0 {
                 vec![R::ONE; n]
             } else {
                 vec![R::ZERO; n]
             };
-            type BF = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
             let flat_witness: Vec<BF> = f
                 .iter()
                 .flat_map(|re| {
@@ -90,9 +91,15 @@ fn main() {
             )
             .expect("cm_f pcs params");
             let f_pcs_f = cmf_pcs::pad_flat_message(&pcs_params_f, &flat_witness);
-            let (t_pcs_f, _s_pcs_f) =
+            let (t_pcs_f, s_pcs_f) =
                 folding_pcs_l2::commit(&pcs_params_f, &f_pcs_f).expect("cm_f pcs commit failed");
             let cm = cmf_pcs::pack_t_as_ring::<R>(&t_pcs_f);
+            if i == 0 {
+                pcs_params_f0 = Some(pcs_params_f.clone());
+                f_pcs_f0 = Some(f_pcs_f.clone());
+                s_pcs_f0 = Some(s_pcs_f);
+                t_pcs_f0 = Some(t_pcs_f.clone());
+            }
             witnesses.push(Arc::new(f));
             cm_f.push(cm);
         }
@@ -162,8 +169,7 @@ fn main() {
             out.proof.coins.bytes.len()
         );
 
-        // Gate size report: build r_cp and full (with a tiny PCS instance, coins from trace SqueezeBytes).
-        type BF = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
+        // Gate size report: build r_cp and full (real PCS-in-gate).
         let poseidon_cfg = <PC as GetPoseidonParams<BF>>::get_poseidon_config();
 
         let (rcp, rcp_asg) = WeGateDr1csBuilder::r_cp_poseidon_pifold_math_and_cfs_openings::<R>(
@@ -207,15 +213,13 @@ fn main() {
                 bits.push(((b >> i) & 1) == 1);
             }
         }
-        let r = 1usize;
-        let kappa = 2usize;
-        let pcs_n = 4usize;
-        // Must satisfy delta^alpha >= modulus (enforced by folding_pcs_l2 exactness guard).
-        let delta = 1u64 << 32;
-        let alpha = 2usize;
-        let beta0 = 1u64 << 10;
-        let beta1 = 2 * beta0;
-        let beta2 = 2 * beta1;
+        // Build a real PCS#1 opening proof consistent with the absorbed cm_f surface.
+        let pcs_params = pcs_params_f0.clone().expect("missing pcs_params_f0");
+        let f_pcs = f_pcs_f0.clone().expect("missing f_pcs_f0");
+        let s_pcs = s_pcs_f0.clone().expect("missing s_pcs_f0");
+        let t_pcs = t_pcs_f0.clone().expect("missing t_pcs_f0");
+        let r = pcs_params.r;
+        let kappa = pcs_params.kappa;
         let c1 = BinMatrix {
             rows: r * kappa,
             cols: kappa,
@@ -236,33 +240,27 @@ fn main() {
                 })
                 .collect(),
         };
-        let mut a_data = vec![<BF as Field>::ZERO; pcs_n * (r * pcs_n * alpha)];
-        for i in 0..pcs_n {
-            a_data[i * (r * pcs_n * alpha) + i] = <BF as Field>::ONE;
-        }
-        let a = DenseMatrix::new(pcs_n, r * pcs_n * alpha, a_data);
-        let pcs_params = folding_pcs_l2_params(r, kappa, pcs_n, delta, alpha, beta0, beta1, beta2, a);
         let x0 = vec![<BF as Field>::ONE; r];
         let x1 = vec![<BF as Field>::ONE; r];
         let x2 = vec![<BF as Field>::ONE; r];
-        let y0 = vec![<BF as Field>::ONE; pcs_params.y0_len()];
-        let y1 = kron_ct_in_mul(&c1, pcs_n, &y0);
-        let y2 = kron_ct_in_mul(&c2, pcs_n, &y1);
-        let t_pcs = kron_i_a_mul(&pcs_params.a, pcs_params.kappa, pcs_params.r * pcs_params.n * pcs_params.alpha, &y0);
-        let mut delta_pows = Vec::with_capacity(alpha);
-        let mut acc = <BF as Field>::ONE;
-        let delta_f = <BF as From<u64>>::from(delta);
-        for _ in 0..alpha {
-            delta_pows.push(acc);
-            acc *= delta_f;
-        }
-        let v0 = gadget_apply_digits(&delta_pows, r * kappa * pcs_n, &y0);
-        let v1 = gadget_apply_digits(&delta_pows, r * kappa * pcs_n, &y1);
-        let v2 = gadget_apply_digits(&delta_pows, r * kappa * pcs_n, &y2);
-        let u_pcs = kron_ikn_xt_mul(&x2, kappa, pcs_n, &v0);
-        let pcs_core = FoldingPcsL2ProofCore { y0, v0, y1, v1, y2, v2 };
+        let (u_pcs, pcs_core) =
+            folding_pcs_l2::open(&pcs_params, &f_pcs, &s_pcs, &x0, &x1, &x2, &c1, &c2)
+                .expect("cm_f pcs open failed");
         verify_folding_pcs_l2_with_c_matrices(&pcs_params, &t_pcs, &x0, &x1, &x2, &u_pcs, &pcs_core, &c1, &c2)
             .expect("native folding pcs sanity failed");
+
+        let pcs_coin_squeeze_idx2 = find_squeeze_bytes_idx_after_absorb_marker(
+            &trace.ops,
+            BF::from(BATCHLIN_PCS_DOMAIN_SEP),
+        )
+        .expect("missing SqueezeBytes after BATCHLIN_PCS_DOMAIN_SEP");
+        let log_n = ((out.proof.m * R::dimension()) as f64).log2() as usize;
+        let pcs_params_g = batchlin_scalar_pcs_params::<BF>(log_n).expect("batchlin pcs params");
+        let t_pcs_g = &out.proof.batchlin_pcs_t[0];
+        let x0_g = &out.proof.batchlin_pcs_x0;
+        let x1_g = &out.proof.batchlin_pcs_x1;
+        let x2_g = &out.proof.batchlin_pcs_x2;
+        let pcs_core_g = &out.proof.batchlin_pcs_core;
 
         let (full, full_asg) = WeGateDr1csBuilder::poseidon_plus_pifold_plus_cfs_plus_pcs::<R>(
             &poseidon_cfg,
@@ -281,13 +279,13 @@ fn main() {
             &x2,
             &pcs_core,
             pcs_coin_squeeze_idx,
-            &pcs_params,
-            &t_pcs,
-            &x0,
-            &x1,
-            &x2,
-            &pcs_core,
-            pcs_coin_squeeze_idx.saturating_add(1),
+            &pcs_params_g,
+            t_pcs_g,
+            x0_g,
+            x1_g,
+            x2_g,
+            pcs_core_g,
+            pcs_coin_squeeze_idx2,
         )
         .expect("build full gate dr1cs failed");
         full.check(&full_asg).expect("full gate unsat");
