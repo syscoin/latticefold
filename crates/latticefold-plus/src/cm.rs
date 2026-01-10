@@ -139,13 +139,9 @@ where
             })
             .collect::<Vec<_>>();
 
-        // Pad dpp to next power of 2 for optimized tensor evaluation
-        let l_padded = l.next_power_of_two();
-        let mut dpp: Vec<R> = (0..l)
+        let dpp = (0..l)
             .map(|i| R::from(R::BaseRing::from(dp as u128).pow([i as u64])))
-            .collect();
-        dpp.resize(l_padded, R::zero()); // Pad with zeros
-        
+            .collect::<Vec<_>>();
         let xp = (0..d).map(|i| unit_monomial::<R>(i)).collect::<Vec<_>>();
 
         let mut t0 = calculate_t_z(&c[0], &s_prime_flat, &dpp, &xp);
@@ -436,13 +432,9 @@ where
 
         let dp = R::dimension() / 2;
         let l = self.dcom.dparams.l;
-        // Pad dpp to next power of 2 for optimized tensor evaluation
-        let l_padded = l.next_power_of_two();
-        let mut dpp: Vec<R> = (0..l)
+        let dpp = (0..l)
             .map(|i| R::from(R::BaseRing::from(dp as u128).pow([i as u64])))
-            .collect();
-        dpp.resize(l_padded, R::zero()); // Pad with zeros
-        
+            .collect::<Vec<_>>();
         let xp = (0..d).map(|i| unit_monomial::<R>(i)).collect::<Vec<_>>();
 
         let mut verify_sumcheck =
