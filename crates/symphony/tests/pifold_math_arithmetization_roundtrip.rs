@@ -12,7 +12,7 @@ use symphony::rp_rgchk::RPParams;
 use symphony::symphony_coins::{derive_J, derive_beta_chi};
 use symphony::symphony_open::MultiAjtaiOpenVerifier;
 use symphony::symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices};
-use symphony::symphony_pifold_streaming::{compute_cm_g_aggregate, prove_pi_fold_poseidon_fs, PiFoldStreamingConfig};
+use symphony::symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig};
 use latticefold::commitment::AjtaiCommitmentScheme;
 use symphony::pcs::{cmf_pcs, folding_pcs_l2};
 use symphony::pcs::cmf_pcs::CMF_PCS_DOMAIN_SEP;
@@ -214,10 +214,12 @@ fn test_pifold_math_dr1cs_roundtrip_satisfiable_and_tamper_fails() {
         let _j = derive_J::<R>(&mut ts, rg_params.lambda_pj, rg_params.l_h);
     }
 
-    // Aggregate cm_g absorption (matches prover/verifier schedule).
-    let kappa = out.proof.cm_g[0][0].len();
-    let cm_g_agg = compute_cm_g_aggregate(&out.proof.cm_g, kappa).expect("cm_g_agg failed");
-    ts.absorb_slice(&cm_g_agg);
+    // Bind cm_g commitments into transcript before Π_mon coins (matches prover/verifier schedule).
+    for inst_idx in 0..ell {
+        for dig in 0..rg_params.k_g {
+            ts.absorb_slice(&out.proof.cm_g[inst_idx][dig]);
+        }
+    }
 
     // Phase 2: derive coins for each instance.
     for _ in 0..ell {

@@ -36,7 +36,7 @@ use stark_rings_poly::mle::DenseMultilinearExtension;
 use crate::{
     symphony_coins::{derive_beta_chi, derive_J, ev, ts_weights},
     symphony_open::{NoOpen, VfyOpen},
-    symphony_pifold_streaming::{compute_cm_g_aggregate, compute_mon_b_aggregate},
+    symphony_pifold_streaming::compute_mon_b_aggregate,
     pcs::batchlin_pcs::BATCHLIN_PCS_DOMAIN_SEP,
     pcs::cmf_pcs::{cmf_pcs_coin_bytes_len, cmf_pcs_params_for_flat_len, CMF_PCS_DOMAIN_SEP},
     pcs::folding_pcs_l2::FoldingPcsL2ProofCore,
@@ -490,15 +490,12 @@ where
         }
     }
 
-    // Aggregate cm_g absorption: bind all cm_g commitments via a single short Ajtai commit.
-    // Determine kappa from the first commitment (all should have same length).
-    let kappa = if !proof.cm_g.is_empty() && !proof.cm_g[0].is_empty() {
-        proof.cm_g[0][0].len()
-    } else {
-        return Err("PiFold: empty cm_g".to_string());
-    };
-    let cm_g_agg = compute_cm_g_aggregate(&proof.cm_g, kappa)?;
-    transcript.absorb_slice(&cm_g_agg);
+    // Bind cm_g commitments into transcript before Π_mon challenges.
+    for inst_idx in 0..ell {
+        for dig in 0..rg_params.k_g {
+            transcript.absorb_slice(&proof.cm_g[inst_idx][dig]);
+        }
+    }
 
     // Phase 2: Derive Π_mon coins for all instances (now bound to the aggregate).
     for _inst_idx in 0..ell {
@@ -677,6 +674,12 @@ where
         mon_b
     };
 
+    // Ajtai commitment length (kappa) inferred from cm_g commitments.
+    let kappa = if !proof.cm_g.is_empty() && !proof.cm_g[0].is_empty() {
+        proof.cm_g[0][0].len()
+    } else {
+        return Err("PiFold: empty cm_g".to_string());
+    };
     // Aggregate mon_b absorption: bind all mon_b values into transcript via a single
     // short Ajtai commitment (reduces Poseidon permutations from O(ell*k_g) to O(kappa)).
     let mon_b_agg = compute_mon_b_aggregate(&mon_b, kappa)?;
@@ -926,14 +929,11 @@ where
         }
     }
 
-    // Aggregate cm_g absorption: bind all cm_g commitments via a single short Ajtai commit.
-    let kappa = if !proof.cm_g.is_empty() && !proof.cm_g[0].is_empty() {
-        proof.cm_g[0][0].len()
-    } else {
-        return Err("PiFold: empty cm_g".to_string());
-    };
-    let cm_g_agg = compute_cm_g_aggregate(&proof.cm_g, kappa)?;
-    transcript.absorb_slice(&cm_g_agg);
+    for inst_idx in 0..ell {
+        for dig in 0..rg_params.k_g {
+            transcript.absorb_slice(&proof.cm_g[inst_idx][dig]);
+        }
+    }
 
     // Phase 2: Derive Π_mon coins for all instances (now bound to the aggregate).
     for _inst_idx in 0..ell {
@@ -1106,6 +1106,13 @@ where
             mon_b.push(b_inst);
         }
         mon_b
+    };
+
+    // Ajtai commitment length (kappa) inferred from cm_g commitments.
+    let kappa = if !proof.cm_g.is_empty() && !proof.cm_g[0].is_empty() {
+        proof.cm_g[0][0].len()
+    } else {
+        return Err("PiFold: empty cm_g".to_string());
     };
 
     // Aggregate mon_b absorption: bind all mon_b values into transcript via a single
