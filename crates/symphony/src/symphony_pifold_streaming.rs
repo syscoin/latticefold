@@ -45,9 +45,70 @@ use crate::pcs::cmf_pcs::{cmf_pcs_coin_bytes_len, cmf_pcs_params_for_flat_len, C
 use crate::pcs::batchlin_pcs::{batchlin_scalar_pcs_params, BatchlinPcsConfig, mle_point_to_tensor};
 use crate::pcs::folding_pcs_l2::{commit as pcs_commit, open as pcs_open, BinMatrix};
 
+/// Fixed seed for the cm_g aggregate commitment scheme.
+/// This derives a dedicated Ajtai matrix for binding all cm_g commitments into a single short value.
+pub const CM_G_AGG_SEED: [u8; 32] = *b"SYMPHONY_CM_G_AGG_V1_0000000000_";
+
 /// Fixed seed for the mon_b aggregate commitment scheme.
 /// This derives a dedicated Ajtai matrix for binding all mon_b values into a single short value.
 pub const MON_B_AGG_SEED: [u8; 32] = *b"SYMPHONY_MON_B_AGG_V1_000000000_";
+
+/// Compute the aggregate commitment for all cm_g values.
+///
+/// This flattens `cm_g[inst][dig][*]` into a single vector and commits via a dedicated
+/// Ajtai scheme. The result is a short commitment that binds all cm_g values, reducing
+/// Poseidon absorption from O(ell * k_g * kappa) field elements to O(kappa).
+pub fn compute_cm_g_aggregate<R: CoeffRing>(
+    cm_g: &[Vec<Vec<R>>],
+    kappa: usize,
+) -> Result<Vec<R>, String>
+where
+    R::BaseRing: Zq + stark_rings::balanced_decomposition::Decompose,
+{
+    if cm_g.is_empty() {
+        return Err("cm_g_aggregate: empty cm_g".to_string());
+    }
+    if kappa == 0 {
+        return Err("cm_g_aggregate: kappa=0 is invalid".to_string());
+    }
+    let k_g = cm_g[0].len();
+    if k_g == 0 {
+        return Err("cm_g_aggregate: k_g=0 (no digits) is invalid".to_string());
+    }
+    // Flatten: concat_{inst, dig, j} cm_g[inst][dig][j]
+    let mut cm_g_flat: Vec<R> = Vec::new();
+    for (inst_idx, inst) in cm_g.iter().enumerate() {
+        if inst.is_empty() {
+            return Err(format!("cm_g_aggregate: empty cm_g[{inst_idx}]"));
+        }
+        if inst.len() != k_g {
+            return Err(format!(
+                "cm_g_aggregate: cm_g[{inst_idx}] digit count mismatch (got {}, expected {k_g})",
+                inst.len()
+            ));
+        }
+        for (dig_idx, dig) in inst.iter().enumerate() {
+            if dig.len() != kappa {
+                return Err(format!(
+                    "cm_g_aggregate: cm_g[{inst_idx}][{dig_idx}] len mismatch (got {}, expected {kappa})",
+                    dig.len()
+                ));
+            }
+            cm_g_flat.extend(dig.iter().copied());
+        }
+    }
+    let n = cm_g_flat.len();
+    if n == 0 {
+        return Err("cm_g_aggregate: flattened cm_g is empty".to_string());
+    }
+    
+    // Create the aggregate scheme with the dedicated domain and seed.
+    let agg_scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_g_agg", CM_G_AGG_SEED, kappa, n);
+    let c_agg = agg_scheme
+        .commit(&cm_g_flat)
+        .map_err(|e| format!("cm_g_aggregate: commit failed: {e:?}"))?;
+    Ok(c_agg.as_ref().to_vec())
+}
 
 /// Compute the aggregate commitment for all mon_b values.
 ///
@@ -568,16 +629,12 @@ where
     }
 
     // -----------------------------------------------------------------------
-    // Bind cm_g commitments into transcript before Π_mon challenges.
-    //
-    // These are prover messages (Figure 2 Step 3). They MUST be absorbed before Π_mon challenges
-    // are sampled, otherwise Π_mon becomes malleable.
+    // Aggregate cm_g absorption: bind all cm_g commitments into transcript via a single
+    // short Ajtai commitment (reduces Poseidon permutations from O(ell*k_g*kappa) to O(kappa)).
     // -----------------------------------------------------------------------
-    for inst_idx in 0..ell {
-        for dig in 0..rg_params.k_g {
-            transcript.absorb_slice(&cm_g[inst_idx][dig]);
-        }
-    }
+    let kappa = cm_g_scheme.kappa();
+    let cm_g_agg = compute_cm_g_aggregate(&cm_g, kappa)?;
+    transcript.absorb_slice(&cm_g_agg);
 
     // -----------------------------------------------------------------------
     // Phase 2: Derive Π_mon coins for all instances (now bound to the aggregate).
@@ -601,7 +658,7 @@ where
 
     if prof {
         eprintln!(
-            "[PiFold streaming hetero] coins+J+cm_g: {:?} (ell={}, k_g={}, g_nvars={})",
+            "[PiFold streaming hetero] coins+J+agg: {:?} (ell={}, k_g={}, g_nvars={})",
             t_coins.elapsed(),
             ell,
             rg_params.k_g,
@@ -995,7 +1052,6 @@ where
     // Aggregate mon_b absorption: bind all mon_b values into transcript via a single
     // short Ajtai commitment (reduces Poseidon permutations from O(ell*k_g) to O(kappa)).
     // -----------------------------------------------------------------------
-    let kappa = cm_g_scheme.kappa();
     let mon_b_agg = compute_mon_b_aggregate(&mon_b, kappa)?;
     transcript.absorb_slice(&mon_b_agg);
 

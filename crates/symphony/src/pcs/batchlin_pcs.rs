@@ -5,9 +5,9 @@
 //!
 //! ## Architecture (Stage 1)
 //!
-//! We bind the Π_mon prover messages (`cm_g`) directly into the transcript schedule and use
-//! the PCS layer for the folded batchlin object. This gives us soundness for `R_batchlin`
-//! without a separate Ajtai aggregate commitment object.
+//! For now, we keep the existing `cm_g_agg` Ajtai binding intact and ADD the PCS layer
+//! for the folded batchlin object. This gives us real soundness for `R_batchlin` without
+//! breaking the existing Π_mon schedule.
 //!
 //! ## Point Conversion
 //!

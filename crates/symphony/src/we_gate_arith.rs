@@ -41,7 +41,7 @@ use crate::pcs::folding_pcs_l2::{FoldingPcsL2Params, FoldingPcsL2ProofCore};
 use crate::public_coin_transcript::FixedTranscript;
 use crate::symphony_coins::{derive_beta_chi, derive_J};
 use crate::symphony_pifold_batched::{PiFoldAuxWitness, PiFoldBatchedProof};
-use crate::symphony_pifold_streaming::MON_B_AGG_SEED;
+use crate::symphony_pifold_streaming::{CM_G_AGG_SEED, MON_B_AGG_SEED};
 use crate::pcs::batchlin_pcs::BATCHLIN_PCS_DOMAIN_SEP;
 use crate::pcs::cmf_pcs::{cmf_pcs_coin_bytes_len, cmf_pcs_params_for_flat_len, CMF_PCS_DOMAIN_SEP};
 use crate::transcript::PoseidonTraceOp;
@@ -151,12 +151,41 @@ impl WeGateDr1csBuilder {
         parts.push((poseidon_inst, poseidon_asg));
         parts.push((cfs_inst, cfs_asg));
 
-        // Determine kappa from the first commitment (used below for mon_b_agg scheme).
+        // ---------------------------------------------------------------------
+        // Ajtai-open check for cm_g aggregate: enforce c_agg = A_agg · cm_g_flat.
+        // This binds the aggregate (absorbed into transcript) to the individual cm_g values.
+        // ---------------------------------------------------------------------
         let kappa = if !proof.cm_g.is_empty() && !proof.cm_g[0].is_empty() {
             proof.cm_g[0][0].len()
         } else {
-            return Err("WeGateDr1csBuilder: empty cm_g".to_string());
+            return Err("WeGateDr1csBuilder: empty cm_g for aggregate".to_string());
         };
+
+        // Flatten cm_g: concat_{inst, dig, j} cm_g[inst][dig][j]
+        let mut cm_g_flat: Vec<R> = Vec::new();
+        for inst in proof.cm_g.iter() {
+            for dig in inst.iter() {
+                cm_g_flat.extend(dig.iter().copied());
+            }
+        }
+        let n_agg = cm_g_flat.len();
+
+        // Create the aggregate scheme (same as used in compute_cm_g_aggregate).
+        let cm_g_agg_scheme =
+            AjtaiCommitmentScheme::<R>::seeded(b"cm_g_agg", CM_G_AGG_SEED, kappa, n_agg);
+
+        // Compute the expected aggregate (verifier-side recomputation).
+        let cm_g_agg = cm_g_agg_scheme
+            .commit(&cm_g_flat)
+            .map_err(|e| format!("WeGateDr1csBuilder: cm_g_agg commit failed: {e:?}"))?
+            .as_ref()
+            .to_vec();
+
+        // Enforce: A_agg · cm_g_flat = cm_g_agg (linear constraints).
+        let (cm_g_agg_inst, cm_g_agg_asg) =
+            ajtai_open_dr1cs_from_scheme_full::<R>(&cm_g_agg_scheme, &cm_g_flat, &cm_g_agg)?;
+        parts.push((cm_g_agg_inst, cm_g_agg_asg));
+
         // Flatten mon_b: concat_{inst, dig} mon_b[inst][dig]
         let mut mon_b_flat: Vec<R> = Vec::new();
         for inst in aux.mon_b.iter() {
@@ -241,12 +270,8 @@ impl WeGateDr1csBuilder {
             let _j = derive_J::<R>(&mut ts, proof.rg_params.lambda_pj, proof.rg_params.l_h);
         }
 
-        // Bind cm_g commitments (prover messages) into transcript before Π_mon challenges.
-        for inst_idx in 0..ell {
-            for dig in 0..k_g {
-                ts.absorb_slice(&proof.cm_g[inst_idx][dig]);
-            }
-        }
+        // Aggregate cm_g absorption (reuse cm_g_agg computed above for Ajtai check).
+        ts.absorb_slice(&cm_g_agg);
 
         // Phase 2: derive coins for each instance.
         for _ in 0..ell {
@@ -367,8 +392,8 @@ impl WeGateDr1csBuilder {
         }
 
         // Build glue list in local indices: (part_a, var_a, part_b, var_b).
-        // part 0 = poseidon, part 1 = cfs-openings, part 2 = mon_b_agg, part 3 = pifold-math
-        const PIFOLD_PART: usize = 3;
+        // part 0 = poseidon, part 1 = cfs-openings, part 2 = cm_g_agg, part 3 = mon_b_agg, part 4 = pifold-math
+        const PIFOLD_PART: usize = 4;
         let mut glue: Vec<(usize, usize, usize, usize)> = Vec::new();
 
         let mut ch = 0usize;
@@ -897,8 +922,7 @@ impl WeGateDr1csBuilder {
         }
         glue.push((pcs_g_part_idx, pcs_g_wiring.u_re_vars[0], bind_part_idx, u_local));
         // Glue lhs locals to Π_fold Step-5 lhs vars.
-        // Part indices (after cm_g_agg removal): 0=poseidon, 1=cfs-openings, 2=mon_b_agg, 3=pifold-math.
-        const PIFOLD_PART: usize = 3;
+        const PIFOLD_PART: usize = 4;
         for (&pv, &lv) in pifold_wiring.step5_lhs_ct.iter().zip(lhs_locals.iter()) {
             glue.push((PIFOLD_PART, pv, bind_part_idx, lv));
         }
