@@ -211,6 +211,10 @@ pub fn eval_tensor4_mle<F: OverField>(
 ///
 /// # Complexity
 /// O(κ + k*d + ℓ + d) instead of O(κ * k*d * ℓ * d)
+///
+/// Note: We precompute tensor(c_z) (size κ = 2^log_κ, typically small like 8-16)
+/// instead of using eval_tensor_mle, because the tensor() function has specific
+/// bit ordering that doesn't match the standard MLE eq formula.
 pub fn eval_t_z_optimized<F: OverField>(
     c_z: &[F],
     s_prime: &[F],
@@ -218,10 +222,10 @@ pub fn eval_t_z_optimized<F: OverField>(
     x_powers: &[F],
     r: &[F],
 ) -> F {
-    // For tensor(c_z), we use the special eval_tensor_mle
-    // which is O(|c_z|) instead of O(2^|c_z|)
-    
-    let kappa = 1 << c_z.len(); // 2^|c_z|
+    // Precompute tensor(c_z) - this is O(κ) where κ = 2^|c_z|
+    // For typical κ = 8 or 16, this is negligible.
+    let tensor_c_z = tensor(c_z);
+    let kappa = tensor_c_z.len();
     
     // Factor sizes in REVERSE order (innermost to outermost)
     let config = TensorConfig::new(vec![
@@ -240,15 +244,33 @@ pub fn eval_t_z_optimized<F: OverField>(
     let r2 = &r[offsets[2]..offsets[2] + vars[2]]; // s_prime
     let r1 = &r[offsets[3]..offsets[3] + vars[3]]; // tensor(c_z)
     
-    // Evaluate tensor(c_z) MLE at r1 using special formula
-    let v1 = eval_tensor_mle(c_z, r1);
-    
-    // Evaluate other factors using standard small MLE eval
+    // Evaluate each factor's MLE using standard small MLE eval
+    let v1 = eval_small_mle(&tensor_c_z, r1);
     let v2 = eval_small_mle(s_prime, r2);
     let v3 = eval_small_mle(d_prime_powers, r3);
     let v4 = eval_small_mle(x_powers, r4);
     
     v1 * v2 * v3 * v4
+}
+
+/// Compute tensor(c) = fold over tensor_product with [1-c_i, c_i]
+/// 
+/// This matches the `tensor` function in utils.rs
+fn tensor<F: OverField>(c: &[F]) -> Vec<F> {
+    c.iter().fold(vec![F::one()], |acc, x| {
+        tensor_product_pair(&acc, &[F::one() - *x, *x])
+    })
+}
+
+/// Simple tensor product of two vectors: a ⊗ b
+fn tensor_product_pair<F: OverField>(a: &[F], b: &[F]) -> Vec<F> {
+    let mut result = Vec::with_capacity(a.len() * b.len());
+    for &ai in a {
+        for &bi in b {
+            result.push(ai * bi);
+        }
+    }
+    result
 }
 
 #[cfg(test)]
