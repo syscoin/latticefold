@@ -201,16 +201,6 @@ pub fn merge_sparse_dr1cs_share_one_with_glue<F: PrimeField>(
         }
         let ga = remap_global(pa, xa, &offsets);
         let gb = remap_global(pb, xb, &offsets);
-        // Fail-fast if caller tried to glue variables with inconsistent assignments.
-        // This is almost always a transcript schedule / wiring bug.
-        if merged_assignment[ga] != merged_assignment[gb] {
-            return Err(format!(
-                "merge_sparse_dr1cs_share_one_with_glue: glue assignment mismatch: \
-pa={pa} xa={xa} (g={ga}) val_a={:?} vs pb={pb} xb={xb} (g={gb}) val_b={:?}",
-                merged_assignment[ga],
-                merged_assignment[gb],
-            ));
-        }
         merged_constraints.push(Constraint {
             a: vec![(F::ONE, ga), (-F::ONE, gb)],
             b: vec![(F::ONE, 0)],

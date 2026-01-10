@@ -947,10 +947,10 @@ where
                     }
                 }
             }
-            // Absorb v_digits_folded as ring elements (one per digit) for a canonical, compact schedule.
-            // This must match the verifier schedule.
             for v_i in &v_digits_folded {
-                transcript.absorb(&R::from(v_i.clone()));
+                for x in v_i {
+                    transcript.absorb_field_element(x);
+                }
             }
         }
 
@@ -1140,9 +1140,6 @@ where
     let (t_vec, s_open) = pcs_commit::<R::BaseRing>(&pcs_params, &f_batch)?;
 
     // Bind commitment surface into transcript (required by verifier schedule).
-    //
-    // IMPORTANT: must match `symphony_pifold_batched` verifier schedule exactly:
-    // absorb outer len, inner len, then absorb all elements of t.
     let batchlin_pcs_t: Vec<Vec<R::BaseRing>> = vec![t_vec.clone()];
     transcript.absorb_field_element(&R::BaseRing::from(batchlin_pcs_t.len() as u128));
     transcript.absorb_field_element(&R::BaseRing::from(batchlin_pcs_t[0].len() as u128));

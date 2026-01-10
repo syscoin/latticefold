@@ -537,9 +537,10 @@ where
         &proof.mon_sumcheck,
         hook_round,
         |t, _sampled| {
-            // Match prover schedule: absorb v_digits_folded as ring elements (one per digit).
             for v_i in &proof.v_digits_folded {
-                t.absorb(&R::from(v_i.clone()));
+                for x in v_i {
+                    t.absorb_field_element(x);
+                }
             }
         },
     )
@@ -973,7 +974,9 @@ where
         hook_round,
         |t, _sampled| {
             for v_i in &proof.v_digits_folded {
-                t.absorb(&R::from(v_i.clone()));
+                    for x in v_i {
+                        t.absorb_field_element(x);
+                }
             }
         },
     )

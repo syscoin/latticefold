@@ -311,7 +311,9 @@ impl WeGateDr1csBuilder {
             hook_round,
             |t, _sampled| {
                 for v_i in &proof.v_digits_folded {
-                    t.absorb(&R::from(v_i.clone()));
+                    for x in v_i {
+                        t.absorb_field_element(x);
+                    }
                 }
             },
         )
