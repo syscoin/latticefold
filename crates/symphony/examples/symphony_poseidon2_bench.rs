@@ -1138,8 +1138,11 @@ where
                         let a = cw.y_a_tail[j];
                         let b = cw.y_b_tail[j];
                         let wv = cw.w[idx];
-                        let cx_minus = cw.y_c_tail[j]; // subtract 0 for the tail half
-                        let c = wv + lambda_small * cx_minus;
+                        // For α in the "tail" half (k+1..2k), the verifier's q3 uses only the w-part:
+                        // the C-part coefficient vector is zero because λ_{2k}(α) is the basis vector at idx>=k
+                        // and `sample_queries_and_predicate_sparse` uses only `lam_2k[..k]` for the C-part.
+                        // So the correct answer is just w(α) = a*b.
+                        let c = wv;
                         (a, b, c)
                     }
                 };
