@@ -502,11 +502,6 @@ mod tests {
         // Optimized evaluation (should handle padding automatically)
         let optimized_result = eval_t_z_optimized(&c_z, &s_prime, &d_prime_powers, &x_powers, &ro);
         
-        println!("Raw t_z len: {}", raw_len);
-        println!("Padded len: {}", padded_len);
-        println!("padded_nvars: {}", padded_nvars);
-        println!("Dense result: {:?}", dense_result);
-        println!("Optimized result: {:?}", optimized_result);
         
         assert_eq!(optimized_result, dense_result);
     }
