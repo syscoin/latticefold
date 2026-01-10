@@ -892,12 +892,12 @@ where
         let x0 = vec![<BF<R> as Field>::ONE; r];
         let x1 = vec![<BF<R> as Field>::ONE; r];
         let x2 = vec![<BF<R> as Field>::ONE; r];
-        // Build y0:
-        // - in toy mode: all-ones
-        // - in cm_f mode: set y0=t, where t is derived from the actual Ajtai `cm_f` coefficients.
+        // Build PCS#1 statement/proof:
+        // - toy mode: commit/open to a trivial all-ones message
+        // - cm_f mode: commit/open to a real message derived from the *actual Ajtai cm_f surface*,
+        //   i.e. `f_pcs = flatten(cm_f coeffs)` so PCS#1 is no longer synthetic.
         let (t_pcs, u_pcs, pcs_core) = if pcs_mode == "cm_f" {
-            // Flatten `cm` (Vec<R> length κ) into κ*d base-field scalars.
-            let mut t = Vec::with_capacity(kappa_pcs * pcs_n);
+            let mut f_pcs = Vec::with_capacity(kappa_pcs * pcs_n);
             for re in &cm {
                 for c in re.coeffs() {
                     let fp = c
@@ -905,22 +905,25 @@ where
                         .into_iter()
                         .next()
                         .expect("empty base-prime-field limb");
-                    t.push(fp);
+                    f_pcs.push(fp);
                 }
             }
-            assert_eq!(t.len(), pcs_params.t_len(), "cm_f -> t dimension mismatch");
-            let y0 = vec![<BF<R> as Field>::ONE; pcs_params.f_len()];
-            let (t_pcs, s) = symphony::pcs::folding_pcs_l2::commit(&pcs_params, &y0)
+            assert_eq!(f_pcs.len(), pcs_params.f_len(), "cm_f -> pcs message dimension mismatch");
+            let (t_pcs, s) = symphony::pcs::folding_pcs_l2::commit(&pcs_params, &f_pcs)
                 .expect("pcs commit failed");
-            let (u_pcs, pcs_core) = symphony::pcs::folding_pcs_l2::open(&pcs_params, &y0, &s, &x0, &x1, &x2, &c1, &c2)
-                .expect("pcs open failed");
+            let (u_pcs, pcs_core) = symphony::pcs::folding_pcs_l2::open(
+                &pcs_params, &f_pcs, &s, &x0, &x1, &x2, &c1, &c2,
+            )
+            .expect("pcs open failed");
             (t_pcs, u_pcs, pcs_core)
         } else {
             let f = vec![<BF<R> as Field>::ONE; pcs_params.f_len()];
             let (t_pcs, s) = symphony::pcs::folding_pcs_l2::commit(&pcs_params, &f)
                 .expect("pcs commit failed");
-            let (u_pcs, pcs_core) = symphony::pcs::folding_pcs_l2::open(&pcs_params, &f, &s, &x0, &x1, &x2, &c1, &c2)
-                .expect("pcs open failed");
+            let (u_pcs, pcs_core) = symphony::pcs::folding_pcs_l2::open(
+                &pcs_params, &f, &s, &x0, &x1, &x2, &c1, &c2,
+            )
+            .expect("pcs open failed");
             (t_pcs, u_pcs, pcs_core)
         };
         verify_folding_pcs_l2_with_c_matrices(&pcs_params, &t_pcs, &x0, &x1, &x2, &u_pcs, &pcs_core, &c1, &c2)
