@@ -17,7 +17,9 @@ const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
 #[test]
 fn test_streaming_pifold_fs_roundtrip_verifies() {
     let n = 1 << 10;
-    let m = 1 << 10;
+    // NOTE: batchlin PCS (ℓ=2) currently requires log2(m*d) divisible by 3.
+    // For Frog, d=16, so pick m=256 => m*d=4096 => log2=12.
+    let m = 1 << 8;
 
     // Choose matrices so Π_had holds for any witness: M1=I, M2=0, M3=0.
     let mut m1 = SparseMatrix::<R>::identity(m);
