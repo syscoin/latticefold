@@ -32,43 +32,6 @@ where
     fn check(public: &FoldedOutput<R>, witness: &Self::Witness) -> Result<(), String>;
 }
 
-/// Reduced relation checker that can keep consuming a shared transcript.
-///
-/// This is the intended interface for the "single Poseidon transcript with domain-separated phases"
-/// design:
-/// - Phase 1 (fold): run Π_fold / `R_cp` inside the transcript.
-/// - Phase 2 (lin): run π_lin / `R_o` in the *same* transcript (domain-separated), so its verifier
-///   coins are bound to the entire fold transcript.
-pub trait ReducedRelationWithTranscript<R: CoeffRing>
-where
-    R::BaseRing: Zq,
-{
-    type Witness;
-
-    fn check_with_transcript(
-        public: &FoldedOutput<R>,
-        witness: &Self::Witness,
-        transcript: &mut impl latticefold::transcript::Transcript<R>,
-    ) -> Result<(), String>;
-}
-
-impl<R, RO> ReducedRelationWithTranscript<R> for RO
-where
-    R: CoeffRing,
-    R::BaseRing: Zq,
-    RO: ReducedRelation<R>,
-{
-    type Witness = RO::Witness;
-
-    fn check_with_transcript(
-        public: &FoldedOutput<R>,
-        witness: &Self::Witness,
-        _transcript: &mut impl latticefold::transcript::Transcript<R>,
-    ) -> Result<(), String> {
-        RO::check(public, witness)
-    }
-}
-
 // =============================================================================
 // Test/scaffolding helpers
 // =============================================================================
