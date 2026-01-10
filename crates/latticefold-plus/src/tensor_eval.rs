@@ -22,22 +22,22 @@ use stark_rings::OverField;
 
 /// Evaluate a small MLE (given as evaluations) at a point.
 ///
-/// Input: `evals` of length `2^k`, point `r` of length `k`
+/// Input: `evals` of length `m`, point `r` of length `k` where `2^k >= m`
 /// Output: `MLE(r) = Σ_i evals[i] * eq(r, bits(i))`
 ///
-/// Complexity: O(2^k) = O(|evals|)
+/// When `m < 2^k`, this is equivalent to evaluating the MLE of `evals` padded with zeros
+/// to length `2^k`. The padding contributes 0 to the sum, so we only iterate over actual
+/// elements but use ALL coordinates of `r` when computing eq weights.
+///
+/// Complexity: O(|evals| * |r|)
 pub fn eval_small_mle<F: OverField>(evals: &[F], r: &[F]) -> F {
     let n = evals.len();
     if n == 0 {
         return F::zero();
     }
     
-    let num_vars = log2(n.next_power_of_two()) as usize;
-    assert!(r.len() >= num_vars, "point must have at least {} coordinates", num_vars);
-    
-    // Use the standard MLE evaluation algorithm
-    // eq(r, i) = Π_j (r_j * i_j + (1-r_j) * (1-i_j))
-    //          = Π_j (r_j if i_j=1, else 1-r_j)
+    // Use ALL coordinates of r (this handles padding correctly)
+    let num_vars = r.len();
     
     let mut result = F::ZERO;
     for (i, &eval_i) in evals.iter().enumerate() {
@@ -45,7 +45,8 @@ pub fn eval_small_mle<F: OverField>(evals: &[F], r: &[F]) -> F {
             continue; // Skip zero terms
         }
         
-        // Compute eq(r, bits(i))
+        // Compute eq(r, bits(i)) using ALL num_vars bits
+        // For i < n, the high bits (beyond log2(n)) are all 0
         let mut eq_val = F::one();
         for j in 0..num_vars {
             let bit_j = (i >> j) & 1;
@@ -189,6 +190,11 @@ pub fn eval_tensor4_mle<F: OverField>(
     v1 * v2 * v3 * v4
 }
 
+/// Check if n is a power of 2
+fn is_power_of_two(n: usize) -> bool {
+    n > 0 && (n & (n - 1)) == 0
+}
+
 /// Evaluate `t(z) = tensor(c_z) ⊗ s' ⊗ d_powers ⊗ x_powers` at a point.
 ///
 /// This is the optimized version of the calculation in `cm.rs`.
@@ -202,15 +208,30 @@ pub fn eval_tensor4_mle<F: OverField>(
 ///         result.push(a * b * c * d)
 /// ```
 ///
+/// # Important: Factored Evaluation
+/// The factored approach `MLE(r) = Π MLE_factor(r_factor)` only works correctly
+/// when ALL factor sizes are powers of 2. This is because the bit decomposition
+/// of tensor indices only aligns with factor indices when sizes are powers of 2.
+///
+/// When factor sizes aren't all powers of 2, we fall back to dense evaluation
+/// of the full tensor product.
+///
+/// # Important: Zero Padding
+/// The prover pads the tensor product with zeros to length 2^nvars.
+/// When evaluating at point r of length nvars, we must account for this:
+/// - For indices in the tensor range: contribute tensor[i] * eq(r, bits(i))
+/// - For indices in padding range: contribute 0 (don't affect the sum)
+///
 /// # Arguments
 /// - `c_z`: Challenge vector (length log κ)
 /// - `s_prime`: Decomposition challenges (length k*d)
 /// - `d_prime_powers`: Powers of d' (length ℓ)
 /// - `x_powers`: Monomial powers (length d)
-/// - `r`: Evaluation point (length log(κ * k*d * ℓ * d))
+/// - `r`: Evaluation point (length nvars, may be longer than tensor vars)
 ///
 /// # Complexity
-/// O(κ + k*d + ℓ + d) instead of O(κ * k*d * ℓ * d)
+/// - O(κ + k*d + ℓ + d + nvars) when all factor sizes are powers of 2
+/// - O(κ * k*d * ℓ * d) otherwise (falls back to dense)
 ///
 /// Note: We precompute tensor(c_z) (size κ = 2^log_κ, typically small like 8-16)
 /// instead of using eval_tensor_mle, because the tensor() function has specific
@@ -227,6 +248,17 @@ pub fn eval_t_z_optimized<F: OverField>(
     let tensor_c_z = tensor(c_z);
     let kappa = tensor_c_z.len();
     
+    // Check if all factor sizes are powers of 2 (required for factored evaluation)
+    let all_pow2 = is_power_of_two(kappa) 
+        && is_power_of_two(s_prime.len())
+        && is_power_of_two(d_prime_powers.len())
+        && is_power_of_two(x_powers.len());
+    
+    if !all_pow2 {
+        // Fall back to dense evaluation when factors aren't all powers of 2
+        return eval_t_z_dense(&tensor_c_z, s_prime, d_prime_powers, x_powers, r);
+    }
+    
     // Factor sizes in REVERSE order (innermost to outermost)
     let config = TensorConfig::new(vec![
         x_powers.len(),
@@ -237,6 +269,7 @@ pub fn eval_t_z_optimized<F: OverField>(
     
     let offsets = config.factor_offsets();
     let vars = config.vars_per_factor();
+    let tensor_vars = vars.iter().sum::<usize>();
     
     // Split r into chunks (innermost to outermost)
     let r4 = &r[offsets[0]..offsets[0] + vars[0]]; // x_powers
@@ -250,7 +283,34 @@ pub fn eval_t_z_optimized<F: OverField>(
     let v3 = eval_small_mle(d_prime_powers, r3);
     let v4 = eval_small_mle(x_powers, r4);
     
-    v1 * v2 * v3 * v4
+    let mut result = v1 * v2 * v3 * v4;
+    
+    // Account for zero padding: for indices in tensor range, high bits are 0.
+    // eq(r, bits(i)) for i < tensor_size includes factor (1 - r[j]) for j >= tensor_vars.
+    for j in tensor_vars..r.len() {
+        result *= F::one() - r[j];
+    }
+    
+    result
+}
+
+/// Dense fallback for eval_t_z when factor sizes aren't powers of 2.
+/// 
+/// Builds the full tensor product and evaluates the MLE directly.
+fn eval_t_z_dense<F: OverField>(
+    tensor_c_z: &[F],
+    s_prime: &[F],
+    d_prime_powers: &[F],
+    x_powers: &[F],
+    r: &[F],
+) -> F {
+    // Build full tensor product
+    let part1 = tensor_product_pair(tensor_c_z, s_prime);
+    let part2 = tensor_product_pair(&part1, d_prime_powers);
+    let t_z = tensor_product_pair(&part2, x_powers);
+    
+    // Evaluate MLE (handles padding implicitly since eval_small_mle only iterates over actual elements)
+    eval_small_mle(&t_z, r)
 }
 
 /// Compute tensor(c) = fold over tensor_product with [1-c_i, c_i]
@@ -333,5 +393,81 @@ mod tests {
         let dense = eval_small_mle(&full, &r);
         
         assert_eq!(optimized, dense);
+    }
+    
+    #[test]
+    fn test_eval_t_z_vs_dense() {
+        use stark_rings_poly::mle::DenseMultilinearExtension;
+        use crate::utils::{tensor as utils_tensor, tensor_product as utils_tensor_product};
+        
+        // Same parameters as cm.rs uses
+        let c_z = vec![R::from(2u128), R::from(3u128)]; // log_kappa = 2
+        let s_prime = vec![R::from(5u128), R::from(6u128), R::from(7u128), R::from(8u128)]; // k*d = 4
+        let d_prime_powers = vec![R::from(1u128), R::from(9u128)]; // l = 2
+        let x_powers = vec![R::from(1u128), R::from(10u128)]; // d = 2
+        
+        // Build dense t_z using same method as cm.rs calculate_t_z
+        let tensor_c_z = utils_tensor(&c_z);
+        let part1 = utils_tensor_product(&tensor_c_z, &s_prime);
+        let part2 = utils_tensor_product(&part1, &d_prime_powers);
+        let t_z_dense = utils_tensor_product(&part2, &x_powers);
+        
+        // Total vars
+        let nvars = ark_std::log2(t_z_dense.len()) as usize;
+        
+        // Random evaluation point
+        let ro: Vec<R> = (0..nvars).map(|i| R::from((11 + i) as u128)).collect();
+        
+        // Dense MLE evaluation (original method)
+        let mle = DenseMultilinearExtension::from_evaluations_vec(nvars, t_z_dense.clone());
+        let dense_result = mle.evaluate(&ro).unwrap();
+        
+        // Optimized evaluation
+        let optimized_result = eval_t_z_optimized(&c_z, &s_prime, &d_prime_powers, &x_powers, &ro);
+        
+        assert_eq!(optimized_result, dense_result);
+    }
+    
+    #[test]
+    fn test_eval_t_z_vs_dense_with_padding() {
+        use stark_rings_poly::mle::DenseMultilinearExtension;
+        use crate::utils::{tensor as utils_tensor, tensor_product as utils_tensor_product};
+        
+        // Parameters that result in non-power-of-2 tensor product
+        let c_z = vec![R::from(2u128), R::from(3u128)]; // log_kappa = 2, kappa = 4
+        let s_prime = vec![R::from(5u128), R::from(6u128), R::from(7u128)]; // k*d = 3 (not power of 2)
+        let d_prime_powers = vec![R::from(1u128), R::from(9u128), R::from(81u128)]; // l = 3 (not power of 2)
+        let x_powers = vec![R::from(1u128), R::from(10u128)]; // d = 2
+        
+        // Build dense t_z using same method as cm.rs calculate_t_z
+        let tensor_c_z = utils_tensor(&c_z);
+        let part1 = utils_tensor_product(&tensor_c_z, &s_prime);
+        let part2 = utils_tensor_product(&part1, &d_prime_powers);
+        let mut t_z_dense = utils_tensor_product(&part2, &x_powers);
+        
+        let raw_len = t_z_dense.len();
+        
+        // Pad to larger power of 2 (simulating cm.rs behavior)
+        let padded_nvars = 10; // Much larger than needed
+        let padded_len = 1 << padded_nvars;
+        t_z_dense.resize(padded_len, R::ZERO);
+        
+        // Random evaluation point (now has padded_nvars coordinates)
+        let ro: Vec<R> = (0..padded_nvars).map(|i| R::from((11 + i) as u128)).collect();
+        
+        // Dense MLE evaluation (original method with padding)
+        let mle = DenseMultilinearExtension::from_evaluations_vec(padded_nvars, t_z_dense.clone());
+        let dense_result = mle.evaluate(&ro).unwrap();
+        
+        // Optimized evaluation (should handle padding automatically)
+        let optimized_result = eval_t_z_optimized(&c_z, &s_prime, &d_prime_powers, &x_powers, &ro);
+        
+        println!("Raw t_z len: {}", raw_len);
+        println!("Padded len: {}", padded_len);
+        println!("padded_nvars: {}", padded_nvars);
+        println!("Dense result: {:?}", dense_result);
+        println!("Optimized result: {:?}", optimized_result);
+        
+        assert_eq!(optimized_result, dense_result);
     }
 }
