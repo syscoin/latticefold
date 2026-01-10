@@ -562,6 +562,7 @@ where
         symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices},
         symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig},
         transcript::PoseidonTraceOp,
+        poseidon_trace::find_squeeze_bytes_idx_after_absorb_marker,
         we_gate_arith::WeGateDr1csBuilder,
     };
     use cyclotomic_rings::rings::GetPoseidonParams;
@@ -678,16 +679,30 @@ where
     let m3 = Arc::new(m3);
     let witness = Arc::new(witness);
 
-    // Commitment setup
-    let kappa = 8; // Ajtai commitment rows
-    // Seeded Ajtai is the intended "CRS-as-seed" instantiation (public, fixed seed).
-    const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
-    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, kappa, n);
-    let cm = scheme
-        .commit_const_coeff_fast(witness.as_ref())
-        .unwrap()
-        .as_ref()
-        .to_vec();
+    // Commitment setup (cm_f is PCS now).
+    //
+    // We commit to the **flattened witness coefficients** (Option A) using FoldingPCS(ℓ=2),
+    // and treat the commitment surface `t` as the public `cm_f` object that is absorbed into Π_fold.
+    let kappa = 8; // PCS commitment length (t_len)
+    let d = R::dimension();
+    let flat_witness: Vec<BF<R>> = witness
+        .iter()
+        .flat_map(|re| {
+            re.coeffs()
+                .iter()
+                .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+        })
+        .collect();
+    let pcs_params_f = symphony::pcs::cmf_pcs::cmf_pcs_params_for_flat_len::<BF<R>>(
+        flat_witness.len(),
+        kappa,
+    )
+    .expect("cm_f pcs params");
+    let f_pcs_f = symphony::pcs::cmf_pcs::pad_flat_message(&pcs_params_f, &flat_witness);
+    let (t_pcs_f, s_pcs_f) = symphony::pcs::folding_pcs_l2::commit(&pcs_params_f, &f_pcs_f)
+        .expect("cm_f pcs commit failed");
+    // Pack the PCS commitment surface into ring elements for Π_fold plumbing (fills coefficients).
+    let cm = symphony::pcs::cmf_pcs::pack_t_as_ring::<R>(&t_pcs_f);
 
     // Symphony Π_rg parameters (defined above, after decomposition so it matches padded shapes).
 
@@ -817,9 +832,12 @@ where
         //
         // - PCS_f: keep the bench default (first SqueezeBytes) for now.
         // - PCS_g (batchlin): use the *squeeze immediately after* the mandatory
-        //   `BATCHLIN_PCS_DOMAIN_SEP` splice, so the coins are transcript-bound to the
-        //   batchlin PCS commitment surface.
-        let pcs_coin_squeeze_idx = 0usize;
+        // PCS#1 coin source: SqueezeBytes right after `CMF_PCS_DOMAIN_SEP`.
+        let pcs_coin_squeeze_idx = find_squeeze_bytes_idx_after_absorb_marker(
+            &trace.ops,
+            <BF<R> as From<u128>>::from(symphony::pcs::cmf_pcs::CMF_PCS_DOMAIN_SEP),
+        )
+        .expect("missing SqueezeBytes after CMF_PCS_DOMAIN_SEP");
         let c_bytes = &squeeze_bytes[pcs_coin_squeeze_idx];
         let mut bits = Vec::with_capacity(c_bytes.len() * 8);
         for &b in c_bytes {
@@ -938,33 +956,11 @@ where
         let x1_g = &out.proof.batchlin_pcs_x1;
         let x2_g = &out.proof.batchlin_pcs_x2;
         let pcs_core_g = &out.proof.batchlin_pcs_core;
-        // Find the SqueezeBytes index that follows `BATCHLIN_PCS_DOMAIN_SEP` absorption.
-        let mut pcs_coin_squeeze_idx2: Option<usize> = None;
-        {
-            let marker = <BF<R> as From<u128>>::from(BATCHLIN_PCS_DOMAIN_SEP);
-            let mut squeeze_idx = 0usize;
-            let mut saw_marker = false;
-            for op in &trace.ops {
-                match op {
-                    PoseidonTraceOp::Absorb(v) => {
-                        // Domain separators are typically absorbed as a single field element.
-                        if v.len() == 1 && v[0] == marker {
-                            saw_marker = true;
-                        }
-                    }
-                    PoseidonTraceOp::SqueezeBytes { .. } => {
-                        if saw_marker {
-                            pcs_coin_squeeze_idx2 = Some(squeeze_idx);
-                            break;
-                        }
-                        squeeze_idx += 1;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let pcs_coin_squeeze_idx2 =
-            pcs_coin_squeeze_idx2.unwrap_or_else(|| pcs_coin_squeeze_idx + 1);
+        let pcs_coin_squeeze_idx2 = find_squeeze_bytes_idx_after_absorb_marker(
+            &trace.ops,
+            <BF<R> as From<u128>>::from(BATCHLIN_PCS_DOMAIN_SEP),
+        )
+        .expect("missing SqueezeBytes after BATCHLIN_PCS_DOMAIN_SEP");
         let (full, full_asg) = WeGateDr1csBuilder::poseidon_plus_pifold_plus_cfs_plus_pcs::<R>(
             &poseidon_cfg,
             &trace.ops,
@@ -1020,20 +1016,28 @@ where
             };
             use sha2::{Digest, Sha256};
             use rand::{rngs::StdRng, RngCore, SeedableRng};
+            use rayon::prelude::*;
             use symphony::we_statement::we_statement_hash_hetero_m;
 
             println!("    DPP: building sparse Dr1csInstance for full gate...");
             let t0 = Instant::now();
             let k = full.constraints.len();
             let nvars = full.nvars;
-            let mut a_rows = Vec::with_capacity(k);
-            let mut b_rows = Vec::with_capacity(k);
-            let mut c_rows = Vec::with_capacity(k);
-            for row in &full.constraints {
-                a_rows.push(SparseVec::new(row.a.clone()));
-                b_rows.push(SparseVec::new(row.b.clone()));
-                c_rows.push(SparseVec::new(row.c.clone()));
-            }
+            let a_rows: Vec<SparseVec<BF<R>>> = full
+                .constraints
+                .par_iter()
+                .map(|row| SparseVec::new(row.a.clone()))
+                .collect();
+            let b_rows: Vec<SparseVec<BF<R>>> = full
+                .constraints
+                .par_iter()
+                .map(|row| SparseVec::new(row.b.clone()))
+                .collect();
+            let c_rows: Vec<SparseVec<BF<R>>> = full
+                .constraints
+                .par_iter()
+                .map(|row| SparseVec::new(row.c.clone()))
+                .collect();
             let dr1cs = DppDr1csInstanceSparse::<BF<R>> { n: nvars, a: a_rows, b: b_rows, c: c_rows };
             println!("    DPP: dr1cs build: {:?} (nvars={}, k={})", t0.elapsed(), nvars, k);
 

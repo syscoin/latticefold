@@ -169,11 +169,21 @@ impl<F: PrimeField, V: BoundedFlpcpSparse<F>> BooleanProofFlpcpSparse<F, V> {
             out.par_chunks_mut(bytes_per)
                 .zip(pi.par_iter())
                 .for_each(|(chunk, x)| {
-                    // Ensure fixed-width output: pad with zeros if bigint encoding is shorter.
+                    // Ensure fixed-width output.
                     chunk.fill(0);
-                    let xb = x.into_bigint().to_bytes_le();
-                    let take = core::cmp::min(bytes_per, xb.len());
-                    chunk[..take].copy_from_slice(&xb[..take]);
+                    // Avoid per-element heap allocation from `to_bytes_le()` by writing limbs directly.
+                    let xb = x.into_bigint();
+                    let limbs = xb.as_ref(); // little-endian u64 limbs
+                    let mut off = 0usize;
+                    for limb in limbs {
+                        if off >= bytes_per {
+                            break;
+                        }
+                        let limb_bytes = limb.to_le_bytes();
+                        let take = core::cmp::min(bytes_per - off, 8);
+                        chunk[off..off + take].copy_from_slice(&limb_bytes[..take]);
+                        off += take;
+                    }
                 });
             return out;
         }

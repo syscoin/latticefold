@@ -7,7 +7,6 @@
 //! structured MLEs can be evaluated at hypercube indices without storing all values.
 
 use ark_std::vec::Vec;
-#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use std::sync::Arc;
 use stark_rings::{OverField, PolyRing, Ring};
@@ -821,11 +820,9 @@ impl StreamingSumcheck {
             levals: vec![R::ZERO; degree + 1],
         };
 
-        // Sequential or parallel iteration over domain
-        #[cfg(not(feature = "parallel"))]
-        let result = {
-            let mut s = scratch();
-            for b in 0..domain_half {
+        let result = (0..domain_half)
+            .into_par_iter()
+            .fold(scratch, |mut s, b| {
                 // Evaluate all MLEs at indices 2*b (for x_i=0) and 2*b+1 (for x_i=1)
                 for (i, mle) in state.mles.iter().enumerate() {
                     s.vals0[i] = mle.eval_at_index(b << 1);
@@ -853,52 +850,15 @@ impl StreamingSumcheck {
                 for (e, l) in s.evals.iter_mut().zip(s.levals.iter()) {
                     *e += *l;
                 }
-            }
-            s.evals
-        };
-
-        #[cfg(feature = "parallel")]
-        let result = {
-            use ark_std::cfg_into_iter;
-            let evaluations = cfg_into_iter!(0..domain_half)
-                .fold(scratch, |mut s, b| {
-                    for (i, mle) in state.mles.iter().enumerate() {
-                        s.vals0[i] = mle.eval_at_index(b << 1);
-                        s.vals1[i] = mle.eval_at_index((b << 1) | 1);
-                    }
-
-                    s.levals[0] = comb_fn(&s.vals0);
-                    s.levals[1] = comb_fn(&s.vals1);
-
-                    for i in 0..num_polys {
-                        s.steps[i] = s.vals1[i] - s.vals0[i];
-                        s.vals[i] = s.vals1[i];
-                    }
-
-                    for d in 2..=degree {
-                        for i in 0..num_polys {
-                            s.vals[i] += s.steps[i];
-                        }
-                        s.levals[d] = comb_fn(&s.vals);
-                    }
-
-                    for (e, l) in s.evals.iter_mut().zip(s.levals.iter()) {
-                        *e += *l;
-                    }
-                    s
-                })
-                .map(|s| s.evals)
-                .reduce(
-                    || vec![R::ZERO; degree + 1],
-                    |mut acc, evals| {
-                        for (a, e) in acc.iter_mut().zip(evals) {
-                            *a += e;
-                        }
-                        acc
-                    },
-                );
-            evaluations
-        };
+                s
+            })
+            .map(|s| s.evals)
+            .reduce(|| vec![R::ZERO; degree + 1], |mut acc, evals| {
+                for (a, e) in acc.iter_mut().zip(evals) {
+                    *a += e;
+                }
+                acc
+            });
 
         StreamingProverMsg { evaluations: result }
     }
@@ -950,10 +910,9 @@ impl StreamingSumcheck {
             levals: vec![R::BaseRing::ZERO; degree + 1],
         };
 
-        #[cfg(not(feature = "parallel"))]
-        let result0 = {
-            let mut s = scratch();
-            for b in 0..domain_half {
+        let result0 = (0..domain_half)
+            .into_par_iter()
+            .fold(scratch, |mut s, b| {
                 for (i, mle) in state.mles.iter().enumerate() {
                     s.vals0[i] = mle.eval0_at_index(b << 1);
                     s.vals1[i] = mle.eval0_at_index((b << 1) | 1);
@@ -977,47 +936,15 @@ impl StreamingSumcheck {
                 for (e, l) in s.evals.iter_mut().zip(s.levals.iter()) {
                     *e += *l;
                 }
-            }
-            s.evals
-        };
-
-        #[cfg(feature = "parallel")]
-        let result0 = {
-            use ark_std::cfg_into_iter;
-            cfg_into_iter!(0..domain_half)
-                .fold(scratch, |mut s, b| {
-                    for (i, mle) in state.mles.iter().enumerate() {
-                        s.vals0[i] = mle.eval0_at_index(b << 1);
-                        s.vals1[i] = mle.eval0_at_index((b << 1) | 1);
-                    }
-                    s.levals[0] = comb_fn0(&s.vals0);
-                    s.levals[1] = comb_fn0(&s.vals1);
-                    for i in 0..num_polys {
-                        s.steps[i] = s.vals1[i] - s.vals0[i];
-                        s.vals[i] = s.vals1[i];
-                    }
-                    for d in 2..=degree {
-                        for i in 0..num_polys {
-                            s.vals[i] += s.steps[i];
-                        }
-                        s.levals[d] = comb_fn0(&s.vals);
-                    }
-                    for (e, l) in s.evals.iter_mut().zip(s.levals.iter()) {
-                        *e += *l;
-                    }
-                    s
-                })
-                .map(|s| s.evals)
-                .reduce(
-                    || vec![R::BaseRing::ZERO; degree + 1],
-                    |mut acc, evals| {
-                        for (a, e) in acc.iter_mut().zip(evals) {
-                            *a += e;
-                        }
-                        acc
-                    },
-                )
-        };
+                s
+            })
+            .map(|s| s.evals)
+            .reduce(|| vec![R::BaseRing::ZERO; degree + 1], |mut acc, evals| {
+                for (a, e) in acc.iter_mut().zip(evals) {
+                    *a += e;
+                }
+                acc
+            });
 
         StreamingProverMsg {
             evaluations: result0.into_iter().map(R::from).collect(),

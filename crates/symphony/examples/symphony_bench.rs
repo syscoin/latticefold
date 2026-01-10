@@ -17,12 +17,14 @@ fn main() {
             DenseMatrix, FoldingPcsL2ProofCore,
             verify_folding_pcs_l2_with_c_matrices,
         },
+        pcs::{cmf_pcs, folding_pcs_l2},
         rp_rgchk::RPParams,
         symphony_open::MultiAjtaiOpenVerifier,
         symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices},
         symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig},
         symphony_we_relation::{FoldedOutput, TrivialRo},
         transcript::PoseidonTraceOp,
+        poseidon_trace::find_squeeze_bytes_idx_after_absorb_marker,
         we_gate_arith::WeGateDr1csBuilder,
     };
     use cyclotomic_rings::rings::GetPoseidonParams;
@@ -58,9 +60,9 @@ fn main() {
         <R as PolyRing>::BaseRing::from(456u128),
     ];
 
-    // Ajtai commitment for cm_f.
+    // cm_f commitment surface: PCS-backed (packed into ring elements for existing Π_fold APIs).
     const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
-    let scheme_f = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 8, n);
+    let kappa_cm_f = 8usize;
 
     // Try a few batch sizes ℓ.
     for &ell in &[2usize, 4, 8] {
@@ -73,7 +75,24 @@ fn main() {
             } else {
                 vec![R::ZERO; n]
             };
-            let cm = scheme_f.commit(&f).unwrap().as_ref().to_vec();
+            type BF = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
+            let flat_witness: Vec<BF> = f
+                .iter()
+                .flat_map(|re| {
+                    re.coeffs()
+                        .iter()
+                        .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+                })
+                .collect();
+            let pcs_params_f = cmf_pcs::cmf_pcs_params_for_flat_len::<BF>(
+                flat_witness.len(),
+                kappa_cm_f,
+            )
+            .expect("cm_f pcs params");
+            let f_pcs_f = cmf_pcs::pad_flat_message(&pcs_params_f, &flat_witness);
+            let (t_pcs_f, _s_pcs_f) =
+                folding_pcs_l2::commit(&pcs_params_f, &f_pcs_f).expect("cm_f pcs commit failed");
+            let cm = cmf_pcs::pack_t_as_ring::<R>(&t_pcs_f);
             witnesses.push(Arc::new(f));
             cm_f.push(cm);
         }
@@ -176,7 +195,11 @@ fn main() {
             continue;
         }
 
-        let pcs_coin_squeeze_idx = 0usize;
+        let pcs_coin_squeeze_idx = find_squeeze_bytes_idx_after_absorb_marker(
+            &trace.ops,
+            BF::from(cmf_pcs::CMF_PCS_DOMAIN_SEP),
+        )
+        .expect("missing SqueezeBytes after CMF_PCS_DOMAIN_SEP");
         let c_bytes = &squeeze_bytes[pcs_coin_squeeze_idx];
         let mut bits = Vec::with_capacity(c_bytes.len() * 8);
         for &b in c_bytes {

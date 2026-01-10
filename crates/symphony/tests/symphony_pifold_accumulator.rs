@@ -8,6 +8,7 @@ use std::sync::Arc;
 use symphony::symphony_coins::derive_beta_chi;
 use latticefold::transcript::Transcript;
 use symphony::{
+    pcs::{cmf_pcs, folding_pcs_l2},
     rp_rgchk::RPParams,
     symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices},
     symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig},
@@ -16,6 +17,7 @@ use symphony::{
 use latticefold::commitment::AjtaiCommitmentScheme;
 use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing, Ring};
 use stark_rings_linalg::SparseMatrix;
+use ark_ff::Field;
 
 const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
 
@@ -51,7 +53,8 @@ fn test_pifold_accumulator_two_steps() {
     let m2 = Arc::new(m2);
     let m3 = Arc::new(m3);
 
-    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
+    let kappa_cm_f = 2usize;
+    type BF = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
 
     let rg_params = RPParams {
         l_h: 64,
@@ -73,11 +76,39 @@ fn test_pifold_accumulator_two_steps() {
 
     // Accumulator starts at f_acc = 1.
     let mut f_acc = vec![R::one(); n];
-    let mut cm_acc = scheme.commit(&f_acc).unwrap().as_ref().to_vec();
+    let pcs_params_f = {
+        let flat_len = n * R::dimension();
+        cmf_pcs::cmf_pcs_params_for_flat_len::<BF>(flat_len, kappa_cm_f).expect("cm_f pcs params")
+    };
+    let mut cm_acc = {
+        let flat: Vec<BF> = f_acc
+            .iter()
+            .flat_map(|re| {
+                re.coeffs()
+                    .iter()
+                    .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+            })
+            .collect();
+        let f_pcs = cmf_pcs::pad_flat_message(&pcs_params_f, &flat);
+        let (t, _s) = folding_pcs_l2::commit(&pcs_params_f, &f_pcs).expect("cm_f pcs commit");
+        cmf_pcs::pack_t_as_ring::<R>(&t)
+    };
 
     // Step 1: fold in f1 = 0.
     let f1 = vec![R::ZERO; n];
-    let cm1 = scheme.commit(&f1).unwrap().as_ref().to_vec();
+    let cm1 = {
+        let flat: Vec<BF> = f1
+            .iter()
+            .flat_map(|re| {
+                re.coeffs()
+                    .iter()
+                    .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+            })
+            .collect();
+        let f_pcs = cmf_pcs::pad_flat_message(&pcs_params_f, &flat);
+        let (t, _s) = folding_pcs_l2::commit(&pcs_params_f, &f_pcs).expect("cm_f pcs commit");
+        cmf_pcs::pack_t_as_ring::<R>(&t)
+    };
 
     // Build Ms: shared matrices repeated for each instance.
     let ms = vec![

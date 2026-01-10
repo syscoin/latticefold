@@ -5,18 +5,21 @@ use stark_rings_linalg::SparseMatrix;
 
 use symphony::dpp_poseidon::poseidon_sponge_dr1cs_from_trace;
 use symphony::we_gate_arith::WeGateDr1csBuilder;
+use symphony::poseidon_trace::find_squeeze_bytes_idx_after_absorb_marker;
 use symphony::poseidon_trace::replay_poseidon_transcript_trace;
 use symphony::rp_rgchk::RPParams;
 use symphony::symphony_open::MultiAjtaiOpenVerifier;
 use symphony::symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices};
 use symphony::symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStreamingConfig};
 use symphony::transcript::PoseidonTraceOp;
+use symphony::pcs::cmf_pcs::CMF_PCS_DOMAIN_SEP;
 use symphony::pcs::dpp_folding_pcs_l2::folding_pcs_l2_params;
 use symphony::pcs::folding_pcs_l2::{
     gadget_apply_digits, kron_ct_in_mul, kron_i_a_mul, kron_ikn_xt_mul, BinMatrix, DenseMatrix,
     FoldingPcsL2ProofCore,
     verify_folding_pcs_l2_with_c_matrices,
 };
+use symphony::pcs::{cmf_pcs, folding_pcs_l2};
 use dpp::{
     dr1cs_flpcp::{Dr1csInstanceSparse as DppDr1csInstanceSparse, RsDr1csFlpcpSparse, RsDr1csNpFlpcpSparse},
     embedding::EmbeddingParams,
@@ -91,13 +94,42 @@ fn test_poseidon_trace_arithmetization_roundtrip_real_verifier() {
         d_prime: (R::dimension() as u128) - 2,
     };
 
-    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
+    let kappa_cm_f = 2usize;
     let f0 = vec![<R as stark_rings::Ring>::ONE; n];
     let f1 = (0..n)
         .map(|i| if i % 2 == 0 { <R as stark_rings::Ring>::ONE } else { <R as stark_rings::Ring>::ZERO })
         .collect::<Vec<_>>();
-    let cm0 = scheme.commit_const_coeff_fast(&f0).unwrap().as_ref().to_vec();
-    let cm1 = scheme.commit_const_coeff_fast(&f1).unwrap().as_ref().to_vec();
+    type BF = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
+    let pcs_params_f = {
+        let flat_len = n * R::dimension();
+        cmf_pcs::cmf_pcs_params_for_flat_len::<BF>(flat_len, kappa_cm_f).expect("cm_f pcs params")
+    };
+    let cm0 = {
+        let flat: Vec<BF> = f0
+            .iter()
+            .flat_map(|re| {
+                re.coeffs()
+                    .iter()
+                    .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+            })
+            .collect();
+        let f_pcs = cmf_pcs::pad_flat_message(&pcs_params_f, &flat);
+        let (t, _s) = folding_pcs_l2::commit(&pcs_params_f, &f_pcs).expect("cm_f pcs commit");
+        cmf_pcs::pack_t_as_ring::<R>(&t)
+    };
+    let cm1 = {
+        let flat: Vec<BF> = f1
+            .iter()
+            .flat_map(|re| {
+                re.coeffs()
+                    .iter()
+                    .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+            })
+            .collect();
+        let f_pcs = cmf_pcs::pad_flat_message(&pcs_params_f, &flat);
+        let (t, _s) = folding_pcs_l2::commit(&pcs_params_f, &f_pcs).expect("cm_f pcs commit");
+        cmf_pcs::pack_t_as_ring::<R>(&t)
+    };
 
     let cms = vec![cm0.clone(), cm1.clone()];
     let witnesses = vec![std::sync::Arc::new(f0.clone()), std::sync::Arc::new(f1.clone())];
@@ -244,15 +276,42 @@ fn test_poseidon_trace_sparse_dpp_end_to_end_accepts() {
         d_prime: (R::dimension() as u128) - 2,
     };
 
-    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
+    let kappa_cm_f = 2usize;
     let f0 = vec![<R as stark_rings::Ring>::ONE; n];
     let f1 = (0..n)
         .map(|i| if i % 2 == 0 { <R as stark_rings::Ring>::ONE } else { <R as stark_rings::Ring>::ZERO })
         .collect::<Vec<_>>();
-    // For arithmetization tests, use the full Ajtai commit (not the const-coeff shortcut),
-    // so `AjtaiOpen` constraints match exactly.
-    let cm0 = scheme.commit(&f0).unwrap().as_ref().to_vec();
-    let cm1 = scheme.commit(&f1).unwrap().as_ref().to_vec();
+    type BF = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
+    let pcs_params_f = {
+        let flat_len = n * R::dimension();
+        cmf_pcs::cmf_pcs_params_for_flat_len::<BF>(flat_len, kappa_cm_f).expect("cm_f pcs params")
+    };
+    let cm0 = {
+        let flat: Vec<BF> = f0
+            .iter()
+            .flat_map(|re| {
+                re.coeffs()
+                    .iter()
+                    .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+            })
+            .collect();
+        let f_pcs = cmf_pcs::pad_flat_message(&pcs_params_f, &flat);
+        let (t, _s) = folding_pcs_l2::commit(&pcs_params_f, &f_pcs).expect("cm_f pcs commit");
+        cmf_pcs::pack_t_as_ring::<R>(&t)
+    };
+    let cm1 = {
+        let flat: Vec<BF> = f1
+            .iter()
+            .flat_map(|re| {
+                re.coeffs()
+                    .iter()
+                    .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+            })
+            .collect();
+        let f_pcs = cmf_pcs::pad_flat_message(&pcs_params_f, &flat);
+        let (t, _s) = folding_pcs_l2::commit(&pcs_params_f, &f_pcs).expect("cm_f pcs commit");
+        cmf_pcs::pack_t_as_ring::<R>(&t)
+    };
     let cms = vec![cm0, cm1];
     let witnesses = vec![std::sync::Arc::new(f0), std::sync::Arc::new(f1)];
     let public_inputs: Vec<<R as PolyRing>::BaseRing> = vec![];
@@ -364,7 +423,11 @@ fn test_poseidon_trace_sparse_dpp_end_to_end_accepts() {
         !squeeze_bytes.is_empty(),
         "expected verifier trace to contain at least one SqueezeBytes op"
     );
-    let pcs_coin_squeeze_idx = 0usize;
+    let pcs_coin_squeeze_idx = find_squeeze_bytes_idx_after_absorb_marker(
+        &trace.ops,
+        BF::from(CMF_PCS_DOMAIN_SEP),
+    )
+    .expect("missing SqueezeBytes after CMF_PCS_DOMAIN_SEP");
     let c_bytes = &squeeze_bytes[pcs_coin_squeeze_idx];
     // Little-endian bits per byte (same convention as `bytes_to_bitstream_le_dr1cs`).
     let mut bits = Vec::with_capacity(c_bytes.len() * 8);
@@ -444,32 +507,11 @@ fn test_poseidon_trace_sparse_dpp_end_to_end_accepts() {
     let x2_g = &out.proof.batchlin_pcs_x2;
     let pcs_core_g = &out.proof.batchlin_pcs_core;
 
-    // Find the SqueezeBytes index that follows `BATCHLIN_PCS_DOMAIN_SEP` absorption.
-    let mut pcs_coin_squeeze_idx2: Option<usize> = None;
-    {
-        let marker = BF::from(BATCHLIN_PCS_DOMAIN_SEP);
-        let mut squeeze_idx = 0usize;
-        let mut saw_marker = false;
-        for op in &trace.ops {
-            match op {
-                PoseidonTraceOp::Absorb(v) => {
-                    if v.len() == 1 && v[0] == marker {
-                        saw_marker = true;
-                    }
-                }
-                PoseidonTraceOp::SqueezeBytes { .. } => {
-                    if saw_marker {
-                        pcs_coin_squeeze_idx2 = Some(squeeze_idx);
-                        break;
-                    }
-                    squeeze_idx += 1;
-                }
-                _ => {}
-            }
-        }
-    }
-    let pcs_coin_squeeze_idx2 = pcs_coin_squeeze_idx2
-        .expect("missing SqueezeBytes after BATCHLIN_PCS_DOMAIN_SEP (PCS#2 coin source)");
+    let pcs_coin_squeeze_idx2 = find_squeeze_bytes_idx_after_absorb_marker(
+        &trace.ops,
+        BF::from(BATCHLIN_PCS_DOMAIN_SEP),
+    )
+    .expect("missing SqueezeBytes after BATCHLIN_PCS_DOMAIN_SEP (PCS#2 coin source)");
 
     let (merged3, merged3_asg) = WeGateDr1csBuilder::poseidon_plus_pifold_plus_cfs_plus_pcs::<R>(
         &poseidon_cfg,
@@ -651,13 +693,42 @@ fn test_poseidon_trace_rs_flpcp_full_trace_honest_accepts() {
 
     let rg_params = RPParams { l_h: 4, lambda_pj: 1, k_g: 2, d_prime: (R::dimension() as u128) - 2 };
 
-    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
+    let kappa_cm_f = 2usize;
     let f0 = vec![<R as stark_rings::Ring>::ONE; n];
     let f1 = (0..n)
         .map(|i| if i % 2 == 0 { <R as stark_rings::Ring>::ONE } else { <R as stark_rings::Ring>::ZERO })
         .collect::<Vec<_>>();
-    let cm0 = scheme.commit_const_coeff_fast(&f0).unwrap().as_ref().to_vec();
-    let cm1 = scheme.commit_const_coeff_fast(&f1).unwrap().as_ref().to_vec();
+    type BF = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
+    let pcs_params_f = {
+        let flat_len = n * R::dimension();
+        cmf_pcs::cmf_pcs_params_for_flat_len::<BF>(flat_len, kappa_cm_f).expect("cm_f pcs params")
+    };
+    let cm0 = {
+        let flat: Vec<BF> = f0
+            .iter()
+            .flat_map(|re| {
+                re.coeffs()
+                    .iter()
+                    .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+            })
+            .collect();
+        let f_pcs = cmf_pcs::pad_flat_message(&pcs_params_f, &flat);
+        let (t, _s) = folding_pcs_l2::commit(&pcs_params_f, &f_pcs).expect("cm_f pcs commit");
+        cmf_pcs::pack_t_as_ring::<R>(&t)
+    };
+    let cm1 = {
+        let flat: Vec<BF> = f1
+            .iter()
+            .flat_map(|re| {
+                re.coeffs()
+                    .iter()
+                    .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+            })
+            .collect();
+        let f_pcs = cmf_pcs::pad_flat_message(&pcs_params_f, &flat);
+        let (t, _s) = folding_pcs_l2::commit(&pcs_params_f, &f_pcs).expect("cm_f pcs commit");
+        cmf_pcs::pack_t_as_ring::<R>(&t)
+    };
     let cms = vec![cm0, cm1];
     let witnesses = vec![std::sync::Arc::new(f0), std::sync::Arc::new(f1)];
     let public_inputs: Vec<<R as PolyRing>::BaseRing> = vec![];
@@ -775,13 +846,42 @@ fn test_poseidon_trace_full_dpp_end_to_end_no_boolean_full_trace() {
 
     let rg_params = RPParams { l_h: 4, lambda_pj: 1, k_g: 2, d_prime: (R::dimension() as u128) - 2 };
 
-    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
+    let kappa_cm_f = 2usize;
     let f0 = vec![<R as stark_rings::Ring>::ONE; n];
     let f1 = (0..n)
         .map(|i| if i % 2 == 0 { <R as stark_rings::Ring>::ONE } else { <R as stark_rings::Ring>::ZERO })
         .collect::<Vec<_>>();
-    let cm0 = scheme.commit_const_coeff_fast(&f0).unwrap().as_ref().to_vec();
-    let cm1 = scheme.commit_const_coeff_fast(&f1).unwrap().as_ref().to_vec();
+    type BF = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
+    let pcs_params_f = {
+        let flat_len = n * R::dimension();
+        cmf_pcs::cmf_pcs_params_for_flat_len::<BF>(flat_len, kappa_cm_f).expect("cm_f pcs params")
+    };
+    let cm0 = {
+        let flat: Vec<BF> = f0
+            .iter()
+            .flat_map(|re| {
+                re.coeffs()
+                    .iter()
+                    .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+            })
+            .collect();
+        let f_pcs = cmf_pcs::pad_flat_message(&pcs_params_f, &flat);
+        let (t, _s) = folding_pcs_l2::commit(&pcs_params_f, &f_pcs).expect("cm_f pcs commit");
+        cmf_pcs::pack_t_as_ring::<R>(&t)
+    };
+    let cm1 = {
+        let flat: Vec<BF> = f1
+            .iter()
+            .flat_map(|re| {
+                re.coeffs()
+                    .iter()
+                    .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+            })
+            .collect();
+        let f_pcs = cmf_pcs::pad_flat_message(&pcs_params_f, &flat);
+        let (t, _s) = folding_pcs_l2::commit(&pcs_params_f, &f_pcs).expect("cm_f pcs commit");
+        cmf_pcs::pack_t_as_ring::<R>(&t)
+    };
     let cms = vec![cm0, cm1];
     let witnesses = vec![std::sync::Arc::new(f0), std::sync::Arc::new(f1)];
     let public_inputs: Vec<<R as PolyRing>::BaseRing> = vec![];

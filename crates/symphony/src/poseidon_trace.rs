@@ -233,6 +233,36 @@ pub fn replay_ops<F: PrimeField>(
     Ok(PoseidonSpongeReplayResult { final_state: state, permutes })
 }
 
+/// Find the **SqueezeBytes index** of the first `PoseidonTraceOp::SqueezeBytes` that occurs
+/// after observing an `PoseidonTraceOp::Absorb([marker])`.
+///
+/// Returns an index into the sequence of `SqueezeBytes` ops (0-based), which matches how
+/// `WeGateDr1csBuilder` indexes `PoseidonByteWiring.squeeze_byte_ranges`.
+pub fn find_squeeze_bytes_idx_after_absorb_marker<F: PrimeField>(
+    ops: &[PoseidonTraceOp<F>],
+    marker: F,
+) -> Option<usize> {
+    let mut saw_marker = false;
+    let mut squeeze_idx = 0usize;
+    for op in ops {
+        match op {
+            PoseidonTraceOp::Absorb(v) => {
+                if v.len() == 1 && v[0] == marker {
+                    saw_marker = true;
+                }
+            }
+            PoseidonTraceOp::SqueezeBytes { .. } => {
+                if saw_marker {
+                    return Some(squeeze_idx);
+                }
+                squeeze_idx += 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn absorb_internal_with_record<F: PrimeField>(
     cfg: &PoseidonConfig<F>,
     state: &mut [F],

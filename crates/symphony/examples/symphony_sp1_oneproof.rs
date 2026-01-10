@@ -19,6 +19,8 @@ use std::time::Instant;
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
 use cyclotomic_rings::rings::GetPoseidonParams;
 use latticefold::commitment::AjtaiCommitmentScheme;
+use ark_ff::Field;
+use symphony::pcs::{cmf_pcs, folding_pcs_l2};
 use symphony::pcs::dpp_folding_pcs_l2::folding_pcs_l2_params;
 use symphony::pcs::folding_pcs_l2::{
     gadget_apply_digits, kron_ct_in_mul, kron_i_a_mul, kron_ikn_xt_mul, BinMatrix, DenseMatrix,
@@ -37,6 +39,7 @@ use symphony::symphony_pifold_streaming::{
 };
 use symphony::symphony_sp1_r1cs::open_sp1_r1cs_chunk_cache;
 use symphony::transcript::PoseidonTraceOp;
+use symphony::poseidon_trace::find_squeeze_bytes_idx_after_absorb_marker;
 use symphony::we_gate_arith::WeGateDr1csBuilder;
 use ark_ff::Field;
 
@@ -79,8 +82,7 @@ fn main() {
     println!("=========================================================");
     println!("  CHUNK_SIZE={chunk_size}  L_H={l_h}  LAMBDA_PJ={lambda_pj}");
     println!(
-        "  parallel_feature={}  rayon_threads={}",
-        cfg!(feature = "parallel"),
+        "  rayon_threads={}",
         rayon::current_num_threads()
     );
 
@@ -107,14 +109,25 @@ fn main() {
         d_prime: (R::dimension() as u128) - 2,
     };
 
-    // Commit
+    // Commit (`cm_f` is PCS-backed; packed into ring elements for existing Π_fold APIs).
     const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
-    let scheme_main = Arc::new(AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 8, ncols));
-    let cm_main = scheme_main
-        .commit_const_coeff_fast(&witness)
-        .unwrap()
-        .as_ref()
-        .to_vec();
+    let kappa_cm_f = 8usize;
+    type BF = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
+    let flat_witness: Vec<BF> = witness
+        .iter()
+        .flat_map(|re| {
+            re.coeffs()
+                .iter()
+                .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+        })
+        .collect();
+    let pcs_params_f =
+        cmf_pcs::cmf_pcs_params_for_flat_len::<BF>(flat_witness.len(), kappa_cm_f)
+            .expect("cm_f pcs params");
+    let f_pcs_f = cmf_pcs::pad_flat_message(&pcs_params_f, &flat_witness);
+    let (t_pcs_f, _s_pcs_f) =
+        folding_pcs_l2::commit(&pcs_params_f, &f_pcs_f).expect("cm_f pcs commit failed");
+    let cm_main = cmf_pcs::pack_t_as_ring::<R>(&t_pcs_f);
     let scheme_had = Arc::new(AjtaiCommitmentScheme::<R>::seeded(
         b"cfs_had_u",
         MASTER_SEED,
@@ -274,7 +287,11 @@ fn main() {
             println!("  gate dr1cs: no SqueezeBytes in trace; skipping full-gate (pcs) count");
             return;
         }
-        let pcs_coin_squeeze_idx = 0usize;
+        let pcs_coin_squeeze_idx = find_squeeze_bytes_idx_after_absorb_marker(
+            &trace.ops,
+            BF::from(cmf_pcs::CMF_PCS_DOMAIN_SEP),
+        )
+        .expect("missing SqueezeBytes after CMF_PCS_DOMAIN_SEP");
         let c_bytes = &squeeze_bytes[pcs_coin_squeeze_idx];
         let mut bits = Vec::with_capacity(c_bytes.len() * 8);
         for &b in c_bytes {

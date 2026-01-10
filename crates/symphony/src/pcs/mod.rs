@@ -13,4 +13,5 @@
 pub mod folding_pcs_l2;
 pub mod dpp_folding_pcs_l2;
 pub mod batchlin_pcs;
+pub mod cmf_pcs;
 

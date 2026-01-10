@@ -16,6 +16,9 @@ use symphony::symphony_pifold_streaming::{prove_pi_fold_poseidon_fs, PiFoldStrea
 use symphony::transcript::PoseidonTraceOp;
 use symphony::we_gate_arith::WeGateDr1csBuilder;
 use symphony::pcs::batchlin_pcs::{batchlin_scalar_pcs_params, BATCHLIN_PCS_DOMAIN_SEP};
+use symphony::pcs::cmf_pcs::CMF_PCS_DOMAIN_SEP;
+use symphony::poseidon_trace::find_squeeze_bytes_idx_after_absorb_marker;
+use symphony::pcs::{cmf_pcs, folding_pcs_l2};
 
 use ark_ff::Field;
 
@@ -89,7 +92,7 @@ fn we_gate_constraint_counts_real_pcs_in_gate() {
         d_prime: (R::dimension() as u128) - 2,
     };
 
-    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
+    let kappa_cm_f = 2usize;
     let f0 = vec![<R as stark_rings::Ring>::ONE; n];
     let f1 = (0..n)
         .map(|i| {
@@ -100,8 +103,37 @@ fn we_gate_constraint_counts_real_pcs_in_gate() {
             }
         })
         .collect::<Vec<_>>();
-    let cm0 = scheme.commit_const_coeff_fast(&f0).unwrap().as_ref().to_vec();
-    let cm1 = scheme.commit_const_coeff_fast(&f1).unwrap().as_ref().to_vec();
+    type BF = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
+    let pcs_params_f = {
+        let flat_len = n * R::dimension();
+        cmf_pcs::cmf_pcs_params_for_flat_len::<BF>(flat_len, kappa_cm_f).expect("cm_f pcs params")
+    };
+    let cm0 = {
+        let flat: Vec<BF> = f0
+            .iter()
+            .flat_map(|re| {
+                re.coeffs()
+                    .iter()
+                    .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+            })
+            .collect();
+        let f_pcs = cmf_pcs::pad_flat_message(&pcs_params_f, &flat);
+        let (t, _s) = folding_pcs_l2::commit(&pcs_params_f, &f_pcs).expect("cm_f pcs commit");
+        cmf_pcs::pack_t_as_ring::<R>(&t)
+    };
+    let cm1 = {
+        let flat: Vec<BF> = f1
+            .iter()
+            .flat_map(|re| {
+                re.coeffs()
+                    .iter()
+                    .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+            })
+            .collect();
+        let f_pcs = cmf_pcs::pad_flat_message(&pcs_params_f, &flat);
+        let (t, _s) = folding_pcs_l2::commit(&pcs_params_f, &f_pcs).expect("cm_f pcs commit");
+        cmf_pcs::pack_t_as_ring::<R>(&t)
+    };
     let cms = vec![cm0, cm1];
     let witnesses = vec![std::sync::Arc::new(f0), std::sync::Arc::new(f1)];
     let public_inputs: Vec<<R as PolyRing>::BaseRing> = vec![];
@@ -192,7 +224,11 @@ fn we_gate_constraint_counts_real_pcs_in_gate() {
         !squeeze_bytes.is_empty(),
         "expected verifier trace to contain at least one SqueezeBytes op"
     );
-    let pcs_coin_squeeze_idx = 0usize;
+    let pcs_coin_squeeze_idx = find_squeeze_bytes_idx_after_absorb_marker(
+        &trace.ops,
+        BF::from(CMF_PCS_DOMAIN_SEP),
+    )
+    .expect("missing SqueezeBytes after CMF_PCS_DOMAIN_SEP");
     let c_bytes = &squeeze_bytes[pcs_coin_squeeze_idx];
     let bits = bits_le_from_bytes(c_bytes);
 
@@ -266,32 +302,11 @@ fn we_gate_constraint_counts_real_pcs_in_gate() {
     let x2_g = &out.proof.batchlin_pcs_x2;
     let pcs_core_g = &out.proof.batchlin_pcs_core;
 
-    // Find the SqueezeBytes index that follows `BATCHLIN_PCS_DOMAIN_SEP` absorption.
-    let mut pcs_coin_squeeze_idx2: Option<usize> = None;
-    {
-        let marker = BF::from(BATCHLIN_PCS_DOMAIN_SEP);
-        let mut squeeze_idx = 0usize;
-        let mut saw_marker = false;
-        for op in &trace.ops {
-            match op {
-                PoseidonTraceOp::Absorb(v) => {
-                    if v.len() == 1 && v[0] == marker {
-                        saw_marker = true;
-                    }
-                }
-                PoseidonTraceOp::SqueezeBytes { .. } => {
-                    if saw_marker {
-                        pcs_coin_squeeze_idx2 = Some(squeeze_idx);
-                        break;
-                    }
-                    squeeze_idx += 1;
-                }
-                _ => {}
-            }
-        }
-    }
-    let pcs_coin_squeeze_idx2 =
-        pcs_coin_squeeze_idx2.expect("missing SqueezeBytes after BATCHLIN_PCS_DOMAIN_SEP");
+    let pcs_coin_squeeze_idx2 = find_squeeze_bytes_idx_after_absorb_marker(
+        &trace.ops,
+        BF::from(BATCHLIN_PCS_DOMAIN_SEP),
+    )
+    .expect("missing SqueezeBytes after BATCHLIN_PCS_DOMAIN_SEP");
 
     let (full, full_asg) = WeGateDr1csBuilder::poseidon_plus_pifold_plus_cfs_plus_pcs::<R>(
         &poseidon_cfg,

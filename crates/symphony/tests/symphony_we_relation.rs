@@ -1,6 +1,7 @@
 use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
 use latticefold::commitment::AjtaiCommitmentScheme;
 use symphony::{
+    pcs::{cmf_pcs, folding_pcs_l2},
     rp_rgchk::RPParams,
     symphony_open::MultiAjtaiOpenVerifier,
     symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices},
@@ -9,6 +10,7 @@ use symphony::{
 };
 use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing, Ring, Zq};
 use stark_rings_linalg::SparseMatrix;
+use ark_ff::Field;
 
 const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
 
@@ -56,11 +58,40 @@ fn setup_two_instances_any_witness_holds() -> (
         row.clear();
     }
 
-    let scheme_f = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
     let f0 = std::sync::Arc::new(vec![R::ONE; n]);
     let f1 = std::sync::Arc::new(vec![R::ZERO; n]);
-    let cm0 = scheme_f.commit(f0.as_ref()).unwrap().as_ref().to_vec();
-    let cm1 = scheme_f.commit(f1.as_ref()).unwrap().as_ref().to_vec();
+    let kappa_cm_f = 2usize;
+    type BF = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
+    let pcs_params_f = {
+        let flat_len = n * R::dimension();
+        cmf_pcs::cmf_pcs_params_for_flat_len::<BF>(flat_len, kappa_cm_f).expect("cm_f pcs params")
+    };
+    let cm0 = {
+        let flat: Vec<BF> = f0
+            .iter()
+            .flat_map(|re| {
+                re.coeffs()
+                    .iter()
+                    .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+            })
+            .collect();
+        let f_pcs = cmf_pcs::pad_flat_message(&pcs_params_f, &flat);
+        let (t, _s) = folding_pcs_l2::commit(&pcs_params_f, &f_pcs).expect("cm_f pcs commit");
+        cmf_pcs::pack_t_as_ring::<R>(&t)
+    };
+    let cm1 = {
+        let flat: Vec<BF> = f1
+            .iter()
+            .flat_map(|re| {
+                re.coeffs()
+                    .iter()
+                    .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+            })
+            .collect();
+        let f_pcs = cmf_pcs::pad_flat_message(&pcs_params_f, &flat);
+        let (t, _s) = folding_pcs_l2::commit(&pcs_params_f, &f_pcs).expect("cm_f pcs commit");
+        cmf_pcs::pack_t_as_ring::<R>(&t)
+    };
 
     let rg_params = RPParams {
         l_h: 64,

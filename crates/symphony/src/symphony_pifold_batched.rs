@@ -38,6 +38,7 @@ use crate::{
     symphony_open::{NoOpen, VfyOpen},
     symphony_pifold_streaming::{compute_cm_g_aggregate, compute_mon_b_aggregate},
     pcs::batchlin_pcs::BATCHLIN_PCS_DOMAIN_SEP,
+    pcs::cmf_pcs::{cmf_pcs_coin_bytes_len, cmf_pcs_params_for_flat_len, CMF_PCS_DOMAIN_SEP},
     pcs::folding_pcs_l2::FoldingPcsL2ProofCore,
     rp_rgchk::{compose_v_digits, RPParams},
     symphony_cm::SymphonyCoins,
@@ -472,6 +473,15 @@ where
     // Phase 1: Absorb cm_f and derive J for each instance; validate cm_g structure.
     for (inst_idx, cm_f) in cms.iter().enumerate() {
         transcript.absorb_slice(cm_f);
+        // PCS#1 (cm_f PCS) coin splice: bind to cm_f surface and derive C1/C2 bytes.
+        // Deterministically parameterized by (n_f, cm_f surface length).
+        transcript.absorb_field_element(&R::BaseRing::from(CMF_PCS_DOMAIN_SEP));
+        let n_f = Ms[inst_idx][0].ncols;
+        let flat_len = n_f * R::dimension();
+        let kappa_commit = cm_f.len() * R::dimension();
+        let pcs_params_cmf = cmf_pcs_params_for_flat_len::<R::BaseRing>(flat_len, kappa_commit)?;
+        let n_bytes_cmf = cmf_pcs_coin_bytes_len(&pcs_params_cmf);
+        let _ = transcript.squeeze_bytes(n_bytes_cmf);
         let J = derive_J::<R>(transcript, rg_params.lambda_pj, rg_params.l_h);
         Js.push(J);
 
@@ -900,6 +910,13 @@ where
     // Phase 1: Absorb cm_f and derive J for each instance; validate cm_g structure.
     for (inst_idx, cm_f) in cms.iter().enumerate() {
         transcript.absorb_slice(cm_f);
+        transcript.absorb_field_element(&R::BaseRing::from(CMF_PCS_DOMAIN_SEP));
+        let n_f = M[0].ncols;
+        let flat_len = n_f * R::dimension();
+        let kappa_commit = cm_f.len() * R::dimension();
+        let pcs_params_cmf = cmf_pcs_params_for_flat_len::<R::BaseRing>(flat_len, kappa_commit)?;
+        let n_bytes_cmf = cmf_pcs_coin_bytes_len(&pcs_params_cmf);
+        let _ = transcript.squeeze_bytes(n_bytes_cmf);
         let J = derive_J::<R>(transcript, rg_params.lambda_pj, rg_params.l_h);
         Js.push(J);
 

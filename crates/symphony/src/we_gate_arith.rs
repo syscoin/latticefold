@@ -694,7 +694,7 @@ impl WeGateDr1csBuilder {
             Ok((pcs_part_idx, pcs_wiring))
         };
 
-        let (_pcs_f_part_idx, _pcs_f_wiring) = add_pcs_part(
+        let (pcs_f_part_idx, pcs_f_wiring) = add_pcs_part(
             pcs_f_params,
             pcs_f_t,
             pcs_f_x0,
@@ -712,6 +712,47 @@ impl WeGateDr1csBuilder {
             pcs_g_proof,
             pcs_g_coin_squeeze_idx,
         )?;
+
+        // ---------------------------------------------------------------------
+        // PCS_f commitment binding:
+        //
+        // `cm_f` is absorbed as ring elements early in Π_fold. Each ring absorb is `d` base-field elems.
+        // We glue only those `d`-sized absorbs (skipping 1-sized domain separators) and take the first
+        // `t_len = pcs_f_wiring.t_vars.len()` elements as the cm_f commitment surface.
+        // ---------------------------------------------------------------------
+        let d = R::dimension();
+        let mut absorbed_cmf_vars: Vec<usize> = Vec::with_capacity(pcs_f_wiring.t_vars.len());
+        let mut absorb_op_idx = 0usize;
+        for op in ops {
+            if let PoseidonTraceOp::Absorb(elems) = op {
+                let (start, len) = pose_wiring
+                    .absorb_ranges
+                    .get(absorb_op_idx)
+                    .copied()
+                    .unwrap_or((0, 0));
+                absorb_op_idx += 1;
+                if len != elems.len() {
+                    return Err("WeGateDr1csBuilder: poseidon absorb wiring length mismatch".to_string());
+                }
+                if elems.len() != d {
+                    continue;
+                }
+                let vars = &pose_wiring.absorb_vars[start..start + len];
+                absorbed_cmf_vars.extend_from_slice(vars);
+                if absorbed_cmf_vars.len() >= pcs_f_wiring.t_vars.len() {
+                    break;
+                }
+            }
+        }
+        if absorbed_cmf_vars.len() < pcs_f_wiring.t_vars.len() {
+            return Err("WeGateDr1csBuilder: failed to locate enough cm_f absorb vars to glue pcs_f_t".to_string());
+        }
+        for (&pv, &tv) in absorbed_cmf_vars[..pcs_f_wiring.t_vars.len()]
+            .iter()
+            .zip(pcs_f_wiring.t_vars.iter())
+        {
+            glue.push((0, pv, pcs_f_part_idx, tv));
+        }
 
         // ---------------------------------------------------------------------
         // Batchlin PCS binding:

@@ -14,6 +14,7 @@ use symphony::symphony_open::MultiAjtaiOpenVerifier;
 use symphony::symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices};
 use symphony::symphony_pifold_streaming::{compute_cm_g_aggregate, prove_pi_fold_poseidon_fs, PiFoldStreamingConfig};
 use latticefold::commitment::AjtaiCommitmentScheme;
+use symphony::pcs::{cmf_pcs, folding_pcs_l2};
 
 const MASTER_SEED: [u8; 32] = *b"SYMPHONY_AJTAI_SEED_V1_000000000";
 
@@ -83,13 +84,42 @@ fn test_pifold_math_dr1cs_roundtrip_satisfiable_and_tamper_fails() {
         d_prime: (R::dimension() as u128) - 2,
     };
 
-    let scheme = AjtaiCommitmentScheme::<R>::seeded(b"cm_f", MASTER_SEED, 2, n);
+    let kappa_cm_f = 2usize;
     let f0 = vec![<R as stark_rings::Ring>::ONE; n];
     let f1 = (0..n)
         .map(|i| if i % 2 == 0 { <R as stark_rings::Ring>::ONE } else { <R as stark_rings::Ring>::ZERO })
         .collect::<Vec<_>>();
-    let cm0 = scheme.commit_const_coeff_fast(&f0).unwrap().as_ref().to_vec();
-    let cm1 = scheme.commit_const_coeff_fast(&f1).unwrap().as_ref().to_vec();
+    type BF = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
+    let pcs_params_f = {
+        let flat_len = n * R::dimension();
+        cmf_pcs::cmf_pcs_params_for_flat_len::<BF>(flat_len, kappa_cm_f).expect("cm_f pcs params")
+    };
+    let cm0 = {
+        let flat: Vec<BF> = f0
+            .iter()
+            .flat_map(|re| {
+                re.coeffs()
+                    .iter()
+                    .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+            })
+            .collect();
+        let f_pcs = cmf_pcs::pad_flat_message(&pcs_params_f, &flat);
+        let (t, _s) = folding_pcs_l2::commit(&pcs_params_f, &f_pcs).expect("cm_f pcs commit");
+        cmf_pcs::pack_t_as_ring::<R>(&t)
+    };
+    let cm1 = {
+        let flat: Vec<BF> = f1
+            .iter()
+            .flat_map(|re| {
+                re.coeffs()
+                    .iter()
+                    .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+            })
+            .collect();
+        let f_pcs = cmf_pcs::pad_flat_message(&pcs_params_f, &flat);
+        let (t, _s) = folding_pcs_l2::commit(&pcs_params_f, &f_pcs).expect("cm_f pcs commit");
+        cmf_pcs::pack_t_as_ring::<R>(&t)
+    };
 
     let cms = vec![cm0.clone(), cm1.clone()];
     let witnesses = vec![std::sync::Arc::new(f0.clone()), std::sync::Arc::new(f1.clone())];
