@@ -33,8 +33,11 @@ fn bits_le_from_bytes(bytes: &[u8]) -> Vec<bool> {
 #[test]
 fn we_gate_constraint_counts_real_pcs_in_gate() {
     // Keep this tiny: we just want a stable, deterministic constraint count smoke test.
-    let n = 1 << 4; // witness length
-    let m = 1 << 3; // rows per instance
+    // NOTE: batchlin PCS (ℓ=2) currently requires log2(m*d) divisible by 3.
+    // For Frog, d=16, so pick m=32 => m*d=512 => log_n=9.
+    // Also keep n >= m so SparseMatrix::pad_cols(n) doesn't need to "shrink" identity matrices.
+    let n = 1 << 5; // witness length
+    let m = 1 << 5; // rows per instance
 
     // Two instances with sparse A, and B=C=0 so constraints hold for any witness.
     let mut a0 = SparseMatrix::<R>::identity(m);
