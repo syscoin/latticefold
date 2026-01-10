@@ -175,10 +175,11 @@ mod tests {
         let B = estimate_bound(sop, L, d, k) + 1;
         let m = n / k;
         let kappa = 2;
-        // log_d' (q)
-        let l = ((<<R as PolyRing>::BaseRing>::MODULUS.0[0] as f64).ln()
+        // log_d' (q) - round up to power of 2 for optimized tensor evaluation
+        let l_raw = ((<<R as PolyRing>::BaseRing>::MODULUS.0[0] as f64).ln()
             / ((R::dimension() / 2) as f64).ln())
         .ceil() as usize;
+        let l = l_raw.next_power_of_two();
         let params = LinParameters {
             kappa,
             decomp: DecompParameters { b, k, l },
@@ -255,10 +256,11 @@ mod tests {
         let B = estimate_bound(sop, L, d, k) / 2; // + 1;
         let m = n / k;
         let kappa = 2;
-        // log_d' (q)
-        let l = ((<<R as PolyRing>::BaseRing>::MODULUS.0[0] as f64).ln()
+        // log_d' (q) - round up to power of 2 for optimized tensor evaluation
+        let l_raw = ((<<R as PolyRing>::BaseRing>::MODULUS.0[0] as f64).ln()
             / ((R::dimension() / 2) as f64).ln())
         .ceil() as usize;
+        let l = l_raw.next_power_of_two();
         let params = LinParameters {
             kappa,
             decomp: DecompParameters { b, k, l },
