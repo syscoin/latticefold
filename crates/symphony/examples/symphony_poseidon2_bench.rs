@@ -554,9 +554,8 @@ where
     use ark_ff::{BigInteger, Field, PrimeField};
     use latticefold::commitment::AjtaiCommitmentScheme;
     use symphony::{
-        pcs::dpp_folding_pcs_l2::folding_pcs_l2_params,
         pcs::folding_pcs_l2::{
-            BinMatrix, DenseMatrix, verify_folding_pcs_l2_with_c_matrices,
+            BinMatrix, verify_folding_pcs_l2_with_c_matrices,
         },
         rp_rgchk::RPParams,
         symphony_open::MultiAjtaiOpenVerifier,
@@ -699,7 +698,7 @@ where
     )
     .expect("cm_f pcs params");
     let f_pcs_f = symphony::pcs::cmf_pcs::pad_flat_message(&pcs_params_f, &flat_witness);
-    let (t_pcs_f, _s_pcs_f) = symphony::pcs::folding_pcs_l2::commit(&pcs_params_f, &f_pcs_f)
+    let (t_pcs_f, s_pcs_f) = symphony::pcs::folding_pcs_l2::commit(&pcs_params_f, &f_pcs_f)
         .expect("cm_f pcs commit failed");
     // Pack the PCS commitment surface into ring elements for Π_fold plumbing (fills coefficients).
     let cm = symphony::pcs::cmf_pcs::pack_t_as_ring::<R>(&t_pcs_f);
@@ -847,40 +846,11 @@ where
             }
         }
 
-        // PCS instance:
-        //
-        // - `PCS_MODE=toy` (default): tiny instance for wiring/delta sanity only.
-        // - `PCS_MODE=cm_f`: "production-shaped" instance whose statement `t` is derived from the
-        //   real `cm_f` commitment surface (flattened coefficients). This is the right direction
-        //   for measuring *real PCS* overhead relative to the actual commitment object, even though
-        //   this example still does not generate a full PCS opening proof from the witness.
-        let pcs_mode = std::env::var("PCS_MODE").unwrap_or_else(|_| "toy".to_string());
-        let (r, kappa_pcs, pcs_n, delta, alpha, beta0, beta1, beta2) = if pcs_mode == "cm_f" {
-            // Map the Ajtai `cm_f` surface (κ ring elements of dimension d) to PCS field vector
-            // length κ*n with n=d.
-            let r = 1usize;
-            let kappa_pcs = kappa; // match cm_f row count
-            let pcs_n = R::dimension(); // match ring dimension d
-            // Must satisfy delta^alpha >= modulus (enforced by folding_pcs_l2 exactness guard).
-            let delta = 1u64 << 32;
-            let alpha = 2usize;
-            // Large per-coordinate signed bounds so the synthetic proof doesn't trip range checks.
-            let beta0 = 1u64 << 63;
-            let beta1 = beta0;
-            let beta2 = beta0;
-            (r, kappa_pcs, pcs_n, delta, alpha, beta0, beta1, beta2)
-        } else {
-            // Tiny wiring-only mode.
-            let r = 1usize;
-            let kappa_pcs = 2usize;
-            let pcs_n = 4usize;
-            let delta = 1u64 << 32;
-            let alpha = 2usize;
-            let beta0 = 1u64 << 10;
-            let beta1 = 2 * beta0;
-            let beta2 = 2 * beta1;
-            (r, kappa_pcs, pcs_n, delta, alpha, beta0, beta1, beta2)
-        };
+        // PCS#1 (cm_f PCS): MUST match the actual cm_f commitment surface absorbed into Π_fold.
+        // So we use the prover's `pcs_params_f` and commitment `t_pcs_f`.
+        let pcs_params = pcs_params_f.clone();
+        let r = pcs_params.r;
+        let kappa_pcs = pcs_params.kappa;
         let c1 = BinMatrix {
             rows: r * kappa_pcs,
             cols: kappa_pcs,
@@ -901,52 +871,21 @@ where
                 })
                 .collect(),
         };
-        // Matrix A: for now use identity (keeps the example simple).
-        let mut a_data = vec![<BF<R> as Field>::ZERO; pcs_n * (r * pcs_n * alpha)];
-        for i in 0..pcs_n {
-            a_data[i * (r * pcs_n * alpha) + i] = <BF<R> as Field>::ONE;
-        }
-        let a = DenseMatrix::new(pcs_n, r * pcs_n * alpha, a_data);
-        let pcs_params =
-            folding_pcs_l2_params(r, kappa_pcs, pcs_n, delta, alpha, beta0, beta1, beta2, a);
         let x0 = vec![<BF<R> as Field>::ONE; r];
         let x1 = vec![<BF<R> as Field>::ONE; r];
         let x2 = vec![<BF<R> as Field>::ONE; r];
-        // Build PCS#1 statement/proof:
-        // - toy mode: commit/open to a trivial all-ones message
-        // - cm_f mode: commit/open to a real message derived from the *actual Ajtai cm_f surface*,
-        //   i.e. `f_pcs = flatten(cm_f coeffs)` so PCS#1 is no longer synthetic.
-        let (t_pcs, u_pcs, pcs_core) = if pcs_mode == "cm_f" {
-            let mut f_pcs = Vec::with_capacity(kappa_pcs * pcs_n);
-            for re in &cm {
-                for c in re.coeffs() {
-                    let fp = c
-                        .to_base_prime_field_elements()
-                        .into_iter()
-                        .next()
-                        .expect("empty base-prime-field limb");
-                    f_pcs.push(fp);
-                }
-            }
-            assert_eq!(f_pcs.len(), pcs_params.f_len(), "cm_f -> pcs message dimension mismatch");
-            let (t_pcs, s) = symphony::pcs::folding_pcs_l2::commit(&pcs_params, &f_pcs)
-                .expect("pcs commit failed");
-            let (u_pcs, pcs_core) = symphony::pcs::folding_pcs_l2::open(
-                &pcs_params, &f_pcs, &s, &x0, &x1, &x2, &c1, &c2,
-            )
-            .expect("pcs open failed");
-            (t_pcs, u_pcs, pcs_core)
-        } else {
-            let f = vec![<BF<R> as Field>::ONE; pcs_params.f_len()];
-            let (t_pcs, s) = symphony::pcs::folding_pcs_l2::commit(&pcs_params, &f)
-                .expect("pcs commit failed");
-            let (u_pcs, pcs_core) = symphony::pcs::folding_pcs_l2::open(
-                &pcs_params, &f, &s, &x0, &x1, &x2, &c1, &c2,
-            )
-            .expect("pcs open failed");
-            (t_pcs, u_pcs, pcs_core)
-        };
-        verify_folding_pcs_l2_with_c_matrices(&pcs_params, &t_pcs, &x0, &x1, &x2, &u_pcs, &pcs_core, &c1, &c2)
+        let (u_pcs, pcs_core) = symphony::pcs::folding_pcs_l2::open(
+            &pcs_params,
+            &f_pcs_f,
+            &s_pcs_f,
+            &x0,
+            &x1,
+            &x2,
+            &c1,
+            &c2,
+        )
+        .expect("cm_f pcs open failed");
+        verify_folding_pcs_l2_with_c_matrices(&pcs_params, &t_pcs_f, &x0, &x1, &x2, &u_pcs, &pcs_core, &c1, &c2)
             .expect("native folding pcs sanity failed");
 
         // use prover-produced commitment surface + proof core.
@@ -974,7 +913,7 @@ where
             &out.cfs_had_u,
             &out.cfs_mon_b,
             &pcs_params,
-            &t_pcs,
+            &t_pcs_f,
             &x0,
             &x1,
             &x2,
