@@ -3,11 +3,11 @@
 //! This module provides the bridge between Symphony's batchlin relation (evaluation at `r'`)
 //! and the Cini ℓ=2 folding PCS (evaluation at `(x0, x1, x2)`).
 //!
-//! ## Architecture (Stage 1)
+//! ## Architecture
 //!
-//! For now, we keep the existing `cm_g_agg` Ajtai binding intact and ADD the PCS layer
-//! for the folded batchlin object. This gives us real soundness for `R_batchlin` without
-//! breaking the existing Π_mon schedule.
+//! - Π_mon prover messages (`cm_g`) are transcript-bound before Π_mon coins are sampled (via a
+//!   compressed aggregate commitment `cm_g_agg` that is itself bound in-gate).
+//! - The folded batchlin object is bound/verified via the batched scalar PCS (PCS#2) in the WE gate.
 //!
 //! ## Point Conversion
 //!

@@ -1056,13 +1056,11 @@ where
     transcript.absorb_slice(&mon_b_agg);
 
     // -----------------------------------------------------------------------
-    // Stage-1 Batchlin PCS transcript splice (domain-separated):
+    // Batchlin PCS transcript splice (domain-separated, REQUIRED):
     //
-    // Mirror the verifier schedule in `symphony_pifold_batched` so the PCS coin material is
-    // transcript-bound and cannot be prover-optional.
-    //
-    // NOTE: This is still a placeholder commitment surface until the real batchlin PCS prover
-    // is implemented; however, the *transcript schedule* must already be fixed.
+    // This is part of the canonical transcript schedule. It binds the batchlin PCS commitment
+    // surface `batchlin_pcs_t` and derives PCS coins (C1/C2 bits) from Poseidon via SqueezeBytes.
+    // The WE gate verifies this PCS (PCS#2) in-gate, so this phase is not optional.
     // -----------------------------------------------------------------------
     // Batched scalar PCS:
     // - We commit to a single scalar-valued MLE f[j] = Σ_dig γ^dig * ct(psi * g_folded^{(dig)}[j]).

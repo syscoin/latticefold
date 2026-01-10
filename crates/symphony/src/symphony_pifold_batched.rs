@@ -106,15 +106,15 @@ where
     ///   (paper `R_batchlin`) and will be proved succinctly by `π_lin`.
     pub cm_g: Vec<Vec<Vec<R>>>,
 
-    /// Stage-1 (PCS batchlin): PCS commitment(s) for the **folded** batchlin object `g_*^{(dig)}`.
+    /// Batchlin PCS: PCS commitment surface for the **batched scalar** folded batchlin object.
     ///
-    /// This is *not yet* verified by Π_fold itself; it is intended to be verified in the WE gate
-    /// via the second PCS instance, after `r'` and `u_*` are fixed.
+    /// This commitment is transcript-bound and verified in the WE gate (PCS#2) after `r'` and
+    /// `u_*` are fixed.
     ///
     /// Shape: `[k_g][t_len]` where `t_len` is the PCS commitment length for a single digit.
     pub batchlin_pcs_t: Vec<Vec<R::BaseRing>>,
 
-    /// Stage-1 (PCS batchlin): tensor eval vectors derived from `r'` (length r each).
+    /// Batchlin PCS: tensor eval vectors derived from `r'` (length r each).
     ///
     /// For the batched (single-proof) variant we commit to a *single* scalar-valued MLE, so these
     /// are shared across all digits and are public transcript-bound values.
@@ -122,9 +122,7 @@ where
     pub batchlin_pcs_x1: Vec<R::BaseRing>,
     pub batchlin_pcs_x2: Vec<R::BaseRing>,
 
-    /// Stage-1 (PCS batchlin): PCS proof core for the **batched scalar** commitment.
-    ///
-    /// This is verified in the WE gate as PCS#2.
+    /// Batchlin PCS: PCS proof core for the **batched scalar** commitment (verified in the WE gate as PCS#2).
     pub batchlin_pcs_core: FoldingPcsL2ProofCore<R::BaseRing>,
 
     /// Folded Π_rg hook message v_digits* (k_g × d), using scalar β (constants in the base field).
@@ -777,7 +775,7 @@ where
     let folded_bat = SymphonyBatchLin { r_prime, c_g: c_g_folded, u: u_folded };
 
     // -----------------------------------------------------------------------
-    // Stage-1 Batchlin PCS transcript splice (domain-separated):
+    // Batchlin PCS transcript splice (domain-separated, REQUIRED):
     //
     // If the proof includes a PCS commitment surface for the folded batchlin object, bind it
     // into the Poseidon transcript *after* `r'` and `u_*` are fixed, and then squeeze bytes to
@@ -1207,7 +1205,7 @@ where
     let folded_bat = SymphonyBatchLin { r_prime, c_g: c_g_folded, u: u_folded };
 
     // -----------------------------------------------------------------------
-    // Stage-1 Batchlin PCS transcript splice (domain-separated). See the hetero-M variant.
+    // Batchlin PCS transcript splice (domain-separated, REQUIRED). See the hetero-M variant.
     // -----------------------------------------------------------------------
     // Batchlin PCS transcript splice (REQUIRED). See hetero-M variant for rationale.
     if proof.batchlin_pcs_t.is_empty() {

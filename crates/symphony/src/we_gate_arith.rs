@@ -327,7 +327,7 @@ impl WeGateDr1csBuilder {
             .collect::<Vec<_>>();
 
         // ---------------------------------------------------------------------
-        // Stage-1 Batchlin PCS transcript splice (domain-separated):
+        // Batchlin PCS transcript splice (domain-separated, REQUIRED):
         // ---------------------------------------------------------------------
         if proof.batchlin_pcs_t.is_empty() {
             return Err("WeGateDr1csBuilder: missing batchlin_pcs_t".to_string());
