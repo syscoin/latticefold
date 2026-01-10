@@ -3,12 +3,7 @@ use latticefold::commitment::AjtaiCommitmentScheme;
 use stark_rings::{cyclotomic_ring::models::frog_ring::RqPoly as R, PolyRing};
 use stark_rings_linalg::SparseMatrix;
 
-use symphony::pcs::dpp_folding_pcs_l2::folding_pcs_l2_params;
-use symphony::pcs::folding_pcs_l2::{
-    gadget_apply_digits, kron_ct_in_mul, kron_i_a_mul, kron_ikn_xt_mul, BinMatrix, DenseMatrix,
-    FoldingPcsL2ProofCore,
-    verify_folding_pcs_l2_with_c_matrices,
-};
+use symphony::pcs::folding_pcs_l2::{BinMatrix, verify_folding_pcs_l2_with_c_matrices};
 use symphony::rp_rgchk::RPParams;
 use symphony::symphony_open::MultiAjtaiOpenVerifier;
 use symphony::symphony_pifold_batched::{verify_pi_fold_cp_poseidon_fs, PiFoldMatrices};
@@ -231,65 +226,65 @@ fn we_gate_constraint_counts_real_pcs_in_gate() {
     let c_bytes = &squeeze_bytes[pcs_coin_squeeze_idx];
     let bits = bits_le_from_bytes(c_bytes);
 
-    // Tiny PCS instance (only used to measure gate arithmetization overhead).
-    let r = 1usize;
-    let kappa = 2usize;
-    let pcs_n = 4usize;
-    let delta = 4u64;
-    let alpha = 1usize;
-    let beta0 = 1u64 << 10;
-    let beta1 = 2 * beta0;
-    let beta2 = 2 * beta1;
+    // PCS#1 (cm_f PCS): MUST match the actual `cm_f` surface absorbed into the transcript.
+    // Build a real opening proof for the first instance (cms[0] / witness f0) using the
+    // transcript-derived C1/C2 coins (the `SqueezeBytes(N)` right after CMF_PCS_DOMAIN_SEP).
+    let pcs_params = pcs_params_f.clone();
 
     let c1 = BinMatrix {
-        rows: r * kappa,
-        cols: kappa,
-        data: (0..(r * kappa * kappa))
+        rows: pcs_params.r * pcs_params.kappa,
+        cols: pcs_params.kappa,
+        data: (0..(pcs_params.r * pcs_params.kappa * pcs_params.kappa))
             .map(|i| if bits[i] { BF::ONE } else { BF::ZERO })
             .collect(),
     };
     let c2 = BinMatrix {
-        rows: r * kappa,
-        cols: kappa,
-        data: (0..(r * kappa * kappa))
-            .map(|i| if bits[(r * kappa * kappa) + i] { BF::ONE } else { BF::ZERO })
+        rows: pcs_params.r * pcs_params.kappa,
+        cols: pcs_params.kappa,
+        data: (0..(pcs_params.r * pcs_params.kappa * pcs_params.kappa))
+            .map(|i| {
+                if bits[(pcs_params.r * pcs_params.kappa * pcs_params.kappa) + i] {
+                    BF::ONE
+                } else {
+                    BF::ZERO
+                }
+            })
             .collect(),
     };
 
-    // A = I_{pcs_n}.
-    let mut a_data = vec![BF::ZERO; pcs_n * (r * pcs_n * alpha)];
-    for i in 0..pcs_n {
-        a_data[i * (r * pcs_n * alpha) + i] = BF::ONE;
-    }
-    let a = DenseMatrix::new(pcs_n, r * pcs_n * alpha, a_data);
-    let pcs_params = folding_pcs_l2_params(r, kappa, pcs_n, delta, alpha, beta0, beta1, beta2, a);
+    let x0 = vec![BF::ONE; pcs_params.r];
+    let x1 = vec![BF::ONE; pcs_params.r];
+    let x2 = vec![BF::ONE; pcs_params.r];
 
-    let x0 = vec![BF::ONE; r];
-    let x1 = vec![BF::ONE; r];
-    let x2 = vec![BF::ONE; r];
-
-    // Deterministic small y0 within bounds (no RNG needed for count test).
-    let y0 = vec![BF::ONE; pcs_params.y0_len()];
-    let y1 = kron_ct_in_mul(&c1, pcs_n, &y0);
-    let y2 = kron_ct_in_mul(&c2, pcs_n, &y1);
-    let t_pcs = kron_i_a_mul(&pcs_params.a, pcs_params.kappa, pcs_params.r * pcs_params.n * pcs_params.alpha, &y0);
-    let mut delta_pows = Vec::with_capacity(alpha);
-    let mut acc = BF::ONE;
-    let delta_f = BF::from(delta);
-    for _ in 0..alpha {
-        delta_pows.push(acc);
-        acc *= delta_f;
-    }
-    let v0 = gadget_apply_digits(&delta_pows, r * kappa * pcs_n, &y0);
-    let v1 = gadget_apply_digits(&delta_pows, r * kappa * pcs_n, &y1);
-    let v2 = gadget_apply_digits(&delta_pows, r * kappa * pcs_n, &y2);
-    let u_pcs = kron_ikn_xt_mul(&x2, kappa, pcs_n, &v0);
-
-    let pcs_core = FoldingPcsL2ProofCore { y0, v0, y1, v1, y2, v2 };
-    verify_folding_pcs_l2_with_c_matrices(
-        &pcs_params, &t_pcs, &x0, &x1, &x2, &u_pcs, &pcs_core, &c1, &c2,
+    // Flatten witness f0 into BF and pad to PCS message length.
+    let flat0: Vec<BF> = witnesses[0]
+        .iter()
+        .flat_map(|re| {
+            re.coeffs()
+                .iter()
+                .map(|c| c.to_base_prime_field_elements().into_iter().next().expect("bf limb"))
+        })
+        .collect();
+    let f_pcs0 = cmf_pcs::pad_flat_message(&pcs_params, &flat0);
+    let (t_pcs, s0) = folding_pcs_l2::commit(&pcs_params, &f_pcs0).expect("cm_f pcs commit");
+    assert_eq!(
+        cms[0],
+        cmf_pcs::pack_t_as_ring::<R>(&t_pcs),
+        "cms[0] must equal pack_t_as_ring(commit(f0)) for cm_f PCS binding"
+    );
+    let (u_pcs, pcs_core) = folding_pcs_l2::open(
+        &pcs_params,
+        &f_pcs0,
+        &s0,
+        &x0,
+        &x1,
+        &x2,
+        &c1,
+        &c2,
     )
-    .expect("native folding PCS sanity check failed");
+    .expect("cm_f pcs open");
+    verify_folding_pcs_l2_with_c_matrices(&pcs_params, &t_pcs, &x0, &x1, &x2, &u_pcs, &pcs_core, &c1, &c2)
+        .expect("native cm_f PCS sanity check failed");
 
     // Use the full trace ops here (production-shape).
     // PCS#2 (batchlin) must use the prover-produced commitment surface and transcript-bound coins.

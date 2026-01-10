@@ -358,8 +358,6 @@ fn test_poseidon_trace_sparse_dpp_end_to_end_accepts() {
     attempt.result.expect("cp verify failed");
     let trace = attempt.trace;
 
-    // (debug-only prover/vfy transcript alignment checks removed)
-
     // IMPORTANT: for this DPP integration test we only take a short prefix of the transcript ops,
     // to keep the resulting dR1CS small (and thus keep the RS FLPCP proof length `m=2k` small).
     //
