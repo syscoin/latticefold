@@ -195,6 +195,46 @@ fn is_power_of_two(n: usize) -> bool {
     n > 0 && (n & (n - 1)) == 0
 }
 
+/// Check if tensor factors would use the optimized path
+pub fn would_use_optimized_path(
+    c_z_len: usize,
+    s_prime_len: usize,
+    d_prime_powers_len: usize,
+    x_powers_len: usize,
+) -> bool {
+    let kappa = 1 << c_z_len;
+    is_power_of_two(kappa) 
+        && is_power_of_two(s_prime_len)
+        && is_power_of_two(d_prime_powers_len)
+        && is_power_of_two(x_powers_len)
+}
+
+/// Print tensor factor sizes and optimization status
+pub fn print_tensor_optimization_status(
+    c_z_len: usize,
+    s_prime_len: usize,
+    d_prime_powers_len: usize,
+    x_powers_len: usize,
+) {
+    let kappa = 1 << c_z_len;
+    let optimized = would_use_optimized_path(c_z_len, s_prime_len, d_prime_powers_len, x_powers_len);
+    
+    println!("=== Tensor Evaluation Optimization ===");
+    println!("  tensor(c_z) size (κ): {} (pow2: {})", kappa, is_power_of_two(kappa));
+    println!("  s_prime size (k×d):   {} (pow2: {})", s_prime_len, is_power_of_two(s_prime_len));
+    println!("  d_prime_powers (ℓ):   {} (pow2: {})", d_prime_powers_len, is_power_of_two(d_prime_powers_len));
+    println!("  x_powers (d):         {} (pow2: {})", x_powers_len, is_power_of_two(x_powers_len));
+    println!("  Using optimized path: {}", if optimized { "YES ✓" } else { "NO (dense fallback)" });
+    if optimized {
+        let ops = kappa + s_prime_len + d_prime_powers_len + x_powers_len;
+        println!("  Estimated ops: ~{}", ops);
+    } else {
+        let ops = kappa * s_prime_len * d_prime_powers_len * x_powers_len;
+        println!("  Estimated ops (dense): ~{}", ops);
+    }
+    println!("======================================");
+}
+
 /// Evaluate `t(z) = tensor(c_z) ⊗ s' ⊗ d_powers ⊗ x_powers` at a point.
 ///
 /// This is the optimized version of the calculation in `cm.rs`.

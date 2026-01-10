@@ -215,16 +215,33 @@ mod tests {
 
         let proof = prover.prove(&[cr1cs0, cr1cs1]);
 
+        // log_kappa for tensor status printing (kappa already defined above)
+        let log_kappa = ark_std::log2(kappa) as usize;
+        
         let transcript = PoseidonTranscript::empty::<PC>();
         let mut verifier = PlusVerifier::init(A, M, pparams, transcript);
+        
+        // Time verification
+        let start = std::time::Instant::now();
         verifier.verify(&proof);
+        let verify_time = start.elapsed();
         
         // Print transcript metrics for DPP cost estimation
-        println!("\n=== LF+ Verifier Transcript Metrics (n={}) ===", n);
+        println!("\n=== LF+ Verifier Metrics (n={}) ===", n);
         println!("  Ring dimension d = {}", R::dimension());
-        println!("  Decomposition k = {}, l = {}", k, l);
+        println!("  Decomposition k = {}, l = {} (padded to {})", k, l, l.next_power_of_two());
         println!("  Folding instances L = {}", L);
+        println!("  Verification time: {:?}", verify_time);
         verifier.transcript().print_metrics();
+        
+        // Print tensor optimization status
+        use crate::tensor_eval::print_tensor_optimization_status;
+        print_tensor_optimization_status(
+            log_kappa,
+            k * R::dimension(),
+            l.next_power_of_two(),
+            R::dimension(),
+        );
     }
 
     #[test]
