@@ -17,7 +17,7 @@
 //!
 //! Complexity: O(|t1| + |t2| + |t3| + |t4|) instead of O(|t1| * |t2| * |t3| * |t4|)
 
-use ark_std::{log2, One};
+use ark_std::log2;
 use stark_rings::OverField;
 
 /// Evaluate a small MLE (given as evaluations) at a point.
