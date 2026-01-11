@@ -42,18 +42,21 @@ fn lift_to_big<Fs: PrimeField>(x: Fs) -> FBig {
 
 fn bench_we_dpp(c: &mut Criterion) {
     // Keep defaults small-ish so local runs work; override on server by editing this file for now.
-    // Fast toy parameters: keeps tau_unpadded_len <= 1024 so this bench focuses on WE/DPP,
-    // not prover-side RG setup.
-    let k = 2usize;
-    let kappa = 2usize;
-    // NOTE: `RgInstance::from_f` currently calls `split(..., k = decomp.l)`, so we must keep `ell >= 2`
-    // to avoid `balanced_decomposition` panics for k=1 in that path.
-    let ell = 2usize;
+    // Toy params, but must still satisfy decomposition constraints:
+    // - `RgInstance::from_f` uses `split(..., padding_size = ell)` to gadget-decompose commitment entries.
+    // - If `ell` is too small, `balanced_decomposition` can panic (needs enough digits to represent a typical field element).
+    // Use a conservative `ell=32` as in other benches.
+    //
+    // We also keep `f=0` so the *cf(f)* decomposition with `k=1` is safe.
+    let k = 1usize;
+    let kappa = 1usize;
+    let ell = 32usize;
     let b = 2u128;
     // Ensure `n >= tau_unpadded_len` for `split`:
     // tau_unpadded_len = kappa * (k*d) * ell * d.
-    // With Frog d=16, (kappa,k,ell)=(2,2,2) gives tau_unpadded_len=2048, so pick n=2048.
-    let n = 1 << 11;
+    let d = R::dimension();
+    let tau_unpadded_len = kappa * (k * d) * ell * d;
+    let n = tau_unpadded_len.next_power_of_two();
     let nvars = ark_std::log2(n) as usize;
 
     let dparams = DecompParameters { b, k, l: ell };
