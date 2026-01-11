@@ -79,9 +79,14 @@ where
     #[inline]
     pub fn eval_at_index(&self, index: usize) -> R {
         match self {
-            StreamingMleEnum::DenseOwned { evals, .. } => evals[index],
-            StreamingMleEnum::DenseArc { evals, .. } => evals[index],
-            StreamingMleEnum::BaseScalarOwned { evals, .. } => R::from(evals[index]),
+            // IMPORTANT: allow implicit zero-padding when the backing table is shorter than 2^num_vars.
+            // This matches existing LF usage patterns where callers sometimes pass `nvars` for a
+            // larger padded domain, while some intermediates live on a smaller row domain.
+            StreamingMleEnum::DenseOwned { evals, .. } => evals.get(index).copied().unwrap_or(R::ZERO),
+            StreamingMleEnum::DenseArc { evals, .. } => evals.get(index).copied().unwrap_or(R::ZERO),
+            StreamingMleEnum::BaseScalarOwned { evals, .. } => {
+                evals.get(index).copied().map(R::from).unwrap_or(R::ZERO)
+            }
             StreamingMleEnum::EqBase {
                 scale,
                 r,
@@ -97,6 +102,9 @@ where
             StreamingMleEnum::SparseMatVec {
                 matrix, witness, ..
             } => {
+                if index >= matrix.coeffs.len() {
+                    return R::ZERO;
+                }
                 let mut sum = R::ZERO;
                 for (coeff, col_idx) in &matrix.coeffs[index] {
                     if *col_idx < witness.len() {

@@ -324,17 +324,23 @@ fn build_eq_table_base<R: PolyRing>(r: &[R::BaseRing]) -> Vec<R::BaseRing>
 where
     R::BaseRing: Ring,
 {
-    let mut acc = vec![R::BaseRing::ONE];
-    for &ri in r {
-        let one_minus = R::BaseRing::ONE - ri;
-        let mut next = Vec::with_capacity(acc.len() * 2);
-        for &v in &acc {
-            next.push(v * one_minus);
-            next.push(v * ri);
+    // Must match `latticefold::utils::sumcheck::utils::build_eq_x_r_vec` ordering:
+    // bit i corresponds to r[i] in LITTLE-endian index order (i = LSB).
+    //
+    // That implementation recurses on r[1..] first, then expands with r[0].
+    // An equivalent iterative form is to fold from the end toward the start.
+    let mut buf = vec![R::BaseRing::ONE];
+    for &ri in r.iter().rev() {
+        let mut res = vec![R::BaseRing::ZERO; buf.len() << 1];
+        // even idx = (1-ri)*bi, odd idx = ri*bi
+        for (i, out) in res.iter_mut().enumerate() {
+            let bi = buf[i >> 1];
+            let tmp = ri * bi;
+            *out = if (i & 1) == 0 { bi - tmp } else { tmp };
         }
-        acc = next;
+        buf = res;
     }
-    acc
+    buf
 }
 
 fn dot_base<R: PolyRing>(v: &[R::BaseRing], eq: &[R::BaseRing]) -> R::BaseRing
