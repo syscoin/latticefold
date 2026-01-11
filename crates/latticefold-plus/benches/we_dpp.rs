@@ -42,11 +42,17 @@ fn lift_to_big<Fs: PrimeField>(x: Fs) -> FBig {
 
 fn bench_we_dpp(c: &mut Criterion) {
     // Keep defaults small-ish so local runs work; override on server by editing this file for now.
-    let n = 1 << 10;
     let k = 2usize;
     let kappa = 2usize;
     let ell = 32usize;
     let b = 2u128;
+    // `RgInstance::from_f` calls `utils::split(com, n, d/2, ell)` where `split` requires:
+    //   n >= tau_unpadded_len = kappa * (k*d) * ell * d.
+    // We pick the smallest power-of-two n that satisfies this.
+    let d = R::dimension();
+    let tau_unpadded_len = kappa * (k * d) * ell * d;
+    let n = tau_unpadded_len.next_power_of_two();
+    let nvars = ark_std::log2(n) as usize;
 
     let dparams = DecompParameters { b, k, l: ell };
     let mut rng = ark_std::test_rng();
@@ -56,7 +62,7 @@ fn bench_we_dpp(c: &mut Criterion) {
     let A = Matrix::<R>::rand(&mut rng, kappa, n);
     let inst = RgInstance::from_f(f, &A, &dparams);
     let rg = Rg {
-        nvars: ark_std::log2(n) as usize,
+        nvars,
         instances: vec![inst],
         dparams: dparams.clone(),
     };
@@ -74,9 +80,9 @@ fn bench_we_dpp(c: &mut Criterion) {
 
     // Statement params prefix (placeholder values; we only bind layout in this bench).
     let params = WeParams {
-        nvars_setchk: ark_std::log2(n) as u64,
+        nvars_setchk: nvars as u64,
         degree_setchk: 3,
-        nvars_cm: ark_std::log2(n) as u64,
+        nvars_cm: nvars as u64,
         degree_cm: 2,
         kappa: kappa as u64,
         ring_dim_d: R::dimension() as u64,
