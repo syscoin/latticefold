@@ -7,7 +7,7 @@ use latticefold::{
     },
 };
 use stark_rings::{OverField, PolyRing, Ring};
-use stark_rings_linalg::{ops::Transpose, SparseMatrix};
+use stark_rings_linalg::{ops::Transpose, Matrix, SparseMatrix};
 use thiserror::Error;
 use std::sync::Arc;
 use std::time::Instant;
@@ -22,7 +22,10 @@ use rayon::prelude::*;
 
 #[derive(Clone, Debug)]
 pub enum MonomialSet<R> {
+    /// Legacy sparse representation (kept for unit tests / small cases).
     Matrix(SparseMatrix<R>),
+    /// Dense n×d matrix of monomial ring elements (preferred for large instances).
+    DenseMatrix(Matrix<R>),
     Vector(Vec<R>),
 }
 
@@ -72,11 +75,19 @@ impl<R: OverField> In<R> {
         let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
         let t_total = Instant::now();
 
-        let Ms: Vec<&SparseMatrix<R>> = self
+        let Ms_sparse: Vec<&SparseMatrix<R>> = self
             .sets
             .iter()
             .filter_map(|set| match set {
                 MonomialSet::Matrix(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        let Ms_dense: Vec<&Matrix<R>> = self
+            .sets
+            .iter()
+            .filter_map(|set| match set {
+                MonomialSet::DenseMatrix(m) => Some(m),
                 _ => None,
             })
             .collect();
@@ -89,18 +100,27 @@ impl<R: OverField> In<R> {
             })
             .collect();
 
-        let ncols = Ms[0].ncols;
-        let MTs = Ms.iter().map(|M| M.transpose()).collect::<Vec<_>>();
-        let tnvars = log2(Ms[0].nrows.next_power_of_two()) as usize;
+        assert!(
+            !Ms_sparse.is_empty() || !Ms_dense.is_empty(),
+            "set_check requires at least one matrix set"
+        );
+        let (nrows, ncols) = if let Some(m0) = Ms_dense.first() {
+            ((*m0).nrows, (*m0).ncols)
+        } else {
+            (Ms_sparse[0].nrows, Ms_sparse[0].ncols)
+        };
+        let tnvars = log2(nrows.next_power_of_two()) as usize;
+        let MTs = Ms_sparse.iter().map(|M| (*M).transpose()).collect::<Vec<_>>();
 
         // Streaming MLEs (avoid materializing DenseMultilinearExtension tables).
         use crate::streaming_sumcheck::{StreamingMleEnum, StreamingSumcheck};
+        let Ms_len = Ms_dense.len() + Ms_sparse.len();
         let mut mles: Vec<StreamingMleEnum<R>> =
-            Vec::with_capacity((Ms.len() + ms.len()) * (ncols * 2 + 1));
-        let mut alphas = Vec::with_capacity(Ms.len());
+            Vec::with_capacity((Ms_len + ms.len()) * (ncols * 2 + 1));
+        let mut alphas = Vec::with_capacity(Ms_len);
 
-        // matrix sets
-        for (mi, M) in Ms.iter().enumerate() {
+        // matrix sets (dense path)
+        for (mi, Md) in Ms_dense.iter().enumerate() {
             let t_mat = Instant::now();
             // Step 1
             let c0 = transcript.get_challenges(self.nvars);
@@ -108,31 +128,32 @@ impl<R: OverField> In<R> {
             let beta = transcript.get_challenge();
 
             // Step 2
-            let MT = M.transpose();
-
             // Fast evaluation uses precomputed beta powers (degree = ring dimension).
             let beta_pows = beta_pows::<R>(beta);
 
-            // Build per-column base-scalar tables in parallel (each is length n = M.nrows).
+            // Build per-column base-scalar tables by scanning dense rows.
             #[cfg(feature = "parallel")]
             let col_tables: Vec<Arc<Vec<R::BaseRing>>> = (0..ncols)
                 .into_par_iter()
                 .map(|col| {
-                    let row = &MT.coeffs[col];
-                    let mut v = vec![R::BaseRing::ZERO; M.nrows];
-                    for (r_ij, idx) in row.iter() {
-                        v[*idx] = ev_fast::<R>(r_ij, &beta_pows);
-                    }
+                    let v: Vec<R::BaseRing> = (0..nrows)
+                        .into_par_iter()
+                        .map(|row| {
+                            // Md: n×d, access by row-major.
+                            let rij = Md.vals[row][col];
+                            ev_fast::<R>(&rij, &beta_pows)
+                        })
+                        .collect();
                     Arc::new(v)
                 })
                 .collect();
             #[cfg(not(feature = "parallel"))]
             let col_tables: Vec<Arc<Vec<R::BaseRing>>> = (0..ncols)
                 .map(|col| {
-                    let row = &MT.coeffs[col];
-                    let mut v = vec![R::BaseRing::ZERO; M.nrows];
-                    for (r_ij, idx) in row.iter() {
-                        v[*idx] = ev_fast::<R>(r_ij, &beta_pows);
+                    let mut v = vec![R::BaseRing::ZERO; nrows];
+                    for row in 0..nrows {
+                        let rij = Md.vals[row][col];
+                        v[row] = ev_fast::<R>(&rij, &beta_pows);
                     }
                     Arc::new(v)
                 })
@@ -157,6 +178,51 @@ impl<R: OverField> In<R> {
             if profile {
                 println!(
                     "[LF+ setchk] matrix_set[{mi}] build_tables: {:?} (nrows={}, ncols={})",
+                    t_mat.elapsed(),
+                    nrows,
+                    ncols
+                );
+            }
+        }
+
+        // matrix sets (legacy sparse path)
+        for (mi, M) in Ms_sparse.iter().enumerate() {
+            let t_mat = Instant::now();
+            let c0 = transcript.get_challenges(self.nvars);
+            let one_minus_c0 = c0.iter().copied().map(|x| R::BaseRing::ONE - x).collect();
+            let beta = transcript.get_challenge();
+
+            let MT = (*M).transpose();
+            let beta_pows = beta_pows::<R>(beta);
+
+            // This is inherently limited-parallel (ncols is small). Kept for small/unit tests.
+            let col_tables: Vec<Arc<Vec<R::BaseRing>>> = (0..ncols)
+                .map(|col| {
+                    let row = &MT.coeffs[col];
+                    let mut v = vec![R::BaseRing::ZERO; M.nrows];
+                    for (r_ij, idx) in row.iter() {
+                        v[*idx] = ev_fast::<R>(r_ij, &beta_pows);
+                    }
+                    Arc::new(v)
+                })
+                .collect();
+
+            for col in 0..ncols {
+                let tab = col_tables[col].clone();
+                mles.push(StreamingMleEnum::BaseScalarArc { evals: tab.clone(), num_vars: tnvars, square: false });
+                mles.push(StreamingMleEnum::BaseScalarArc { evals: tab, num_vars: tnvars, square: true });
+            }
+            mles.push(StreamingMleEnum::EqBase {
+                scale: R::BaseRing::ONE,
+                r: c0,
+                one_minus_r: one_minus_c0,
+            });
+            let alpha = transcript.get_challenge();
+            alphas.push(alpha);
+
+            if profile {
+                println!(
+                    "[LF+ setchk] matrix_set_sparse[{mi}] build_tables: {:?} (nrows={}, ncols={})",
                     t_mat.elapsed(),
                     M.nrows,
                     ncols
@@ -199,11 +265,11 @@ impl<R: OverField> In<R> {
         }
 
         // random linear combinator, for batching
-        let rc: Option<R::BaseRing> = (Ms.len() > 1).then(|| transcript.get_challenge());
+        let rc: Option<R::BaseRing> = (Ms_len > 1).then(|| transcript.get_challenge());
 
         let comb_fn = |vals: &[R]| -> R {
             let mut lc = R::zero();
-            for (i, alpha) in alphas.iter().enumerate().take(Ms.len()) {
+            for (i, alpha) in alphas.iter().enumerate().take(Ms_len) {
                 // 2 * ncols for (m_j, m_prime_j), +1 for eq
                 let s = i * (2 * ncols + 1);
                 let mut res = R::zero();
@@ -219,10 +285,10 @@ impl<R: OverField> In<R> {
                 };
             }
             for i in 0..ms.len() {
-                let s_base = Ms.len() * (2 * ncols + 1);
+                let s_base = Ms_len * (2 * ncols + 1);
                 let s = s_base + i * 3;
                 let mut res = R::zero();
-                let alpha_idx = Ms.len() + i;
+                let alpha_idx = Ms_len + i;
                 res += (vals[s] * vals[s] - vals[s + 1]) * alphas[alpha_idx];
                 res *= vals[s + 2]; // eq
                 lc += if let Some(rc) = &rc {
@@ -243,7 +309,7 @@ impl<R: OverField> In<R> {
                 t_sc.elapsed(),
                 self.nvars,
                 ncols,
-                Ms.len(),
+                Ms_len,
                 ms.len()
             );
         }
@@ -271,45 +337,43 @@ impl<R: OverField> In<R> {
         let e: Vec<Vec<Vec<R>>> = {
             let mut e = Vec::with_capacity(1 + M.len());
 
-            // e0: eval of each MT row at point r.
+            // e0:
+            // - for dense matrices: e0[m][col] = Σ_row Md[row][col] * eq(row)
+            // - for sparse matrices: keep legacy transpose iteration
             #[cfg(feature = "parallel")]
-            let e0 = MTs
-                .par_iter()
-                .map(|MT| {
-                    MT.coeffs
-                        .par_iter()
-                        .map(|row| {
-                            let mut acc = R::ZERO;
-                            for &(rij, idx) in row {
-                                acc += rij * eq_r_ring[idx];
-                            }
-                            acc
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<Vec<R>>>();
+            let mut e0: Vec<Vec<R>> = Vec::with_capacity(Ms_dense.len() + MTs.len());
             #[cfg(not(feature = "parallel"))]
-            let e0 = MTs
-                .iter()
-                .map(|MT| {
-                    MT.coeffs
-                        .iter()
-                        .map(|row| {
-                            let mut acc = R::ZERO;
-                            for &(rij, idx) in row {
-                                acc += rij * eq_r_ring[idx];
-                            }
-                            acc
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<Vec<R>>>();
-            e.push(e0);
+            let mut e0: Vec<Vec<R>> = Vec::with_capacity(Ms_dense.len() + MTs.len());
 
-            // Mf
-            for (mi, y) in y_mats.iter().enumerate() {
+            // Dense sets
+            for Md in &Ms_dense {
                 #[cfg(feature = "parallel")]
-                let ei = MTs
+                let v = (0..ncols)
+                    .into_par_iter()
+                    .map(|col| {
+                        let mut acc = R::ZERO;
+                        for row in 0..nrows {
+                            acc += Md.vals[row][col] * eq_r_ring[row];
+                        }
+                        acc
+                    })
+                    .collect::<Vec<_>>();
+                #[cfg(not(feature = "parallel"))]
+                let v = (0..ncols)
+                    .map(|col| {
+                        let mut acc = R::ZERO;
+                        for row in 0..nrows {
+                            acc += Md.vals[row][col] * eq_r_ring[row];
+                        }
+                        acc
+                    })
+                    .collect::<Vec<_>>();
+                e0.push(v);
+            }
+            // Sparse sets
+            #[cfg(feature = "parallel")]
+            {
+                let v = MTs
                     .par_iter()
                     .map(|MT| {
                         MT.coeffs
@@ -317,15 +381,18 @@ impl<R: OverField> In<R> {
                             .map(|row| {
                                 let mut acc = R::ZERO;
                                 for &(rij, idx) in row {
-                                    acc += rij * y[idx];
+                                    acc += rij * eq_r_ring[idx];
                                 }
                                 acc
                             })
                             .collect::<Vec<_>>()
                     })
                     .collect::<Vec<Vec<R>>>();
-                #[cfg(not(feature = "parallel"))]
-                let ei = MTs
+                e0.extend(v);
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                let v = MTs
                     .iter()
                     .map(|MT| {
                         MT.coeffs
@@ -333,13 +400,86 @@ impl<R: OverField> In<R> {
                             .map(|row| {
                                 let mut acc = R::ZERO;
                                 for &(rij, idx) in row {
-                                    acc += rij * y[idx];
+                                    acc += rij * eq_r_ring[idx];
                                 }
                                 acc
                             })
                             .collect::<Vec<_>>()
                     })
                     .collect::<Vec<Vec<R>>>();
+                e0.extend(v);
+            }
+            e.push(e0);
+
+            // Mf
+            for (mi, y) in y_mats.iter().enumerate() {
+                let mut ei: Vec<Vec<R>> = Vec::with_capacity(Ms_dense.len() + MTs.len());
+
+                // Dense sets: Σ_row Md[row][col] * y[row]
+                for Md in &Ms_dense {
+                    #[cfg(feature = "parallel")]
+                    let v = (0..ncols)
+                        .into_par_iter()
+                        .map(|col| {
+                            let mut acc = R::ZERO;
+                            for row in 0..nrows {
+                                acc += Md.vals[row][col] * y[row];
+                            }
+                            acc
+                        })
+                        .collect::<Vec<_>>();
+                    #[cfg(not(feature = "parallel"))]
+                    let v = (0..ncols)
+                        .map(|col| {
+                            let mut acc = R::ZERO;
+                            for row in 0..nrows {
+                                acc += Md.vals[row][col] * y[row];
+                            }
+                            acc
+                        })
+                        .collect::<Vec<_>>();
+                    ei.push(v);
+                }
+
+                // Sparse sets (legacy)
+                #[cfg(feature = "parallel")]
+                {
+                    let v = MTs
+                        .par_iter()
+                        .map(|MT| {
+                            MT.coeffs
+                                .par_iter()
+                                .map(|row| {
+                                    let mut acc = R::ZERO;
+                                    for &(rij, idx) in row {
+                                        acc += rij * y[idx];
+                                    }
+                                    acc
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<Vec<R>>>();
+                    ei.extend(v);
+                }
+                #[cfg(not(feature = "parallel"))]
+                {
+                    let v = MTs
+                        .iter()
+                        .map(|MT| {
+                            MT.coeffs
+                                .iter()
+                                .map(|row| {
+                                    let mut acc = R::ZERO;
+                                    for &(rij, idx) in row {
+                                        acc += rij * y[idx];
+                                    }
+                                    acc
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<Vec<R>>>();
+                    ei.extend(v);
+                }
                 let _ = mi;
                 e.push(ei);
             }

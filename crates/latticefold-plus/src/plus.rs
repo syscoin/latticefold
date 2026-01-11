@@ -311,7 +311,19 @@ mod tests {
     #[ignore] // Only run manually due to long runtime
     fn test_large_scale() {
         use crate::tensor_eval::print_tensor_optimization_status;
+        use std::time::Instant;
         
+        let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
+        if profile {
+            #[cfg(feature = "parallel")]
+            println!(
+                "[LF+ test_large_scale] rayon_threads={}",
+                rayon::current_num_threads()
+            );
+            #[cfg(not(feature = "parallel"))]
+            println!("[LF+ test_large_scale] rayon_threads=DISABLED(feature=parallel)");
+        }
+
         let n = 1 << 20; // 1M constraints - closer to SP1 scale
         let sop = R::dimension() * 128;
         let L = 3;
@@ -339,6 +351,7 @@ mod tests {
         let mut rng = ark_std::test_rng();
         let pop = [R::ZERO, R::ONE];
 
+        let t = Instant::now();
         let r1cs = r1cs_decomposed_square(
             R1CS::<R> {
                 l: 1,
@@ -350,17 +363,44 @@ mod tests {
             B,
             k,
         );
+        if profile {
+            println!("[LF+ test_large_scale] build r1cs_decomposed_square: {:?}", t.elapsed());
+        }
 
+        let t = Instant::now();
         let A = Matrix::<R>::rand(&mut ark_std::test_rng(), params.kappa, n);
+        if profile {
+            println!("[LF+ test_large_scale] sample Ajtai A (kappa×n): {:?}", t.elapsed());
+        }
+
+        let t = Instant::now();
         let z: Vec<R> = (0..m).map(|_| *pop.choose(&mut rng).unwrap()).collect();
+        if profile {
+            println!("[LF+ test_large_scale] sample witness z (len=m): {:?}", t.elapsed());
+        }
+
+        let t = Instant::now();
         let cr1cs = ComR1CS::new(r1cs, z, 1, B, k, &A);
+        if profile {
+            println!("[LF+ test_large_scale] ComR1CS::new (decomp+commit): {:?}", t.elapsed());
+        }
+
+        let t = Instant::now();
         let M = cr1cs.x.matrices();
+        if profile {
+            println!("[LF+ test_large_scale] extract M matrices: {:?}", t.elapsed());
+        }
+
         let pparams = PlusParameters { lin: params, B };
         
         // Generate proof
         let ts = PoseidonTranscript::empty::<PC>();
         let mut prover = PlusProver::init(A.clone(), M.clone(), 1, pparams.clone(), ts);
+        let t = Instant::now();
         let proof = prover.prove(std::slice::from_ref(&cr1cs));
+        if profile {
+            println!("[LF+ test_large_scale] prover.prove total: {:?}", t.elapsed());
+        }
         
         // Verify with timing
         let ts = PoseidonTranscript::empty::<PC>();

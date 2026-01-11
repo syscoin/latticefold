@@ -91,7 +91,8 @@ where
         let mut sets = Vec::with_capacity(self.instances.len() * (self.instances[0].M_f.len() + 1));
         for inst in &self.instances {
             inst.M_f.iter().for_each(|m| {
-                sets.push(MonomialSet::Matrix(SparseMatrix::<R>::from_dense(m)));
+                // Avoid materializing huge SparseMatrix for dense monomial matrices.
+                sets.push(MonomialSet::DenseMatrix(m.clone()));
             });
         }
         for inst in &self.instances {
@@ -226,7 +227,7 @@ impl<R: PolyRing> RgInstance<R> {
     pub fn sets(&self) -> Vec<MonomialSet<R>> {
         self.M_f
             .iter()
-            .map(|m| MonomialSet::Matrix(SparseMatrix::<R>::from_dense(m)))
+            .map(|m| MonomialSet::DenseMatrix(m.clone()))
             .chain(once(MonomialSet::Vector(self.m_tau.clone())))
             .collect()
     }
