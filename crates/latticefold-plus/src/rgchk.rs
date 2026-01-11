@@ -239,8 +239,12 @@ where
     R: Decompose,
 {
     pub fn from_f(f: Vec<R>, A: &Matrix<R>, decomp: &DecompParameters) -> Self {
+        let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
+        let t_total = std::time::Instant::now();
+
         let n = f.len();
 
+        let t = std::time::Instant::now();
         let cfs: Matrix<_> = f
             .iter()
             .map(|r| r.coeffs().to_vec())
@@ -251,10 +255,20 @@ where
             .iter()
             .map(|row| row.decompose_to_vec(decomp.b, decomp.k))
             .collect::<Vec<_>>();
+        if profile {
+            println!(
+                "[LF+ RgInstance::from_f] decompose_to_vec: {:?} (n={}, d={}, k={})",
+                t.elapsed(),
+                n,
+                R::dimension(),
+                decomp.k
+            );
+        }
 
         let mut D_f = vec![Matrix::zero(n, R::dimension()); decomp.k];
 
         // map dec: (Z n x d x k) to D_f: (Z n x d, k matrices)
+        let t = std::time::Instant::now();
         dec.iter().enumerate().for_each(|(n_i, drow)| {
             drow.iter().enumerate().for_each(|(d_i, coeffs)| {
                 coeffs.iter().enumerate().for_each(|(k_i, coeff)| {
@@ -262,7 +276,14 @@ where
                 });
             });
         });
+        if profile {
+            println!(
+                "[LF+ RgInstance::from_f] map digits into D_f: {:?}",
+                t.elapsed()
+            );
+        }
 
+        let t = std::time::Instant::now();
         let M_f: Vec<Matrix<R>> = D_f
             .iter()
             .map(|m| {
@@ -277,25 +298,55 @@ where
                     .into()
             })
             .collect::<Vec<_>>();
+        if profile {
+            println!(
+                "[LF+ RgInstance::from_f] build M_f via exp: {:?} (k={}, n×d={})",
+                t.elapsed(),
+                decomp.k,
+                n * R::dimension()
+            );
+        }
 
+        let t = std::time::Instant::now();
         let comM_f = M_f
             .iter()
             .map(|M| A.try_mul_mat(M).unwrap())
             .collect::<Vec<_>>();
         let com = Matrix::hconcat(&comM_f).unwrap();
+        if profile {
+            println!(
+                "[LF+ RgInstance::from_f] commit monomial mats (A*M_f): {:?} (kappa×(k*d) = {}×{})",
+                t.elapsed(),
+                A.nrows,
+                decomp.k * R::dimension()
+            );
+        }
 
+        let t = std::time::Instant::now();
         let tau = split(&com, n, (R::dimension() / 2) as u128, decomp.l);
+        if profile {
+            println!("[LF+ RgInstance::from_f] split tau: {:?}", t.elapsed());
+        }
 
+        let t = std::time::Instant::now();
         let m_tau = tau
             .iter()
             .map(|c| exp::<R>(*c).unwrap())
             .collect::<Vec<_>>();
+        if profile {
+            println!("[LF+ RgInstance::from_f] build m_tau via exp: {:?}", t.elapsed());
+        }
 
+        let t = std::time::Instant::now();
         let cm_f = A.try_mul_vec(&f).unwrap();
         let C_Mf = A
             .try_mul_vec(&tau.iter().map(|z| R::from(*z)).collect::<Vec<R>>())
             .unwrap();
         let cm_mtau = A.try_mul_vec(&m_tau).unwrap();
+        if profile {
+            println!("[LF+ RgInstance::from_f] commit f/tau/m_tau: {:?}", t.elapsed());
+            println!("[LF+ RgInstance::from_f] total: {:?}", t_total.elapsed());
+        }
         let fcoms = FComs {
             cm_f,
             C_Mf,

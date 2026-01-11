@@ -5,6 +5,7 @@ use stark_rings::{
     CoeffRing, Zq,
 };
 use stark_rings_linalg::{Matrix, SparseMatrix};
+use std::time::Instant;
 
 use crate::{
     cm::{Cm, CmProof},
@@ -45,13 +46,25 @@ where
         M: &[SparseMatrix<R>],
         transcript: &mut impl Transcript<R>,
     ) -> (LinB2<R>, CmProof<R>) {
+        let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
+        let t_total = Instant::now();
         let n = self.lins[0].f.len();
 
+        let t = Instant::now();
         let instances = self
             .lins
             .iter()
             .map(|lin| RgInstance::from_f(lin.f.clone(), A, &self.params.decomp))
             .collect::<Vec<_>>();
+        if profile {
+            println!(
+                "[LF+ Mlin::mlin] build instances: {:?} (L={}, n={}, kappa={})",
+                t.elapsed(),
+                self.lins.len(),
+                n,
+                self.params.kappa
+            );
+        }
 
         let rg = Rg {
             nvars: log2(n) as usize,
@@ -61,7 +74,11 @@ where
 
         let cm = Cm { rg };
 
+        let t = Instant::now();
         let (com, proof) = cm.prove(M, transcript);
+        if profile {
+            println!("[LF+ Mlin::mlin] Cm::prove: {:?}", t.elapsed());
+        }
 
         let cm_g = com
             .x
@@ -100,6 +117,10 @@ where
             acc
         });
         let linb2 = LinB2 { g, x };
+
+        if profile {
+            println!("[LF+ Mlin::mlin] total: {:?}", t_total.elapsed());
+        }
 
         (linb2, proof)
     }
