@@ -47,11 +47,11 @@ fn bench_we_dpp(c: &mut Criterion) {
     let ell = 32usize;
     let b = 2u128;
     // `RgInstance::from_f` calls `utils::split(com, n, d/2, ell)` where `split` requires:
-    //   n >= tau_unpadded_len = kappa * (k*d) * ell * d.
+    //   n > tau_unpadded_len = kappa * (k*d) * ell * d  (STRICT).
     // We pick the smallest power-of-two n that satisfies this.
     let d = R::dimension();
     let tau_unpadded_len = kappa * (k * d) * ell * d;
-    let n = tau_unpadded_len.next_power_of_two();
+    let n = (tau_unpadded_len + 1).next_power_of_two();
     let nvars = ark_std::log2(n) as usize;
 
     let dparams = DecompParameters { b, k, l: ell };
