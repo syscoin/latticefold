@@ -10,11 +10,11 @@ use crate::lin::{LinB, LinBX};
 
 pub type RxR<R> = (R, R);
 
-#[derive(Clone, Debug)]
-pub struct Decomp<R> {
+#[derive(Debug)]
+pub struct Decomp<'a, R> {
     pub f: Vec<R>,
     pub r: Vec<(R, R)>,
-    pub M: Vec<SparseMatrix<R>>,
+    pub M: &'a [SparseMatrix<R>],
 }
 
 #[derive(Clone, Debug)]
@@ -24,7 +24,7 @@ pub struct DecompProof<R> {
     pub v: (Vec<RxR<R>>, Vec<RxR<R>>), // (v(0), v(1))
 }
 
-impl<R: PolyRing> Decomp<R>
+impl<R: PolyRing> Decomp<'_, R>
 where
     R: Decompose,
     R::BaseRing: Zq,
@@ -169,6 +169,8 @@ mod tests {
 
         let cr1cs = ComR1CS::new(r1cs, z, 1, 2, k, &A);
 
+        let M = cr1cs.x.matrices();
+
         let mut ts = PoseidonTranscript::empty::<PC>();
         let (linb, lproof) = cr1cs.linearize(&mut ts);
 
@@ -180,7 +182,7 @@ mod tests {
         let decomp = Decomp {
             f: cr1cs.f,
             r,
-            M: cr1cs.x.matrices(),
+            M: &M,
         };
 
         let ((_linb0, _linb1), proof) = decomp.decompose(&A, B);
@@ -260,7 +262,7 @@ mod tests {
         let decomp = Decomp {
             f: linb2.g,
             r: linb2.x.ro,
-            M,
+            M: &M,
         };
 
         let (_linb, proof) = decomp.decompose(&A, B);

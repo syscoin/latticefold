@@ -88,7 +88,7 @@ where
         let decomp = Decomp {
             f: linb2.g,
             r: linb2.x.ro.clone(),
-            M: self.M.clone(),
+            M: &self.M,
         };
         let (linb, dproof) = decomp.decompose(&self.A, self.params.B);
 
