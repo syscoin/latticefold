@@ -25,7 +25,7 @@ pub enum MonomialSet<R> {
     /// Legacy sparse representation (kept for unit tests / small cases).
     Matrix(SparseMatrix<R>),
     /// Dense n×d matrix of monomial ring elements (preferred for large instances).
-    DenseMatrix(Matrix<R>),
+    DenseMatrix(Arc<Matrix<R>>),
     Vector(Vec<R>),
 }
 
@@ -83,11 +83,11 @@ impl<R: OverField> In<R> {
                 _ => None,
             })
             .collect();
-        let Ms_dense: Vec<&Matrix<R>> = self
+        let Ms_dense: Vec<Arc<Matrix<R>>> = self
             .sets
             .iter()
             .filter_map(|set| match set {
-                MonomialSet::DenseMatrix(m) => Some(m),
+                MonomialSet::DenseMatrix(m) => Some(m.clone()),
                 _ => None,
             })
             .collect();
@@ -105,7 +105,7 @@ impl<R: OverField> In<R> {
             "set_check requires at least one matrix set"
         );
         let (nrows, ncols) = if let Some(m0) = Ms_dense.first() {
-            ((*m0).nrows, (*m0).ncols)
+            (m0.nrows, m0.ncols)
         } else {
             (Ms_sparse[0].nrows, Ms_sparse[0].ncols)
         };
@@ -133,7 +133,7 @@ impl<R: OverField> In<R> {
 
             // Avoid materializing full `nrows` tables up front:
             // represent each column as an on-demand MLE that materializes only after the first fix.
-            let mat = Arc::new((*Md).clone());
+            let mat = Md.clone(); // Arc clone (no data copy)
             let beta_pows = Arc::new(beta_pows);
             for col in 0..ncols {
                 mles.push(StreamingMleEnum::DenseMatrixColEv {

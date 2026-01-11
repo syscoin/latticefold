@@ -6,6 +6,7 @@ use stark_rings::{
 };
 use stark_rings_linalg::{Matrix, SparseMatrix};
 use thiserror::Error;
+use std::sync::Arc;
 
 use crate::{
     setchk::{In, MonomialSet, Out},
@@ -92,7 +93,7 @@ where
         for inst in &self.instances {
             inst.M_f.iter().for_each(|m| {
                 // Avoid materializing huge SparseMatrix for dense monomial matrices.
-                sets.push(MonomialSet::DenseMatrix(m.clone()));
+                sets.push(MonomialSet::DenseMatrix(Arc::new(m.clone())));
             });
         }
         for inst in &self.instances {
@@ -227,7 +228,7 @@ impl<R: PolyRing> RgInstance<R> {
     pub fn sets(&self) -> Vec<MonomialSet<R>> {
         self.M_f
             .iter()
-            .map(|m| MonomialSet::DenseMatrix(m.clone()))
+            .map(|m| MonomialSet::DenseMatrix(Arc::new(m.clone())))
             .chain(once(MonomialSet::Vector(self.m_tau.clone())))
             .collect()
     }
