@@ -29,8 +29,8 @@ pub fn split<R: Decompose + PolyRing>(
             acc.extend(row);
             acc
         });
-    if tau.len() < n {
-        // TODO handle when opposite
+    if tau.len() <= n {
+        // Pad to length n (no-op if already equal).
         tau.resize(n, R::BaseRing::zero());
     } else {
         panic!(

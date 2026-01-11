@@ -42,16 +42,13 @@ fn lift_to_big<Fs: PrimeField>(x: Fs) -> FBig {
 
 fn bench_we_dpp(c: &mut Criterion) {
     // Keep defaults small-ish so local runs work; override on server by editing this file for now.
-    let k = 2usize;
+    // Fast toy parameters: keeps tau_unpadded_len <= 1024 so this bench focuses on WE/DPP,
+    // not prover-side RG setup.
+    let k = 1usize;
     let kappa = 2usize;
-    let ell = 32usize;
+    let ell = 1usize;
     let b = 2u128;
-    // `RgInstance::from_f` calls `utils::split(com, n, d/2, ell)` where `split` requires:
-    //   n > tau_unpadded_len = kappa * (k*d) * ell * d  (STRICT).
-    // We pick the smallest power-of-two n that satisfies this.
-    let d = R::dimension();
-    let tau_unpadded_len = kappa * (k * d) * ell * d;
-    let n = (tau_unpadded_len + 1).next_power_of_two();
+    let n = 1 << 10;
     let nvars = ark_std::log2(n) as usize;
 
     let dparams = DecompParameters { b, k, l: ell };
