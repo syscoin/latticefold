@@ -692,12 +692,13 @@ where
     let mut b = Dr1csBuilder::<BF<R>>::new();
     b.enforce_var_eq_const(b.one(), BF::<R>::ONE);
 
+    fn push_phase<F: PrimeField>(names: &mut Vec<String>, marks: &mut Vec<usize>, name: String, b: &Dr1csBuilder<F>) {
+        names.push(name);
+        marks.push(b.rows.len());
+    }
+
     let mut phase_marks: Vec<usize> = Vec::new();
     let mut phase_names: Vec<String> = Vec::new();
-    let mut mark = |name: &str, b: &Dr1csBuilder<BF<R>>| {
-        phase_names.push(name.to_string());
-        phase_marks.push(b.rows.len());
-    };
 
     // --- Challenges (allocated locally; caller glues to coin/field wiring) ---
     // short challenges: s (3), s_prime_flat (k*d)
@@ -771,7 +772,7 @@ where
         }
         comh_vars.push(row);
     }
-    mark("after_comh_absorb", &b);
+    push_phase(&mut phase_names, &mut phase_marks, "after_comh_absorb".to_string(), &b);
 
     // --- Compute u[l][*] from dcom.out.e and s_prime_flat ---
     // u[l] has length = dcom.out.e.len() (expected 1+Mlen).
@@ -806,7 +807,7 @@ where
         }
         u_vars.push(u_l);
     }
-    mark("after_u_vars", &b);
+    push_phase(&mut phase_names, &mut phase_marks, "after_u_vars".to_string(), &b);
 
     // --- tensor(c0/c1) and tcch0/tcch1 ---
     let tensor_c0 = tensor_scalar_vars::<BF<R>>(&mut b, &field_wiring.c0);
@@ -831,7 +832,7 @@ where
         tcch0.push(acc0);
         tcch1.push(acc1);
     }
-    mark("after_tcch", &b);
+    push_phase(&mut phase_names, &mut phase_marks, "after_tcch".to_string(), &b);
 
     // --- Precompute constants for eval_t_z_optimized ---
     // dpp = [dp^i] as scalar ring elements (length ℓ = dparams.l)
@@ -891,7 +892,7 @@ where
     let sc1 = parse_sc_msgs(&mut b, &proof.sumcheck_proofs.1)?;
     let evals0 = extract_evals(&mut b, &proof.evals.0)?;
     let evals1 = extract_evals(&mut b, &proof.evals.1)?;
-    mark("after_parse_msgs_evals", &b);
+    push_phase(&mut phase_names, &mut phase_marks, "after_parse_msgs_evals".to_string(), &b);
 
     // dcom evals for claimed_sum: per l, vectors of len 1+Mlen in (a,b,c)
     let mlen_chunks_usize = mlen_mats;
@@ -903,15 +904,18 @@ where
     // - subclaim_eval via sumcheck_verify_degree2
     // - eval via recombination
     // and enforce equality.
-    let do_one = |_which: usize,
+    let do_one = |which: usize,
                   b: &mut Dr1csBuilder<BF<R>>,
                   absorb_flat: &mut Vec<usize>,
+                  phase_names: &mut Vec<String>,
+                  phase_marks: &mut Vec<usize>,
                   rc: usize,
                   r_sc: &[usize],
                   msgs: &[[RingVars; 3]],
                   evals: &[Vec<[RingVars; 4]>],
                   tcch0: &[RingVars],
                   tcch1: &[RingVars]| -> Result<(), String> {
+        let tag = if which == 0 { "cm_sc0" } else { "cm_sc1" };
         // Sumcheck parameter block absorbed by the transcript.
         // NOTE: we assume base field (extension_degree=1), matching our Poseidon wiring usage.
         let v_nvars = const_var(b, BF::<R>::from(nvars as u64));
@@ -928,6 +932,7 @@ where
             absorb_flat.extend_from_slice(&m[2].coeffs);
             absorb_field_elem_as_ring::<R>(b, absorb_flat, r_sc[round]);
         }
+        push_phase(phase_names, phase_marks, format!("{tag}:after_absorb_schedule"), b);
 
         let rc_pows = scalar_pow_table::<BF<R>>(b, rc, max_pow);
         let mut claimed_sum = scalar_to_ringvars::<R>(b, BF::<R>::ZERO);
@@ -972,8 +977,10 @@ where
             let t_tcch1 = ring_scale::<BF<R>>(b, &tcch1[l], rc_pows[z_idx + 1]);
             claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_tcch1);
         }
+        push_phase(phase_names, phase_marks, format!("{tag}:after_claimed_sum"), b);
 
         let subclaim_eval = sumcheck_verify_degree2::<BF<R>>(b, claimed_sum, msgs, r_sc)?;
+        push_phase(phase_names, phase_marks, format!("{tag}:after_sumcheck_verify"), b);
 
         // t(z) eval at ro (independent of l)
         let t0 = eval_t_z_optimized_ring::<R>(
@@ -1004,6 +1011,7 @@ where
             .collect::<Vec<_>>();
         let eq = eq_eval_vars::<BF<R>>(b, &r_pre, r_sc);
         let mut eval_acc = scalar_to_ringvars::<R>(b, BF::<R>::ZERO);
+        push_phase(phase_names, phase_marks, format!("{tag}:after_eq_eval"), b);
 
         for l in 0..l_instances {
             let l_idx = l * (4 + 4 * mlen_chunks_usize);
@@ -1047,8 +1055,10 @@ where
             let t1e_s = ring_scale::<BF<R>>(b, &t1e, rc_pows[z_idx + 1]);
             eval_acc = ring_add::<BF<R>>(b, &eval_acc, &t1e_s);
         }
+        push_phase(phase_names, phase_marks, format!("{tag}:after_recompute_eval"), b);
 
         ring_eq::<BF<R>>(b, &subclaim_eval, &eval_acc);
+        push_phase(phase_names, phase_marks, format!("{tag}:after_final_eq"), b);
 
         // After sumcheck verification, Cm verifier absorbs the per-instance eval tables.
         // (`absorb_evaluations(evals, transcript)`).
@@ -1061,6 +1071,7 @@ where
                 absorb_flat.extend_from_slice(&row[3].coeffs);
             }
         }
+        push_phase(phase_names, phase_marks, format!("{tag}:after_absorb_evals"), b);
         Ok(())
     };
 
@@ -1068,6 +1079,8 @@ where
         0,
         &mut b,
         &mut absorb_flat,
+        &mut phase_names,
+        &mut phase_marks,
         field_wiring.rc0,
         &field_wiring.sumcheck_r0,
         &sc0,
@@ -1075,11 +1088,13 @@ where
         &tcch0,
         &tcch1,
     )?;
-    mark("after_do_one_0", &b);
+    push_phase(&mut phase_names, &mut phase_marks, "after_do_one_0".to_string(), &b);
     do_one(
         1,
         &mut b,
         &mut absorb_flat,
+        &mut phase_names,
+        &mut phase_marks,
         field_wiring.rc1,
         &field_wiring.sumcheck_r1,
         &sc1,
@@ -1087,7 +1102,7 @@ where
         &tcch0,
         &tcch1,
     )?;
-    mark("after_do_one_1", &b);
+    push_phase(&mut phase_names, &mut phase_marks, "after_do_one_1".to_string(), &b);
 
     let (inst, asg) = b.into_instance();
     Ok((
