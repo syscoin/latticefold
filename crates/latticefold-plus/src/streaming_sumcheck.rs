@@ -349,8 +349,17 @@ where
     pub fn fix_last_variable(&mut self, r: R::BaseRing) {
         let nv = self.remaining_vars();
         assert!(nv == 1, "fix_last_variable expects 1 remaining var, got {nv}");
-        for m in self.mles.iter_mut() {
-            m.fix_variable_in_place_base(r);
+        #[cfg(feature = "parallel")]
+        {
+            self.mles
+                .par_iter_mut()
+                .for_each(|m| m.fix_variable_in_place_base(r));
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for m in self.mles.iter_mut() {
+                m.fix_variable_in_place_base(r);
+            }
         }
     }
 
@@ -397,8 +406,20 @@ impl StreamingSumcheck {
         if let Some(r) = v_msg {
             assert!(state.round > 0);
             state.randomness.push(r);
-            for m in state.mles.iter_mut() {
-                m.fix_variable_in_place_base(r);
+            // This step is often O(total_table_size) and can dominate wall time if left serial,
+            // especially when some MLE variants need to materialize on first fix.
+            #[cfg(feature = "parallel")]
+            {
+                state
+                    .mles
+                    .par_iter_mut()
+                    .for_each(|m| m.fix_variable_in_place_base(r));
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                for m in state.mles.iter_mut() {
+                    m.fix_variable_in_place_base(r);
+                }
             }
         } else {
             assert!(state.round == 0);
