@@ -4,14 +4,16 @@ use stark_rings::{
     balanced_decomposition::{Decompose, DecomposeToVec},
     exp, psi, CoeffRing, OverField, PolyRing, Ring, Zq,
 };
-use stark_rings_linalg::{ops::Transpose, Matrix, SparseMatrix};
-use stark_rings_poly::mle::DenseMultilinearExtension;
+use stark_rings_linalg::{Matrix, SparseMatrix};
 use thiserror::Error;
 
 use crate::{
     setchk::{In, MonomialSet, Out},
     utils::split,
 };
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 // D_f: decomposed cf(f), Z n x dk
 // M_f: EXP(D_f)
@@ -83,6 +85,9 @@ where
         M: &[SparseMatrix<R>],
         transcript: &mut impl Transcript<R>,
     ) -> Dcom<R> {
+        let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
+        let t_total = std::time::Instant::now();
+
         let mut sets = Vec::with_capacity(self.instances.len() * (self.instances[0].M_f.len() + 1));
         for inst in &self.instances {
             inst.M_f.iter().for_each(|m| {
@@ -99,79 +104,54 @@ where
         };
         let out_rel = in_rel.set_check(M, transcript);
 
+        // Precompute eq(bits(idx), r) table once (base ring).
+        let t = std::time::Instant::now();
+        let eq = build_eq_table_base::<R>(&out_rel.r);
+        if profile {
+            println!(
+                "[LF+ Rg::range_check] set_check: {:?}, build_eq_table: {:?} (n={}, nvars={})",
+                t_total.elapsed(),
+                t.elapsed(),
+                eq.len(),
+                self.nvars
+            );
+        }
+
         let evals = self
             .instances
             .iter()
             .enumerate()
             .map(|(l, inst)| {
-                let cfs = inst
-                    .f
-                    .iter()
-                    .map(|r| r.coeffs().to_vec())
-                    .collect::<Vec<_>>()
-                    .transpose();
-                let v = cfs
-                    .into_iter()
-                    .map(|evals| {
-                        let mle =
-                            DenseMultilinearExtension::from_evaluations_vec(self.nvars, evals);
-                        mle.evaluate(&out_rel.r).unwrap()
-                    })
-                    .collect::<Vec<_>>();
-
-                // TODO v is equal to c[0]
-
-                let r = out_rel.r.iter().map(|z| R::from(*z)).collect::<Vec<_>>();
-
                 let mut a = Vec::with_capacity(1 + M.len());
                 let mut b = Vec::with_capacity(1 + M.len());
                 // Let `c` be the evaluation of `f` over r
                 let mut c = Vec::with_capacity(1 + M.len());
 
-                a.push(
-                    DenseMultilinearExtension::from_evaluations_vec(self.nvars, inst.tau.clone())
-                        .evaluate(&out_rel.r)
-                        .unwrap(),
-                );
+                // v: coefficient-wise evaluation of f at out_rel.r
+                let v = eval_vec_coeffs_at_point::<R>(&inst.f, &eq);
 
+                a.push(dot_base::<R>(&inst.tau, &eq));
                 b.push(out_rel.b[l]);
+                c.push(dot_ring::<R>(&inst.f, &eq));
 
-                c.push(
-                    DenseMultilinearExtension::from_evaluations_vec(self.nvars, inst.f.clone())
-                        .evaluate(&out_rel.r.iter().map(|z| R::from(*z)).collect::<Vec<_>>())
-                        .unwrap(),
-                );
-
-                M.iter().for_each(|m| {
-                    let Mtau = m
-                        .try_mul_vec(&inst.tau.iter().map(|z| R::from(*z)).collect::<Vec<R>>())
-                        .unwrap();
-                    a.push(
-                        DenseMultilinearExtension::from_evaluations_vec(self.nvars, Mtau)
-                            .evaluate(&r)
-                            .unwrap()
-                            .ct(),
-                    );
-
-                    let Mm_tau = m.try_mul_vec(&inst.m_tau).unwrap();
-                    b.push(
-                        DenseMultilinearExtension::from_evaluations_vec(self.nvars, Mm_tau)
-                            .evaluate(&r)
-                            .unwrap(),
-                    );
-
-                    let Mf = m.try_mul_vec(&inst.f).unwrap();
-                    c.push(
-                        DenseMultilinearExtension::from_evaluations_vec(self.nvars, Mf)
-                            .evaluate(&r)
-                            .unwrap(),
-                    );
-                });
+                // Evaluate M * tau / m_tau / f at out_rel.r *without materializing length-n vectors*.
+                //
+                // For each matrix M:
+                //   eval(M*w)(r) = Σ_row eq[row] * (Σ_{(coeff,col) in row} coeff * w[col])
+                for m in M {
+                    a.push(sparse_mat_vec_eval_ct::<R>(m, &inst.tau, &eq));
+                    b.push(sparse_mat_vec_eval_ring::<R>(m, &inst.m_tau, &eq));
+                    c.push(sparse_mat_vec_eval_ring::<R>(m, &inst.f, &eq));
+                }
                 DcomEvals { v, a, b, c }
             })
             .collect::<Vec<_>>();
 
         absorb_evaluations(&evals, transcript);
+
+        if profile {
+            println!("[LF+ Rg::range_check] evals+absorb: {:?}", t_total.elapsed());
+        }
 
         Dcom {
             evals,
@@ -337,6 +317,177 @@ fn absorb_evaluations<R: OverField>(evals: &[DcomEvals<R>], transcript: &mut imp
         transcript.absorb_slice(&eval.a.iter().map(|z| R::from(*z)).collect::<Vec<R>>());
         transcript.absorb_slice(&eval.c);
     });
+}
+
+/// Build the full eq table: eq(bits(idx), r) for all idx in {0,1}^nvars (LSB-first).
+fn build_eq_table_base<R: PolyRing>(r: &[R::BaseRing]) -> Vec<R::BaseRing>
+where
+    R::BaseRing: Ring,
+{
+    let mut acc = vec![R::BaseRing::ONE];
+    for &ri in r {
+        let one_minus = R::BaseRing::ONE - ri;
+        let mut next = Vec::with_capacity(acc.len() * 2);
+        for &v in &acc {
+            next.push(v * one_minus);
+            next.push(v * ri);
+        }
+        acc = next;
+    }
+    acc
+}
+
+fn dot_base<R: PolyRing>(v: &[R::BaseRing], eq: &[R::BaseRing]) -> R::BaseRing
+where
+    R::BaseRing: Ring,
+{
+    debug_assert_eq!(v.len(), eq.len());
+    #[cfg(feature = "parallel")]
+    {
+        v.par_iter()
+            .zip(eq.par_iter())
+            .map(|(&x, &w)| x * w)
+            .reduce(|| R::BaseRing::ZERO, |a, b| a + b)
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        v.iter().zip(eq.iter()).map(|(&x, &w)| x * w).sum()
+    }
+}
+
+fn dot_ring<R>(v: &[R], eq: &[R::BaseRing]) -> R
+where
+    R: PolyRing + From<R::BaseRing>,
+    R::BaseRing: Ring,
+{
+    debug_assert_eq!(v.len(), eq.len());
+    #[cfg(feature = "parallel")]
+    {
+        v.par_iter()
+            .zip(eq.par_iter())
+            .map(|(&x, &w)| x * R::from(w))
+            .reduce(|| R::ZERO, |a, b| a + b)
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        v.iter().zip(eq.iter()).map(|(&x, &w)| x * R::from(w)).sum()
+    }
+}
+
+fn eval_vec_coeffs_at_point<R: PolyRing>(v: &[R], eq: &[R::BaseRing]) -> Vec<R::BaseRing>
+where
+    R::BaseRing: Ring,
+{
+    debug_assert_eq!(v.len(), eq.len());
+    let d = R::dimension();
+    #[cfg(feature = "parallel")]
+    {
+        (0..d)
+            .into_par_iter()
+            .map(|j| {
+                v.par_iter()
+                    .zip(eq.par_iter())
+                    .map(|(x, &w)| x.coeffs()[j] * w)
+                    .reduce(|| R::BaseRing::ZERO, |a, b| a + b)
+            })
+            .collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut out = vec![R::BaseRing::ZERO; d];
+        for (x, &w) in v.iter().zip(eq.iter()) {
+            for j in 0..d {
+                out[j] += x.coeffs()[j] * w;
+            }
+        }
+        out
+    }
+}
+
+fn sparse_mat_vec_eval_ct<R: PolyRing>(
+    m: &SparseMatrix<R>,
+    witness0: &[R::BaseRing],
+    eq: &[R::BaseRing],
+) -> R::BaseRing
+where
+    R::BaseRing: Ring,
+{
+    debug_assert_eq!(m.nrows, eq.len());
+    #[cfg(feature = "parallel")]
+    {
+        m.coeffs
+            .par_iter()
+            .zip(eq.par_iter())
+            .map(|(row, &w_row)| {
+                // row_dot is ring, but we only need constant term at the end.
+                let mut sum0 = R::BaseRing::ZERO;
+                for (coeff, col_idx) in row {
+                    if *col_idx < witness0.len() {
+                        sum0 += coeff.coeffs()[0] * witness0[*col_idx];
+                    }
+                }
+                sum0 * w_row
+            })
+            .reduce(|| R::BaseRing::ZERO, |a, b| a + b)
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut acc = R::BaseRing::ZERO;
+        for (row_idx, row) in m.coeffs.iter().enumerate() {
+            let w_row = eq[row_idx];
+            let mut sum0 = R::BaseRing::ZERO;
+            for (coeff, col_idx) in row {
+                if *col_idx < witness0.len() {
+                    sum0 += coeff.coeffs()[0] * witness0[*col_idx];
+                }
+            }
+            acc += sum0 * w_row;
+        }
+        acc
+    }
+}
+
+fn sparse_mat_vec_eval_ring<R>(
+    m: &SparseMatrix<R>,
+    witness: &[R],
+    eq: &[R::BaseRing],
+) -> R
+where
+    R: PolyRing + From<R::BaseRing>,
+    R::BaseRing: Ring,
+{
+    debug_assert_eq!(m.nrows, eq.len());
+    #[cfg(feature = "parallel")]
+    {
+        m.coeffs
+            .par_iter()
+            .zip(eq.par_iter())
+            .map(|(row, &w_row)| {
+                let mut row_dot = R::ZERO;
+                for (coeff, col_idx) in row {
+                    if *col_idx < witness.len() {
+                        row_dot += *coeff * witness[*col_idx];
+                    }
+                }
+                row_dot * R::from(w_row)
+            })
+            .reduce(|| R::ZERO, |a, b| a + b)
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut acc = R::ZERO;
+        for (row_idx, row) in m.coeffs.iter().enumerate() {
+            let w_row = R::from(eq[row_idx]);
+            let mut row_dot = R::ZERO;
+            for (coeff, col_idx) in row {
+                if *col_idx < witness.len() {
+                    row_dot += *coeff * witness[*col_idx];
+                }
+            }
+            acc += row_dot * w_row;
+        }
+        acc
+    }
 }
 
 #[cfg(test)]

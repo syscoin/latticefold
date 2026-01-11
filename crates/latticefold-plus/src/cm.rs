@@ -6,13 +6,12 @@ use ark_std::{
 use latticefold::{
     transcript::Transcript,
     utils::sumcheck::{
-        utils::{build_eq_x_r, eq_eval},
+        utils::eq_eval,
         MLSumcheck, Proof, SumCheckError,
     },
 };
 use stark_rings::{unit_monomial, CoeffRing, OverField, PolyRing, Ring, Zq};
 use stark_rings_linalg::SparseMatrix;
-use stark_rings_poly::mle::DenseMultilinearExtension;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -269,7 +268,6 @@ where
     ) -> (Proof<R>, Vec<InstanceEvals<R>>, Vec<R>) {
         let t_sumcheck = Instant::now();
         let nvars = self.rg.nvars;
-        let r: Vec<R> = dcom.out.r.iter().map(|x| R::from(*x)).collect();
 
         let rc = transcript.get_challenge();
 
