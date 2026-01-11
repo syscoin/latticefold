@@ -135,10 +135,16 @@ fn bench_we_dpp(c: &mut Criterion) {
         };
         let k_rows = inst_sparse.k();
         let ell = 2 * k_rows;
-        let flpcp = dpp::dr1cs_flpcp::RsDr1csFlpcpSparse::<FSmall>::new(inst_sparse, ell);
+        // IMPORTANT (WE/DPP path):
+        // Use the NP-style FLPCP so the *entire* dR1CS assignment lives in the proof (π),
+        // and we can safely use the Rev2 "assume_boolean_proof=true" bound regime.
+        //
+        // This matches the Symphony bench structure (x is empty; witness is in π).
+        let flpcp = dpp::dr1cs_flpcp::RsDr1csNpFlpcpSparse::<FSmall>::new(inst_sparse, 0, ell);
 
-        let x_small = out.assignment.clone();
-        let pi_field_small = flpcp.prove(&x_small);
+        let x_small: Vec<FSmall> = vec![];
+        let z_w_small = out.assignment.clone();
+        let pi_field_small = flpcp.prove(&x_small, &z_w_small);
 
         // Rev2 pipeline (Booleanize -> Embed -> Pack) into a large field.
         //
@@ -150,17 +156,13 @@ fn bench_we_dpp(c: &mut Criterion) {
             flpcp,
             dpp::EmbeddingParams {
                 gamma: 2,
-                // IMPORTANT: booleanization here is only for the *proof* π.
-                // Our statement vector `x` (the dR1CS assignment) is not Boolean in general,
-                // so we must NOT use the tight "assume_boolean_proof" bound regime, otherwise
-                // decoding can fail with `Decode(NoSolution)`.
-                assume_boolean_proof: false,
+                assume_boolean_proof: true,
                 k_prime: 0,
             },
         )
         .expect("build_rev2_dpp_sparse_boolean_auto");
 
-        let x_big = x_small.iter().copied().map(lift_to_big::<FSmall>).collect::<Vec<_>>();
+        let x_big: Vec<FBig> = vec![];
         let pi_big = pi_bits_small
             .iter()
             .copied()
