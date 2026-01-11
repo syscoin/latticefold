@@ -1,7 +1,7 @@
 use ark_std::iter::once;
 use latticefold::transcript::Transcript;
 use stark_rings::{
-    balanced_decomposition::{Decompose, DecomposeToVec},
+    balanced_decomposition::Decompose,
     exp, psi, CoeffRing, OverField, PolyRing, Ring, Zq,
 };
 use stark_rings_linalg::{Matrix, SparseMatrix};
@@ -244,42 +244,33 @@ where
 
         let n = f.len();
 
+        // Build digit matrices D_f[k] without per-coefficient allocations.
+        //
+        // Previous code used `row.decompose_to_vec(...)` which allocates a `Vec` of length `k`
+        // for every coefficient => ~16M allocations at n=1M,d=16,k=4. This dominated runtime.
+        let d = R::dimension();
+        let k = decomp.k;
         let t = std::time::Instant::now();
-        let cfs: Matrix<_> = f
-            .iter()
-            .map(|r| r.coeffs().to_vec())
-            .collect::<Vec<Vec<_>>>()
-            .into();
-        let dec = cfs
-            .vals
-            .iter()
-            .map(|row| row.decompose_to_vec(decomp.b, decomp.k))
-            .collect::<Vec<_>>();
+        let mut D_f: Vec<Matrix<R::BaseRing>> = vec![Matrix::zero(n, d); k];
+        let mut tmp = vec![R::BaseRing::ZERO; k];
+        for (row_idx, fi) in f.iter().enumerate() {
+            let coeffs = fi.coeffs();
+            debug_assert_eq!(coeffs.len(), d);
+            for (col_idx, &c) in coeffs.iter().enumerate() {
+                // Writes into tmp[0..k] in-place.
+                c.decompose_to(decomp.b, &mut tmp);
+                for k_i in 0..k {
+                    D_f[k_i].vals[row_idx][col_idx] = tmp[k_i];
+                }
+            }
+        }
         if profile {
             println!(
-                "[LF+ RgInstance::from_f] decompose_to_vec: {:?} (n={}, d={}, k={})",
+                "[LF+ RgInstance::from_f] decompose_to (no-alloc): {:?} (n={}, d={}, k={})",
                 t.elapsed(),
                 n,
-                R::dimension(),
-                decomp.k
-            );
-        }
-
-        let mut D_f = vec![Matrix::zero(n, R::dimension()); decomp.k];
-
-        // map dec: (Z n x d x k) to D_f: (Z n x d, k matrices)
-        let t = std::time::Instant::now();
-        dec.iter().enumerate().for_each(|(n_i, drow)| {
-            drow.iter().enumerate().for_each(|(d_i, coeffs)| {
-                coeffs.iter().enumerate().for_each(|(k_i, coeff)| {
-                    D_f[k_i].vals[n_i][d_i] = *coeff;
-                });
-            });
-        });
-        if profile {
-            println!(
-                "[LF+ RgInstance::from_f] map digits into D_f: {:?}",
-                t.elapsed()
+                d,
+                k
             );
         }
 
@@ -287,15 +278,19 @@ where
         let M_f: Vec<Matrix<R>> = D_f
             .iter()
             .map(|m| {
-                m.vals
+                #[cfg(feature = "parallel")]
+                let rows = m
+                    .vals
+                    .par_iter()
+                    .map(|row| row.iter().map(|c| exp::<R>(*c).unwrap()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>();
+                #[cfg(not(feature = "parallel"))]
+                let rows = m
+                    .vals
                     .iter()
-                    .map(|row| {
-                        row.iter()
-                            .map(|c| exp::<R>(*c).unwrap())
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>()
-                    .into()
+                    .map(|row| row.iter().map(|c| exp::<R>(*c).unwrap()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>();
+                rows.into()
             })
             .collect::<Vec<_>>();
         if profile {
@@ -303,14 +298,80 @@ where
                 "[LF+ RgInstance::from_f] build M_f via exp: {:?} (k={}, n×d={})",
                 t.elapsed(),
                 decomp.k,
-                n * R::dimension()
+                n * d
             );
         }
 
         let t = std::time::Instant::now();
+        // Commit monomial matrices: comM_f[k_i] = A * M_f[k_i].
+        //
+        // `A.try_mul_mat` appears to under-utilize CPU (kappa small, not parallelized),
+        // so we explicitly parallelize over columns + rows (rayon reduction).
+        fn commit_dense_matrix<Rr>(a: &Matrix<Rr>, m: &Matrix<Rr>) -> Matrix<Rr>
+        where
+            Rr: CoeffRing,
+            Rr::BaseRing: Zq,
+        {
+            let kappa = a.nrows;
+            let n = a.ncols;
+            debug_assert_eq!(m.nrows, n);
+            let dcols = m.ncols;
+            #[cfg(feature = "parallel")]
+            {
+                // Compute one commitment vector per column in parallel, then assemble.
+                let cols: Vec<Vec<Rr>> = (0..dcols)
+                    .into_par_iter()
+                    .map(|col| {
+                        (0..n)
+                            .into_par_iter()
+                            .fold(
+                                || vec![Rr::ZERO; kappa],
+                                |mut acc, i| {
+                                    let mi = m.vals[i][col];
+                                    for r in 0..kappa {
+                                        acc[r] += a.vals[r][i] * mi;
+                                    }
+                                    acc
+                                },
+                            )
+                            .reduce(
+                                || vec![Rr::ZERO; kappa],
+                                |mut a0, b0| {
+                                    for r in 0..kappa {
+                                        a0[r] += b0[r];
+                                    }
+                                    a0
+                                },
+                            )
+                    })
+                    .collect();
+                let mut out = Matrix::zero(kappa, dcols);
+                for col in 0..dcols {
+                    for r in 0..kappa {
+                        out.vals[r][col] = cols[col][r];
+                    }
+                }
+                out
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                let mut out = Matrix::zero(kappa, dcols);
+                for col in 0..dcols {
+                    for r in 0..kappa {
+                        let mut acc = Rr::ZERO;
+                        for i in 0..n {
+                            acc += a.vals[r][i] * m.vals[i][col];
+                        }
+                        out.vals[r][col] = acc;
+                    }
+                }
+                out
+            }
+        }
+
         let comM_f = M_f
             .iter()
-            .map(|M| A.try_mul_mat(M).unwrap())
+            .map(|M| commit_dense_matrix(A, M))
             .collect::<Vec<_>>();
         let com = Matrix::hconcat(&comM_f).unwrap();
         if profile {
@@ -318,7 +379,7 @@ where
                 "[LF+ RgInstance::from_f] commit monomial mats (A*M_f): {:?} (kappa×(k*d) = {}×{})",
                 t.elapsed(),
                 A.nrows,
-                decomp.k * R::dimension()
+                decomp.k * d
             );
         }
 
