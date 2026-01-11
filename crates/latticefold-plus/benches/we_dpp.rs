@@ -12,7 +12,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use cyclotomic_rings::rings::GoldilocksPoseidonConfig as PC;
 use cyclotomic_rings::rings::GetPoseidonParams;
 
-use ark_ff::{BigInteger, Fp384, MontBackend, MontConfig, PrimeField};
+use ark_ff::{BigInteger, Fp, MontBackend, MontConfig, PrimeField};
 use rand::{rngs::StdRng, SeedableRng};
 use dpp::BoundedFlpcpSparse;
 
@@ -33,11 +33,12 @@ use latticefold_plus::we_statement::WeParams;
 // -----------------------------------------------------------------------------
 
 #[derive(MontConfig)]
-// NIST P-384 prime (as used by Symphony’s Rev2 embedding bench).
-#[modulus = "39402006196394479212279040100143613805079739270465446667948293404245721771496870329047266088258938001861606973112319"]
+// RFC 3526 group 2 prime (1024-bit MODP) as a “very large” field for the Rev2 embedding.
+// This keeps the packing “no wrap” condition satisfiable even with conservative bounds.
+#[modulus = "179769313486231590770839156793787453197860296048756011706444423684197180216158519368947833795864925541502180565485980503646440548199239100050792877003355816639229553136239076508735759914822574862575007425302077447712589550957937778424442426617334727629299387668709205606050270810842907692932019128194467627007"]
 #[generator = "2"]
-pub struct Secp384r1Config;
-type FBig = Fp384<MontBackend<Secp384r1Config, 6>>;
+pub struct FBigConfig;
+type FBig = Fp<MontBackend<FBigConfig, 16>, 16>;
 
 fn lift_to_big<Fs: PrimeField>(x: Fs) -> FBig {
     FBig::from_le_bytes_mod_order(&x.into_bigint().to_bytes_le())
