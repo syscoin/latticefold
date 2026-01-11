@@ -13,9 +13,12 @@ use latticefold::{
 use stark_rings::{unit_monomial, CoeffRing, OverField, PolyRing, Ring, Zq};
 use stark_rings_linalg::SparseMatrix;
 use stark_rings_poly::mle::DenseMultilinearExtension;
+use std::sync::Arc;
+use std::time::Instant;
 
 use crate::{
     rgchk::{Dcom, Rg},
+    streaming_sumcheck::{StreamingMleEnum, StreamingSumcheck},
     utils::{short_challenge, tensor, tensor_product},
 };
 
@@ -58,13 +61,38 @@ where
         M: &[SparseMatrix<R>],
         transcript: &mut impl Transcript<R>,
     ) -> (Com<R>, CmProof<R>) {
+        let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
+        let t_total = Instant::now();
+
         let k = self.rg.dparams.k;
         let d = R::dimension();
         let dp = R::dimension() / 2;
         let l = self.rg.dparams.l;
         let n = self.rg.instances[0].tau.len();
 
+        if profile {
+            #[cfg(feature = "parallel")]
+            println!(
+                "[LF+ Cm::prove] start: n={} nvars={} Mlen={} rayon_threads={}",
+                n,
+                self.rg.nvars,
+                M.len(),
+                rayon::current_num_threads()
+            );
+            #[cfg(not(feature = "parallel"))]
+            println!(
+                "[LF+ Cm::prove] start: n={} nvars={} Mlen={} rayon_threads=DISABLED(feature=parallel)",
+                n,
+                self.rg.nvars,
+                M.len(),
+            );
+        }
+
+        let t = Instant::now();
         let dcom = self.rg.range_check(M, transcript);
+        if profile {
+            println!("[LF+ Cm::prove] range_check: {:?}", t.elapsed());
+        }
 
         let s = (0..3)
             .map(|_| short_challenge(128, transcript))
@@ -79,6 +107,7 @@ where
             .collect::<Vec<_>>();
         let s_prime_flat = s_prime.clone().into_iter().flatten().collect::<Vec<R>>();
 
+        let t = Instant::now();
         let h: Vec<Vec<R>> = self
             .rg
             .instances
@@ -101,7 +130,11 @@ where
                 h
             })
             .collect();
+        if profile {
+            println!("[LF+ Cm::prove] build h: {:?}", t.elapsed());
+        }
 
+        let t = Instant::now();
         let comh: Vec<Vec<R>> = self
             .rg
             .instances
@@ -123,6 +156,9 @@ where
                 comh
             })
             .collect();
+        if profile {
+            println!("[LF+ Cm::prove] build comh: {:?}", t.elapsed());
+        }
 
         absorb_comh(&comh, transcript);
 
@@ -144,23 +180,42 @@ where
             .collect::<Vec<_>>();
         let xp = (0..d).map(|i| unit_monomial::<R>(i)).collect::<Vec<_>>();
 
-        let mut t0 = calculate_t_z(&c[0], &s_prime_flat, &dpp, &xp);
-        if t0.len() <= n {
-            t0.resize(n, R::zero()); // pad
-        } else {
-            panic!("t0 too large!");
+        // Build *structured* tensor tables without materializing O(n) vectors.
+        let t = Instant::now();
+        let tensor_c0 = crate::utils::tensor(&c[0]);
+        let tensor_c1 = crate::utils::tensor(&c[1]);
+        let tensor_len = tensor_c0.len() * s_prime_flat.len() * dpp.len() * xp.len();
+        assert_eq!(tensor_c0.len(), tensor_c1.len());
+        if tensor_len > n {
+            panic!("t(z) tensor_len {} > n {}", tensor_len, n);
+        }
+        let t0_mle = StreamingMleEnum::Tensor4Padded {
+            t1: Arc::new(tensor_c0),
+            t2: Arc::new(s_prime_flat.clone()),
+            t3: Arc::new(dpp.clone()),
+            t4: Arc::new(xp.clone()),
+            tensor_len,
+            num_vars: self.rg.nvars,
         };
-
-        let mut t1 = calculate_t_z(&c[1], &s_prime_flat, &dpp, &xp);
-        if t1.len() <= n {
-            t1.resize(n, R::zero()); // pad
-        } else {
-            panic!("t1 too large!");
+        let t1_mle = StreamingMleEnum::Tensor4Padded {
+            t1: Arc::new(tensor_c1),
+            t2: Arc::new(s_prime_flat.clone()),
+            t3: Arc::new(dpp.clone()),
+            t4: Arc::new(xp.clone()),
+            tensor_len,
+            num_vars: self.rg.nvars,
         };
+        if profile {
+            println!(
+                "[LF+ Cm::prove] build t(z) streaming: {:?} (tensor_len={}, padded_to_n={})",
+                t.elapsed(),
+                tensor_len,
+                n
+            );
+        }
 
-        let (proof_a, evals_a, ro_a) =
-            self.sumchecker(&dcom, &h, (t0.clone(), t1.clone()), M, transcript);
-        let (proof_b, evals_b, ro_b) = self.sumchecker(&dcom, &h, (t0, t1), M, transcript);
+        let (proof_a, evals_a, ro_a) = self.sumchecker_streaming(&dcom, &h, &t0_mle, &t1_mle, M, transcript, profile);
+        let (proof_b, evals_b, ro_b) = self.sumchecker_streaming(&dcom, &h, &t0_mle, &t1_mle, M, transcript, profile);
 
         // Step 7
         // TODO needs more folding challenges `s` for the L instances
@@ -195,17 +250,24 @@ where
 
         let com = Com { g, x };
 
+        if profile {
+            println!("[LF+ Cm::prove] total: {:?}", t_total.elapsed());
+        }
+
         (com, proof)
     }
 
-    fn sumchecker(
+    fn sumchecker_streaming(
         &self,
         dcom: &Dcom<R>,
         h: &[Vec<R>],
-        t: (Vec<R>, Vec<R>),
+        t0_mle: &StreamingMleEnum<R>,
+        t1_mle: &StreamingMleEnum<R>,
         M: &[SparseMatrix<R>],
         transcript: &mut impl Transcript<R>,
+        profile: bool,
     ) -> (Proof<R>, Vec<InstanceEvals<R>>, Vec<R>) {
+        let t_sumcheck = Instant::now();
         let nvars = self.rg.nvars;
         let r: Vec<R> = dcom.out.r.iter().map(|x| R::from(*x)).collect();
 
@@ -221,43 +283,76 @@ where
             )
             + 2, // t(z)
         );
-        let eq = build_eq_x_r(&r).unwrap();
-        mles.push(eq);
+
+        // eq table as structured base-ring MLE.
+        let r0 = dcom.out.r.clone();
+        let one_minus_r0 = r0.iter().copied().map(|x| R::BaseRing::ONE - x).collect();
+        mles.push(StreamingMleEnum::EqBase {
+            scale: R::BaseRing::ONE,
+            r: r0,
+            one_minus_r: one_minus_r0,
+        });
+
+        // Share `M` matrices (clone each once into an Arc, instead of materializing M*w vectors).
+        let m_arcs: Vec<Arc<SparseMatrix<R>>> = M.iter().cloned().map(Arc::new).collect();
 
         for (i, inst) in self.rg.instances.iter().enumerate() {
-            let rtau = inst.tau.iter().map(|z| R::from(*z)).collect::<Vec<_>>();
-            let tau_mle = DenseMultilinearExtension::from_evaluations_vec(nvars, rtau.clone());
-            let m_tau_mle =
-                DenseMultilinearExtension::from_evaluations_vec(nvars, inst.m_tau.clone());
-            let f_mle = DenseMultilinearExtension::from_evaluations_vec(nvars, inst.f.clone());
-            let h_mle = DenseMultilinearExtension::from_evaluations_vec(nvars, h[i].clone());
+            let tau0 = StreamingMleEnum::BaseScalarOwned {
+                evals: inst.tau.clone(),
+                num_vars: nvars,
+            };
+            // NOTE: these clones existed before (dense MLE construction); streaming just avoids the *derived* tables.
+            let m_tau_arc = Arc::new(inst.m_tau.clone());
+            let f_arc = Arc::new(inst.f.clone());
+            let h_arc = Arc::new(h[i].clone());
+            let m_tau = StreamingMleEnum::DenseArc {
+                evals: m_tau_arc.clone(),
+                num_vars: nvars,
+            };
+            let f_mle = StreamingMleEnum::DenseArc {
+                evals: f_arc.clone(),
+                num_vars: nvars,
+            };
+            let h_mle = StreamingMleEnum::DenseArc {
+                evals: h_arc.clone(),
+                num_vars: nvars,
+            };
 
-            mles.push(tau_mle);
-            mles.push(m_tau_mle);
+            mles.push(tau0);
+            mles.push(m_tau);
             mles.push(f_mle);
             mles.push(h_mle);
 
-            for m in M {
-                let Mtau = m.try_mul_vec(&rtau).unwrap();
-                mles.push(DenseMultilinearExtension::from_evaluations_vec(nvars, Mtau));
+            // Materialize tau as ring only once for sparse mat-vec evaluation.
+            let tau_ring: Vec<R> = inst.tau.iter().copied().map(R::from).collect();
+            let tau_ring = Arc::new(tau_ring);
 
-                let Mm_tau = m.try_mul_vec(&inst.m_tau).unwrap();
-                mles.push(DenseMultilinearExtension::from_evaluations_vec(
-                    nvars, Mm_tau,
-                ));
-
-                let Mf = m.try_mul_vec(&inst.f).unwrap();
-                mles.push(DenseMultilinearExtension::from_evaluations_vec(nvars, Mf));
-
-                let Mh = m.try_mul_vec(&h[i]).unwrap();
-                mles.push(DenseMultilinearExtension::from_evaluations_vec(nvars, Mh));
+            for m in &m_arcs {
+                mles.push(StreamingMleEnum::SparseMatVec {
+                    matrix: m.clone(),
+                    witness: tau_ring.clone(),
+                    num_vars: nvars,
+                });
+                mles.push(StreamingMleEnum::SparseMatVec {
+                    matrix: m.clone(),
+                    witness: m_tau_arc.clone(),
+                    num_vars: nvars,
+                });
+                mles.push(StreamingMleEnum::SparseMatVec {
+                    matrix: m.clone(),
+                    witness: f_arc.clone(),
+                    num_vars: nvars,
+                });
+                mles.push(StreamingMleEnum::SparseMatVec {
+                    matrix: m.clone(),
+                    witness: h_arc.clone(),
+                    num_vars: nvars,
+                });
             }
         }
 
-        let t0_mle = DenseMultilinearExtension::from_evaluations_vec(nvars, t.0.clone());
-        let t1_mle = DenseMultilinearExtension::from_evaluations_vec(nvars, t.1.clone());
-        mles.push(t0_mle);
-        mles.push(t1_mle);
+        mles.push(t0_mle.clone());
+        mles.push(t1_mle.clone());
 
         let Mlen = M.len();
 
@@ -305,31 +400,28 @@ where
                 .sum::<R>()
         };
 
-        let (sumcheck_proof, prover_state) =
-            MLSumcheck::prove_as_subprotocol(transcript, mles.clone(), nvars, 2, comb_fn);
-        let ro = prover_state
-            .randomness
-            .into_iter()
-            .map(|x| x.into())
-            .collect::<Vec<R>>();
+        let (sumcheck_proof, randomness, final_vals) =
+            StreamingSumcheck::prove_as_subprotocol(transcript, mles, nvars, 2, comb_fn);
+
+        let ro = randomness.into_iter().map(|x| x.into()).collect::<Vec<R>>();
 
         let evals = (0..L)
             .map(|l| {
                 let mut e = Vec::with_capacity(1 + Mlen);
                 let l_idx = 1 + l * (4 + 4 * Mlen);
                 e.push([
-                    mles[l_idx].evaluate(&ro).unwrap(),
-                    mles[l_idx + 1].evaluate(&ro).unwrap(),
-                    mles[l_idx + 2].evaluate(&ro).unwrap(),
-                    mles[l_idx + 3].evaluate(&ro).unwrap(),
+                    final_vals[l_idx],
+                    final_vals[l_idx + 1],
+                    final_vals[l_idx + 2],
+                    final_vals[l_idx + 3],
                 ]);
                 for i in 0..Mlen {
                     let idx = l_idx + 4 + i * 4;
                     e.push([
-                        mles[idx].evaluate(&ro).unwrap(),
-                        mles[idx + 1].evaluate(&ro).unwrap(),
-                        mles[idx + 2].evaluate(&ro).unwrap(),
-                        mles[idx + 3].evaluate(&ro).unwrap(),
+                        final_vals[idx],
+                        final_vals[idx + 1],
+                        final_vals[idx + 2],
+                        final_vals[idx + 3],
                     ]);
                 }
                 InstanceEvals(e)
@@ -337,6 +429,16 @@ where
             .collect::<Vec<_>>();
 
         absorb_evaluations(&evals, transcript);
+
+        if profile {
+            println!(
+                "[LF+ Cm::sumchecker_streaming] sumcheck+evals: {:?} (mles={}, L={}, Mlen={})",
+                t_sumcheck.elapsed(),
+                final_vals.len(),
+                L,
+                Mlen
+            );
+        }
 
         (sumcheck_proof, evals, ro)
     }

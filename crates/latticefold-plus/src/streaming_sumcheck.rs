@@ -1,0 +1,472 @@
+//! Streaming sumcheck prover for LF+ (memory-friendly).
+//!
+//! Produces the *same* `latticefold::utils::sumcheck::Proof<R>` format as the dense prover,
+//! so the existing verifier (`MLSumcheck::verify_as_subprotocol`) remains unchanged.
+
+use std::sync::Arc;
+
+use latticefold::transcript::Transcript;
+use latticefold::utils::sumcheck::prover::ProverMsg;
+use latticefold::utils::sumcheck::Proof;
+use stark_rings::{OverField, PolyRing, Ring};
+use stark_rings_linalg::SparseMatrix;
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
+/// A structured multilinear function that supports:
+/// - evaluating at a hypercube vertex index
+/// - fixing variables LSB-first (same schedule as LF sumcheck)
+#[derive(Clone)]
+pub enum StreamingMleEnum<R: OverField + PolyRing>
+where
+    R::BaseRing: Ring,
+{
+    DenseOwned { evals: Vec<R>, num_vars: usize },
+    DenseArc { evals: Arc<Vec<R>>, num_vars: usize },
+    /// Base-ring scalars (constant-coeff ring elements), stored in base ring for memory.
+    BaseScalarOwned {
+        evals: Vec<R::BaseRing>,
+        num_vars: usize,
+    },
+    /// eq(bits(index), r) in the base ring, then lifted to `R`.
+    EqBase {
+        scale: R::BaseRing,
+        r: Vec<R::BaseRing>,
+        one_minus_r: Vec<R::BaseRing>,
+    },
+    /// y[row] = (M * w)[row], computed from sparse rows (only before the first fix).
+    SparseMatVec {
+        matrix: Arc<SparseMatrix<R>>,
+        witness: Arc<Vec<R>>,
+        num_vars: usize,
+    },
+    /// A padded 4-way tensor-product table:
+    /// t = t1 ⊗ t2 ⊗ t3 ⊗ t4, then padded with zeros up to 2^num_vars.
+    ///
+    /// Indexing matches `utils::tensor_product` nesting:
+    /// for a in t1:
+    ///   for b in t2:
+    ///     for c in t3:
+    ///       for d in t4:
+    ///         push(a*b*c*d)
+    Tensor4Padded {
+        t1: Arc<Vec<R>>,
+        t2: Arc<Vec<R>>,
+        t3: Arc<Vec<R>>,
+        t4: Arc<Vec<R>>,
+        tensor_len: usize,
+        num_vars: usize,
+    },
+}
+
+impl<R: OverField + PolyRing> StreamingMleEnum<R>
+where
+    R::BaseRing: Ring,
+{
+    #[inline]
+    pub fn num_vars(&self) -> usize {
+        match self {
+            StreamingMleEnum::DenseOwned { num_vars, .. } => *num_vars,
+            StreamingMleEnum::DenseArc { num_vars, .. } => *num_vars,
+            StreamingMleEnum::BaseScalarOwned { num_vars, .. } => *num_vars,
+            StreamingMleEnum::EqBase { r, .. } => r.len(),
+            StreamingMleEnum::SparseMatVec { num_vars, .. } => *num_vars,
+            StreamingMleEnum::Tensor4Padded { num_vars, .. } => *num_vars,
+        }
+    }
+
+    #[inline]
+    pub fn eval_at_index(&self, index: usize) -> R {
+        match self {
+            StreamingMleEnum::DenseOwned { evals, .. } => evals[index],
+            StreamingMleEnum::DenseArc { evals, .. } => evals[index],
+            StreamingMleEnum::BaseScalarOwned { evals, .. } => R::from(evals[index]),
+            StreamingMleEnum::EqBase {
+                scale,
+                r,
+                one_minus_r,
+            } => {
+                let mut prod = R::BaseRing::ONE;
+                for i in 0..r.len() {
+                    let bit = ((index >> i) & 1) == 1;
+                    prod *= if bit { r[i] } else { one_minus_r[i] };
+                }
+                R::from(*scale * prod)
+            }
+            StreamingMleEnum::SparseMatVec {
+                matrix, witness, ..
+            } => {
+                let mut sum = R::ZERO;
+                for (coeff, col_idx) in &matrix.coeffs[index] {
+                    if *col_idx < witness.len() {
+                        sum += *coeff * witness[*col_idx];
+                    }
+                }
+                sum
+            }
+            StreamingMleEnum::Tensor4Padded {
+                t1,
+                t2,
+                t3,
+                t4,
+                tensor_len,
+                ..
+            } => {
+                if index >= *tensor_len {
+                    return R::ZERO;
+                }
+                // Index decomposition for the nested-loop order:
+                // i = (((i1 * |t2| + i2) * |t3| + i3) * |t4| + i4)
+                let n4 = t4.len();
+                let n3 = t3.len();
+                let n2 = t2.len();
+                let i4 = index % n4;
+                let q = index / n4;
+                let i3 = q % n3;
+                let q = q / n3;
+                let i2 = q % n2;
+                let i1 = q / n2;
+                t1[i1] * t2[i2] * t3[i3] * t4[i4]
+            }
+        }
+    }
+
+    #[inline]
+    pub fn fix_variable_in_place_base(&mut self, r0: R::BaseRing) {
+        let nv = self.num_vars();
+        assert!(nv > 0);
+        let half = 1usize << (nv - 1);
+        let one_minus0 = R::BaseRing::ONE - r0;
+        let r_ring = R::from(r0);
+        match self {
+            StreamingMleEnum::DenseOwned { evals, num_vars } => {
+                let one_minus = R::ONE - r_ring;
+                for i in 0..half {
+                    let a = evals[i << 1];
+                    let b = evals[(i << 1) | 1];
+                    evals[i] = one_minus * a + r_ring * b;
+                }
+                evals.truncate(half);
+                *num_vars -= 1;
+            }
+            StreamingMleEnum::DenseArc { .. } => {
+                let next = self.fix_variable(r_ring);
+                *self = next;
+            }
+            StreamingMleEnum::BaseScalarOwned { evals, num_vars } => {
+                for i in 0..half {
+                    let a = evals[i << 1];
+                    let b = evals[(i << 1) | 1];
+                    evals[i] = one_minus0 * a + r0 * b;
+                }
+                evals.truncate(half);
+                *num_vars -= 1;
+            }
+            StreamingMleEnum::EqBase {
+                scale,
+                r,
+                one_minus_r,
+            } => {
+                let eq_factor = one_minus0 * one_minus_r[0] + r0 * r[0];
+                *scale *= eq_factor;
+                r.remove(0);
+                one_minus_r.remove(0);
+            }
+            StreamingMleEnum::SparseMatVec { .. } => {
+                let next = self.fix_variable(r_ring);
+                *self = next;
+            }
+            StreamingMleEnum::Tensor4Padded { .. } => {
+                let next = self.fix_variable(r_ring);
+                *self = next;
+            }
+        }
+    }
+
+    pub fn fix_variable(&self, r: R) -> StreamingMleEnum<R> {
+        let nv = self.num_vars();
+        assert!(nv > 0);
+        let half = 1usize << (nv - 1);
+        match self {
+            StreamingMleEnum::DenseOwned { evals, .. } => {
+                let new_evals: Vec<R> = (0..half)
+                    .map(|i| (R::ONE - r) * evals[i << 1] + r * evals[(i << 1) | 1])
+                    .collect();
+                StreamingMleEnum::DenseOwned {
+                    evals: new_evals,
+                    num_vars: nv - 1,
+                }
+            }
+            StreamingMleEnum::DenseArc { evals, .. } => {
+                let new_evals: Vec<R> = (0..half)
+                    .map(|i| (R::ONE - r) * evals[i << 1] + r * evals[(i << 1) | 1])
+                    .collect();
+                StreamingMleEnum::DenseOwned {
+                    evals: new_evals,
+                    num_vars: nv - 1,
+                }
+            }
+            StreamingMleEnum::BaseScalarOwned { .. } => {
+                // Keep base-scalar after fixing.
+                let r0 = r.coeffs()[0];
+                let one_minus0 = R::BaseRing::ONE - r0;
+                let mut out = vec![R::BaseRing::ZERO; half];
+                for i in 0..half {
+                    let a = self.eval_at_index(i << 1).coeffs()[0];
+                    let b = self.eval_at_index((i << 1) | 1).coeffs()[0];
+                    out[i] = one_minus0 * a + r0 * b;
+                }
+                StreamingMleEnum::BaseScalarOwned {
+                    evals: out,
+                    num_vars: nv - 1,
+                }
+            }
+            StreamingMleEnum::EqBase { .. } => {
+                // Use in-place path by cloning and applying one fix.
+                let mut c = self.clone();
+                c.fix_variable_in_place_base(r.coeffs()[0]);
+                c
+            }
+            StreamingMleEnum::SparseMatVec { .. } => {
+                let new_evals: Vec<R> = (0..half)
+                    .map(|i| {
+                        let v0 = self.eval_at_index(i << 1);
+                        let v1 = self.eval_at_index((i << 1) | 1);
+                        (R::ONE - r) * v0 + r * v1
+                    })
+                    .collect();
+                StreamingMleEnum::DenseOwned {
+                    evals: new_evals,
+                    num_vars: nv - 1,
+                }
+            }
+            StreamingMleEnum::Tensor4Padded { .. } => {
+                let new_evals: Vec<R> = (0..half)
+                    .map(|i| {
+                        let v0 = self.eval_at_index(i << 1);
+                        let v1 = self.eval_at_index((i << 1) | 1);
+                        (R::ONE - r) * v0 + r * v1
+                    })
+                    .collect();
+                StreamingMleEnum::DenseOwned {
+                    evals: new_evals,
+                    num_vars: nv - 1,
+                }
+            }
+        }
+    }
+}
+
+pub struct StreamingSumcheckState<R: OverField + PolyRing>
+where
+    R::BaseRing: Ring,
+{
+    pub mles: Vec<StreamingMleEnum<R>>,
+    pub randomness: Vec<R::BaseRing>,
+    pub num_vars: usize,
+    pub max_degree: usize,
+    pub round: usize,
+}
+
+impl<R: OverField + PolyRing> StreamingSumcheckState<R>
+where
+    R::BaseRing: Ring,
+{
+    #[inline]
+    pub fn remaining_vars(&self) -> usize {
+        self.mles[0].num_vars()
+    }
+
+    pub fn fix_last_variable(&mut self, r: R::BaseRing) {
+        let nv = self.remaining_vars();
+        assert!(nv == 1, "fix_last_variable expects 1 remaining var, got {nv}");
+        for m in self.mles.iter_mut() {
+            m.fix_variable_in_place_base(r);
+        }
+    }
+
+    pub fn final_evals(&self) -> Vec<R> {
+        let nv = self.remaining_vars();
+        assert!(nv == 0, "final_evals expects 0 remaining vars, got {nv}");
+        self.mles.iter().map(|m| m.eval_at_index(0)).collect()
+    }
+}
+
+pub struct StreamingSumcheck;
+
+impl StreamingSumcheck {
+    pub fn prover_init<R: OverField + PolyRing>(
+        mles: Vec<StreamingMleEnum<R>>,
+        nvars: usize,
+        degree: usize,
+    ) -> StreamingSumcheckState<R>
+    where
+        R::BaseRing: Ring,
+    {
+        assert!(nvars > 0);
+        assert!(!mles.is_empty());
+        for m in &mles {
+            assert_eq!(m.num_vars(), nvars);
+        }
+        StreamingSumcheckState {
+            mles,
+            randomness: Vec::with_capacity(nvars),
+            num_vars: nvars,
+            max_degree: degree,
+            round: 0,
+        }
+    }
+
+    pub fn prove_round<R: OverField + PolyRing>(
+        state: &mut StreamingSumcheckState<R>,
+        v_msg: Option<R::BaseRing>,
+        comb_fn: &(dyn Fn(&[R]) -> R + Sync + Send),
+    ) -> ProverMsg<R>
+    where
+        R::BaseRing: Ring,
+    {
+        if let Some(r) = v_msg {
+            assert!(state.round > 0);
+            state.randomness.push(r);
+            for m in state.mles.iter_mut() {
+                m.fix_variable_in_place_base(r);
+            }
+        } else {
+            assert!(state.round == 0);
+        }
+
+        state.round += 1;
+        assert!(state.round <= state.num_vars);
+
+        let nv = state.mles[0].num_vars();
+        let degree = state.max_degree;
+        let domain_half = 1usize << (nv - 1);
+        let num_polys = state.mles.len();
+
+        struct Scratch<Rr> {
+            evals: Vec<Rr>,
+            steps: Vec<Rr>,
+            vals0: Vec<Rr>,
+            vals1: Vec<Rr>,
+            vals: Vec<Rr>,
+            levals: Vec<Rr>,
+        }
+
+        let scratch = || Scratch {
+            evals: vec![R::ZERO; degree + 1],
+            steps: vec![R::ZERO; num_polys],
+            vals0: vec![R::ZERO; num_polys],
+            vals1: vec![R::ZERO; num_polys],
+            vals: vec![R::ZERO; num_polys],
+            levals: vec![R::ZERO; degree + 1],
+        };
+
+        #[cfg(feature = "parallel")]
+        let result = (0..domain_half)
+            .into_par_iter()
+            .fold(scratch, |mut s, b| {
+                for (i, mle) in state.mles.iter().enumerate() {
+                    s.vals0[i] = mle.eval_at_index(b << 1);
+                    s.vals1[i] = mle.eval_at_index((b << 1) | 1);
+                }
+                s.levals[0] = comb_fn(&s.vals0);
+                s.levals[1] = comb_fn(&s.vals1);
+                for i in 0..num_polys {
+                    s.steps[i] = s.vals1[i] - s.vals0[i];
+                    s.vals[i] = s.vals1[i];
+                }
+                for d in 2..=degree {
+                    for i in 0..num_polys {
+                        s.vals[i] += s.steps[i];
+                    }
+                    s.levals[d] = comb_fn(&s.vals);
+                }
+                for (e, l) in s.evals.iter_mut().zip(s.levals.iter()) {
+                    *e += *l;
+                }
+                s
+            })
+            .map(|s| s.evals)
+            .reduce(|| vec![R::ZERO; degree + 1], |mut acc, evals| {
+                for (a, e) in acc.iter_mut().zip(evals) {
+                    *a += e;
+                }
+                acc
+            });
+
+        #[cfg(not(feature = "parallel"))]
+        let result = {
+            let mut acc = vec![R::ZERO; degree + 1];
+            let mut s = scratch();
+            for b in 0..domain_half {
+                for (i, mle) in state.mles.iter().enumerate() {
+                    s.vals0[i] = mle.eval_at_index(b << 1);
+                    s.vals1[i] = mle.eval_at_index((b << 1) | 1);
+                }
+                s.levals[0] = comb_fn(&s.vals0);
+                s.levals[1] = comb_fn(&s.vals1);
+                for i in 0..num_polys {
+                    s.steps[i] = s.vals1[i] - s.vals0[i];
+                    s.vals[i] = s.vals1[i];
+                }
+                for d in 2..=degree {
+                    for i in 0..num_polys {
+                        s.vals[i] += s.steps[i];
+                    }
+                    s.levals[d] = comb_fn(&s.vals);
+                }
+                for (a, l) in acc.iter_mut().zip(s.levals.iter()) {
+                    *a += *l;
+                }
+            }
+            acc
+        };
+
+        ProverMsg { evaluations: result }
+    }
+
+    /// Run streaming sumcheck as a subprotocol (same transcript schedule as LF dense prover).
+    ///
+    /// Returns:
+    /// - `Proof<R>` compatible with `MLSumcheck::verify_as_subprotocol`
+    /// - fully sampled verifier randomness vector (length `nvars`)
+    /// - final evaluations of all internal MLEs at the sampled point (same ordering as input `mles`)
+    pub fn prove_as_subprotocol<R: OverField + PolyRing, T: Transcript<R>>(
+        transcript: &mut T,
+        mles: Vec<StreamingMleEnum<R>>,
+        nvars: usize,
+        degree: usize,
+        comb_fn: impl Fn(&[R]) -> R + Sync + Send,
+    ) -> (Proof<R>, Vec<R::BaseRing>, Vec<R>)
+    where
+        R::BaseRing: Ring,
+    {
+        transcript.absorb_field_element(&R::BaseRing::from(nvars as u128));
+        transcript.absorb_field_element(&R::BaseRing::from(degree as u128));
+
+        let mut state = Self::prover_init(mles, nvars, degree);
+        let mut msgs = Vec::with_capacity(nvars);
+        let mut v_msg: Option<R::BaseRing> = None;
+
+        for _ in 0..nvars {
+            let pm = Self::prove_round(&mut state, v_msg, &comb_fn);
+            transcript.absorb_slice(&pm.evaluations);
+            msgs.push(pm);
+            let r = transcript.get_challenge();
+            transcript.absorb_field_element(&r);
+            v_msg = Some(r);
+        }
+
+        // IMPORTANT: last sampled randomness is not yet applied inside the `nvars` rounds,
+        // due to the standard sumcheck schedule (applied at the start of the next round).
+        let last_r = v_msg.expect("nvars>0");
+        state.randomness.push(last_r);
+        state.fix_last_variable(last_r);
+
+        let final_evals = state.final_evals();
+
+        (Proof::new(msgs), state.randomness, final_evals)
+    }
+}
+
