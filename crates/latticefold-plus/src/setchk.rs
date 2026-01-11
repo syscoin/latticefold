@@ -397,7 +397,16 @@ impl<R: OverField + PolyRing> In<R> {
 
         // Step 3
         let t_step3 = Instant::now();
-        let eq_r = build_eq_table_base::<R>(&r);
+        // Avoid materializing full length-2^n eq table: use (low-table + high-scale).
+        let one_minus_r = r.iter().copied().map(|x| R::BaseRing::ONE - x).collect::<Vec<_>>();
+        let t_low = choose_t_low(self.nvars);
+        let low = build_eq_low_table::<R>(&r[..t_low], &one_minus_r[..t_low]);
+        let low_len = 1usize << t_low;
+        let low_mask = low_len - 1;
+        let scale_high = build_scale_high::<R>(&r, &one_minus_r, t_low);
+        let eq_at = |idx: usize| -> R::BaseRing {
+            eq_weight_base::<R>(idx, &low, &scale_high, low_mask, t_low)
+        };
 
         // Precompute y_i = M_i^T * eq_r (so eval(M_i * row)(r) = <y_i, row>).
         //
@@ -408,7 +417,7 @@ impl<R: OverField + PolyRing> In<R> {
             .map(|mi| {
                 let mut y = vec![R::ZERO; mi.ncols];
                 for (row_idx, row) in mi.coeffs.iter().enumerate() {
-                    let w = R::from(eq_r[row_idx]);
+                    let w = R::from(eq_at(row_idx));
                     for (coeff, col_idx) in row {
                         y[*col_idx] += *coeff * w;
                     }
@@ -436,7 +445,7 @@ impl<R: OverField + PolyRing> In<R> {
                     .map(|col| {
                         let mut acc = R::ZERO;
                         for row in 0..nrows {
-                            acc += Md.vals[row][col] * R::from(eq_r[row]);
+                            acc += Md.vals[row][col] * R::from(eq_at(row));
                         }
                         acc
                     })
@@ -446,7 +455,7 @@ impl<R: OverField + PolyRing> In<R> {
                     .map(|col| {
                         let mut acc = R::ZERO;
                         for row in 0..nrows {
-                            acc += Md.vals[row][col] * R::from(eq_r[row]);
+                            acc += Md.vals[row][col] * R::from(eq_at(row));
                         }
                         acc
                     })
@@ -461,7 +470,7 @@ impl<R: OverField + PolyRing> In<R> {
                     .map(|col| {
                         let mut acc = R::ZERO;
                         for row in 0..nrows {
-                            acc += Md.get(row, col) * R::from(eq_r[row]);
+                            acc += Md.get(row, col) * R::from(eq_at(row));
                         }
                         acc
                     })
@@ -471,7 +480,7 @@ impl<R: OverField + PolyRing> In<R> {
                     .map(|col| {
                         let mut acc = R::ZERO;
                         for row in 0..nrows {
-                            acc += Md.get(row, col) * R::from(eq_r[row]);
+                            acc += Md.get(row, col) * R::from(eq_at(row));
                         }
                         acc
                     })
@@ -489,7 +498,7 @@ impl<R: OverField + PolyRing> In<R> {
                             .map(|row| {
                                 let mut acc = R::ZERO;
                                 for &(rij, idx) in row {
-                                        acc += rij * R::from(eq_r[idx]);
+                                    acc += rij * R::from(eq_at(idx));
                                 }
                                 acc
                             })
@@ -508,7 +517,7 @@ impl<R: OverField + PolyRing> In<R> {
                             .map(|row| {
                                 let mut acc = R::ZERO;
                                 for &(rij, idx) in row {
-                                    acc += rij * R::from(eq_r[idx]);
+                                    acc += rij * R::from(eq_at(idx));
                                 }
                                 acc
                             })
@@ -625,7 +634,7 @@ impl<R: OverField + PolyRing> In<R> {
             .map(|m| {
                 let mut acc = R::ZERO;
                 for (i, &mi) in m.iter().enumerate() {
-                    acc += mi * R::from(eq_r[i]);
+                    acc += mi * R::from(eq_at(i));
                 }
                 acc
             })
@@ -636,7 +645,7 @@ impl<R: OverField + PolyRing> In<R> {
             .map(|m| {
                 let mut acc = R::ZERO;
                 for (i, &mi) in m.iter().enumerate() {
-                    acc += mi * R::from(eq_r[i]);
+                    acc += mi * R::from(eq_at(i));
                 }
                 acc
             })
@@ -714,6 +723,7 @@ where
 }
 
 /// Build eq(bits(idx), r) table (little-endian index order), matching latticefold build_eq_x_r_vec.
+#[allow(dead_code)]
 fn build_eq_table_base<R: PolyRing>(r: &[R::BaseRing]) -> Vec<R::BaseRing>
 where
     R::BaseRing: Ring,
@@ -729,6 +739,77 @@ where
         buf = res;
     }
     buf
+}
+
+#[inline]
+fn choose_t_low(nvars: usize) -> usize {
+    // Keep a tiny 2^t table; stream the remaining high bits.
+    nvars.min(12)
+}
+
+/// Build eq weights for the low `t` variables (LSB-first), returned as a length-2^t table.
+fn build_eq_low_table<R: PolyRing>(
+    r_low: &[R::BaseRing],
+    one_minus_r_low: &[R::BaseRing],
+) -> Vec<R::BaseRing>
+where
+    R::BaseRing: Ring,
+{
+    debug_assert_eq!(r_low.len(), one_minus_r_low.len());
+    let t = r_low.len();
+    let mut buf = vec![R::BaseRing::ONE];
+    for i in (0..t).rev() {
+        let ri = r_low[i];
+        let omi = one_minus_r_low[i];
+        let mut res = vec![R::BaseRing::ZERO; buf.len() << 1];
+        for (j, out) in res.iter_mut().enumerate() {
+            let bi = buf[j >> 1];
+            *out = if (j & 1) == 0 { bi * omi } else { bi * ri };
+        }
+        buf = res;
+    }
+    buf
+}
+
+/// Precompute scale factors for the high bits (t..nvars-1): scale_high[high] = Π_i (bit? r[i] : (1-r[i])).
+fn build_scale_high<R: PolyRing>(
+    r: &[R::BaseRing],
+    one_minus_r: &[R::BaseRing],
+    t_low: usize,
+) -> Vec<R::BaseRing>
+where
+    R::BaseRing: Ring,
+{
+    debug_assert_eq!(r.len(), one_minus_r.len());
+    let nvars = r.len();
+    let high_bits = nvars - t_low;
+    let high_len = 1usize << high_bits;
+    let mut out = vec![R::BaseRing::ONE; high_len];
+    for h in 0..high_len {
+        let mut prod = R::BaseRing::ONE;
+        for i in t_low..nvars {
+            let bit = ((h >> (i - t_low)) & 1) == 1;
+            prod *= if bit { r[i] } else { one_minus_r[i] };
+        }
+        out[h] = prod;
+    }
+    out
+}
+
+#[inline]
+fn eq_weight_base<R: PolyRing>(
+    idx: usize,
+    low: &[R::BaseRing],
+    scale_high: &[R::BaseRing],
+    low_mask: usize,
+    t_low: usize,
+) -> R::BaseRing
+where
+    R::BaseRing: Ring,
+{
+    let low_idx = idx & low_mask;
+    let high_idx = idx >> t_low;
+    scale_high[high_idx] * low[low_idx]
 }
 
 impl<R: OverField> Out<R> {
