@@ -692,6 +692,9 @@ fn absorb_evaluations<R: OverField>(
 }
 
 /// t(z) = tensor(c(z)) ⊗ s' ⊗ (1, d', ..., d'^(ℓ-1)) ⊗ (1, X, ..., X^(d-1))
+#[allow(dead_code)]
+// Dense reference implementation (debugging / cross-checking).
+// Hot paths use streaming `Tensor4Padded` (prover) and `eval_t_z_optimized` (verifier).
 fn calculate_t_z<T>(c_z: &[T], s_prime: &[T], d_prime_powers: &[T], x_powers: &[T]) -> Vec<T>
 where
     T: Clone + One + Sub<Output = T> + Mul<Output = T>,

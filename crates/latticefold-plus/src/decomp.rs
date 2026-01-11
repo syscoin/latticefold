@@ -5,10 +5,14 @@ use stark_rings::{
 };
 use stark_rings_linalg::{ops::Transpose, Matrix, SparseMatrix};
 use stark_rings_poly::mle::DenseMultilinearExtension;
+use std::time::Instant;
 
 use crate::lin::{LinB, LinBX};
 
 pub type RxR<R> = (R, R);
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 #[derive(Debug)]
 pub struct Decomp<'a, R> {
@@ -30,48 +34,93 @@ where
     R::BaseRing: Zq,
 {
     pub fn decompose(&self, A: &Matrix<R>, B: u128) -> ((LinB<R>, LinB<R>), DecompProof<R>) {
+        let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
+        let t_total = Instant::now();
+
         let nvars = log2(A.ncols) as usize;
         let mut F = self.f.decompose_to_vec(B, 2).transpose().into_iter();
         let F0 = F.next().unwrap();
         let F1 = F.next().unwrap();
 
+        let r_a = self.r.iter().map(|rr| rr.0).collect::<Vec<_>>();
+        let r_b = self.r.iter().map(|rr| rr.1).collect::<Vec<_>>();
+
+        // Parallel sparse mat-vec (used for Πdecomp hot path).
+        fn mul_vec<Rr: PolyRing>(m: &SparseMatrix<Rr>, v: &[Rr]) -> Vec<Rr> {
+            debug_assert_eq!(m.ncols, v.len());
+            #[cfg(feature = "parallel")]
+            {
+                m.coeffs
+                    .par_iter()
+                    .map(|row| {
+                        let mut acc = Rr::ZERO;
+                        for (coeff, col_idx) in row {
+                            if *col_idx < v.len() {
+                                acc += *coeff * v[*col_idx];
+                            }
+                        }
+                        acc
+                    })
+                    .collect()
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                m.coeffs
+                    .iter()
+                    .map(|row| {
+                        let mut acc = Rr::ZERO;
+                        for (coeff, col_idx) in row {
+                            if *col_idx < v.len() {
+                                acc += *coeff * v[*col_idx];
+                            }
+                        }
+                        acc
+                    })
+                    .collect()
+            }
+        }
+
         let vi_calc = |Fi: &[R]| -> Vec<(R, R)> {
-            let r_a = self.r.iter().map(|rr| rr.0).collect::<Vec<_>>();
-            let r_b = self.r.iter().map(|rr| rr.1).collect::<Vec<_>>();
-            let fv = (
-                DenseMultilinearExtension::from_evaluations_vec(nvars, Fi.to_vec())
-                    .evaluate(&r_a)
-                    .unwrap(),
-                DenseMultilinearExtension::from_evaluations_vec(nvars, Fi.to_vec())
-                    .evaluate(&r_b)
-                    .unwrap(),
-            );
+            // Evaluate Fi at both points without recomputing MLE / mat-vec.
+            let mle_fi = DenseMultilinearExtension::from_evaluations_vec(nvars, Fi.to_vec());
+            let fv = (mle_fi.evaluate(&r_a).unwrap(), mle_fi.evaluate(&r_b).unwrap());
             let mut vi = vec![fv];
             self.M.iter().for_each(|M_i| {
+                // Compute M_i * Fi ONCE, then evaluate at both points.
+                let mfi = mul_vec(M_i, Fi);
+                let mle_mfi = DenseMultilinearExtension::from_evaluations_vec(nvars, mfi);
                 let vj = (
-                    DenseMultilinearExtension::from_evaluations_vec(
-                        nvars,
-                        M_i.try_mul_vec(Fi).unwrap(),
-                    )
-                    .evaluate(&r_a)
-                    .unwrap(),
-                    DenseMultilinearExtension::from_evaluations_vec(
-                        nvars,
-                        M_i.try_mul_vec(Fi).unwrap(),
-                    )
-                    .evaluate(&r_b)
-                    .unwrap(),
+                    mle_mfi.evaluate(&r_a).unwrap(),
+                    mle_mfi.evaluate(&r_b).unwrap(),
                 );
                 vi.push(vj);
             });
             vi
         };
 
+        if profile {
+            println!(
+                "[LF+ Decomp::decompose] setup+split: {:?} (nvars={}, Mlen={})",
+                t_total.elapsed(),
+                nvars,
+                self.M.len()
+            );
+        }
+
+        let t = Instant::now();
         let v0 = vi_calc(&F0);
         let v1 = vi_calc(&F1);
+        if profile {
+            println!("[LF+ Decomp::decompose] compute v0/v1: {:?}", t.elapsed());
+        }
 
+        let t = Instant::now();
         let C0 = A.try_mul_vec(&F0).unwrap();
         let C1 = A.try_mul_vec(&F1).unwrap();
+        if profile {
+            println!("[LF+ Decomp::decompose] commitments C0/C1: {:?}", t.elapsed());
+            println!("[LF+ Decomp::decompose] total: {:?}", t_total.elapsed());
+        }
 
         let linb0 = LinB {
             x: LinBX {
