@@ -12,9 +12,8 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use cyclotomic_rings::rings::GoldilocksPoseidonConfig as PC;
 use cyclotomic_rings::rings::GetPoseidonParams;
 
-use ark_ff::{BigInteger, Fp, MontBackend, MontConfig, PrimeField};
+use ark_ff::{BigInteger, Fp384, MontBackend, MontConfig, PrimeField};
 use rand::{rngs::StdRng, SeedableRng};
-use dpp::BoundedFlpcpSparse;
 
 use latticefold::arith::r1cs::R1CS;
 use stark_rings::balanced_decomposition::GadgetDecompose;
@@ -33,12 +32,11 @@ use latticefold_plus::we_statement::WeParams;
 // -----------------------------------------------------------------------------
 
 #[derive(MontConfig)]
-// RFC 3526 group 2 prime (1024-bit MODP) as a “very large” field for the Rev2 embedding.
-// This keeps the packing “no wrap” condition satisfiable even with conservative bounds.
-#[modulus = "179769313486231590770839156793787453197860296048756011706444423684197180216158519368947833795864925541502180565485980503646440548199239100050792877003355816639229553136239076508735759914822574862575007425302077447712589550957937778424442426617334727629299387668709205606050270810842907692932019128194467627007"]
+// NIST P-384 prime (as used by Symphony’s Rev2 embedding bench).
+#[modulus = "39402006196394479212279040100143613805079739270465446667948293404245721771496870329047266088258938001861606973112319"]
 #[generator = "2"]
-pub struct FBigConfig;
-type FBig = Fp<MontBackend<FBigConfig, 16>, 16>;
+pub struct Secp384r1Config;
+type FBig = Fp384<MontBackend<Secp384r1Config, 6>>;
 
 fn lift_to_big<Fs: PrimeField>(x: Fs) -> FBig {
     FBig::from_le_bytes_mod_order(&x.into_bigint().to_bytes_le())
@@ -143,20 +141,20 @@ fn bench_we_dpp(c: &mut Criterion) {
         let pi_field_small = flpcp.prove(&x_small);
 
         // Rev2 pipeline (Booleanize -> Embed -> Pack) into a large field.
-        let boolized = dpp::BooleanProofFlpcpSparse::<FSmall, _>::new(flpcp);
+        //
+        // Use the same builder as Symphony to match bounds/packing behavior exactly.
+        let boolized = dpp::BooleanProofFlpcpSparse::<FSmall, _>::new(flpcp.clone());
         let pi_bits_small = boolized.encode_proof_bits(&pi_field_small);
 
-        let embedded = dpp::EmbeddedFlpcpSparse::<FSmall, FBig, _>::new(
-            boolized,
+        let dppv = dpp::pipeline::build_rev2_dpp_sparse_boolean_auto::<FSmall, FBig, _>(
+            flpcp,
             dpp::EmbeddingParams {
                 gamma: 2,
-                assume_boolean_proof: false,
+                assume_boolean_proof: true,
                 k_prime: 0,
             },
-        );
-        let pack = dpp::PackedDppParams::from_bounds_max::<FBig>(&embedded.bounds_b())
-            .expect("PackedDppParams::from_bounds_max");
-        let dppv = dpp::DppFromBoundedFlpcpSparse::<FBig, _>::new(embedded, pack);
+        )
+        .expect("build_rev2_dpp_sparse_boolean_auto");
 
         let x_big = x_small.iter().copied().map(lift_to_big::<FSmall>).collect::<Vec<_>>();
         let pi_big = pi_bits_small
