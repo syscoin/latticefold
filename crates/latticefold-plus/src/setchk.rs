@@ -2,14 +2,20 @@ use ark_std::log2;
 use latticefold::{
     transcript::Transcript,
     utils::sumcheck::{
-        utils::{build_eq_x_r, eq_eval},
+        utils::eq_eval,
         MLSumcheck, Proof, SumCheckError,
     },
 };
 use stark_rings::{OverField, PolyRing, Ring};
 use stark_rings_linalg::{ops::Transpose, SparseMatrix};
-use stark_rings_poly::mle::DenseMultilinearExtension;
 use thiserror::Error;
+use std::sync::Arc;
+use std::time::Instant;
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
+// (legacy) build_eq_x_r is no longer used in the streaming prover path
 
 // cM: double commitment, commitment to M
 // M: witness matrix of monomials
@@ -63,6 +69,9 @@ impl<R: OverField> In<R> {
     /// Currently requires k >= 1 monomial matrices sets. TODO support other scenarios.
     /// If k > 1, sumcheck batching is employed.
     pub fn set_check(&self, M: &[SparseMatrix<R>], transcript: &mut impl Transcript<R>) -> Out<R> {
+        let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
+        let t_total = Instant::now();
+
         let Ms: Vec<&SparseMatrix<R>> = self
             .sets
             .iter()
@@ -84,69 +93,109 @@ impl<R: OverField> In<R> {
         let MTs = Ms.iter().map(|M| M.transpose()).collect::<Vec<_>>();
         let tnvars = log2(Ms[0].nrows.next_power_of_two()) as usize;
 
-        let mut mles = Vec::with_capacity((Ms.len() + ms.len()) * (ncols * 2 + 1));
+        // Streaming MLEs (avoid materializing DenseMultilinearExtension tables).
+        use crate::streaming_sumcheck::{StreamingMleEnum, StreamingSumcheck};
+        let mut mles: Vec<StreamingMleEnum<R>> =
+            Vec::with_capacity((Ms.len() + ms.len()) * (ncols * 2 + 1));
         let mut alphas = Vec::with_capacity(Ms.len());
 
         // matrix sets
-        for M in Ms.iter() {
+        for (mi, M) in Ms.iter().enumerate() {
+            let t_mat = Instant::now();
             // Step 1
-            let c: Vec<R> = transcript
-                .get_challenges(self.nvars)
-                .into_iter()
-                .map(|x| x.into())
-                .collect();
+            let c0 = transcript.get_challenges(self.nvars);
+            let one_minus_c0 = c0.iter().copied().map(|x| R::BaseRing::ONE - x).collect();
             let beta = transcript.get_challenge();
 
             // Step 2
             let MT = M.transpose();
 
-            // explore sMLE
-            for row in MT.coeffs.iter() {
-                let mut m_j = vec![R::zero(); M.nrows];
-                row.iter().for_each(|(r, i)| m_j[*i] = R::from(ev(r, beta)));
-                // ev(x^2) = ev(x)^2, if and only if monomial
-                let m_prime_j = m_j.iter().map(|z| *z * z).collect::<Vec<_>>();
+            // Fast evaluation uses precomputed beta powers (degree = ring dimension).
+            let beta_pows = beta_pows::<R>(beta);
 
-                let mle_m_j = DenseMultilinearExtension::from_evaluations_vec(tnvars, m_j);
-                let mle_m_prime_j =
-                    DenseMultilinearExtension::from_evaluations_vec(tnvars, m_prime_j);
+            // Build per-column base-scalar tables in parallel (each is length n = M.nrows).
+            #[cfg(feature = "parallel")]
+            let col_tables: Vec<Arc<Vec<R::BaseRing>>> = (0..ncols)
+                .into_par_iter()
+                .map(|col| {
+                    let row = &MT.coeffs[col];
+                    let mut v = vec![R::BaseRing::ZERO; M.nrows];
+                    for (r_ij, idx) in row.iter() {
+                        v[*idx] = ev_fast::<R>(r_ij, &beta_pows);
+                    }
+                    Arc::new(v)
+                })
+                .collect();
+            #[cfg(not(feature = "parallel"))]
+            let col_tables: Vec<Arc<Vec<R::BaseRing>>> = (0..ncols)
+                .map(|col| {
+                    let row = &MT.coeffs[col];
+                    let mut v = vec![R::BaseRing::ZERO; M.nrows];
+                    for (r_ij, idx) in row.iter() {
+                        v[*idx] = ev_fast::<R>(r_ij, &beta_pows);
+                    }
+                    Arc::new(v)
+                })
+                .collect();
 
-                mles.push(mle_m_j);
-                mles.push(mle_m_prime_j);
+            for col in 0..ncols {
+                let tab = col_tables[col].clone();
+                mles.push(StreamingMleEnum::BaseScalarArc { evals: tab.clone(), num_vars: tnvars, square: false });
+                mles.push(StreamingMleEnum::BaseScalarArc { evals: tab, num_vars: tnvars, square: true });
             }
 
-            let eq = build_eq_x_r(&c).unwrap();
-            mles.push(eq);
+            // eq(x,c) as base-ring structured MLE (constant-coeff)
+            mles.push(StreamingMleEnum::EqBase {
+                scale: R::BaseRing::ONE,
+                r: c0,
+                one_minus_r: one_minus_c0,
+            });
 
             let alpha = transcript.get_challenge();
             alphas.push(alpha);
+
+            if profile {
+                println!(
+                    "[LF+ setchk] matrix_set[{mi}] build_tables: {:?} (nrows={}, ncols={})",
+                    t_mat.elapsed(),
+                    M.nrows,
+                    ncols
+                );
+            }
         }
 
         // vector sets
-        for m in ms.iter() {
+        for (vi, m) in ms.iter().enumerate() {
+            let t_vec = Instant::now();
             // Step 1
-            let c: Vec<R> = transcript
-                .get_challenges(self.nvars)
-                .into_iter()
-                .map(|x| x.into())
-                .collect();
+            let c0 = transcript.get_challenges(self.nvars);
+            let one_minus_c0 = c0.iter().copied().map(|x| R::BaseRing::ONE - x).collect();
             let beta = transcript.get_challenge();
 
-            let m_j = m.iter().map(|r| R::from(ev(r, beta))).collect::<Vec<_>>();
-            // ev(x^2) = ev(x)^2, if and only if monomial
-            let m_prime_j = m_j.iter().map(|z| *z * z).collect::<Vec<_>>();
-
-            let mle_m_j = DenseMultilinearExtension::from_evaluations_vec(tnvars, m_j);
-            let mle_m_prime_j = DenseMultilinearExtension::from_evaluations_vec(tnvars, m_prime_j);
-
-            mles.push(mle_m_j);
-            mles.push(mle_m_prime_j);
-
-            let eq = build_eq_x_r(&c).unwrap();
-            mles.push(eq);
+            let beta_pows = beta_pows::<R>(beta);
+            let mut v0 = vec![R::BaseRing::ZERO; m.len()];
+            for (i, r_i) in m.iter().enumerate() {
+                v0[i] = ev_fast::<R>(r_i, &beta_pows);
+            }
+            let tab = Arc::new(v0);
+            mles.push(StreamingMleEnum::BaseScalarArc { evals: tab.clone(), num_vars: tnvars, square: false });
+            mles.push(StreamingMleEnum::BaseScalarArc { evals: tab, num_vars: tnvars, square: true });
+            mles.push(StreamingMleEnum::EqBase {
+                scale: R::BaseRing::ONE,
+                r: c0,
+                one_minus_r: one_minus_c0,
+            });
 
             let alpha = transcript.get_challenge();
             alphas.push(alpha);
+
+            if profile {
+                println!(
+                    "[LF+ setchk] vector_set[{vi}] build_table: {:?} (len={})",
+                    t_vec.elapsed(),
+                    m.len()
+                );
+            }
         }
 
         // random linear combinator, for batching
@@ -185,31 +234,72 @@ impl<R: OverField> In<R> {
             lc
         };
 
-        let (sumcheck_proof, prover_state) =
-            MLSumcheck::prove_as_subprotocol(transcript, mles, self.nvars, 3, comb_fn);
-
-        let r = prover_state.randomness.clone();
-        let r_poly = prover_state
-            .randomness
-            .into_iter()
-            .map(|x| x.into())
-            .collect::<Vec<R>>();
+        let t_sc = Instant::now();
+        let (sumcheck_proof, r, _final_vals) =
+            StreamingSumcheck::prove_as_subprotocol(transcript, mles, self.nvars, 3, comb_fn);
+        if profile {
+            println!(
+                "[LF+ setchk] sumcheck: {:?} (nvars={}, degree=3, ncols={}, Ms={}, ms={})",
+                t_sc.elapsed(),
+                self.nvars,
+                ncols,
+                Ms.len(),
+                ms.len()
+            );
+        }
 
         // Step 3
+        let t_step3 = Instant::now();
+        let eq_r = build_eq_table_base::<R>(&r);
+        let eq_r_ring: Vec<R> = eq_r.iter().copied().map(R::from).collect();
+
+        // Precompute y_i = M_i^T * eq_r (so eval(M_i * row)(r) = <y_i, row>).
+        let y_mats: Vec<Vec<R>> = M
+            .iter()
+            .map(|mi| {
+                let mut y = vec![R::ZERO; mi.ncols];
+                for (row_idx, row) in mi.coeffs.iter().enumerate() {
+                    let w = eq_r_ring[row_idx];
+                    for (coeff, col_idx) in row {
+                        y[*col_idx] += *coeff * w;
+                    }
+                }
+                y
+            })
+            .collect();
+
         let e: Vec<Vec<Vec<R>>> = {
             let mut e = Vec::with_capacity(1 + M.len());
 
+            // e0: eval of each MT row at point r.
+            #[cfg(feature = "parallel")]
+            let e0 = MTs
+                .par_iter()
+                .map(|MT| {
+                    MT.coeffs
+                        .par_iter()
+                        .map(|row| {
+                            let mut acc = R::ZERO;
+                            for &(rij, idx) in row {
+                                acc += rij * eq_r_ring[idx];
+                            }
+                            acc
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<Vec<R>>>();
+            #[cfg(not(feature = "parallel"))]
             let e0 = MTs
                 .iter()
                 .map(|MT| {
                     MT.coeffs
                         .iter()
                         .map(|row| {
-                            let mut evals = vec![R::ZERO; MT.ncols];
-                            row.iter().for_each(|&(r, i)| evals[i] = r);
-                            let mle =
-                                DenseMultilinearExtension::from_evaluations_vec(tnvars, evals);
-                            mle.evaluate(&r_poly).unwrap()
+                            let mut acc = R::ZERO;
+                            for &(rij, idx) in row {
+                                acc += rij * eq_r_ring[idx];
+                            }
+                            acc
                         })
                         .collect::<Vec<_>>()
                 })
@@ -217,40 +307,78 @@ impl<R: OverField> In<R> {
             e.push(e0);
 
             // Mf
-            for Mi in M {
+            for (mi, y) in y_mats.iter().enumerate() {
+                #[cfg(feature = "parallel")]
+                let ei = MTs
+                    .par_iter()
+                    .map(|MT| {
+                        MT.coeffs
+                            .par_iter()
+                            .map(|row| {
+                                let mut acc = R::ZERO;
+                                for &(rij, idx) in row {
+                                    acc += rij * y[idx];
+                                }
+                                acc
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<Vec<R>>>();
+                #[cfg(not(feature = "parallel"))]
                 let ei = MTs
                     .iter()
                     .map(|MT| {
                         MT.coeffs
                             .iter()
                             .map(|row| {
-                                let mut drow = vec![R::zero(); MT.ncols];
-                                row.iter().for_each(|&(r, i)| {
-                                    drow[i] = r;
-                                });
-                                let evals = Mi.try_mul_vec(&drow).unwrap();
-                                let mle =
-                                    DenseMultilinearExtension::from_evaluations_vec(tnvars, evals);
-                                mle.evaluate(&r_poly).unwrap()
+                                let mut acc = R::ZERO;
+                                for &(rij, idx) in row {
+                                    acc += rij * y[idx];
+                                }
+                                acc
                             })
                             .collect::<Vec<_>>()
                     })
                     .collect::<Vec<Vec<R>>>();
+                let _ = mi;
                 e.push(ei);
             }
             e
         };
 
+        #[cfg(feature = "parallel")]
+        let b: Vec<R> = ms
+            .par_iter()
+            .map(|m| {
+                let mut acc = R::ZERO;
+                for (i, &mi) in m.iter().enumerate() {
+                    acc += mi * eq_r_ring[i];
+                }
+                acc
+            })
+            .collect();
+        #[cfg(not(feature = "parallel"))]
         let b: Vec<R> = ms
             .iter()
             .map(|m| {
-                let mle = DenseMultilinearExtension::from_evaluations_slice(tnvars, m);
-                mle.evaluate(&r_poly).unwrap()
+                let mut acc = R::ZERO;
+                for (i, &mi) in m.iter().enumerate() {
+                    acc += mi * eq_r_ring[i];
+                }
+                acc
             })
-            .collect::<Vec<_>>();
+            .collect();
 
         // Prover to Verifier messages
         absorb_evaluations(&e, &b, transcript);
+
+        if profile {
+            println!(
+                "[LF+ setchk] step3(e,b)+absorb: {:?}  total: {:?}",
+                t_step3.elapsed(),
+                t_total.elapsed()
+            );
+        }
 
         Out {
             nvars: self.nvars,
@@ -260,6 +388,74 @@ impl<R: OverField> In<R> {
             sumcheck_proof,
         }
     }
+}
+
+#[inline]
+fn beta_pows<R: PolyRing>(beta: R::BaseRing) -> Vec<R::BaseRing>
+where
+    R::BaseRing: Ring,
+{
+    let d = R::dimension();
+    let mut out = Vec::with_capacity(d);
+    let mut acc = R::BaseRing::ONE;
+    for _ in 0..d {
+        out.push(acc);
+        acc *= beta;
+    }
+    out
+}
+
+/// Fast `ev(r, beta)`:
+/// - if `r` is monomial-like (<=1 nonzero coeff), do O(1) lookup via `beta_pows`
+/// - otherwise fall back to full dot product against `beta_pows`
+#[inline]
+fn ev_fast<R: PolyRing>(r: &R, beta_pows: &[R::BaseRing]) -> R::BaseRing
+where
+    R::BaseRing: Ring,
+{
+    let coeffs = r.coeffs();
+    debug_assert_eq!(coeffs.len(), beta_pows.len());
+
+    let mut idx: Option<usize> = None;
+    let mut c: R::BaseRing = R::BaseRing::ZERO;
+    for (i, &ci) in coeffs.iter().enumerate() {
+        if ci != R::BaseRing::ZERO {
+            if idx.is_some() {
+                // not monomial
+                let mut acc = R::BaseRing::ZERO;
+                for (cj, pj) in coeffs.iter().zip(beta_pows.iter()) {
+                    if *cj != R::BaseRing::ZERO {
+                        acc += *cj * *pj;
+                    }
+                }
+                return acc;
+            }
+            idx = Some(i);
+            c = ci;
+        }
+    }
+    match idx {
+        None => R::BaseRing::ZERO,
+        Some(i) => c * beta_pows[i],
+    }
+}
+
+/// Build eq(bits(idx), r) table (little-endian index order), matching latticefold build_eq_x_r_vec.
+fn build_eq_table_base<R: PolyRing>(r: &[R::BaseRing]) -> Vec<R::BaseRing>
+where
+    R::BaseRing: Ring,
+{
+    let mut buf = vec![R::BaseRing::ONE];
+    for &ri in r.iter().rev() {
+        let mut res = vec![R::BaseRing::ZERO; buf.len() << 1];
+        for (i, out) in res.iter_mut().enumerate() {
+            let bi = buf[i >> 1];
+            let tmp = ri * bi;
+            *out = if (i & 1) == 0 { bi - tmp } else { tmp };
+        }
+        buf = res;
+    }
+    buf
 }
 
 impl<R: OverField> Out<R> {

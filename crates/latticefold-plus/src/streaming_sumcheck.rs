@@ -29,6 +29,13 @@ where
         evals: Vec<R::BaseRing>,
         num_vars: usize,
     },
+    /// Arc-wrapped base-scalar table (to share between m and m^{∘2}).
+    BaseScalarArc {
+        evals: Arc<Vec<R::BaseRing>>,
+        num_vars: usize,
+        /// If true, interpret this MLE as **vertex-wise squares** (see Symphony notes).
+        square: bool,
+    },
     /// eq(bits(index), r) in the base ring, then lifted to `R`.
     EqBase {
         scale: R::BaseRing,
@@ -70,6 +77,7 @@ where
             StreamingMleEnum::DenseOwned { num_vars, .. } => *num_vars,
             StreamingMleEnum::DenseArc { num_vars, .. } => *num_vars,
             StreamingMleEnum::BaseScalarOwned { num_vars, .. } => *num_vars,
+            StreamingMleEnum::BaseScalarArc { num_vars, .. } => *num_vars,
             StreamingMleEnum::EqBase { r, .. } => r.len(),
             StreamingMleEnum::SparseMatVec { num_vars, .. } => *num_vars,
             StreamingMleEnum::Tensor4Padded { num_vars, .. } => *num_vars,
@@ -86,6 +94,15 @@ where
             StreamingMleEnum::DenseArc { evals, .. } => evals.get(index).copied().unwrap_or(R::ZERO),
             StreamingMleEnum::BaseScalarOwned { evals, .. } => {
                 evals.get(index).copied().map(R::from).unwrap_or(R::ZERO)
+            }
+            StreamingMleEnum::BaseScalarArc {
+                evals,
+                square,
+                ..
+            } => {
+                let v = evals.get(index).copied().unwrap_or(R::BaseRing::ZERO);
+                let v = if *square { v * v } else { v };
+                R::from(v)
             }
             StreamingMleEnum::EqBase {
                 scale,
@@ -171,6 +188,40 @@ where
                 evals.truncate(half);
                 *num_vars -= 1;
             }
+            StreamingMleEnum::BaseScalarArc {
+                evals,
+                num_vars,
+                square,
+            } => {
+                // Take ownership of the Arc if possible; otherwise clone.
+                let arc = std::mem::take(evals);
+                let mut owned = match Arc::try_unwrap(arc) {
+                    Ok(v) => v,
+                    Err(a) => (*a).clone(),
+                };
+                if *square {
+                    // Vertex-wise squares: square BEFORE combining.
+                    for i in 0..half {
+                        let mut a = owned[i << 1];
+                        let mut b = owned[(i << 1) | 1];
+                        a *= a;
+                        b *= b;
+                        owned[i] = one_minus0 * a + r0 * b;
+                    }
+                } else {
+                    for i in 0..half {
+                        let a = owned[i << 1];
+                        let b = owned[(i << 1) | 1];
+                        owned[i] = one_minus0 * a + r0 * b;
+                    }
+                }
+                owned.truncate(half);
+                // After fixing, the table is now the correct MLE values (square semantics consumed).
+                *self = StreamingMleEnum::BaseScalarOwned {
+                    evals: owned,
+                    num_vars: *num_vars - 1,
+                };
+            }
             StreamingMleEnum::EqBase {
                 scale,
                 r,
@@ -229,6 +280,11 @@ where
                     evals: out,
                     num_vars: nv - 1,
                 }
+            }
+            StreamingMleEnum::BaseScalarArc { .. } => {
+                let mut c = self.clone();
+                c.fix_variable_in_place_base(r.coeffs()[0]);
+                c
             }
             StreamingMleEnum::EqBase { .. } => {
                 // Use in-place path by cloning and applying one fix.
