@@ -1,30 +1,28 @@
 //! WE-gate + DPP integration bench (research).
 //!
 //! Current scope:
-//! - Build a WE sparse dR1CS for verifying one `ComR1CSProof` (Π_lin)
+//! - Build a WE sparse dR1CS for verifying one `CmProof` (commitment transform / Π_cm)
 //! - Convert it into the prototype dpp::dr1cs_flpcp pipeline and run verification
 //!
-//! This is *not* yet the full LF+ WE gate (CmProof / DecompProof still TODO).
+//! This is not yet the full LF+ WE gate (DecompProof still TODO).
 
 #![allow(non_snake_case)]
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use cyclotomic_rings::rings::GoldilocksPoseidonConfig as PC;
+use cyclotomic_rings::rings::FrogPoseidonConfig as PC;
 use cyclotomic_rings::rings::GetPoseidonParams;
 
-use ark_ff::{BigInteger, Fp384, MontBackend, MontConfig, PrimeField};
+use ark_ff::{BigInteger, Field, Fp384, MontBackend, MontConfig, PrimeField};
 use rand::{rngs::StdRng, SeedableRng};
 
-use latticefold::arith::r1cs::R1CS;
-use stark_rings::balanced_decomposition::GadgetDecompose;
-use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as R;
+use latticefold_plus::cm::Cm;
+use latticefold_plus::rgchk::{DecompParameters, Rg, RgInstance};
+use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as R;
 use stark_rings::PolyRing;
 use stark_rings_linalg::{Matrix, SparseMatrix};
 
-use latticefold_plus::lin::{Linearize, LinearizedVerify};
 use latticefold_plus::recording_transcript::TracePoseidonTranscript;
-use latticefold_plus::r1cs::ComR1CS;
-use latticefold_plus::we_gate_arith::build_we_dr1cs_for_comr1cs_proof;
+use latticefold_plus::we_gate_arith::build_we_dr1cs_for_cm_proof;
 use latticefold_plus::we_statement::WeParams;
 
 // -----------------------------------------------------------------------------
@@ -42,53 +40,49 @@ fn lift_to_big<Fs: PrimeField>(x: Fs) -> FBig {
     FBig::from_le_bytes_mod_order(&x.into_bigint().to_bytes_le())
 }
 
-fn identity_cs(n: usize) -> (R1CS<R>, Vec<R>) {
-    let r1cs = R1CS::<R> {
-        l: 1,
-        A: SparseMatrix::identity(n),
-        B: SparseMatrix::identity(n),
-        C: SparseMatrix::identity(n),
-    };
-    let z = vec![<R as stark_rings::Ring>::ONE; n];
-    (r1cs, z)
-}
-
 fn bench_we_dpp(c: &mut Criterion) {
     // Keep defaults small-ish so local runs work; override on server by editing this file for now.
     let n = 1 << 10;
-    let k = 4;
-    let m = n / k;
-    let b = 2;
-    let kappa = 2;
+    let k = 2usize;
+    let kappa = 2usize;
+    let ell = 32usize;
+    let b = 2u128;
 
-    let (mut r1cs, z) = identity_cs(m);
-    r1cs.A = r1cs.A.gadget_decompose(b, k);
-    r1cs.B = r1cs.B.gadget_decompose(b, k);
-    r1cs.C = r1cs.C.gadget_decompose(b, k);
+    let dparams = DecompParameters { b, k, l: ell };
+    let mut rng = ark_std::test_rng();
 
-    let A = Matrix::<R>::rand(&mut ark_std::test_rng(), kappa, n);
-    let cr1cs = ComR1CS::new(r1cs, z, 1, b, k, &A);
+    // Single-instance Cm setup.
+    let f = vec![R::from(<R as PolyRing>::BaseRing::ZERO); n];
+    let A = Matrix::<R>::rand(&mut rng, kappa, n);
+    let inst = RgInstance::from_f(f, &A, &dparams);
+    let rg = Rg {
+        nvars: ark_std::log2(n) as usize,
+        instances: vec![inst],
+        dparams: dparams.clone(),
+    };
+    let cm = Cm { rg };
+    let M: Vec<SparseMatrix<R>> = vec![]; // keep Mlen=0 for now
 
-    // Prover-side linearization proof (Π_lin).
+    // Prover-side Cm proof.
     let mut ts = latticefold_plus::transcript::PoseidonTranscript::empty::<PC>();
-    let (_linb, proof) = cr1cs.linearize(&mut ts);
+    let (_com, proof) = cm.prove(&M, &mut ts);
 
     // Record verifier transcript ops.
     let mut rec = TracePoseidonTranscript::<R>::empty::<PC>();
-    assert!(proof.verify(&mut rec));
+    proof.verify(&M, &mut rec).expect("cm proof verify");
     let trace = rec.trace().clone();
 
     // Statement params prefix (placeholder values; we only bind layout in this bench).
     let params = WeParams {
-        nvars_setchk: 0,
-        degree_setchk: 0,
-        nvars_cm: 0,
-        degree_cm: 0,
+        nvars_setchk: ark_std::log2(n) as u64,
+        degree_setchk: 3,
+        nvars_cm: ark_std::log2(n) as u64,
+        degree_cm: 2,
         kappa: kappa as u64,
         ring_dim_d: R::dimension() as u64,
         k: k as u64,
-        l: 0,
-        mlen: 0,
+        l: ell as u64,
+        mlen: M.len() as u64,
     };
 
     let poseidon_cfg = PC::get_poseidon_config();
@@ -96,18 +90,20 @@ fn bench_we_dpp(c: &mut Criterion) {
     let mut group = c.benchmark_group("we_dpp");
     group.sample_size(10);
 
-    group.bench_function(BenchmarkId::new("build_we_dr1cs_pi_lin", n), |bch| {
+    group.bench_function(BenchmarkId::new("build_we_dr1cs_cm_proof", n), |bch| {
         bch.iter(|| {
-            let out = build_we_dr1cs_for_comr1cs_proof::<R>(&poseidon_cfg, &trace, &params, &proof)
-                .expect("build_we_dr1cs_for_comr1cs_proof");
+            let out =
+                build_we_dr1cs_for_cm_proof::<R>(&poseidon_cfg, &trace, &params, &proof, M.len())
+                    .expect("build_we_dr1cs_for_cm_proof");
             out.inst.check(&out.assignment).expect("dr1cs satisfied");
         })
     });
 
-    group.bench_function(BenchmarkId::new("dpp_verify_pi_lin", n), |bch| {
+    group.bench_function(BenchmarkId::new("dpp_verify_cm_proof", n), |bch| {
         // Build once outside the timed loop.
-        let out = build_we_dr1cs_for_comr1cs_proof::<R>(&poseidon_cfg, &trace, &params, &proof)
-            .expect("build_we_dr1cs_for_comr1cs_proof");
+        let out =
+            build_we_dr1cs_for_cm_proof::<R>(&poseidon_cfg, &trace, &params, &proof, M.len())
+                .expect("build_we_dr1cs_for_cm_proof");
         out.inst.check(&out.assignment).expect("dr1cs satisfied");
 
         type FSmall = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;

@@ -30,6 +30,12 @@ pub struct Cm<R: PolyRing> {
 #[derive(Clone, Debug)]
 pub struct InstanceEvals<R>(Vec<[R; 4]>);
 
+impl<R> InstanceEvals<R> {
+    pub(crate) fn rows(&self) -> &[[R; 4]] {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CmProof<R: PolyRing> {
     pub dcom: Dcom<R>,
