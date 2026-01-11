@@ -259,7 +259,11 @@ where
             }
             StreamingMleEnum::DenseArc { evals, .. } => {
                 let new_evals: Vec<R> = (0..half)
-                    .map(|i| (R::ONE - r) * evals[i << 1] + r * evals[(i << 1) | 1])
+                    .map(|i| {
+                        let a = evals.get(i << 1).copied().unwrap_or(R::ZERO);
+                        let b = evals.get((i << 1) | 1).copied().unwrap_or(R::ZERO);
+                        (R::ONE - r) * a + r * b
+                    })
                     .collect();
                 StreamingMleEnum::DenseOwned {
                     evals: new_evals,
