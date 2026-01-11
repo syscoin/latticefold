@@ -900,8 +900,8 @@ where
         // NOTE: we assume base field (extension_degree=1), matching our Poseidon wiring usage.
         let v_nvars = const_var(&mut b, BF::<R>::from(nvars as u64));
         let v_deg = const_var(&mut b, BF::<R>::from(2u64));
-        absorb_flat.push(v_nvars);
-        absorb_flat.push(v_deg);
+        absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat, v_nvars);
+        absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat, v_deg);
 
         // Per-round transcript absorbs:
         // - prover message evaluations (3 ring elems)
@@ -910,7 +910,7 @@ where
             absorb_flat.extend_from_slice(&m[0].coeffs);
             absorb_flat.extend_from_slice(&m[1].coeffs);
             absorb_flat.extend_from_slice(&m[2].coeffs);
-            absorb_flat.push(r_sc[round]);
+            absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat, r_sc[round]);
         }
 
         let rc_pows = scalar_pow_table::<BF<R>>(&mut b, rc, max_pow);
@@ -1335,6 +1335,20 @@ where
     lc_to_var::<BF<R>>(b, lc)
 }
 
+fn absorb_field_elem_as_ring<R>(
+    b: &mut Dr1csBuilder<BF<R>>,
+    absorb_flat: &mut Vec<usize>,
+    x0: usize,
+) where
+    R: PolyRing,
+    R::BaseRing: Field,
+{
+    // Matches latticefold `Transcript::absorb_field_element` default:
+    //   absorb(&From::from(*v)) i.e. absorb a constant-coeff ring element.
+    let rv = scalar_var_to_ringvars::<R>(b, x0);
+    absorb_flat.extend_from_slice(&rv.coeffs);
+}
+
 #[cfg(feature = "we_gate")]
 #[derive(Clone, Debug)]
 struct SetchkMathWiring {
@@ -1414,8 +1428,10 @@ where
 
     let mut absorb_flat: Vec<usize> = Vec::new();
     // Sumcheck parameter block absorbs.
-    absorb_flat.push(const_var(&mut b, BF::<R>::from(nvars as u64)));
-    absorb_flat.push(const_var(&mut b, BF::<R>::from(3u64)));
+    let v_nvars = const_var(&mut b, BF::<R>::from(nvars as u64));
+    let v_deg = const_var(&mut b, BF::<R>::from(3u64));
+    absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat, v_nvars);
+    absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat, v_deg);
 
     let mut msg_vars: Vec<[RingVars; 4]> = Vec::with_capacity(nvars);
     for (round, m) in msgs.msgs().iter().enumerate() {
@@ -1431,8 +1447,8 @@ where
         absorb_flat.extend_from_slice(&e1.coeffs);
         absorb_flat.extend_from_slice(&e2.coeffs);
         absorb_flat.extend_from_slice(&e3.coeffs);
-        // Then absorbs the sampled randomness scalar.
-        absorb_flat.push(r_point[round]);
+        // Then absorbs the sampled randomness scalar (as a constant-coeff ring element).
+        absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat, r_point[round]);
         msg_vars.push([e0, e1, e2, e3]);
     }
 
