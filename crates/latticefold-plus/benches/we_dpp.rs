@@ -219,9 +219,26 @@ fn explain_failed_constraint(
     for (part_idx, &cnt) in dbg.part_constraints.iter().enumerate() {
         if i < acc + cnt {
             let name = names.get(part_idx).copied().unwrap_or("unknown");
-            return format!(
+            let mut msg = format!(
                 "[we_dpp] failed constraint {i} is in PART {part_idx} ({name}), start={acc}, len={cnt}"
             );
+            if part_idx == 6 && !dbg.cm_phase_marks.is_empty() {
+                let local = i - acc;
+                let mut phase = "unknown";
+                for (j, &m) in dbg.cm_phase_marks.iter().enumerate() {
+                    if local < m {
+                        phase = dbg.cm_phase_names.get(j).map(|s| s.as_str()).unwrap_or("unknown");
+                        break;
+                    }
+                }
+                if phase == "unknown" {
+                    if let Some(last) = dbg.cm_phase_names.last() {
+                        phase = last;
+                    }
+                }
+                msg.push_str(&format!("\n[we_dpp] cm_verify local_idx={local}, phase≈{phase}"));
+            }
+            return msg;
         }
         acc += cnt;
     }
