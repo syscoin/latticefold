@@ -150,7 +150,11 @@ fn bench_we_dpp(c: &mut Criterion) {
             flpcp,
             dpp::EmbeddingParams {
                 gamma: 2,
-                assume_boolean_proof: true,
+                // IMPORTANT: booleanization here is only for the *proof* π.
+                // Our statement vector `x` (the dR1CS assignment) is not Boolean in general,
+                // so we must NOT use the tight "assume_boolean_proof" bound regime, otherwise
+                // decoding can fail with `Decode(NoSolution)`.
+                assume_boolean_proof: false,
                 k_prime: 0,
             },
         )
