@@ -317,15 +317,17 @@ impl<R: OverField> In<R> {
         // Step 3
         let t_step3 = Instant::now();
         let eq_r = build_eq_table_base::<R>(&r);
-        let eq_r_ring: Vec<R> = eq_r.iter().copied().map(R::from).collect();
 
         // Precompute y_i = M_i^T * eq_r (so eval(M_i * row)(r) = <y_i, row>).
+        //
+        // NOTE: we intentionally keep `eq_r` in the base ring to avoid allocating a length-2^n
+        // vector of full ring elements (important when scaling to many chunks in parallel).
         let y_mats: Vec<Vec<R>> = M
             .iter()
             .map(|mi| {
                 let mut y = vec![R::ZERO; mi.ncols];
                 for (row_idx, row) in mi.coeffs.iter().enumerate() {
-                    let w = eq_r_ring[row_idx];
+                    let w = R::from(eq_r[row_idx]);
                     for (coeff, col_idx) in row {
                         y[*col_idx] += *coeff * w;
                     }
@@ -353,7 +355,7 @@ impl<R: OverField> In<R> {
                     .map(|col| {
                         let mut acc = R::ZERO;
                         for row in 0..nrows {
-                            acc += Md.vals[row][col] * eq_r_ring[row];
+                            acc += Md.vals[row][col] * R::from(eq_r[row]);
                         }
                         acc
                     })
@@ -363,7 +365,7 @@ impl<R: OverField> In<R> {
                     .map(|col| {
                         let mut acc = R::ZERO;
                         for row in 0..nrows {
-                            acc += Md.vals[row][col] * eq_r_ring[row];
+                            acc += Md.vals[row][col] * R::from(eq_r[row]);
                         }
                         acc
                     })
@@ -381,7 +383,7 @@ impl<R: OverField> In<R> {
                             .map(|row| {
                                 let mut acc = R::ZERO;
                                 for &(rij, idx) in row {
-                                    acc += rij * eq_r_ring[idx];
+                                        acc += rij * R::from(eq_r[idx]);
                                 }
                                 acc
                             })
@@ -400,7 +402,7 @@ impl<R: OverField> In<R> {
                             .map(|row| {
                                 let mut acc = R::ZERO;
                                 for &(rij, idx) in row {
-                                    acc += rij * eq_r_ring[idx];
+                                    acc += rij * R::from(eq_r[idx]);
                                 }
                                 acc
                             })
@@ -492,7 +494,7 @@ impl<R: OverField> In<R> {
             .map(|m| {
                 let mut acc = R::ZERO;
                 for (i, &mi) in m.iter().enumerate() {
-                    acc += mi * eq_r_ring[i];
+                    acc += mi * R::from(eq_r[i]);
                 }
                 acc
             })
@@ -503,7 +505,7 @@ impl<R: OverField> In<R> {
             .map(|m| {
                 let mut acc = R::ZERO;
                 for (i, &mi) in m.iter().enumerate() {
-                    acc += mi * eq_r_ring[i];
+                    acc += mi * R::from(eq_r[i]);
                 }
                 acc
             })
