@@ -107,15 +107,18 @@ where
         };
         let out_rel = in_rel.set_check(M, transcript);
 
-        // Precompute eq(bits(idx), r) table once (base ring).
-        let t = std::time::Instant::now();
-        let eq = build_eq_table_base::<R>(&out_rel.r);
+        // Avoid allocating a full eq-table of size 2^nvars.
+        // We instead stream eq-weights in small blocks in the evaluation routines below.
+        let one_minus_r = out_rel
+            .r
+            .iter()
+            .copied()
+            .map(|x| R::BaseRing::ONE - x)
+            .collect::<Vec<_>>();
         if profile {
             println!(
-                "[LF+ Rg::range_check] set_check: {:?}, build_eq_table: {:?} (n={}, nvars={})",
+                "[LF+ Rg::range_check] set_check: {:?} (nvars={})",
                 t_total.elapsed(),
-                t.elapsed(),
-                eq.len(),
                 self.nvars
             );
         }
@@ -131,20 +134,35 @@ where
                 let mut c = Vec::with_capacity(1 + M.len());
 
                 // v: coefficient-wise evaluation of f at out_rel.r
-                let v = eval_vec_coeffs_at_point::<R>(&inst.f, &eq);
+                let v = eval_vec_coeffs_at_point_streaming::<R>(&inst.f, &out_rel.r, &one_minus_r);
 
-                a.push(dot_base::<R>(&inst.tau, &eq));
+                a.push(dot_base_streaming::<R>(&inst.tau, &out_rel.r, &one_minus_r));
                 b.push(out_rel.b[l]);
-                c.push(dot_ring::<R>(&inst.f, &eq));
+                c.push(dot_ring_streaming::<R>(&inst.f, &out_rel.r, &one_minus_r));
 
                 // Evaluate M * tau / m_tau / f at out_rel.r *without materializing length-n vectors*.
                 //
                 // For each matrix M:
                 //   eval(M*w)(r) = Σ_row eq[row] * (Σ_{(coeff,col) in row} coeff * w[col])
                 for m in M {
-                    a.push(sparse_mat_vec_eval_ct::<R>(m, &inst.tau, &eq));
-                    b.push(sparse_mat_vec_eval_ring::<R>(m, &inst.m_tau, &eq));
-                    c.push(sparse_mat_vec_eval_ring::<R>(m, &inst.f, &eq));
+                    a.push(sparse_mat_vec_eval_ct_streaming::<R>(
+                        m,
+                        &inst.tau,
+                        &out_rel.r,
+                        &one_minus_r,
+                    ));
+                    b.push(sparse_mat_vec_eval_ring_streaming::<R>(
+                        m,
+                        &inst.m_tau,
+                        &out_rel.r,
+                        &one_minus_r,
+                    ));
+                    c.push(sparse_mat_vec_eval_ring_streaming::<R>(
+                        m,
+                        &inst.f,
+                        &out_rel.r,
+                        &one_minus_r,
+                    ));
                 }
                 DcomEvals { v, a, b, c }
             })
@@ -454,81 +472,179 @@ fn absorb_evaluations<R: OverField>(evals: &[DcomEvals<R>], transcript: &mut imp
     });
 }
 
-/// Build the full eq table: eq(bits(idx), r) for all idx in {0,1}^nvars (LSB-first).
-fn build_eq_table_base<R: PolyRing>(r: &[R::BaseRing]) -> Vec<R::BaseRing>
+/// Precompute eq weights for the first `t` (low) variables (LSB-first).
+fn build_eq_low_table<R: PolyRing>(r_low: &[R::BaseRing], one_minus_r_low: &[R::BaseRing]) -> Vec<R::BaseRing>
 where
     R::BaseRing: Ring,
 {
-    // Must match `latticefold::utils::sumcheck::utils::build_eq_x_r_vec` ordering:
-    // bit i corresponds to r[i] in LITTLE-endian index order (i = LSB).
-    //
-    // That implementation recurses on r[1..] first, then expands with r[0].
-    // An equivalent iterative form is to fold from the end toward the start.
+    debug_assert_eq!(r_low.len(), one_minus_r_low.len());
+    let t = r_low.len();
     let mut buf = vec![R::BaseRing::ONE];
-    for &ri in r.iter().rev() {
+    // Expand in the same LSB-first convention used elsewhere.
+    // For low bits, we can fold from high-to-low within this slice.
+    for i in (0..t).rev() {
+        let ri = r_low[i];
+        let omi = one_minus_r_low[i];
         let mut res = vec![R::BaseRing::ZERO; buf.len() << 1];
-        // even idx = (1-ri)*bi, odd idx = ri*bi
-        for (i, out) in res.iter_mut().enumerate() {
-            let bi = buf[i >> 1];
-            let tmp = ri * bi;
-            *out = if (i & 1) == 0 { bi - tmp } else { tmp };
+        for (j, out) in res.iter_mut().enumerate() {
+            let bi = buf[j >> 1];
+            *out = if (j & 1) == 0 { bi * omi } else { bi * ri };
         }
         buf = res;
     }
     buf
 }
 
-fn dot_base<R: PolyRing>(v: &[R::BaseRing], eq: &[R::BaseRing]) -> R::BaseRing
+#[inline]
+fn eq_scale_for_high_bits<R: PolyRing>(
+    high: usize,
+    r: &[R::BaseRing],
+    one_minus_r: &[R::BaseRing],
+    t_low: usize,
+) -> R::BaseRing
 where
     R::BaseRing: Ring,
 {
-    debug_assert_eq!(v.len(), eq.len());
+    let mut prod = R::BaseRing::ONE;
+    for i in t_low..r.len() {
+        let bit = ((high >> (i - t_low)) & 1) == 1;
+        prod *= if bit { r[i] } else { one_minus_r[i] };
+    }
+    prod
+}
+
+#[inline]
+fn choose_t_low(nvars: usize) -> usize {
+    // Keep a tiny table (<= 2^12 = 4096) to avoid big allocations across many chunks.
+    nvars.min(12)
+}
+
+fn dot_base_streaming<R: PolyRing>(
+    v: &[R::BaseRing],
+    r: &[R::BaseRing],
+    one_minus_r: &[R::BaseRing],
+) -> R::BaseRing
+where
+    R::BaseRing: Ring,
+{
+    debug_assert_eq!(r.len(), one_minus_r.len());
+    let nvars = r.len();
+    let n = v.len();
+    debug_assert_eq!(n, 1usize << nvars);
+    let t = choose_t_low(nvars);
+    let low = build_eq_low_table::<R>(&r[..t], &one_minus_r[..t]);
+    let low_len = 1usize << t;
+    let high_bits = nvars - t;
+    let high_len = 1usize << high_bits;
     #[cfg(feature = "parallel")]
     {
-        v.par_iter()
-            .zip(eq.par_iter())
-            .map(|(&x, &w)| x * w)
+        (0..high_len)
+            .into_par_iter()
+            .map(|h| {
+                let scale = eq_scale_for_high_bits::<R>(h, r, one_minus_r, t);
+                let base = h * low_len;
+                let mut acc = R::BaseRing::ZERO;
+                for i in 0..low_len {
+                    acc += v[base + i] * (scale * low[i]);
+                }
+                acc
+            })
             .reduce(|| R::BaseRing::ZERO, |a, b| a + b)
     }
     #[cfg(not(feature = "parallel"))]
     {
-        v.iter().zip(eq.iter()).map(|(&x, &w)| x * w).sum()
+        let mut acc = R::BaseRing::ZERO;
+        for h in 0..high_len {
+            let scale = eq_scale_for_high_bits::<R>(h, r, one_minus_r, t);
+            let base = h * low_len;
+            for i in 0..low_len {
+                acc += v[base + i] * (scale * low[i]);
+            }
+        }
+        acc
     }
 }
 
-fn dot_ring<R>(v: &[R], eq: &[R::BaseRing]) -> R
+fn dot_ring_streaming<R>(v: &[R], r: &[R::BaseRing], one_minus_r: &[R::BaseRing]) -> R
 where
     R: PolyRing + From<R::BaseRing>,
     R::BaseRing: Ring,
 {
-    debug_assert_eq!(v.len(), eq.len());
+    debug_assert_eq!(r.len(), one_minus_r.len());
+    let nvars = r.len();
+    let n = v.len();
+    debug_assert_eq!(n, 1usize << nvars);
+    let t = choose_t_low(nvars);
+    let low = build_eq_low_table::<R>(&r[..t], &one_minus_r[..t]);
+    let low_len = 1usize << t;
+    let high_bits = nvars - t;
+    let high_len = 1usize << high_bits;
     #[cfg(feature = "parallel")]
     {
-        v.par_iter()
-            .zip(eq.par_iter())
-            .map(|(&x, &w)| x * R::from(w))
+        (0..high_len)
+            .into_par_iter()
+            .map(|h| {
+                let scale = eq_scale_for_high_bits::<R>(h, r, one_minus_r, t);
+                let base = h * low_len;
+                let mut acc = R::ZERO;
+                for i in 0..low_len {
+                    let w = scale * low[i];
+                    acc += v[base + i] * R::from(w);
+                }
+                acc
+            })
             .reduce(|| R::ZERO, |a, b| a + b)
     }
     #[cfg(not(feature = "parallel"))]
     {
-        v.iter().zip(eq.iter()).map(|(&x, &w)| x * R::from(w)).sum()
+        let mut acc = R::ZERO;
+        for h in 0..high_len {
+            let scale = eq_scale_for_high_bits::<R>(h, r, one_minus_r, t);
+            let base = h * low_len;
+            for i in 0..low_len {
+                let w = scale * low[i];
+                acc += v[base + i] * R::from(w);
+            }
+        }
+        acc
     }
 }
 
-fn eval_vec_coeffs_at_point<R: PolyRing>(v: &[R], eq: &[R::BaseRing]) -> Vec<R::BaseRing>
+fn eval_vec_coeffs_at_point_streaming<R: PolyRing>(
+    v: &[R],
+    r: &[R::BaseRing],
+    one_minus_r: &[R::BaseRing],
+) -> Vec<R::BaseRing>
 where
     R::BaseRing: Ring,
 {
-    debug_assert_eq!(v.len(), eq.len());
+    debug_assert_eq!(r.len(), one_minus_r.len());
+    let nvars = r.len();
+    let n = v.len();
+    debug_assert_eq!(n, 1usize << nvars);
+    let t = choose_t_low(nvars);
+    let low = build_eq_low_table::<R>(&r[..t], &one_minus_r[..t]);
+    let low_len = 1usize << t;
+    let high_bits = nvars - t;
+    let high_len = 1usize << high_bits;
     let d = R::dimension();
     #[cfg(feature = "parallel")]
     {
         (0..d)
             .into_par_iter()
             .map(|j| {
-                v.par_iter()
-                    .zip(eq.par_iter())
-                    .map(|(x, &w)| x.coeffs()[j] * w)
+                (0..high_len)
+                    .into_par_iter()
+                    .map(|h| {
+                        let scale = eq_scale_for_high_bits::<R>(h, r, one_minus_r, t);
+                        let base = h * low_len;
+                        let mut acc = R::BaseRing::ZERO;
+                        for i in 0..low_len {
+                            let w = scale * low[i];
+                            acc += v[base + i].coeffs()[j] * w;
+                        }
+                        acc
+                    })
                     .reduce(|| R::BaseRing::ZERO, |a, b| a + b)
             })
             .collect()
@@ -536,96 +652,147 @@ where
     #[cfg(not(feature = "parallel"))]
     {
         let mut out = vec![R::BaseRing::ZERO; d];
-        for (x, &w) in v.iter().zip(eq.iter()) {
-            for j in 0..d {
-                out[j] += x.coeffs()[j] * w;
+        for h in 0..high_len {
+            let scale = eq_scale_for_high_bits::<R>(h, r, one_minus_r, t);
+            let base = h * low_len;
+            for i in 0..low_len {
+                let w = scale * low[i];
+                let x = &v[base + i];
+                for j in 0..d {
+                    out[j] += x.coeffs()[j] * w;
+                }
             }
         }
         out
     }
 }
 
-fn sparse_mat_vec_eval_ct<R: PolyRing>(
+fn sparse_mat_vec_eval_ct_streaming<R: PolyRing>(
     m: &SparseMatrix<R>,
     witness0: &[R::BaseRing],
-    eq: &[R::BaseRing],
+    r: &[R::BaseRing],
+    one_minus_r: &[R::BaseRing],
 ) -> R::BaseRing
 where
     R::BaseRing: Ring,
 {
-    debug_assert_eq!(m.nrows, eq.len());
+    debug_assert_eq!(r.len(), one_minus_r.len());
+    let nvars = r.len();
+    let n = m.nrows;
+    debug_assert_eq!(n, 1usize << nvars);
+    let t = choose_t_low(nvars);
+    let low = build_eq_low_table::<R>(&r[..t], &one_minus_r[..t]);
+    let low_len = 1usize << t;
+    let high_bits = nvars - t;
+    let high_len = 1usize << high_bits;
     #[cfg(feature = "parallel")]
     {
-        m.coeffs
-            .par_iter()
-            .zip(eq.par_iter())
-            .map(|(row, &w_row)| {
-                // row_dot is ring, but we only need constant term at the end.
-                let mut sum0 = R::BaseRing::ZERO;
-                for (coeff, col_idx) in row {
-                    if *col_idx < witness0.len() {
-                        sum0 += coeff.coeffs()[0] * witness0[*col_idx];
+        (0..high_len)
+            .into_par_iter()
+            .map(|h| {
+                let scale = eq_scale_for_high_bits::<R>(h, r, one_minus_r, t);
+                let base = h * low_len;
+                let mut acc = R::BaseRing::ZERO;
+                for i in 0..low_len {
+                    let row_idx = base + i;
+                    let w_row = scale * low[i];
+                    let row = &m.coeffs[row_idx];
+                    let mut sum0 = R::BaseRing::ZERO;
+                    for (coeff, col_idx) in row {
+                        if *col_idx < witness0.len() {
+                            sum0 += coeff.coeffs()[0] * witness0[*col_idx];
+                        }
                     }
+                    acc += sum0 * w_row;
                 }
-                sum0 * w_row
+                acc
             })
             .reduce(|| R::BaseRing::ZERO, |a, b| a + b)
     }
     #[cfg(not(feature = "parallel"))]
     {
         let mut acc = R::BaseRing::ZERO;
-        for (row_idx, row) in m.coeffs.iter().enumerate() {
-            let w_row = eq[row_idx];
-            let mut sum0 = R::BaseRing::ZERO;
-            for (coeff, col_idx) in row {
-                if *col_idx < witness0.len() {
-                    sum0 += coeff.coeffs()[0] * witness0[*col_idx];
+        for h in 0..high_len {
+            let scale = eq_scale_for_high_bits::<R>(h, r, one_minus_r, t);
+            let base = h * low_len;
+            for i in 0..low_len {
+                let row_idx = base + i;
+                let w_row = scale * low[i];
+                let row = &m.coeffs[row_idx];
+                let mut sum0 = R::BaseRing::ZERO;
+                for (coeff, col_idx) in row {
+                    if *col_idx < witness0.len() {
+                        sum0 += coeff.coeffs()[0] * witness0[*col_idx];
+                    }
                 }
+                acc += sum0 * w_row;
             }
-            acc += sum0 * w_row;
         }
         acc
     }
 }
 
-fn sparse_mat_vec_eval_ring<R>(
+fn sparse_mat_vec_eval_ring_streaming<R>(
     m: &SparseMatrix<R>,
     witness: &[R],
-    eq: &[R::BaseRing],
+    r: &[R::BaseRing],
+    one_minus_r: &[R::BaseRing],
 ) -> R
 where
     R: PolyRing + From<R::BaseRing>,
     R::BaseRing: Ring,
 {
-    debug_assert_eq!(m.nrows, eq.len());
+    debug_assert_eq!(r.len(), one_minus_r.len());
+    let nvars = r.len();
+    let n = m.nrows;
+    debug_assert_eq!(n, 1usize << nvars);
+    let t = choose_t_low(nvars);
+    let low = build_eq_low_table::<R>(&r[..t], &one_minus_r[..t]);
+    let low_len = 1usize << t;
+    let high_bits = nvars - t;
+    let high_len = 1usize << high_bits;
     #[cfg(feature = "parallel")]
     {
-        m.coeffs
-            .par_iter()
-            .zip(eq.par_iter())
-            .map(|(row, &w_row)| {
-                let mut row_dot = R::ZERO;
-                for (coeff, col_idx) in row {
-                    if *col_idx < witness.len() {
-                        row_dot += *coeff * witness[*col_idx];
+        (0..high_len)
+            .into_par_iter()
+            .map(|h| {
+                let scale = eq_scale_for_high_bits::<R>(h, r, one_minus_r, t);
+                let base = h * low_len;
+                let mut acc = R::ZERO;
+                for i in 0..low_len {
+                    let row_idx = base + i;
+                    let w_row = scale * low[i];
+                    let row = &m.coeffs[row_idx];
+                    let mut row_dot = R::ZERO;
+                    for (coeff, col_idx) in row {
+                        if *col_idx < witness.len() {
+                            row_dot += *coeff * witness[*col_idx];
+                        }
                     }
+                    acc += row_dot * R::from(w_row);
                 }
-                row_dot * R::from(w_row)
+                acc
             })
             .reduce(|| R::ZERO, |a, b| a + b)
     }
     #[cfg(not(feature = "parallel"))]
     {
         let mut acc = R::ZERO;
-        for (row_idx, row) in m.coeffs.iter().enumerate() {
-            let w_row = R::from(eq[row_idx]);
-            let mut row_dot = R::ZERO;
-            for (coeff, col_idx) in row {
-                if *col_idx < witness.len() {
-                    row_dot += *coeff * witness[*col_idx];
+        for h in 0..high_len {
+            let scale = eq_scale_for_high_bits::<R>(h, r, one_minus_r, t);
+            let base = h * low_len;
+            for i in 0..low_len {
+                let row_idx = base + i;
+                let w_row = R::from(scale * low[i]);
+                let row = &m.coeffs[row_idx];
+                let mut row_dot = R::ZERO;
+                for (coeff, col_idx) in row {
+                    if *col_idx < witness.len() {
+                        row_dot += *coeff * witness[*col_idx];
+                    }
                 }
+                acc += row_dot * w_row;
             }
-            acc += row_dot * w_row;
         }
         acc
     }
