@@ -46,9 +46,14 @@ fn bench_we_dpp(c: &mut Criterion) {
     // not prover-side RG setup.
     let k = 2usize;
     let kappa = 2usize;
-    let ell = 1usize;
+    // NOTE: `RgInstance::from_f` currently calls `split(..., k = decomp.l)`, so we must keep `ell >= 2`
+    // to avoid `balanced_decomposition` panics for k=1 in that path.
+    let ell = 2usize;
     let b = 2u128;
-    let n = 1 << 10;
+    // Ensure `n >= tau_unpadded_len` for `split`:
+    // tau_unpadded_len = kappa * (k*d) * ell * d.
+    // With Frog d=16, (kappa,k,ell)=(2,2,2) gives tau_unpadded_len=2048, so pick n=2048.
+    let n = 1 << 11;
     let nvars = ark_std::log2(n) as usize;
 
     let dparams = DecompParameters { b, k, l: ell };
