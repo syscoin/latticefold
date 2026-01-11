@@ -14,3 +14,11 @@ pub mod streaming_sumcheck;
 pub mod tensor_eval;
 pub mod transcript;
 pub mod utils;
+
+// WE/DPP arithmetization frontends (feature-gated; not needed in production proving path).
+#[cfg(feature = "we_gate")]
+pub mod recording_transcript;
+#[cfg(feature = "we_gate")]
+pub mod we_statement;
+#[cfg(feature = "we_gate")]
+pub mod we_gate_arith;

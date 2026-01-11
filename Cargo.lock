@@ -698,6 +698,7 @@ dependencies = [
  "ark-std",
  "criterion",
  "cyclotomic-rings",
+ "dpp",
  "hashbrown 0.15.5",
  "latticefold",
  "num-bigint",
@@ -710,6 +711,7 @@ dependencies = [
  "stark-rings",
  "stark-rings-linalg",
  "stark-rings-poly",
+ "symphony",
  "thiserror",
  "toml",
 ]

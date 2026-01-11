@@ -20,6 +20,9 @@ getrandom = ["ark-std/getrandom"]
 # dev-only
 dhat-heap = []
 
+# WE/DPP arithmetization helpers (bench/research only).
+we_gate = ["dep:dpp", "dep:symphony"]
+
 [dependencies]
 ark-crypto-primitives = { workspace = true }
 ark-ff = { workspace = true }
@@ -37,6 +40,8 @@ stark-rings = { workspace = true }
 stark-rings-linalg = { workspace = true }
 stark-rings-poly = { workspace = true }
 thiserror = { workspace = true }
+dpp = { path = "../dpp", optional = true }
+symphony = { path = "../symphony", optional = true }
 
 [build-dependencies]
 proc-macro2 = { workspace = true }
@@ -97,4 +102,8 @@ harness = false
 
 [[bench]]
 name = "lin"
+harness = false
+
+[[bench]]
+name = "we_dpp"
 harness = false
