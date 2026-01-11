@@ -72,7 +72,9 @@ fn bench_we_dpp(c: &mut Criterion) {
         dparams: dparams.clone(),
     };
     let cm = Cm { rg };
-    let M: Vec<SparseMatrix<R>> = vec![]; // keep Mlen=0 for now
+    // NOTE: `setchk` expects a witness matrix `M` whose entries are unit monomials.
+    // Use plain identity (all-ones on diagonal) to stay in the monomial set.
+    let M: Vec<SparseMatrix<R>> = vec![SparseMatrix::identity(n)];
 
     // Prover-side Cm proof.
     let mut ts = latticefold_plus::transcript::PoseidonTranscript::empty::<PC>();

@@ -349,7 +349,12 @@ impl<R: OverField + PolyRing> In<R> {
         let rc: Option<R::BaseRing> = (Ms_len > 1).then(|| transcript.get_challenge());
 
         let comb_fn = |vals: &[R]| -> R {
+            // When there is only a single term, `rc` is omitted; semantically this means
+            // "all terms have weight 1". (We must still include both matrix- and vector-set
+            // contributions, otherwise the sumcheck claim won't match Step 3.)
+            use ark_std::One;
             let mut lc = R::zero();
+
             for (i, alpha) in alphas.iter().enumerate().take(Ms_len) {
                 // 2 * ncols for (m_j, m_prime_j), +1 for eq
                 let s = i * (2 * ncols + 1);
@@ -359,24 +364,22 @@ impl<R: OverField + PolyRing> In<R> {
                         * alpha.pow([j as u64])
                 }
                 res *= vals[s + 2 * ncols]; // eq
-                lc += if let Some(rc) = &rc {
-                    res * rc.pow([i as u64])
-                } else {
-                    return res;
-                };
+                let w = rc.as_ref().map(|rc| rc.pow([i as u64])).unwrap_or(R::BaseRing::one());
+                lc += res * w;
             }
+
             for i in 0..ms.len() {
                 let s_base = Ms_len * (2 * ncols + 1);
                 let s = s_base + i * 3;
-                let mut res = R::zero();
                 let alpha_idx = Ms_len + i;
+                let mut res = R::zero();
                 res += (vals[s] * vals[s] - vals[s + 1]) * alphas[alpha_idx];
                 res *= vals[s + 2]; // eq
-                lc += if let Some(rc) = &rc {
-                    res * rc.pow([alpha_idx as u64])
-                } else {
-                    return res;
-                };
+                let w = rc
+                    .as_ref()
+                    .map(|rc| rc.pow([alpha_idx as u64]))
+                    .unwrap_or(R::BaseRing::one());
+                lc += res * w;
             }
             lc
         };
