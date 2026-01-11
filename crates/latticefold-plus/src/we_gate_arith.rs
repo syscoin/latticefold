@@ -662,6 +662,7 @@ struct CmMathWiring {
 
 #[cfg(feature = "we_gate")]
 fn cm_verifier_math_dr1cs<R>(
+    trace: &PoseidonTranscriptTrace<BF<R>>,
     proof: &crate::cm::CmProof<R>,
     k: usize,
     log_kappa: usize,
@@ -700,18 +701,51 @@ where
     let mut phase_marks: Vec<usize> = Vec::new();
     let mut phase_names: Vec<String> = Vec::new();
 
+    // Extract the exact CmProof coin bytes (short_challenge) and field challenges from the trace,
+    // so this part's witness assignment matches the Poseidon part (glue constraints).
+    let need_short = 3 + k * d;
+    let need_bytes = need_short * d;
+    let need_field = 2 * log_kappa + 2 + 2 * nvars;
+
+    let mut short_bytes_vals: Vec<u8> = Vec::with_capacity(need_bytes);
+    let mut field_vals: Vec<BF<R>> = Vec::with_capacity(need_field);
+    let mut seen_bytes_ops = 0usize;
+    let mut seen_first_bytes = false;
+    for op in &trace.ops {
+        match op {
+            LfPoseidonTraceOp::SqueezeBytes { out, .. } => {
+                if !seen_first_bytes {
+                    seen_first_bytes = true;
+                }
+                if seen_bytes_ops < need_short {
+                    short_bytes_vals.extend_from_slice(out);
+                    seen_bytes_ops += 1;
+                }
+            }
+            LfPoseidonTraceOp::SqueezeField(v) => {
+                if seen_first_bytes && seen_bytes_ops >= need_short && field_vals.len() < need_field {
+                    if v.len() != 1 {
+                        return Err("cm_verifier_math_dr1cs: expected base-field squeeze len=1".to_string());
+                    }
+                    field_vals.push(v[0]);
+                }
+            }
+            _ => {}
+        }
+    }
+    if short_bytes_vals.len() < need_bytes {
+        return Err("cm_verifier_math_dr1cs: not enough squeeze-bytes for short challenges".to_string());
+    }
+    short_bytes_vals.truncate(need_bytes);
+    if field_vals.len() != need_field {
+        return Err("cm_verifier_math_dr1cs: not enough squeeze-field elements for cm challenges".to_string());
+    }
+
     // --- Challenges (allocated locally; caller glues to coin/field wiring) ---
     // short challenges: s (3), s_prime_flat (k*d)
     let mut byte_vars = Vec::new();
-    // We reuse the same reconstruction gadget to ensure semantics.
-    // Allocate dummy byte vars from the *trace-derived* values by using the witness from proof transcript is not available here,
-    // so we instead allocate them as free vars and rely on gluing to coin_wiring at merge time.
-    // Caller will overwrite/align them via glue constraints.
-    let need_short = 3 + k * d;
-    let need_bytes = need_short * d;
-    for _ in 0..need_bytes {
-        let v = b.new_var(BF::<R>::ZERO);
-        byte_vars.push(v);
+    for &by in short_bytes_vals.iter() {
+        byte_vars.push(b.new_var(BF::<R>::from(by as u64)));
     }
     let mut rings = Vec::with_capacity(need_short);
     for i in 0..need_short {
@@ -724,12 +758,46 @@ where
     let s_prime_flat = rings[3..].to_vec();
 
     // field challenges: c0,c1,rc0,rc1,sumcheck r0,r1
-    let c0 = (0..log_kappa).map(|_| b.new_var(BF::<R>::ZERO)).collect::<Vec<_>>();
-    let c1 = (0..log_kappa).map(|_| b.new_var(BF::<R>::ZERO)).collect::<Vec<_>>();
-    let rc0 = b.new_var(BF::<R>::ZERO);
-    let rc1 = b.new_var(BF::<R>::ZERO);
-    let sumcheck_r0 = (0..nvars).map(|_| b.new_var(BF::<R>::ZERO)).collect::<Vec<_>>();
-    let sumcheck_r1 = (0..nvars).map(|_| b.new_var(BF::<R>::ZERO)).collect::<Vec<_>>();
+    let mut cur = 0usize;
+    let c0 = (0..log_kappa)
+        .map(|_| {
+            let v = b.new_var(field_vals[cur]);
+            cur += 1;
+            v
+        })
+        .collect::<Vec<_>>();
+    let c1 = (0..log_kappa)
+        .map(|_| {
+            let v = b.new_var(field_vals[cur]);
+            cur += 1;
+            v
+        })
+        .collect::<Vec<_>>();
+    let rc0 = {
+        let v = b.new_var(field_vals[cur]);
+        cur += 1;
+        v
+    };
+    let sumcheck_r0 = (0..nvars)
+        .map(|_| {
+            let v = b.new_var(field_vals[cur]);
+            cur += 1;
+            v
+        })
+        .collect::<Vec<_>>();
+    let rc1 = {
+        let v = b.new_var(field_vals[cur]);
+        cur += 1;
+        v
+    };
+    let sumcheck_r1 = (0..nvars)
+        .map(|_| {
+            let v = b.new_var(field_vals[cur]);
+            cur += 1;
+            v
+        })
+        .collect::<Vec<_>>();
+    debug_assert_eq!(cur, field_vals.len());
 
     let short_wiring = CmShortChallengeWiring {
         byte_vars,
@@ -2052,7 +2120,8 @@ where
     }
 
     // Cm verifier arithmetic + absorb surface builder.
-    let (cm_inst, cm_asg, cm_wiring) = cm_verifier_math_dr1cs::<R>(proof, k, log_kappa, nvars, mlen_mats)?;
+    let (cm_inst, cm_asg, cm_wiring) =
+        cm_verifier_math_dr1cs::<R>(trace, proof, k, log_kappa, nvars, mlen_mats)?;
 
     // Glue cm_wiring challenges to the coin/field wiring parts (so the math uses the same coins).
     // Bytes:
