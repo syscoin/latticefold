@@ -247,7 +247,7 @@ mod tests {
 
     #[test]
     fn test_prove_multi() {
-        let n = 1 << 16;
+        let n = 1 << 17; // Increased to accommodate l rounded up to power of 2
         let sop = R::dimension() * 128; // S inf-norm = 128
         let L = 3;
         let k = 4;
