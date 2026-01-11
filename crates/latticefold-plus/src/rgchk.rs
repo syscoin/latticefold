@@ -9,7 +9,7 @@ use thiserror::Error;
 use std::sync::Arc;
 
 use crate::{
-    setchk::{In, MonomialSet, Out},
+    setchk::{DigitsMatrix, In, MonomialSet, Out},
     utils::split,
 };
 
@@ -42,7 +42,8 @@ pub struct Rg<R: PolyRing> {
 
 #[derive(Clone, Debug)]
 pub struct RgInstance<R: PolyRing> {
-    pub M_f: Vec<Matrix<R>>,   // n x d, k matrices, monomials
+    /// Monomial matrices in compact digit form (k matrices, each n×d).
+    pub M_f: Vec<Arc<DigitsMatrix<R>>>,
     pub tau: Vec<R::BaseRing>, // n
     pub m_tau: Vec<R>,         // n, monomials
     pub f: Vec<R>,             // n
@@ -89,11 +90,11 @@ where
         let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
         let t_total = std::time::Instant::now();
 
-        let mut sets = Vec::with_capacity(self.instances.len() * (self.instances[0].M_f.len() + 1));
+        let mut sets =
+            Vec::with_capacity(self.instances.len() * (self.instances[0].M_f.len() + 1));
         for inst in &self.instances {
             inst.M_f.iter().for_each(|m| {
-                // Avoid materializing huge SparseMatrix for dense monomial matrices.
-                sets.push(MonomialSet::DenseMatrix(Arc::new(m.clone())));
+                sets.push(MonomialSet::DigitsMatrix(m.clone()));
             });
         }
         for inst in &self.instances {
@@ -228,7 +229,7 @@ impl<R: PolyRing> RgInstance<R> {
     pub fn sets(&self) -> Vec<MonomialSet<R>> {
         self.M_f
             .iter()
-            .map(|m| MonomialSet::DenseMatrix(Arc::new(m.clone())))
+            .map(|m| MonomialSet::DigitsMatrix(m.clone()))
             .chain(once(MonomialSet::Vector(self.m_tau.clone())))
             .collect()
     }
@@ -245,14 +246,43 @@ where
 
         let n = f.len();
 
-        // Build digit matrices D_f[k] without per-coefficient allocations.
+        // Build compact digit matrices for cf(f) decomposition.
         //
         // Previous code used `row.decompose_to_vec(...)` which allocates a `Vec` of length `k`
         // for every coefficient => ~16M allocations at n=1M,d=16,k=4. This dominated runtime.
         let d = R::dimension();
         let k = decomp.k;
         let t = std::time::Instant::now();
-        let mut D_f: Vec<Matrix<R::BaseRing>> = vec![Matrix::zero(n, d); k];
+        // Digit alphabet: include small signed representatives in [-b, b] to
+        // match possible outputs of balanced decomposition in Zq.
+        //
+        // This keeps the digit index space tiny (<= 2b+1), enabling a fast exp lookup table
+        // and compact u16 storage per entry.
+        let b_i128: i128 = decomp.b as i128;
+        let digit_elems: Vec<R::BaseRing> = (-b_i128..=b_i128)
+            .map(|x| {
+                if x >= 0 {
+                    R::BaseRing::from(x as u128)
+                } else {
+                    -R::BaseRing::from((-x) as u128)
+                }
+            })
+            .collect();
+        assert!(
+            digit_elems.len() <= (u16::MAX as usize),
+            "digit alphabet too large for u16 indices (len={})",
+            digit_elems.len()
+        );
+        let digit_elems = Arc::new(digit_elems);
+        let exp_table: Arc<Vec<R>> = Arc::new(
+            digit_elems
+                .iter()
+                .map(|&x| exp::<R>(x).unwrap())
+                .collect::<Vec<_>>(),
+        );
+
+        // Allocate digit tables (row-major): nrows=n, ncols=d, repeated for k digits.
+        let mut digits_tables: Vec<Vec<u16>> = (0..k).map(|_| vec![0u16; n * d]).collect();
         let mut tmp = vec![R::BaseRing::ZERO; k];
         for (row_idx, fi) in f.iter().enumerate() {
             let coeffs = fi.coeffs();
@@ -261,7 +291,13 @@ where
                 // Writes into tmp[0..k] in-place.
                 c.decompose_to(decomp.b, &mut tmp);
                 for k_i in 0..k {
-                    D_f[k_i].vals[row_idx][col_idx] = tmp[k_i];
+                    let dig = tmp[k_i];
+                    // Small alphabet: linear scan is fine (<= 2b+1 <= d+1 in our use cases).
+                    let idx = digit_elems
+                        .iter()
+                        .position(|&x| x == dig)
+                        .expect("digit not in [-b,b] alphabet") as u16;
+                    digits_tables[k_i][row_idx * d + col_idx] = idx;
                 }
             }
         }
@@ -276,39 +312,11 @@ where
         }
 
         let t = std::time::Instant::now();
-        let M_f: Vec<Matrix<R>> = D_f
-            .iter()
-            .map(|m| {
-                #[cfg(feature = "parallel")]
-                let rows = m
-                    .vals
-                    .par_iter()
-                    .map(|row| row.iter().map(|c| exp::<R>(*c).unwrap()).collect::<Vec<_>>())
-                    .collect::<Vec<_>>();
-                #[cfg(not(feature = "parallel"))]
-                let rows = m
-                    .vals
-                    .iter()
-                    .map(|row| row.iter().map(|c| exp::<R>(*c).unwrap()).collect::<Vec<_>>())
-                    .collect::<Vec<_>>();
-                rows.into()
-            })
-            .collect::<Vec<_>>();
-        if profile {
-            println!(
-                "[LF+ RgInstance::from_f] build M_f via exp: {:?} (k={}, n×d={})",
-                t.elapsed(),
-                decomp.k,
-                n * d
-            );
-        }
-
-        let t = std::time::Instant::now();
-        // Commit monomial matrices: comM_f[k_i] = A * M_f[k_i].
+        // Commit monomial matrices: comM_f[k_i] = A * M_f[k_i] without materializing full `M_f`.
         //
         // `A.try_mul_mat` appears to under-utilize CPU (kappa small, not parallelized),
         // so we explicitly parallelize over columns + rows (rayon reduction).
-        fn commit_dense_matrix<Rr>(a: &Matrix<Rr>, m: &Matrix<Rr>) -> Matrix<Rr>
+        fn commit_digits_matrix<Rr>(a: &Matrix<Rr>, m: &DigitsMatrix<Rr>) -> Matrix<Rr>
         where
             Rr: CoeffRing,
             Rr::BaseRing: Zq,
@@ -328,7 +336,7 @@ where
                             .fold(
                                 || vec![Rr::ZERO; kappa],
                                 |mut acc, i| {
-                                    let mi = m.vals[i][col];
+                                    let mi = m.get(i, col);
                                     for r in 0..kappa {
                                         acc[r] += a.vals[r][i] * mi;
                                     }
@@ -361,7 +369,7 @@ where
                     for r in 0..kappa {
                         let mut acc = Rr::ZERO;
                         for i in 0..n {
-                            acc += a.vals[r][i] * m.vals[i][col];
+                            acc += a.vals[r][i] * m.get(i, col);
                         }
                         out.vals[r][col] = acc;
                     }
@@ -370,9 +378,22 @@ where
             }
         }
 
+        let M_f: Vec<Arc<DigitsMatrix<R>>> = digits_tables
+            .into_iter()
+            .map(|digits| {
+                Arc::new(DigitsMatrix {
+                    nrows: n,
+                    ncols: d,
+                    digits: Arc::new(digits),
+                    digit_elems: digit_elems.clone(),
+                    exp_table: exp_table.clone(),
+                })
+            })
+            .collect();
+
         let comM_f = M_f
             .iter()
-            .map(|M| commit_dense_matrix(A, M))
+            .map(|M| commit_digits_matrix(A, M.as_ref()))
             .collect::<Vec<_>>();
         let com = Matrix::hconcat(&comM_f).unwrap();
         if profile {

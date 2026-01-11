@@ -268,7 +268,8 @@ mod tests {
 
         let mut rng = ark_std::test_rng();
         let pop = [R::ZERO, R::ONE];
-        let z: Vec<R> = (0..m).map(|_| *pop.choose(&mut rng).unwrap()).collect();
+        // Used by downstream prove path; keep name underscore to avoid unused warnings in tests.
+        let _z: Vec<R> = (0..m).map(|_| *pop.choose(&mut rng).unwrap()).collect();
 
         let r1cs = r1cs_decomposed_square(
             R1CS::<R> {

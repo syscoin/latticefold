@@ -10,6 +10,7 @@ use latticefold::utils::sumcheck::prover::ProverMsg;
 use latticefold::utils::sumcheck::Proof;
 use stark_rings::{OverField, PolyRing, Ring};
 use stark_rings_linalg::{Matrix, SparseMatrix};
+use crate::setchk::DigitsMatrix;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -43,6 +44,17 @@ where
     /// we materialize the half-sized base-scalar table (and then proceed as `BaseScalarOwned`).
     DenseMatrixColEv {
         mat: Arc<Matrix<R>>,
+        col: usize,
+        beta_pows: Arc<Vec<R::BaseRing>>,
+        num_vars: usize,
+        square: bool,
+    },
+    /// On-demand column evaluation from a compact digit-backed monomial matrix:
+    /// evals[row] = ev(exp(digit[row,col]), beta) in the base ring, optionally vertex-squared.
+    ///
+    /// On the first `fix_variable`, materializes into a half-sized `BaseScalarOwned` table.
+    DigitsMatrixColEv {
+        mat: Arc<DigitsMatrix<R>>,
         col: usize,
         beta_pows: Arc<Vec<R::BaseRing>>,
         num_vars: usize,
@@ -91,6 +103,7 @@ where
             StreamingMleEnum::BaseScalarOwned { num_vars, .. } => *num_vars,
             StreamingMleEnum::BaseScalarArc { num_vars, .. } => *num_vars,
             StreamingMleEnum::DenseMatrixColEv { num_vars, .. } => *num_vars,
+            StreamingMleEnum::DigitsMatrixColEv { num_vars, .. } => *num_vars,
             StreamingMleEnum::EqBase { r, .. } => r.len(),
             StreamingMleEnum::SparseMatVec { num_vars, .. } => *num_vars,
             StreamingMleEnum::Tensor4Padded { num_vars, .. } => *num_vars,
@@ -158,6 +171,21 @@ where
                     return R::ZERO;
                 }
                 let v0 = Self::ev_fast_from_beta_pows(&mat.vals[index][*col], beta_pows);
+                let v0 = if *square { v0 * v0 } else { v0 };
+                R::from(v0)
+            }
+            StreamingMleEnum::DigitsMatrixColEv {
+                mat,
+                col,
+                beta_pows,
+                square,
+                ..
+            } => {
+                if index >= mat.nrows {
+                    return R::ZERO;
+                }
+                let x = mat.get(index, *col);
+                let v0 = Self::ev_fast_from_beta_pows(&x, beta_pows);
                 let v0 = if *square { v0 * v0 } else { v0 };
                 R::from(v0)
             }
@@ -311,6 +339,39 @@ where
                     num_vars: *num_vars - 1,
                 };
             }
+            StreamingMleEnum::DigitsMatrixColEv {
+                mat,
+                col,
+                beta_pows,
+                num_vars,
+                square,
+            } => {
+                let half = 1usize << (*num_vars - 1);
+                let one_minus0 = R::BaseRing::ONE - r0;
+                let mut out = vec![R::BaseRing::ZERO; half];
+                for i in 0..half {
+                    let idx0 = i << 1;
+                    let idx1 = (i << 1) | 1;
+                    let a0 = if idx0 < mat.nrows {
+                        let x0 = mat.get(idx0, *col);
+                        Self::ev_fast_from_beta_pows(&x0, beta_pows)
+                    } else {
+                        R::BaseRing::ZERO
+                    };
+                    let b0 = if idx1 < mat.nrows {
+                        let x1 = mat.get(idx1, *col);
+                        Self::ev_fast_from_beta_pows(&x1, beta_pows)
+                    } else {
+                        R::BaseRing::ZERO
+                    };
+                    let (a0, b0) = if *square { (a0 * a0, b0 * b0) } else { (a0, b0) };
+                    out[i] = one_minus0 * a0 + r0 * b0;
+                }
+                *self = StreamingMleEnum::BaseScalarOwned {
+                    evals: out,
+                    num_vars: *num_vars - 1,
+                };
+            }
             StreamingMleEnum::EqBase {
                 scale,
                 r,
@@ -380,6 +441,11 @@ where
                 c
             }
             StreamingMleEnum::DenseMatrixColEv { .. } => {
+                let mut c = self.clone();
+                c.fix_variable_in_place_base(r.coeffs()[0]);
+                c
+            }
+            StreamingMleEnum::DigitsMatrixColEv { .. } => {
                 let mut c = self.clone();
                 c.fix_variable_in_place_base(r.coeffs()[0]);
                 c

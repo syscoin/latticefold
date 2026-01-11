@@ -21,16 +21,51 @@ use rayon::prelude::*;
 // M: witness matrix of monomials
 
 #[derive(Clone, Debug)]
-pub enum MonomialSet<R> {
+pub enum MonomialSet<R: PolyRing> {
     /// Legacy sparse representation (kept for unit tests / small cases).
     Matrix(SparseMatrix<R>),
     /// Dense n×d matrix of monomial ring elements (preferred for large instances).
     DenseMatrix(Arc<Matrix<R>>),
+    /// Compact monomial matrix represented by small digits:
+    /// entry(row,col) = exp(digit_elems[digits[row*ncols + col]]).
+    ///
+    /// This avoids storing `n×d` full ring elements (which is huge), while keeping prover
+    /// transcript / verifier behavior identical.
+    DigitsMatrix(Arc<DigitsMatrix<R>>),
     Vector(Vec<R>),
 }
 
+/// Compact monomial matrix backed by a digit table.
+///
+/// - `digits` stores indices into `digit_elems` / `exp_table` (row-major).
+/// - `digit_elems[i]` is the base-ring digit value (e.g. small signed reps).
+/// - `exp_table[i] = exp::<R>(digit_elems[i])` is the ring monomial element.
 #[derive(Clone, Debug)]
-pub struct In<R> {
+pub struct DigitsMatrix<R: PolyRing> {
+    pub nrows: usize,
+    pub ncols: usize,
+    pub digits: Arc<Vec<u16>>,
+    pub digit_elems: Arc<Vec<R::BaseRing>>,
+    pub exp_table: Arc<Vec<R>>,
+}
+
+impl<R: PolyRing> DigitsMatrix<R> {
+    #[inline]
+    pub fn digit_idx(&self, row: usize, col: usize) -> usize {
+        debug_assert!(row < self.nrows);
+        debug_assert!(col < self.ncols);
+        (self.digits[row * self.ncols + col]) as usize
+    }
+
+    #[inline]
+    pub fn get(&self, row: usize, col: usize) -> R {
+        let idx = self.digit_idx(row, col);
+        self.exp_table[idx]
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct In<R: PolyRing> {
     pub nvars: usize,
     pub sets: Vec<MonomialSet<R>>, // Ms and ms: n x m, or n
 }
@@ -65,7 +100,7 @@ fn ev<R: PolyRing>(r: &R, x: R::BaseRing) -> R::BaseRing {
         .0
 }
 
-impl<R: OverField> In<R> {
+impl<R: OverField + PolyRing> In<R> {
     /// Monomial set check
     ///
     /// Proves sets rings are all unit monomials.
@@ -91,6 +126,14 @@ impl<R: OverField> In<R> {
                 _ => None,
             })
             .collect();
+        let Ms_digits: Vec<Arc<DigitsMatrix<R>>> = self
+            .sets
+            .iter()
+            .filter_map(|set| match set {
+                MonomialSet::DigitsMatrix(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect();
         let ms: Vec<&Vec<R>> = self
             .sets
             .iter()
@@ -101,10 +144,12 @@ impl<R: OverField> In<R> {
             .collect();
 
         assert!(
-            !Ms_sparse.is_empty() || !Ms_dense.is_empty(),
+            !Ms_sparse.is_empty() || !Ms_dense.is_empty() || !Ms_digits.is_empty(),
             "set_check requires at least one matrix set"
         );
         let (nrows, ncols) = if let Some(m0) = Ms_dense.first() {
+            (m0.nrows, m0.ncols)
+        } else if let Some(m0) = Ms_digits.first() {
             (m0.nrows, m0.ncols)
         } else {
             (Ms_sparse[0].nrows, Ms_sparse[0].ncols)
@@ -114,7 +159,7 @@ impl<R: OverField> In<R> {
 
         // Streaming MLEs (avoid materializing DenseMultilinearExtension tables).
         use crate::streaming_sumcheck::{StreamingMleEnum, StreamingSumcheck};
-        let Ms_len = Ms_dense.len() + Ms_sparse.len();
+        let Ms_len = Ms_dense.len() + Ms_digits.len() + Ms_sparse.len();
         let mut mles: Vec<StreamingMleEnum<R>> =
             Vec::with_capacity((Ms_len + ms.len()) * (ncols * 2 + 1));
         let mut alphas = Vec::with_capacity(Ms_len);
@@ -165,6 +210,55 @@ impl<R: OverField> In<R> {
             if profile {
                 println!(
                     "[LF+ setchk] matrix_set[{mi}] build_tables: {:?} (nrows={}, ncols={})",
+                    t_mat.elapsed(),
+                    nrows,
+                    ncols
+                );
+            }
+        }
+
+        // matrix sets (digit/oracle path)
+        for (mi, Md) in Ms_digits.iter().enumerate() {
+            let t_mat = Instant::now();
+            // Step 1
+            let c0 = transcript.get_challenges(self.nvars);
+            let one_minus_c0 = c0.iter().copied().map(|x| R::BaseRing::ONE - x).collect();
+            let beta = transcript.get_challenge();
+
+            // Step 2
+            let beta_pows = beta_pows::<R>(beta);
+            let mat = Md.clone();
+            let beta_pows = Arc::new(beta_pows);
+            for col in 0..ncols {
+                mles.push(StreamingMleEnum::DigitsMatrixColEv {
+                    mat: mat.clone(),
+                    col,
+                    beta_pows: beta_pows.clone(),
+                    num_vars: tnvars,
+                    square: false,
+                });
+                mles.push(StreamingMleEnum::DigitsMatrixColEv {
+                    mat: mat.clone(),
+                    col,
+                    beta_pows: beta_pows.clone(),
+                    num_vars: tnvars,
+                    square: true,
+                });
+            }
+
+            // eq(x,c)
+            mles.push(StreamingMleEnum::EqBase {
+                scale: R::BaseRing::ONE,
+                r: c0,
+                one_minus_r: one_minus_c0,
+            });
+
+            let alpha = transcript.get_challenge();
+            alphas.push(alpha);
+
+            if profile {
+                println!(
+                    "[LF+ setchk] matrix_set_digits[{mi}] build_tables: {:?} (nrows={}, ncols={})",
                     t_mat.elapsed(),
                     nrows,
                     ncols
@@ -330,9 +424,9 @@ impl<R: OverField> In<R> {
             // - for dense matrices: e0[m][col] = Σ_row Md[row][col] * eq(row)
             // - for sparse matrices: keep legacy transpose iteration
             #[cfg(feature = "parallel")]
-            let mut e0: Vec<Vec<R>> = Vec::with_capacity(Ms_dense.len() + MTs.len());
+            let mut e0: Vec<Vec<R>> = Vec::with_capacity(Ms_dense.len() + Ms_digits.len() + MTs.len());
             #[cfg(not(feature = "parallel"))]
-            let mut e0: Vec<Vec<R>> = Vec::with_capacity(Ms_dense.len() + MTs.len());
+            let mut e0: Vec<Vec<R>> = Vec::with_capacity(Ms_dense.len() + Ms_digits.len() + MTs.len());
 
             // Dense sets
             for Md in &Ms_dense {
@@ -353,6 +447,31 @@ impl<R: OverField> In<R> {
                         let mut acc = R::ZERO;
                         for row in 0..nrows {
                             acc += Md.vals[row][col] * R::from(eq_r[row]);
+                        }
+                        acc
+                    })
+                    .collect::<Vec<_>>();
+                e0.push(v);
+            }
+            // Digit sets
+            for Md in &Ms_digits {
+                #[cfg(feature = "parallel")]
+                let v = (0..ncols)
+                    .into_par_iter()
+                    .map(|col| {
+                        let mut acc = R::ZERO;
+                        for row in 0..nrows {
+                            acc += Md.get(row, col) * R::from(eq_r[row]);
+                        }
+                        acc
+                    })
+                    .collect::<Vec<_>>();
+                #[cfg(not(feature = "parallel"))]
+                let v = (0..ncols)
+                    .map(|col| {
+                        let mut acc = R::ZERO;
+                        for row in 0..nrows {
+                            acc += Md.get(row, col) * R::from(eq_r[row]);
                         }
                         acc
                     })
@@ -402,7 +521,7 @@ impl<R: OverField> In<R> {
 
             // Mf
             for (mi, y) in y_mats.iter().enumerate() {
-                let mut ei: Vec<Vec<R>> = Vec::with_capacity(Ms_dense.len() + MTs.len());
+                let mut ei: Vec<Vec<R>> = Vec::with_capacity(Ms_dense.len() + Ms_digits.len() + MTs.len());
 
                 // Dense sets: Σ_row Md[row][col] * y[row]
                 for Md in &Ms_dense {
@@ -423,6 +542,31 @@ impl<R: OverField> In<R> {
                             let mut acc = R::ZERO;
                             for row in 0..nrows {
                                 acc += Md.vals[row][col] * y[row];
+                            }
+                            acc
+                        })
+                        .collect::<Vec<_>>();
+                    ei.push(v);
+                }
+                // Digit sets
+                for Md in &Ms_digits {
+                    #[cfg(feature = "parallel")]
+                    let v = (0..ncols)
+                        .into_par_iter()
+                        .map(|col| {
+                            let mut acc = R::ZERO;
+                            for row in 0..nrows {
+                                acc += Md.get(row, col) * y[row];
+                            }
+                            acc
+                        })
+                        .collect::<Vec<_>>();
+                    #[cfg(not(feature = "parallel"))]
+                    let v = (0..ncols)
+                        .map(|col| {
+                            let mut acc = R::ZERO;
+                            for row in 0..nrows {
+                                acc += Md.get(row, col) * y[row];
                             }
                             acc
                         })

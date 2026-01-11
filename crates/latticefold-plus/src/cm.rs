@@ -117,7 +117,36 @@ where
                     .M_f
                     .iter()
                     .zip(s_prime.iter())
-                    .map(|(M, s_i)| M.try_mul_vec(s_i).unwrap())
+                    .map(|(M, s_i)| {
+                        debug_assert_eq!(M.nrows, n);
+                        debug_assert_eq!(M.ncols, s_i.len());
+                        #[cfg(feature = "parallel")]
+                        {
+                            use rayon::prelude::*;
+                            (0..n)
+                                .into_par_iter()
+                                .map(|row| {
+                                    let mut acc = R::ZERO;
+                                    for col in 0..M.ncols {
+                                        acc += M.get(row, col) * s_i[col];
+                                    }
+                                    acc
+                                })
+                                .collect::<Vec<_>>()
+                        }
+                        #[cfg(not(feature = "parallel"))]
+                        {
+                            let mut out = vec![R::ZERO; n];
+                            for row in 0..n {
+                                let mut acc = R::ZERO;
+                                for col in 0..M.ncols {
+                                    acc += M.get(row, col) * s_i[col];
+                                }
+                                out[row] = acc;
+                            }
+                            out
+                        }
+                    })
                     .collect();
 
                 let mut h = vec![R::zero(); n];
