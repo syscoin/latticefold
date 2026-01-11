@@ -1885,6 +1885,32 @@ where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + Field,
 {
+    let (out, _dbg) =
+        build_we_dr1cs_for_cm_proof_debug::<R>(poseidon_cfg, trace, params, proof, mlen_mats)?;
+    Ok(out)
+}
+
+#[cfg(feature = "we_gate")]
+#[derive(Clone, Debug)]
+pub struct WeCmBuildDebug {
+    pub part_constraints: Vec<usize>,
+    pub part_nvars: Vec<usize>,
+    pub base_constraints: usize,
+    pub glue: Vec<(usize, usize, usize, usize)>,
+}
+
+#[cfg(feature = "we_gate")]
+pub fn build_we_dr1cs_for_cm_proof_debug<R>(
+    poseidon_cfg: &PoseidonConfig<BF<R>>,
+    trace: &PoseidonTranscriptTrace<BF<R>>,
+    params: &WeParams,
+    proof: &crate::cm::CmProof<R>,
+    mlen_mats: usize,
+) -> Result<(WeDr1csOutput<BF<R>>, WeCmBuildDebug), String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + Field,
+{
     // Poseidon trace -> dR1CS (+ wiring).
     let ops = lf_ops_to_symphony_ops::<BF<R>>(&trace.ops);
     let (mut pose_inst, pose_asg, _replay, _byte_wit, pose_wiring, byte_wiring) =
@@ -2120,11 +2146,22 @@ where
         (field_inst, field_asg), // 5
         (cm_inst, cm_asg),       // 6
     ];
+    let part_constraints = parts.iter().map(|(i, _)| i.constraints.len()).collect::<Vec<_>>();
+    let part_nvars = parts.iter().map(|(i, _)| i.nvars).collect::<Vec<_>>();
+    let base_constraints = part_constraints.iter().sum::<usize>();
     let (inst, assignment) =
         merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| e.to_string())?;
 
     let public_len = 1 + 9;
-    Ok(WeDr1csOutput { inst, assignment, public_len })
+    Ok((
+        WeDr1csOutput { inst, assignment, public_len },
+        WeCmBuildDebug {
+            part_constraints,
+            part_nvars,
+            base_constraints,
+            glue,
+        },
+    ))
 }
 
 #[cfg(all(test, feature = "we_gate"))]

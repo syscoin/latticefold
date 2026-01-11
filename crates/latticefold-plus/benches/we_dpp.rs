@@ -22,7 +22,7 @@ use stark_rings::PolyRing;
 use stark_rings_linalg::{Matrix, SparseMatrix};
 
 use latticefold_plus::recording_transcript::TracePoseidonTranscript;
-use latticefold_plus::we_gate_arith::build_we_dr1cs_for_cm_proof;
+use latticefold_plus::we_gate_arith::{build_we_dr1cs_for_cm_proof_debug, WeCmBuildDebug};
 use latticefold_plus::we_statement::WeParams;
 
 // -----------------------------------------------------------------------------
@@ -98,19 +98,25 @@ fn bench_we_dpp(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("build_we_dr1cs_cm_proof", n), |bch| {
         bch.iter(|| {
-            let out =
-                build_we_dr1cs_for_cm_proof::<R>(&poseidon_cfg, &trace, &params, &proof, M.len())
-                    .expect("build_we_dr1cs_for_cm_proof");
-            out.inst.check(&out.assignment).expect("dr1cs satisfied");
+            let (out, dbg) =
+                build_we_dr1cs_for_cm_proof_debug::<R>(&poseidon_cfg, &trace, &params, &proof, M.len())
+                    .expect("build_we_dr1cs_for_cm_proof_debug");
+            if let Err(e) = out.inst.check(&out.assignment) {
+                explain_failed_constraint(&out, &dbg, &e);
+                panic!("dr1cs satisfied: {e:?}");
+            }
         })
     });
 
     group.bench_function(BenchmarkId::new("dpp_verify_cm_proof", n), |bch| {
         // Build once outside the timed loop.
-        let out =
-            build_we_dr1cs_for_cm_proof::<R>(&poseidon_cfg, &trace, &params, &proof, M.len())
-                .expect("build_we_dr1cs_for_cm_proof");
-        out.inst.check(&out.assignment).expect("dr1cs satisfied");
+        let (out, dbg) =
+            build_we_dr1cs_for_cm_proof_debug::<R>(&poseidon_cfg, &trace, &params, &proof, M.len())
+                .expect("build_we_dr1cs_for_cm_proof_debug");
+        if let Err(e) = out.inst.check(&out.assignment) {
+            explain_failed_constraint(&out, &dbg, &e);
+            panic!("dr1cs satisfied: {e:?}");
+        }
 
         type FSmall = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
         // Convert sparse dR1CS -> sparse dR1CS instance for the prototype RS FLPCP.
@@ -182,6 +188,46 @@ fn bench_we_dpp(c: &mut Criterion) {
     });
 
     group.finish();
+}
+
+fn parse_failed_constraint_idx(msg: &str) -> Option<usize> {
+    // expected "constraint {i} failed"
+    let msg = msg.trim();
+    let msg = msg.strip_prefix("constraint ")?;
+    let msg = msg.strip_suffix(" failed")?;
+    msg.parse::<usize>().ok()
+}
+
+fn explain_failed_constraint(
+    _out: &latticefold_plus::we_gate_arith::WeDr1csOutput<
+        <<R as PolyRing>::BaseRing as Field>::BasePrimeField,
+    >,
+    dbg: &WeCmBuildDebug,
+    err: &str,
+) {
+    let Some(i) = parse_failed_constraint_idx(err) else { return };
+    let mut acc = 0usize;
+    for (part_idx, &cnt) in dbg.part_constraints.iter().enumerate() {
+        if i < acc + cnt {
+            eprintln!(
+                "[we_dpp] failed constraint {} is in part {} (start={}, len={})",
+                i, part_idx, acc, cnt
+            );
+            return;
+        }
+        acc += cnt;
+    }
+    // Glue constraints
+    let glue_idx = i.saturating_sub(dbg.base_constraints);
+    if glue_idx < dbg.glue.len() {
+        let (pa, xa, pb, xb) = dbg.glue[glue_idx];
+        eprintln!(
+            "[we_dpp] failed constraint {} is GLUE #{}: (part {}, var {}) == (part {}, var {})",
+            i, glue_idx, pa, xa, pb, xb
+        );
+    } else {
+        eprintln!("[we_dpp] failed constraint {} is after all parts+glue??", i);
+    }
 }
 
 criterion_group!(benches, bench_we_dpp);
