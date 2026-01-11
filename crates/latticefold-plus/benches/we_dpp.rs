@@ -44,7 +44,7 @@ fn bench_we_dpp(c: &mut Criterion) {
     // Keep defaults small-ish so local runs work; override on server by editing this file for now.
     // Fast toy parameters: keeps tau_unpadded_len <= 1024 so this bench focuses on WE/DPP,
     // not prover-side RG setup.
-    let k = 1usize;
+    let k = 2usize;
     let kappa = 2usize;
     let ell = 1usize;
     let b = 2u128;
