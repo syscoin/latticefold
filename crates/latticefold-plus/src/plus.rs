@@ -284,21 +284,108 @@ mod tests {
 
         let A = Matrix::<R>::rand(&mut ark_std::test_rng(), params.kappa, n);
 
-        let cr1cs = ComR1CS::new(r1cs, z, 1, B, k, &A);
+        let cr1cs: Vec<_> = (0..4)
+            .map(|_| {
+                let z: Vec<R> = (0..m).map(|_| *pop.choose(&mut rng).unwrap()).collect();
+                ComR1CS::new(r1cs.clone(), z, 1, B, k, &A)
+            })
+            .collect();
 
-        let M = cr1cs.x.matrices();
+        let M = cr1cs[0].x.matrices();
 
-        let ts = PoseidonTranscript::empty::<PC>();
+        let transcript = PoseidonTranscript::empty::<PC>();
 
         let pparams = PlusParameters { lin: params, B };
+        let mut prover = PlusProver::init(A.clone(), M.clone(), 1, pparams.clone(), transcript);
+
+        let proof = prover.prove(&cr1cs);
+
+        let transcript = PoseidonTranscript::empty::<PC>();
+        let mut verifier = PlusVerifier::init(A, M, pparams, transcript);
+        verifier.verify(&proof);
+    }
+
+    /// Large-scale test to measure tensor optimization impact
+    /// Run with: cargo test --release test_large_scale -- --nocapture --ignored
+    #[test]
+    #[ignore] // Only run manually due to long runtime
+    fn test_large_scale() {
+        use crate::tensor_eval::{set_force_dense, print_tensor_optimization_status};
+        
+        let n = 1 << 20; // 1M constraints - closer to SP1 scale
+        let sop = R::dimension() * 128;
+        let L = 3;
+        let k = 4;
+        let d = R::dimension();
+        let b = (R::dimension() / 2) as u128;
+        let B = estimate_bound(sop, L, d, k) / 2;
+        let m = n / k;
+        let kappa = 2;
+        let l_raw = ((<<R as PolyRing>::BaseRing>::MODULUS.0[0] as f64).ln()
+            / ((R::dimension() / 2) as f64).ln())
+        .ceil() as usize;
+        let l = l_raw.next_power_of_two();
+        let log_kappa = ark_std::log2(kappa) as usize;
+        
+        println!("\n========== LARGE SCALE BENCHMARK (n={}) ==========", n);
+        println!("Parameters: d={}, k={}, l={} (raw {}), kappa={}", d, k, l, l_raw, kappa);
+        print_tensor_optimization_status(log_kappa, k * d, l, d);
+        
+        let params = LinParameters {
+            kappa,
+            decomp: DecompParameters { b, k, l },
+        };
+
+        let mut rng = ark_std::test_rng();
+        let pop = [R::ZERO, R::ONE];
+        let z: Vec<R> = (0..m).map(|_| *pop.choose(&mut rng).unwrap()).collect();
+
+        let r1cs = r1cs_decomposed_square(
+            R1CS::<R> {
+                l: 1,
+                A: SparseMatrix::identity(m),
+                B: SparseMatrix::identity(m),
+                C: SparseMatrix::identity(m),
+            },
+            n,
+            B,
+            k,
+        );
+
+        let A = Matrix::<R>::rand(&mut ark_std::test_rng(), params.kappa, n);
+        let cr1cs = ComR1CS::new(r1cs, z, 1, B, k, &A);
+        let M = cr1cs.x.matrices();
+        let pparams = PlusParameters { lin: params, B };
+        
+        // Generate proof once
+        let ts = PoseidonTranscript::empty::<PC>();
         let mut prover = PlusProver::init(A.clone(), M.clone(), 1, pparams.clone(), ts);
-
-        let ts_v = PoseidonTranscript::empty::<PC>();
-        let mut verifier = PlusVerifier::init(A, M, pparams, ts_v);
-
-        for _ in 0..3 {
-            let proof = prover.prove(std::slice::from_ref(&cr1cs));
-            verifier.verify(&proof);
-        }
+        let proof = prover.prove(std::slice::from_ref(&cr1cs));
+        
+        // Benchmark OPTIMIZED verification
+        set_force_dense(false);
+        let ts = PoseidonTranscript::empty::<PC>();
+        let mut verifier = PlusVerifier::init(A.clone(), M.clone(), pparams.clone(), ts);
+        let start = std::time::Instant::now();
+        verifier.verify(&proof);
+        let optimized_time = start.elapsed();
+        
+        // Benchmark DENSE verification  
+        set_force_dense(true);
+        let ts = PoseidonTranscript::empty::<PC>();
+        let mut verifier = PlusVerifier::init(A, M, pparams, ts);
+        let start = std::time::Instant::now();
+        verifier.verify(&proof);
+        let dense_time = start.elapsed();
+        set_force_dense(false);
+        
+        println!("\n=== VERIFICATION BENCHMARK (n={}) ===", n);
+        println!("  OPTIMIZED time: {:?}", optimized_time);
+        println!("  DENSE time:     {:?}", dense_time);
+        let speedup = dense_time.as_secs_f64() / optimized_time.as_secs_f64();
+        println!("  Speedup:        {:.2}x", speedup);
+        println!("==========================================\n");
+        
+        verifier.transcript().print_metrics();
     }
 }
