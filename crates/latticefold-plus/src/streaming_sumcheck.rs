@@ -9,7 +9,7 @@ use latticefold::transcript::Transcript;
 use latticefold::utils::sumcheck::prover::ProverMsg;
 use latticefold::utils::sumcheck::Proof;
 use stark_rings::{OverField, PolyRing, Ring};
-use stark_rings_linalg::SparseMatrix;
+use stark_rings_linalg::{Matrix, SparseMatrix};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -34,6 +34,18 @@ where
         evals: Arc<Vec<R::BaseRing>>,
         num_vars: usize,
         /// If true, interpret this MLE as **vertex-wise squares** (see Symphony notes).
+        square: bool,
+    },
+    /// On-demand column evaluation from a dense matrix:
+    /// evals[row] = ev(mat[row][col], beta) in the base ring, optionally vertex-squared.
+    ///
+    /// This avoids materializing the full length-2^n table up front. On the first `fix_variable`,
+    /// we materialize the half-sized base-scalar table (and then proceed as `BaseScalarOwned`).
+    DenseMatrixColEv {
+        mat: Arc<Matrix<R>>,
+        col: usize,
+        beta_pows: Arc<Vec<R::BaseRing>>,
+        num_vars: usize,
         square: bool,
     },
     /// eq(bits(index), r) in the base ring, then lifted to `R`.
@@ -78,9 +90,40 @@ where
             StreamingMleEnum::DenseArc { num_vars, .. } => *num_vars,
             StreamingMleEnum::BaseScalarOwned { num_vars, .. } => *num_vars,
             StreamingMleEnum::BaseScalarArc { num_vars, .. } => *num_vars,
+            StreamingMleEnum::DenseMatrixColEv { num_vars, .. } => *num_vars,
             StreamingMleEnum::EqBase { r, .. } => r.len(),
             StreamingMleEnum::SparseMatVec { num_vars, .. } => *num_vars,
             StreamingMleEnum::Tensor4Padded { num_vars, .. } => *num_vars,
+        }
+    }
+
+    #[inline]
+    fn ev_fast_from_beta_pows(x: &R, beta_pows: &[R::BaseRing]) -> R::BaseRing {
+        let coeffs = x.coeffs();
+        debug_assert_eq!(coeffs.len(), beta_pows.len());
+
+        // Fast monomial check: <=1 nonzero coefficient.
+        let mut idx: Option<usize> = None;
+        let mut c: R::BaseRing = R::BaseRing::ZERO;
+        for (i, &ci) in coeffs.iter().enumerate() {
+            if ci != R::BaseRing::ZERO {
+                if idx.is_some() {
+                    // fallback full dot
+                    let mut acc = R::BaseRing::ZERO;
+                    for (cj, pj) in coeffs.iter().zip(beta_pows.iter()) {
+                        if *cj != R::BaseRing::ZERO {
+                            acc += *cj * *pj;
+                        }
+                    }
+                    return acc;
+                }
+                idx = Some(i);
+                c = ci;
+            }
+        }
+        match idx {
+            None => R::BaseRing::ZERO,
+            Some(i) => c * beta_pows[i],
         }
     }
 
@@ -103,6 +146,20 @@ where
                 let v = evals.get(index).copied().unwrap_or(R::BaseRing::ZERO);
                 let v = if *square { v * v } else { v };
                 R::from(v)
+            }
+            StreamingMleEnum::DenseMatrixColEv {
+                mat,
+                col,
+                beta_pows,
+                square,
+                ..
+            } => {
+                if index >= mat.nrows {
+                    return R::ZERO;
+                }
+                let v0 = Self::ev_fast_from_beta_pows(&mat.vals[index][*col], beta_pows);
+                let v0 = if *square { v0 * v0 } else { v0 };
+                R::from(v0)
             }
             StreamingMleEnum::EqBase {
                 scale,
@@ -222,6 +279,38 @@ where
                     num_vars: *num_vars - 1,
                 };
             }
+            StreamingMleEnum::DenseMatrixColEv {
+                mat,
+                col,
+                beta_pows,
+                num_vars,
+                square,
+            } => {
+                // Materialize after the first fix into base-scalar owned table (half size).
+                let half = 1usize << (*num_vars - 1);
+                let one_minus0 = R::BaseRing::ONE - r0;
+                let mut out = vec![R::BaseRing::ZERO; half];
+                for i in 0..half {
+                    let idx0 = i << 1;
+                    let idx1 = (i << 1) | 1;
+                    let a0 = if idx0 < mat.nrows {
+                        Self::ev_fast_from_beta_pows(&mat.vals[idx0][*col], beta_pows)
+                    } else {
+                        R::BaseRing::ZERO
+                    };
+                    let b0 = if idx1 < mat.nrows {
+                        Self::ev_fast_from_beta_pows(&mat.vals[idx1][*col], beta_pows)
+                    } else {
+                        R::BaseRing::ZERO
+                    };
+                    let (a0, b0) = if *square { (a0 * a0, b0 * b0) } else { (a0, b0) };
+                    out[i] = one_minus0 * a0 + r0 * b0;
+                }
+                *self = StreamingMleEnum::BaseScalarOwned {
+                    evals: out,
+                    num_vars: *num_vars - 1,
+                };
+            }
             StreamingMleEnum::EqBase {
                 scale,
                 r,
@@ -286,6 +375,11 @@ where
                 }
             }
             StreamingMleEnum::BaseScalarArc { .. } => {
+                let mut c = self.clone();
+                c.fix_variable_in_place_base(r.coeffs()[0]);
+                c
+            }
+            StreamingMleEnum::DenseMatrixColEv { .. } => {
                 let mut c = self.clone();
                 c.fix_variable_in_place_base(r.coeffs()[0]);
                 c

@@ -131,38 +131,25 @@ impl<R: OverField> In<R> {
             // Fast evaluation uses precomputed beta powers (degree = ring dimension).
             let beta_pows = beta_pows::<R>(beta);
 
-            // Build per-column base-scalar tables by scanning dense rows.
-            #[cfg(feature = "parallel")]
-            let col_tables: Vec<Arc<Vec<R::BaseRing>>> = (0..ncols)
-                .into_par_iter()
-                .map(|col| {
-                    let v: Vec<R::BaseRing> = (0..nrows)
-                        .into_par_iter()
-                        .map(|row| {
-                            // Md: n×d, access by row-major.
-                            let rij = Md.vals[row][col];
-                            ev_fast::<R>(&rij, &beta_pows)
-                        })
-                        .collect();
-                    Arc::new(v)
-                })
-                .collect();
-            #[cfg(not(feature = "parallel"))]
-            let col_tables: Vec<Arc<Vec<R::BaseRing>>> = (0..ncols)
-                .map(|col| {
-                    let mut v = vec![R::BaseRing::ZERO; nrows];
-                    for row in 0..nrows {
-                        let rij = Md.vals[row][col];
-                        v[row] = ev_fast::<R>(&rij, &beta_pows);
-                    }
-                    Arc::new(v)
-                })
-                .collect();
-
+            // Avoid materializing full `nrows` tables up front:
+            // represent each column as an on-demand MLE that materializes only after the first fix.
+            let mat = Arc::new((*Md).clone());
+            let beta_pows = Arc::new(beta_pows);
             for col in 0..ncols {
-                let tab = col_tables[col].clone();
-                mles.push(StreamingMleEnum::BaseScalarArc { evals: tab.clone(), num_vars: tnvars, square: false });
-                mles.push(StreamingMleEnum::BaseScalarArc { evals: tab, num_vars: tnvars, square: true });
+                mles.push(StreamingMleEnum::DenseMatrixColEv {
+                    mat: mat.clone(),
+                    col,
+                    beta_pows: beta_pows.clone(),
+                    num_vars: tnvars,
+                    square: false,
+                });
+                mles.push(StreamingMleEnum::DenseMatrixColEv {
+                    mat: mat.clone(),
+                    col,
+                    beta_pows: beta_pows.clone(),
+                    num_vars: tnvars,
+                    square: true,
+                });
             }
 
             // eq(x,c) as base-ring structured MLE (constant-coeff)
