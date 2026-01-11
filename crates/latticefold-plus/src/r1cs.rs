@@ -3,7 +3,7 @@ use latticefold::{
     arith::r1cs::R1CS,
     transcript::Transcript,
     utils::sumcheck::{
-        utils::{build_eq_x_r, eq_eval},
+        utils::eq_eval,
         MLSumcheck, Proof,
     },
 };
@@ -12,9 +12,10 @@ use stark_rings::{
     OverField, Ring,
 };
 use stark_rings_linalg::{Matrix, SparseMatrix};
-use stark_rings_poly::mle::DenseMultilinearExtension;
+use std::sync::Arc;
 
 use crate::lin::{LinB, LinBX, Linearize, LinearizedVerify};
+use crate::streaming_sumcheck::{StreamingMleEnum, StreamingSumcheck};
 
 /// Committed R1CS
 ///
@@ -76,33 +77,45 @@ impl<R: OverField> Linearize<R> for ComR1CS<R> {
         let ga = self.x.r1cs.A.try_mul_vec(&self.f).unwrap();
         let gb = self.x.r1cs.B.try_mul_vec(&self.f).unwrap();
         let gc = self.x.r1cs.C.try_mul_vec(&self.f).unwrap();
-        let r: Vec<R> = transcript
-            .get_challenges(nvars)
-            .into_iter()
-            .map(|x| x.into())
-            .collect();
-        let eq = build_eq_x_r(&r).unwrap();
-        let mle_f = DenseMultilinearExtension::from_evaluations_vec(nvars, self.f.clone());
-        let mle_ga = DenseMultilinearExtension::from_evaluations_vec(nvars, ga);
-        let mle_gb = DenseMultilinearExtension::from_evaluations_vec(nvars, gb);
-        let mle_gc = DenseMultilinearExtension::from_evaluations_vec(nvars, gc);
-
-        let mles = vec![eq, mle_ga.clone(), mle_gb.clone(), mle_gc.clone()];
+        // Streaming sumcheck (memory-friendly) producing the same `Proof<R>` type.
+        let r0 = transcript.get_challenges(nvars);
+        let one_minus_r0 = r0.iter().copied().map(|x| R::BaseRing::ONE - x).collect();
+        let mles = vec![
+            // eq(x, r0) (constant-coeff)
+            StreamingMleEnum::EqBase {
+                scale: R::BaseRing::ONE,
+                r: r0,
+                one_minus_r: one_minus_r0,
+            },
+            StreamingMleEnum::DenseArc {
+                evals: Arc::new(ga),
+                num_vars: nvars,
+            },
+            StreamingMleEnum::DenseArc {
+                evals: Arc::new(gb),
+                num_vars: nvars,
+            },
+            StreamingMleEnum::DenseArc {
+                evals: Arc::new(gc),
+                num_vars: nvars,
+            },
+            // include f so we can extract v = f(ro) without a separate dense MLE eval
+            StreamingMleEnum::DenseArc {
+                evals: Arc::new(self.f.clone()),
+                num_vars: nvars,
+            },
+        ];
 
         let comb_fn = |vals: &[R]| -> R { vals[0] * (vals[1] * vals[2] - vals[3]) };
 
-        let (sumcheck_proof, prover_state) =
-            MLSumcheck::prove_as_subprotocol(transcript, mles, nvars, 3, comb_fn);
-        let ro = prover_state
-            .randomness
-            .into_iter()
-            .map(|x| x.into())
-            .collect::<Vec<R>>();
+        let (sumcheck_proof, randomness, final_vals) =
+            StreamingSumcheck::prove_as_subprotocol(transcript, mles, nvars, 3, comb_fn);
 
-        let v = mle_f.evaluate(&ro).unwrap();
-        let va = mle_ga.evaluate(&ro).unwrap();
-        let vb = mle_gb.evaluate(&ro).unwrap();
-        let vc = mle_gc.evaluate(&ro).unwrap();
+        let ro = randomness.into_iter().map(|x| x.into()).collect::<Vec<R>>();
+        let va = final_vals[1];
+        let vb = final_vals[2];
+        let vc = final_vals[3];
+        let v = final_vals[4];
 
         absorb_evaluations(&[v, va, vb, vc], transcript);
 
