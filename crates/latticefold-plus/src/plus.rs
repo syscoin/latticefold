@@ -310,7 +310,7 @@ mod tests {
     #[test]
     #[ignore] // Only run manually due to long runtime
     fn test_large_scale() {
-        use crate::tensor_eval::{set_force_dense, print_tensor_optimization_status};
+        use crate::tensor_eval::print_tensor_optimization_status;
         
         let n = 1 << 20; // 1M constraints - closer to SP1 scale
         let sop = R::dimension() * 128;
@@ -338,7 +338,6 @@ mod tests {
 
         let mut rng = ark_std::test_rng();
         let pop = [R::ZERO, R::ONE];
-        let z: Vec<R> = (0..m).map(|_| *pop.choose(&mut rng).unwrap()).collect();
 
         let r1cs = r1cs_decomposed_square(
             R1CS::<R> {
@@ -353,37 +352,25 @@ mod tests {
         );
 
         let A = Matrix::<R>::rand(&mut ark_std::test_rng(), params.kappa, n);
+        let z: Vec<R> = (0..m).map(|_| *pop.choose(&mut rng).unwrap()).collect();
         let cr1cs = ComR1CS::new(r1cs, z, 1, B, k, &A);
         let M = cr1cs.x.matrices();
         let pparams = PlusParameters { lin: params, B };
         
-        // Generate proof once
+        // Generate proof
         let ts = PoseidonTranscript::empty::<PC>();
         let mut prover = PlusProver::init(A.clone(), M.clone(), 1, pparams.clone(), ts);
         let proof = prover.prove(std::slice::from_ref(&cr1cs));
         
-        // Benchmark OPTIMIZED verification
-        set_force_dense(false);
-        let ts = PoseidonTranscript::empty::<PC>();
-        let mut verifier = PlusVerifier::init(A.clone(), M.clone(), pparams.clone(), ts);
-        let start = std::time::Instant::now();
-        verifier.verify(&proof);
-        let optimized_time = start.elapsed();
-        
-        // Benchmark DENSE verification  
-        set_force_dense(true);
+        // Verify with timing
         let ts = PoseidonTranscript::empty::<PC>();
         let mut verifier = PlusVerifier::init(A, M, pparams, ts);
         let start = std::time::Instant::now();
         verifier.verify(&proof);
-        let dense_time = start.elapsed();
-        set_force_dense(false);
+        let verify_time = start.elapsed();
         
         println!("\n=== VERIFICATION BENCHMARK (n={}) ===", n);
-        println!("  OPTIMIZED time: {:?}", optimized_time);
-        println!("  DENSE time:     {:?}", dense_time);
-        let speedup = dense_time.as_secs_f64() / optimized_time.as_secs_f64();
-        println!("  Speedup:        {:.2}x", speedup);
+        println!("  Verification time: {:?}", verify_time);
         println!("==========================================\n");
         
         verifier.transcript().print_metrics();
