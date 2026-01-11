@@ -530,12 +530,12 @@ where
     debug_assert_eq!(r.len(), one_minus_r.len());
     let nvars = r.len();
     let n = v.len();
-    debug_assert_eq!(n, 1usize << nvars);
     let t = choose_t_low(nvars);
     let low = build_eq_low_table::<R>(&r[..t], &one_minus_r[..t]);
     let low_len = 1usize << t;
     let high_bits = nvars - t;
-    let high_len = 1usize << high_bits;
+    // Cap at the actual table length; anything beyond `n` is implicit zero padding.
+    let high_len = ((n + low_len - 1) / low_len).min(1usize << high_bits);
     #[cfg(feature = "parallel")]
     {
         (0..high_len)
@@ -545,7 +545,11 @@ where
                 let base = h * low_len;
                 let mut acc = R::BaseRing::ZERO;
                 for i in 0..low_len {
-                    acc += v[base + i] * (scale * low[i]);
+                    let idx = base + i;
+                    if idx >= n {
+                        break;
+                    }
+                    acc += v[idx] * (scale * low[i]);
                 }
                 acc
             })
@@ -558,7 +562,11 @@ where
             let scale = eq_scale_for_high_bits::<R>(h, r, one_minus_r, t);
             let base = h * low_len;
             for i in 0..low_len {
-                acc += v[base + i] * (scale * low[i]);
+                let idx = base + i;
+                if idx >= n {
+                    break;
+                }
+                acc += v[idx] * (scale * low[i]);
             }
         }
         acc
@@ -573,12 +581,11 @@ where
     debug_assert_eq!(r.len(), one_minus_r.len());
     let nvars = r.len();
     let n = v.len();
-    debug_assert_eq!(n, 1usize << nvars);
     let t = choose_t_low(nvars);
     let low = build_eq_low_table::<R>(&r[..t], &one_minus_r[..t]);
     let low_len = 1usize << t;
     let high_bits = nvars - t;
-    let high_len = 1usize << high_bits;
+    let high_len = ((n + low_len - 1) / low_len).min(1usize << high_bits);
     #[cfg(feature = "parallel")]
     {
         (0..high_len)
@@ -588,8 +595,12 @@ where
                 let base = h * low_len;
                 let mut acc = R::ZERO;
                 for i in 0..low_len {
+                    let idx = base + i;
+                    if idx >= n {
+                        break;
+                    }
                     let w = scale * low[i];
-                    acc += v[base + i] * R::from(w);
+                    acc += v[idx] * R::from(w);
                 }
                 acc
             })
@@ -602,8 +613,12 @@ where
             let scale = eq_scale_for_high_bits::<R>(h, r, one_minus_r, t);
             let base = h * low_len;
             for i in 0..low_len {
+                let idx = base + i;
+                if idx >= n {
+                    break;
+                }
                 let w = scale * low[i];
-                acc += v[base + i] * R::from(w);
+                acc += v[idx] * R::from(w);
             }
         }
         acc
@@ -621,12 +636,11 @@ where
     debug_assert_eq!(r.len(), one_minus_r.len());
     let nvars = r.len();
     let n = v.len();
-    debug_assert_eq!(n, 1usize << nvars);
     let t = choose_t_low(nvars);
     let low = build_eq_low_table::<R>(&r[..t], &one_minus_r[..t]);
     let low_len = 1usize << t;
     let high_bits = nvars - t;
-    let high_len = 1usize << high_bits;
+    let high_len = ((n + low_len - 1) / low_len).min(1usize << high_bits);
     let d = R::dimension();
     #[cfg(feature = "parallel")]
     {
@@ -641,7 +655,11 @@ where
                         let mut acc = R::BaseRing::ZERO;
                         for i in 0..low_len {
                             let w = scale * low[i];
-                            acc += v[base + i].coeffs()[j] * w;
+                            let idx = base + i;
+                            if idx >= n {
+                                break;
+                            }
+                            acc += v[idx].coeffs()[j] * w;
                         }
                         acc
                     })
@@ -657,7 +675,11 @@ where
             let base = h * low_len;
             for i in 0..low_len {
                 let w = scale * low[i];
-                let x = &v[base + i];
+                let idx = base + i;
+                if idx >= n {
+                    break;
+                }
+                let x = &v[idx];
                 for j in 0..d {
                     out[j] += x.coeffs()[j] * w;
                 }
@@ -679,12 +701,11 @@ where
     debug_assert_eq!(r.len(), one_minus_r.len());
     let nvars = r.len();
     let n = m.nrows;
-    debug_assert_eq!(n, 1usize << nvars);
     let t = choose_t_low(nvars);
     let low = build_eq_low_table::<R>(&r[..t], &one_minus_r[..t]);
     let low_len = 1usize << t;
     let high_bits = nvars - t;
-    let high_len = 1usize << high_bits;
+    let high_len = ((n + low_len - 1) / low_len).min(1usize << high_bits);
     #[cfg(feature = "parallel")]
     {
         (0..high_len)
@@ -695,6 +716,9 @@ where
                 let mut acc = R::BaseRing::ZERO;
                 for i in 0..low_len {
                     let row_idx = base + i;
+                    if row_idx >= n {
+                        break;
+                    }
                     let w_row = scale * low[i];
                     let row = &m.coeffs[row_idx];
                     let mut sum0 = R::BaseRing::ZERO;
@@ -717,6 +741,9 @@ where
             let base = h * low_len;
             for i in 0..low_len {
                 let row_idx = base + i;
+                if row_idx >= n {
+                    break;
+                }
                 let w_row = scale * low[i];
                 let row = &m.coeffs[row_idx];
                 let mut sum0 = R::BaseRing::ZERO;
@@ -745,12 +772,11 @@ where
     debug_assert_eq!(r.len(), one_minus_r.len());
     let nvars = r.len();
     let n = m.nrows;
-    debug_assert_eq!(n, 1usize << nvars);
     let t = choose_t_low(nvars);
     let low = build_eq_low_table::<R>(&r[..t], &one_minus_r[..t]);
     let low_len = 1usize << t;
     let high_bits = nvars - t;
-    let high_len = 1usize << high_bits;
+    let high_len = ((n + low_len - 1) / low_len).min(1usize << high_bits);
     #[cfg(feature = "parallel")]
     {
         (0..high_len)
@@ -761,6 +787,9 @@ where
                 let mut acc = R::ZERO;
                 for i in 0..low_len {
                     let row_idx = base + i;
+                    if row_idx >= n {
+                        break;
+                    }
                     let w_row = scale * low[i];
                     let row = &m.coeffs[row_idx];
                     let mut row_dot = R::ZERO;
@@ -783,6 +812,9 @@ where
             let base = h * low_len;
             for i in 0..low_len {
                 let row_idx = base + i;
+                if row_idx >= n {
+                    break;
+                }
                 let w_row = R::from(scale * low[i]);
                 let row = &m.coeffs[row_idx];
                 let mut row_dot = R::ZERO;
