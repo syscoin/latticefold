@@ -485,8 +485,6 @@ mod tests {
         let part2 = utils_tensor_product(&part1, &d_prime_powers);
         let mut t_z_dense = utils_tensor_product(&part2, &x_powers);
         
-        let raw_len = t_z_dense.len();
-        
         // Pad to larger power of 2 (simulating cm.rs behavior)
         let padded_nvars = 10; // Much larger than needed
         let padded_len = 1 << padded_nvars;
