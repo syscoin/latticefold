@@ -102,8 +102,8 @@ fn bench_we_dpp(c: &mut Criterion) {
                 build_we_dr1cs_for_cm_proof_debug::<R>(&poseidon_cfg, &trace, &params, &proof, M.len())
                     .expect("build_we_dr1cs_for_cm_proof_debug");
             if let Err(e) = out.inst.check(&out.assignment) {
-                explain_failed_constraint(&out, &dbg, &e);
-                panic!("dr1cs satisfied: {e:?}");
+                let msg = explain_failed_constraint(&out, &dbg, &e);
+                panic!("dr1cs satisfied: {e}\n{msg}");
             }
         })
     });
@@ -114,8 +114,8 @@ fn bench_we_dpp(c: &mut Criterion) {
             build_we_dr1cs_for_cm_proof_debug::<R>(&poseidon_cfg, &trace, &params, &proof, M.len())
                 .expect("build_we_dr1cs_for_cm_proof_debug");
         if let Err(e) = out.inst.check(&out.assignment) {
-            explain_failed_constraint(&out, &dbg, &e);
-            panic!("dr1cs satisfied: {e:?}");
+            let msg = explain_failed_constraint(&out, &dbg, &e);
+            panic!("dr1cs satisfied: {e}\n{msg}");
         }
 
         type FSmall = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
@@ -199,21 +199,29 @@ fn parse_failed_constraint_idx(msg: &str) -> Option<usize> {
 }
 
 fn explain_failed_constraint(
-    _out: &latticefold_plus::we_gate_arith::WeDr1csOutput<
-        <<R as PolyRing>::BaseRing as Field>::BasePrimeField,
-    >,
+    out: &latticefold_plus::we_gate_arith::WeDr1csOutput<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
     dbg: &WeCmBuildDebug,
     err: &str,
-) {
-    let Some(i) = parse_failed_constraint_idx(err) else { return };
+) -> String {
+    let Some(i) = parse_failed_constraint_idx(err) else {
+        return "[we_dpp] could not parse failed constraint index".to_string();
+    };
     let mut acc = 0usize;
+    let names = [
+        "poseidon",
+        "params",
+        "setchk_verify",
+        "dcom_absorb",
+        "cm_short_bytes",
+        "cm_field_chals",
+        "cm_verify",
+    ];
     for (part_idx, &cnt) in dbg.part_constraints.iter().enumerate() {
         if i < acc + cnt {
-            eprintln!(
-                "[we_dpp] failed constraint {} is in part {} (start={}, len={})",
-                i, part_idx, acc, cnt
+            let name = names.get(part_idx).copied().unwrap_or("unknown");
+            return format!(
+                "[we_dpp] failed constraint {i} is in PART {part_idx} ({name}), start={acc}, len={cnt}"
             );
-            return;
         }
         acc += cnt;
     }
@@ -221,12 +229,24 @@ fn explain_failed_constraint(
     let glue_idx = i.saturating_sub(dbg.base_constraints);
     if glue_idx < dbg.glue.len() {
         let (pa, xa, pb, xb) = dbg.glue[glue_idx];
-        eprintln!(
-            "[we_dpp] failed constraint {} is GLUE #{}: (part {}, var {}) == (part {}, var {})",
-            i, glue_idx, pa, xa, pb, xb
+        // Compute merged-space indices to show witness mismatch.
+        let mut offsets = Vec::with_capacity(dbg.part_nvars.len());
+        let mut off = 0usize;
+        for &nv in &dbg.part_nvars {
+            offsets.push(off);
+            off += nv - 1;
+        }
+        let ga = if xa == 0 { 0 } else { xa + offsets[pa] };
+        let gb = if xb == 0 { 0 } else { xb + offsets[pb] };
+        let va = out.assignment[ga];
+        let vb = out.assignment[gb];
+        return format!(
+            "[we_dpp] failed constraint {i} is GLUE #{glue_idx}: (part {pa}, var {xa}) == (part {pb}, var {xb})\n\
+             merged idxs: {ga} vs {gb}\n\
+             values: {va:?} vs {vb:?}"
         );
     } else {
-        eprintln!("[we_dpp] failed constraint {} is after all parts+glue??", i);
+        format!("[we_dpp] failed constraint {i} is after all parts+glue??")
     }
 }
 
