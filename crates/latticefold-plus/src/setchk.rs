@@ -160,6 +160,8 @@ pub struct Out<R: PolyRing> {
 pub enum SetCheckError<R: Ring> {
     #[error("Sumcheck failed: {0}")]
     Sumcheck(#[from] SumCheckError<R>),
+    #[error("Sumcheck point mismatch: stored `r` != transcript-derived point")]
+    PointMismatch,
     #[error("Recomputed claim `v` mismatch: expected = {0}, received = {1}")]
     ExpectedEvaluation(R, R),
 }
@@ -1401,7 +1403,12 @@ impl<R: OverField> Out<R> {
             &self.sumcheck_proof,
         )?;
 
-        let r: Vec<R> = subclaim.point.into_iter().map(|x| x.into()).collect();
+        let r_br = subclaim.point;
+        // Bind the proof's stored `r` to the transcript-derived sumcheck point. Avoids using an adversarially chosen `self.r` in downstream protocols.
+        if self.r != r_br {
+            return Err(SetCheckError::PointMismatch);
+        }
+        let r: Vec<R> = r_br.into_iter().map(|x| x.into()).collect();
 
         let v = subclaim.expected_evaluation;
 

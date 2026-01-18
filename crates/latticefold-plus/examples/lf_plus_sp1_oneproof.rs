@@ -358,7 +358,7 @@ Re-export the R1LF after enabling CircuitV2CommitPublicValues handling in the SP
             1 + l_pub
         );
     }
-    let mut public_inputs: Vec<BFSmall> = w_host[1..1 + l_pub].to_vec();
+    let public_inputs: Vec<BFSmall> = w_host[1..1 + l_pub].to_vec();
     println!("  public_inputs_len={} (from witness[1..=l])", public_inputs.len());
 
    /* if !public_inputs.is_empty() {
@@ -410,14 +410,11 @@ Re-export the R1LF after enabling CircuitV2CommitPublicValues handling in the SP
         pparams.clone(),
         latticefold_plus::transcript::PoseidonTranscript::empty::<PC>(),
     );
-    for b in &public_inputs {
-        prover.transcript.absorb_field_element(b);
-    }
     println!("  setup full LF+: {:?}", t_setup.elapsed());
     maybe_print_rss("after setup full LF+");
 
     let t_prove = Instant::now();
-    let proof = prover.prove_sparse_base(std::slice::from_ref(&cr1cs));
+    let proof = prover.prove_sparse_base(std::slice::from_ref(&cr1cs), &public_inputs);
     println!("  PlusProverSparseBase::prove_sparse_base: {:?}", t_prove.elapsed());
     maybe_print_rss("after prove_sparse_base");
 
@@ -432,7 +429,7 @@ Re-export the R1LF after enabling CircuitV2CommitPublicValues handling in the SP
         lp.verify(&mut rec);
     }
     proof.cmproof
-        .verify_with_mlen(m0.len(), &mut rec)
+        .verify_with_mlen_and_public_inputs(m0.len(), &public_inputs, &mut rec)
         .expect("cm proof verify");
     println!("  PlusVerifier::verify(record trace): {:?}", t_verify_record.elapsed());
     maybe_print_rss("after verify(record)");

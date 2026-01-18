@@ -198,6 +198,28 @@ where
         num_vars: usize,
         square: bool,
     },
+    /// A sparse MLE supported on exactly two vertices:
+    /// - value at index 0 is `v0`
+    /// - value at index 1 is `v1`
+    /// - all other vertices are 0
+    ///
+    /// Used for statement binding where we want to control the **eq-weighted** sum by choosing
+    /// `v0, v1` as functions of the verifier's eq-point.
+    Delta01Scaled {
+        v0: R,
+        v1: R,
+        num_vars: usize,
+    },
+    /// A sparse MLE supported on exactly one vertex:
+    /// - value at index 0 is `value`
+    /// - all other vertices are 0
+    ///
+    /// Under LSB-first fixing, its evaluation at a point `r` is:
+    /// `value * Π_{i=0..}(1 - r[i])`.
+    Delta0Scaled {
+        value: R,
+        num_vars: usize,
+    },
     /// eq(bits(index), r) in the base ring, then lifted to `R`.
     EqBase {
         scale: R::BaseRing,
@@ -774,7 +796,7 @@ where
             }
             _ => {
                 // Generic fallback (slower): still keeps base witnesses in base ring.
-                // Critical: if the witness is base-scalar, stay in the base ring for accumulation and lift once.
+                // If the witness is base-scalar, stay in the base ring for accumulation and lift once.
                 let (mut b0, mut r0) = if matches!(&self.w0, CmMatVecWitness::Base(_)) {
                     (Some(R::BaseRing::ZERO), R::ZERO)
                 } else {
@@ -927,6 +949,8 @@ where
             StreamingMleEnum::BaseScalarConst { num_vars, .. } => *num_vars,
             StreamingMleEnum::DenseMatrixColEv { num_vars, .. } => *num_vars,
             StreamingMleEnum::DigitsMatrixColEv { num_vars, .. } => *num_vars,
+            StreamingMleEnum::Delta01Scaled { num_vars, .. } => *num_vars,
+            StreamingMleEnum::Delta0Scaled { num_vars, .. } => *num_vars,
             StreamingMleEnum::EqBase { r, .. } => r.len(),
             StreamingMleEnum::SparseMatVec { num_vars, .. } => *num_vars,
             StreamingMleEnum::SparseMatVecConstCoeff { num_vars, .. } => *num_vars,
@@ -1015,6 +1039,15 @@ where
                 let v0 = Self::ev_fast_from_beta_pows(&x, beta_pows);
                 if *square { v0 * v0 } else { v0 }
             }
+            StreamingMleEnum::Delta01Scaled { v0, v1, .. } => match index {
+                0 => v0.coeffs()[0],
+                1 => v1.coeffs()[0],
+                _ => R::BaseRing::ZERO,
+            },
+            StreamingMleEnum::Delta0Scaled { value, .. } => match index {
+                0 => value.coeffs()[0],
+                _ => R::BaseRing::ZERO,
+            },
             StreamingMleEnum::EqBase {
                 scale,
                 r,
@@ -1138,6 +1171,14 @@ where
                     }
                 }
                 sum
+            }
+            StreamingMleEnum::Delta01Scaled { v0, v1, .. } => match index {
+                0 => *v0,
+                1 => *v1,
+                _ => R::ZERO,
+            },
+            StreamingMleEnum::Delta0Scaled { value, .. } => {
+                if index == 0 { *value } else { R::ZERO }
             }
             StreamingMleEnum::SparseMatVecConstCoeff { .. } => R::from(self.eval0_at_index(index)),
             StreamingMleEnum::SparseMatVecConstCoeffBase { .. } => R::from(self.eval0_at_index(index)),
@@ -1509,6 +1550,17 @@ where
                 // Constant function stays constant after fixing; just decrement dimension.
                 *num_vars -= 1;
             }
+            StreamingMleEnum::Delta01Scaled { v0, v1, num_vars } => {
+                let new = StreamingMleEnum::Delta0Scaled {
+                    value: *v0 * (R::ONE - r_ring) + *v1 * r_ring,
+                    num_vars: *num_vars - 1,
+                };
+                *self = new;
+            }
+            StreamingMleEnum::Delta0Scaled { value, num_vars } => {
+                *value = *value * (R::ONE - r_ring);
+                *num_vars -= 1;
+            }
             StreamingMleEnum::DenseMatrixColEv {
                 mat,
                 col,
@@ -1772,7 +1824,7 @@ where
                 self.fix_variable_in_place_base(r0);
             }
             StreamingMleEnum::CmMatVec4Part { .. } => {
-                // Critical: if this part is constant-coefficient (base-scalar), keep it base-scalar
+                // If this part is constant-coefficient (base-scalar), keep it base-scalar
                 // after fixing (otherwise we allocate a gigantic Vec<R> and blow up RAM for d64).
                 let nv0 = self.num_vars();
                 let half = 1usize << (nv0 - 1);
@@ -1858,6 +1910,21 @@ where
                 num_vars: nv - 1,
                 square: *square,
             },
+            StreamingMleEnum::Delta01Scaled { v0, v1, .. } => {
+                // Collapse to Delta0Scaled after fixing the LSB:
+                // f'(0) = v0*(1-r) + v1*r.
+                StreamingMleEnum::Delta0Scaled {
+                    value: *v0 * (R::ONE - r) + *v1 * r,
+                    num_vars: nv - 1,
+                }
+            }
+            StreamingMleEnum::Delta0Scaled { value, .. } => {
+                // f'(0) = value*(1-r) + 0*r = value*(1-r)
+                StreamingMleEnum::Delta0Scaled {
+                    value: *value * (R::ONE - r),
+                    num_vars: nv - 1,
+                }
+            }
             StreamingMleEnum::DenseMatrixColEv { .. } => {
                 let mut c = self.clone();
                 c.fix_variable_in_place_base(r.coeffs()[0]);

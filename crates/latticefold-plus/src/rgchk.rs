@@ -327,6 +327,10 @@ where
         M: &[Arc<SparseMatrix<R>>],
         transcript: &mut impl Transcript<R>,
     ) -> Dcom<R> {
+        // Bind all subsequent Fiat–Shamir coins to the committed witness.
+        // This must happen before `set_check`, which consumes verifier coins.
+        absorb_fcoms_instances(&self.instances, transcript);
+
         let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
         let t_total = std::time::Instant::now();
 
@@ -403,10 +407,10 @@ where
                     ));
                     b.push(match &inst.m_tau {
                         MonomialVec::Dense(v) => sparse_mat_vec_eval_ring_streaming::<R>(
-                            m,
+                        m,
                             v.as_ref(),
-                            &out_rel.r,
-                            &one_minus_r,
+                        &out_rel.r,
+                        &one_minus_r,
                         ),
                         MonomialVec::Digits { digits, exp_table } => {
                             sparse_mat_vec_eval_ring_streaming_monomial_digits::<R>(
@@ -456,6 +460,10 @@ where
         M0: &[Arc<SparseMatrix<R::BaseRing>>],
         transcript: &mut impl Transcript<R>,
     ) -> Dcom<R> {
+        // Bind all subsequent Fiat–Shamir coins to the committed witness.
+        // This must happen before `set_check`, which consumes verifier coins.
+        absorb_fcoms_instances(&self.instances, transcript);
+
         let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
         let t_total = std::time::Instant::now();
 
@@ -574,6 +582,10 @@ where
     R::BaseRing: Zq,
 {
     pub fn verify(&self, transcript: &mut impl Transcript<R>) -> Result<(), RangeCheckError<R>> {
+        // Must match prover-side `Rg::{range_check,range_check_base}` ordering.
+        // The witness commitments must be transcript-absorbed before any verifier coins.
+        absorb_fcoms_fcoms(&self.fcoms, transcript);
+
         self.out.verify(transcript).unwrap(); //.map_err(|_| ())?;
 
         absorb_evaluations(&self.evals, transcript);
@@ -626,6 +638,31 @@ where
     }
 }
 
+#[inline]
+fn absorb_fcoms_instances<R: OverField + PolyRing>(
+    instances: &[RgInstance<R>],
+    transcript: &mut impl Transcript<R>,
+) {
+    // Absorb each instance's witness commitments in a fixed order.
+    for inst in instances {
+        transcript.absorb_slice(&inst.fcoms.cm_f);
+        transcript.absorb_slice(&inst.fcoms.C_Mf);
+        transcript.absorb_slice(&inst.fcoms.cm_mtau);
+    }
+}
+
+#[inline]
+fn absorb_fcoms_fcoms<R: OverField + PolyRing>(
+    fcoms: &[FComs<R>],
+    transcript: &mut impl Transcript<R>,
+) {
+    for cmc in fcoms {
+        transcript.absorb_slice(&cmc.cm_f);
+        transcript.absorb_slice(&cmc.C_Mf);
+        transcript.absorb_slice(&cmc.cm_mtau);
+    }
+}
+
 impl<R: PolyRing> RgInstance<R> {
     /// Construct monomial sets from `M_f` and `m_tau`
     pub fn sets(&self) -> Vec<MonomialSet<R>> {
@@ -667,23 +704,23 @@ where
         // We therefore build the digit alphabet as [-D, D] and decompose coefficients into that set.
         let digit_abs_max: i128 = (R::dimension() as i128) / 2 - 1;
         assert!(digit_abs_max >= 1, "ring dimension too small for monomial digits");
-        let b_i128: i128 = decomp.b as i128;
+            let b_i128: i128 = decomp.b as i128;
         assert!(b_i128 >= 2, "decomposition base must be >= 2");
         let digit_elems: Vec<R::BaseRing> = (-digit_abs_max..=digit_abs_max)
             .map(|x| br_from_i128::<R::BaseRing>(x))
-            .collect();
-        assert!(
-            digit_elems.len() <= (u16::MAX as usize),
-            "digit alphabet too large for u16 indices (len={})",
-            digit_elems.len()
-        );
-        let exp_table: Arc<Vec<R>> = Arc::new(
-            digit_elems
-                .iter()
-                .map(|&x| exp::<R>(x).unwrap())
-                .collect::<Vec<_>>(),
-        );
-        let digit_elems = Arc::new(digit_elems);
+                .collect();
+            assert!(
+                digit_elems.len() <= (u16::MAX as usize),
+                "digit alphabet too large for u16 indices (len={})",
+                digit_elems.len()
+            );
+            let exp_table: Arc<Vec<R>> = Arc::new(
+                digit_elems
+                    .iter()
+                    .map(|&x| exp::<R>(x).unwrap())
+                    .collect::<Vec<_>>(),
+            );
+            let digit_elems = Arc::new(digit_elems);
         let b_u128 = decomp.b;
         let ctx: &'static str = "RgInstance::from_f";
         let map_digit_to_idx: Box<dyn Fn(R::BaseRing) -> u16 + Send + Sync> =
@@ -742,7 +779,7 @@ where
                             );
                             table[row_idx] = (map_digit_to_idx)(tmp_local[k_i]);
                         } else {
-                            for (col_idx, &c) in coeffs.iter().enumerate() {
+                        for (col_idx, &c) in coeffs.iter().enumerate() {
                                 bounded_decompose_to_digits(
                                     c,
                                     b_i128,
@@ -753,7 +790,7 @@ where
                                     row_idx,
                                     ctx,
                                 );
-                                table[row_idx * d + col_idx] = (map_digit_to_idx)(tmp_local[k_i]);
+                            table[row_idx * d + col_idx] = (map_digit_to_idx)(tmp_local[k_i]);
                             }
                         }
                     }
@@ -780,8 +817,8 @@ where
                         digits_tables[k_i][row_idx] = (map_digit_to_idx)(tmp[k_i]);
                     }
                 } else {
-                    for (col_idx, &c) in coeffs.iter().enumerate() {
-                        // Writes into tmp[0..k] in-place.
+                for (col_idx, &c) in coeffs.iter().enumerate() {
+                    // Writes into tmp[0..k] in-place.
                         bounded_decompose_to_digits(
                             c,
                             b_i128,
@@ -792,8 +829,8 @@ where
                             row_idx,
                             ctx,
                         );
-                        for k_i in 0..k {
-                            digits_tables[k_i][row_idx * d + col_idx] = (map_digit_to_idx)(tmp[k_i]);
+                    for k_i in 0..k {
+                        digits_tables[k_i][row_idx * d + col_idx] = (map_digit_to_idx)(tmp[k_i]);
                         }
                     }
                 }

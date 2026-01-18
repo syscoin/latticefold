@@ -63,6 +63,7 @@ pub struct Cm<R: PolyRing> {
 pub struct InstanceEvals<R>(Vec<[R; 4]>);
 
 impl<R> InstanceEvals<R> {
+    #[inline]
     pub(crate) fn rows(&self) -> &[[R; 4]] {
         &self.0
     }
@@ -389,6 +390,7 @@ where
     pub fn prove_base(
         &self,
         M0: &[Arc<SparseMatrix<R::BaseRing>>],
+        public_inputs: &[R::BaseRing],
         transcript: &mut impl Transcript<R>,
     ) -> (Com<R>, CmProof<R>) {
         let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
@@ -779,6 +781,16 @@ where
                     .collect::<Vec<R>>()
             })
             .collect::<Vec<_>>();
+
+        // Statement-binding coefficients α (only when public inputs are present).
+        // Sampled after witness is transcript-fixed (via `range_check_base`) and after `comh`/`c`.
+        // Domain-separated to make this robust to future transcript refactors.
+        let bind_alpha: Option<Vec<R::BaseRing>> = (!public_inputs.is_empty()).then(|| {
+            const BIND_ALPHA_DOMAIN_SEP: u128 = 0xB1A1;
+            let ds = R::BaseRing::from(BIND_ALPHA_DOMAIN_SEP);
+            transcript.absorb_field_element(&ds);
+            transcript.get_challenges(1 + public_inputs.len())
+        });
         let h: Vec<Arc<Vec<R>>> = if h_mles_full.is_some() {
             Vec::new()
         } else {
@@ -848,6 +860,7 @@ where
                 &t1_mle,
                 &m_arcs0,
                 mats_const,
+                bind_alpha.as_deref(),
                 transcript,
                 profile,
             );
@@ -858,6 +871,7 @@ where
                 &t1_mle,
                 &m_arcs0,
                 mats_const,
+                bind_alpha.as_deref(),
                 transcript,
                 profile,
             );
@@ -916,6 +930,7 @@ where
                 &t1_mle,
                 &m_arcs0,
                 mats_const,
+                bind_alpha.as_deref(),
                 transcript,
                 profile,
             );
@@ -926,6 +941,7 @@ where
                 &t1_mle,
                 &m_arcs0,
                 mats_const,
+                bind_alpha.as_deref(),
                 transcript,
                 profile,
             );
@@ -1323,6 +1339,7 @@ where
         let t_rcps = Instant::now();
         let mut rcps = vec![];
         let mut rcp = R::BaseRing::ONE;
+        let stride = 4 + 4 * Mlen;
         for _ in 0..L {
             // [tau, m_tau, f, h]
             for _ in 0..4 {
@@ -1351,10 +1368,9 @@ where
         let comb_fn2 = move |v0: &[R], v1: &[R]| -> [R; 3] {
             debug_assert_eq!(v0.len(), v1.len());
             let n = v0.len();
-            debug_assert_eq!(n, 1 + L * (4 + 4 * Mlen) + 2);
+            debug_assert_eq!(n, 1 + L * stride + 2);
             let w_t0 = rcps[n - 3];
             let w_t1 = rcps[n - 2];
-            let stride = 4 + 4 * Mlen;
 
             #[inline]
             fn at2<Rr: OverField + PolyRing>(v0: &[Rr], v1: &[Rr], idx: usize) -> Rr
@@ -1407,10 +1423,12 @@ where
         let ro = randomness.into_iter().map(|x| x.into()).collect::<Vec<R>>();
 
         let t_evals = Instant::now();
+        let bind_slot = 0usize;
+        let stride = 4 + 4 * Mlen;
         let evals = (0..L)
             .map(|l| {
-                let mut e = Vec::with_capacity(1 + Mlen);
-                let l_idx = 1 + l * (4 + 4 * Mlen);
+                let mut e = Vec::with_capacity(1 + Mlen + bind_slot);
+                let l_idx = 1 + l * stride;
                 e.push([
                     final_vals[l_idx],
                     final_vals[l_idx + 1],
@@ -1466,6 +1484,7 @@ where
         t1_mle: &StreamingMleEnum<R>,
         m_arcs0: &[Arc<SparseMatrix<R::BaseRing>>],
         mats_const: bool,
+        bind_alpha: Option<&[R::BaseRing]>,
         transcript: &mut impl Transcript<R>,
         profile: bool,
     ) -> (Proof<R>, Vec<InstanceEvals<R>>, Vec<R>) {
@@ -1475,8 +1494,9 @@ where
         let rc = transcript.get_challenge();
         let L = self.rg.instances.len();
         let Mlen = m_arcs0.len();
+        let bind_slot = if bind_alpha.is_some() { 1 } else { 0 };
 
-        let mut mles = Vec::with_capacity(1 + L * (4 + 4 * Mlen) + 2);
+        let mut mles = Vec::with_capacity(1 + L * (4 + 4 * (Mlen + bind_slot)) + 2);
 
         let r0 = dcom.out.r.clone();
         let one_minus_r0 = r0.iter().copied().map(|x| R::BaseRing::ONE - x).collect();
@@ -1763,6 +1783,50 @@ where
                     }
                 }
             }
+
+            // --- Statement binding slot (virtual) ---
+            if let Some(alpha) = bind_alpha {
+                let l_in = alpha.len().saturating_sub(1);
+                let f0 = f0_arc
+                    .as_ref()
+                    .expect("binding requires const-coeff witness (f0)");
+
+                let mut acc = R::BaseRing::ZERO;
+                let w0 = f0.get(0).copied().unwrap_or(R::BaseRing::ZERO);
+                acc += alpha[0] * w0;
+                for i in 0..l_in {
+                    let wi = f0.get(1 + i).copied().unwrap_or(R::BaseRing::ZERO);
+                    acc += alpha[1 + i] * wi;
+                }
+                let l_witness = R::from(acc);
+
+                mles.push(StreamingMleEnum::BaseScalarConst {
+                    value: R::BaseRing::ZERO,
+                    num_vars: nvars,
+                    square: false,
+                });
+                mles.push(StreamingMleEnum::BaseScalarConst {
+                    value: R::BaseRing::ZERO,
+                    num_vars: nvars,
+                    square: false,
+                });
+                // Choose a two-point table on {0,1} such that its **eq(r0,·)-weighted sum** is 0:
+                // eq(0)*v0 + eq(1)*v1 = 0, where eq(0)=(1-r0_0)*rest and eq(1)=r0_0*rest.
+                // Setting v0 = r0_0 and v1 = -(1-r0_0) cancels for all rest.
+                let r0_0 = dcom.out.r[0];
+                let v0 = l_witness * R::from(r0_0);
+                let v1 = R::ZERO - (l_witness * R::from(R::BaseRing::ONE - r0_0));
+                mles.push(StreamingMleEnum::Delta01Scaled {
+                    v0,
+                    v1,
+                    num_vars: nvars,
+                });
+                mles.push(StreamingMleEnum::BaseScalarConst {
+                    value: R::BaseRing::ZERO,
+                    num_vars: nvars,
+                    square: false,
+                });
+            }
         }
 
         if profile {
@@ -1780,6 +1844,8 @@ where
         let t_rcps = Instant::now();
         let mut rcps = vec![];
         let mut rcp = R::BaseRing::ONE;
+        let bind_slot = if bind_alpha.is_some() { 1 } else { 0 };
+        let stride = 4 + 4 * (Mlen + bind_slot);
         for _ in 0..L {
             // [tau, m_tau, f, h]
             for _ in 0..4 {
@@ -1788,6 +1854,12 @@ where
             }
             for _ in 0..Mlen {
                 // M_i * [tau, m_tau, f, h]
+                for _ in 0..4 {
+                    rcps.push(rcp);
+                    rcp *= rc;
+                }
+            }
+            if bind_slot == 1 {
                 for _ in 0..4 {
                     rcps.push(rcp);
                     rcp *= rc;
@@ -1808,10 +1880,9 @@ where
         let comb_fn2 = move |v0: &[R], v1: &[R]| -> [R; 3] {
             debug_assert_eq!(v0.len(), v1.len());
             let n = v0.len();
-            debug_assert_eq!(n, 1 + L * (4 + 4 * Mlen) + 2);
+            debug_assert_eq!(n, 1 + L * stride + 2);
             let w_t0 = rcps[n - 3];
             let w_t1 = rcps[n - 2];
-            let stride = 4 + 4 * Mlen;
 
             #[inline]
             fn at2<Rr: OverField + PolyRing>(v0: &[Rr], v1: &[Rr], idx: usize) -> Rr
@@ -1864,10 +1935,11 @@ where
         let ro = randomness.into_iter().map(|x| x.into()).collect::<Vec<R>>();
 
         let t_evals = Instant::now();
+        let stride = 4 + 4 * (Mlen + bind_slot);
         let evals = (0..L)
             .map(|l| {
-                let mut e = Vec::with_capacity(1 + Mlen);
-                let l_idx = 1 + l * (4 + 4 * Mlen);
+                let mut e = Vec::with_capacity(1 + Mlen + bind_slot);
+                let l_idx = 1 + l * stride;
                 e.push([
                     final_vals[l_idx],
                     final_vals[l_idx + 1],
@@ -1876,6 +1948,15 @@ where
                 ]);
                 for i in 0..Mlen {
                     let idx = l_idx + 4 + i * 4;
+                    e.push([
+                        final_vals[idx],
+                        final_vals[idx + 1],
+                        final_vals[idx + 2],
+                        final_vals[idx + 3],
+                    ]);
+                }
+                if bind_slot == 1 {
+                    let idx = l_idx + 4 + Mlen * 4;
                     e.push([
                         final_vals[idx],
                         final_vals[idx + 1],
@@ -1923,6 +2004,7 @@ where
         t1_mle: &StreamingMleEnum<R>,
         m_arcs0: &[Arc<SparseMatrix<R::BaseRing>>],
         mats_const: bool,
+        bind_alpha: Option<&[R::BaseRing]>,
         transcript: &mut impl Transcript<R>,
         profile: bool,
     ) -> (Proof<R>, Vec<InstanceEvals<R>>, Vec<R>) {
@@ -1932,9 +2014,8 @@ where
         let rc = transcript.get_challenge();
         let L = self.rg.instances.len();
 
-        let mut mles = Vec::with_capacity(
-            1 + L * (4 + 4 * m_arcs0.len()) + 2,
-        );
+        let bind_slot = if bind_alpha.is_some() { 1 } else { 0 };
+        let mut mles = Vec::with_capacity(1 + L * (4 + 4 * (m_arcs0.len() + bind_slot)) + 2);
 
         let r0 = dcom.out.r.clone();
         let one_minus_r0 = r0.iter().copied().map(|x| R::BaseRing::ONE - x).collect();
@@ -2217,6 +2298,52 @@ where
                     }
                 }
             }
+
+            // --- Statement binding slot (virtual) ---
+            // Append one additional "pseudo-matrix" slot with 4 entries, where only the `f` entry
+            // is nonzero and equals a two-point supported MLE:
+            //   bind(x) = (δ_0(x) - δ_1(x)) * L_witness
+            // This has zero cube-sum and therefore does not affect the claimed_sum.
+            if let Some(alpha) = bind_alpha {
+                let l_in = alpha.len().saturating_sub(1);
+                let f0 = f0_arc
+                    .as_ref()
+                    .expect("binding requires const-coeff witness (f0)");
+
+                let mut acc = R::BaseRing::ZERO;
+                let w0 = f0.get(0).copied().unwrap_or(R::BaseRing::ZERO);
+                acc += alpha[0] * w0;
+                for i in 0..l_in {
+                    let wi = f0.get(1 + i).copied().unwrap_or(R::BaseRing::ZERO);
+                    acc += alpha[1 + i] * wi;
+                }
+                let l_witness = R::from(acc);
+
+                // tau, m_tau, h entries are zero
+                mles.push(StreamingMleEnum::BaseScalarConst {
+                    value: R::BaseRing::ZERO,
+                    num_vars: nvars,
+                    square: false,
+                });
+                mles.push(StreamingMleEnum::BaseScalarConst {
+                    value: R::BaseRing::ZERO,
+                    num_vars: nvars,
+                    square: false,
+                });
+                let r0_0 = dcom.out.r[0];
+                let v0 = l_witness * R::from(r0_0);
+                let v1 = R::ZERO - (l_witness * R::from(R::BaseRing::ONE - r0_0));
+                mles.push(StreamingMleEnum::Delta01Scaled {
+                    v0,
+                    v1,
+                    num_vars: nvars,
+                });
+                mles.push(StreamingMleEnum::BaseScalarConst {
+                    value: R::BaseRing::ZERO,
+                    num_vars: nvars,
+                    square: false,
+                });
+            }
         }
 
         if profile {
@@ -2231,6 +2358,7 @@ where
         mles.push(t1_mle.clone());
 
         let Mlen = m_arcs0.len();
+        let stride = 4 + 4 * (Mlen + bind_slot);
 
         let t_rcps = Instant::now();
         let mut rcps = vec![];
@@ -2241,6 +2369,12 @@ where
                 rcp *= rc;
             }
             for _ in 0..Mlen {
+                for _ in 0..4 {
+                    rcps.push(rcp);
+                    rcp *= rc;
+                }
+            }
+            if bind_slot == 1 {
                 for _ in 0..4 {
                     rcps.push(rcp);
                     rcp *= rc;
@@ -2263,10 +2397,9 @@ where
         let comb_fn2 = move |v0: &[R], v1: &[R]| -> [R; 3] {
             debug_assert_eq!(v0.len(), v1.len());
             let n = v0.len();
-            debug_assert_eq!(n, 1 + L * (4 + 4 * Mlen) + 2);
+            debug_assert_eq!(n, 1 + L * stride + 2);
             let w_t0 = rcps[n - 3];
             let w_t1 = rcps[n - 2];
-            let stride = 4 + 4 * Mlen;
 
             #[inline]
             fn at2<Rr: OverField + PolyRing>(v0: &[Rr], v1: &[Rr], idx: usize) -> Rr
@@ -2314,8 +2447,8 @@ where
         let t_evals = Instant::now();
         let evals = (0..L)
             .map(|l| {
-                let mut e = Vec::with_capacity(1 + Mlen);
-                let l_idx = 1 + l * (4 + 4 * Mlen);
+                let mut e = Vec::with_capacity(1 + Mlen + bind_slot);
+                let l_idx = 1 + l * stride;
                 e.push([
                     final_vals[l_idx],
                     final_vals[l_idx + 1],
@@ -2324,6 +2457,15 @@ where
                 ]);
                 for i in 0..Mlen {
                     let idx = l_idx + 4 + i * 4;
+                    e.push([
+                        final_vals[idx],
+                        final_vals[idx + 1],
+                        final_vals[idx + 2],
+                        final_vals[idx + 3],
+                    ]);
+                }
+                if bind_slot == 1 {
+                    let idx = l_idx + 4 + Mlen * 4;
                     e.push([
                         final_vals[idx],
                         final_vals[idx + 1],
@@ -2374,6 +2516,20 @@ where
         mlen: usize,
         transcript: &mut impl Transcript<R>,
     ) -> Result<ComX<R>, SumCheckError<R>> {
+        self.verify_with_mlen_and_public_inputs(mlen, &[], transcript)
+    }
+
+    /// Verify with statement binding against `public_inputs`.
+    ///
+    /// When `public_inputs` is non-empty, expects the prover to have included the virtual bind slot
+    /// in `evals` and enforces (for each Cm sumcheck point) that the committed witness prefix matches
+    /// the statement public inputs.
+    pub fn verify_with_mlen_and_public_inputs(
+        &self,
+        mlen: usize,
+        public_inputs: &[R::BaseRing],
+        transcript: &mut impl Transcript<R>,
+    ) -> Result<ComX<R>, SumCheckError<R>> {
         let k = self.dcom.dparams.k;
         let d = R::dimension();
         let nvars = self.dcom.out.nvars;
@@ -2408,6 +2564,13 @@ where
                     .collect::<Vec<R>>()
             })
             .collect::<Vec<_>>();
+
+        let bind_alpha: Option<Vec<R::BaseRing>> = (!public_inputs.is_empty()).then(|| {
+            const BIND_ALPHA_DOMAIN_SEP: u128 = 0xB1A1;
+            let ds = R::BaseRing::from(BIND_ALPHA_DOMAIN_SEP);
+            transcript.absorb_field_element(&ds);
+            transcript.get_challenges(1 + public_inputs.len())
+        });
 
         let u: Vec<Vec<R>> = (0..L)
             .map(|l| {
@@ -2467,10 +2630,14 @@ where
         }
         let xp = (0..d).map(|i| unit_monomial::<R>(i)).collect::<Vec<_>>();
 
-        let mut verify_sumcheck =
-            |sumcheck_proof: &Proof<R>, evals: &[InstanceEvals<R>]| -> Result<Vec<R>, ()> {
+        let bind_slot = if bind_alpha.is_some() { 1usize } else { 0usize };
+        let stride = 4 + 4 * (mlen + bind_slot);
+        let z_idx = L * stride;
+
+        let mut verify_sumcheck = |sumcheck_proof: &Proof<R>,
+                                   evals: &[InstanceEvals<R>]|
+         -> Result<Vec<R>, SumCheckError<R>> {
                 let rc: R = transcript.get_challenge().into();
-                let z_idx = L * (4 + 4 * mlen);
                 // Precompute rc^i for all indices used below.
                 let mut rc_pows = Vec::<R>::with_capacity(z_idx + 2);
                 {
@@ -2487,7 +2654,7 @@ where
                     .iter()
                     .enumerate()
                     .map(|(l, eval)| {
-                        let l_idx = l * (4 + 4 * mlen);
+                        let l_idx = l * stride;
 
                         R::from(eval.a[0]) * rc_pows[l_idx]
                             + eval.b[0] * rc_pows[l_idx + 1]
@@ -2537,7 +2704,7 @@ where
                     .enumerate()
                     .map(|(l, el)| {
                         let el = &el.0;
-                        let l_idx = l * (4 + 4 * mlen);
+                        let l_idx = l * stride;
                         eq * (el[0][0] * rc_pows[l_idx]
                             + el[0][1] * rc_pows[l_idx + 1]
                             + el[0][2] * rc_pows[l_idx + 2]
@@ -2553,18 +2720,77 @@ where
                                         + M_evals[3] * rc_pows[idx + 3]
                                 })
                                 .sum::<R>())
+                            + if bind_slot == 1 {
+                                let be = el[1 + mlen];
+                                let idx = l_idx + 4 + mlen * 4;
+                                eq * (be[0] * rc_pows[idx]
+                                    + be[1] * rc_pows[idx + 1]
+                                    + be[2] * rc_pows[idx + 2]
+                                    + be[3] * rc_pows[idx + 3])
+                            } else {
+                                R::ZERO
+                            }
                             + (t0_ro * el[0][0]) * rc_pows[z_idx]
                             + (t1_ro * el[0][0]) * rc_pows[z_idx + 1]
                     })
                     .sum::<R>();
 
-                assert_eq!(expected_eval, eval);
+                if expected_eval != eval {
+                    return Err(SumCheckError::SumCheckFailed(expected_eval, eval));
+                }
+
+                // Statement binding check:
+                // bind_f == (r0_0*χ0(ro) - (1-r0_0)*χ1(ro)) * L_stmt
+                if bind_slot == 1 {
+                    let alpha = bind_alpha.as_ref().expect("bind_slot implies alpha");
+                    let mut l_stmt = alpha[0]; // times 1
+                    for (i, &x) in public_inputs.iter().enumerate() {
+                        l_stmt += alpha[1 + i] * x;
+                    }
+                    if ro.is_empty() {
+                        return Err(SumCheckError::SumCheckFailed(R::ZERO, R::ONE));
+                    }
+                    let mut chi_rest = R::BaseRing::ONE;
+                    for ri in ro.iter().skip(1) {
+                        chi_rest *= R::BaseRing::ONE - ri.coeffs()[0];
+                    }
+                    let ro0 = ro[0].coeffs()[0];
+                    let chi0 = (R::BaseRing::ONE - ro0) * chi_rest;
+                    let chi1 = ro0 * chi_rest;
+                    let r0_0 = self.dcom.out.r[0];
+                    let want0 = r0_0 * chi0;
+                    let want1 = (R::BaseRing::ONE - r0_0) * chi1;
+                    // Standard negligible bad event:
+                    // the scalar factor (want0 - want1) can be 0 with probability ~1/|F|.
+                    // In that event the check becomes non-binding for this round.
+                    let want = R::from((want0 - want1) * l_stmt);
+                    for el in evals.iter() {
+                        let rows = &el.0;
+                        let be = match rows.get(1 + mlen) {
+                            Some(v) => v,
+                            None => return Err(SumCheckError::SumCheckFailed(R::ZERO, R::ONE)),
+                        };
+                        if be[0] != R::ZERO {
+                            return Err(SumCheckError::SumCheckFailed(R::ZERO, be[0]));
+                        }
+                        if be[1] != R::ZERO {
+                            return Err(SumCheckError::SumCheckFailed(R::ZERO, be[1]));
+                        }
+                        if be[3] != R::ZERO {
+                            return Err(SumCheckError::SumCheckFailed(R::ZERO, be[3]));
+                        }
+                        // Enforce constant-coeff and equality to statement-derived value.
+                        if be[2] != want {
+                            return Err(SumCheckError::SumCheckFailed(want, be[2]));
+                        }
+                    }
+                }
 
                 Ok(ro)
             };
 
-        let ro0 = verify_sumcheck(&self.sumcheck_proofs.0, &self.evals.0).unwrap();
-        let ro1 = verify_sumcheck(&self.sumcheck_proofs.1, &self.evals.1).unwrap();
+        let ro0 = verify_sumcheck(&self.sumcheck_proofs.0, &self.evals.0)?;
+        let ro1 = verify_sumcheck(&self.sumcheck_proofs.1, &self.evals.1)?;
 
         let ro = ro0.into_iter().zip(ro1).collect::<Vec<_>>();
 
@@ -2582,6 +2808,15 @@ where
 
     pub fn x(&self, s: &[R], ro: Vec<(R, R)>) -> ComX<R> {
         let L = self.dcom.fcoms.len();
+        // `vo` is part of the LinB2X instance consumed by Π_decomp.
+        // It must reflect only the *real* CM slots (base row + external matrices),
+        // and MUST NOT include the extra statement-binding slot (which is internal to CmProof).
+        let vo_rows = self
+            .dcom
+            .evals
+            .get(0)
+            .map(|ev| ev.a.len())
+            .unwrap_or(0);
 
         // TODO needs more folding challenges `s` for the L instances
         let cm_g = self
@@ -2607,7 +2842,8 @@ where
                 let e0l = &self.evals.0[l].0;
                 let e1l = &self.evals.1[l].0;
                 e0l.iter()
-                    .zip(e1l.iter())
+                    .take(vo_rows)
+                    .zip(e1l.iter().take(vo_rows))
                     .map(|(e0li, e1li)| {
                         (
                             (s[0] * e0li[0]) + (s[1] * e0li[1]) + (s[2] * e0li[2]) + e0li[3],

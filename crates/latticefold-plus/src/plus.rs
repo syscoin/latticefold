@@ -122,6 +122,7 @@ where
 
         proof
     }
+
 }
 
 impl<R, TS> PlusProverSparseBase<R, TS>
@@ -150,12 +151,19 @@ where
         }
     }
 
-    pub fn prove_sparse_base<L>(&mut self, comp: &[L]) -> PlusProof<R, L::Proof>
+    pub fn prove_sparse_base<L>(
+        &mut self,
+        comp: &[L],
+        public_inputs: &[R::BaseRing],
+    ) -> PlusProof<R, L::Proof>
     where
         L: Linearize<R>,
         R::BaseRing: PrimeField,
         <R::BaseRing as PrimeField>::BigInt: BigInteger,
     {
+        for x in public_inputs {
+            self.transcript.absorb_field_element(x);
+        }
         maybe_print_rss("PlusProverSparseBase::prove_sparse_base (start)");
         let mut lproof = Vec::with_capacity(comp.len());
         comp.iter().for_each(|compi| {
@@ -165,9 +173,12 @@ where
         });
 
         maybe_print_rss("PlusProverSparseBase::prove_sparse_base (after linearize)");
-        let (linb2, cmproof) =
-            self.acc
-                .mlin_seeded_base(&self.scheme, &self.M0, &mut self.transcript);
+        let (linb2, cmproof) = self.acc.mlin_seeded_base(
+            &self.scheme,
+            &self.M0,
+            public_inputs,
+            &mut self.transcript,
+        );
         maybe_print_rss("PlusProverSparseBase::prove_sparse_base (after mlin_seeded)");
 
         let decomp = crate::decomp::DecompBase {
@@ -212,12 +223,36 @@ where
         }
     }
 
-    /// Verify
+    /// Verify a proof **without** statement-binding public inputs.
+    ///
+    /// This is the legacy / generic verifier entrypoint (used by the non-sparse prover paths).
     pub fn verify<P: LinearizedVerify<R>>(&mut self, proof: &PlusProof<R, P>) -> bool {
         for lp in &proof.lproof {
             lp.verify(&mut self.transcript);
         }
         proof.cmproof.verify(&self.M, &mut self.transcript).unwrap();
+        proof
+            .dproof
+            .verify(&proof.linb2x.cm_g, &proof.linb2x.vo, self.params.B);
+        true
+    }
+
+    /// Verify a proof with explicit statement-bound `public_inputs` (SP1/sparse regime).
+    pub fn verify_with_public_inputs<P: LinearizedVerify<R>>(
+        &mut self,
+        proof: &PlusProof<R, P>,
+        public_inputs: &[R::BaseRing],
+    ) -> bool {
+        for x in public_inputs {
+            self.transcript.absorb_field_element(x);
+        }
+        for lp in &proof.lproof {
+            lp.verify(&mut self.transcript);
+        }
+        proof
+            .cmproof
+            .verify_with_mlen_and_public_inputs(self.M.len(), public_inputs, &mut self.transcript)
+            .unwrap();
         proof
             .dproof
             .verify(&proof.linb2x.cm_g, &proof.linb2x.vo, self.params.B);

@@ -368,6 +368,8 @@ pub struct CmShortChallengeWiring {
 pub struct CmFieldChallengeWiring {
     pub c0: Vec<usize>,
     pub c1: Vec<usize>,
+    /// Binding coefficients α (length 1 + public_inputs.len()) when enabled; empty otherwise.
+    pub bind_alpha: Vec<usize>,
     pub rc0: usize,
     pub rc1: usize,
     pub sumcheck_r0: Vec<usize>,
@@ -387,6 +389,7 @@ fn cm_challenge_op_wiring<R>(
     k: usize,
     log_kappa: usize,
     nvars: usize,
+    bind_alpha_len: usize,
     ops_offset: usize,
 ) -> Result<CmChallengeOpWiring, String>
 where
@@ -395,7 +398,7 @@ where
 {
     let d = R::dimension();
     let need_short = 3 + k * d;
-    let need_field = 2 * log_kappa + 2 + 2 * nvars;
+    let need_field = 2 * log_kappa + bind_alpha_len + 2 + 2 * nvars;
 
     if ops_offset > trace.ops.len() {
         return Err("cm_challenge_op_wiring: ops_offset out of range".to_string());
@@ -686,6 +689,11 @@ where
 #[cfg(feature = "we_gate")]
 #[derive(Clone, Debug)]
 struct CmMathWiring {
+    /// Public input BF variables (one per absorbed statement element).
+    public_input_vars: Vec<usize>,
+    /// The Dcom/SetChk sumcheck point `r` (length `nvars`), as local BF vars.
+    /// These must be glued to the corresponding Dcom prefix `r_point_vars` in the Plus/WE relation.
+    r_pre_vars: Vec<usize>,
     short: CmShortChallengeWiring,
     field: CmFieldChallengeWiring,
     /// Flattened BF variables that must equal Poseidon absorb inputs (non-reabsorb absorbs),
@@ -696,6 +704,7 @@ struct CmMathWiring {
 #[cfg(feature = "we_gate")]
 fn cm_verifier_math_dr1cs<R>(
     trace: &PoseidonTranscriptTrace<BF<R>>,
+    public_inputs: &[BF<R>],
     proof: &crate::cm::CmProof<R>,
     k: usize,
     log_kappa: usize,
@@ -727,11 +736,25 @@ where
     let mut b = Dr1csBuilder::<BF<R>>::new();
     b.enforce_var_eq_const(b.one(), BF::<R>::ONE);
 
+    // Public inputs absorbed into the verifier transcript at the start of verification.
+    // These must be available to enforce algebraic statement binding in CM verification.
+    let public_input_vars: Vec<usize> = public_inputs
+        .iter()
+        .copied()
+        .map(|x| b.new_var(x))
+        .collect();
+
     // Extract the exact CmProof coin bytes (short_challenge) and field challenges from the trace,
     // so this part's witness assignment matches the Poseidon part (glue constraints).
     let need_short = 3 + k * d;
     let need_bytes = need_short * d;
-    let need_field = 2 * log_kappa + 2 + 2 * nvars;
+    // Binding coefficients α are present iff statement public inputs are present.
+    let bind_alpha_len = if public_inputs.is_empty() {
+        0usize
+    } else {
+        1 + public_inputs.len()
+    };
+    let need_field = 2 * log_kappa + bind_alpha_len + 2 + 2 * nvars;
 
     let mut short_bytes_vals: Vec<u8> = Vec::with_capacity(need_bytes);
     let mut field_vals: Vec<BF<R>> = Vec::with_capacity(need_field);
@@ -786,7 +809,7 @@ where
     let s = rings[0..3].to_vec();
     let s_prime_flat = rings[3..].to_vec();
 
-    // field challenges: c0,c1,rc0,rc1,sumcheck r0,r1
+    // field challenges: c0,c1,bind_alpha(if any),rc0,rc1,sumcheck r0,r1
     let mut cur = 0usize;
     let c0 = (0..log_kappa)
         .map(|_| {
@@ -796,6 +819,13 @@ where
         })
         .collect::<Vec<_>>();
     let c1 = (0..log_kappa)
+        .map(|_| {
+            let v = b.new_var(field_vals[cur]);
+            cur += 1;
+            v
+        })
+        .collect::<Vec<_>>();
+    let bind_alpha = (0..bind_alpha_len)
         .map(|_| {
             let v = b.new_var(field_vals[cur]);
             cur += 1;
@@ -836,6 +866,7 @@ where
     let field_wiring = CmFieldChallengeWiring {
         c0,
         c1,
+        bind_alpha,
         rc0,
         rc1,
         sumcheck_r0,
@@ -868,6 +899,13 @@ where
             row.push(rv);
         }
         comh_vars.push(row);
+    }
+
+    // --- Domain separator for bind_alpha sampling (native CM absorbs before sampling α) ---
+    if bind_alpha_len != 0 {
+        const BIND_ALPHA_DOMAIN_SEP: u64 = 0xB1A1;
+        let ds = const_var(&mut b, BF::<R>::from(BIND_ALPHA_DOMAIN_SEP));
+        absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat, ds);
     }
 
     // --- Compute u[l][*] from dcom.out.e and s_prime_flat ---
@@ -987,10 +1025,25 @@ where
     let evals0 = extract_evals(&mut b, &proof.evals.0)?;
     let evals1 = extract_evals(&mut b, &proof.evals.1)?;
 
-    // dcom evals for claimed_sum: per l, vectors of len 1+Mlen in (a,b,c)
+    // dcom evals for claimed_sum: per l, vectors of len 1+Mlen in (a,b,c).
+    // CM statement binding adds one extra "virtual slot" per instance (4 terms), so the rc-power
+    // positions of the t(z) terms shift, even though the bind slot contributes 0 to the cube sum.
     let mlen_chunks_usize = mlen_mats;
-    let z_idx = l_instances * (4 + 4 * mlen_chunks_usize);
+    let bind_slot = if bind_alpha_len == 0 { 0usize } else { 1usize };
+    let stride = 4 + 4 * (mlen_chunks_usize + bind_slot);
+    let z_idx = l_instances * stride;
     let max_pow = z_idx + 1;
+
+    // eq(r, ro) where r is dcom.out.r (base ring)
+    // IMPORTANT: in the Plus/WE relation we glue these vars to the transcript-derived SetChk point.
+    let r_pre = proof
+        .dcom
+        .out
+        .r
+        .iter()
+        .copied()
+        .map(|x| b.new_var(bf_from_base_ring::<R>(x)))
+        .collect::<Vec<_>>();
 
     // For each of the two sumchecks, compute:
     // - claimed_sum
@@ -1027,7 +1080,7 @@ where
         let mut claimed_sum = scalar_to_ringvars::<R>(b, BF::<R>::ZERO);
 
         for (l, eval) in proof.dcom.evals.iter().enumerate() {
-            let l_idx = l * (4 + 4 * mlen_chunks_usize);
+            let l_idx = l * stride;
             // a terms are scalars in base ring
             let a0 = b.new_var(bf_from_base_ring::<R>(eval.a[0]));
             let a0pow = scalar_mul::<BF<R>>(b, a0, rc_pows[l_idx]);
@@ -1087,20 +1140,11 @@ where
             r_sc,
         );
 
-        // eq(r, ro) where r is dcom.out.r (base ring)
-        let r_pre = proof
-            .dcom
-            .out
-            .r
-            .iter()
-            .copied()
-            .map(|x| b.new_var(bf_from_base_ring::<R>(x)))
-            .collect::<Vec<_>>();
         let eq = eq_eval_vars::<BF<R>>(b, &r_pre, r_sc);
         let mut eval_acc = scalar_to_ringvars::<R>(b, BF::<R>::ZERO);
 
         for l in 0..l_instances {
-            let l_idx = l * (4 + 4 * mlen_chunks_usize);
+            let l_idx = l * stride;
             let mut inner = scalar_to_ringvars::<R>(b, BF::<R>::ZERO);
             // First group (tau,m_tau,f,h) is evals[l][0]
             let e00 = &evals[l][0][0];
@@ -1128,6 +1172,22 @@ where
                 let t_m3 = ring_scale::<BF<R>>(b, &Mi[3], rc_pows[idx + 3]);
                 inner = ring_add::<BF<R>>(b, &inner, &t_m3);
             }
+            // Bind slot (virtual) chunk
+            if bind_slot == 1 {
+                if evals[l].len() != 1 + mlen_chunks_usize + 1 {
+                    return Err("cm math: evals rows missing bind slot".to_string());
+                }
+                let idx = l_idx + 4 + mlen_chunks_usize * 4;
+                let be = &evals[l][1 + mlen_chunks_usize];
+                let t_b0 = ring_scale::<BF<R>>(b, &be[0], rc_pows[idx]);
+                inner = ring_add::<BF<R>>(b, &inner, &t_b0);
+                let t_b1 = ring_scale::<BF<R>>(b, &be[1], rc_pows[idx + 1]);
+                inner = ring_add::<BF<R>>(b, &inner, &t_b1);
+                let t_b2 = ring_scale::<BF<R>>(b, &be[2], rc_pows[idx + 2]);
+                inner = ring_add::<BF<R>>(b, &inner, &t_b2);
+                let t_b3 = ring_scale::<BF<R>>(b, &be[3], rc_pows[idx + 3]);
+                inner = ring_add::<BF<R>>(b, &inner, &t_b3);
+            }
             // eq * inner
             let eq_ring = scalar_var_to_ringvars::<R>(b, eq);
             let eq_inner = ring_mul_negacyclic::<BF<R>>(b, &eq_ring, &inner);
@@ -1153,6 +1213,63 @@ where
                 absorb_flat.extend_from_slice(&row[1].coeffs);
                 absorb_flat.extend_from_slice(&row[2].coeffs);
                 absorb_flat.extend_from_slice(&row[3].coeffs);
+            }
+        }
+
+        // Algebraic statement binding check:
+        // bind_f == (r0_0*χ0(ro) - (1-r0_0)*χ1(ro)) * L_stmt(public_inputs)
+        if bind_slot == 1 {
+            // L_stmt = α0*1 + Σ α_{i+1} * x_i
+            if field_wiring.bind_alpha.len() != bind_alpha_len {
+                return Err("cm math: bind_alpha wiring length mismatch".to_string());
+            }
+            if bind_alpha_len != 1 + public_input_vars.len() {
+                return Err("cm math: public_inputs length mismatch".to_string());
+            }
+            let mut l_stmt = field_wiring.bind_alpha[0];
+            for (i, &xv) in public_input_vars.iter().enumerate() {
+                let term = scalar_mul::<BF<R>>(b, field_wiring.bind_alpha[1 + i], xv);
+                l_stmt = scalar_add::<BF<R>>(b, l_stmt, term);
+            }
+            // χ0(ro) = (1-ro0)*Π_{i>0}(1-ro_i), χ1(ro) = ro0*Π_{i>0}(1-ro_i)
+            if r_sc.is_empty() {
+                return Err("cm math: empty sumcheck point".to_string());
+            }
+            let one = b.one();
+            let mut chi_rest = one;
+            for &rv in r_sc.iter().skip(1) {
+                let om = scalar_one_minus::<BF<R>>(b, rv);
+                chi_rest = scalar_mul::<BF<R>>(b, chi_rest, om);
+            }
+            let ro0 = r_sc[0];
+            let one_minus_ro0 = scalar_one_minus::<BF<R>>(b, ro0);
+            let chi0 = scalar_mul::<BF<R>>(b, one_minus_ro0, chi_rest);
+            let chi1 = scalar_mul::<BF<R>>(b, ro0, chi_rest);
+            let r0_0 = r_pre[0];
+            let term0 = scalar_mul::<BF<R>>(b, r0_0, chi0);
+            let one_minus_r0_0 = scalar_one_minus::<BF<R>>(b, r0_0);
+            let term1 = scalar_mul::<BF<R>>(b, one_minus_r0_0, chi1);
+            let rhs_coeff = scalar_sub::<BF<R>>(b, term0, term1);
+            let rhs_scalar = scalar_mul::<BF<R>>(b, rhs_coeff, l_stmt);
+
+            // Enforce per-instance bind row shape and value (constant-coeff).
+            for l in 0..l_instances {
+                let be = &evals[l][1 + mlen_chunks_usize];
+                // tau/m_tau/h must be zero ring
+                for rv in [&be[0], &be[1], &be[3]] {
+                    for &c in &rv.coeffs {
+                        b.enforce_var_eq_const(c, BF::<R>::ZERO);
+                    }
+                }
+                // bind_f must be constant-coeff and match rhs
+                if be[2].coeffs.is_empty() {
+                    return Err("cm math: empty ring coeffs".to_string());
+                }
+                let diff = scalar_sub::<BF<R>>(b, be[2].coeffs[0], rhs_scalar);
+                b.enforce_var_eq_const(diff, BF::<R>::ZERO);
+                for &c in be[2].coeffs.iter().skip(1) {
+                    b.enforce_var_eq_const(c, BF::<R>::ZERO);
+                }
             }
         }
         Ok(())
@@ -1186,6 +1303,8 @@ where
         inst,
         asg,
         CmMathWiring {
+            public_input_vars,
+            r_pre_vars: r_pre,
             short: short_wiring,
             field: field_wiring,
             absorb_flat,
@@ -1497,6 +1616,8 @@ struct DcomPrefixMathWiring {
     /// - `Out::verify` absorbs (sumcheck params, prover msgs, verifier randomness absorbs, and `absorb_evaluations(e,b)`)
     /// - `rgchk::absorb_evaluations(dcom.evals)` absorbs (R::from(a_i) then c_i)
     absorb_flat: Vec<usize>,
+    /// The SetChk sumcheck point `r` (length `nvars`), as Poseidon squeeze-field vars.
+    r_point_vars: Vec<usize>,
 }
 
 #[cfg(feature = "we_gate")]
@@ -1652,6 +1773,44 @@ where
     if include_public_inputs_in_absorb {
     for &v in &public_input_vars {
         absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat, v);
+        }
+    }
+
+    // --- rgchk::absorb_fcoms (NEW) ---
+    // Dcom verification now absorbs the witness commitments before running `Out::verify`,
+    // so that all subsequent verifier coins are bound to the committed witness.
+    //
+    // Must match `rgchk::absorb_fcoms_{instances,fcoms}` ordering:
+    // for each instance l: cm_f, C_Mf, cm_mtau.
+    {
+        let kappa: usize = {
+            let k = params.kappa;
+            if k > (usize::MAX as u64) {
+                return Err("dcom/rgchk: kappa too large for usize".to_string());
+            }
+            k as usize
+        };
+        if dcom.fcoms.len() != dcom.evals.len() {
+            return Err("dcom/rgchk: fcoms length mismatch".to_string());
+        }
+        for (l, cmc) in dcom.fcoms.iter().enumerate() {
+            if cmc.cm_f.len() != kappa || cmc.C_Mf.len() != kappa || cmc.cm_mtau.len() != kappa {
+                return Err(format!(
+                    "dcom/rgchk: fcoms[{l}] commitment len mismatch (expected kappa={kappa})"
+                ));
+            }
+            for j in 0..kappa {
+                let rv = ring_to_ringvars::<R>(&mut b, &cmc.cm_f[j]);
+                absorb_flat.extend_from_slice(&rv.coeffs);
+            }
+            for j in 0..kappa {
+                let rv = ring_to_ringvars::<R>(&mut b, &cmc.C_Mf[j]);
+                absorb_flat.extend_from_slice(&rv.coeffs);
+            }
+            for j in 0..kappa {
+                let rv = ring_to_ringvars::<R>(&mut b, &cmc.cm_mtau[j]);
+                absorb_flat.extend_from_slice(&rv.coeffs);
+            }
         }
     }
     // Sumcheck parameter block absorbs.
@@ -1863,6 +2022,7 @@ where
             params_vars,
             public_input_vars,
             absorb_flat,
+            r_point_vars: r_point,
         },
     ))
 }
@@ -2069,7 +2229,7 @@ where
 
     // Short challenges part (bytes -> ring coeffs).
     let (coin_inst, coin_asg, coin_wiring) = cm_short_challenges_dr1cs::<R>(trace, k, 0)?;
-    let op_wiring = cm_challenge_op_wiring::<R>(trace, k, log_kappa, nvars, 0)?;
+    let op_wiring = cm_challenge_op_wiring::<R>(trace, k, log_kappa, nvars, 0, 0)?;
     let (pose_byte_vars, pose_field_vars) =
         cm_poseidon_challenge_vars::<R>(&pose_wiring, &byte_wiring, &op_wiring)?;
 
@@ -2084,9 +2244,14 @@ where
 
     // Field challenges part: allocate local vars with the expected values from the trace,
     // then glue them to the Poseidon squeeze-field vars selected by op wiring.
-    let need_field = 2 * log_kappa + 2 + 2 * nvars;
+    let bind_alpha_len = 0usize;
+    let need_field = 2 * log_kappa + bind_alpha_len + 2 + 2 * nvars;
     if pose_field_vars.len() != need_field {
-        return Err("poseidon field var length mismatch".to_string());
+        return Err(format!(
+            "plus: poseidon field var length mismatch (need={}, got={})",
+            need_field,
+            pose_field_vars.len()
+        ));
     }
     // Extract the matching field values from the trace by scanning SqueezeField ops after short challenges.
     let mut squeezed_field_vals = Vec::with_capacity(need_field);
@@ -2132,12 +2297,21 @@ where
     let rc1 = take(&mut cur, 1, &squeezed_field_vals, &mut b_fields)[0];
     let sumcheck_r1 = take(&mut cur, nvars, &squeezed_field_vals, &mut b_fields);
     let (field_inst, field_asg) = b_fields.into_instance();
-    let field_wiring_local = CmFieldChallengeWiring { c0, c1, rc0, rc1, sumcheck_r0, sumcheck_r1 };
+    let field_wiring_local = CmFieldChallengeWiring {
+        c0,
+        c1,
+        bind_alpha: Vec::new(),
+        rc0,
+        rc1,
+        sumcheck_r0,
+        sumcheck_r1,
+    };
 
     // Glue local field vars to selected Poseidon squeeze-field vars in order.
     let mut local_field_vars = Vec::with_capacity(need_field);
     local_field_vars.extend_from_slice(&field_wiring_local.c0);
     local_field_vars.extend_from_slice(&field_wiring_local.c1);
+    local_field_vars.extend_from_slice(&field_wiring_local.bind_alpha);
     local_field_vars.push(field_wiring_local.rc0);
     local_field_vars.extend_from_slice(&field_wiring_local.sumcheck_r0);
     local_field_vars.push(field_wiring_local.rc1);
@@ -2181,6 +2355,24 @@ where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + Field,
 {
+    // Detect whether this CmProof contains the algebraic statement-binding slot.
+    // (Generic Cm proofs do not; sparse/SP1 path does.)
+    let cm_has_bind_slot = {
+        let expected_rows = 1 + mlen_mats + 1;
+        proof
+            .evals
+            .0
+            .get(0)
+            .map(|ie| ie.rows().len() == expected_rows)
+            .unwrap_or(false)
+    };
+    let bind_alpha_len = if cm_has_bind_slot {
+        1 + public_inputs.len()
+    } else {
+        0usize
+    };
+    let cm_public_inputs_for_math: &[BF<R>] = if cm_has_bind_slot { public_inputs } else { &[] };
+
     // Hygiene: CmProof is a standalone verifier relation, so its transcript segment begins at 0.
     let ops_offset = 0usize;
     let absorb_op_offset = 0usize;
@@ -2242,13 +2434,13 @@ where
         let coin_build = || {
             let t = std::time::Instant::now();
     let (coin_inst, coin_asg, coin_wiring) = cm_short_challenges_dr1cs::<R>(trace, k, 0)?;
-    let op_wiring = cm_challenge_op_wiring::<R>(trace, k, log_kappa, nvars, 0)?;
+    let op_wiring = cm_challenge_op_wiring::<R>(trace, k, log_kappa, nvars, bind_alpha_len, 0)?;
             Ok::<_, String>((coin_inst, coin_asg, coin_wiring, op_wiring, t.elapsed()))
         };
         let cm_build = || {
             let t = std::time::Instant::now();
             let (cm_inst, cm_asg, cm_wiring) =
-                cm_verifier_math_dr1cs::<R>(trace, proof, k, log_kappa, nvars, mlen_mats, 0)?;
+            cm_verifier_math_dr1cs::<R>(trace, cm_public_inputs_for_math, proof, k, log_kappa, nvars, mlen_mats, 0)?;
             Ok::<_, String>((cm_inst, cm_asg, cm_wiring, t.elapsed()))
         };
 
@@ -2279,9 +2471,13 @@ where
     }
 
     // Field challenge local vars (same as in build_we_dr1cs_for_cm_challenges).
-    let need_field = 2 * log_kappa + 2 + 2 * nvars;
+    let need_field = 2 * log_kappa + bind_alpha_len + 2 + 2 * nvars;
     if pose_field_vars.len() != need_field {
-        return Err("poseidon field var length mismatch".to_string());
+        return Err(format!(
+            "cm_challenges: poseidon field var length mismatch (need={}, got={})",
+            need_field,
+            pose_field_vars.len()
+        ));
     }
     let mut squeezed_field_vals = Vec::with_capacity(need_field);
     let mut seen_first_bytes = false;
@@ -2326,12 +2522,21 @@ where
     let rc1 = take(&mut cur, 1, &squeezed_field_vals, &mut b_fields)[0];
     let sumcheck_r1 = take(&mut cur, nvars, &squeezed_field_vals, &mut b_fields);
     let (field_inst, field_asg) = b_fields.into_instance();
-    let field_wiring_local = CmFieldChallengeWiring { c0, c1, rc0, rc1, sumcheck_r0, sumcheck_r1 };
+    let field_wiring_local = CmFieldChallengeWiring {
+        c0,
+        c1,
+        bind_alpha: Vec::new(),
+        rc0,
+        rc1,
+        sumcheck_r0,
+        sumcheck_r1,
+    };
 
     // Glue local field vars to Poseidon squeeze-field vars.
     let mut local_field_vars = Vec::with_capacity(need_field);
     local_field_vars.extend_from_slice(&field_wiring_local.c0);
     local_field_vars.extend_from_slice(&field_wiring_local.c1);
+    local_field_vars.extend_from_slice(&field_wiring_local.bind_alpha);
     local_field_vars.push(field_wiring_local.rc0);
     local_field_vars.extend_from_slice(&field_wiring_local.sumcheck_r0);
     local_field_vars.push(field_wiring_local.rc1);
@@ -2350,6 +2555,14 @@ where
         glue.push((5, *cv, 4, *lv));
     }
     for (cv, lv) in cm_wiring.field.c1.iter().zip(field_wiring_local.c1.iter()) {
+        glue.push((5, *cv, 4, *lv));
+    }
+    for (cv, lv) in cm_wiring
+        .field
+        .bind_alpha
+        .iter()
+        .zip(field_wiring_local.bind_alpha.iter())
+    {
         glue.push((5, *cv, 4, *lv));
     }
     glue.push((5, cm_wiring.field.rc0, 4, field_wiring_local.rc0));
@@ -2728,6 +2941,25 @@ where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + Field,
 {
+    let cm_has_bind_slot = {
+        let expected_rows = 1 + mlen_mats + 1;
+        proof
+            .cmproof
+            .evals
+            .0
+            .get(0)
+            .map(|ie| ie.rows().len() == expected_rows)
+            .unwrap_or(false)
+    };
+    // SP1/WE usage invariant: statement public inputs are mandatory, and the CM proof must include
+    // the bind slot so the WE gate enforces algebraic statement binding.
+    if public_inputs.is_empty() {
+        return Err("build_we_dr1cs_for_plus_proof: public_inputs must be non-empty".to_string());
+    }
+    if !cm_has_bind_slot {
+        return Err("build_we_dr1cs_for_plus_proof: CM bind slot missing in proof".to_string());
+    }
+
     // Hygiene + soundness: bind the trace to the verifier *program*.
     //
     // We deterministically consume the transcript op sequence induced by:
@@ -2846,6 +3078,23 @@ where
         let dcom = &proof.cmproof.dcom;
         let out = &dcom.out;
 
+        // NEW (rgchk): Dcom verification now absorbs witness commitments (`fcoms`) before any
+        // verifier coins are drawn (so subsequent coins are bound to the committed witness).
+        //
+        // Must match `rgchk::absorb_fcoms_fcoms` ordering:
+        // for each instance l: cm_f, C_Mf, cm_mtau (each length κ ring elements).
+        for cmc in &dcom.fcoms {
+            for _ in 0..cmc.cm_f.len() {
+                expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+            }
+            for _ in 0..cmc.C_Mf.len() {
+                expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+            }
+            for _ in 0..cmc.cm_mtau.len() {
+                expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+            }
+        }
+
         // Out::verify (SetChk) transcript coins.
         let nclaims = out.e[0].len() + out.b.len();
         for _ in 0..nclaims {
@@ -2912,6 +3161,15 @@ where
         for _ in 0..(2 * log_kappa) {
             expect_get_challenge(&mut op_idx, &mut absorb_ops, &mut squeezed_field_elems)?;
         }
+
+        // Domain separator before sampling bind_alpha.
+        expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+
+        // Statement-binding coefficients α = get_challenges(1 + public_inputs.len()).
+        for _ in 0..(1 + public_inputs.len()) {
+            expect_get_challenge(&mut op_idx, &mut absorb_ops, &mut squeezed_field_elems)?;
+        }
+        
 
         // Two CM sumchecks (degree=2) + eval table absorbs.
         let nvars_cm = params.nvars_cm as usize;
@@ -3033,7 +3291,15 @@ where
         let coin_build = || {
             let (coin_inst, coin_asg, coin_wiring) =
                 cm_short_challenges_dr1cs::<R>(trace, k, cm_ops_offset)?;
-            let op_wiring = cm_challenge_op_wiring::<R>(trace, k, log_kappa, nvars, cm_ops_offset)?;
+            let bind_alpha_len = 1 + public_inputs.len();
+            let op_wiring = cm_challenge_op_wiring::<R>(
+                trace,
+                k,
+                log_kappa,
+                nvars,
+                bind_alpha_len,
+                cm_ops_offset,
+            )?;
             Ok::<_, String>((coin_inst, coin_asg, coin_wiring, op_wiring))
         };
 
@@ -3041,8 +3307,17 @@ where
             // Extract the matching field values from the trace using the canonical op wiring.
             // This avoids subtle bugs where we collect the right *count* of squeezes but slice them
             // differently than the Poseidon wiring/glue expects.
-            let op_wiring = cm_challenge_op_wiring::<R>(trace, k, log_kappa, nvars, cm_ops_offset)?;
-            let need_field = 2 * log_kappa + 2 + 2 * nvars;
+            let bind_alpha_len = 1 + public_inputs.len();
+            let op_wiring = cm_challenge_op_wiring::<R>(
+                trace,
+                k,
+                log_kappa,
+                nvars,
+                bind_alpha_len,
+                cm_ops_offset,
+            )?;
+            let bind_alpha_len = 1 + public_inputs.len();
+            let need_field = 2 * log_kappa + bind_alpha_len + 2 + 2 * nvars;
             if op_wiring.squeeze_field_ops.len() != need_field {
                 return Err("field_build: squeeze_field op wiring length mismatch".to_string());
             }
@@ -3084,6 +3359,7 @@ where
             };
             let c0 = take(&mut cur, log_kappa, &squeezed_field_vals, &mut b_fields);
             let c1 = take(&mut cur, log_kappa, &squeezed_field_vals, &mut b_fields);
+            let bind_alpha = take(&mut cur, bind_alpha_len, &squeezed_field_vals, &mut b_fields);
             let rc0 = take(&mut cur, 1, &squeezed_field_vals, &mut b_fields)[0];
             let sumcheck_r0 = take(&mut cur, nvars, &squeezed_field_vals, &mut b_fields);
             let rc1 = take(&mut cur, 1, &squeezed_field_vals, &mut b_fields)[0];
@@ -3092,6 +3368,7 @@ where
             let field_wiring_local = CmFieldChallengeWiring {
                 c0,
                 c1,
+                bind_alpha,
                 rc0,
                 rc1,
                 sumcheck_r0,
@@ -3103,6 +3380,7 @@ where
         let cm_build = || {
             cm_verifier_math_dr1cs::<R>(
                 trace,
+                public_inputs,
                 &proof.cmproof,
                 k,
                 log_kappa,
@@ -3177,9 +3455,14 @@ where
 
     // Field challenges part: allocate local vars with the expected values from the trace,
     // then glue them to the Poseidon squeeze-field vars selected by op wiring.
-    let need_field = 2 * log_kappa + 2 + 2 * nvars;
+    let bind_alpha_len = 1 + public_inputs.len();
+    let need_field = 2 * log_kappa + bind_alpha_len + 2 + 2 * nvars;
     if pose_field_vars.len() != need_field {
-        return Err("poseidon field var length mismatch".to_string());
+        return Err(format!(
+            "plus: poseidon field var length mismatch (need={}, got={})",
+            need_field,
+            pose_field_vars.len()
+        ));
     }
 
     // Glue Π_lin challenges (prefix squeeze-field) to Poseidon squeeze-field vars.
@@ -3246,12 +3529,14 @@ where
     let glue_cap = lin_ch_vars.len()
         + stmt_absorb_flat.len()
         + stmt_pub_vars.len()
+        + cm_wiring.public_input_vars.len()
         + lin_absorb_flat.len()
         + pose_byte_vars.len()
         + need_field
         + cm_wiring.short.byte_vars.len()
         + cm_wiring.field.c0.len()
         + cm_wiring.field.c1.len()
+        + cm_wiring.field.bind_alpha.len()
         + 2 /* rc0/rc1 */
         + cm_wiring.field.sumcheck_r0.len()
         + cm_wiring.field.sumcheck_r1.len()
@@ -3288,6 +3573,22 @@ where
         glue.push((1, *pv, 3, *sv));
     }
 
+    // Glue statement public inputs into the CM math gadget (used for algebraic statement binding).
+    if cm_wiring.public_input_vars.len() != stmt_pub_vars.len() {
+        return Err("plus: cm/public input length mismatch".to_string());
+    }
+    for (sv, cv) in stmt_pub_vars.iter().zip(cm_wiring.public_input_vars.iter()) {
+        glue.push((3, *sv, 7, *cv));
+    }
+
+    // Glue the SetChk sumcheck point `r` from the Dcom prefix into the CM math gadget.
+    if dcom_wiring.r_point_vars.len() != cm_wiring.r_pre_vars.len() {
+        return Err("plus: dcom/cm r length mismatch".to_string());
+    }
+    for (rv, cv) in dcom_wiring.r_point_vars.iter().zip(cm_wiring.r_pre_vars.iter()) {
+        glue.push((4, *rv, 7, *cv));
+    }
+
     // Glue Π_lin absorbs over the remaining prefix [absorb_ops_before_first_sf..cm_absorb_op_offset).
     if cm_absorb_op_offset > pose_wiring.absorb_ranges.len() {
         return Err("plus: cm_absorb_op_offset out of range".to_string());
@@ -3322,6 +3623,7 @@ where
     let mut local_field_vars = Vec::with_capacity(need_field);
     local_field_vars.extend_from_slice(&field_wiring_local.c0);
     local_field_vars.extend_from_slice(&field_wiring_local.c1);
+    local_field_vars.extend_from_slice(&field_wiring_local.bind_alpha);
     local_field_vars.push(field_wiring_local.rc0);
     local_field_vars.extend_from_slice(&field_wiring_local.sumcheck_r0);
     local_field_vars.push(field_wiring_local.rc1);
@@ -3343,6 +3645,14 @@ where
         glue.push((7, *cv, 6, *lv));
     }
     for (cv, lv) in cm_wiring.field.c1.iter().zip(field_wiring_local.c1.iter()) {
+        glue.push((7, *cv, 6, *lv));
+    }
+    for (cv, lv) in cm_wiring
+        .field
+        .bind_alpha
+        .iter()
+        .zip(field_wiring_local.bind_alpha.iter())
+    {
         glue.push((7, *cv, 6, *lv));
     }
     glue.push((7, cm_wiring.field.rc0, 6, field_wiring_local.rc0));
@@ -3436,6 +3746,16 @@ where
     }
     for (pv, lv) in pose_abs_prefix.iter().zip(dcom_wiring.absorb_flat.iter()) {
         glue.push((0, *pv, 4, *lv));
+    }
+
+    // Glue SetChk sumcheck point `r` into CM math.
+    // In the standalone CmProof WE relation we still have the Dcom prefix, so we must tie
+    // the `dcom.out.r` used by CM verification to the transcript-derived `r`.
+    if dcom_wiring.r_point_vars.len() != cm_wiring.r_pre_vars.len() {
+        return Err("cm_proof: dcom/cm r length mismatch".to_string());
+    }
+    for (rv, cv) in dcom_wiring.r_point_vars.iter().zip(cm_wiring.r_pre_vars.iter()) {
+        glue.push((2, *rv, 5, *cv));
     }
 
     // Glue Cm absorb surface (non-reabsorb absorbs starting at Cm segment) to Poseidon absorb vars.
@@ -4204,10 +4524,7 @@ mod tests {
                 pparams.clone(),
                 transcript,
             );
-            for b in sp1_digest_bits {
-                prover.transcript.absorb_field_element(b);
-            }
-            let proof = prover.prove_sparse_base(std::slice::from_ref(&cr1cs));
+            let proof = prover.prove_sparse_base(std::slice::from_ref(&cr1cs), sp1_digest_bits);
             eprintln!("[test_large_trace] plus.prove: {:?}", t0.elapsed());
 
             let t1 = std::time::Instant::now();
@@ -4221,7 +4538,7 @@ mod tests {
             }
             proof
                 .cmproof
-                .verify_with_mlen(m0.len(), &mut rec)
+                .verify_with_mlen_and_public_inputs(m0.len(), sp1_digest_bits, &mut rec)
                 .expect("cm verify");
             let trace = rec.trace().clone();
             eprintln!("[test_large_trace] plus.verify(record): {:?}", t1.elapsed());
@@ -4468,12 +4785,16 @@ mod tests {
         let c = SparseMatrix::<BR> { nrows: n, ncols: n, coeffs: zero_rows };
         let r1cs = R1CS::<BR> { l: 0, A: a, B: b, C: c };
 
-        // Constant-coeff witness prefix. Keep values tiny; the protocol is still well-defined.
-        let f0: Arc<Vec<BR>> = Arc::new(
-            (0..n)
-                .map(|i| if i == 0 { BR::ONE } else { BR::ZERO })
-                .collect(),
-        );
+        // Constant-coeff witness with statement-bound public prefix:
+        // z[0]=1, z[1+i]=public_inputs[i] for i in 0..public_inputs.len().
+        let f0: Arc<Vec<BR>> = {
+            let mut v = vec![BR::ZERO; n];
+            v[0] = BR::ONE;
+            for (i, &x) in public_inputs.iter().enumerate() {
+                v[1 + i] = x.into();
+            }
+            Arc::new(v)
+        };
 
         let cr1cs = ComR1CSBase::<RR>::from_f0_seeded_base(r1cs, f0, 0, &ajtai);
         let m0 = cr1cs.x.matrices_arc_base();
@@ -4526,10 +4847,13 @@ mod tests {
             pparams.clone(),
             PoseidonTranscript::empty::<PCF>(),
         );
-        for b in &public_inputs {
-            prover.transcript.absorb_field_element(b);
-        }
-        let proof = prover.prove_sparse_base(std::slice::from_ref(&cr1cs));
+        let proof = prover.prove_sparse_base(std::slice::from_ref(&cr1cs), &public_inputs);
+        // Binding must be enabled in sparse/WE regime.
+        assert_eq!(
+            proof.cmproof.evals.0[0].rows().len(),
+            1 + m0.len() + 1,
+            "cm bind slot missing in prover output"
+        );
 
         // Record verifier trace (mirror the SP1 oneproof harness).
         let poseidon_cfg = PCF::get_poseidon_config();
@@ -4542,7 +4866,7 @@ mod tests {
         }
         proof
             .cmproof
-            .verify_with_mlen(m0.len(), &mut rec)
+            .verify_with_mlen_and_public_inputs(m0.len(), &public_inputs, &mut rec)
             .expect("cm verify (record)");
         let trace = rec.trace().clone();
 
