@@ -60,6 +60,9 @@ pub struct ComR1CSXBase<R: Ring + PolyRing> {
     pub l_in: usize,
     pub l: usize,
     pub cm_f: Vec<R>, // kappa
+    /// Statement public inputs (length = l_in). These are used to override the witness prefix
+    /// for paper-faithful `z = (1, x_ccs, w_priv)` semantics in `ComR1CSBase::linearize`.
+    pub x_ccs: Arc<Vec<R::BaseRing>>,
 }
 
 #[derive(Clone, Debug)]
@@ -190,6 +193,7 @@ impl<R: Decompose + Ring + PolyRing> ComR1CS<R> {
             f: WitnessVec::ConstCoeffBase {
                 values: f0,
                 domain_len: n,
+                prefix: None,
             },
         }
     }
@@ -208,6 +212,7 @@ impl<R: Decompose + Ring + PolyRing> ComR1CSBase<R> {
         r1cs: R1CS<R::BaseRing>,
         f0: Arc<Vec<R::BaseRing>>,
         l_in: usize,
+        x_ccs: Arc<Vec<R::BaseRing>>,
         scheme: &AjtaiCommitmentScheme<R>,
     ) -> Self
     where
@@ -218,8 +223,20 @@ impl<R: Decompose + Ring + PolyRing> ComR1CSBase<R> {
         let cm_f = scheme
             .commit_many_const_coeff_base_fast(n, 1, {
                 let f0 = f0.clone();
+                let x_ccs = x_ccs.clone();
                 move |j, out| {
-                    out[0] = f0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
+                    // Paper-faithful witness oracle semantics:
+                    // z = (1, x_ccs, w_priv)
+                    out[0] = if j == 0 {
+                        R::BaseRing::ONE
+                    } else if j <= l_in {
+                        x_ccs
+                            .get(j - 1)
+                            .copied()
+                            .unwrap_or(R::BaseRing::ZERO)
+                    } else {
+                        f0.get(j).copied().unwrap_or(R::BaseRing::ZERO)
+                    };
                 }
             })
             .expect("commit_many_const_coeff_base_fast (f0 padded)")
@@ -236,12 +253,19 @@ impl<R: Decompose + Ring + PolyRing> ComR1CSBase<R> {
             cm_f,
             l_in,
             l,
+            x_ccs: x_ccs.clone(),
         };
         Self {
             x,
             f: WitnessVec::ConstCoeffBase {
                 values: f0,
                 domain_len: n,
+                prefix: Some({
+                    let mut p = Vec::with_capacity(1 + l_in);
+                    p.push(R::BaseRing::ONE);
+                    p.extend(x_ccs.iter().copied());
+                    Arc::new(p)
+                }),
             },
         }
     }
@@ -333,6 +357,7 @@ impl<R: OverField + PolyRing> Linearize<R> for ComR1CS<R> {
                     },
                     StreamingMleEnum::BaseScalarArc {
                         evals: f0.clone(),
+                        prefix: None,
                         num_vars: nvars,
                         square: false,
                     },
@@ -403,20 +428,44 @@ impl<R: OverField + PolyRing> Linearize<R> for ComR1CSBase<R> {
             StreamingMleEnum::SparseMatVecConstCoeffBase {
                 matrix: self.x.a.clone(),
                 witness0: f0.clone(),
+                prefix: Some({
+                    let mut p = Vec::with_capacity(1 + self.x.l_in);
+                    p.push(R::BaseRing::ONE);
+                    p.extend(self.x.x_ccs.iter().copied());
+                    Arc::new(p)
+                }),
                 num_vars: nvars,
             },
             StreamingMleEnum::SparseMatVecConstCoeffBase {
                 matrix: self.x.b.clone(),
                 witness0: f0.clone(),
+                prefix: Some({
+                    let mut p = Vec::with_capacity(1 + self.x.l_in);
+                    p.push(R::BaseRing::ONE);
+                    p.extend(self.x.x_ccs.iter().copied());
+                    Arc::new(p)
+                }),
                 num_vars: nvars,
             },
             StreamingMleEnum::SparseMatVecConstCoeffBase {
                 matrix: self.x.c.clone(),
                 witness0: f0.clone(),
+                prefix: Some({
+                    let mut p = Vec::with_capacity(1 + self.x.l_in);
+                    p.push(R::BaseRing::ONE);
+                    p.extend(self.x.x_ccs.iter().copied());
+                    Arc::new(p)
+                }),
                 num_vars: nvars,
             },
             StreamingMleEnum::BaseScalarArc {
                 evals: f0.clone(),
+                prefix: Some({
+                    let mut p = Vec::with_capacity(1 + self.x.l_in);
+                    p.push(R::BaseRing::ONE);
+                    p.extend(self.x.x_ccs.iter().copied());
+                    Arc::new(p)
+                }),
                 num_vars: nvars,
                 square: false,
             },

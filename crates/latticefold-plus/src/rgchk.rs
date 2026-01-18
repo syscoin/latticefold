@@ -254,6 +254,14 @@ pub enum WitnessVec<R: PolyRing> {
     ConstCoeffBase {
         values: Arc<Vec<R::BaseRing>>,
         domain_len: usize,
+        /// Optional fixed prefix override for statement binding.
+        ///
+        /// Semantics: for indices `j < prefix.len()`, the witness value is `prefix[j]`
+        /// regardless of what is stored in `values[j]`.
+        ///
+        /// This is used to enforce paper-faithful SP1 semantics `z = (1, x_ccs, w_priv)`
+        /// without cloning/mutating the full witness table.
+        prefix: Option<Arc<Vec<R::BaseRing>>>,
     },
 }
 
@@ -1237,6 +1245,7 @@ where
     /// ring elements (the SP1 production regime).
     pub fn from_f0_seeded(
         f0: Arc<Vec<R::BaseRing>>,
+        prefix: Option<Arc<Vec<R::BaseRing>>>,
         scheme: &AjtaiCommitmentScheme<R>,
         decomp: &DecompParameters,
     ) -> Self {
@@ -1474,10 +1483,15 @@ where
         let cm_pair = scheme
             .commit_many_const_coeff_base_fast(n, 2, {
                 let f0 = f0.clone();
+                let prefix = prefix.clone();
                 let tau0 = tau0.clone();
                 move |j, out| {
-                    // f0 is a prefix; missing entries are implicit zeros.
-                    out[0] = f0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
+                    // Paper-faithful prefix override: indices < prefix.len() are statement elements.
+                    out[0] = prefix
+                        .as_ref()
+                        .and_then(|p| p.get(j).copied())
+                        .or_else(|| f0.get(j).copied())
+                        .unwrap_or(R::BaseRing::ZERO);
                     out[1] = tau0[j];
                 }
             })
@@ -1507,6 +1521,7 @@ where
             f: WitnessVec::ConstCoeffBase {
                 values: f0,
                 domain_len: n,
+                prefix,
             },
             comM_f,
             fcoms,
@@ -1578,9 +1593,25 @@ where
 {
     match v {
         WitnessVec::Ring(vr) => eval_vec_coeffs_at_point_streaming::<R>(vr.as_ref(), r, one_minus_r),
-        WitnessVec::ConstCoeffBase { values: v0, .. } => {
+        WitnessVec::ConstCoeffBase { values: v0, prefix, .. } => {
             let mut out = vec![R::BaseRing::ZERO; R::dimension()];
-            out[0] = dot_base_streaming::<R>(v0.as_ref(), r, one_minus_r);
+            let mut acc = dot_base_streaming::<R>(v0.as_ref(), r, one_minus_r);
+            if let Some(p) = prefix.as_ref() {
+                // Correct the first |p| entries to reflect the statement override.
+                for (j, &pj) in p.iter().enumerate() {
+                    let vj = v0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
+                    if pj == vj {
+                        continue;
+                    }
+                    let mut w = R::BaseRing::ONE;
+                    for i in 0..r.len() {
+                        let bit = ((j >> i) & 1) == 1;
+                        w *= if bit { r[i] } else { one_minus_r[i] };
+                    }
+                    acc += (pj - vj) * w;
+                }
+            }
+            out[0] = acc;
             out
         }
     }
@@ -1597,9 +1628,107 @@ where
 {
     match v {
         WitnessVec::Ring(vr) => dot_ring_streaming::<R>(vr.as_ref(), r, one_minus_r),
-        WitnessVec::ConstCoeffBase { values: v0, .. } => {
-            R::from(dot_base_streaming::<R>(v0.as_ref(), r, one_minus_r))
+        WitnessVec::ConstCoeffBase { values: v0, prefix, .. } => {
+            let mut acc = dot_base_streaming::<R>(v0.as_ref(), r, one_minus_r);
+            if let Some(p) = prefix.as_ref() {
+                for (j, &pj) in p.iter().enumerate() {
+                    let vj = v0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
+                    if pj == vj {
+                        continue;
+                    }
+                    let mut w = R::BaseRing::ONE;
+                    for i in 0..r.len() {
+                        let bit = ((j >> i) & 1) == 1;
+                        w *= if bit { r[i] } else { one_minus_r[i] };
+                    }
+                    acc += (pj - vj) * w;
+                }
+            }
+            R::from(acc)
         }
+    }
+}
+
+fn sparse_mat_vec_eval_ct_streaming_prefixed<R: PolyRing>(
+    m: &SparseMatrix<R>,
+    witness0: &[R::BaseRing],
+    prefix: &[R::BaseRing],
+    r: &[R::BaseRing],
+    one_minus_r: &[R::BaseRing],
+) -> R::BaseRing
+where
+    R::BaseRing: Ring,
+{
+    debug_assert_eq!(r.len(), one_minus_r.len());
+    let nvars = r.len();
+    let n = m.nrows;
+    let t = choose_t_low(nvars);
+    let low = build_eq_low_table::<R>(&r[..t], &one_minus_r[..t]);
+    let low_len = 1usize << t;
+    let high_bits = nvars - t;
+    let high_len = ((n + low_len - 1) / low_len).min(1usize << high_bits);
+    #[cfg(feature = "parallel")]
+    {
+        (0..high_len)
+            .into_par_iter()
+            .map(|h| {
+                let scale = eq_scale_for_high_bits::<R>(h, r, one_minus_r, t);
+                let base = h * low_len;
+                let mut acc = R::BaseRing::ZERO;
+                for i in 0..low_len {
+                    let row_idx = base + i;
+                    if row_idx >= n {
+                        break;
+                    }
+                    let w_row = scale * low[i];
+                    let row = &m.coeffs[row_idx];
+                    let mut sum0 = R::BaseRing::ZERO;
+                    for (coeff, col_idx) in row {
+                        let cj = *col_idx;
+                        let wj = prefix
+                            .get(cj)
+                            .copied()
+                            .or_else(|| witness0.get(cj).copied())
+                            .unwrap_or(R::BaseRing::ZERO);
+                        if wj != R::BaseRing::ZERO {
+                            sum0 += coeff.coeffs()[0] * wj;
+                        }
+                    }
+                    acc += sum0 * w_row;
+                }
+                acc
+            })
+            .reduce(|| R::BaseRing::ZERO, |a, b| a + b)
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut acc = R::BaseRing::ZERO;
+        for h in 0..high_len {
+            let scale = eq_scale_for_high_bits::<R>(h, r, one_minus_r, t);
+            let base = h * low_len;
+            for i in 0..low_len {
+                let row_idx = base + i;
+                if row_idx >= n {
+                    break;
+                }
+                let w_row = scale * low[i];
+                let row = &m.coeffs[row_idx];
+                let mut sum0 = R::BaseRing::ZERO;
+                for (coeff, col_idx) in row {
+                    let cj = *col_idx;
+                    let wj = prefix
+                        .get(cj)
+                        .copied()
+                        .or_else(|| witness0.get(cj).copied())
+                        .unwrap_or(R::BaseRing::ZERO);
+                    if wj != R::BaseRing::ZERO {
+                        sum0 += coeff.coeffs()[0] * wj;
+                    }
+                }
+                acc += sum0 * w_row;
+            }
+        }
+        acc
     }
 }
 
@@ -1615,8 +1744,18 @@ where
 {
     match witness {
         WitnessVec::Ring(vr) => sparse_mat_vec_eval_ring_streaming::<R>(m, vr.as_ref(), r, one_minus_r),
-        WitnessVec::ConstCoeffBase { values: v0, .. } => {
-            R::from(sparse_mat_vec_eval_ct_streaming::<R>(m, v0.as_ref(), r, one_minus_r))
+        WitnessVec::ConstCoeffBase { values: v0, prefix, .. } => {
+            if let Some(p) = prefix.as_ref() {
+                R::from(sparse_mat_vec_eval_ct_streaming_prefixed::<R>(
+                    m,
+                    v0.as_ref(),
+                    p.as_ref(),
+                    r,
+                    one_minus_r,
+                ))
+            } else {
+                R::from(sparse_mat_vec_eval_ct_streaming::<R>(m, v0.as_ref(), r, one_minus_r))
+            }
         }
     }
 }

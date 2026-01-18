@@ -61,11 +61,20 @@ where
                     // Non-seeded path is used only for small/unit tests; cloning here is OK.
                     RgInstance::from_f(vr.as_ref().clone(), A, &self.params.decomp)
                 }
-                crate::rgchk::WitnessVec::ConstCoeffBase { values: v0, domain_len } => {
+                crate::rgchk::WitnessVec::ConstCoeffBase { values: v0, domain_len, prefix } => {
                     // Fallback for non-seeded path: materialize ring elements (zero-padded).
                     let mut f_ring = vec![R::ZERO; *domain_len];
+                    if let Some(p) = prefix.as_ref() {
+                        for (i, &pi) in p.iter().enumerate() {
+                            if i < f_ring.len() {
+                                f_ring[i] = R::from(pi);
+                            }
+                        }
+                    }
                     for (i, &x) in v0.iter().enumerate() {
-                        f_ring[i] = R::from(x);
+                        if prefix.as_ref().and_then(|p| p.get(i)).is_none() {
+                            f_ring[i] = R::from(x);
+                        }
                     }
                     RgInstance::from_f(f_ring, A, &self.params.decomp)
                 }
@@ -166,7 +175,7 @@ where
         let mut n_ring = 0usize;
         for (i, lin) in self.lins.iter().enumerate() {
             match &lin.f {
-                crate::rgchk::WitnessVec::ConstCoeffBase { values: v0, .. } => {
+                crate::rgchk::WitnessVec::ConstCoeffBase { values: v0, prefix, .. } => {
                     n_f0 += 1;
                     if profile {
                         println!(
@@ -176,6 +185,7 @@ where
                     }
                     instances.push(RgInstance::from_f0_seeded(
                         v0.clone(),
+                        prefix.clone(),
                         scheme,
                         &self.params.decomp,
                     ));
@@ -288,7 +298,7 @@ where
         let mut n_ring = 0usize;
         for (i, lin) in self.lins.iter().enumerate() {
             match &lin.f {
-                crate::rgchk::WitnessVec::ConstCoeffBase { values: v0, .. } => {
+                crate::rgchk::WitnessVec::ConstCoeffBase { values: v0, prefix, .. } => {
                     n_f0 += 1;
                     if profile {
                         println!(
@@ -298,6 +308,7 @@ where
                     }
                     instances.push(RgInstance::from_f0_seeded(
                         v0.clone(),
+                        prefix.clone(),
                         scheme,
                         &self.params.decomp,
                     ));

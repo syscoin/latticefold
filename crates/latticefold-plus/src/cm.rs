@@ -1083,6 +1083,7 @@ where
             // Use BaseScalarArc whenever available; otherwise use DenseArc.
             mles.push(StreamingMleEnum::BaseScalarArc {
                 evals: tau0_arc.clone(),
+                prefix: None,
                 num_vars: nvars,
                 square: false,
             });
@@ -1093,6 +1094,7 @@ where
             if mtau_cc {
                 mles.push(StreamingMleEnum::BaseScalarArc {
                     evals: mtau0_arc.as_ref().unwrap().clone(),
+                    prefix: None,
                     num_vars: nvars,
                     square: false,
                 });
@@ -1138,6 +1140,7 @@ where
             if f_cc {
                 mles.push(StreamingMleEnum::BaseScalarArc {
                     evals: f0_arc.as_ref().unwrap().clone(),
+                    prefix: None,
                     num_vars: nvars,
                     square: false,
                 });
@@ -1153,6 +1156,7 @@ where
             if h_cc {
                 mles.push(StreamingMleEnum::BaseScalarArc {
                     evals: h0_arc.as_ref().unwrap().clone(),
+                    prefix: None,
                     num_vars: nvars,
                     square: false,
                 });
@@ -1517,6 +1521,7 @@ where
 
             mles.push(StreamingMleEnum::BaseScalarArc {
                 evals: tau0_arc.clone(),
+                prefix: None,
                 num_vars: nvars,
                 square: false,
             });
@@ -1527,6 +1532,7 @@ where
             if mtau_cc {
                 mles.push(StreamingMleEnum::BaseScalarArc {
                     evals: mtau0_arc.as_ref().unwrap().clone(),
+                    prefix: None,
                     num_vars: nvars,
                     square: false,
                 });
@@ -1574,6 +1580,7 @@ where
             if f_cc {
                 mles.push(StreamingMleEnum::BaseScalarArc {
                     evals: f0_arc.as_ref().unwrap().clone(),
+                    prefix: None,
                     num_vars: nvars,
                     square: false,
                 });
@@ -1977,6 +1984,7 @@ where
 
             mles.push(StreamingMleEnum::BaseScalarArc {
                 evals: tau0_arc.clone(),
+                prefix: None,
                 num_vars: nvars,
                 square: false,
             });
@@ -1987,6 +1995,7 @@ where
             if mtau_cc {
                 mles.push(StreamingMleEnum::BaseScalarArc {
                     evals: mtau0_arc.as_ref().unwrap().clone(),
+                    prefix: None,
                     num_vars: nvars,
                     square: false,
                 });
@@ -2033,6 +2042,7 @@ where
             if f_cc {
                 mles.push(StreamingMleEnum::BaseScalarArc {
                     evals: f0_arc.as_ref().unwrap().clone(),
+                    prefix: None,
                     num_vars: nvars,
                     square: false,
                 });
@@ -2049,6 +2059,7 @@ where
             if h_cc {
                 mles.push(StreamingMleEnum::BaseScalarArc {
                     evals: h0_arc.as_ref().unwrap().clone(),
+                    prefix: None,
                     num_vars: nvars,
                     square: false,
                 });

@@ -162,6 +162,10 @@ where
     /// Arc-wrapped base-scalar table (to share between m and m^{∘2}).
     BaseScalarArc {
         evals: Arc<Vec<R::BaseRing>>,
+        /// Optional fixed prefix override (statement binding).
+        ///
+        /// If present, indices `i < prefix.len()` evaluate to `prefix[i]` instead of `evals[i]`.
+        prefix: Option<Arc<Vec<R::BaseRing>>>,
         num_vars: usize,
         /// If true, interpret this MLE as **vertex-wise squares** (see Symphony notes).
         square: bool,
@@ -229,6 +233,10 @@ where
     SparseMatVecConstCoeffBase {
         matrix: Arc<SparseMatrix<R::BaseRing>>,
         witness0: Arc<Vec<R::BaseRing>>,
+        /// Optional fixed prefix override (statement binding).
+        ///
+        /// If present, witness entry `w[j]` is `prefix[j]` for `j < prefix.len()`.
+        prefix: Option<Arc<Vec<R::BaseRing>>>,
         num_vars: usize,
     },
     /// y[row] = (M0 * w)[row] where `M0` has **base-ring coefficients** and `w` is ring-valued.
@@ -981,8 +989,17 @@ where
     pub fn eval0_at_index(&self, index: usize) -> R::BaseRing {
         match self {
             StreamingMleEnum::BaseScalarOwned { evals, .. } => evals.get(index).copied().unwrap_or(R::BaseRing::ZERO),
-            StreamingMleEnum::BaseScalarArc { evals, square, .. } => {
-                let v = evals.get(index).copied().unwrap_or(R::BaseRing::ZERO);
+            StreamingMleEnum::BaseScalarArc {
+                evals,
+                prefix,
+                square,
+                ..
+            } => {
+                let v = prefix
+                    .as_ref()
+                    .and_then(|p| p.get(index).copied())
+                    .or_else(|| evals.get(index).copied())
+                    .unwrap_or(R::BaseRing::ZERO);
                 if *square { v * v } else { v }
             }
             StreamingMleEnum::BaseScalarConst { value, square, .. } => {
@@ -1047,8 +1064,16 @@ where
             StreamingMleEnum::SparseMatVecConstCoeffBase {
                 matrix,
                 witness0,
+                prefix,
                 ..
-            } => eval0_sparse_matvec_const_coeff_base::<R>(matrix, witness0, index),
+            } => {
+                eval0_sparse_matvec_const_coeff_base::<R>(
+                    matrix,
+                    witness0,
+                    prefix.as_ref().map(|p| p.as_slice()),
+                    index,
+                )
+            }
             StreamingMleEnum::SparseMatVecBaseCoeffRing { .. } => self.eval_at_index(index).coeffs()[0],
             StreamingMleEnum::SparseMatVecFromMle { .. } => self.eval_at_index(index).coeffs()[0],
             StreamingMleEnum::SparseMatVecBaseCoeffFromMle { .. } => self.eval_at_index(index).coeffs()[0],
@@ -1073,10 +1098,15 @@ where
             }
             StreamingMleEnum::BaseScalarArc {
                 evals,
+                prefix,
                 square,
                 ..
             } => {
-                let v = evals.get(index).copied().unwrap_or(R::BaseRing::ZERO);
+                let v = prefix
+                    .as_ref()
+                    .and_then(|p| p.get(index).copied())
+                    .or_else(|| evals.get(index).copied())
+                    .unwrap_or(R::BaseRing::ZERO);
                 let v = if *square { v * v } else { v };
                 R::from(v)
             }
@@ -1380,10 +1410,29 @@ where
             }
             StreamingMleEnum::BaseScalarArc {
                 evals,
+                prefix,
                 num_vars,
                 square,
             } => {
-                // Take ownership of the Arc if possible; otherwise clone.
+                // If a statement prefix override is present, materialize via `eval0_at_index`
+                // so the override is honored.
+                if prefix.is_some() {
+                    let nv0 = *num_vars;
+                    let half = 1usize << (nv0 - 1);
+                    let mut out = vec![R::BaseRing::ZERO; half];
+                    for i in 0..half {
+                        let a0 = self.eval0_at_index(i << 1);
+                        let b0 = self.eval0_at_index((i << 1) | 1);
+                        out[i] = one_minus0 * a0 + r0 * b0;
+                    }
+                    *self = StreamingMleEnum::BaseScalarOwned {
+                        evals: out,
+                        num_vars: nv0 - 1,
+                    };
+                    return;
+                }
+
+                // Fast path (no prefix): take ownership of the Arc if possible; otherwise allocate half table.
                 let arc = std::mem::take(evals);
                 match Arc::try_unwrap(arc) {
                     Ok(mut owned) => {
@@ -1647,6 +1696,7 @@ where
                 matrix,
                 witness0,
                 num_vars,
+                prefix,
             } => {
                 // Materialize after the first fix into a half-sized base-scalar table.
                 let nv0 = *num_vars;
@@ -1654,12 +1704,13 @@ where
                 let one_minus0 = R::BaseRing::ONE - r0;
                 let m = matrix.clone();
                 let w0 = witness0.clone();
+                let px = prefix.as_ref().map(|p| p.as_slice());
                 let mut out = vec![R::BaseRing::ZERO; half];
                 for i in 0..half {
                     let idx0 = i << 1;
                     let idx1 = (i << 1) | 1;
-                    let a0 = eval0_sparse_matvec_const_coeff_base::<R>(&m, &w0, idx0);
-                    let b0 = eval0_sparse_matvec_const_coeff_base::<R>(&m, &w0, idx1);
+                    let a0 = eval0_sparse_matvec_const_coeff_base::<R>(&m, &w0, px, idx0);
+                    let b0 = eval0_sparse_matvec_const_coeff_base::<R>(&m, &w0, px, idx1);
                     out[i] = one_minus0 * a0 + r0 * b0;
                 }
                 *self = StreamingMleEnum::BaseScalarOwned {
@@ -2227,18 +2278,41 @@ where
 fn eval0_sparse_matvec_const_coeff_base<R: OverField + PolyRing>(
     matrix: &SparseMatrix<R::BaseRing>,
     witness0: &[R::BaseRing],
+    prefix: Option<&[R::BaseRing]>,
     row: usize,
 ) -> R::BaseRing
 where
     R::BaseRing: Ring,
 {
+    // Fast path: no statement-binding prefix override.
+    if prefix.is_none() {
+        if row >= matrix.coeffs.len() {
+            return R::BaseRing::ZERO;
+        }
+        let mut sum0 = R::BaseRing::ZERO;
+        for (coeff, col_idx) in &matrix.coeffs[row] {
+            if *col_idx < witness0.len() {
+                sum0 += *coeff * witness0[*col_idx];
+            }
+        }
+        return sum0;
+    }
+
     if row >= matrix.coeffs.len() {
         return R::BaseRing::ZERO;
     }
+    let px = prefix.unwrap();
     let mut sum0 = R::BaseRing::ZERO;
-    for (coeff, col_idx) in &matrix.coeffs[row] {
-        if *col_idx < witness0.len() {
-            sum0 += *coeff * witness0[*col_idx];
+    for (coeff0, col_idx) in &matrix.coeffs[row] {
+        let wj = if *col_idx < px.len() {
+            px[*col_idx]
+        } else if *col_idx < witness0.len() {
+            witness0[*col_idx]
+        } else {
+            R::BaseRing::ZERO
+        };
+        if wj != R::BaseRing::ZERO && *coeff0 != R::BaseRing::ZERO {
+            sum0 += *coeff0 * wj;
         }
     }
     sum0
