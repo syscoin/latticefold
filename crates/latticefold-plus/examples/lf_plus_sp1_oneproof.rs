@@ -260,12 +260,8 @@ fn main() {
     let ajtai = AjtaiCommitmentScheme::<R>::seeded(b"lf_plus_ajtai", AJTAI_SEED, kappa, cache.ncols);
     maybe_print_rss("after init Ajtai scheme");
 
-    // Statement public inputs (x_ccs) are the SP1-exported public slots (indices 1..=l_pub).
-    // These are the verifier-provided statement elements for paper-faithful z = (1, x_ccs, w_priv).
-    debug_assert!(w_host.len() >= 1 + l_pub);
-    let x_ccs: Arc<Vec<F>> = Arc::new(w_host[1..1 + l_pub].to_vec());
-
-    let cr1cs = latticefold_plus::r1cs::ComR1CSBase::<R>::from_f0_seeded_base(r1cs, f0, l_pub, x_ccs, &ajtai);
+    let cr1cs =
+        latticefold_plus::r1cs::ComR1CSBase::<R>::from_f0_seeded_base(r1cs, f0, l_pub, &ajtai);
     maybe_print_rss("after ComR1CS::from_f0_seeded");
     let m0 = cr1cs.x.matrices_arc_base();
     maybe_print_rss("after matrices_arc");

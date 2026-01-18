@@ -4186,7 +4186,7 @@ mod tests {
                     })
                     .collect(),
             );
-            let cr1cs = ComR1CSBase::<RR>::from_f0_seeded_base(r1cs0, f0, 0, Arc::new(Vec::new()), &scheme);
+            let cr1cs = ComR1CSBase::<RR>::from_f0_seeded_base(r1cs0, f0, 0, &scheme);
             let m0 = cr1cs.x.matrices_arc_base();
 
             let lin_params = LinParameters {
@@ -4475,7 +4475,7 @@ mod tests {
                 .collect(),
         );
 
-        let cr1cs = ComR1CSBase::<RR>::from_f0_seeded_base(r1cs, f0, 0, Arc::new(Vec::new()), &ajtai);
+        let cr1cs = ComR1CSBase::<RR>::from_f0_seeded_base(r1cs, f0, 0, &ajtai);
         let m0 = cr1cs.x.matrices_arc_base();
 
         // Range-check decomposition parameters (used inside CM/RG machinery).

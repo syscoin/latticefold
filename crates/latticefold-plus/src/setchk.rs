@@ -385,8 +385,8 @@ impl<R: OverField + PolyRing> In<R> {
 
             for col in 0..ncols {
                 let tab = col_tables[col].clone();
-                mles.push(StreamingMleEnum::BaseScalarArc { evals: tab.clone(), prefix: None, num_vars: tnvars, square: false });
-                mles.push(StreamingMleEnum::BaseScalarArc { evals: tab, prefix: None, num_vars: tnvars, square: true });
+                mles.push(StreamingMleEnum::BaseScalarArc { evals: tab.clone(), num_vars: tnvars, square: false });
+                mles.push(StreamingMleEnum::BaseScalarArc { evals: tab, num_vars: tnvars, square: true });
             }
             mles.push(StreamingMleEnum::EqBase {
                 scale: R::BaseRing::ONE,
@@ -429,8 +429,8 @@ impl<R: OverField + PolyRing> In<R> {
                 }
             };
             let tab = Arc::new(v0);
-            mles.push(StreamingMleEnum::BaseScalarArc { evals: tab.clone(), prefix: None, num_vars: tnvars, square: false });
-            mles.push(StreamingMleEnum::BaseScalarArc { evals: tab, prefix: None, num_vars: tnvars, square: true });
+            mles.push(StreamingMleEnum::BaseScalarArc { evals: tab.clone(), num_vars: tnvars, square: false });
+            mles.push(StreamingMleEnum::BaseScalarArc { evals: tab, num_vars: tnvars, square: true });
             mles.push(StreamingMleEnum::EqBase {
                 scale: R::BaseRing::ONE,
                 r: c0,
