@@ -365,7 +365,7 @@ Re-export the R1LF after enabling CircuitV2CommitPublicValues handling in the SP
     let mut public_inputs: Vec<BFSmall> = w_host[1..1 + l_pub].to_vec();
     println!("  public_inputs_len={} (from witness[1..=l])", public_inputs.len());
 
-    if !public_inputs.is_empty() {
+   /* if !public_inputs.is_empty() {
         // Debug: show that the mutation actually changes the field element.
         let before0 = public_inputs[0];
         let before_preview_len = public_inputs.len().min(8);
@@ -386,7 +386,7 @@ Re-export the R1LF after enabling CircuitV2CommitPublicValues handling in the SP
             &public_inputs[..after_preview_len],
             before0 != after0
         );
-    }
+    }*/
     // Proof-agnostic arming statement digest (binds vk, r1cs, gate version, **params**, and public inputs).
     // This is what an honest armer/decapper should use to derive lock coins.
     let r1cs_digest = cache.stats.digest; // SP1 R1LF instance digest (statement-defined)
