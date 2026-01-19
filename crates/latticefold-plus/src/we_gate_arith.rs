@@ -3010,6 +3010,10 @@ where
             let mut pub_input_vars = Vec::with_capacity(public_inputs.len());
             for &x in public_inputs {
                 let v = b_params.new_var(x);
+                // Statement-bound DPP: fix each statement input to this circuit instance.
+                // This prevents mix-and-match by making the statement part of the *relation*,
+                // not merely a public input vector.
+                b_params.enforce_var_eq_const(v, x);
                 pub_input_vars.push(v);
             }
             let (params_inst, params_asg) = b_params.into_instance();
@@ -3474,7 +3478,9 @@ where
     ];
     let (inst, assignment) =
         merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| e.to_string())?;
-    let public_len = 1 + 10 + public_inputs.len();
+    // Statement-bound DPP: statement inputs are enforced as constants inside the circuit,
+    // so they are NOT part of the public input vector.
+    let public_len = 1 + 10;
     Ok(WeDr1csOutput {
         inst,
         assignment,
