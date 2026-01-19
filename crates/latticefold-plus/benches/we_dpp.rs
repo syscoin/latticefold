@@ -111,10 +111,9 @@ fn bench_we_dpp(c: &mut Criterion) {
     // (In production this comes from SP1 public inputs.)
     type FSmall = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
     // Use a "random-looking" in-field digest (so we don't accidentally rely on small constants).
-    let sp1_public_input_digest_bits: Vec<FSmall> = {
-        let d: [u8; 32] = Sha256::digest(b"LFP_SP1_PUBLIC_INPUT_DIGEST_V1").into();
-        digest32_to_bits_field::<FSmall>(d)
-    };
+    let r1cs_digest: [u8; 32] = Sha256::digest(b"LFP_SP1_PUBLIC_INPUT_DIGEST_V1").into();
+    let sp1_public_input_digest_bits: Vec<FSmall> =
+        digest32_to_bits_field::<FSmall>(r1cs_digest);
     for b in &sp1_public_input_digest_bits {
         prover.transcript.absorb_field_element(b);
     }
@@ -228,7 +227,6 @@ fn bench_we_dpp(c: &mut Criterion) {
         // Proof-agnostic arming model: derive query coins from a statement digest (no per-proof artifacts).
         // (In production, `vk_hash` and `r1cs_digest` are provided by SP1, and `gate_digest` is a fixed per-gate constant.)
         let vk_hash = [1u8; 32];
-        let r1cs_digest = [2u8; 32];
         // Gate digest: production model is a precomputed constant per WE gate version.
         // (Do NOT hash over 10^8+ nonzeros at runtime.)
         let gate_digest: [u8; 32] = LFP_WE_GATE_DIGEST_V1;

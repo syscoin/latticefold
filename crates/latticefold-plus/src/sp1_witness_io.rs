@@ -20,6 +20,50 @@ pub struct Sp1WitnessBundle {
     pub r1lf_digest: [u8; 32],
 }
 
+/// Verify SP1's current shrink-verifier public-input layout in the exported witness:
+/// - `witness[0] = 1`
+/// - `num_public = 40`
+/// - `witness[1..=8]` are the 8 BabyBear words of `sp1_vk_digest` (not checked here)
+/// - `witness[1+8..1+8+32]` are the 32 bytes of `committed_values_digest` (checked here)
+///
+/// Rationale: this establishes that the SP1 R1LF export is "compliant to z" in the sense that
+/// statement-defining public values occupy fixed witness indices (1..=num_public).
+pub fn check_sp1_public_inputs_layout(
+    bundle: &Sp1WitnessBundle,
+    num_public: usize,
+) -> Result<(), String> {
+    if bundle.witness.is_empty() || bundle.witness[0] != 1 {
+        return Err("SP1 witness must have w[0]=1".to_string());
+    }
+    if num_public != 40 {
+        return Err(format!(
+            "unexpected SP1 num_public={num_public} (expected 40 = 8 sp1_vk_digest words + 32 committed_value_digest bytes)"
+        ));
+    }
+    if bundle.witness.len() < 1 + num_public {
+        return Err(format!(
+            "SP1 witness too short for public inputs: w_len={} need_at_least={}",
+            bundle.witness.len(),
+            1 + num_public
+        ));
+    }
+    let (_vk_hash, committed_values_digest) = bundle.public_inputs;
+    for i in 0..32 {
+        let got = bundle.witness[1 + 8 + i];
+        let exp = committed_values_digest[i] as u64;
+        if got != exp {
+            return Err(format!(
+                "public input mismatch at idx={} (committed_value_digest[{}]): got={} expected={}",
+                1 + 8 + i,
+                i,
+                got,
+                exp
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Load a witness in either of these formats:
 /// - **Single file only**: `witness_path` is the full witness of length `num_vars`.
 ///

@@ -351,6 +351,11 @@ fn main() {
 Re-export the R1LF after enabling CircuitV2CommitPublicValues handling in the SP1 R1CS compiler."
         );
     }
+    // Enforce the expected SP1 shrink-verifier public-input layout so we don't accidentally
+    // “think we are binding z” when the exported R1LF isn’t actually exporting the intended
+    // statement-defining public inputs.
+    latticefold_plus::sp1_witness_io::check_sp1_public_inputs_layout(&bundle, l_pub)
+        .expect("SP1 public input layout check failed");
     if w_host.len() < 1 + l_pub {
         panic!(
             "witness too short for declared public inputs: w_len={} need_at_least={}",
@@ -359,7 +364,11 @@ Re-export the R1LF after enabling CircuitV2CommitPublicValues handling in the SP
         );
     }
     let public_inputs: Vec<BFSmall> = w_host[1..1 + l_pub].to_vec();
-    println!("  public_inputs_len={} (from witness[1..=l])", public_inputs.len());
+    let r1cs_digest = cache.stats.digest; // SP1 R1LF instance digest (statement-defined)
+    println!(
+        "  public_inputs_len={} (witness[1..=l])",
+        public_inputs.len()
+    );
 
    /* if !public_inputs.is_empty() {
         // Debug: show that the mutation actually changes the field element.
@@ -385,7 +394,6 @@ Re-export the R1LF after enabling CircuitV2CommitPublicValues handling in the SP
     }*/
     // Proof-agnostic arming statement digest (binds vk, r1cs, gate version, **params**, and public inputs).
     // This is what an honest armer/decapper should use to derive lock coins.
-    let r1cs_digest = cache.stats.digest; // SP1 R1LF instance digest (statement-defined)
     let stmt_digest = we_statement_hash_lf_plus::<R>(vk_hash, r1cs_digest, LFP_WE_GATE_DIGEST_V1, &we_params, &public_inputs);
     println!("  stmt_digest=0x{}", hex32(&stmt_digest));
 

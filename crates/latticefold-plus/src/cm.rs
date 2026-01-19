@@ -158,29 +158,29 @@ where
                 let n = 1 << self.rg.nvars;
                 maybe_print_rss("cm: build_h one inst start");
                 let mut h = vec![R::ZERO; n];
-                #[cfg(feature = "parallel")]
-                {
-                    use rayon::prelude::*;
+                        #[cfg(feature = "parallel")]
+                        {
+                            use rayon::prelude::*;
                     h.par_iter_mut().enumerate().for_each(|(row, out)| {
-                        let mut acc = R::ZERO;
+                                    let mut acc = R::ZERO;
                         for (i, M) in inst.M_f.iter().enumerate() {
                             let s_i = &s_prime[i];
-                            for col in 0..M.ncols {
-                                acc += M.get(row, col) * s_i[col];
-                            }
+                                    for col in 0..M.ncols {
+                                        acc += M.get(row, col) * s_i[col];
+                                    }
                         }
                         *out = acc;
                     });
-                }
-                #[cfg(not(feature = "parallel"))]
-                {
-                    for row in 0..n {
-                        let mut acc = R::ZERO;
+                        }
+                        #[cfg(not(feature = "parallel"))]
+                        {
+                            for row in 0..n {
+                                let mut acc = R::ZERO;
                         for (i, M) in inst.M_f.iter().enumerate() {
                             let s_i = &s_prime[i];
-                            for col in 0..M.ncols {
-                                acc += M.get(row, col) * s_i[col];
-                            }
+                                for col in 0..M.ncols {
+                                    acc += M.get(row, col) * s_i[col];
+                                }
                         }
                         h[row] = acc;
                     }
@@ -340,8 +340,8 @@ where
                             };
                             let r_h = h[i][j];
                             (s[0] * R::from(r_tau)) + (s[1] * r_mtau) + (s[2] * r_f) + r_h
-                        })
-                        .collect::<Vec<R>>()
+                    })
+                    .collect::<Vec<R>>()
                 }
                 #[cfg(not(feature = "parallel"))]
                 {
@@ -390,7 +390,7 @@ where
     pub fn prove_base(
         &self,
         M0: &[Arc<SparseMatrix<R::BaseRing>>],
-        public_inputs: &[R::BaseRing],
+        _public_inputs: &[R::BaseRing],
         transcript: &mut impl Transcript<R>,
     ) -> (Com<R>, CmProof<R>) {
         let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
@@ -782,15 +782,9 @@ where
             })
             .collect::<Vec<_>>();
 
-        // Statement-binding coefficients α (only when public inputs are present).
-        // Sampled after witness is transcript-fixed (via `range_check_base`) and after `comh`/`c`.
-        // Domain-separated to make this robust to future transcript refactors.
-        let bind_alpha: Option<Vec<R::BaseRing>> = (!public_inputs.is_empty()).then(|| {
-            const BIND_ALPHA_DOMAIN_SEP: u128 = 0xB1A1;
-            let ds = R::BaseRing::from(BIND_ALPHA_DOMAIN_SEP);
-            transcript.absorb_field_element(&ds);
-            transcript.get_challenges(1 + public_inputs.len())
-        });
+        // NOTE: Statement binding against `public_inputs` used to be implemented here via a
+        // prover-provided “virtual bind slot”. This was removed because it was not verifier-enforced
+        // against the underlying witness/commitment relation.
         let h: Vec<Arc<Vec<R>>> = if h_mles_full.is_some() {
             Vec::new()
         } else {
@@ -860,7 +854,6 @@ where
                 &t1_mle,
                 &m_arcs0,
                 mats_const,
-                bind_alpha.as_deref(),
                 transcript,
                 profile,
             );
@@ -871,7 +864,6 @@ where
                 &t1_mle,
                 &m_arcs0,
                 mats_const,
-                bind_alpha.as_deref(),
                 transcript,
                 profile,
             );
@@ -930,7 +922,6 @@ where
                 &t1_mle,
                 &m_arcs0,
                 mats_const,
-                bind_alpha.as_deref(),
                 transcript,
                 profile,
             );
@@ -941,7 +932,6 @@ where
                 &t1_mle,
                 &m_arcs0,
                 mats_const,
-                bind_alpha.as_deref(),
                 transcript,
                 profile,
             );
@@ -1180,7 +1170,7 @@ where
                 if cm_lazy > 0 {
                     mles.push(StreamingMleEnum::LazyFixed {
                         inner: Box::new(mle),
-                        num_vars: nvars,
+                    num_vars: nvars,
                         fixed: Vec::new(),
                         weights: vec![R::BaseRing::ONE],
                         max_lazy: cm_lazy,
@@ -1191,7 +1181,7 @@ where
             }
 
             if profile {
-                println!(
+                    println!(
                     "[LF+ Cm::sumchecker_streaming] const-coeff mat-vec flags (L_idx={}): mats_const={} tau_cc={} mtau_cc={} f_cc={} h_cc={}",
                     i, mats_const, tau_cc, mtau_cc, f_cc, h_cc
                 );
@@ -1241,9 +1231,9 @@ where
                     match &inst.m_tau {
                         crate::rgchk::MonomialVec::Dense(v) => {
                             let mle = StreamingMleEnum::SparseMatVec {
-                                matrix: m.clone(),
+                        matrix: m.clone(),
                                 witness: v.clone(),
-                                num_vars: nvars,
+                        num_vars: nvars,
                             };
                             if cm_lazy > 0 {
                                 mles.push(StreamingMleEnum::LazyFixed {
@@ -1281,32 +1271,32 @@ where
 
                 if f_cc {
                     mles.push(StreamingMleEnum::SparseMatVecConstCoeff {
-                        matrix: m.clone(),
+                    matrix: m.clone(),
                         witness0: f0_arc.as_ref().unwrap().clone(),
-                        num_vars: nvars,
-                    });
+                    num_vars: nvars,
+                });
                 } else {
-                    mles.push(StreamingMleEnum::SparseMatVec {
-                        matrix: m.clone(),
+                mles.push(StreamingMleEnum::SparseMatVec {
+                    matrix: m.clone(),
                         witness: f_arc_ring
                             .as_ref()
                             .expect("Ring witness required when f_cc is false")
                             .clone(),
-                        num_vars: nvars,
-                    });
+                    num_vars: nvars,
+                });
                 }
 
                 if h_cc {
                     mles.push(StreamingMleEnum::SparseMatVecConstCoeff {
-                        matrix: m.clone(),
+                    matrix: m.clone(),
                         witness0: h0_arc.as_ref().unwrap().clone(),
-                        num_vars: nvars,
-                    });
+                    num_vars: nvars,
+                });
                 } else {
                     let mle = StreamingMleEnum::SparseMatVec {
-                        matrix: m.clone(),
+                    matrix: m.clone(),
                         witness: h_arc_ring.clone(),
-                        num_vars: nvars,
+                    num_vars: nvars,
                     };
                     if cm_lazy > 0 {
                         mles.push(StreamingMleEnum::LazyFixed {
@@ -1426,7 +1416,7 @@ where
         let bind_slot = 0usize;
         let stride = 4 + 4 * Mlen;
         let evals = (0..L)
-            .map(|l| {
+                .map(|l| {
                 let mut e = Vec::with_capacity(1 + Mlen + bind_slot);
                 let l_idx = 1 + l * stride;
                 e.push([
@@ -1436,7 +1426,7 @@ where
                     final_vals[l_idx + 3],
                 ]);
                 for i in 0..Mlen {
-                    let idx = l_idx + 4 + i * 4;
+                        let idx = l_idx + 4 + i * 4;
                     e.push([
                         final_vals[idx],
                         final_vals[idx + 1],
@@ -1484,7 +1474,6 @@ where
         t1_mle: &StreamingMleEnum<R>,
         m_arcs0: &[Arc<SparseMatrix<R::BaseRing>>],
         mats_const: bool,
-        bind_alpha: Option<&[R::BaseRing]>,
         transcript: &mut impl Transcript<R>,
         profile: bool,
     ) -> (Proof<R>, Vec<InstanceEvals<R>>, Vec<R>) {
@@ -1494,7 +1483,7 @@ where
         let rc = transcript.get_challenge();
         let L = self.rg.instances.len();
         let Mlen = m_arcs0.len();
-        let bind_slot = if bind_alpha.is_some() { 1 } else { 0 };
+        let bind_slot = 0usize;
 
         let mut mles = Vec::with_capacity(1 + L * (4 + 4 * (Mlen + bind_slot)) + 2);
 
@@ -1784,49 +1773,7 @@ where
                 }
             }
 
-            // --- Statement binding slot (virtual) ---
-            if let Some(alpha) = bind_alpha {
-                let l_in = alpha.len().saturating_sub(1);
-                let f0 = f0_arc
-                    .as_ref()
-                    .expect("binding requires const-coeff witness (f0)");
-
-                let mut acc = R::BaseRing::ZERO;
-                let w0 = f0.get(0).copied().unwrap_or(R::BaseRing::ZERO);
-                acc += alpha[0] * w0;
-                for i in 0..l_in {
-                    let wi = f0.get(1 + i).copied().unwrap_or(R::BaseRing::ZERO);
-                    acc += alpha[1 + i] * wi;
-                }
-                let l_witness = R::from(acc);
-
-                mles.push(StreamingMleEnum::BaseScalarConst {
-                    value: R::BaseRing::ZERO,
-                    num_vars: nvars,
-                    square: false,
-                });
-                mles.push(StreamingMleEnum::BaseScalarConst {
-                    value: R::BaseRing::ZERO,
-                    num_vars: nvars,
-                    square: false,
-                });
-                // Choose a two-point table on {0,1} such that its **eq(r0,·)-weighted sum** is 0:
-                // eq(0)*v0 + eq(1)*v1 = 0, where eq(0)=(1-r0_0)*rest and eq(1)=r0_0*rest.
-                // Setting v0 = r0_0 and v1 = -(1-r0_0) cancels for all rest.
-                let r0_0 = dcom.out.r[0];
-                let v0 = l_witness * R::from(r0_0);
-                let v1 = R::ZERO - (l_witness * R::from(R::BaseRing::ONE - r0_0));
-                mles.push(StreamingMleEnum::Delta01Scaled {
-                    v0,
-                    v1,
-                    num_vars: nvars,
-                });
-                mles.push(StreamingMleEnum::BaseScalarConst {
-                    value: R::BaseRing::ZERO,
-                    num_vars: nvars,
-                    square: false,
-                });
-            }
+            // NOTE: Statement binding via a prover-supplied “virtual slot” was removed.
         }
 
         if profile {
@@ -1844,7 +1791,7 @@ where
         let t_rcps = Instant::now();
         let mut rcps = vec![];
         let mut rcp = R::BaseRing::ONE;
-        let bind_slot = if bind_alpha.is_some() { 1 } else { 0 };
+        let bind_slot = 0usize;
         let stride = 4 + 4 * (Mlen + bind_slot);
         for _ in 0..L {
             // [tau, m_tau, f, h]
@@ -2004,7 +1951,6 @@ where
         t1_mle: &StreamingMleEnum<R>,
         m_arcs0: &[Arc<SparseMatrix<R::BaseRing>>],
         mats_const: bool,
-        bind_alpha: Option<&[R::BaseRing]>,
         transcript: &mut impl Transcript<R>,
         profile: bool,
     ) -> (Proof<R>, Vec<InstanceEvals<R>>, Vec<R>) {
@@ -2014,7 +1960,7 @@ where
         let rc = transcript.get_challenge();
         let L = self.rg.instances.len();
 
-        let bind_slot = if bind_alpha.is_some() { 1 } else { 0 };
+        let bind_slot = 0usize;
         let mut mles = Vec::with_capacity(1 + L * (4 + 4 * (m_arcs0.len() + bind_slot)) + 2);
 
         let r0 = dcom.out.r.clone();
@@ -2299,51 +2245,7 @@ where
                 }
             }
 
-            // --- Statement binding slot (virtual) ---
-            // Append one additional "pseudo-matrix" slot with 4 entries, where only the `f` entry
-            // is nonzero and equals a two-point supported MLE:
-            //   bind(x) = (δ_0(x) - δ_1(x)) * L_witness
-            // This has zero cube-sum and therefore does not affect the claimed_sum.
-            if let Some(alpha) = bind_alpha {
-                let l_in = alpha.len().saturating_sub(1);
-                let f0 = f0_arc
-                    .as_ref()
-                    .expect("binding requires const-coeff witness (f0)");
-
-                let mut acc = R::BaseRing::ZERO;
-                let w0 = f0.get(0).copied().unwrap_or(R::BaseRing::ZERO);
-                acc += alpha[0] * w0;
-                for i in 0..l_in {
-                    let wi = f0.get(1 + i).copied().unwrap_or(R::BaseRing::ZERO);
-                    acc += alpha[1 + i] * wi;
-                }
-                let l_witness = R::from(acc);
-
-                // tau, m_tau, h entries are zero
-                mles.push(StreamingMleEnum::BaseScalarConst {
-                    value: R::BaseRing::ZERO,
-                    num_vars: nvars,
-                    square: false,
-                });
-                mles.push(StreamingMleEnum::BaseScalarConst {
-                    value: R::BaseRing::ZERO,
-                    num_vars: nvars,
-                    square: false,
-                });
-                let r0_0 = dcom.out.r[0];
-                let v0 = l_witness * R::from(r0_0);
-                let v1 = R::ZERO - (l_witness * R::from(R::BaseRing::ONE - r0_0));
-                mles.push(StreamingMleEnum::Delta01Scaled {
-                    v0,
-                    v1,
-                    num_vars: nvars,
-                });
-                mles.push(StreamingMleEnum::BaseScalarConst {
-                    value: R::BaseRing::ZERO,
-                    num_vars: nvars,
-                    square: false,
-                });
-            }
+            // NOTE: Statement binding via a prover-supplied “virtual slot” was removed.
         }
 
         if profile {
@@ -2369,12 +2271,6 @@ where
                 rcp *= rc;
             }
             for _ in 0..Mlen {
-                for _ in 0..4 {
-                    rcps.push(rcp);
-                    rcp *= rc;
-                }
-            }
-            if bind_slot == 1 {
                 for _ in 0..4 {
                     rcps.push(rcp);
                     rcp *= rc;
@@ -2565,12 +2461,10 @@ where
             })
             .collect::<Vec<_>>();
 
-        let bind_alpha: Option<Vec<R::BaseRing>> = (!public_inputs.is_empty()).then(|| {
-            const BIND_ALPHA_DOMAIN_SEP: u128 = 0xB1A1;
-            let ds = R::BaseRing::from(BIND_ALPHA_DOMAIN_SEP);
-            transcript.absorb_field_element(&ds);
-            transcript.get_challenges(1 + public_inputs.len())
-        });
+        // NOTE: Statement binding against `public_inputs` used to be implemented here via a
+        // prover-provided “virtual bind slot”. This was removed because it was not verifier-enforced
+        // against the underlying witness/commitment relation.
+        let _ = public_inputs;
 
         let u: Vec<Vec<R>> = (0..L)
             .map(|l| {
@@ -2630,7 +2524,7 @@ where
         }
         let xp = (0..d).map(|i| unit_monomial::<R>(i)).collect::<Vec<_>>();
 
-        let bind_slot = if bind_alpha.is_some() { 1usize } else { 0usize };
+        let bind_slot = 0usize;
         let stride = 4 + 4 * (mlen + bind_slot);
         let z_idx = L * stride;
 
@@ -2685,7 +2579,7 @@ where
 
                 let r: Vec<R> = self.dcom.out.r.iter().map(|x| R::from(*x)).collect();
                 let ro: Vec<R> = subclaim.point.into_iter().map(|x| x.into()).collect();
-
+                
                 // OPTIMIZED: Use tensor structure for O(small) evaluation instead of O(n)
                 // The tensor product t(z) = tensor(c_z) ⊗ s' ⊗ d_powers ⊗ x_powers
                 // can be evaluated factor-by-factor in O(κ + k*d + ℓ + d) time.
@@ -2720,16 +2614,6 @@ where
                                         + M_evals[3] * rc_pows[idx + 3]
                                 })
                                 .sum::<R>())
-                            + if bind_slot == 1 {
-                                let be = el[1 + mlen];
-                                let idx = l_idx + 4 + mlen * 4;
-                                eq * (be[0] * rc_pows[idx]
-                                    + be[1] * rc_pows[idx + 1]
-                                    + be[2] * rc_pows[idx + 2]
-                                    + be[3] * rc_pows[idx + 3])
-                            } else {
-                                R::ZERO
-                            }
                             + (t0_ro * el[0][0]) * rc_pows[z_idx]
                             + (t1_ro * el[0][0]) * rc_pows[z_idx + 1]
                     })
@@ -2737,53 +2621,6 @@ where
 
                 if expected_eval != eval {
                     return Err(SumCheckError::SumCheckFailed(expected_eval, eval));
-                }
-
-                // Statement binding check:
-                // bind_f == (r0_0*χ0(ro) - (1-r0_0)*χ1(ro)) * L_stmt
-                if bind_slot == 1 {
-                    let alpha = bind_alpha.as_ref().expect("bind_slot implies alpha");
-                    let mut l_stmt = alpha[0]; // times 1
-                    for (i, &x) in public_inputs.iter().enumerate() {
-                        l_stmt += alpha[1 + i] * x;
-                    }
-                    if ro.is_empty() {
-                        return Err(SumCheckError::SumCheckFailed(R::ZERO, R::ONE));
-                    }
-                    let mut chi_rest = R::BaseRing::ONE;
-                    for ri in ro.iter().skip(1) {
-                        chi_rest *= R::BaseRing::ONE - ri.coeffs()[0];
-                    }
-                    let ro0 = ro[0].coeffs()[0];
-                    let chi0 = (R::BaseRing::ONE - ro0) * chi_rest;
-                    let chi1 = ro0 * chi_rest;
-                    let r0_0 = self.dcom.out.r[0];
-                    let want0 = r0_0 * chi0;
-                    let want1 = (R::BaseRing::ONE - r0_0) * chi1;
-                    // Standard negligible bad event:
-                    // the scalar factor (want0 - want1) can be 0 with probability ~1/|F|.
-                    // In that event the check becomes non-binding for this round.
-                    let want = R::from((want0 - want1) * l_stmt);
-                    for el in evals.iter() {
-                        let rows = &el.0;
-                        let be = match rows.get(1 + mlen) {
-                            Some(v) => v,
-                            None => return Err(SumCheckError::SumCheckFailed(R::ZERO, R::ONE)),
-                        };
-                        if be[0] != R::ZERO {
-                            return Err(SumCheckError::SumCheckFailed(R::ZERO, be[0]));
-                        }
-                        if be[1] != R::ZERO {
-                            return Err(SumCheckError::SumCheckFailed(R::ZERO, be[1]));
-                        }
-                        if be[3] != R::ZERO {
-                            return Err(SumCheckError::SumCheckFailed(R::ZERO, be[3]));
-                        }
-                        // Enforce constant-coeff and equality to statement-derived value.
-                        if be[2] != want {
-                            return Err(SumCheckError::SumCheckFailed(want, be[2]));
-                        }
-                    }
                 }
 
                 Ok(ro)

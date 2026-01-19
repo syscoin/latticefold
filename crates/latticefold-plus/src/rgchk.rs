@@ -309,6 +309,8 @@ pub struct DcomEvals<R: PolyRing> {
 
 #[derive(Debug, Error)]
 pub enum RangeCheckError<R: PolyRing> {
+    #[error("Set check failed: {0}")]
+    SetCheck(#[from] crate::setchk::SetCheckError<R>),
     #[error("Psi check failed: a = {0}, b = {1}")]
     PsiCheckAB(R::BaseRing, R),
     #[error("Psi check failed: v = {0}, u-comb = {1}")]
@@ -586,7 +588,9 @@ where
         // The witness commitments must be transcript-absorbed before any verifier coins.
         absorb_fcoms_fcoms(&self.fcoms, transcript);
 
-        self.out.verify(transcript).unwrap(); //.map_err(|_| ())?;
+        // SECURITY CRITICAL: `Out::verify` binds `self.out.r` to the transcript-derived sumcheck point.
+        // Do NOT unwrap; propagate failures.
+        self.out.verify(transcript)?;
 
         absorb_evaluations(&self.evals, transcript);
 

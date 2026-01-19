@@ -737,7 +737,6 @@ where
     b.enforce_var_eq_const(b.one(), BF::<R>::ONE);
 
     // Public inputs absorbed into the verifier transcript at the start of verification.
-    // These must be available to enforce algebraic statement binding in CM verification.
     let public_input_vars: Vec<usize> = public_inputs
         .iter()
         .copied()
@@ -748,12 +747,8 @@ where
     // so this part's witness assignment matches the Poseidon part (glue constraints).
     let need_short = 3 + k * d;
     let need_bytes = need_short * d;
-    // Binding coefficients α are present iff statement public inputs are present.
-    let bind_alpha_len = if public_inputs.is_empty() {
-        0usize
-    } else {
-        1 + public_inputs.len()
-    };
+    // NOTE: CM no longer samples statement-binding coefficients.
+    let bind_alpha_len = 0usize;
     let need_field = 2 * log_kappa + bind_alpha_len + 2 + 2 * nvars;
 
     let mut short_bytes_vals: Vec<u8> = Vec::with_capacity(need_bytes);
@@ -809,7 +804,7 @@ where
     let s = rings[0..3].to_vec();
     let s_prime_flat = rings[3..].to_vec();
 
-    // field challenges: c0,c1,bind_alpha(if any),rc0,rc1,sumcheck r0,r1
+    // field challenges: c0,c1,rc0,rc1,sumcheck r0,r1
     let mut cur = 0usize;
     let c0 = (0..log_kappa)
         .map(|_| {
@@ -825,13 +820,7 @@ where
             v
         })
         .collect::<Vec<_>>();
-    let bind_alpha = (0..bind_alpha_len)
-        .map(|_| {
-            let v = b.new_var(field_vals[cur]);
-            cur += 1;
-            v
-        })
-        .collect::<Vec<_>>();
+    let bind_alpha: Vec<usize> = Vec::new();
     let rc0 = {
         let v = b.new_var(field_vals[cur]);
         cur += 1;
@@ -1026,10 +1015,8 @@ where
     let evals1 = extract_evals(&mut b, &proof.evals.1)?;
 
     // dcom evals for claimed_sum: per l, vectors of len 1+Mlen in (a,b,c).
-    // CM statement binding adds one extra "virtual slot" per instance (4 terms), so the rc-power
-    // positions of the t(z) terms shift, even though the bind slot contributes 0 to the cube sum.
     let mlen_chunks_usize = mlen_mats;
-    let bind_slot = if bind_alpha_len == 0 { 0usize } else { 1usize };
+    let bind_slot = 0usize;
     let stride = 4 + 4 * (mlen_chunks_usize + bind_slot);
     let z_idx = l_instances * stride;
     let max_pow = z_idx + 1;
@@ -2355,23 +2342,9 @@ where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + Field,
 {
-    // Detect whether this CmProof contains the algebraic statement-binding slot.
-    // (Generic Cm proofs do not; sparse/SP1 path does.)
-    let cm_has_bind_slot = {
-        let expected_rows = 1 + mlen_mats + 1;
-        proof
-            .evals
-            .0
-            .get(0)
-            .map(|ie| ie.rows().len() == expected_rows)
-            .unwrap_or(false)
-    };
-    let bind_alpha_len = if cm_has_bind_slot {
-        1 + public_inputs.len()
-    } else {
-        0usize
-    };
-    let cm_public_inputs_for_math: &[BF<R>] = if cm_has_bind_slot { public_inputs } else { &[] };
+    // CM no longer samples statement-binding coefficients.
+    let bind_alpha_len = 0usize;
+    let cm_public_inputs_for_math: &[BF<R>] = &[];
 
     // Hygiene: CmProof is a standalone verifier relation, so its transcript segment begins at 0.
     let ops_offset = 0usize;
@@ -2941,23 +2914,9 @@ where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + Field,
 {
-    let cm_has_bind_slot = {
-        let expected_rows = 1 + mlen_mats + 1;
-        proof
-            .cmproof
-            .evals
-            .0
-            .get(0)
-            .map(|ie| ie.rows().len() == expected_rows)
-            .unwrap_or(false)
-    };
-    // SP1/WE usage invariant: statement public inputs are mandatory, and the CM proof must include
-    // the bind slot so the WE gate enforces algebraic statement binding.
+    // SP1/WE usage invariant: statement public inputs are mandatory in this integration.
     if public_inputs.is_empty() {
         return Err("build_we_dr1cs_for_plus_proof: public_inputs must be non-empty".to_string());
-    }
-    if !cm_has_bind_slot {
-        return Err("build_we_dr1cs_for_plus_proof: CM bind slot missing in proof".to_string());
     }
 
     // Hygiene + soundness: bind the trace to the verifier *program*.
@@ -3162,14 +3121,8 @@ where
             expect_get_challenge(&mut op_idx, &mut absorb_ops, &mut squeezed_field_elems)?;
         }
 
-        // Domain separator before sampling bind_alpha.
-        expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+        // (No statement-binding coefficients sampled in CM anymore.)
 
-        // Statement-binding coefficients α = get_challenges(1 + public_inputs.len()).
-        for _ in 0..(1 + public_inputs.len()) {
-            expect_get_challenge(&mut op_idx, &mut absorb_ops, &mut squeezed_field_elems)?;
-        }
-        
 
         // Two CM sumchecks (degree=2) + eval table absorbs.
         let nvars_cm = params.nvars_cm as usize;
@@ -4454,10 +4407,8 @@ mod tests {
 
         type BR = <RR as PolyRing>::BaseRing;
         type FSmall = <BR as ark_ff::Field>::BasePrimeField;
-        let sp1_digest_bits: Vec<FSmall> = {
-            let d: [u8; 32] = Sha256::digest(b"LFP_SP1_PUBLIC_INPUT_DIGEST_V1").into();
-            digest32_to_bits_field::<FSmall>(d)
-        };
+        let r1cs_digest: [u8; 32] = Sha256::digest(b"LFP_SP1_PUBLIC_INPUT_DIGEST_V1").into();
+        let sp1_digest_bits: Vec<FSmall> = digest32_to_bits_field::<FSmall>(r1cs_digest);
 
         let run_one = |label: &str, sp1_digest_bits: &[FSmall]| {
             eprintln!("\n[test_large_trace] case={label} n=2^{n_pow} (sparse-base prover, FrogRing64)");
@@ -4610,7 +4561,6 @@ mod tests {
             // Armer-time: derive the query "coin" from statement-bound randomness.
             // ---------------------------------------------------------------------
             let vk_hash = [1u8; 32];
-            let r1cs_digest = [2u8; 32];
             let stmt_digest = we_statement_hash_lf_plus::<RR>(
                 vk_hash,
                 r1cs_digest,
@@ -4769,10 +4719,8 @@ mod tests {
 
         // SP1-style public inputs: 256 digest bits.
         type BF0 = <<RR as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
-        let public_inputs: Vec<BF0> = {
-            let d: [u8; 32] = Sha256::digest(b"LFP_WE_PLUS_SPARSE_BASE_SMALL_V1").into();
-            digest32_to_bits_field::<BF0>(d)
-        };
+        let r1lf_digest: [u8; 32] = Sha256::digest(b"LFP_WE_PLUS_SPARSE_BASE_SMALL_V1").into();
+        let public_inputs: Vec<BF0> = digest32_to_bits_field::<BF0>(r1lf_digest);
 
         // Seeded Ajtai scheme (deterministic system parameter).
         const AJTAI_SEED: [u8; 32] = *b"LFP_SP1_AJTAI_SEED_V1_0000000000";
