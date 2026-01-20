@@ -226,19 +226,29 @@ fn main() {
     // - **all vars (including aux)**: centered embedding mod p_bb
     let p_bb = cache.stats.p_bb;
     let t_w = Instant::now();
-    let w_host: Arc<Vec<F>> = Arc::new(
-        w_u64
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(i, x)| {
-                if x >= p_bb {
-                    panic!("witness word out of [0,p_bb) range at idx={i}: x={x} p_bb={p_bb}");
-                }
-                babybear_u64_to_centered_host(x, p_bb)
-            })
-            .collect(),
-    );
+    let mut w_host_vec: Vec<F> = w_u64
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, x)| {
+            if x >= p_bb {
+                panic!("witness word out of [0,p_bb) range at idx={i}: x={x} p_bb={p_bb}");
+            }
+            babybear_u64_to_centered_host(x, p_bb)
+        })
+        .collect();
+    // Optional: tweak a public input in the witness to force unsat / LF+ failure.
+    if l_pub > 0
+        && w_host_vec.len() > 1
+        && std::env::var("LFP_TWEAK_PUBLIC_INPUT")
+            .ok()
+            .as_deref()
+            == Some("1")
+    {
+        w_host_vec[1] += <F as ark_ff::Field>::ONE;
+        println!("  tweaked witness public input w[1]");
+    }
+    let w_host: Arc<Vec<F>> = Arc::new(w_host_vec);
     println!("  map witness u64->F: {:?}", t_w.elapsed());
     maybe_print_rss("after map witness u64->F");
 
