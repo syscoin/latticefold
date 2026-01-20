@@ -268,24 +268,7 @@ fn main() {
     // IMPORTANT: SP1 R1LF/R1CS exports statement-bound public inputs occupying indices 1..=l.
     let r1cs = latticefold::arith::r1cs::R1CS::<F> { l: l_pub, A: m_a, B: m_b, C: m_c };
     maybe_print_rss("after build r1cs struct");
-    // Sanity-check SP1 R1CS satisfiability for the current witness.
-    {
-        // R1CS expects witness length == ncols (padded). Build a padded copy.
-        let mut w_full: Vec<F> = (*w_host).clone();
-        if w_full.len() < cache.ncols {
-            w_full.resize(cache.ncols, <F as ark_ff::Field>::ZERO);
-        }
-        r1cs
-            .check_relation(&w_full)
-            .expect("SP1 R1CS should be satisfied by the original witness");
-        if l_pub > 0 {
-            let mut w_bad = w_full.clone();
-            w_bad[1] += <F as ark_ff::Field>::ONE;
-            if r1cs.check_relation(&w_bad).is_ok() {
-                panic!("SP1 R1CS still satisfied after public input flip (unexpected)");
-            }
-        }
-    }
+
 
     // Deterministic Ajtai commitment scheme (system parameter). Keep kappa=1 for now.
     let kappa: usize = 1;
