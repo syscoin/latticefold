@@ -206,11 +206,15 @@ fn main() {
     );
     maybe_print_rss("after build full mats (A,B,C)");
 
+    let l_pub = cache.stats.num_public;
     let bundle = latticefold_plus::sp1_witness_io::load_sp1_witness_any(
         &witness_path,
         cache.stats.num_vars,
     )
     .expect("load witness");
+    // Enforce the expected SP1 shrink-verifier public-input layout so we don't accidentally
+    // “think we are binding z” when the exported R1LF isn’t actually exporting the intended
+    // statement-defining public inputs.
     latticefold_plus::sp1_witness_io::check_sp1_public_inputs_layout(&bundle, l_pub)
         .expect("SP1 public input layout check failed");
     let (w_u64, base_len, aux_len) = (bundle.witness, bundle.base_len, bundle.aux_len);
@@ -252,7 +256,6 @@ fn main() {
     // Build `ComR1CS` instance and run the full LF+ prover to produce a `PlusProof`.
     let t_setup = Instant::now();
     // IMPORTANT: SP1 R1LF/R1CS exports statement-bound public inputs occupying indices 1..=l.
-    let l_pub = cache.stats.num_public;
     let r1cs = latticefold::arith::r1cs::R1CS::<F> { l: l_pub, A: m_a, B: m_b, C: m_c };
     maybe_print_rss("after build r1cs struct");
 
@@ -353,6 +356,11 @@ fn main() {
 Re-export the R1LF after enabling CircuitV2CommitPublicValues handling in the SP1 R1CS compiler."
         );
     }
+    // Enforce the expected SP1 shrink-verifier public-input layout so we don't accidentally
+    // “think we are binding z” when the exported R1LF isn’t actually exporting the intended
+    // statement-defining public inputs.
+    latticefold_plus::sp1_witness_io::check_sp1_public_inputs_layout(&bundle, l_pub)
+        .expect("SP1 public input layout check failed");
     if w_host.len() < 1 + l_pub {
         panic!(
             "witness too short for declared public inputs: w_len={} need_at_least={}",
@@ -360,7 +368,7 @@ Re-export the R1LF after enabling CircuitV2CommitPublicValues handling in the SP
             1 + l_pub
         );
     }
-    let public_inputs: Vec<BFSmall> = w_host[1..1 + l_pub].to_vec();
+    let mut public_inputs: Vec<BFSmall> = w_host[1..1 + l_pub].to_vec();
     println!("  public_inputs_len={} (from witness[1..=l])", public_inputs.len());
 
     if !public_inputs.is_empty() {
