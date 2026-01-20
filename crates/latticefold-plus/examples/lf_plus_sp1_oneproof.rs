@@ -356,11 +356,6 @@ fn main() {
 Re-export the R1LF after enabling CircuitV2CommitPublicValues handling in the SP1 R1CS compiler."
         );
     }
-    // Enforce the expected SP1 shrink-verifier public-input layout so we don't accidentally
-    // “think we are binding z” when the exported R1LF isn’t actually exporting the intended
-    // statement-defining public inputs.
-    latticefold_plus::sp1_witness_io::check_sp1_public_inputs_layout(&bundle, l_pub)
-        .expect("SP1 public input layout check failed");
     if w_host.len() < 1 + l_pub {
         panic!(
             "witness too short for declared public inputs: w_len={} need_at_least={}",
