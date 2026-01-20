@@ -96,6 +96,46 @@ where
     h.finalize().into()
 }
 
+#[cfg(feature = "we_gate")]
+pub fn pcs_commit_public_inputs<BF: PrimeField>(
+    public_inputs: &[BF],
+    kappa_commit: usize,
+) -> Result<Vec<BF>, String> {
+    use symphony::pcs::{cmf_pcs, folding_pcs_l2};
+
+    let pcs_params =
+        cmf_pcs::cmf_pcs_params_for_flat_len::<BF>(public_inputs.len(), kappa_commit)?;
+    let f_pcs = cmf_pcs::pad_flat_message(&pcs_params, public_inputs);
+    let (t_pcs, _s_pcs) = folding_pcs_l2::commit(&pcs_params, &f_pcs)?;
+    Ok(t_pcs)
+}
+
+/// Statement hash that binds public inputs via PCS commitment (cm_f PCS).
+///
+/// This replaces the raw `public_inputs` payload with a PCS commitment surface, so the statement
+/// digest is bound to a deterministic commitment of those inputs.
+#[cfg(feature = "we_gate")]
+pub fn we_statement_hash_lf_plus_pcs<R: OverField>(
+    vk_hash: [u8; 32],
+    r1cs_digest: [u8; 32],
+    gate_digest: [u8; 32],
+    params: &WeParams,
+    public_inputs: &[R::BaseRing],
+) -> Result<[u8; 32], String>
+where
+    R::BaseRing: PrimeField,
+{
+    let kappa_commit = 8usize;
+    let cm_t = pcs_commit_public_inputs::<R::BaseRing>(public_inputs, kappa_commit)?;
+    Ok(we_statement_hash_lf_plus::<R>(
+        vk_hash,
+        r1cs_digest,
+        gate_digest,
+        params,
+        &cm_t,
+    ))
+}
+
 /// Canonical encoding for a 32-byte digest as a field element.
 ///
 /// Interpret the digest as a **little-endian** integer and reduce mod p.

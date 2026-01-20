@@ -164,6 +164,7 @@ fn bench_we_dpp(c: &mut Criterion) {
                 &sp1_public_input_digest_bits,
                 &proof,
                 M.len(),
+                None,
                 B_bound,
             )
             .expect("build_we_dr1cs_for_plus_proof");
@@ -180,6 +181,7 @@ fn bench_we_dpp(c: &mut Criterion) {
             &sp1_public_input_digest_bits,
             &proof,
             M.len(),
+            None,
             B_bound,
         )
         .expect("build_we_dr1cs_for_plus_proof");

@@ -17,6 +17,8 @@ use symphony::dpp_poseidon::{
 };
 use symphony::dpp_sumcheck::Dr1csBuilder;
 use symphony::dpp_sumcheck::{sumcheck_verify_degree3, RingVars};
+use symphony::pcs::dpp_folding_pcs_l2::folding_pcs_l2_verify_dr1cs_with_c_bytes;
+use symphony::pcs::folding_pcs_l2::{FoldingPcsL2Params, FoldingPcsL2ProofCore};
 
 /// Output of WE-gate arithmetization (single merged sparse dR1CS instance).
 #[derive(Clone, Debug)]
@@ -25,6 +27,17 @@ pub struct WeDr1csOutput<F: PrimeField> {
     pub assignment: Vec<F>,
     /// Number of public variables `l` (prefix of the assignment vector) intended as `x`.
     pub public_len: usize,
+}
+
+#[cfg(feature = "we_gate")]
+pub struct WePcsInput<'a, F: PrimeField> {
+    pub params: &'a FoldingPcsL2Params<F>,
+    pub t: &'a [F],
+    pub x0: &'a [F],
+    pub x1: &'a [F],
+    pub x2: &'a [F],
+    pub proof: &'a FoldingPcsL2ProofCore<F>,
+    pub coin_squeeze_idx: usize,
 }
 
 fn lf_ops_to_symphony_ops<F: PrimeField>(ops: &[LfPoseidonTraceOp<F>]) -> Vec<symphony::transcript::PoseidonTraceOp<F>> {
@@ -2715,13 +2728,14 @@ where
 }
 
 #[cfg(feature = "we_gate")]
-pub fn build_we_dr1cs_for_plus_proof<R>(
+pub fn build_we_dr1cs_for_plus_proof<'a, R>(
     poseidon_cfg: &PoseidonConfig<BF<R>>,
     trace: &PoseidonTranscriptTrace<BF<R>>,
     params: &WeParams,
     public_inputs: &[BF<R>],
     proof: &crate::plus::PlusProof<R, crate::r1cs::ComR1CSProof<R>>,
     mlen_mats: usize,
+    pcs: Option<WePcsInput<'a, BF<R>>>,
     B: u128,
 ) -> Result<WeDr1csOutput<BF<R>>, String>
 where
@@ -2737,6 +2751,7 @@ where
     //
     // and reject if the provided trace deviates or has extra ops.
     use crate::recording_transcript::PoseidonTraceOp as Op;
+    let ops_for_offsets: &[LfPoseidonTraceOp<BF<R>>] = &trace.ops;
     let (cm_ops_offset, cm_absorb_op_offset, cm_squeezed_field_offset) = {
         let mut op_idx = 0usize;
         let mut absorb_ops = 0usize;
@@ -2748,7 +2763,20 @@ where
              op_idx: &mut usize,
              absorb_ops: &mut usize|
              -> Result<(), String> {
-                match trace.ops.get(*op_idx) {
+                if pcs.is_some() {
+                    loop {
+                        match ops_for_offsets.get(*op_idx) {
+                            Some(Op::Absorb(v)) if v.len() != expected_len => {
+                                *op_idx += 1;
+                            }
+                            Some(Op::SqueezeField(_)) => {
+                                *op_idx += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                match ops_for_offsets.get(*op_idx) {
                     Some(Op::Absorb(v)) if v.len() == expected_len => {
                         *op_idx += 1;
                         *absorb_ops += 1;
@@ -2766,7 +2794,17 @@ where
              op_idx: &mut usize,
              squeezed_field_elems: &mut usize|
              -> Result<(), String> {
-                match trace.ops.get(*op_idx) {
+                // When PCS is enabled, allow extra scalar absorbs in the trace prefix
+                // (they are transcript-bound but not part of the CM verifier schedule).
+                loop {
+                    match ops_for_offsets.get(*op_idx) {
+                        Some(Op::Absorb(_)) => {
+                            *op_idx += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                match ops_for_offsets.get(*op_idx) {
                     Some(Op::SqueezeField(v)) if v.len() == expected_len => {
                         *op_idx += 1;
                         *squeezed_field_elems += v.len();
@@ -2793,7 +2831,7 @@ where
 
         let expect_squeeze_bytes =
             |expected_n: usize, op_idx: &mut usize| -> Result<(), String> {
-                match trace.ops.get(*op_idx) {
+                match ops_for_offsets.get(*op_idx) {
                     Some(Op::SqueezeBytes { n, out }) if *n == expected_n && out.len() == expected_n => {
                         *op_idx += 1;
                         Ok(())
@@ -2941,11 +2979,11 @@ where
             }
         }
 
-        if op_idx != trace.ops.len() {
+        if op_idx != ops_for_offsets.len() {
             return Err(format!(
                 "offsets: trace has extra ops: consumed {} of {}",
                 op_idx,
-                trace.ops.len()
+                ops_for_offsets.len()
             ));
         }
 
@@ -3461,7 +3499,7 @@ where
     }
 
     // Merge: (poseidon, params/public_inputs, lin, stmt_absorb, dcom, coin, field, cm, decomp)
-    let parts = vec![
+    let mut parts = vec![
         (pose_inst, pose_asg),     // 0
         (params_inst, params_asg), // 1
         (lin_inst, lin_asg),       // 2
@@ -3472,6 +3510,89 @@ where
         (cm_inst, cm_asg),         // 7
         (decomp_inst, decomp_asg), // 8
     ];
+    if let Some(pcs) = pcs {
+        // Enforce that PCS coins come from the first SqueezeBytes immediately after
+        // absorbing CMF_PCS_DOMAIN_SEP (deterministic transcript position).
+        let expected_pcs_idx: Option<usize> = trace
+            .ops
+            .iter()
+            .any(|op| matches!(op, LfPoseidonTraceOp::SqueezeBytes { .. }))
+            .then_some(0);
+        let expected_pcs_idx = expected_pcs_idx.ok_or_else(|| {
+            "plus: missing SqueezeBytes op for PCS coins".to_string()
+        })?;
+        if pcs.coin_squeeze_idx != expected_pcs_idx {
+            return Err(format!(
+                "plus: pcs coin squeeze idx {} != expected {}",
+                pcs.coin_squeeze_idx, expected_pcs_idx
+            ));
+        }
+        // Find Poseidon SqueezeBytes outputs in trace order.
+        let squeeze_outs: Vec<Vec<u8>> = trace
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                LfPoseidonTraceOp::SqueezeBytes { out, .. } => Some(out.clone()),
+                _ => None,
+            })
+            .collect();
+        if pcs.coin_squeeze_idx >= squeeze_outs.len() {
+            return Err(format!(
+                "plus: pcs coin squeeze idx {} out of range (num_squeezes={})",
+                pcs.coin_squeeze_idx,
+                squeeze_outs.len()
+            ));
+        }
+        if pcs.coin_squeeze_idx >= byte_wiring.squeeze_byte_ranges.len() {
+            return Err(format!(
+                "plus: poseidon byte wiring missing squeeze idx {} (have {})",
+                pcs.coin_squeeze_idx,
+                byte_wiring.squeeze_byte_ranges.len()
+            ));
+        }
+        let c_bytes = &squeeze_outs[pcs.coin_squeeze_idx];
+        let (byte_start, byte_len) = byte_wiring.squeeze_byte_ranges[pcs.coin_squeeze_idx];
+        if byte_len != c_bytes.len() {
+            return Err(format!(
+                "plus: pcs coin byte length mismatch: poseidon_wiring_len={} ops_len={}",
+                byte_len,
+                c_bytes.len()
+            ));
+        }
+        let pose_byte_vars = &byte_wiring.squeeze_byte_vars[byte_start..byte_start + byte_len];
+
+        let mut b_pcs = Dr1csBuilder::<BF<R>>::new();
+        b_pcs.enforce_var_eq_const(b_pcs.one(), BF::<R>::ONE);
+        let pcs_byte_vars: Vec<usize> = c_bytes
+            .iter()
+            .map(|&by| b_pcs.new_var(BF::<R>::from(by as u64)))
+            .collect();
+        let pcs_wiring = folding_pcs_l2_verify_dr1cs_with_c_bytes(
+            &mut b_pcs,
+            pcs.params,
+            pcs.t,
+            pcs.x0,
+            pcs.x1,
+            pcs.x2,
+            pcs.proof,
+            &pcs_byte_vars,
+        )?;
+        let (pcs_inst, pcs_asg) = b_pcs.into_instance();
+        let pcs_part_idx = parts.len();
+        parts.push((pcs_inst, pcs_asg));
+
+        // Glue Poseidon SqueezeBytes vars to PCS coin bytes.
+        for (&pv, &cv) in pose_byte_vars.iter().zip(pcs_byte_vars.iter()) {
+            glue.push((0, pv, pcs_part_idx, cv));
+        }
+        // Glue PCS commitment surface to public inputs.
+        if pcs_wiring.t_vars.len() != pub_input_vars.len() {
+            return Err("plus: pcs/public input length mismatch".to_string());
+        }
+        for (tv, pv) in pcs_wiring.t_vars.iter().zip(pub_input_vars.iter()) {
+            glue.push((1, *pv, pcs_part_idx, *tv));
+        }
+    }
     let (inst, assignment) =
         merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| e.to_string())?;
     // Public layout: [ONE] || [10×WeParams] || [public_inputs...]
@@ -4249,6 +4370,7 @@ mod tests {
                 sp1_digest_bits,
                 &proof,
                 m0.len(),
+                None,
                 b_bound,
             )
             .expect("build we dr1cs");
@@ -4404,6 +4526,21 @@ mod tests {
 
     #[test]
     fn test_we_plus_prover_sparse_base_small_mock_sat() {
+        fn with_large_stack<F: FnOnce() + Send + 'static>(f: F) {
+            std::thread::Builder::new()
+                .stack_size(64 * 1024 * 1024)
+                .spawn(f)
+                .expect("spawn with large stack")
+                .join()
+                .expect("join large stack thread");
+        }
+        with_large_stack(|| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .stack_size(64 * 1024 * 1024)
+                .build()
+                .expect("build local rayon pool");
+            pool.install(|| {
         // A small end-to-end test for the **production** SP1-style path:
         // - ComR1CSBase (A/B/C over base ring + const-coeff witness)
         // - PlusProverSparseBase::prove_sparse_base
@@ -4428,6 +4565,9 @@ mod tests {
         use crate::rgchk::DecompParameters;
         use crate::transcript::PoseidonTranscript;
         use crate::we_statement::digest32_to_bits_field;
+        use symphony::pcs::cmf_pcs::cmf_pcs_params_for_flat_len;
+        use symphony::pcs::{cmf_pcs, folding_pcs_l2};
+        use symphony::pcs::folding_pcs_l2::BinMatrix;
         use latticefold::arith::r1cs::R1CS;
         use latticefold::commitment::AjtaiCommitmentScheme;
 
@@ -4453,10 +4593,17 @@ mod tests {
 
         // SP1-style public inputs: 256 digest bits.
         type BF0 = <<RR as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
-        let public_inputs: Vec<BF0> = {
+        let public_inputs_raw: Vec<BF0> = {
             let d: [u8; 32] = Sha256::digest(b"LFP_WE_PLUS_SPARSE_BASE_SMALL_V1").into();
             digest32_to_bits_field::<BF0>(d)
         };
+        let kappa_commit = 8usize;
+        let pcs_params = cmf_pcs_params_for_flat_len::<BF0>(public_inputs_raw.len(), kappa_commit)
+            .expect("cmf pcs params");
+        let f_pcs = cmf_pcs::pad_flat_message(&pcs_params, &public_inputs_raw);
+        let (t_pcs, s_pcs) = folding_pcs_l2::commit(&pcs_params, &f_pcs)
+            .expect("cmf pcs commit");
+        let public_inputs = t_pcs.clone();
 
         // Seeded Ajtai scheme (deterministic system parameter).
         const AJTAI_SEED: [u8; 32] = *b"LFP_SP1_AJTAI_SEED_V1_0000000000";
@@ -4545,7 +4692,56 @@ mod tests {
             .cmproof
             .verify_with_mlen(m0.len(), &public_inputs, &mut rec)
             .expect("cm verify (record)");
+        // Domain-separated PCS coin squeeze (recorded in trace for WE gate wiring).
         let trace = rec.trace().clone();
+
+        // Build PCS proof for the committed public inputs (cmf PCS).
+        let squeeze_bytes_outs: Vec<Vec<u8>> = trace
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                crate::recording_transcript::PoseidonTraceOp::SqueezeBytes { out, .. } => {
+                    Some(out.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let pcs_coin_squeeze_idx = 0usize;
+        let c_bytes = &squeeze_bytes_outs[pcs_coin_squeeze_idx];
+        let bits = {
+            let mut out = Vec::with_capacity(c_bytes.len() * 8);
+            for &b in c_bytes {
+                for i in 0..8 {
+                    out.push(((b >> i) & 1) == 1);
+                }
+            }
+            out
+        };
+        let r = pcs_params.r;
+        let kappa = pcs_params.kappa;
+        let need = r * kappa * kappa;
+        let to_bin_matrix = |offset: usize| -> BinMatrix<BF0> {
+            let data = (0..(r * kappa * kappa))
+                .map(|i| if bits[offset + i] { BF0::ONE } else { BF0::ZERO })
+                .collect();
+            BinMatrix { rows: r * kappa, cols: kappa, data }
+        };
+        let c1 = to_bin_matrix(0);
+        let c2 = to_bin_matrix(need);
+        let x0 = vec![BF0::ONE; r];
+        let x1 = vec![BF0::ONE; r];
+        let x2 = vec![BF0::ONE; r];
+        let (_u_pcs, pcs_core) = folding_pcs_l2::open(
+            &pcs_params,
+            &f_pcs,
+            &s_pcs,
+            &x0,
+            &x1,
+            &x2,
+            &c1,
+            &c2,
+        )
+        .expect("cmf pcs open");
 
         let params = WeParams {
             nvars_setchk: nvars as u64,
@@ -4567,10 +4763,21 @@ mod tests {
             &public_inputs,
             &proof,
             m0.len(),
+            Some(WePcsInput {
+                params: &pcs_params,
+                t: &public_inputs,
+                x0: &x0,
+                x1: &x1,
+                x2: &x2,
+                proof: &pcs_core,
+                coin_squeeze_idx: pcs_coin_squeeze_idx,
+            }),
             b_decomp,
         )
         .expect("build_we_dr1cs_for_plus_proof");
         out.inst.check(&out.assignment).expect("we gate dr1cs satisfied");
+            });
+        });
     }
 }
 

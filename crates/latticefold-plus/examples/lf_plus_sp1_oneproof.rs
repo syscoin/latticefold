@@ -25,6 +25,8 @@ use latticefold::transcript::Transcript;
 use latticefold_plus::lin::LinearizedVerify;
 use latticefold_plus::utils::maybe_print_rss;
 use latticefold_plus::we_statement::{we_statement_hash_lf_plus, LFP_WE_GATE_DIGEST_V1};
+use symphony::pcs::{cmf_pcs, folding_pcs_l2};
+use symphony::pcs::folding_pcs_l2::BinMatrix;
 use cyclotomic_rings::rings::FrogRing64 as R;
 use stark_rings::PolyRing;
 use stark_rings_linalg::SparseMatrix;
@@ -39,6 +41,37 @@ use dpp::packing::{
     centered_bigint_to_field, field_to_centered_bigint, sample_packing_weights, FlpcpPredicate,
     PackedDppQuerySparse,
 };
+
+fn bytes_to_bits_le(bytes: &[u8]) -> Vec<bool> {
+    let mut out = Vec::with_capacity(bytes.len() * 8);
+    for &b in bytes {
+        for i in 0..8 {
+            out.push(((b >> i) & 1) == 1);
+        }
+    }
+    out
+}
+
+fn bin_matrix_from_bits<BF: PrimeField>(
+    bits: &[bool],
+    rows: usize,
+    cols: usize,
+    offset: usize,
+) -> BinMatrix<BF> {
+    let need = rows * cols;
+    if bits.len() < offset + need {
+        panic!(
+            "bin_matrix_from_bits: need {} bits at offset {}, have {}",
+            need,
+            offset,
+            bits.len()
+        );
+    }
+    let data = (0..need)
+        .map(|i| if bits[offset + i] { BF::ONE } else { BF::ZERO })
+        .collect();
+    BinMatrix { rows, cols, data }
+}
 use dpp::pipeline::build_rev2_dpp_sparse_boolean_auto;
 use dpp::sparse::SparseVec;
 
@@ -206,17 +239,11 @@ fn main() {
     );
     maybe_print_rss("after build full mats (A,B,C)");
 
-    let l_pub = cache.stats.num_public;
     let bundle = latticefold_plus::sp1_witness_io::load_sp1_witness_any(
         &witness_path,
         cache.stats.num_vars,
     )
     .expect("load witness");
-    // Enforce the expected SP1 shrink-verifier public-input layout so we don't accidentally
-    // “think we are binding z” when the exported R1LF isn’t actually exporting the intended
-    // statement-defining public inputs.
-    latticefold_plus::sp1_witness_io::check_sp1_public_inputs_layout(&bundle, l_pub)
-        .expect("SP1 public input layout check failed");
     let (w_u64, base_len, aux_len) = (bundle.witness, bundle.base_len, bundle.aux_len);
     println!("  loaded witness: base={} aux={} full={}", base_len, aux_len, w_u64.len());
     assert!(!w_u64.is_empty() && w_u64[0] == 1, "witness must have w[0]=1");
@@ -226,29 +253,19 @@ fn main() {
     // - **all vars (including aux)**: centered embedding mod p_bb
     let p_bb = cache.stats.p_bb;
     let t_w = Instant::now();
-    let mut w_host_vec: Vec<F> = w_u64
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(i, x)| {
-            if x >= p_bb {
-                panic!("witness word out of [0,p_bb) range at idx={i}: x={x} p_bb={p_bb}");
-            }
-            babybear_u64_to_centered_host(x, p_bb)
-        })
-        .collect();
-    // Optional: tweak a public input in the witness to force unsat / LF+ failure.
-    if l_pub > 0
-        && w_host_vec.len() > 1
-        && std::env::var("LFP_TWEAK_PUBLIC_INPUT")
-            .ok()
-            .as_deref()
-            == Some("1")
-    {
-        w_host_vec[1] += <F as ark_ff::Field>::ONE;
-        println!("  tweaked witness public input w[1]");
-    }
-    let w_host: Arc<Vec<F>> = Arc::new(w_host_vec);
+    let w_host: Arc<Vec<F>> = Arc::new(
+        w_u64
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, x)| {
+                if x >= p_bb {
+                    panic!("witness word out of [0,p_bb) range at idx={i}: x={x} p_bb={p_bb}");
+                }
+                babybear_u64_to_centered_host(x, p_bb)
+            })
+            .collect(),
+    );
     println!("  map witness u64->F: {:?}", t_w.elapsed());
     maybe_print_rss("after map witness u64->F");
 
@@ -266,9 +283,9 @@ fn main() {
     // Build `ComR1CS` instance and run the full LF+ prover to produce a `PlusProof`.
     let t_setup = Instant::now();
     // IMPORTANT: SP1 R1LF/R1CS exports statement-bound public inputs occupying indices 1..=l.
+    let l_pub = cache.stats.num_public;
     let r1cs = latticefold::arith::r1cs::R1CS::<F> { l: l_pub, A: m_a, B: m_b, C: m_c };
     maybe_print_rss("after build r1cs struct");
-
 
     // Deterministic Ajtai commitment scheme (system parameter). Keep kappa=1 for now.
     let kappa: usize = 1;
@@ -343,7 +360,7 @@ fn main() {
     let (vk_hash, committed_values_digest) = bundle.public_inputs;
     println!("  bundle_r1lf_digest=0x{}", hex32(&bundle.r1lf_digest));
     println!("  vk_hash=0x{}", hex32(&vk_hash));
-    println!(
+        println!(
         "  committed_values_digest=0x{}",
         hex32(&committed_values_digest)
     );
@@ -367,6 +384,11 @@ fn main() {
 Re-export the R1LF after enabling CircuitV2CommitPublicValues handling in the SP1 R1CS compiler."
         );
     }
+    // Enforce the expected SP1 shrink-verifier public-input layout so we don't accidentally
+    // “think we are binding z” when the exported R1LF isn’t actually exporting the intended
+    // statement-defining public inputs.
+    latticefold_plus::sp1_witness_io::check_sp1_public_inputs_layout(&bundle, l_pub)
+        .expect("SP1 public input layout check failed");
     if w_host.len() < 1 + l_pub {
         panic!(
             "witness too short for declared public inputs: w_len={} need_at_least={}",
@@ -374,35 +396,34 @@ Re-export the R1LF after enabling CircuitV2CommitPublicValues handling in the SP
             1 + l_pub
         );
     }
-    let mut public_inputs: Vec<BFSmall> = w_host[1..1 + l_pub].to_vec();
-    println!("  public_inputs_len={} (from witness[1..=l])", public_inputs.len());
+    let public_inputs_raw: Vec<BFSmall> = w_host[1..1 + l_pub].to_vec();
+    println!(
+        "  public_inputs_len={} (from witness[1..=l])",
+        public_inputs_raw.len()
+    );
+    let kappa_commit = 8usize;
+    let pcs_params =
+        cmf_pcs::cmf_pcs_params_for_flat_len::<BFSmall>(public_inputs_raw.len(), kappa_commit)
+            .expect("cmf pcs params");
+    let f_pcs = cmf_pcs::pad_flat_message(&pcs_params, &public_inputs_raw);
+    let (t_pcs, s_pcs) = folding_pcs_l2::commit(&pcs_params, &f_pcs)
+        .expect("cmf pcs commit");
+    let public_inputs = t_pcs.clone();
+    println!(
+        "  pcs_public_inputs_len={} (cmf PCS commitment surface)",
+        public_inputs.len()
+    );
 
-    if !public_inputs.is_empty() {
-        // Debug: show that the mutation actually changes the field element.
-        let before0 = public_inputs[0];
-        let before_preview_len = public_inputs.len().min(8);
-        println!(
-            "  public_inputs_before[0]={:?} preview[0..{}]={:?}",
-            before0,
-            before_preview_len,
-            &public_inputs[..before_preview_len]
-        );
-        public_inputs[0] =
-            <BFSmall as ark_ff::Field>::ONE - public_inputs[0];
-        let after0 = public_inputs[0];
-        let after_preview_len = public_inputs.len().min(8);
-        println!(
-            "  public_inputs_after [0]={:?} preview[0..{}]={:?} (changed={})",
-            after0,
-            after_preview_len,
-            &public_inputs[..after_preview_len],
-            before0 != after0
-        );
-    }
     // Proof-agnostic arming statement digest (binds vk, r1cs, gate version, **params**, and public inputs).
     // This is what an honest armer/decapper should use to derive lock coins.
     let r1cs_digest = cache.stats.digest; // SP1 R1LF instance digest (statement-defined)
-    let stmt_digest = we_statement_hash_lf_plus::<R>(vk_hash, r1cs_digest, LFP_WE_GATE_DIGEST_V1, &we_params, &public_inputs);
+    let stmt_digest = we_statement_hash_lf_plus::<R>(
+        vk_hash,
+        r1cs_digest,
+        LFP_WE_GATE_DIGEST_V1,
+        &we_params,
+        &public_inputs,
+    );
     println!("  stmt_digest=0x{}", hex32(&stmt_digest));
 
     // Demonstrate how an honest armer derives lock/query coins from the statement digest.
@@ -454,6 +475,50 @@ Re-export the R1LF after enabling CircuitV2CommitPublicValues handling in the SP
     maybe_print_rss("after verify(record)");
     let trace = rec.trace().clone();
 
+    // Build PCS proof for the committed public inputs (cmf PCS).
+    let squeeze_bytes_outs: Vec<Vec<u8>> = trace
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            latticefold_plus::recording_transcript::PoseidonTraceOp::SqueezeBytes { out, .. } => {
+                Some(out.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    if squeeze_bytes_outs.is_empty() {
+        panic!("expected at least one SqueezeBytes op for PCS coins");
+    }
+    let pcs_coin_squeeze_idx = 0usize;
+    let c_bytes = &squeeze_bytes_outs[pcs_coin_squeeze_idx];
+    let bits = bytes_to_bits_le(c_bytes);
+    let r = pcs_params.r;
+    let kappa = pcs_params.kappa;
+    let need = r * kappa * kappa;
+    if bits.len() < 2 * need {
+        panic!(
+            "PCS coin bytes too short: need {} bits, have {}",
+            2 * need,
+            bits.len()
+        );
+    }
+    let c1 = bin_matrix_from_bits::<BFSmall>(&bits, r * kappa, kappa, 0);
+    let c2 = bin_matrix_from_bits::<BFSmall>(&bits, r * kappa, kappa, need);
+    let x0 = vec![BFSmall::ONE; r];
+    let x1 = vec![BFSmall::ONE; r];
+    let x2 = vec![BFSmall::ONE; r];
+    let (_u_pcs, pcs_core) = folding_pcs_l2::open(
+        &pcs_params,
+        &f_pcs,
+        &s_pcs,
+        &x0,
+        &x1,
+        &x2,
+        &c1,
+        &c2,
+    )
+    .expect("cmf pcs open");
+
     let t_we = Instant::now();
     let out = latticefold_plus::we_gate_arith::build_we_dr1cs_for_plus_proof::<R>(
         &poseidon_cfg,
@@ -462,6 +527,15 @@ Re-export the R1LF after enabling CircuitV2CommitPublicValues handling in the SP
         &public_inputs,
         &proof,
         m0.len(),
+        Some(latticefold_plus::we_gate_arith::WePcsInput {
+            params: &pcs_params,
+            t: &public_inputs,
+            x0: &x0,
+            x1: &x1,
+            x2: &x2,
+            proof: &pcs_core,
+            coin_squeeze_idx: pcs_coin_squeeze_idx,
+        }),
         b_decomp,
     )
     .expect("build_we_dr1cs_for_plus_proof");
