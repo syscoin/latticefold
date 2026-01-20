@@ -20,6 +20,27 @@ pub struct Sp1WitnessBundle {
     pub r1lf_digest: [u8; 32],
 }
 
+/// Best-effort guardrail to ensure the SP1-exported R1LF is actually exporting statement-binding
+/// public inputs (i.e. `l_pub` is small but non-zero).
+///
+/// - Newer SP1 exports: `l_pub = DIGEST_SIZE = 8` (only `RecursionPublicValues.digest`)
+/// - Legacy SP1 exports: `l_pub = 40` (`sp1_vk_digest || committed_value_digest_bytes`)
+///
+/// We keep this intentionally lightweight: the circuit itself enforces that `digest` is the
+/// Poseidon2 hash of the full public-values vector.
+pub fn check_sp1_public_inputs_layout(bundle: &Sp1WitnessBundle, l_pub: usize) -> Result<(), String> {
+    let (_vk_hash, _committed_values_digest) = bundle.public_inputs;
+    if l_pub == 0 {
+        return Err("SP1 R1LF exports num_public=0".to_string());
+    }
+    if l_pub == 8 || l_pub == 40 {
+        return Ok(());
+    }
+    Err(format!(
+        "unexpected SP1 R1LF num_public={l_pub} (expected 8 for digest-only or legacy 40)"
+    ))
+}
+
 /// Load a witness in either of these formats:
 /// - **Single file only**: `witness_path` is the full witness of length `num_vars`.
 ///

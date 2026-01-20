@@ -59,7 +59,7 @@ type F = <R as PolyRing>::BaseRing;
 // - `EXPECTED_R1LF_DIGEST_HEX`: digest of the SP1 R1LF instance (shape id)
 // - `EXPECTED_VK_HASH_HEX`: SP1 verifier/program id (bytes32_raw)
 const EXPECTED_R1LF_DIGEST_HEX: &str =
-    "0x1d5fa6fcd7ec8246f73714190327d203592e08a86d9feb510eba0d3c3c02ecce";
+    "0x8140ed4551ea30286f5b81ac642a5c82b337e12864274d62d422a4ad631d096d";
 const EXPECTED_VK_HASH_HEX: &str =
     "0x004cda927463a9cda648d01028f3de6b4d4ff3135683772508de859c42fe6a08";
 
@@ -351,6 +351,11 @@ fn main() {
 Re-export the R1LF after enabling CircuitV2CommitPublicValues handling in the SP1 R1CS compiler."
         );
     }
+    // Enforce the expected SP1 shrink-verifier public-input layout so we don't accidentally
+    // “think we are binding z” when the exported R1LF isn’t actually exporting the intended
+    // statement-defining public inputs.
+    latticefold_plus::sp1_witness_io::check_sp1_public_inputs_layout(&bundle, l_pub)
+        .expect("SP1 public input layout check failed");
     if w_host.len() < 1 + l_pub {
         panic!(
             "witness too short for declared public inputs: w_len={} need_at_least={}",
@@ -358,7 +363,7 @@ Re-export the R1LF after enabling CircuitV2CommitPublicValues handling in the SP
             1 + l_pub
         );
     }
-    let mut public_inputs: Vec<BFSmall> = w_host[1..1 + l_pub].to_vec();
+    let public_inputs: Vec<BFSmall> = w_host[1..1 + l_pub].to_vec();
     println!("  public_inputs_len={} (from witness[1..=l])", public_inputs.len());
 
     if !public_inputs.is_empty() {
@@ -432,7 +437,7 @@ Re-export the R1LF after enabling CircuitV2CommitPublicValues handling in the SP
         lp.verify(&mut rec);
     }
     proof.cmproof
-        .verify_with_mlen(m0.len(), &mut rec)
+        .verify_with_mlen(m0.len(), &public_inputs, &mut rec)
         .expect("cm proof verify");
     println!("  PlusVerifier::verify(record trace): {:?}", t_verify_record.elapsed());
     maybe_print_rss("after verify(record)");

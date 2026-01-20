@@ -3010,10 +3010,6 @@ where
             let mut pub_input_vars = Vec::with_capacity(public_inputs.len());
             for &x in public_inputs {
                 let v = b_params.new_var(x);
-                // Statement-bound DPP: fix each statement input to this circuit instance.
-                // This prevents mix-and-match by making the statement part of the *relation*,
-                // not merely a public input vector.
-                b_params.enforce_var_eq_const(v, x);
                 pub_input_vars.push(v);
             }
             let (params_inst, params_asg) = b_params.into_instance();
@@ -3478,9 +3474,8 @@ where
     ];
     let (inst, assignment) =
         merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| e.to_string())?;
-    // Statement-bound DPP: statement inputs are enforced as constants inside the circuit,
-    // so they are NOT part of the public input vector.
-    let public_len = 1 + 10;
+    // Public layout: [ONE] || [10×WeParams] || [public_inputs...]
+    let public_len = 1 + 10 + public_inputs.len();
     Ok(WeDr1csOutput {
         inst,
         assignment,
@@ -4227,7 +4222,7 @@ mod tests {
             }
             proof
                 .cmproof
-                .verify_with_mlen(m0.len(), &mut rec)
+                .verify_with_mlen(m0.len(), sp1_digest_bits, &mut rec)
                 .expect("cm verify");
             let trace = rec.trace().clone();
             eprintln!("[test_large_trace] plus.verify(record): {:?}", t1.elapsed());
@@ -4548,7 +4543,7 @@ mod tests {
         }
         proof
             .cmproof
-            .verify_with_mlen(m0.len(), &mut rec)
+            .verify_with_mlen(m0.len(), &public_inputs, &mut rec)
             .expect("cm verify (record)");
         let trace = rec.trace().clone();
 
