@@ -263,7 +263,7 @@ fn main() {
         // R1CS expects witness length == ncols (padded). Build a padded copy.
         let mut w_full: Vec<F> = (*w_host).clone();
         if w_full.len() < cache.ncols {
-            w_full.resize(cache.ncols, F::ZERO);
+            w_full.resize(cache.ncols, <F as ark_ff::Field>::ZERO);
         }
         r1cs
             .check_relation(&w_full)
