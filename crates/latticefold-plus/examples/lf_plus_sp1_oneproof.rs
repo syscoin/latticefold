@@ -266,7 +266,7 @@ fn main() {
             .expect("SP1 R1CS should be satisfied by the original witness");
         if l_pub > 0 {
             let mut w_bad = w_full.clone();
-            w_bad[1] += F::ONE;
+            w_bad[1] += <F as ark_ff::Field>::ONE;
             if r1cs.check_relation(&w_bad).is_ok() {
                 panic!("SP1 R1CS still satisfied after public input flip (unexpected)");
             }
