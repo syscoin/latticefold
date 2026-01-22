@@ -162,6 +162,11 @@ pub fn merge_sparse_dr1cs_share_one_with_glue<F: PrimeField>(
         return Err("merge_sparse_dr1cs_share_one_with_glue: empty parts".to_string());
     }
 
+    // Fast path: no glue => standard merge.
+    if glue.is_empty() {
+        return merge_sparse_dr1cs_share_one(parts);
+    }
+
     // Compute offsets for each part (how much its non-const vars are shifted by in merged space).
     let mut offsets: Vec<usize> = Vec::with_capacity(parts.len());
     let mut merged_assignment: Vec<F> = vec![F::ONE];
@@ -180,8 +185,137 @@ pub fn merge_sparse_dr1cs_share_one_with_glue<F: PrimeField>(
         if local == 0 { 0 } else { local + offsets[part_idx] }
     };
 
-    let total_constraints: usize =
-        parts.iter().map(|(inst, _)| inst.constraints.len()).sum::<usize>() + glue.len();
+    // --------------------------------------------------------------------
+    // Variable unification for glue:
+    // Instead of adding explicit equality constraints, we *identify* glued variables
+    // into a single variable (like an R1CS variable rename), shrinking nvars and also
+    // eliminating glue constraints.
+    //
+    // This is safe because glue is only used to equate variables that are intended to be
+    // exactly equal (e.g. Poseidon squeeze vars == verifier coin vars, or shared witness
+    // variables across sub-circuits). If two glued vars have different assignments, we
+    // return an error (the caller constructed an inconsistent witness).
+    // --------------------------------------------------------------------
+    use std::collections::HashMap;
+
+    // Collect all *global* indices that appear in glue.
+    let mut idx_map: HashMap<usize, usize> = HashMap::with_capacity(glue.len() * 2);
+    let mut idxs: Vec<usize> = Vec::with_capacity(glue.len() * 2);
+    let mut glue_pairs: Vec<(usize, usize)> = Vec::with_capacity(glue.len());
+
+    let get_id = |g: usize, idx_map: &mut HashMap<usize, usize>, idxs: &mut Vec<usize>| -> usize {
+        if let Some(&id) = idx_map.get(&g) {
+            id
+        } else {
+            let id = idxs.len();
+            idxs.push(g);
+            idx_map.insert(g, id);
+            id
+        }
+    };
+
+    for &(pa, xa, pb, xb) in glue {
+        if pa >= parts.len() || pb >= parts.len() {
+            return Err("merge_sparse_dr1cs_share_one_with_glue: glue part idx out of range".to_string());
+        }
+        let ga = remap_global(pa, xa, &offsets);
+        let gb = remap_global(pb, xb, &offsets);
+        let ia = get_id(ga, &mut idx_map, &mut idxs);
+        let ib = get_id(gb, &mut idx_map, &mut idxs);
+        glue_pairs.push((ia, ib));
+    }
+
+    // Union-find over the glued variable set.
+    let m = idxs.len();
+    let mut parent: Vec<usize> = (0..m).collect();
+    let mut rank: Vec<u8> = vec![0u8; m];
+
+    let find = |mut x: usize, parent: &mut [usize]| -> usize {
+        // Path compression
+        let mut root = x;
+        while parent[root] != root {
+            root = parent[root];
+        }
+        while parent[x] != x {
+            let p = parent[x];
+            parent[x] = root;
+            x = p;
+        }
+        root
+    };
+
+    let union = |a: usize, b: usize, parent: &mut [usize], rank: &mut [u8]| {
+        let ra = find(a, parent);
+        let rb = find(b, parent);
+        if ra == rb {
+            return;
+        }
+        let (mut ra, mut rb) = (ra, rb);
+        if rank[ra] < rank[rb] {
+            core::mem::swap(&mut ra, &mut rb);
+        }
+        parent[rb] = ra;
+        if rank[ra] == rank[rb] {
+            rank[ra] = rank[ra].saturating_add(1);
+        }
+    };
+
+    for (a, b) in glue_pairs {
+        union(a, b, &mut parent, &mut rank);
+    }
+
+    // For each UF root, choose a representative global index (min global index).
+    let mut rep_global_for_root: Vec<usize> = vec![usize::MAX; m];
+    for local_id in 0..m {
+        let r = find(local_id, &mut parent);
+        let g = idxs[local_id];
+        let slot = &mut rep_global_for_root[r];
+        if *slot == usize::MAX || g < *slot {
+            *slot = g;
+        }
+    }
+
+    // Map each glued global index -> its representative global index.
+    let mut rep_of_global: HashMap<usize, usize> = HashMap::with_capacity(m);
+    for local_id in 0..m {
+        let r = find(local_id, &mut parent);
+        let rep_g = rep_global_for_root[r];
+        let g = idxs[local_id];
+        rep_of_global.insert(g, rep_g);
+    }
+
+    // Build a compacted assignment by dropping non-representative glued vars.
+    let old_nvars = merged_assignment.len();
+    let mut new_index: Vec<usize> = vec![usize::MAX; old_nvars];
+    let mut new_assignment: Vec<F> = Vec::with_capacity(old_nvars);
+
+    for i in 0..old_nvars {
+        if let Some(&rep) = rep_of_global.get(&i) {
+            if i != rep {
+                // Consistency check: glued assignments must match exactly.
+                if merged_assignment[i] != merged_assignment[rep] {
+                    return Err(format!(
+                        "merge_sparse_dr1cs_share_one_with_glue: inconsistent glued assignment ({} != {})",
+                        i, rep
+                    ));
+                }
+                continue; // drop this var
+            }
+        }
+        new_index[i] = new_assignment.len();
+        new_assignment.push(merged_assignment[i]);
+    }
+    // Fill indices for dropped vars: map to representative's new index.
+    for (&g, &rep) in rep_of_global.iter() {
+        if g != rep {
+            new_index[g] = new_index[rep];
+        }
+    }
+    if new_index[0] != 0 || new_assignment.get(0).copied().unwrap_or(F::ZERO) != F::ONE {
+        return Err("merge_sparse_dr1cs_share_one_with_glue: internal error (const-1 slot)".to_string());
+    }
+
+    let total_constraints: usize = parts.iter().map(|(inst, _)| inst.constraints.len()).sum::<usize>();
     let mut merged_constraints: Vec<Constraint<F>> = Vec::with_capacity(total_constraints);
 
     // Merge constraints with remapped indices.
@@ -192,8 +326,7 @@ pub fn merge_sparse_dr1cs_share_one_with_glue<F: PrimeField>(
     // bottleneck and appear “single-core bound” in system monitors. In that case, we allow a
     // parallel remap that preserves constraint order and does not allocate *extra* constraints
     // beyond the final merged list (it still must allocate the final `merged_constraints`).
-    let use_parallel_merge =
-        total_constraints >= 2_000_000;
+    let use_parallel_merge = total_constraints >= 2_000_000;
 
     if use_parallel_merge {
         let remapped_parts: Vec<Vec<Constraint<F>>> = parts
@@ -201,7 +334,10 @@ pub fn merge_sparse_dr1cs_share_one_with_glue<F: PrimeField>(
             .enumerate()
             .map(|(part_idx, (inst, _asg))| {
                 let offset = offsets[part_idx];
-                let remap_idx = |idx: usize| -> usize { if idx == 0 { 0 } else { idx + offset } };
+                let remap_idx = |idx: usize| -> usize {
+                    let g = if idx == 0 { 0 } else { idx + offset };
+                    new_index[g]
+                };
                 let remap_lc = |lc: &[(F, usize)]| -> Vec<(F, usize)> {
                     let mut out = Vec::with_capacity(lc.len());
                     for (c, i) in lc {
@@ -226,7 +362,10 @@ pub fn merge_sparse_dr1cs_share_one_with_glue<F: PrimeField>(
     } else {
         for (part_idx, (inst, _asg)) in parts.iter().enumerate() {
             let offset = offsets[part_idx];
-            let remap_idx = |idx: usize| -> usize { if idx == 0 { 0 } else { idx + offset } };
+            let remap_idx = |idx: usize| -> usize {
+                let g = if idx == 0 { 0 } else { idx + offset };
+                new_index[g]
+            };
             for row in &inst.constraints {
                 let remap_lc = |lc: &[(F, usize)]| -> Vec<(F, usize)> {
                     let mut out = Vec::with_capacity(lc.len());
@@ -244,26 +383,12 @@ pub fn merge_sparse_dr1cs_share_one_with_glue<F: PrimeField>(
         }
     }
 
-    // Add glue constraints: (x - y) * 1 = 0.
-    for &(pa, xa, pb, xb) in glue {
-        if pa >= parts.len() || pb >= parts.len() {
-            return Err("merge_sparse_dr1cs_share_one_with_glue: glue part idx out of range".to_string());
-        }
-        let ga = remap_global(pa, xa, &offsets);
-        let gb = remap_global(pb, xb, &offsets);
-        merged_constraints.push(Constraint {
-            a: vec![(F::ONE, ga), (-F::ONE, gb)],
-            b: vec![(F::ONE, 0)],
-            c: vec![(F::ZERO, 0)],
-        });
-    }
-
     Ok((
         SparseDr1csInstance {
-            nvars: merged_assignment.len(),
+            nvars: new_assignment.len(),
             constraints: merged_constraints,
         },
-        merged_assignment,
+        new_assignment,
     ))
 }
 
