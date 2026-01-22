@@ -25,16 +25,14 @@ pub struct SparseDr1csInstance<F: PrimeField> {
 
 impl<F: PrimeField> SparseDr1csInstance<F> {
     pub fn eval_lc(terms: &[(F, usize)], assignment: &[F]) -> F {
-        if terms.len() > 64 {
-            terms
-                .par_iter()
-                .map(|(c, idx)| *c * assignment[*idx])
-                .reduce(|| F::ZERO, |a, b| a + b)
-        } else {
+        // IMPORTANT: keep this sequential.
+        //
+        // `check()` already parallelizes across constraints. Parallelizing inside each linear
+        // combination can introduce nested Rayon parallelism, which is high-overhead and can
+        // trigger stack overflows on large instances.
         terms
             .iter()
             .fold(F::ZERO, |acc, (c, idx)| acc + (*c * assignment[*idx]))
-        }
     }
 
     pub fn check(&self, assignment: &[F]) -> Result<(), String> {
