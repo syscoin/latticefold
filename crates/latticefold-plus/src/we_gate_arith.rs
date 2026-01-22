@@ -1848,10 +1848,17 @@ where
     let mut b = Dr1csBuilder::<BF<R>>::new();
     b.enforce_var_eq_const(b.one(), BF::<R>::ONE);
 
+    // Soundness note:
+    // This subcircuit is only sound *as part of a merged WE instance* where `byte_vars`
+    // are glued to the Poseidon `SqueezeBytes` outputs. On its own, it does not constrain
+    // transcript bytes to be Poseidon outputs (and therefore does not bind challenges).
+
     // Allocate byte vars (as field elements) for the needed bytes.
     let mut byte_vars = Vec::with_capacity(need_bytes);
     for &by in short_bytes_vals.iter() {
-        let v = const_var(&mut b, BF::<R>::from(by as u64));
+        // WE/arm-before-proof: these bytes must be witness variables (later glued to Poseidon
+        // `SqueezeBytes` outputs), not fixed constants from the recorded trace.
+        let v = b.new_var(BF::<R>::from(by as u64));
         byte_vars.push(v);
     }
 
