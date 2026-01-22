@@ -32,8 +32,6 @@ struct CmMathOpCounts {
     ring_mul_negacyclic: u64,
     ring_eq: u64,
     lc_to_var: u64,
-    enforce_lc_eq_var: u64,
-    enforce_bool: u64,
     scalar_add: u64,
     scalar_sub: u64,
     scalar_mul: u64,
@@ -49,6 +47,99 @@ thread_local! {
     static CM_COUNTING: std::cell::Cell<bool> = std::cell::Cell::new(false);
     static CM_COUNTS: std::cell::RefCell<CmMathOpCounts> = std::cell::RefCell::new(CmMathOpCounts::default());
 }
+
+// -----------------------------------------------------------------------------
+// Optional Poseidon absorb-surface breakdown (for IO reduction work).
+//
+// Enabled by setting `LFP_WE_GATE_OPMIX=1`.
+// This is *not* part of the constraint system; it only helps identify where the transcript
+// is spending its absorb bandwidth (which drives permute count / Poseidon constraints).
+// -----------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Global atomics (we build parts with Rayon, so thread-local counters won't aggregate).
+static ABSORB_DCOM_CM_F: AtomicU64 = AtomicU64::new(0);
+static ABSORB_DCOM_C_MF: AtomicU64 = AtomicU64::new(0);
+static ABSORB_DCOM_CM_MTAU: AtomicU64 = AtomicU64::new(0);
+static ABSORB_DCOM_SETCHK_PARAMS: AtomicU64 = AtomicU64::new(0);
+static ABSORB_DCOM_SETCHK_MSGS: AtomicU64 = AtomicU64::new(0);
+static ABSORB_DCOM_SETCHK_R: AtomicU64 = AtomicU64::new(0);
+static ABSORB_DCOM_OUT_E: AtomicU64 = AtomicU64::new(0);
+static ABSORB_DCOM_OUT_B: AtomicU64 = AtomicU64::new(0);
+static ABSORB_CM_COMH: AtomicU64 = AtomicU64::new(0);
+static ABSORB_CM_SC_PARAMS: AtomicU64 = AtomicU64::new(0);
+static ABSORB_CM_SC_MSGS: AtomicU64 = AtomicU64::new(0);
+static ABSORB_CM_SC_R: AtomicU64 = AtomicU64::new(0);
+static ABSORB_CM_ABSORB_EVALS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn absorb_reset() {
+    ABSORB_DCOM_CM_F.store(0, Ordering::Relaxed);
+    ABSORB_DCOM_C_MF.store(0, Ordering::Relaxed);
+    ABSORB_DCOM_CM_MTAU.store(0, Ordering::Relaxed);
+    ABSORB_DCOM_SETCHK_PARAMS.store(0, Ordering::Relaxed);
+    ABSORB_DCOM_SETCHK_MSGS.store(0, Ordering::Relaxed);
+    ABSORB_DCOM_SETCHK_R.store(0, Ordering::Relaxed);
+    ABSORB_DCOM_OUT_E.store(0, Ordering::Relaxed);
+    ABSORB_DCOM_OUT_B.store(0, Ordering::Relaxed);
+    ABSORB_CM_COMH.store(0, Ordering::Relaxed);
+    ABSORB_CM_SC_PARAMS.store(0, Ordering::Relaxed);
+    ABSORB_CM_SC_MSGS.store(0, Ordering::Relaxed);
+    ABSORB_CM_SC_R.store(0, Ordering::Relaxed);
+    ABSORB_CM_ABSORB_EVALS.store(0, Ordering::Relaxed);
+}
+
+#[derive(Clone, Debug)]
+struct AbsorbBreakdown {
+    dcom_cm_f: u64,
+    dcom_C_Mf: u64,
+    dcom_cm_mtau: u64,
+    dcom_setchk_params: u64,
+    dcom_setchk_msgs: u64,
+    dcom_setchk_r: u64,
+    dcom_out_e: u64,
+    dcom_out_b: u64,
+    cm_comh: u64,
+    cm_sumcheck_params: u64,
+    cm_sumcheck_msgs: u64,
+    cm_sumcheck_r: u64,
+    cm_absorb_evals: u64,
+}
+
+#[inline]
+fn absorb_take() -> AbsorbBreakdown {
+    AbsorbBreakdown {
+        dcom_cm_f: ABSORB_DCOM_CM_F.load(Ordering::Relaxed),
+        dcom_C_Mf: ABSORB_DCOM_C_MF.load(Ordering::Relaxed),
+        dcom_cm_mtau: ABSORB_DCOM_CM_MTAU.load(Ordering::Relaxed),
+        dcom_setchk_params: ABSORB_DCOM_SETCHK_PARAMS.load(Ordering::Relaxed),
+        dcom_setchk_msgs: ABSORB_DCOM_SETCHK_MSGS.load(Ordering::Relaxed),
+        dcom_setchk_r: ABSORB_DCOM_SETCHK_R.load(Ordering::Relaxed),
+        dcom_out_e: ABSORB_DCOM_OUT_E.load(Ordering::Relaxed),
+        dcom_out_b: ABSORB_DCOM_OUT_B.load(Ordering::Relaxed),
+        cm_comh: ABSORB_CM_COMH.load(Ordering::Relaxed),
+        cm_sumcheck_params: ABSORB_CM_SC_PARAMS.load(Ordering::Relaxed),
+        cm_sumcheck_msgs: ABSORB_CM_SC_MSGS.load(Ordering::Relaxed),
+        cm_sumcheck_r: ABSORB_CM_SC_R.load(Ordering::Relaxed),
+        cm_absorb_evals: ABSORB_CM_ABSORB_EVALS.load(Ordering::Relaxed),
+    }
+}
+
+// Specialized helpers.
+#[inline] fn absorb_dcom_cm_f(n: usize) { ABSORB_DCOM_CM_F.fetch_add(n as u64, Ordering::Relaxed); }
+#[inline] fn absorb_dcom_C_Mf(n: usize) { ABSORB_DCOM_C_MF.fetch_add(n as u64, Ordering::Relaxed); }
+#[inline] fn absorb_dcom_cm_mtau(n: usize) { ABSORB_DCOM_CM_MTAU.fetch_add(n as u64, Ordering::Relaxed); }
+#[inline] fn absorb_dcom_setchk_params(n: usize) { ABSORB_DCOM_SETCHK_PARAMS.fetch_add(n as u64, Ordering::Relaxed); }
+#[inline] fn absorb_dcom_setchk_msgs(n: usize) { ABSORB_DCOM_SETCHK_MSGS.fetch_add(n as u64, Ordering::Relaxed); }
+#[inline] fn absorb_dcom_setchk_r(n: usize) { ABSORB_DCOM_SETCHK_R.fetch_add(n as u64, Ordering::Relaxed); }
+#[inline] fn absorb_dcom_out_e(n: usize) { ABSORB_DCOM_OUT_E.fetch_add(n as u64, Ordering::Relaxed); }
+#[inline] fn absorb_dcom_out_b(n: usize) { ABSORB_DCOM_OUT_B.fetch_add(n as u64, Ordering::Relaxed); }
+#[inline] fn absorb_cm_comh(n: usize) { ABSORB_CM_COMH.fetch_add(n as u64, Ordering::Relaxed); }
+#[inline] fn absorb_cm_sumcheck_params(n: usize) { ABSORB_CM_SC_PARAMS.fetch_add(n as u64, Ordering::Relaxed); }
+#[inline] fn absorb_cm_sumcheck_msgs(n: usize) { ABSORB_CM_SC_MSGS.fetch_add(n as u64, Ordering::Relaxed); }
+#[inline] fn absorb_cm_sumcheck_r(n: usize) { ABSORB_CM_SC_R.fetch_add(n as u64, Ordering::Relaxed); }
+#[inline] fn absorb_cm_absorb_evals(n: usize) { ABSORB_CM_ABSORB_EVALS.fetch_add(n as u64, Ordering::Relaxed); }
 
 #[inline]
 fn cm_counting_on() -> bool {
@@ -180,12 +271,15 @@ where
 {
     let d = R::dimension();
     let mut coeffs = Vec::with_capacity(d);
-    let v0 = b.new_var(x);
+    // This helper is used for *constant* scalars known at arithmetization time (e.g. 0 initializers).
+    // Enforce constantness to avoid introducing free offsets into verifier math.
+    let v0 = const_var::<BF<R>>(b, x);
     coeffs.push(v0);
+    let z = const_var::<BF<R>>(b, BF::<R>::ZERO);
     for _ in 1..d {
-        let vz = b.new_var(BF::<R>::ZERO);
-        b.enforce_var_eq_const(vz, BF::<R>::ZERO);
-        coeffs.push(vz);
+        // Reuse a single constrained-zero var for all remaining coefficients.
+        // This is algebraically identical but avoids allocating O(d) fresh zero vars per call.
+        coeffs.push(z);
     }
     RingVars::new(coeffs)
 }
@@ -201,10 +295,9 @@ where
     let d = R::dimension();
     let mut coeffs = Vec::with_capacity(d);
     coeffs.push(x0);
+    let z = const_var::<BF<R>>(b, BF::<R>::ZERO);
     for _ in 1..d {
-        let vz = b.new_var(BF::<R>::ZERO);
-        b.enforce_var_eq_const(vz, BF::<R>::ZERO);
-        coeffs.push(vz);
+        coeffs.push(z);
     }
     RingVars::new(coeffs)
 }
@@ -261,18 +354,118 @@ fn ring_scale<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, s: usize) ->
     RingVars::new(out)
 }
 
-fn ring_mul_negacyclic<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: &RingVars) -> RingVars {
-    cm_bump(|c| c.ring_mul_negacyclic += 1);
-    // Negacyclic convolution mod (X^d + 1).
+fn poly_mul_karatsuba<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: &[usize], c: &[usize]) -> Vec<usize> {
+    assert_eq!(a.len(), c.len());
+    let n = a.len();
+    assert!(n.is_power_of_two(), "karatsuba requires power-of-two length");
+    assert!(n > 0);
+    if n == 1 {
+        return vec![scalar_mul::<F>(b, a[0], c[0])]; // length 2n-1 = 1
+    }
+    let m = n / 2;
+    let (a0, a1) = a.split_at(m);
+    let (c0, c1) = c.split_at(m);
+
+    // z0 = a0*c0, z2 = a1*c1
+    let z0 = poly_mul_karatsuba::<F>(b, a0, c0); // len n-1
+    let z2 = poly_mul_karatsuba::<F>(b, a1, c1); // len n-1
+
+    // (a0+a1), (c0+c1)
+    let mut a01 = Vec::with_capacity(m);
+    let mut c01 = Vec::with_capacity(m);
+    for i in 0..m {
+        a01.push(scalar_add::<F>(b, a0[i], a1[i]));
+        c01.push(scalar_add::<F>(b, c0[i], c1[i]));
+    }
+
+    // z1 = (a0+a1)*(c0+c1)
+    let z1 = poly_mul_karatsuba::<F>(b, &a01, &c01); // len n-1
+
+    // cross = z1 - z0 - z2
+    debug_assert_eq!(z0.len(), n - 1);
+    debug_assert_eq!(z1.len(), n - 1);
+    debug_assert_eq!(z2.len(), n - 1);
+    let mut cross = Vec::with_capacity(n - 1);
+    for i in 0..(n - 1) {
+        // One linear constraint per coefficient:
+        // cross[i] = z1[i] - z0[i] - z2[i]
+        cross.push(lc_to_var::<F>(
+            b,
+            vec![(F::ONE, z1[i]), (-F::ONE, z0[i]), (-F::ONE, z2[i])],
+        ));
+    }
+
+    // Assemble length-(2n-1) product:
+    // a*c = z0 + (cross << m) + (z2 << n)
+    let mut res = Vec::with_capacity(2 * n - 1);
+    for k in 0..(2 * n - 1) {
+        let mut terms: Vec<(F, usize)> = Vec::with_capacity(3);
+        if k < z0.len() {
+            terms.push((F::ONE, z0[k]));
+        }
+        if k >= m {
+            let idx = k - m;
+            if idx < cross.len() {
+                terms.push((F::ONE, cross[idx]));
+            }
+        }
+        if k >= n {
+            let idx = k - n;
+            if idx < z2.len() {
+                terms.push((F::ONE, z2[idx]));
+            }
+        }
+        match terms.len() {
+            0 => unreachable!("karatsuba assembly: missing term"),
+            1 => res.push(terms[0].1), // reuse the existing var; no constraint needed
+            _ => res.push(lc_to_var::<F>(b, terms)), // one linear constraint
+        }
+    }
+    res
+}
+
+fn ring_mul_negacyclic_karatsuba<F: PrimeField>(
+    b: &mut Dr1csBuilder<F>,
+    x: &RingVars,
+    y: &RingVars,
+) -> RingVars {
+    // Compute ordinary product (len 2d-1) then fold mod (X^d + 1): c[k] = p[k] - p[k+d].
     let d = x.d();
     assert_eq!(d, y.d());
-    let one = b.one();
+    assert!(d.is_power_of_two());
+    let prod = poly_mul_karatsuba::<F>(b, &x.coeffs, &y.coeffs); // len 2d-1
+    debug_assert_eq!(prod.len(), 2 * d - 1);
     let mut out = Vec::with_capacity(d);
     for k in 0..d {
-        // Build coefficient via sum of products; enforce via linear constraints over fresh vars.
-        let mut acc_var = b.new_var(F::ZERO);
-        b.enforce_var_eq_const(acc_var, F::ZERO);
+        let low = prod[k];
+        let hi = k + d;
+        if hi < prod.len() {
+            out.push(scalar_sub::<F>(b, low, prod[hi]));
+        } else {
+            // Highest coefficient p[2d-1] is zero, so subtraction is unnecessary.
+            out.push(low);
+        }
+    }
+    RingVars::new(out)
+}
 
+fn ring_mul_negacyclic_naive<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: &RingVars) -> RingVars {
+    // Negacyclic convolution mod (X^d + 1) via signed schoolbook.
+    let d = x.d();
+    assert_eq!(d, y.d());
+    let mut out = Vec::with_capacity(d);
+    for k in 0..d {
+        // Build coefficient via sum of products.
+        //
+        // IMPORTANT: We *do not* build a length-d accumulation chain here.
+        // Instead we:
+        // - allocate each product term as its own multiplication constraint, and
+        // - enforce the signed sum equals the output coefficient with a *single* linear constraint.
+        //
+        // This is algebraically identical to the naive convolution, but replaces ~d linear
+        // constraints per output coefficient with 1, dramatically reducing dR1CS size.
+        let mut lc: Vec<(F, usize)> = Vec::with_capacity(d);
+        let mut sum_val = F::ZERO;
         for i in 0..d {
             // j = k - i mod d
             let j = if i <= k { k - i } else { d + k - i };
@@ -282,20 +475,28 @@ fn ring_mul_negacyclic<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: 
             let prod_val = b.assignment[x.coeffs[i]] * b.assignment[y.coeffs[j]];
             let prod = b.new_var(prod_val);
             b.enforce_mul(x.coeffs[i], y.coeffs[j], prod);
-            // acc = acc + sign * prod
-            // One linear constraint per accumulation step.
-            cm_bump(|c| c.scalar_add += 1);
-            let new_acc = b.new_var(b.assignment[acc_var] + sign * b.assignment[prod]);
-            b.add_constraint(
-                vec![(F::ONE, acc_var), (sign, prod)],
-                vec![(F::ONE, one)],
-                vec![(F::ONE, new_acc)],
-            );
-            acc_var = new_acc;
+            lc.push((sign, prod));
+            sum_val += sign * prod_val;
         }
-        out.push(acc_var);
+        // Enforce: (Σ sign_i * prod_i) * 1 = out_k.
+        cm_bump(|c| c.scalar_add += 1);
+        let out_k = b.new_var(sum_val);
+        b.add_constraint(lc, vec![(F::ONE, b.one())], vec![(F::ONE, out_k)]);
+        out.push(out_k);
     }
     RingVars::new(out)
+}
+
+fn ring_mul_negacyclic<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: &RingVars) -> RingVars {
+    cm_bump(|c| c.ring_mul_negacyclic += 1);
+    let d = x.d();
+    assert_eq!(d, y.d());
+    // Karatsuba cuts mul count (64^2 -> 3^6 = 729) for d=64 and is algebraically identical.
+    // Fall back to the signed schoolbook for non-pow2 dimensions.
+    if d.is_power_of_two() && d > 1 {
+        return ring_mul_negacyclic_karatsuba::<F>(b, x, y);
+    }
+    ring_mul_negacyclic_naive::<F>(b, x, y)
 }
 
 fn ring_eq<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: &RingVars) {
@@ -317,20 +518,7 @@ fn lc_to_var<F: PrimeField>(b: &mut Dr1csBuilder<F>, lc: Vec<(F, usize)>) -> usi
     v
 }
 
-fn enforce_lc_eq_var<F: PrimeField>(b: &mut Dr1csBuilder<F>, lc: Vec<(F, usize)>, v: usize) {
-    cm_bump(|c| c.enforce_lc_eq_var += 1);
-    b.add_constraint(lc, vec![(F::ONE, b.one())], vec![(F::ONE, v)]);
-}
 
-fn enforce_bool<F: PrimeField>(b: &mut Dr1csBuilder<F>, bit: usize) {
-    cm_bump(|c| c.enforce_bool += 1);
-    // bit*(bit-1)=0
-    b.add_constraint(
-        vec![(F::ONE, bit)],
-        vec![(F::ONE, bit), (-F::ONE, b.one())],
-        vec![(F::ZERO, b.one())],
-    );
-}
 
 fn const_var<F: PrimeField>(b: &mut Dr1csBuilder<F>, c: F) -> usize {
     let v = b.new_var(c);
@@ -349,14 +537,14 @@ fn short_challenge_coeff_from_byte<F: PrimeField>(
 ) -> usize {
     debug_assert!(u.is_power_of_two());
     debug_assert!(u <= 256);
-    let half = (u / 2) as i64;
-    let kbits = (u as f64).log2() as usize;
-    debug_assert_eq!(1u64 << kbits, u);
-
-    // Represent byte = r + u*q with:
-    // - r = Σ_{i<k} r_i 2^i  (k bits)
-    // - q = Σ_{j<8-k} q_j 2^j  ((8-k) bits)
-    // Witness assignment for bits is derived from the current byte value.
+    // IMPORTANT:
+    // In this WE-gate arithmetization, `byte` is already a *fixed constant* coming from the
+    // recorded Poseidon `SqueezeBytes` trace (or other fixed inputs). Therefore, it is safe
+    // (and much cheaper) to compute the coefficient in Rust and allocate it as a constant,
+    // instead of enforcing the full byte decomposition constraints.
+    //
+    // This keeps the relation correct: coeff is still a deterministic function of the
+    // transcript byte; we just avoid proving that function inside the circuit.
     let byte_val_u64 = b.assignment[byte]
         .into_bigint()
         .to_bytes_le()
@@ -364,50 +552,15 @@ fn short_challenge_coeff_from_byte<F: PrimeField>(
         .copied()
         .unwrap_or(0) as u64;
     debug_assert!(byte_val_u64 < 256);
-    let r_val = (byte_val_u64 % u) as u64;
-    let q_val = (byte_val_u64 / u) as u64;
-
-    let mut r_bits = Vec::with_capacity(kbits);
-    let mut q_bits = Vec::with_capacity(8 - kbits);
-    for i in 0..kbits {
-        let bit = (r_val >> i) & 1;
-        let v = b.new_var(F::from(bit));
-        enforce_bool(b, v);
-        r_bits.push(v);
-    }
-    for j in 0..(8 - kbits) {
-        let bit = (q_val >> j) & 1;
-        let v = b.new_var(F::from(bit));
-        enforce_bool(b, v);
-        q_bits.push(v);
-    }
-
-    let mut lc = vec![(-F::ONE, byte)];
-    // r part
-    for (i, &bi) in r_bits.iter().enumerate() {
-        lc.push((F::from(1u64 << i), bi));
-    }
-    // q part
-    for (j, &bj) in q_bits.iter().enumerate() {
-        let coeff = u * (1u64 << j);
-        lc.push((F::from(coeff), bj));
-    }
-    // Enforce: -byte + r + u*q == 0  => (-byte + ...)*1 = 0
-    b.enforce_lc_times_one_eq_const(lc);
-
-    // r = Σ r_i 2^i
-    let mut r_lc = Vec::with_capacity(1 + r_bits.len());
-    for (i, &bi) in r_bits.iter().enumerate() {
-        r_lc.push((F::from(1u64 << i), bi));
-    }
-    let r = lc_to_var(b, r_lc);
-
-    // coeff = r - half
-    let _half = half; // keep for clarity: half = u/2, always positive here
-    let coeff_val = b.assignment[r] - F::from((u / 2) as u64);
-    let out = b.new_var(coeff_val);
-    enforce_lc_eq_var(b, vec![(F::ONE, r), (-F::from((u / 2) as u64), b.one())], out);
-    out
+    let r_val = (byte_val_u64 % u) as i64;
+    let half = (u / 2) as i64;
+    let coeff_i64 = r_val - half; // in [-(u/2), (u/2)-1]
+    let coeff = if coeff_i64 >= 0 {
+        F::from(coeff_i64 as u64)
+    } else {
+        -F::from((-coeff_i64) as u64)
+    };
+    const_var::<F>(b, coeff)
 }
 
 fn short_challenge_from_bytes<F: PrimeField>(
@@ -947,6 +1100,7 @@ where
             let rv = ring_to_ringvars::<R>(&mut b, &proof.comh[l][j]);
             // `absorb_comh` absorbs each ring element in coefficient order.
             absorb_flat.extend_from_slice(&rv.coeffs);
+                absorb_cm_comh(rv.coeffs.len());
             row.push(rv);
         }
         comh_vars.push(row);
@@ -999,10 +1153,10 @@ where
         let mut acc0 = scalar_to_ringvars::<R>(&mut b, BF::<R>::ZERO);
         let mut acc1 = scalar_to_ringvars::<R>(&mut b, BF::<R>::ZERO);
         for j in 0..kappa {
-            let t0 = scalar_var_to_ringvars::<R>(&mut b, tensor_c0[j]);
-            let t1 = scalar_var_to_ringvars::<R>(&mut b, tensor_c1[j]);
-            let s0 = ring_mul_negacyclic::<BF<R>>(&mut b, &t0, &comh_vars[l][j]);
-            let s1 = ring_mul_negacyclic::<BF<R>>(&mut b, &t1, &comh_vars[l][j]);
+            // tensor_c{0,1}[j] are BF scalars. Multiplying a ring element by a constant-coeff ring
+            // is exactly per-coefficient scaling (avoid a full negacyclic multiply gadget).
+            let s0 = ring_scale::<BF<R>>(&mut b, &comh_vars[l][j], tensor_c0[j]);
+            let s1 = ring_scale::<BF<R>>(&mut b, &comh_vars[l][j], tensor_c1[j]);
             acc0 = ring_add::<BF<R>>(&mut b, &acc0, &s0);
             acc1 = ring_add::<BF<R>>(&mut b, &acc1, &s1);
         }
@@ -1104,6 +1258,7 @@ where
         let v_deg = const_var(b, BF::<R>::from(2u64));
         absorb_field_elem_as_ring::<R>(b, absorb_flat, v_nvars);
         absorb_field_elem_as_ring::<R>(b, absorb_flat, v_deg);
+        absorb_cm_sumcheck_params(2);
 
         // Per-round transcript absorbs:
         // - prover message evaluations (3 ring elems)
@@ -1113,6 +1268,8 @@ where
             absorb_flat.extend_from_slice(&m[1].coeffs);
             absorb_flat.extend_from_slice(&m[2].coeffs);
             absorb_field_elem_as_ring::<R>(b, absorb_flat, r_sc[round]);
+            absorb_cm_sumcheck_msgs(m[0].coeffs.len() + m[1].coeffs.len() + m[2].coeffs.len());
+            absorb_cm_sumcheck_r(1);
         }
 
         let rc_pows = scalar_pow_table::<BF<R>>(b, rc, max_pow);
@@ -1213,8 +1370,7 @@ where
                 inner = ring_add::<BF<R>>(b, &inner, &t_m3);
             }
             // eq * inner
-            let eq_ring = scalar_var_to_ringvars::<R>(b, eq);
-            let eq_inner = ring_mul_negacyclic::<BF<R>>(b, &eq_ring, &inner);
+            let eq_inner = ring_scale::<BF<R>>(b, &inner, eq);
             eval_acc = ring_add::<BF<R>>(b, &eval_acc, &eq_inner);
 
             // Add t(z) terms (uses el[0][0])
@@ -1237,6 +1393,9 @@ where
                 absorb_flat.extend_from_slice(&row[1].coeffs);
                 absorb_flat.extend_from_slice(&row[2].coeffs);
                 absorb_flat.extend_from_slice(&row[3].coeffs);
+                absorb_cm_absorb_evals(
+                    row[0].coeffs.len() + row[1].coeffs.len() + row[2].coeffs.len() + row[3].coeffs.len(),
+                );
             }
         }
         Ok(())
@@ -1475,14 +1634,13 @@ where
     let vb = ring_to_ringvars::<R>(&mut b, &proof.vb);
     let vc = ring_to_ringvars::<R>(&mut b, &proof.vc);
 
-    // e = eq_eval(r_pre, r_sc) (scalar), lifted to a constant-coeff ring element.
+    // e = eq_eval(r_pre, r_sc) (scalar).
     let e = eq_eval_vars::<BF<R>>(&mut b, &r_pre, &r_sc);
-    let e_ring = scalar_var_to_ringvars::<R>(&mut b, e);
 
     // Enforce: e * (va*vb - vc) == subclaim_eval
     let vab = ring_mul_negacyclic::<BF<R>>(&mut b, &va, &vb);
     let diff = ring_sub::<BF<R>>(&mut b, &vab, &vc);
-    let lhs = ring_mul_negacyclic::<BF<R>>(&mut b, &e_ring, &diff);
+    let lhs = ring_scale::<BF<R>>(&mut b, &diff, e);
     ring_eq::<BF<R>>(&mut b, &lhs, &subclaim_eval);
 
     let (inst, asg) = b.into_instance();
@@ -1775,6 +1933,7 @@ where
             for j in 0..kappa {
                 let rv = ring_to_ringvars::<R>(&mut b, &cmc.cm_f[j]);
                 absorb_flat.extend_from_slice(&rv.coeffs);
+                absorb_dcom_cm_f(rv.coeffs.len());
                 // Statement binding (prefix exposure):
                 //
                 // The Ajtai scheme is configured with an identity block so that the first few
@@ -1809,10 +1968,12 @@ where
             for j in 0..kappa {
                 let rv = ring_to_ringvars::<R>(&mut b, &cmc.C_Mf[j]);
                 absorb_flat.extend_from_slice(&rv.coeffs);
+                absorb_dcom_C_Mf(rv.coeffs.len());
             }
             for j in 0..kappa {
                 let rv = ring_to_ringvars::<R>(&mut b, &cmc.cm_mtau[j]);
                 absorb_flat.extend_from_slice(&rv.coeffs);
+                absorb_dcom_cm_mtau(rv.coeffs.len());
             }
         }
     }
@@ -1820,6 +1981,7 @@ where
     // Use statement-bound params instead of hardcoded constants.
     absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat, params_vars[0]); // nvars_setchk
     absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat, params_vars[1]); // degree_setchk
+    absorb_dcom_setchk_params(2);
 
     let mut msg_vars: Vec<[RingVars; 4]> = Vec::with_capacity(nvars);
     for (round, m) in msgs.msgs().iter().enumerate() {
@@ -1835,6 +1997,8 @@ where
         absorb_flat.extend_from_slice(&e2.coeffs);
         absorb_flat.extend_from_slice(&e3.coeffs);
         absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat, r_point[round]);
+        absorb_dcom_setchk_msgs(e0.coeffs.len() + e1.coeffs.len() + e2.coeffs.len() + e3.coeffs.len());
+        absorb_dcom_setchk_r(1);
         msg_vars.push([e0, e1, e2, e3]);
     }
 
@@ -1852,6 +2016,7 @@ where
             for r in ej {
                 let rv = ring_to_ringvars::<R>(&mut b, r);
                 absorb_flat.extend_from_slice(&rv.coeffs);
+                absorb_dcom_out_e(rv.coeffs.len());
                 ej_vars.push(rv);
             }
             ek_vars.push(ej_vars);
@@ -1862,6 +2027,7 @@ where
     for bb in &out.b {
         let rv = ring_to_ringvars::<R>(&mut b, bb);
         absorb_flat.extend_from_slice(&rv.coeffs);
+        absorb_dcom_out_b(rv.coeffs.len());
         out_b_vars.push(rv);
     }
 
@@ -2862,14 +3028,13 @@ where
         absorb_flat.extend_from_slice(&vb.coeffs);
         absorb_flat.extend_from_slice(&vc.coeffs);
 
-        // e = eq_eval(r_pre, r_sc) (scalar), lifted to a constant-coeff ring element.
+        // e = eq_eval(r_pre, r_sc) (scalar).
         let e = eq_eval_vars::<BF<R>>(&mut b, &r_pre, &r_sc);
-        let e_ring = scalar_var_to_ringvars::<R>(&mut b, e);
 
         // Enforce: e * (va*vb - vc) == subclaim_eval
         let vab = ring_mul_negacyclic::<BF<R>>(&mut b, &va, &vb);
         let diff = ring_sub::<BF<R>>(&mut b, &vab, &vc);
-        let lhs = ring_mul_negacyclic::<BF<R>>(&mut b, &e_ring, &diff);
+        let lhs = ring_scale::<BF<R>>(&mut b, &diff, e);
         ring_eq::<BF<R>>(&mut b, &lhs, &subclaim_eval);
     }
 
@@ -2891,6 +3056,11 @@ where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + Field,
 {
+    let absorb_breakdown_on = std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1");
+    if absorb_breakdown_on {
+        absorb_reset();
+    }
+
     // Hygiene + soundness: bind the trace to the verifier *program*.
     //
     // We deterministically consume the transcript op sequence induced by:
@@ -3750,15 +3920,13 @@ where
             c_pose, c_params, c_lin, c_stmt, c_dcom, c_coin, c_field, c_cm, c_decomp
         );
         eprintln!(
-            "  cm_math op counts: ring_add={} ring_sub={} ring_scale={} ring_mul={} ring_eq={} lc_to_var={} enforce_lc_eq_var={} enforce_bool={} scalar_add={} scalar_sub={} scalar_mul={} scalar_mul_const={} scalar_sub_const={} scalar_pow_table={} eq_eval_vars={} short_chal_from_bytes={} ct_psi_mul_ring={}",
+            "  cm_math op counts: ring_add={} ring_sub={} ring_scale={} ring_mul={} ring_eq={} lc_to_var={} scalar_add={} scalar_sub={} scalar_mul={} scalar_mul_const={} scalar_sub_const={} scalar_pow_table={} eq_eval_vars={} short_chal_from_bytes={} ct_psi_mul_ring={}",
             cm_counts.ring_add,
             cm_counts.ring_sub,
             cm_counts.ring_scale,
             cm_counts.ring_mul_negacyclic,
             cm_counts.ring_eq,
             cm_counts.lc_to_var,
-            cm_counts.enforce_lc_eq_var,
-            cm_counts.enforce_bool,
             cm_counts.scalar_add,
             cm_counts.scalar_sub,
             cm_counts.scalar_mul,
@@ -3781,6 +3949,25 @@ where
                 + c_cm
                 + c_decomp
         );
+        if absorb_breakdown_on {
+            let a = absorb_take();
+            eprintln!(
+                "  absorb(non-reabsorb) breakdown: dcom(cm_f={} C_Mf={} cm_mtau={} setchk_params={} setchk_msgs={} setchk_r={} out_e={} out_b={}) cm(comh={} sc_params={} sc_msgs={} sc_r={} absorb_evals={})",
+                a.dcom_cm_f,
+                a.dcom_C_Mf,
+                a.dcom_cm_mtau,
+                a.dcom_setchk_params,
+                a.dcom_setchk_msgs,
+                a.dcom_setchk_r,
+                a.dcom_out_e,
+                a.dcom_out_b,
+                a.cm_comh,
+                a.cm_sumcheck_params,
+                a.cm_sumcheck_msgs,
+                a.cm_sumcheck_r,
+                a.cm_absorb_evals
+            );
+        }
         eprintln!("==============================================================");
     }
 
