@@ -919,24 +919,32 @@ where
 struct CmMathWiring {
     short: CmShortChallengeWiring,
     field: CmFieldChallengeWiring,
-    /// Base-field variables for `dcom.out.r` used by CM's `eq(r, ro)` factor.
-    ///
-    /// This must be glued to the transcript-derived setchk point coming from the Dcom prefix.
-    r_pre_vars: Vec<usize>,
-    /// Flattened BF variables that must equal Poseidon absorb inputs (non-reabsorb absorbs),
-    /// for the CmProof segment starting at `absorb_comh`.
-    absorb_flat: Vec<usize>,
+    // --- Dcom-prefix wiring (SetChk + RgChk) ---
+    squeeze_field_vars: Vec<usize>,
+    params_vars: Vec<usize>,
+    public_input_vars: Vec<usize>,
+    /// Flattened absorb surface for the Dcom prefix excluding reabsorbs.
+    absorb_flat_prefix: Vec<usize>,
+    /// Transcript-derived SetChk sumcheck point r (base field), length = out.nvars.
+    #[allow(dead_code)]
+    r_point_vars: Vec<usize>,
+    // --- CmProof segment absorbs (starting at absorb_comh) ---
+    absorb_flat_cm: Vec<usize>,
 }
 
 #[cfg(feature = "we_gate")]
 fn cm_verifier_math_dr1cs<R>(
     trace: &PoseidonTranscriptTrace<BF<R>>,
     proof: &crate::cm::CmProof<R>,
+    params: &WeParams,
+    public_inputs: &[BF<R>],
     k: usize,
     log_kappa: usize,
     nvars: usize,
     mlen_mats: usize,
     ops_offset: usize,
+    squeezed_field_offset: usize,
+    include_public_inputs_in_absorb: bool,
 ) -> Result<
     (
         SparseDr1csInstance<BF<R>>,
@@ -961,6 +969,350 @@ where
 
     let mut b = Dr1csBuilder::<BF<R>>::new();
     b.enforce_var_eq_const(b.one(), BF::<R>::ONE);
+
+    // ------------------------------------------------------------
+    // Dcom prefix verifier math (SetChk + RgChk) inside this builder
+    // ------------------------------------------------------------
+    let dcom = &proof.dcom;
+    let out_sc = &dcom.out;
+    let nvars_setchk = out_sc.nvars;
+    let nclaims_setchk = out_sc.e[0].len() + out_sc.b.len();
+    let has_rc_setchk = out_sc.e[0].len() > 1;
+
+    let expected_squeezes =
+        nclaims_setchk * (nvars_setchk + 2) + if has_rc_setchk { 1 } else { 0 } + nvars_setchk;
+    if ops_offset > trace.ops.len() {
+        return Err("cm/dcom prefix: ops_offset out of range".to_string());
+    }
+    let prefix_squeezes =
+        count_squeezed_field_elems_before_first_squeeze_bytes::<BF<R>>(&trace.ops[ops_offset..]);
+    if prefix_squeezes != expected_squeezes {
+        return Err(format!(
+            "cm/dcom prefix: squeeze_field count mismatch before bytes: expected {}, trace has {}",
+            expected_squeezes, prefix_squeezes
+        ));
+    }
+    if squeezed_field_offset > trace.squeezed_field.len() {
+        return Err("cm/dcom prefix: squeezed_field_offset out of range".to_string());
+    }
+    if trace.squeezed_field.len() - squeezed_field_offset < expected_squeezes {
+        return Err("cm/dcom prefix: trace.squeezed_field too short".to_string());
+    }
+
+    // Allocate statement-bound params as local vars and enforce they match expected constants.
+    let params_vals = params.to_field_vec::<BF<R>>();
+    if params_vals.len() != 10 {
+        return Err("we params: expected 10 field elements".to_string());
+    }
+    let mut params_vars = Vec::with_capacity(10);
+    for &v in &params_vals {
+        params_vars.push(b.new_var(v));
+    }
+    b.enforce_var_eq_const(params_vars[0], BF::<R>::from(out_sc.nvars as u64)); // nvars_setchk
+    b.enforce_var_eq_const(params_vars[1], BF::<R>::from(3u64)); // degree_setchk
+    b.enforce_var_eq_const(params_vars[2], BF::<R>::from(params.nvars_cm)); // nvars_cm
+    b.enforce_var_eq_const(params_vars[3], BF::<R>::from(2u64)); // degree_cm
+    b.enforce_var_eq_const(params_vars[4], BF::<R>::from(params.kappa)); // kappa
+    b.enforce_var_eq_const(params_vars[5], BF::<R>::from(R::dimension() as u64)); // ring_dim_d
+    b.enforce_var_eq_const(params_vars[6], BF::<R>::from(dcom.dparams.b as u64)); // decomp_b
+    b.enforce_var_eq_const(params_vars[7], BF::<R>::from(dcom.dparams.k as u64)); // k
+    b.enforce_var_eq_const(params_vars[8], BF::<R>::from(dcom.dparams.l as u64)); // l
+    b.enforce_var_eq_const(params_vars[9], BF::<R>::from(params.mlen)); // mlen
+
+    // Allocate extra statement-defined public inputs as vars (not fixed).
+    let mut public_input_vars = Vec::with_capacity(public_inputs.len());
+    for &x in public_inputs {
+        public_input_vars.push(b.new_var(x));
+    }
+
+    // Allocate local squeeze vars with trace values (prefix coins).
+    let mut squeeze_field_vars: Vec<usize> = Vec::with_capacity(expected_squeezes);
+    for &v in trace
+        .squeezed_field
+        .iter()
+        .skip(squeezed_field_offset)
+        .take(expected_squeezes)
+    {
+        squeeze_field_vars.push(b.new_var(v));
+    }
+
+    let mut cur_prefix = 0usize;
+    let take_prefix = |cur: &mut usize, n: usize, xs: &[usize]| -> Vec<usize> {
+        let out = xs[*cur..*cur + n].to_vec();
+        *cur += n;
+        out
+    };
+    let mut c_vars: Vec<Vec<usize>> = Vec::with_capacity(nclaims_setchk);
+    let mut beta_vars: Vec<usize> = Vec::with_capacity(nclaims_setchk);
+    let mut alpha_vars: Vec<usize> = Vec::with_capacity(nclaims_setchk);
+    for _ in 0..nclaims_setchk {
+        c_vars.push(take_prefix(&mut cur_prefix, nvars_setchk, &squeeze_field_vars));
+        beta_vars.push(take_prefix(&mut cur_prefix, 1, &squeeze_field_vars)[0]);
+        alpha_vars.push(take_prefix(&mut cur_prefix, 1, &squeeze_field_vars)[0]);
+    }
+    let rc_var = if has_rc_setchk {
+        Some(take_prefix(&mut cur_prefix, 1, &squeeze_field_vars)[0])
+    } else {
+        None
+    };
+    let r_point_vars = take_prefix(&mut cur_prefix, nvars_setchk, &squeeze_field_vars);
+    debug_assert_eq!(cur_prefix, expected_squeezes);
+
+    // Prefix absorb surface (non-reabsorb absorbs before first SqueezeBytes).
+    let mut absorb_flat_prefix: Vec<usize> = Vec::new();
+    if include_public_inputs_in_absorb {
+        for &v in &public_input_vars {
+            absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat_prefix, v);
+        }
+    }
+
+    // Absorb witness commitments (commit-before-challenge) + enforce prefix binding.
+    {
+        let kappa: usize = params.kappa as usize;
+        for (l, cmc) in dcom.fcoms.iter().enumerate() {
+            for j in 0..kappa {
+                let rv = ring_to_ringvars::<R>(&mut b, &cmc.cm_f[j]);
+                absorb_flat_prefix.extend_from_slice(&rv.coeffs);
+                absorb_dcom_cm_f(rv.coeffs.len());
+
+                const EXPOSE_MAX: usize = 8;
+                let expose_rows = EXPOSE_MAX.min(kappa);
+                if expose_rows > 0 {
+                    if public_input_vars.len() < expose_rows {
+                        return Err(format!(
+                            "dcom/rgchk: expected at least {} public inputs for prefix binding (got {})",
+                            expose_rows,
+                            public_input_vars.len()
+                        ));
+                    }
+                    if dcom.fcoms.len() != 1 {
+                        return Err(format!(
+                            "dcom/rgchk: prefix binding requires L=1 (got L={})",
+                            dcom.fcoms.len()
+                        ));
+                    }
+                    if l == 0 && j < expose_rows {
+                        let pv_ring = scalar_var_to_ringvars::<R>(&mut b, public_input_vars[j]);
+                        ring_eq::<BF<R>>(&mut b, &rv, &pv_ring);
+                    }
+                }
+            }
+            for j in 0..kappa {
+                let rv = ring_to_ringvars::<R>(&mut b, &cmc.C_Mf[j]);
+                absorb_flat_prefix.extend_from_slice(&rv.coeffs);
+                absorb_dcom_C_Mf(rv.coeffs.len());
+            }
+            for j in 0..kappa {
+                let rv = ring_to_ringvars::<R>(&mut b, &cmc.cm_mtau[j]);
+                absorb_flat_prefix.extend_from_slice(&rv.coeffs);
+                absorb_dcom_cm_mtau(rv.coeffs.len());
+            }
+        }
+    }
+
+    // Sumcheck parameter block absorbs.
+    absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat_prefix, params_vars[0]); // nvars_setchk
+    absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat_prefix, params_vars[1]); // degree_setchk
+    absorb_dcom_setchk_params(2);
+
+    // Sumcheck prover messages: per-round 4 ring elements + absorb r_i.
+    let msgs_sc: &ScProof<R> = &out_sc.sumcheck_proof;
+    if msgs_sc.msgs().len() != nvars_setchk {
+        return Err("cm/dcom prefix: sumcheck proof length mismatch".to_string());
+    }
+    let mut msg_vars_sc: Vec<[RingVars; 4]> = Vec::with_capacity(nvars_setchk);
+    for (round, m) in msgs_sc.msgs().iter().enumerate() {
+        if m.evaluations.len() != 4 {
+            return Err("cm/dcom prefix: expected degree-3 evals (len=4)".to_string());
+        }
+        let e0 = ring_to_ringvars::<R>(&mut b, &m.evaluations[0]);
+        let e1 = ring_to_ringvars::<R>(&mut b, &m.evaluations[1]);
+        let e2 = ring_to_ringvars::<R>(&mut b, &m.evaluations[2]);
+        let e3 = ring_to_ringvars::<R>(&mut b, &m.evaluations[3]);
+        absorb_flat_prefix.extend_from_slice(&e0.coeffs);
+        absorb_flat_prefix.extend_from_slice(&e1.coeffs);
+        absorb_flat_prefix.extend_from_slice(&e2.coeffs);
+        absorb_flat_prefix.extend_from_slice(&e3.coeffs);
+        absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat_prefix, r_point_vars[round]);
+        absorb_dcom_setchk_msgs(e0.coeffs.len() + e1.coeffs.len() + e2.coeffs.len() + e3.coeffs.len());
+        absorb_dcom_setchk_r(1);
+        msg_vars_sc.push([e0, e1, e2, e3]);
+    }
+
+    let z0 = const_var(&mut b, BF::<R>::ZERO);
+    let ring_zero = scalar_var_to_ringvars::<R>(&mut b, z0);
+    let v_sc = sumcheck_verify_degree3::<BF<R>>(&mut b, ring_zero.clone(), &msg_vars_sc, &r_point_vars)?;
+
+    // Allocate out.e/out.b ring vars once (used by SetChk digest + RgChk + CM u computation).
+    let mut out_e_vars: Vec<Vec<Vec<RingVars>>> = Vec::with_capacity(out_sc.e.len());
+    for ek in &out_sc.e {
+        let mut ek_vars: Vec<Vec<RingVars>> = Vec::with_capacity(ek.len());
+        for ej in ek {
+            let mut ej_vars: Vec<RingVars> = Vec::with_capacity(ej.len());
+            for r in ej {
+                ej_vars.push(ring_to_ringvars::<R>(&mut b, r));
+            }
+            ek_vars.push(ej_vars);
+        }
+        out_e_vars.push(ek_vars);
+    }
+    let mut out_b_vars: Vec<RingVars> = Vec::with_capacity(out_sc.b.len());
+    for bb in &out_sc.b {
+        out_b_vars.push(ring_to_ringvars::<R>(&mut b, bb));
+    }
+
+    // SetChk recombination: enforce ver == v_sc and digest-absorb out.e/out.b.
+    let rc_pow_base = rc_var.unwrap_or_else(|| const_var(&mut b, BF::<R>::ONE));
+    let rc_pows = scalar_pow_table::<BF<R>>(&mut b, rc_pow_base, nclaims_setchk.saturating_sub(1));
+    let mut ver_scalar = const_var(&mut b, BF::<R>::ZERO);
+    b.enforce_var_eq_const(ver_scalar, BF::<R>::ZERO);
+
+    for i in 0..out_sc.e[0].len() {
+        let eq = eq_eval_vars::<BF<R>>(&mut b, &c_vars[i], &r_point_vars);
+        let beta = beta_vars[i];
+        let alpha = alpha_vars[i];
+        let beta2 = scalar_mul::<BF<R>>(&mut b, beta, beta);
+        let alpha_pows =
+            scalar_pow_table::<BF<R>>(&mut b, alpha, out_sc.e[0][i].len().saturating_sub(1));
+
+        let mut e_sum = const_var(&mut b, BF::<R>::ZERO);
+        b.enforce_var_eq_const(e_sum, BF::<R>::ZERO);
+        for j in 0..out_sc.e[0][i].len() {
+            let ejv = &out_e_vars[0][i][j];
+            let ev1 = ring_eval_at_scalar::<R>(&mut b, ejv, beta);
+            let ev2 = ring_eval_at_scalar::<R>(&mut b, ejv, beta2);
+            absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat_prefix, ev1);
+            absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat_prefix, ev2);
+            absorb_dcom_out_e(2);
+            let ev1_sq = scalar_mul::<BF<R>>(&mut b, ev1, ev1);
+            let diff = scalar_sub::<BF<R>>(&mut b, ev1_sq, ev2);
+            let term = scalar_mul::<BF<R>>(&mut b, diff, alpha_pows[j]);
+            e_sum = scalar_add::<BF<R>>(&mut b, e_sum, term);
+        }
+        let t = scalar_mul::<BF<R>>(&mut b, eq, e_sum);
+        let t = scalar_mul::<BF<R>>(&mut b, t, rc_pows[i]);
+        ver_scalar = scalar_add::<BF<R>>(&mut b, ver_scalar, t);
+    }
+    for i in 0..out_sc.b.len() {
+        let offset = out_sc.e[0].len();
+        let idx = i + offset;
+        let eq = eq_eval_vars::<BF<R>>(&mut b, &c_vars[idx], &r_point_vars);
+        let beta = beta_vars[idx];
+        let alpha = alpha_vars[idx];
+        let beta2 = scalar_mul::<BF<R>>(&mut b, beta, beta);
+        let b_ring = &out_b_vars[i];
+        let ev1 = ring_eval_at_scalar::<R>(&mut b, b_ring, beta);
+        let ev2 = ring_eval_at_scalar::<R>(&mut b, b_ring, beta2);
+        absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat_prefix, ev1);
+        absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat_prefix, ev2);
+        absorb_dcom_out_b(2);
+        let ev1_sq = scalar_mul::<BF<R>>(&mut b, ev1, ev1);
+        let b_claim = scalar_sub::<BF<R>>(&mut b, ev1_sq, ev2);
+        let t = scalar_mul::<BF<R>>(&mut b, eq, alpha);
+        let t = scalar_mul::<BF<R>>(&mut b, t, b_claim);
+        let t = scalar_mul::<BF<R>>(&mut b, t, rc_pows[idx]);
+        ver_scalar = scalar_add::<BF<R>>(&mut b, ver_scalar, t);
+    }
+    let ver_ring = scalar_var_to_ringvars::<R>(&mut b, ver_scalar);
+    ring_eq::<BF<R>>(&mut b, &ver_ring, &v_sc);
+
+    // Bind prover-provided out.r to transcript-derived point.
+    if out_sc.r.len() != r_point_vars.len() {
+        return Err("cm/dcom prefix: out.r length mismatch".to_string());
+    }
+    for (&ri, &rv) in out_sc.r.iter().zip(r_point_vars.iter()) {
+        let v_ri = b.new_var(bf_from_base_ring::<R>(ri));
+        let diff = scalar_sub::<BF<R>>(&mut b, v_ri, rv);
+        b.enforce_var_eq_const(diff, BF::<R>::ZERO);
+    }
+
+    // --- rgchk::Dcom::verify checks + absorb(dcom.evals) ---
+    {
+        let L = dcom.evals.len();
+        let k_rg = dcom.dparams.k;
+        let decomp_b = dcom.dparams.b;
+        let mut dppow_vars: Vec<usize> = Vec::with_capacity(k_rg);
+        for i in 0..k_rg {
+            let base = R::BaseRing::from(decomp_b);
+            let p_br = ark_ff::Field::pow(&base, [i as u64]);
+            dppow_vars.push(const_var(&mut b, bf_from_base_ring::<R>(p_br)));
+        }
+
+        let mut eval_a_vars: Vec<Vec<usize>> = Vec::with_capacity(L);
+        let mut eval_b_vars: Vec<Vec<RingVars>> = Vec::with_capacity(L);
+        let mut eval_c_vars: Vec<Vec<RingVars>> = Vec::with_capacity(L);
+        let mut eval_v_vars: Vec<Vec<usize>> = Vec::with_capacity(L);
+        for eval in &dcom.evals {
+            let mut a_l = Vec::with_capacity(eval.a.len());
+            for &ai in &eval.a {
+                let a_var = b.new_var(bf_from_base_ring::<R>(ai));
+                a_l.push(a_var);
+                let a_ring = scalar_var_to_ringvars::<R>(&mut b, a_var);
+                absorb_flat_prefix.extend_from_slice(&a_ring.coeffs);
+            }
+            eval_a_vars.push(a_l);
+
+            let mut b_l = Vec::with_capacity(eval.b.len());
+            for bi in &eval.b {
+                b_l.push(ring_to_ringvars::<R>(&mut b, bi));
+            }
+            eval_b_vars.push(b_l);
+
+            let mut c_l = Vec::with_capacity(eval.c.len());
+            for ci in &eval.c {
+                let rv = ring_to_ringvars::<R>(&mut b, ci);
+                absorb_flat_prefix.extend_from_slice(&rv.coeffs);
+                c_l.push(rv);
+            }
+            eval_c_vars.push(c_l);
+
+            let mut v_l = Vec::with_capacity(eval.v.len());
+            for &vj in &eval.v {
+                v_l.push(b.new_var(bf_from_base_ring::<R>(vj)));
+            }
+            eval_v_vars.push(v_l);
+        }
+
+        for l in 0..L {
+            if eval_a_vars[l].len() != eval_b_vars[l].len() {
+                return Err("dcom/rgchk: eval.a/eval.b length mismatch".to_string());
+            }
+            for i in 0..eval_a_vars[l].len() {
+                let ct = ct_psi_mul_ring::<R>(&mut b, &eval_b_vars[l][i]);
+                let diff = scalar_sub::<BF<R>>(&mut b, ct, eval_a_vars[l][i]);
+                b.enforce_var_eq_const(diff, BF::<R>::ZERO);
+            }
+        }
+
+        for l in 0..L {
+            let base = l * k_rg;
+            for ni in 0..out_sc.e.len() {
+                for col in 0..d {
+                    let mut acc = ring_zero.clone();
+                    for i in 0..k_rg {
+                        let ui_col = &out_e_vars[ni][base + i][col];
+                        let scaled = ring_scale::<BF<R>>(&mut b, ui_col, dppow_vars[i]);
+                        acc = ring_add::<BF<R>>(&mut b, &acc, &scaled);
+                    }
+                    let ct = ct_psi_mul_ring::<R>(&mut b, &acc);
+                    let expected = if ni == 0 {
+                        *eval_v_vars[l]
+                            .get(col)
+                            .ok_or("dcom/rgchk: eval.v length mismatch")?
+                    } else {
+                        *eval_c_vars[l]
+                            .get(ni)
+                            .ok_or("dcom/rgchk: eval.c length mismatch")?
+                            .coeffs
+                            .get(col)
+                            .ok_or("dcom/rgchk: ring coeff index oob")?
+                    };
+                    let diff = scalar_sub::<BF<R>>(&mut b, ct, expected);
+                    b.enforce_var_eq_const(diff, BF::<R>::ZERO);
+                }
+            }
+        }
+    }
 
     // Extract the exact CmProof coin bytes (short_challenge) and field challenges from the trace,
     // so this part's witness assignment matches the Poseidon part (glue constraints).
@@ -1080,7 +1432,7 @@ where
     // Build the expected absorb surface for the CmProof segment.
     // This excludes all Poseidon-internal reabsorbs performed by `get_challenge`, which we already
     // constrain via `enforce_reabsorb_equals_squeeze` in the Poseidon part.
-    let mut absorb_flat: Vec<usize> = Vec::new();
+    let mut absorb_flat_cm: Vec<usize> = Vec::new();
 
     // --- Witness: commitment surface `comh` (L × κ) ---
     let kappa = proof.comh[0].len();
@@ -1099,8 +1451,8 @@ where
         for j in 0..kappa {
             let rv = ring_to_ringvars::<R>(&mut b, &proof.comh[l][j]);
             // `absorb_comh` absorbs each ring element in coefficient order.
-            absorb_flat.extend_from_slice(&rv.coeffs);
-                absorb_cm_comh(rv.coeffs.len());
+            absorb_flat_cm.extend_from_slice(&rv.coeffs);
+            absorb_cm_comh(rv.coeffs.len());
             row.push(rv);
         }
         comh_vars.push(row);
@@ -1112,28 +1464,18 @@ where
     let mut u_vars: Vec<Vec<RingVars>> = Vec::with_capacity(l_instances);
     for l in 0..l_instances {
         let mut u_l = Vec::with_capacity(e_sets.len());
-        for e_i in e_sets.iter() {
-            if e_i.len() < (l + 1) * k {
+        for ni in 0..e_sets.len() {
+            if out_e_vars[ni].len() < (l + 1) * k {
                 return Err("CmProof: dcom.out.e too short for L,k".to_string());
             }
-            // Flatten k blocks (each Vec<R> of len d) -> length k*d.
-            let mut flat: Vec<RingVars> = Vec::with_capacity(k * d);
-            for block in e_i.iter().skip(l * k).take(k) {
-                if block.len() != d {
-                    return Err("CmProof: dcom.out.e block len != d".to_string());
-                }
-                for x in block {
-                    flat.push(ring_to_ringvars::<R>(&mut b, x));
-                }
-            }
-            if flat.len() != short_wiring.s_prime_flat.len() {
-                return Err("CmProof: e_i flatten len mismatch with s_prime_flat".to_string());
-            }
-            // Σ_j flat[j] * s_prime_flat[j]
             let mut acc = scalar_to_ringvars::<R>(&mut b, BF::<R>::ZERO);
-            for (uij, sij) in flat.iter().zip(short_wiring.s_prime_flat.iter()) {
-                let prod = ring_mul_negacyclic::<BF<R>>(&mut b, uij, sij);
-                acc = ring_add::<BF<R>>(&mut b, &acc, &prod);
+            for blk in 0..k {
+                for col in 0..d {
+                    let uij = &out_e_vars[ni][l * k + blk][col];
+                    let sij = &short_wiring.s_prime_flat[blk * d + col];
+                    let prod = ring_mul_negacyclic::<BF<R>>(&mut b, uij, sij);
+                    acc = ring_add::<BF<R>>(&mut b, &acc, &prod);
+                }
             }
             u_l.push(acc);
         }
@@ -1228,15 +1570,6 @@ where
     let z_idx = l_instances * (4 + 4 * mlen_chunks_usize);
     let max_pow = z_idx + 1;
 
-    // Base-field r used by CM's `eq(r, ro)` factor.
-    let r_pre_vars: Vec<usize> = proof
-        .dcom
-        .out
-        .r
-        .iter()
-        .copied()
-        .map(|x| b.new_var(bf_from_base_ring::<R>(x)))
-        .collect();
 
     // For each of the two sumchecks, compute:
     // - claimed_sum
@@ -1336,8 +1669,8 @@ where
             r_sc,
         );
 
-        // eq(r, ro) where r is dcom.out.r (base ring)
-        let eq = eq_eval_vars::<BF<R>>(b, &r_pre_vars, r_sc);
+        // eq(r, ro) where r is the transcript-derived SetChk point
+        let eq = eq_eval_vars::<BF<R>>(b, &r_point_vars, r_sc);
         let mut eval_acc = scalar_to_ringvars::<R>(b, BF::<R>::ZERO);
 
         for l in 0..l_instances {
@@ -1404,7 +1737,7 @@ where
     do_one(
         0,
         &mut b,
-        &mut absorb_flat,
+        &mut absorb_flat_cm,
         field_wiring.rc0,
         &field_wiring.sumcheck_r0,
         &sc0,
@@ -1415,7 +1748,7 @@ where
     do_one(
         1,
         &mut b,
-        &mut absorb_flat,
+        &mut absorb_flat_cm,
         field_wiring.rc1,
         &field_wiring.sumcheck_r1,
         &sc1,
@@ -1431,8 +1764,12 @@ where
         CmMathWiring {
             short: short_wiring,
             field: field_wiring,
-            r_pre_vars,
-            absorb_flat,
+            squeeze_field_vars,
+            params_vars,
+            public_input_vars,
+            absorb_flat_prefix,
+            r_point_vars,
+            absorb_flat_cm,
         },
     ))
 }
@@ -1732,23 +2069,6 @@ fn absorb_field_elem_as_ring<R>(
 }
 
 #[cfg(feature = "we_gate")]
-#[derive(Clone, Debug)]
-struct DcomPrefixMathWiring {
-    /// Local vars for all Poseidon `SqueezeField` outputs used in the Dcom prefix, in order.
-    squeeze_field_vars: Vec<usize>,
-    /// Transcript-derived setchk sumcheck point `r` (base field), length = nvars.
-    r_point_vars: Vec<usize>,
-    /// Local vars for the 9 statement-bound params (same order as `WeParams::to_field_vec`).
-    params_vars: Vec<usize>,
-    /// Local vars for the extra statement-defined public inputs (e.g. SP1 public input digest).
-    public_input_vars: Vec<usize>,
-    /// Flattened absorb surface for the Dcom prefix excluding reabsorbs:
-    /// - `Out::verify` absorbs (sumcheck params, prover msgs, verifier randomness absorbs, and `absorb_evaluations(e,b)`)
-    /// - `rgchk::absorb_evaluations(dcom.evals)` absorbs (R::from(a_i) then c_i)
-    absorb_flat: Vec<usize>,
-}
-
-#[cfg(feature = "we_gate")]
 fn ct_psi_mul_ring<R>(b: &mut Dr1csBuilder<BF<R>>, x: &RingVars) -> usize
 where
     R: OverField + CoeffRing + PolyRing,
@@ -1775,433 +2095,6 @@ where
         acc = scalar_add::<BF<R>>(b, acc, term);
     }
     acc
-}
-
-#[cfg(feature = "we_gate")]
-fn dcom_verifier_math_dr1cs<R>(
-    dcom: &crate::rgchk::Dcom<R>,
-    trace: &PoseidonTranscriptTrace<BF<R>>,
-    params: &WeParams,
-    public_inputs: &[BF<R>],
-    ops_offset: usize,
-    squeezed_field_offset: usize,
-    include_public_inputs_in_absorb: bool,
-) -> Result<(SparseDr1csInstance<BF<R>>, Vec<BF<R>>, DcomPrefixMathWiring), String>
-where
-    R: OverField + CoeffRing + PolyRing,
-    R::BaseRing: Zq + Field,
-{
-    use latticefold::utils::sumcheck::Proof as ScProof;
-
-    let out = &dcom.out;
-    let nvars = out.nvars;
-    let nclaims = out.e[0].len() + out.b.len();
-    let has_rc = out.e[0].len() > 1;
-
-    // --- Setchk verifier math (same squeeze schedule as `Out::verify`) ---
-    let expected_squeezes = nclaims * (nvars + 2) + if has_rc { 1 } else { 0 } + nvars;
-    if ops_offset > trace.ops.len() {
-        return Err("dcom/setchk: ops_offset out of range".to_string());
-    }
-    let prefix_squeezes =
-        count_squeezed_field_elems_before_first_squeeze_bytes::<BF<R>>(&trace.ops[ops_offset..]);
-    if prefix_squeezes != expected_squeezes {
-        return Err(format!(
-            "dcom/setchk: squeeze_field count mismatch before bytes: expected {}, trace has {}",
-            expected_squeezes, prefix_squeezes
-        ));
-    }
-    if squeezed_field_offset > trace.squeezed_field.len() {
-        return Err("dcom/setchk: squeezed_field_offset out of range".to_string());
-    }
-    if trace.squeezed_field.len() - squeezed_field_offset < expected_squeezes {
-        return Err("dcom/setchk: trace.squeezed_field too short".to_string());
-    }
-
-    let mut b = Dr1csBuilder::<BF<R>>::new();
-    b.enforce_var_eq_const(b.one(), BF::<R>::ONE);
-
-    // Allocate statement-bound params as local vars and enforce they match the circuit's expected constants.
-    let params_vals = params.to_field_vec::<BF<R>>();
-    if params_vals.len() != 10 {
-        return Err("we params: expected 10 field elements".to_string());
-    }
-    let mut params_vars = Vec::with_capacity(10);
-    for &v in &params_vals {
-        params_vars.push(b.new_var(v));
-    }
-    // Enforce equality to the verifier/gadget constants (so changing public_x alone => UNSAT).
-    b.enforce_var_eq_const(params_vars[0], BF::<R>::from(out.nvars as u64)); // nvars_setchk
-    b.enforce_var_eq_const(params_vars[1], BF::<R>::from(3u64)); // degree_setchk
-    b.enforce_var_eq_const(params_vars[2], BF::<R>::from(out.nvars as u64)); // nvars_cm (same nvars in this bench)
-    b.enforce_var_eq_const(params_vars[3], BF::<R>::from(2u64)); // degree_cm
-    b.enforce_var_eq_const(params_vars[4], BF::<R>::from(params.kappa)); // kappa (not otherwise used here)
-    b.enforce_var_eq_const(params_vars[5], BF::<R>::from(R::dimension() as u64)); // ring_dim_d
-    b.enforce_var_eq_const(params_vars[6], BF::<R>::from(dcom.dparams.b as u64)); // decomp_b
-    b.enforce_var_eq_const(params_vars[7], BF::<R>::from(dcom.dparams.k as u64)); // k
-    b.enforce_var_eq_const(params_vars[8], BF::<R>::from(dcom.dparams.l as u64)); // l
-    // mlen is enforced against the builder-provided Mlen in `build_we_dr1cs_for_cm_proof`
-    // via the `mlen_mats` argument; here we can at least ensure it is <= u64::MAX (already).
-    b.enforce_var_eq_const(params_vars[9], BF::<R>::from(params.mlen)); // mlen
-
-    // Allocate extra statement-defined public inputs as vars (not fixed), and absorb them
-    // as field-elements-as-ring at the start of the transcript (proof-agnostic binding).
-    //
-    // IMPORTANT: These are *general field elements* in the current SP1 integration (e.g. SP1's
-    // exported R1CS public inputs like `sp1_vk_digest` and `committed_value_digest` bytes).
-    // They are not necessarily boolean bits, so we must NOT enforce booleanity here.
-    let mut public_input_vars = Vec::with_capacity(public_inputs.len());
-    for &x in public_inputs {
-        let v = b.new_var(x);
-        public_input_vars.push(v);
-    }
-
-    // Allocate local squeeze vars with trace values.
-    let mut squeeze_field_vars: Vec<usize> = Vec::with_capacity(expected_squeezes);
-    for &v in trace
-        .squeezed_field
-        .iter()
-        .skip(squeezed_field_offset)
-        .take(expected_squeezes)
-    {
-        squeeze_field_vars.push(b.new_var(v));
-    }
-    let mut cur = 0usize;
-    let take = |cur: &mut usize, n: usize, xs: &[usize]| -> Vec<usize> {
-        let out = xs[*cur..*cur + n].to_vec();
-        *cur += n;
-        out
-    };
-
-    // Parse cba challenges.
-    let mut c_vars: Vec<Vec<usize>> = Vec::with_capacity(nclaims);
-    let mut beta_vars: Vec<usize> = Vec::with_capacity(nclaims);
-    let mut alpha_vars: Vec<usize> = Vec::with_capacity(nclaims);
-    for _ in 0..nclaims {
-        c_vars.push(take(&mut cur, nvars, &squeeze_field_vars));
-        beta_vars.push(take(&mut cur, 1, &squeeze_field_vars)[0]);
-        alpha_vars.push(take(&mut cur, 1, &squeeze_field_vars)[0]);
-    }
-    let rc_var = if has_rc {
-        Some(take(&mut cur, 1, &squeeze_field_vars)[0])
-    } else {
-        None
-    };
-    let r_point = take(&mut cur, nvars, &squeeze_field_vars);
-    debug_assert_eq!(cur, expected_squeezes);
-
-    // Sumcheck prover messages: per-round 4 ring elements.
-    let msgs: &ScProof<R> = &out.sumcheck_proof;
-    if msgs.msgs().len() != nvars {
-        return Err("dcom/setchk: sumcheck proof length mismatch".to_string());
-    }
-
-    let mut absorb_flat: Vec<usize> = Vec::new();
-
-    // Public inputs are absorbed *before* proof verification begins (optional when the overall
-    // verifier has already absorbed them earlier in the transcript and `ops_offset` starts later).
-    if include_public_inputs_in_absorb {
-        for &v in &public_input_vars {
-            absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat, v);
-        }
-    }
-
-    // (Fiat–Shamir): commit-before-challenge.
-    //
-    // Dcom verification now absorbs the witness commitments before running `Out::verify`,
-    // so that all subsequent verifier coins are bound to the committed witness.
-    //
-    // Must match `rgchk::absorb_fcoms_{instances,fcoms}` ordering:
-    // for each instance l: cm_f, C_Mf, cm_mtau.
-    {
-        let kappa: usize = {
-            let k = params.kappa;
-            if k > (usize::MAX as u64) {
-                return Err("dcom/rgchk: kappa too large for usize".to_string());
-            }
-            k as usize
-        };
-        if dcom.fcoms.len() != dcom.evals.len() {
-            return Err("dcom/rgchk: fcoms length mismatch".to_string());
-        }
-        for (l, cmc) in dcom.fcoms.iter().enumerate() {
-            if cmc.cm_f.len() != kappa || cmc.C_Mf.len() != kappa || cmc.cm_mtau.len() != kappa {
-                return Err(format!(
-                    "dcom/rgchk: fcoms[{l}] commitment len mismatch (expected kappa={kappa})"
-                ));
-            }
-            for j in 0..kappa {
-                let rv = ring_to_ringvars::<R>(&mut b, &cmc.cm_f[j]);
-                absorb_flat.extend_from_slice(&rv.coeffs);
-                absorb_dcom_cm_f(rv.coeffs.len());
-                // Statement binding (prefix exposure):
-                //
-                // The Ajtai scheme is configured with an identity block so that the first few
-                // commitment coordinates are *literal* witness coordinates (readable from `cm_f`).
-                //
-                // Fail closed: if the verifier expects prefix binding (expose_rows > 0), require
-                // the corresponding number of statement public inputs to be provided.
-                const EXPOSE_MAX: usize = 8;
-                let expose_rows = EXPOSE_MAX.min(kappa);
-                if expose_rows > 0 {
-                    if public_input_vars.len() < expose_rows {
-                        return Err(format!(
-                            "dcom/rgchk: expected at least {} public inputs for prefix binding (got {})",
-                            expose_rows,
-                            public_input_vars.len()
-                        ));
-                    }
-                    // Current SP1 streamed/WE usage is L=1. If this ever changes, either bind all
-                    // instances or explicitly statement-bind a per-instance digest.
-                    if dcom.fcoms.len() != 1 {
-                        return Err(format!(
-                            "dcom/rgchk: prefix binding requires L=1 (got L={})",
-                            dcom.fcoms.len()
-                        ));
-                    }
-                    if l == 0 && j < expose_rows {
-                        let pv_ring = scalar_var_to_ringvars::<R>(&mut b, public_input_vars[j]);
-                        ring_eq::<BF<R>>(&mut b, &rv, &pv_ring);
-                    }
-                }
-            }
-            for j in 0..kappa {
-                let rv = ring_to_ringvars::<R>(&mut b, &cmc.C_Mf[j]);
-                absorb_flat.extend_from_slice(&rv.coeffs);
-                absorb_dcom_C_Mf(rv.coeffs.len());
-            }
-            for j in 0..kappa {
-                let rv = ring_to_ringvars::<R>(&mut b, &cmc.cm_mtau[j]);
-                absorb_flat.extend_from_slice(&rv.coeffs);
-                absorb_dcom_cm_mtau(rv.coeffs.len());
-            }
-        }
-    }
-    // Sumcheck parameter block absorbs.
-    // Use statement-bound params instead of hardcoded constants.
-    absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat, params_vars[0]); // nvars_setchk
-    absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat, params_vars[1]); // degree_setchk
-    absorb_dcom_setchk_params(2);
-
-    let mut msg_vars: Vec<[RingVars; 4]> = Vec::with_capacity(nvars);
-    for (round, m) in msgs.msgs().iter().enumerate() {
-        if m.evaluations.len() != 4 {
-            return Err("dcom/setchk: expected degree-3 evals (len=4)".to_string());
-        }
-        let e0 = ring_to_ringvars::<R>(&mut b, &m.evaluations[0]);
-        let e1 = ring_to_ringvars::<R>(&mut b, &m.evaluations[1]);
-        let e2 = ring_to_ringvars::<R>(&mut b, &m.evaluations[2]);
-        let e3 = ring_to_ringvars::<R>(&mut b, &m.evaluations[3]);
-        absorb_flat.extend_from_slice(&e0.coeffs);
-        absorb_flat.extend_from_slice(&e1.coeffs);
-        absorb_flat.extend_from_slice(&e2.coeffs);
-        absorb_flat.extend_from_slice(&e3.coeffs);
-        absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat, r_point[round]);
-        absorb_dcom_setchk_msgs(e0.coeffs.len() + e1.coeffs.len() + e2.coeffs.len() + e3.coeffs.len());
-        absorb_dcom_setchk_r(1);
-        msg_vars.push([e0, e1, e2, e3]);
-    }
-
-    // Verify sumcheck with claimed sum = 0.
-    let z0 = const_var(&mut b, BF::<R>::ZERO);
-    let ring_zero = scalar_var_to_ringvars::<R>(&mut b, z0);
-    let v = sumcheck_verify_degree3::<BF<R>>(&mut b, ring_zero.clone(), &msg_vars, &r_point)?;
-
-    // Keep e/b evaluations ring vars for rgchk checks.
-    //
-    // IMPORTANT (digest-absorb): the real verifier no longer absorbs the full coefficient vectors
-    // of `out.e` and `out.b` here. Instead, it absorbs the scalar digests `ev(r, beta)` and
-    // `ev(r, beta^2)` (via `absorb_field_element`) during the recombination check below.
-    let mut out_e_vars: Vec<Vec<Vec<RingVars>>> = Vec::with_capacity(out.e.len());
-    for ek in &out.e {
-        let mut ek_vars: Vec<Vec<RingVars>> = Vec::with_capacity(ek.len());
-        for ej in ek {
-            let mut ej_vars: Vec<RingVars> = Vec::with_capacity(ej.len());
-            for r in ej {
-                let rv = ring_to_ringvars::<R>(&mut b, r);
-                ej_vars.push(rv);
-            }
-            ek_vars.push(ej_vars);
-        }
-        out_e_vars.push(ek_vars);
-    }
-    let mut out_b_vars: Vec<RingVars> = Vec::with_capacity(out.b.len());
-    for bb in &out.b {
-        let rv = ring_to_ringvars::<R>(&mut b, bb);
-        out_b_vars.push(rv);
-    }
-
-    // Compute verifier recombination `ver` (scalar-in-ring), and enforce ver == v.
-    let rc_pow_base = rc_var.unwrap_or_else(|| const_var(&mut b, BF::<R>::ONE));
-    let rc_pows = scalar_pow_table::<BF<R>>(&mut b, rc_pow_base, nclaims.saturating_sub(1));
-    let mut ver_scalar = const_var(&mut b, BF::<R>::ZERO);
-    b.enforce_var_eq_const(ver_scalar, BF::<R>::ZERO);
-
-    // e[0] claims
-    for i in 0..out.e[0].len() {
-        let eq = eq_eval_vars::<BF<R>>(&mut b, &c_vars[i], &r_point);
-        let beta = beta_vars[i];
-        let alpha = alpha_vars[i];
-        let beta2 = scalar_mul::<BF<R>>(&mut b, beta, beta);
-        let alpha_pows =
-            scalar_pow_table::<BF<R>>(&mut b, alpha, out.e[0][i].len().saturating_sub(1));
-
-        let mut e_sum = const_var(&mut b, BF::<R>::ZERO);
-        b.enforce_var_eq_const(e_sum, BF::<R>::ZERO);
-        for j in 0..out.e[0][i].len() {
-            let ejv = &out_e_vars[0][i][j];
-            let ev1 = ring_eval_at_scalar::<R>(&mut b, ejv, beta);
-            let ev2 = ring_eval_at_scalar::<R>(&mut b, ejv, beta2);
-            // Digest-absorb prover messages in the same order as `setchk::Out::verify`.
-            absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat, ev1);
-            absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat, ev2);
-            absorb_dcom_out_e(2);
-            let ev1_sq = scalar_mul::<BF<R>>(&mut b, ev1, ev1);
-            let diff = scalar_sub::<BF<R>>(&mut b, ev1_sq, ev2);
-            let term = scalar_mul::<BF<R>>(&mut b, diff, alpha_pows[j]);
-            e_sum = scalar_add::<BF<R>>(&mut b, e_sum, term);
-        }
-
-        let t = scalar_mul::<BF<R>>(&mut b, eq, e_sum);
-        let t = scalar_mul::<BF<R>>(&mut b, t, rc_pows[i]);
-        ver_scalar = scalar_add::<BF<R>>(&mut b, ver_scalar, t);
-    }
-
-    // b claims
-    for i in 0..out.b.len() {
-        let offset = out.e[0].len();
-        let idx = i + offset;
-        let eq = eq_eval_vars::<BF<R>>(&mut b, &c_vars[idx], &r_point);
-        let beta = beta_vars[idx];
-        let alpha = alpha_vars[idx];
-        let beta2 = scalar_mul::<BF<R>>(&mut b, beta, beta);
-
-        let b_ring = &out_b_vars[i];
-        let ev1 = ring_eval_at_scalar::<R>(&mut b, b_ring, beta);
-        let ev2 = ring_eval_at_scalar::<R>(&mut b, b_ring, beta2);
-        // Digest-absorb prover messages in the same order as `setchk::Out::verify`.
-        absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat, ev1);
-        absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat, ev2);
-        absorb_dcom_out_b(2);
-        let ev1_sq = scalar_mul::<BF<R>>(&mut b, ev1, ev1);
-        let b_claim = scalar_sub::<BF<R>>(&mut b, ev1_sq, ev2);
-
-        let t = scalar_mul::<BF<R>>(&mut b, eq, alpha);
-        let t = scalar_mul::<BF<R>>(&mut b, t, b_claim);
-        let t = scalar_mul::<BF<R>>(&mut b, t, rc_pows[idx]);
-        ver_scalar = scalar_add::<BF<R>>(&mut b, ver_scalar, t);
-    }
-
-    let ver_ring = scalar_var_to_ringvars::<R>(&mut b, ver_scalar);
-    ring_eq::<BF<R>>(&mut b, &ver_ring, &v);
-
-    // --- rgchk::Dcom::verify checks + absorb(dcom.evals) ---
-    // Absorb dcom evals in transcript order (R::from(a_i) then c_i),
-    // and enforce the psi/ct checks.
-    let L = dcom.evals.len();
-    let k = dcom.dparams.k;
-    let d = R::dimension();
-    let decomp_b = dcom.dparams.b;
-
-    // (d')^i constants (BF vars) for u-comb.
-    let mut dppow_vars: Vec<usize> = Vec::with_capacity(k);
-    for i in 0..k {
-        let base = R::BaseRing::from(decomp_b);
-        let p_br = ark_ff::Field::pow(&base, [i as u64]);
-        dppow_vars.push(const_var(&mut b, bf_from_base_ring::<R>(p_br)));
-    }
-
-    // Allocate eval witness vars and absorb.
-    let mut eval_a_vars: Vec<Vec<usize>> = Vec::with_capacity(L);
-    let mut eval_b_vars: Vec<Vec<RingVars>> = Vec::with_capacity(L);
-    let mut eval_c_vars: Vec<Vec<RingVars>> = Vec::with_capacity(L);
-    let mut eval_v_vars: Vec<Vec<usize>> = Vec::with_capacity(L);
-
-    for eval in &dcom.evals {
-        let mut a_l = Vec::with_capacity(eval.a.len());
-        for &ai in &eval.a {
-            let a_var = b.new_var(bf_from_base_ring::<R>(ai));
-            a_l.push(a_var);
-            let a_ring = scalar_var_to_ringvars::<R>(&mut b, a_var);
-            absorb_flat.extend_from_slice(&a_ring.coeffs);
-        }
-        eval_a_vars.push(a_l);
-
-        let mut b_l = Vec::with_capacity(eval.b.len());
-        for bi in &eval.b {
-            b_l.push(ring_to_ringvars::<R>(&mut b, bi));
-        }
-        eval_b_vars.push(b_l);
-
-        let mut c_l = Vec::with_capacity(eval.c.len());
-        for ci in &eval.c {
-            let rv = ring_to_ringvars::<R>(&mut b, ci);
-            absorb_flat.extend_from_slice(&rv.coeffs);
-            c_l.push(rv);
-        }
-        eval_c_vars.push(c_l);
-
-        let mut v_l = Vec::with_capacity(eval.v.len());
-        for &vj in &eval.v {
-            v_l.push(b.new_var(bf_from_base_ring::<R>(vj)));
-        }
-        eval_v_vars.push(v_l);
-    }
-
-    // ct(psi * b_i) == a_i
-    for l in 0..L {
-        if eval_a_vars[l].len() != eval_b_vars[l].len() {
-            return Err("dcom/rgchk: eval.a/eval.b length mismatch".to_string());
-        }
-        for i in 0..eval_a_vars[l].len() {
-            let ct = ct_psi_mul_ring::<R>(&mut b, &eval_b_vars[l][i]);
-            let diff = scalar_sub::<BF<R>>(&mut b, ct, eval_a_vars[l][i]);
-            b.enforce_var_eq_const(diff, BF::<R>::ZERO);
-        }
-    }
-
-    // ct(psi * (Σ_i (d')^i * u_i[col])) == expected[col]
-    for l in 0..L {
-        let base = l * k;
-        for ni in 0..out.e.len() {
-            for col in 0..d {
-                let mut acc = ring_zero.clone();
-                for i in 0..k {
-                    let ui_col = &out_e_vars[ni][base + i][col];
-                    let scaled = ring_scale::<BF<R>>(&mut b, ui_col, dppow_vars[i]);
-                    acc = ring_add::<BF<R>>(&mut b, &acc, &scaled);
-                }
-                let ct = ct_psi_mul_ring::<R>(&mut b, &acc);
-                let expected = if ni == 0 {
-                    *eval_v_vars[l]
-                        .get(col)
-                        .ok_or("dcom/rgchk: eval.v length mismatch")?
-                } else {
-                    *eval_c_vars[l]
-                        .get(ni)
-                        .ok_or("dcom/rgchk: eval.c length mismatch")?
-                        .coeffs
-                        .get(col)
-                        .ok_or("dcom/rgchk: ring coeff index oob")?
-                };
-                let diff = scalar_sub::<BF<R>>(&mut b, ct, expected);
-                b.enforce_var_eq_const(diff, BF::<R>::ZERO);
-            }
-        }
-    }
-
-    let (inst, asg) = b.into_instance();
-    Ok((
-        inst,
-        asg,
-        DcomPrefixMathWiring {
-            squeeze_field_vars,
-            r_point_vars: r_point.clone(),
-            params_vars,
-            public_input_vars,
-            absorb_flat,
-        },
-    ))
 }
 
 fn lagrange_degree2<F: PrimeField>(b: &mut Dr1csBuilder<F>, r: usize) -> (usize, usize, usize) {
@@ -2534,7 +2427,6 @@ where
     let (
         (pose_inst, pose_asg, pose_wiring, byte_wiring, t_pose),
         (params_inst, params_asg, params_vars, pub_input_vars, t_params),
-        (dcom_inst, dcom_asg, dcom_wiring, t_dcom),
         (coin_inst, coin_asg, coin_wiring, op_wiring, t_coin),
         (cm_inst, cm_asg, cm_wiring, t_cm),
     ) = {
@@ -2562,20 +2454,6 @@ where
     let (params_inst, params_asg) = b_params.into_instance();
             Ok::<_, String>((params_inst, params_asg, params_vars, pub_input_vars, t.elapsed()))
         };
-        let dcom_build = || {
-            let t = std::time::Instant::now();
-    let (dcom_inst, dcom_asg, dcom_wiring) =
-                dcom_verifier_math_dr1cs::<R>(
-                    &proof.dcom,
-                    trace,
-                    params,
-                    public_inputs,
-                    ops_offset,
-                    squeezed_field_offset,
-                    true, // include_public_inputs_in_absorb
-                )?;
-            Ok::<_, String>((dcom_inst, dcom_asg, dcom_wiring, t.elapsed()))
-        };
         let coin_build = || {
             let t = std::time::Instant::now();
     let (coin_inst, coin_asg, coin_wiring) = cm_short_challenges_dr1cs::<R>(trace, k, 0)?;
@@ -2585,20 +2463,32 @@ where
         let cm_build = || {
             let t = std::time::Instant::now();
             let (cm_inst, cm_asg, cm_wiring) =
-                cm_verifier_math_dr1cs::<R>(trace, proof, k, log_kappa, nvars, mlen_mats, 0)?;
+                cm_verifier_math_dr1cs::<R>(
+                    trace,
+                    proof,
+                    params,
+                    public_inputs,
+                    k,
+                    log_kappa,
+                    nvars,
+                    mlen_mats,
+                    ops_offset,
+                    squeezed_field_offset,
+                    true, // include_public_inputs_in_absorb
+                )?;
             Ok::<_, String>((cm_inst, cm_asg, cm_wiring, t.elapsed()))
         };
 
         #[cfg(feature = "parallel")]
         {
-            let (a, b) = rayon::join(|| rayon::join(pose_build, params_build), || rayon::join(dcom_build, || rayon::join(coin_build, cm_build)));
+            let (a, b) = rayon::join(|| rayon::join(pose_build, params_build), || rayon::join(coin_build, cm_build));
             let (pose_r, params_r) = a;
-            let (dcom_r, (coin_r, cm_r)) = b;
-            (pose_r?, params_r?, dcom_r?, coin_r?, cm_r?)
+            let (coin_r, cm_r) = b;
+            (pose_r?, params_r?, coin_r?, cm_r?)
         }
         #[cfg(not(feature = "parallel"))]
         {
-            (pose_build()?, params_build()?, dcom_build()?, coin_build()?, cm_build()?)
+            (pose_build()?, params_build()?, coin_build()?, cm_build()?)
         }
     };
 
@@ -2612,7 +2502,7 @@ where
     }
     let mut glue: Vec<(usize, usize, usize, usize)> = Vec::new();
     for (pv, lv) in pose_byte_vars.iter().zip(coin_wiring.byte_vars.iter()) {
-        glue.push((0, *pv, 3, *lv));
+        glue.push((0, *pv, 2, *lv));
     }
 
     // Field challenge local vars (same as in build_we_dr1cs_for_cm_challenges).
@@ -2674,28 +2564,28 @@ where
     local_field_vars.push(field_wiring_local.rc1);
     local_field_vars.extend_from_slice(&field_wiring_local.sumcheck_r1);
     for (pv, lv) in pose_field_vars.iter().zip(local_field_vars.iter()) {
-        glue.push((0, *pv, 4, *lv));
+        glue.push((0, *pv, 3, *lv));
     }
 
     // Glue cm_wiring challenges to the coin/field wiring parts (so the math uses the same coins).
     // Bytes:
     for (cv, lv) in cm_wiring.short.byte_vars.iter().zip(coin_wiring.byte_vars.iter()) {
-        glue.push((5, *cv, 3, *lv));
+        glue.push((4, *cv, 2, *lv));
     }
     // Field scalars:
     for (cv, lv) in cm_wiring.field.c0.iter().zip(field_wiring_local.c0.iter()) {
-        glue.push((5, *cv, 4, *lv));
+        glue.push((4, *cv, 3, *lv));
     }
     for (cv, lv) in cm_wiring.field.c1.iter().zip(field_wiring_local.c1.iter()) {
-        glue.push((5, *cv, 4, *lv));
+        glue.push((4, *cv, 3, *lv));
     }
-    glue.push((5, cm_wiring.field.rc0, 4, field_wiring_local.rc0));
-    glue.push((5, cm_wiring.field.rc1, 4, field_wiring_local.rc1));
+    glue.push((4, cm_wiring.field.rc0, 3, field_wiring_local.rc0));
+    glue.push((4, cm_wiring.field.rc1, 3, field_wiring_local.rc1));
     for (cv, lv) in cm_wiring.field.sumcheck_r0.iter().zip(field_wiring_local.sumcheck_r0.iter()) {
-        glue.push((5, *cv, 4, *lv));
+        glue.push((4, *cv, 3, *lv));
     }
     for (cv, lv) in cm_wiring.field.sumcheck_r1.iter().zip(field_wiring_local.sumcheck_r1.iter()) {
-        glue.push((5, *cv, 4, *lv));
+        glue.push((4, *cv, 3, *lv));
     }
 
     // Glue Cm absorb surface (non-reabsorb absorbs after first SqueezeBytes) to Poseidon absorb vars.
@@ -2742,25 +2632,25 @@ where
 
     // Glue Dcom-prefix squeeze-field vars (prefix before first SqueezeBytes) to Poseidon squeeze-field vars,
     // starting at `squeezed_field_offset`.
-    if squeezed_field_offset + dcom_wiring.squeeze_field_vars.len() > pose_wiring.squeeze_field_vars.len() {
+    if squeezed_field_offset + cm_wiring.squeeze_field_vars.len() > pose_wiring.squeeze_field_vars.len() {
         return Err("poseidon wiring: not enough squeeze_field_vars for dcom prefix".to_string());
     }
-    for (i, &sv) in dcom_wiring.squeeze_field_vars.iter().enumerate() {
-        glue.push((0, pose_wiring.squeeze_field_vars[squeezed_field_offset + i], 2, sv));
+    for (i, &sv) in cm_wiring.squeeze_field_vars.iter().enumerate() {
+        glue.push((0, pose_wiring.squeeze_field_vars[squeezed_field_offset + i], 4, sv));
     }
     // Glue statement params (public inputs) into the Dcom prefix gadget.
-    if params_vars.len() != dcom_wiring.params_vars.len() {
+    if params_vars.len() != cm_wiring.params_vars.len() {
         return Err("params glue length mismatch".to_string());
     }
-    for (pv, dv) in params_vars.iter().zip(dcom_wiring.params_vars.iter()) {
-        glue.push((1, *pv, 2, *dv));
+    for (pv, dv) in params_vars.iter().zip(cm_wiring.params_vars.iter()) {
+        glue.push((1, *pv, 4, *dv));
     }
     // Glue extra public inputs into the Dcom prefix gadget.
-    if pub_input_vars.len() != dcom_wiring.public_input_vars.len() {
+    if pub_input_vars.len() != cm_wiring.public_input_vars.len() {
         return Err("public input glue length mismatch".to_string());
     }
-    for (pv, dv) in pub_input_vars.iter().zip(dcom_wiring.public_input_vars.iter()) {
-        glue.push((1, *pv, 2, *dv));
+    for (pv, dv) in pub_input_vars.iter().zip(cm_wiring.public_input_vars.iter()) {
+        glue.push((1, *pv, 4, *dv));
     }
 
     // Flatten Poseidon absorb vars for non-reabsorb absorbs *before* the Cm segment,
@@ -2782,16 +2672,16 @@ where
         }
         pose_abs_prefix.extend_from_slice(&pose_wiring.absorb_vars[start..start + len]);
     }
-    if pose_abs_prefix.len() != dcom_wiring.absorb_flat.len() {
+    if pose_abs_prefix.len() != cm_wiring.absorb_flat_prefix.len() {
         return Err(format!(
             "prefix absorb glue length mismatch: pose={} local={}",
             pose_abs_prefix.len(),
-            dcom_wiring.absorb_flat.len()
+            cm_wiring.absorb_flat_prefix.len()
         ));
     }
     // Glue the entire Dcom-prefix absorb surface.
-    for (pv, lv) in pose_abs_prefix.iter().zip(dcom_wiring.absorb_flat.iter()) {
-        glue.push((0, *pv, 2, *lv));
+    for (pv, lv) in pose_abs_prefix.iter().zip(cm_wiring.absorb_flat_prefix.iter()) {
+        glue.push((0, *pv, 4, *lv));
     }
 
     // Flatten Poseidon absorb vars for non-reabsorb absorbs starting at Cm segment.
@@ -2807,30 +2697,29 @@ where
         }
         pose_abs_flat.extend_from_slice(&pose_wiring.absorb_vars[start..start + len]);
     }
-    if pose_abs_flat.len() != cm_wiring.absorb_flat.len() {
+    if pose_abs_flat.len() != cm_wiring.absorb_flat_cm.len() {
         return Err(format!(
             "cm absorb glue length mismatch: pose={} cm={}",
             pose_abs_flat.len(),
-            cm_wiring.absorb_flat.len()
+            cm_wiring.absorb_flat_cm.len()
         ));
     }
-    for (pv, cv) in pose_abs_flat.iter().zip(cm_wiring.absorb_flat.iter()) {
-        glue.push((0, *pv, 5, *cv));
+    for (pv, cv) in pose_abs_flat.iter().zip(cm_wiring.absorb_flat_cm.iter()) {
+        glue.push((0, *pv, 4, *cv));
     }
 
     let parts = vec![
         (pose_inst, pose_asg),   // 0
         (params_inst, params_asg), // 1
-        (dcom_inst, dcom_asg),   // 2
-        (coin_inst, coin_asg),   // 3
-        (field_inst, field_asg), // 4
-        (cm_inst, cm_asg),       // 5
+        (coin_inst, coin_asg),   // 2
+        (field_inst, field_asg), // 3
+        (cm_inst, cm_asg),       // 4
     ];
     let base_constraints = parts.iter().map(|(i, _)| i.constraints.len()).sum::<usize>();
 
     let t_merge = std::time::Instant::now();
     let (inst, assignment) = merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| e.to_string())?;
-    let _ = (t_pose, t_params, t_dcom, t_coin, t_cm, t_glue, base_constraints, t_merge);
+    let _ = (t_pose, t_params, t_coin, t_cm, t_glue, base_constraints, t_merge);
 
     let public_len = 1 + 10 + public_inputs.len();
     Ok(WeDr1csOutput { inst, assignment, public_len })
@@ -3327,7 +3216,6 @@ where
         (pose_inst, pose_asg, pose_wiring, byte_wiring, is_reabsorb, pose_permutes),
         (params_inst, params_asg, params_vars, pub_input_vars),
         (lin_inst, lin_asg, lin_ch_vars, lin_absorb_flat),
-        (dcom_inst, dcom_asg, dcom_wiring),
         (coin_inst, coin_asg, coin_wiring, op_wiring),
         (field_inst, field_asg, field_wiring_local),
         (cm_inst, cm_asg, cm_wiring, cm_counts),
@@ -3387,18 +3275,6 @@ where
         };
 
         let lin_build = || plus_lin_verifier_math_dr1cs::<R>(&proof.lproof, trace, params);
-
-        let dcom_build = || {
-            dcom_verifier_math_dr1cs::<R>(
-                &proof.cmproof.dcom,
-                trace,
-                params,
-                public_inputs, // statement public inputs (do NOT re-absorb in this segment)
-                cm_ops_offset,
-                cm_squeezed_field_offset,
-                false, // include_public_inputs_in_absorb
-            )
-        };
 
         let coin_build = || {
             let (coin_inst, coin_asg, coin_wiring) =
@@ -3479,11 +3355,15 @@ where
             let out = cm_verifier_math_dr1cs::<R>(
                 trace,
                 &proof.cmproof,
+                params,
+                public_inputs, // statement public inputs (do NOT re-absorb in this segment)
                 k,
                 log_kappa,
                 nvars,
                 mlen_mats,
                 cm_ops_offset,
+                cm_squeezed_field_offset,
+                false, // include_public_inputs_in_absorb
             );
             if do_count {
                 CM_COUNTING.with(|c| c.set(false));
@@ -3507,20 +3387,15 @@ where
             let (pose_r, rest) = join(pose_build, || {
                 join(params_build, || {
                     join(lin_build, || {
-                        join(dcom_build, || {
-                            join(coin_build, || {
-                                join(field_build, || join(cm_build, decomp_build))
-                            })
-                        })
+                        join(coin_build, || join(field_build, || join(cm_build, decomp_build)))
                     })
                 })
             });
-            let (params_r, (lin_r, (dcom_r, (coin_r, (field_r, (cm_r, decomp_r)))))) = rest;
+            let (params_r, (lin_r, (coin_r, (field_r, (cm_r, decomp_r))))) = rest;
             (
                 pose_r?,
                 params_r?,
                 lin_r?,
-                dcom_r?,
                 coin_r?,
                 field_r?,
                 cm_r?,
@@ -3533,7 +3408,6 @@ where
                 pose_build()?,
                 params_build()?,
                 lin_build()?,
-                dcom_build()?,
                 coin_build()?,
                 field_build()?,
                 cm_build()?,
@@ -3635,10 +3509,10 @@ where
         + 2 /* rc0/rc1 */
         + cm_wiring.field.sumcheck_r0.len()
         + cm_wiring.field.sumcheck_r1.len()
-        + dcom_wiring.squeeze_field_vars.len()
         + params_vars.len()
-        + dcom_wiring.absorb_flat.len()
-        + cm_wiring.absorb_flat.len();
+        + cm_wiring.squeeze_field_vars.len()
+        + cm_wiring.absorb_flat_prefix.len()
+        + cm_wiring.absorb_flat_cm.len();
 
     let mut glue: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(glue_cap);
 
@@ -3695,7 +3569,7 @@ where
         return Err("poseidon/coin byte length mismatch".to_string());
     }
     for (pv, lv) in pose_byte_vars.iter().zip(coin_wiring.byte_vars.iter()) {
-        glue.push((0, *pv, 5, *lv));
+        glue.push((0, *pv, 4, *lv));
     }
 
     // Glue local field vars to Poseidon squeeze-field vars (selected by op wiring).
@@ -3707,7 +3581,7 @@ where
     local_field_vars.push(field_wiring_local.rc1);
     local_field_vars.extend_from_slice(&field_wiring_local.sumcheck_r1);
     for (pv, lv) in pose_field_vars.iter().zip(local_field_vars.iter()) {
-        glue.push((0, *pv, 6, *lv));
+        glue.push((0, *pv, 5, *lv));
     }
 
     // Glue Cm math wiring challenges to the coin/field wiring parts (so the math uses the same coins).
@@ -3717,23 +3591,23 @@ where
         .iter()
         .zip(coin_wiring.byte_vars.iter())
     {
-        glue.push((7, *cv, 5, *lv));
+        glue.push((6, *cv, 4, *lv));
     }
     for (cv, lv) in cm_wiring.field.c0.iter().zip(field_wiring_local.c0.iter()) {
-        glue.push((7, *cv, 6, *lv));
+        glue.push((6, *cv, 5, *lv));
     }
     for (cv, lv) in cm_wiring.field.c1.iter().zip(field_wiring_local.c1.iter()) {
-        glue.push((7, *cv, 6, *lv));
+        glue.push((6, *cv, 5, *lv));
     }
-    glue.push((7, cm_wiring.field.rc0, 6, field_wiring_local.rc0));
-    glue.push((7, cm_wiring.field.rc1, 6, field_wiring_local.rc1));
+    glue.push((6, cm_wiring.field.rc0, 5, field_wiring_local.rc0));
+    glue.push((6, cm_wiring.field.rc1, 5, field_wiring_local.rc1));
     for (cv, lv) in cm_wiring
         .field
         .sumcheck_r0
         .iter()
         .zip(field_wiring_local.sumcheck_r0.iter())
     {
-        glue.push((7, *cv, 6, *lv));
+        glue.push((6, *cv, 5, *lv));
     }
     for (cv, lv) in cm_wiring
         .field
@@ -3741,30 +3615,30 @@ where
         .iter()
         .zip(field_wiring_local.sumcheck_r1.iter())
     {
-        glue.push((7, *cv, 6, *lv));
+        glue.push((6, *cv, 5, *lv));
     }
 
     // Glue Dcom-prefix squeeze-field vars (prefix before first SqueezeBytes) to Poseidon squeeze-field vars,
     // starting at `cm_squeezed_field_offset`.
-    if cm_squeezed_field_offset + dcom_wiring.squeeze_field_vars.len()
+    if cm_squeezed_field_offset + cm_wiring.squeeze_field_vars.len()
         > pose_wiring.squeeze_field_vars.len()
     {
         return Err("poseidon wiring: not enough squeeze_field_vars for dcom prefix".to_string());
     }
-    for (i, &sv) in dcom_wiring.squeeze_field_vars.iter().enumerate() {
+    for (i, &sv) in cm_wiring.squeeze_field_vars.iter().enumerate() {
         glue.push((
             0,
             pose_wiring.squeeze_field_vars[cm_squeezed_field_offset + i],
-            4,
+            6,
             sv,
         ));
     }
     // Glue statement params (public inputs) into the Dcom prefix gadget.
-    if params_vars.len() != dcom_wiring.params_vars.len() {
+    if params_vars.len() != cm_wiring.params_vars.len() {
         return Err("params glue length mismatch".to_string());
     }
-    for (pv, dv) in params_vars.iter().zip(dcom_wiring.params_vars.iter()) {
-        glue.push((1, *pv, 4, *dv));
+    for (pv, dv) in params_vars.iter().zip(cm_wiring.params_vars.iter()) {
+        glue.push((1, *pv, 6, *dv));
     }
     // Glue extra public inputs into the Dcom prefix gadget.
     //
@@ -3773,11 +3647,11 @@ where
     // must **not** re-absorb them (we pass `include_public_inputs_in_absorb=false`), but we
     // still allocate them as local vars so we can enforce statement-binding constraints
     // (e.g. exposed-prefix checks) and glue them to the circuit public inputs.
-    if pub_input_vars.len() != dcom_wiring.public_input_vars.len() {
+    if pub_input_vars.len() != cm_wiring.public_input_vars.len() {
         return Err("plus: public input glue length mismatch (dcom prefix)".to_string());
     }
-    for (pv, dv) in pub_input_vars.iter().zip(dcom_wiring.public_input_vars.iter()) {
-        glue.push((1, *pv, 4, *dv));
+    for (pv, dv) in pub_input_vars.iter().zip(cm_wiring.public_input_vars.iter()) {
+        glue.push((1, *pv, 6, *dv));
     }
 
     // Compute the absorb-op count in the Cm-prefix segment (from cm_ops_offset until first SqueezeBytes).
@@ -3812,29 +3686,15 @@ where
     // Glue the entire Dcom-prefix absorb surface.
     let pose_abs_prefix =
         flatten_pose_absorb_vars(&pose_wiring, &is_reabsorb, cm_absorb_op_offset, end_prefix);
-    if pose_abs_prefix.len() != dcom_wiring.absorb_flat.len() {
+    if pose_abs_prefix.len() != cm_wiring.absorb_flat_prefix.len() {
         return Err(format!(
             "plus: prefix absorb glue length mismatch: pose={} local={}",
             pose_abs_prefix.len(),
-            dcom_wiring.absorb_flat.len()
+            cm_wiring.absorb_flat_prefix.len()
         ));
     }
-    for (pv, lv) in pose_abs_prefix.iter().zip(dcom_wiring.absorb_flat.iter()) {
-        glue.push((0, *pv, 4, *lv));
-    }
-
-    // Glue SetChk sumcheck point `r` into CM math.
-    // In the standalone CmProof WE relation we still have the Dcom prefix, so we must tie
-    // the `dcom.out.r` used by CM verification to the transcript-derived `r`.
-    if dcom_wiring.r_point_vars.len() != cm_wiring.r_pre_vars.len() {
-        return Err("plus: dcom/cm r length mismatch".to_string());
-    }
-    for (rv, cv) in dcom_wiring
-        .r_point_vars
-        .iter()
-        .zip(cm_wiring.r_pre_vars.iter())
-    {
-        glue.push((4, *rv, 7, *cv));
+    for (pv, lv) in pose_abs_prefix.iter().zip(cm_wiring.absorb_flat_prefix.iter()) {
+        glue.push((0, *pv, 6, *lv));
     }
 
     // Glue Cm absorb surface (non-reabsorb absorbs starting at Cm segment) to Poseidon absorb vars.
@@ -3848,15 +3708,15 @@ where
         cm_abs_start,
         pose_wiring.absorb_ranges.len(),
     );
-    if pose_abs_flat.len() != cm_wiring.absorb_flat.len() {
+    if pose_abs_flat.len() != cm_wiring.absorb_flat_cm.len() {
         return Err(format!(
             "plus: cm absorb glue length mismatch: pose={} cm={}",
             pose_abs_flat.len(),
-            cm_wiring.absorb_flat.len()
+            cm_wiring.absorb_flat_cm.len()
         ));
     }
-    for (pv, cv) in pose_abs_flat.iter().zip(cm_wiring.absorb_flat.iter()) {
-        glue.push((0, *pv, 7, *cv));
+    for (pv, cv) in pose_abs_flat.iter().zip(cm_wiring.absorb_flat_cm.iter()) {
+        glue.push((0, *pv, 6, *cv));
     }
 
     // Optional: print an op-mix breakdown for tiny-field porting estimates.
@@ -3902,7 +3762,6 @@ where
         let c_params = params_inst.constraints.len();
         let c_lin = lin_inst.constraints.len();
         let c_stmt = stmt_inst.constraints.len();
-        let c_dcom = dcom_inst.constraints.len();
         let c_coin = coin_inst.constraints.len();
         let c_field = field_inst.constraints.len();
         let c_cm = cm_inst.constraints.len();
@@ -3925,8 +3784,8 @@ where
             pose_permutes_before_cm, pose_permutes_after_cm
         );
         eprintln!(
-            "  dr1cs constraints by part: poseidon={} params={} lin={} stmt_absorb={} dcom={} cm_coins={} cm_fields={} cm_math={} decomp={}",
-            c_pose, c_params, c_lin, c_stmt, c_dcom, c_coin, c_field, c_cm, c_decomp
+            "  dr1cs constraints by part: poseidon={} params={} lin={} stmt_absorb={} cm_coins={} cm_fields={} cm_math={} decomp={}",
+            c_pose, c_params, c_lin, c_stmt, c_coin, c_field, c_cm, c_decomp
         );
         eprintln!(
             "  cm_math op counts: ring_add={} ring_sub={} ring_scale={} ring_mul={} ring_eq={} lc_to_var={} scalar_add={} scalar_sub={} scalar_mul={} scalar_mul_const={} scalar_sub_const={} scalar_pow_table={} eq_eval_vars={} short_chal_from_bytes={} ct_psi_mul_ring={}",
@@ -3952,7 +3811,6 @@ where
                 + c_params
                 + c_lin
                 + c_stmt
-                + c_dcom
                 + c_coin
                 + c_field
                 + c_cm
@@ -3980,17 +3838,16 @@ where
         eprintln!("==============================================================");
     }
 
-    // Merge: (poseidon, params/public_inputs, lin, stmt_absorb, dcom, coin, field, cm, decomp)
+    // Merge: (poseidon, params/public_inputs, lin, stmt_absorb, coin, field, cm, decomp)
     let parts = vec![
         (pose_inst, pose_asg),     // 0
         (params_inst, params_asg), // 1
         (lin_inst, lin_asg),       // 2
         (stmt_inst, stmt_asg),     // 3
-        (dcom_inst, dcom_asg),     // 4
-        (coin_inst, coin_asg),     // 5
-        (field_inst, field_asg),   // 6
-        (cm_inst, cm_asg),         // 7
-        (decomp_inst, decomp_asg), // 8
+        (coin_inst, coin_asg),     // 4
+        (field_inst, field_asg),   // 5
+        (cm_inst, cm_asg),         // 6
+        (decomp_inst, decomp_asg), // 7
     ];
     let (inst, assignment) =
         merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| e.to_string())?;
