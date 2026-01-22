@@ -12,7 +12,7 @@ use crate::we_statement::WeParams;
 
 // Reuse symphony’s sparse dR1CS primitives and Poseidon arithmetizer.
 use symphony::dpp_poseidon::{
-    merge_sparse_dr1cs_share_one_with_glue, poseidon_sponge_dr1cs_from_trace_with_wiring_and_bytes,
+    merge_sparse_dr1cs_share_one_with_glue, poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes,
     Constraint, PoseidonByteWiring, PoseidonDr1csWiring, SparseDr1csInstance,
 };
 use symphony::dpp_sumcheck::Dr1csBuilder;
@@ -532,35 +532,59 @@ fn const_var<F: PrimeField>(b: &mut Dr1csBuilder<F>, c: F) -> usize {
 /// Returns a BF var holding `coeff`.
 fn short_challenge_coeff_from_byte<F: PrimeField>(
     b: &mut Dr1csBuilder<F>,
-    byte: usize,
+    byte_var: usize,
     u: u64,
 ) -> usize {
     debug_assert!(u.is_power_of_two());
     debug_assert!(u <= 256);
-    // IMPORTANT:
-    // In this WE-gate arithmetization, `byte` is already a *fixed constant* coming from the
-    // recorded Poseidon `SqueezeBytes` trace (or other fixed inputs). Therefore, it is safe
-    // (and much cheaper) to compute the coefficient in Rust and allocate it as a constant,
-    // instead of enforcing the full byte decomposition constraints.
-    //
-    // This keeps the relation correct: coeff is still a deterministic function of the
-    // transcript byte; we just avoid proving that function inside the circuit.
-    let byte_val_u64 = b.assignment[byte]
+    // WE-sound arithmetization:
+    // - constrain `byte_var` is an 8-bit value via bit decomposition,
+    // - compute `byte % u` as the low `log2(u)` bits,
+    // - subtract the centered offset `u/2`.
+    let byte_val_u64 = b.assignment[byte_var]
         .into_bigint()
         .to_bytes_le()
         .get(0)
         .copied()
         .unwrap_or(0) as u64;
-    debug_assert!(byte_val_u64 < 256);
-    let r_val = (byte_val_u64 % u) as i64;
-    let half = (u / 2) as i64;
-    let coeff_i64 = r_val - half; // in [-(u/2), (u/2)-1]
-    let coeff = if coeff_i64 >= 0 {
-        F::from(coeff_i64 as u64)
-    } else {
-        -F::from((-coeff_i64) as u64)
-    };
-    const_var::<F>(b, coeff)
+    let byte0 = (byte_val_u64 & 0xFF) as u8;
+
+    // Allocate 8 bit vars (witness), enforce boolean.
+    let one = b.one();
+    let mut bits: [usize; 8] = [0; 8];
+    for i in 0..8 {
+        let bi = ((byte0 >> i) & 1) as u64;
+        let v = b.new_var(if bi == 1 { F::ONE } else { F::ZERO });
+        // v * (1 - v) = 0
+        b.add_constraint(
+            vec![(F::ONE, v)],
+            vec![(F::ONE, one), (-F::ONE, v)],
+            vec![(F::ZERO, one)],
+        );
+        bits[i] = v;
+    }
+
+    // Enforce: byte_var == Σ 2^i * bits[i]
+    let mut lc_byte: Vec<(F, usize)> = Vec::with_capacity(1 + 8);
+    lc_byte.push((F::ONE, byte_var));
+    let mut p2 = F::ONE;
+    for &vbit in bits.iter() {
+        lc_byte.push((-p2, vbit));
+        p2 = p2.double();
+    }
+    b.enforce_lc_times_one_eq_const(lc_byte);
+
+    // coeff = (Σ_{i<logu} 2^i * bits[i]) - (u/2)
+    let logu = u.trailing_zeros() as usize;
+    let half = F::from((u / 2) as u64);
+    let mut lc_coeff: Vec<(F, usize)> = Vec::with_capacity(1 + logu);
+    lc_coeff.push((-half, one));
+    let mut p2 = F::ONE;
+    for i in 0..logu {
+        lc_coeff.push((p2, bits[i]));
+        p2 = p2.double();
+    }
+    lc_to_var::<F>(b, lc_coeff)
 }
 
 fn short_challenge_from_bytes<F: PrimeField>(
@@ -2171,7 +2195,7 @@ where
     // Poseidon trace -> dR1CS
     let ops = lf_ops_to_symphony_ops::<BF<R>>(&trace.ops);
     let (mut pose_inst, pose_asg, _replay, _byte_wit, wiring, _byte_wiring) =
-        poseidon_sponge_dr1cs_from_trace_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
+        poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
             .map_err(|e| format!("poseidon arith failed: {e}"))?;
     enforce_reabsorb_equals_squeeze::<BF<R>>(&mut pose_inst, &wiring, &ops)?;
 
@@ -2232,7 +2256,7 @@ where
     // Poseidon trace -> dR1CS (+ wiring with squeeze-field + squeeze-byte var indices).
     let ops = lf_ops_to_symphony_ops::<BF<R>>(&trace.ops);
     let (mut pose_inst, pose_asg, _replay, _byte_wit, wiring, byte_wiring) =
-        poseidon_sponge_dr1cs_from_trace_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
+        poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
             .map_err(|e| format!("poseidon arith failed: {e}"))?;
     enforce_reabsorb_equals_squeeze::<BF<R>>(&mut pose_inst, &wiring, &ops)?;
 
@@ -2285,7 +2309,7 @@ where
 {
     let ops = lf_ops_to_symphony_ops::<BF<R>>(&trace.ops);
     let (mut pose_inst, pose_asg, _replay, _byte_wit, pose_wiring, byte_wiring) =
-        poseidon_sponge_dr1cs_from_trace_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
+        poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
             .map_err(|e| format!("poseidon arith failed: {e}"))?;
     enforce_reabsorb_equals_squeeze::<BF<R>>(&mut pose_inst, &pose_wiring, &ops)?;
 
@@ -2433,7 +2457,7 @@ where
         let pose_build = || {
             let t = std::time::Instant::now();
     let (mut pose_inst, pose_asg, _replay, _byte_wit, pose_wiring, byte_wiring) =
-        poseidon_sponge_dr1cs_from_trace_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
+        poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
             .map_err(|e| format!("poseidon arith failed: {e}"))?;
     enforce_reabsorb_equals_squeeze::<BF<R>>(&mut pose_inst, &pose_wiring, &ops)?;
             Ok::<_, String>((pose_inst, pose_asg, pose_wiring, byte_wiring, t.elapsed()))
@@ -3223,7 +3247,7 @@ where
     ) = {
         let pose_build = || {
             let (mut pose_inst, pose_asg, replay, _byte_wit, pose_wiring, byte_wiring) =
-                poseidon_sponge_dr1cs_from_trace_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
+                poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
                     .map_err(|e| format!("poseidon arith failed: {e}"))?;
             enforce_reabsorb_equals_squeeze::<BF<R>>(&mut pose_inst, &pose_wiring, &ops)?;
             let pose_permutes = replay.permutes.len();

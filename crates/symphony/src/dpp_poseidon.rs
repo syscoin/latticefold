@@ -713,9 +713,32 @@ pub fn poseidon_sponge_dr1cs_from_trace_with_wiring<F: PrimeField>(
     ),
     ReplayErr,
 > {
-    poseidon_sponge_dr1cs_from_trace_impl(cfg, ops, false).map(|(inst, asg, replay, bytes, wiring, _bw)| {
-        (inst, asg, replay, bytes, wiring)
-    })
+    poseidon_sponge_dr1cs_from_trace_impl(cfg, ops, false, PoseidonArithMode::ReplayFixed).map(
+        |(inst, asg, replay, bytes, wiring, _bw)| (inst, asg, replay, bytes, wiring),
+    )
+}
+
+/// Like `poseidon_sponge_dr1cs_from_trace_with_wiring_and_bytes`, but suitable for
+/// **arm-before-proof WE**: it does **not** bake recorded trace IO values into constraints, and
+/// it does **not** require replay consistency.
+///
+/// This makes the dR1CS instance depend only on the operation schedule (lengths) and Poseidon
+/// parameters, not on a specific transcript realization.
+pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes<F: PrimeField>(
+    cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+    ops: &[PoseidonTraceOp<F>],
+) -> Result<
+    (
+        SparseDr1csInstance<F>,
+        Vec<F>,
+        PoseidonSpongeReplayResult<F>,
+        Vec<ByteSqueezeWitness>,
+        PoseidonDr1csWiring,
+        PoseidonByteWiring,
+    ),
+    ReplayErr,
+> {
+    poseidon_sponge_dr1cs_from_trace_impl(cfg, ops, true, PoseidonArithMode::WeWitness)
 }
 
 /// Like `poseidon_sponge_dr1cs_from_trace_with_wiring`, but also **arithmetizes `SqueezeBytes`**:
@@ -736,13 +759,23 @@ pub fn poseidon_sponge_dr1cs_from_trace_with_wiring_and_bytes<F: PrimeField>(
     ),
     ReplayErr,
 > {
-    poseidon_sponge_dr1cs_from_trace_impl(cfg, ops, true)
+    poseidon_sponge_dr1cs_from_trace_impl(cfg, ops, true, PoseidonArithMode::ReplayFixed)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PoseidonArithMode {
+    /// “Replay mode”: enforce Absorb/Squeeze outputs match the recorded trace values and run
+    /// sanity checks against a replay.
+    ReplayFixed,
+    /// “WE mode”: do not bake recorded trace values into constraints.
+    WeWitness,
 }
 
 fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
     cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
     ops: &[PoseidonTraceOp<F>],
     with_bytes: bool,
+    arith_mode: PoseidonArithMode,
 ) -> Result<
     (
         SparseDr1csInstance<F>,
@@ -754,8 +787,16 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
     ),
     ReplayErr,
 > {
-    // First replay to ensure the ops are consistent and to get permute boundaries.
-    let replay = replay_ops(cfg, ops)?;
+    // In WE mode we must not require replay consistency (arming has no concrete trace yet),
+    // and we must not bake recorded trace outputs into constraints.
+    let replay = if arith_mode == PoseidonArithMode::ReplayFixed {
+        replay_ops(cfg, ops)?
+    } else {
+        PoseidonSpongeReplayResult {
+            final_state: vec![F::ZERO; cfg.rate + cfg.capacity],
+            permutes: Vec::new(),
+        }
+    };
 
     let t = cfg.rate + cfg.capacity;
     let mut b = Dr1csBuilder::<F>::new();
@@ -780,20 +821,27 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
     // Helper: apply a Poseidon permutation to the current `state_vars`.
     let mut permute_ptr: usize = 0;
     let mut apply_perm = |b: &mut Dr1csBuilder<F>, state_vars: &mut Vec<usize>| -> Result<(), ReplayErr> {
-        if permute_ptr >= replay.permutes.len() {
-            return Err(ReplayErr::Invalid("permute ptr out of range".to_string()));
-        }
-        let before = replay.permutes[permute_ptr].before.clone();
-        let (after_state, round_states) = permute_with_round_trace(cfg, &before)?;
-
-        // Ensure the current state witness matches `before` (sanity; not a constraint).
-        for i in 0..t {
-            if b.assignment[state_vars[i]] != before[i] {
-                return Err(ReplayErr::Mismatch(format!(
-                    "state mismatch before permute #{permute_ptr} at i={i}"
-                )));
+        let (after_state, round_states) = if arith_mode == PoseidonArithMode::ReplayFixed {
+            if permute_ptr >= replay.permutes.len() {
+                return Err(ReplayErr::Invalid("permute ptr out of range".to_string()));
             }
-        }
+            let before = replay.permutes[permute_ptr].before.clone();
+            let (after_state, round_states) = permute_with_round_trace(cfg, &before)?;
+
+            // Ensure the current state witness matches `before` (sanity; not a constraint).
+            for i in 0..t {
+                if b.assignment[state_vars[i]] != before[i] {
+                    return Err(ReplayErr::Mismatch(format!(
+                        "state mismatch before permute #{permute_ptr} at i={i}"
+                    )));
+                }
+            }
+            (after_state, round_states)
+        } else {
+            // WE mode: no replay-derived sanity checks.
+            let before = (0..t).map(|i| b.assignment[state_vars[i]]).collect::<Vec<_>>();
+            permute_with_round_trace(cfg, &before)?
+        };
 
         let full_rounds_over_2 = cfg.full_rounds / 2;
         let total_rounds = cfg.full_rounds + cfg.partial_rounds;
@@ -941,24 +989,28 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                 }
             }
 
-            // Sanity against traced round state.
-            let expected = &round_states[r];
-            for i in 0..t {
-                if b.assignment[next_vars[i]] != expected[i] {
-                    return Err(ReplayErr::Mismatch(format!(
-                        "round {r} state mismatch at i={i} for permute #{permute_ptr}"
-                    )));
+            if arith_mode == PoseidonArithMode::ReplayFixed {
+                // Sanity against traced round state.
+                let expected = &round_states[r];
+                for i in 0..t {
+                    if b.assignment[next_vars[i]] != expected[i] {
+                        return Err(ReplayErr::Mismatch(format!(
+                            "round {r} state mismatch at i={i} for permute #{permute_ptr}"
+                        )));
+                    }
                 }
             }
             *state_vars = next_vars;
         }
 
-        // Final sanity against permute-after.
-        for i in 0..t {
-            if b.assignment[state_vars[i]] != after_state[i] {
-                return Err(ReplayErr::Mismatch(format!(
-                    "after state mismatch at i={i} for permute #{permute_ptr}"
-                )));
+        if arith_mode == PoseidonArithMode::ReplayFixed {
+            // Final sanity against permute-after.
+            for i in 0..t {
+                if b.assignment[state_vars[i]] != after_state[i] {
+                    return Err(ReplayErr::Mismatch(format!(
+                        "after state mismatch at i={i} for permute #{permute_ptr}"
+                    )));
+                }
             }
         }
         permute_ptr += 1;
@@ -988,9 +1040,11 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                         absorb_index = 0;
                     }
 
-                    // Materialize element as a fixed var (so it can be part of the witness vector).
                     let e_var = b.new_var(e);
-                    b.enforce_var_eq_const(e_var, e);
+                    if arith_mode == PoseidonArithMode::ReplayFixed {
+                        // Replay mode: fix absorb inputs to the recorded trace values.
+                        b.enforce_var_eq_const(e_var, e);
+                    }
                     wiring.absorb_vars.push(e_var);
                     range_len += 1;
 
@@ -1030,12 +1084,17 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                     let take = core::cmp::min(cfg.rate - squeeze_index, out.len() - produced);
                     for j in 0..take {
                         let pos = cfg.capacity + squeeze_index + j;
-                        let expected = out[produced + j];
-                        let v = b.new_var(expected);
-                        b.enforce_var_eq_const(v, expected);
-                        // v == state[pos]
-                        b.enforce_var_eq_var(state_vars[pos], v);
-                        wiring.squeeze_field_vars.push(v);
+                        if arith_mode == PoseidonArithMode::ReplayFixed {
+                            let expected = out[produced + j];
+                            let v = b.new_var(expected);
+                            b.enforce_var_eq_const(v, expected);
+                            // v == state[pos]
+                            b.enforce_var_eq_var(state_vars[pos], v);
+                            wiring.squeeze_field_vars.push(v);
+                        } else {
+                            // WE mode: expose the state element as the squeeze output var.
+                            wiring.squeeze_field_vars.push(state_vars[pos]);
+                        }
                     }
                     produced += take;
                     squeeze_index += take;
@@ -1085,15 +1144,17 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                     }
                 }
 
-                // Compute bytes from witness values and check they match recorded.
-                let mut bytes: Vec<u8> = Vec::with_capacity(usable_bytes * num_elements);
-                for &v in &src_vars {
-                    let elem_bytes = b.assignment[v].into_bigint().to_bytes_le();
-                    bytes.extend_from_slice(&elem_bytes[..usable_bytes]);
-                }
-                bytes.truncate(*n);
-                if &bytes != out {
-                    return Err(ReplayErr::Mismatch("SqueezeBytes bytes mismatch".to_string()));
+                if arith_mode == PoseidonArithMode::ReplayFixed {
+                    // Compute bytes from witness values and check they match recorded.
+                    let mut bytes: Vec<u8> = Vec::with_capacity(usable_bytes * num_elements);
+                    for &v in &src_vars {
+                        let elem_bytes = b.assignment[v].into_bigint().to_bytes_le();
+                        bytes.extend_from_slice(&elem_bytes[..usable_bytes]);
+                    }
+                    bytes.truncate(*n);
+                    if &bytes != out {
+                        return Err(ReplayErr::Mismatch("SqueezeBytes bytes mismatch".to_string()));
+                    }
                 }
 
                 byte_witnesses.push(ByteSqueezeWitness {
@@ -1111,11 +1172,20 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                     let range_start = byte_wiring.squeeze_byte_vars.len();
                     let full_len = usable_bytes * num_elements;
 
-                    // Build full bytes from current witness values (untruncated).
+                    // Replay mode: derive bytes from witness values.
+                    // WE mode: use the recorded `out` (or dummy placeholders) only as initial
+                    // assignment values; constraints below enforce correctness/canonicality.
                     let mut full_bytes: Vec<u8> = Vec::with_capacity(full_len);
-                    for &v in &src_vars {
-                        let elem_bytes = b.assignment[v].into_bigint().to_bytes_le();
-                        full_bytes.extend_from_slice(&elem_bytes[..usable_bytes]);
+                    if arith_mode == PoseidonArithMode::ReplayFixed {
+                        for &v in &src_vars {
+                            let elem_bytes = b.assignment[v].into_bigint().to_bytes_le();
+                            full_bytes.extend_from_slice(&elem_bytes[..usable_bytes]);
+                        }
+                    } else {
+                        full_bytes.resize(full_len, 0u8);
+                        for (i, bb) in out.iter().copied().enumerate().take(full_len) {
+                            full_bytes[i] = bb;
+                        }
                     }
                     debug_assert_eq!(full_bytes.len(), full_len);
 
@@ -1135,15 +1205,35 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
 
                     for e in 0..num_elements {
                         // Allocate byte vars for this element.
-                        //
-                        // IMPORTANT: these bytes are already fixed by the recorded trace
-                        // (`enforce_var_eq_const`), so additional bit-decomposition constraints
-                        // are unnecessary for soundness of this arithmetization and are very costly.
                         let mut byte_vars: Vec<usize> = Vec::with_capacity(usable_bytes);
                         for i in 0..usable_bytes {
                             let bval = F::from(full_bytes[e * usable_bytes + i] as u64);
                             let bv = b.new_var(bval);
-                            b.enforce_var_eq_const(bv, bval);
+                            if arith_mode == PoseidonArithMode::ReplayFixed {
+                                b.enforce_var_eq_const(bv, bval);
+                            } else {
+                                // WE mode: enforce byte is canonical (0..255) via bit decomposition.
+                                let mut bits: Vec<usize> = Vec::with_capacity(8);
+                                for bi in 0..8 {
+                                    let bit = ((full_bytes[e * usable_bytes + i] >> bi) & 1) as u64;
+                                    let vbit = b.new_var(if bit == 1 { F::ONE } else { F::ZERO });
+                                    // boolean: vbit * (1 - vbit) = 0
+                                    b.add_constraint(
+                                        vec![(F::ONE, vbit)],
+                                        vec![(F::ONE, one), (-F::ONE, vbit)],
+                                        vec![(F::ZERO, one)],
+                                    );
+                                    bits.push(vbit);
+                                }
+                                // bv == Σ 2^j * bits[j]
+                                let mut lc: Vec<(F, usize)> = Vec::with_capacity(8);
+                                let mut p2 = F::ONE;
+                                for &vbit in &bits {
+                                    lc.push((p2, vbit));
+                                    p2 = p2.double();
+                                }
+                                b.enforce_lc_times_one_eq_var(lc, bv);
+                            }
                             byte_vars.push(bv);
                             op_byte_vars.push(bv);
                         }
