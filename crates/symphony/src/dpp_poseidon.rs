@@ -1273,7 +1273,7 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
         }
     }
 
-    if permute_ptr != replay.permutes.len() {
+    if arith_mode == PoseidonArithMode::ReplayFixed && permute_ptr != replay.permutes.len() {
         return Err(ReplayErr::Invalid(format!(
             "permute count mismatch: used {permute_ptr}, replay has {}",
             replay.permutes.len()
