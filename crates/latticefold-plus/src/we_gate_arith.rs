@@ -1731,56 +1731,29 @@ where
             .to_vec();
         cols.push(col);
     }
-    // Helper: compute `y = a * x` where `a` is a constant ring element and `x` is a ring var.
-    let mul_const_left = |b: &mut Dr1csBuilder<BF<R>>, a: &R, x: &RingVars| -> RingVars {
-        if x.d() != d || a.coeffs().len() != d {
-            panic!("mul_const_left: ring dimension mismatch");
-        }
-        let a_coeffs = a.coeffs();
-        let mut out: Vec<usize> = Vec::with_capacity(d);
-        for k_out in 0..d {
-            // y[k] = Σ_v (± a[u]) * x[v], where u = (k - v mod d), sign = + if k>=v else -.
-            let mut acc = BF::<R>::ZERO;
-            for v in 0..d {
-                let (u, sign) = if k_out >= v {
-                    (k_out - v, BF::<R>::ONE)
-                } else {
-                    (k_out + d - v, -BF::<R>::ONE)
-                };
-                let w = bf_from_base_ring::<R>(a_coeffs[u]) * sign;
-                if w == BF::<R>::ZERO {
-                    continue;
-                }
-                acc += w * b.assignment[x.coeffs[v]];
-            }
-            let yk = b.new_var(acc);
-            let mut lc: Vec<(BF<R>, usize)> = Vec::new();
-            for v in 0..d {
-                let (u, sign) = if k_out >= v {
-                    (k_out - v, BF::<R>::ONE)
-                } else {
-                    (k_out + d - v, -BF::<R>::ONE)
-                };
-                let w = bf_from_base_ring::<R>(a_coeffs[u]) * sign;
-                if w != BF::<R>::ZERO {
-                    lc.push((w, x.coeffs[v]));
-                }
-            }
-            lc.push((-BF::<R>::ONE, yk));
-            b.enforce_lc_times_one_eq_const(lc);
-            out.push(yk);
-        }
-        RingVars::new(out)
-    };
-    // Accumulate per-row commitment and equate to witness `out_e_agg_vars`.
+    // Enforce each output coefficient directly as a linear form over input coefficients.
     for i in 0..kappa {
-        let mut acc = RingVars::new((0..d).map(|_| const_var(&mut b, BF::<R>::ZERO)).collect());
-        for j in 0..n_out_agg {
-            let aij = &cols[j][i];
-            let prod = mul_const_left(&mut b, aij, &out_flat_vars[j]);
-            acc = ring_add::<BF<R>>(&mut b, &acc, &prod);
+        for k_out in 0..d {
+            let mut lc: Vec<(BF<R>, usize)> = Vec::new();
+            for j in 0..n_out_agg {
+                let aij = &cols[j][i];
+                let a_coeffs = aij.coeffs();
+                for v in 0..d {
+                    let (u, sign) = if k_out >= v {
+                        (k_out - v, BF::<R>::ONE)
+                    } else {
+                        (k_out + d - v, -BF::<R>::ONE)
+                    };
+                    let w = bf_from_base_ring::<R>(a_coeffs[u]) * sign;
+                    if w != BF::<R>::ZERO {
+                        lc.push((w, out_flat_vars[j].coeffs[v]));
+                    }
+                }
+            }
+            let rhs_var = out_e_agg_vars[i].coeffs[k_out];
+            lc.push((-BF::<R>::ONE, rhs_var));
+            b.enforce_lc_times_one_eq_const(lc);
         }
-        ring_eq::<BF<R>>(&mut b, &acc, &out_e_agg_vars[i]);
     }
 
     // SetChk recombination: enforce ver == v_sc and digest-absorb out.e/out.b.
