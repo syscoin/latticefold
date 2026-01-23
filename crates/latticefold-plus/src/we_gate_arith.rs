@@ -3767,18 +3767,11 @@ where
             expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
         }
         // absorb_evaluations_digest(out.e, out.b):
-        // for each ring element r, absorb_field_element(ev(r,beta)) and absorb_field_element(ev(r,beta^2)).
-        for blk in &out.e {
-            for ej in blk {
-                for _ in 0..ej.len() {
-                    expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
-                    expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
-                }
-            }
-        }
-        for _ in 0..out.b.len() {
-            expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
-            expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+        // SetChk binds all outputs via an Ajtai aggregate commitment and absorbs that commitment.
+        // (κ ring elements, each absorbed as len=d base-field elems).
+        let kappa = dcom.fcoms.first().map(|f| f.cm_f.len()).unwrap_or(0);
+        for _ in 0..kappa {
+            expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
         }
 
         // rgchk::absorb_evaluations(&dcom.evals):
