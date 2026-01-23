@@ -1620,7 +1620,12 @@ where
 
 fn absorb_evaluations<R: OverField>(evals: &[DcomEvals<R>], transcript: &mut impl Transcript<R>) {
     evals.iter().for_each(|eval| {
-        transcript.absorb_slice(&eval.a.iter().map(|z| R::from(*z)).collect::<Vec<R>>());
+        // IMPORTANT (encoding / WE-gate arithmetization):
+        // `eval.a` are base-ring scalars; absorb them as scalars (len=1) rather than as constant-coeff
+        // ring elements (which would absorb `R::dimension()` elems and inject a bunch of zeros).
+        for z in &eval.a {
+            transcript.absorb_field_element(z);
+        }
         transcript.absorb_slice(&eval.c);
     });
 }

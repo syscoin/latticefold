@@ -330,10 +330,12 @@ where
     for _ in 0..kappa {
         push_absorb::<BF<R>>(&mut ops, d);
     }
-    // rgchk::absorb_evaluations(dcom.evals): absorb a (as const-coeff rings, len=d) and c (ring, len=d).
+    // rgchk::absorb_evaluations(dcom.evals):
+    // - absorb eval.a as base-ring scalars (len=1 each)
+    // - absorb eval.c as ring elements (len=d each)
     for _ in 0..dcom_evals_len {
         for _ in 0..dcom_eval_vec_len {
-            push_absorb::<BF<R>>(&mut ops, d);
+            push_absorb::<BF<R>>(&mut ops, 1);
         }
         for _ in 0..dcom_eval_vec_len {
             push_absorb::<BF<R>>(&mut ops, d);
@@ -3776,10 +3778,12 @@ where
             expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
         }
 
-        // rgchk::absorb_evaluations(&dcom.evals): absorb eval.a (as const-coeff rings), then eval.c
+        // rgchk::absorb_evaluations(&dcom.evals):
+        // - eval.a absorbed as scalars (len=1 each)
+        // - eval.c absorbed as ring elements (len=d each)
         for ev in &dcom.evals {
             for _ in 0..ev.a.len() {
-                expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+                expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
             }
             for _ in 0..ev.c.len() {
                 expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
