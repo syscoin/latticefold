@@ -544,7 +544,7 @@ where
     let proof = dummy_plus_proof_shape::<R>(params, mlen_mats, B, n_lin_proofs)?;
     let trace = poseidon_trace_schedule_for_plus::<R>(public_inputs_len, params, n_lin_proofs, mlen_mats)?;
     let public_inputs = vec![BF::<R>::ZERO; public_inputs_len];
-    let out = build_we_dr1cs_for_plus_proof_with_options::<R>(
+    let out = build_we_dr1cs_for_plus_proof_internal::<R>(
         poseidon_cfg,
         &trace,
         params,
@@ -552,7 +552,6 @@ where
         &proof,
         mlen_mats,
         B,
-        false, // shape-only: allow dummy witness values across glued vars
     )?;
     Ok(WeDr1csShape { inst: out.inst, public_len: out.public_len })
 }
@@ -3425,7 +3424,7 @@ where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + Field,
 {
-    build_we_dr1cs_for_plus_proof_with_options::<R>(
+    build_we_dr1cs_for_plus_proof_internal::<R>(
         poseidon_cfg,
         trace,
         params,
@@ -3433,12 +3432,11 @@ where
         proof,
         mlen_mats,
         B,
-        true, // witness-time: require glue-consistent assignments
     )
 }
 
 #[cfg(feature = "we_gate")]
-fn build_we_dr1cs_for_plus_proof_with_options<R>(
+fn build_we_dr1cs_for_plus_proof_internal<R>(
     poseidon_cfg: &PoseidonConfig<BF<R>>,
     trace: &PoseidonTranscriptTrace<BF<R>>,
     params: &WeParams,
@@ -3446,7 +3444,6 @@ fn build_we_dr1cs_for_plus_proof_with_options<R>(
     proof: &crate::plus::PlusProof<R, crate::r1cs::ComR1CSProof<R>>,
     mlen_mats: usize,
     B: u128,
-    check_glue_assignment_consistency: bool,
 ) -> Result<WeDr1csOutput<BF<R>>, String>
 where
     R: OverField + CoeffRing + PolyRing,
@@ -4386,13 +4383,7 @@ where
         inst.nvars = asg.len();
         Ok((inst, asg))
     }
-    let (inst, assignment) = if check_glue_assignment_consistency {
-        // witness-time: strict merge is fine (and smaller), but keep consistent with shape-time
-        // by using explicit glue constraints here as well.
-        merge_with_glue_constraints(&parts, &glue)?
-    } else {
-        merge_with_glue_constraints(&parts, &glue)?
-    };
+    let (inst, assignment) = merge_with_glue_constraints(&parts, &glue)?;
     if std::env::var("LFP_WE_GATE_OPMIX").is_ok() {
         eprintln!(
             "LF+ WE gate merged: nvars={} constraints={} (glue constraints={})",
@@ -5577,9 +5568,8 @@ mod tests {
         )
         .expect("build_we_dr1cs_for_plus_proof_shape");
 
-        // 2) witness: build the witness-time instance+assignment (same code path as production),
-        // and sanity-check it satisfies *itself* before checking against the armed shape.
-        let out_wit = build_we_dr1cs_for_plus_proof_with_options::<RR>(
+        // 2) witness: fill assignment from the real proof+trace
+        let assignment = build_we_dr1cs_for_plus_proof_witness::<RR>(
             &poseidon_cfg,
             &trace,
             &params,
@@ -5587,52 +5577,12 @@ mod tests {
             &proof,
             m0.len(),
             b_decomp,
-            true, // witness-time: require glue-consistent assignments
         )
-        .expect("build_we_dr1cs_for_plus_proof_with_options (witness)");
-        out_wit
-            .inst
-            .check(&out_wit.assignment)
-            .expect("witness-time instance satisfied");
-
-        // Helpful debug if shape mismatches witness instance structure.
-        if shape.inst.nvars != out_wit.inst.nvars || shape.inst.constraints.len() != out_wit.inst.constraints.len() {
-            eprintln!(
-                "[test_we_plus_prover_sparse_base_small_mock_sat] shape vs witness mismatch: shape(nvars={}, constraints={}) witness(nvars={}, constraints={})",
-                shape.inst.nvars,
-                shape.inst.constraints.len(),
-                out_wit.inst.nvars,
-                out_wit.inst.constraints.len()
-            );
-        }
+        .expect("build_we_dr1cs_for_plus_proof_witness");
         shape
             .inst
-            .check(&out_wit.assignment)
-            .unwrap_or_else(|e| {
-                // Best-effort debug for the first failing constraint.
-                if let Some(idx_str) = e.strip_prefix("constraint ").and_then(|s| s.split_whitespace().next()) {
-                    if let Ok(idx) = idx_str.parse::<usize>() {
-                        if let Some(row) = shape.inst.constraints.get(idx) {
-                            fn eval_lc<F: ark_ff::PrimeField>(lc: &[(F, usize)], asg: &[F]) -> F {
-                                lc.iter()
-                                    .fold(F::ZERO, |acc, (c, i)| acc + (*c * asg[*i]))
-                            }
-                            let a = eval_lc::<BF<RR>>(&row.a, &out_wit.assignment);
-                            let b = eval_lc::<BF<RR>>(&row.b, &out_wit.assignment);
-                            let c = eval_lc::<BF<RR>>(&row.c, &out_wit.assignment);
-                            eprintln!(
-                                "[we_gate debug] failed constraint idx={} |a|={} |b|={} |c|={}  a*b==c? {}",
-                                idx,
-                                row.a.len(),
-                                row.b.len(),
-                                row.c.len(),
-                                a * b == c
-                            );
-                        }
-                    }
-                }
-                panic!("we gate dr1cs satisfied: {:?}", e)
-            });
+            .check(&assignment)
+            .expect("we gate dr1cs satisfied");
     }
 }
 
