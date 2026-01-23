@@ -1795,22 +1795,14 @@ mod tests {
         r.coeffs_mut()[1] = r.coeffs()[1] + <R as PolyRing>::BaseRing::ONE;
         out.e[1][0][0] = r;
 
-        #[cfg(feature = "we_gate")]
-        {
-            let mut ts2 = PoseidonTranscript::empty::<PC>();
-            assert!(out.verify(&mut ts2, 2).is_err());
-        }
-        #[cfg(not(feature = "we_gate"))]
-        {
-            let mut ts1 = PoseidonTranscript::empty::<PC>();
-            out_orig.verify(&mut ts1, 2).unwrap();
-            let c1 = ts1.get_challenge();
+        let mut ts1 = PoseidonTranscript::empty::<PC>();
+        out_orig.verify(&mut ts1, 2).unwrap();
+        let c1 = ts1.get_challenge();
 
-            let mut ts2 = PoseidonTranscript::empty::<PC>();
-            out.verify(&mut ts2, 2).unwrap();
-            let c2 = ts2.get_challenge();
+        let mut ts2 = PoseidonTranscript::empty::<PC>();
+        out.verify(&mut ts2, 2).unwrap();
+        let c2 = ts2.get_challenge();
 
-            assert_ne!(c1, c2, "binding should change downstream challenge");
-        }
+        assert_ne!(c1, c2, "binding should change downstream challenge");
     }
 }
