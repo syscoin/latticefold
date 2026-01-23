@@ -4300,9 +4300,13 @@ where
         // This removes ambiguity about “perm-heavy CM” vs “math-heavy CM”.
         let pose_permutes_before_cm = {
             use symphony::poseidon_trace::replay_ops;
-            replay_ops(poseidon_cfg, &ops[..cm_ops_offset])
-                .map(|r| r.permutes.len())
-                .unwrap_or(0usize)
+            match replay_ops(poseidon_cfg, &ops[..cm_ops_offset]) {
+                Ok(r) => r.permutes.len(),
+                Err(e) => {
+                    eprintln!("  poseidon replay(before_cm) failed: {e}");
+                    0usize
+                }
+            }
         };
         let pose_permutes_after_cm = pose_permutes.saturating_sub(pose_permutes_before_cm);
 
