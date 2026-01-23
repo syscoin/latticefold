@@ -1399,56 +1399,126 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                                 is_eq = prod;
                             }
 
-                            // diff = (p0-1 - low) * is_eq, and diff must be in [0, 256^k).
-                            let tmp_val = p0_minus1_val - b.assignment[low_var];
-                            let tmp = b.new_var(tmp_val);
-                            b.enforce_lc_times_one_eq_var(vec![(p0_minus1_val, one), (-F::ONE, low_var)], tmp);
-                            let diff_val = b.assignment[tmp] * b.assignment[is_eq];
-                            let diff = b.new_var(diff_val);
-                            b.enforce_mul(tmp, is_eq, diff);
-
-                            // Range-check `diff` by decomposing it into `usable_bytes` bytes.
-                            let mut diff_byte_vars: Vec<usize> = Vec::with_capacity(usable_bytes);
-                            let diff_bytes_le = diff_val.into_bigint().to_bytes_le();
-                            for i in 0..usable_bytes {
-                                let bb = diff_bytes_le.get(i).copied().unwrap_or(0u8);
-                                let bval = F::from(bb as u64);
-                                let bv = b.new_var(bval);
-                                // byte range check via bits
-                                let mut bits: [usize; 8] = [0usize; 8];
-                                for bi in 0..8 {
-                                    let bit = ((bb >> bi) & 1) as u64;
-                                    let vbit = b.new_var(if bit == 1 { F::ONE } else { F::ZERO });
-                                    b.add_constraint(
-                                        vec![(F::ONE, vbit)],
-                                        vec![(F::ONE, one), (-F::ONE, vbit)],
-                                        vec![(F::ZERO, one)],
-                                    );
-                                    bits[bi] = vbit;
+                            // If high == p_hi, then we must have low <= p0-1 (i.e. low < p0).
+                            //
+                            // We enforce this with a bytewise comparator against the *constant*
+                            // bound (p0-1) using the already-existing per-byte bit decompositions,
+                            // instead of introducing a fresh `diff` value and re-decomposing it.
+                            // This is substantially cheaper and keeps soundness.
+                            //
+                            // Build constant bytes for (p0 - 1) in little-endian order.
+                            let mut bound_bytes: Vec<u8> = p0_bytes.to_vec();
+                            // subtract 1 (since p0 > 0)
+                            let mut carry: i16 = -1;
+                            for bb in bound_bytes.iter_mut() {
+                                let v = (*bb as i16) + carry;
+                                if v < 0 {
+                                    *bb = 255u8;
+                                    carry = -1;
+                                } else {
+                                    *bb = v as u8;
+                                    carry = 0;
                                 }
-                                let mut lc: Vec<(F, usize)> = Vec::with_capacity(8);
-                                let mut p2 = F::ONE;
-                                for &vbit in bits.iter() {
-                                    lc.push((p2, vbit));
-                                    p2 = p2.double();
-                                }
-                                b.enforce_lc_times_one_eq_var(lc, bv);
-                                diff_byte_vars.push(bv);
                             }
-                            // diff == Σ 256^i * diff_byte_i
-                            let mut lc_d: Vec<(F, usize)> = Vec::with_capacity(usable_bytes);
-                            let mut val = F::ZERO;
-                            for i in 0..usable_bytes {
-                                lc_d.push((pow256[i], diff_byte_vars[i]));
-                                val += pow256[i] * b.assignment[diff_byte_vars[i]];
-                            }
-                            let diff_recomp = b.new_var(val);
-                            b.enforce_lc_times_one_eq_var(lc_d, diff_recomp);
-                            // Enforce diff == diff_recomp
-                            b.enforce_var_eq_var(diff, diff_recomp);
 
-                            // `byte_bits` is kept for potential future strengthening/debug; silence warnings.
-                            let _ = &byte_bits;
+                            // Compare the little-endian byte vector `byte_vars` (and their bits)
+                            // to `bound_bytes` in big-endian order.
+                            let mut eq_prefix = b.one(); // 1 iff all more-significant bytes equal
+                            b.enforce_var_eq_const(eq_prefix, F::ONE);
+                            let mut lt_total = b.new_var(F::ZERO);
+                            b.enforce_var_eq_const(lt_total, F::ZERO);
+                            for bi in (0..usable_bytes).rev() {
+                                // Per-byte eq and lt against constant bound_bytes[bi].
+                                let cb = bound_bytes[bi];
+                                let cb_bits = (0..8).map(|j| ((cb >> j) & 1) as u8).collect::<Vec<_>>();
+
+                                // eq_byte = Π_j (bit_j == cb_j)
+                                let mut eq_byte = b.one();
+                                b.enforce_var_eq_const(eq_byte, F::ONE);
+                                for j in 0..8 {
+                                    let bit = byte_bits[bi][j];
+                                    let eq_bit = if cb_bits[j] == 1 {
+                                        // eq_bit = bit
+                                        bit
+                                    } else {
+                                        // eq_bit = 1 - bit
+                                        let t_val = F::ONE - b.assignment[bit];
+                                        let t = b.new_var(t_val);
+                                        b.enforce_lc_times_one_eq_var(vec![(F::ONE, one), (-F::ONE, bit)], t);
+                                        t
+                                    };
+                                    let prod_val = b.assignment[eq_byte] * b.assignment[eq_bit];
+                                    let prod = b.new_var(prod_val);
+                                    b.enforce_mul(eq_byte, eq_bit, prod);
+                                    eq_byte = prod;
+                                }
+
+                                // lt_byte: standard “first differing bit” check from MSB down.
+                                let mut lt_byte = b.new_var(F::ZERO);
+                                b.enforce_var_eq_const(lt_byte, F::ZERO);
+                                let mut eq_bit_prefix = b.one();
+                                b.enforce_var_eq_const(eq_bit_prefix, F::ONE);
+                                for j in (0..8).rev() {
+                                    let bit = byte_bits[bi][j];
+                                    let cbit = ((cb >> j) & 1) as u8;
+                                    if cbit == 1 {
+                                        // term = eq_bit_prefix * (1 - bit)
+                                        let om_val = F::ONE - b.assignment[bit];
+                                        let om = b.new_var(om_val);
+                                        b.enforce_lc_times_one_eq_var(vec![(F::ONE, one), (-F::ONE, bit)], om);
+                                        let term_val = b.assignment[eq_bit_prefix] * b.assignment[om];
+                                        let term = b.new_var(term_val);
+                                        b.enforce_mul(eq_bit_prefix, om, term);
+                                        let sum_val = b.assignment[lt_byte] + b.assignment[term];
+                                        let sum = b.new_var(sum_val);
+                                        b.enforce_lc_times_one_eq_var(vec![(F::ONE, lt_byte), (F::ONE, term)], sum);
+                                        lt_byte = sum;
+                                        // update prefix: eq_bit_prefix *= bit
+                                        let newp_val = b.assignment[eq_bit_prefix] * b.assignment[bit];
+                                        let newp = b.new_var(newp_val);
+                                        b.enforce_mul(eq_bit_prefix, bit, newp);
+                                        eq_bit_prefix = newp;
+                                    } else {
+                                        // cbit == 0: update prefix *= (1 - bit)
+                                        let om_val = F::ONE - b.assignment[bit];
+                                        let om = b.new_var(om_val);
+                                        b.enforce_lc_times_one_eq_var(vec![(F::ONE, one), (-F::ONE, bit)], om);
+                                        let newp_val = b.assignment[eq_bit_prefix] * b.assignment[om];
+                                        let newp = b.new_var(newp_val);
+                                        b.enforce_mul(eq_bit_prefix, om, newp);
+                                        eq_bit_prefix = newp;
+                                    }
+                                }
+
+                                // lt_total += eq_prefix * lt_byte
+                                let term_val = b.assignment[eq_prefix] * b.assignment[lt_byte];
+                                let term = b.new_var(term_val);
+                                b.enforce_mul(eq_prefix, lt_byte, term);
+                                let sum_val = b.assignment[lt_total] + b.assignment[term];
+                                let sum = b.new_var(sum_val);
+                                b.enforce_lc_times_one_eq_var(vec![(F::ONE, lt_total), (F::ONE, term)], sum);
+                                lt_total = sum;
+
+                                // eq_prefix *= eq_byte
+                                let new_eq_val = b.assignment[eq_prefix] * b.assignment[eq_byte];
+                                let new_eq = b.new_var(new_eq_val);
+                                b.enforce_mul(eq_prefix, eq_byte, new_eq);
+                                eq_prefix = new_eq;
+                            }
+
+                            // ok = (low <= bound) = lt_total + eq_prefix (disjoint).
+                            let ok_val = b.assignment[lt_total] + b.assignment[eq_prefix];
+                            let ok = b.new_var(ok_val);
+                            b.enforce_lc_times_one_eq_var(vec![(F::ONE, lt_total), (F::ONE, eq_prefix)], ok);
+
+                            // Enforce: if is_eq==1 then ok==1  ⇔  is_eq * (1 - ok) = 0.
+                            let one_minus_ok_val = F::ONE - b.assignment[ok];
+                            let one_minus_ok = b.new_var(one_minus_ok_val);
+                            b.enforce_lc_times_one_eq_var(vec![(F::ONE, one), (-F::ONE, ok)], one_minus_ok);
+                            let viol_val = b.assignment[is_eq] * b.assignment[one_minus_ok];
+                            let viol = b.new_var(viol_val);
+                            b.enforce_mul(is_eq, one_minus_ok, viol);
+                            b.enforce_var_eq_const(viol, F::ZERO);
                         }
                     }
 
