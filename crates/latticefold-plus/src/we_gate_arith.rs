@@ -781,6 +781,16 @@ fn eval_lc_val<F: PrimeField>(b: &Dr1csBuilder<F>, lc: &[(F, usize)]) -> F {
 }
 
 #[inline]
+fn lc_extend_scaled<F: PrimeField>(dst: &mut Lc<F>, scale: F, src: &Lc<F>) {
+    if scale.is_zero() {
+        return;
+    }
+    for (c, v) in src {
+        dst.push((scale * *c, *v));
+    }
+}
+
+#[inline]
 fn scalar_mul_lc<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: Lc<F>, c: Lc<F>) -> usize {
     cm_bump(|cc| cc.scalar_mul += 1);
     let aval = eval_lc_val::<F>(b, &a);
@@ -790,13 +800,14 @@ fn scalar_mul_lc<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: Lc<F>, c: Lc<F>) -> 
     out
 }
 
-fn poly_mul_karatsuba_lc<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: &[Lc<F>], c: &[Lc<F>]) -> Vec<usize> {
+fn poly_mul_karatsuba_lc<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: &[Lc<F>], c: &[Lc<F>]) -> Vec<Lc<F>> {
     assert_eq!(a.len(), c.len());
     let n = a.len();
     assert!(n.is_power_of_two(), "karatsuba_lc requires power-of-two length");
     assert!(n > 0);
     if n == 1 {
-        return vec![scalar_mul_lc::<F>(b, a[0].clone(), c[0].clone())];
+        let prod = scalar_mul_lc::<F>(b, a[0].clone(), c[0].clone());
+        return vec![vec![(F::ONE, prod)]];
     }
     let m = n / 2;
     let (a0, a1) = a.split_at(m);
@@ -827,33 +838,36 @@ fn poly_mul_karatsuba_lc<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: &[Lc<F>], c:
     debug_assert_eq!(z1.len(), n - 1);
     debug_assert_eq!(z2.len(), n - 1);
     let cross_lc: Vec<Lc<F>> = (0..(n - 1))
-        .map(|i| vec![(F::ONE, z1[i]), (-F::ONE, z0[i]), (-F::ONE, z2[i])])
+        .map(|i| {
+            let mut lc = Vec::new();
+            lc_extend_scaled(&mut lc, F::ONE, &z1[i]);
+            lc_extend_scaled(&mut lc, -F::ONE, &z0[i]);
+            lc_extend_scaled(&mut lc, -F::ONE, &z2[i]);
+            lc
+        })
         .collect();
 
-    // Assemble product without materializing `cross` vars.
+    // Assemble product without materializing vars.
     let mut res = Vec::with_capacity(2 * n - 1);
     for k in 0..(2 * n - 1) {
-        let mut terms: Vec<(F, usize)> = Vec::with_capacity(6);
+        let mut lc: Lc<F> = Vec::new();
         if k < z0.len() {
-            terms.push((F::ONE, z0[k]));
+            lc_extend_scaled(&mut lc, F::ONE, &z0[k]);
         }
         if k >= m {
             let idx = k - m;
             if idx < cross_lc.len() {
-                terms.extend_from_slice(&cross_lc[idx]);
+                lc_extend_scaled(&mut lc, F::ONE, &cross_lc[idx]);
             }
         }
         if k >= n {
             let idx = k - n;
             if idx < z2.len() {
-                terms.push((F::ONE, z2[idx]));
+                lc_extend_scaled(&mut lc, F::ONE, &z2[idx]);
             }
         }
-        match terms.len() {
-            0 => unreachable!("karatsuba_lc assembly: missing term"),
-            1 => res.push(terms[0].1),
-            _ => res.push(lc_to_var::<F>(b, terms)),
-        }
+        assert!(!lc.is_empty(), "karatsuba_lc assembly: missing term");
+        res.push(lc);
     }
     res
 }
@@ -869,6 +883,15 @@ fn poly_mul_karatsuba<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: &[usize], c: &[
     let a_lc: Vec<Lc<F>> = a.iter().map(|&v| vec![(F::ONE, v)]).collect();
     let c_lc: Vec<Lc<F>> = c.iter().map(|&v| vec![(F::ONE, v)]).collect();
     poly_mul_karatsuba_lc::<F>(b, &a_lc, &c_lc)
+        .into_iter()
+        .map(|lc| {
+            if lc.len() == 1 && lc[0].0 == F::ONE {
+                lc[0].1
+            } else {
+                lc_to_var::<F>(b, lc)
+            }
+        })
+        .collect()
 }
 
 fn ring_mul_negacyclic_karatsuba<F: PrimeField>(
