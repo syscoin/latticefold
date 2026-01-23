@@ -1,4 +1,8 @@
+use latticefold::commitment::AjtaiCommitmentScheme;
 use ark_std::log2;
+
+/// Fixed seed for the setchk out.e/out.b aggregate commitment.
+pub const OUT_E_AGG_SEED: [u8; 32] = *b"SETCHK_OUT_E_AGG_V1_0000000000__";
 use latticefold::{
     transcript::Transcript,
     utils::sumcheck::{
@@ -167,6 +171,13 @@ pub enum SetCheckError<R: Ring + PolyRing> {
     },
     #[error("Recomputed claim `v` mismatch: expected = {0}, received = {1}")]
     ExpectedEvaluation(R, R),
+    #[error("Non-const coefficient in {which}: blk={blk} idx={idx} lane={lane}")]
+    NonConstCoeff {
+        which: &'static str,
+        blk: usize,
+        idx: usize,
+        lane: usize,
+    },
 }
 
 fn ev<R: PolyRing>(r: &R, x: R::BaseRing) -> R::BaseRing {
@@ -182,13 +193,59 @@ fn ev<R: PolyRing>(r: &R, x: R::BaseRing) -> R::BaseRing {
         .0
 }
 
+#[inline]
+fn ensure_const_coeff_out<R: OverField + PolyRing>(
+    e: &[Vec<Vec<R>>],
+    b: &[R],
+) -> Result<(), SetCheckError<R>>
+where
+    R::BaseRing: Ring,
+{
+    for (blk, ek) in e.iter().enumerate() {
+        for (idx, lane) in ek.iter().enumerate() {
+            for (j, r) in lane.iter().enumerate() {
+                let coeffs = r.coeffs();
+                for lane_idx in 1..coeffs.len() {
+                    if coeffs[lane_idx] != R::BaseRing::ZERO {
+                        return Err(SetCheckError::NonConstCoeff {
+                            which: "e",
+                            blk,
+                            idx,
+                            lane: j,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    for (idx, r) in b.iter().enumerate() {
+        let coeffs = r.coeffs();
+        for lane_idx in 1..coeffs.len() {
+            if coeffs[lane_idx] != R::BaseRing::ZERO {
+                return Err(SetCheckError::NonConstCoeff {
+                    which: "b",
+                    blk: 0,
+                    idx,
+                    lane: lane_idx,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 impl<R: OverField + PolyRing> In<R> {
     /// Monomial set check
     ///
     /// Proves sets rings are all unit monomials.
     /// Currently requires k >= 1 monomial matrices sets. TODO support other scenarios.
     /// If k > 1, sumcheck batching is employed.
-    pub fn set_check(&self, M: ExternalMats<'_, R>, transcript: &mut impl Transcript<R>) -> Out<R> {
+    pub fn set_check(
+        &self,
+        M: ExternalMats<'_, R>,
+        transcript: &mut impl Transcript<R>,
+        kappa: usize,
+    ) -> Out<R> {
         let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
         let t_total = Instant::now();
         maybe_print_rss("setchk: start");
@@ -255,9 +312,6 @@ impl<R: OverField + PolyRing> In<R> {
         let mut mles: Vec<StreamingMleEnum<R>> =
             Vec::with_capacity((Ms_len + ms.len()) * (ncols * 2 + 1));
         let mut alphas = Vec::with_capacity(Ms_len);
-        // Track per-claim betas in the exact same order that `e0` and `b` are constructed.
-        // This is later used to shrink the transcript absorb surface for prover messages.
-        let mut betas: Vec<R::BaseRing> = Vec::with_capacity(Ms_len + ms.len());
         // Track which matrix sets are stored as `DigitsBacking::ConstCol0`.
         // For those, only column 0 varies by row; columns 1..d-1 are fixed to a constant monomial
         // and contribute identically zero to the set-check polynomial. We can omit them from the
@@ -271,7 +325,6 @@ impl<R: OverField + PolyRing> In<R> {
             let c0 = transcript.get_challenges(self.nvars);
             let one_minus_c0 = c0.iter().copied().map(|x| R::BaseRing::ONE - x).collect();
             let beta = transcript.get_challenge();
-            betas.push(beta);
 
             // Step 2
             // Fast evaluation uses precomputed beta powers (degree = ring dimension).
@@ -317,7 +370,6 @@ impl<R: OverField + PolyRing> In<R> {
             let c0 = transcript.get_challenges(self.nvars);
             let one_minus_c0 = c0.iter().copied().map(|x| R::BaseRing::ONE - x).collect();
             let beta = transcript.get_challenge();
-            betas.push(beta);
 
             // Step 2
             let beta_pows = beta_pows::<R>(beta);
@@ -377,7 +429,6 @@ impl<R: OverField + PolyRing> In<R> {
             let c0 = transcript.get_challenges(self.nvars);
             let one_minus_c0 = c0.iter().copied().map(|x| R::BaseRing::ONE - x).collect();
             let beta = transcript.get_challenge();
-            betas.push(beta);
 
             let MT = (*M).transpose();
             let beta_pows = beta_pows::<R>(beta);
@@ -416,7 +467,6 @@ impl<R: OverField + PolyRing> In<R> {
             let c0 = transcript.get_challenges(self.nvars);
             let one_minus_c0 = c0.iter().copied().map(|x| R::BaseRing::ONE - x).collect();
             let beta = transcript.get_challenge();
-            betas.push(beta);
 
             let beta_pows = beta_pows::<R>(beta);
             let (v0, m_len) = match mset {
@@ -1223,16 +1273,18 @@ impl<R: OverField + PolyRing> In<R> {
         let t_absorb = std::time::Instant::now();
         // Prover to Verifier messages (digest-absorb).
         //
-        // Instead of absorbing the full ring coefficient vectors for `e` and `b` (which costs
-        // `R::dimension()` base-field absorbs per ring element), we absorb a compact digest:
-        // for each ring element `r`, absorb `ev(r, beta)` and `ev(r, beta^2)` as base-ring scalars.
-        //
-        // CRITICAL (soundness / FS binding):
-        // We must bind *all* `e` blocks to the transcript before downstream challenges are sampled
+        // Bind *all* `e` blocks to the transcript before downstream challenges are sampled
         // (e.g. `CmProof::verify_with_mlen` samples `s/s_prime` after `Dcom::verify` and then uses
-        // all `out.e` blocks in linear combinations). If we only bind `e[0]`, a malicious prover
-        // can potentially adjust `e[1..]` without affecting transcript-derived challenges.
-        absorb_evaluations_digest(&e, &b, &betas, transcript);
+        // all `out.e` blocks in linear combinations). If we only bind `e[0]` (or too few
+        // evaluations), a malicious prover can potentially adjust `e[1..]` without affecting
+        // transcript-derived challenges.
+        //
+        // We therefore absorb the full coefficient vectors for `e` and `b`.
+        #[cfg(feature = "we_gate")]
+        if cfg!(debug_assertions) {
+            ensure_const_coeff_out(&e, &b).expect("setchk: non-const coeff in out.e/out.b");
+        }
+        absorb_evaluations_digest(&e, &b, transcript, kappa);
         if profile {
             println!("[LF+ setchk] step3(absorb): {:?}", t_absorb.elapsed());
         }
@@ -1397,7 +1449,11 @@ where
 }
 
 impl<R: OverField> Out<R> {
-    pub fn verify(&self, transcript: &mut impl Transcript<R>) -> Result<(), SetCheckError<R>> {
+    pub fn verify(
+        &self,
+        transcript: &mut impl Transcript<R>,
+        kappa: usize,
+    ) -> Result<(), SetCheckError<R>> {
         let nclaims = self.e[0].len() + self.b.len();
 
         let cba: Vec<(Vec<R>, R::BaseRing, R::BaseRing)> = (0..nclaims)
@@ -1442,8 +1498,9 @@ impl<R: OverField> Out<R> {
         let v = subclaim.expected_evaluation;
 
         // Prover to Verifier messages
-        let betas: Vec<R::BaseRing> = cba.iter().map(|(_c, beta, _a)| *beta).collect();
-        absorb_evaluations_digest(&self.e, &self.b, &betas, transcript);
+        #[cfg(feature = "we_gate")]
+        ensure_const_coeff_out(&self.e, &self.b)?;
+        absorb_evaluations_digest(&self.e, &self.b, transcript, kappa);
 
         use ark_std::One;
         let mut ver = R::zero();
@@ -1503,26 +1560,16 @@ impl<R: OverField> Out<R> {
 
 /// Digest-absorb the prover messages for `Out::verify`.
 ///
-/// Instead of absorbing every coefficient of every ring element in `e`/`b`, absorb the scalar
-/// evaluations at the verifier's sampled points `beta` and `beta^2`.
-///
-/// The betas must be provided in the same order as the verifier's `cba` sampling:
-/// first all `e[0]` claims (one beta per `e[0][i]`), then all `b` claims (one beta per `b[i]`).
+/// Bind the full setchk outputs via an Ajtai aggregate commitment, then absorb that commitment.
 fn absorb_evaluations_digest<R: OverField + PolyRing>(
     e: &[Vec<Vec<R>>],
     b: &[R],
-    betas: &[R::BaseRing],
     transcript: &mut impl Transcript<R>,
+    kappa: usize,
 ) where
     R::BaseRing: Ring,
 {
     let e0_len = e.get(0).map(|v| v.len()).unwrap_or(0);
-    let nclaims = e0_len + b.len();
-    assert_eq!(
-        betas.len(),
-        nclaims,
-        "absorb_evaluations_digest: betas length mismatch"
-    );
 
     // Sanity: all `e` blocks must have the same outer length.
     for (blk_idx, blk) in e.iter().enumerate() {
@@ -1533,35 +1580,41 @@ fn absorb_evaluations_digest<R: OverField + PolyRing>(
         );
     }
 
-    // e claims: for each claim index `i` (beta = betas[i]), absorb evaluations for *all* blocks
-    // e[blk][i][lane] at beta and beta^2.
+    if kappa == 0 {
+        panic!("absorb_evaluations_digest: kappa=0");
+    }
+
+    // Flatten out.e/out.b in a fixed order: claim index -> block -> lane.
+    let mut flat: Vec<R> = Vec::new();
     for i in 0..e0_len {
-        let beta = betas[i];
-        let beta2 = beta * beta;
-        let beta_pows1 = beta_pows::<R>(beta);
-        let beta_pows2 = beta_pows::<R>(beta2);
         for blk in e {
             let lane = &blk[i];
             for r in lane {
-                let ev1 = ev_fast::<R>(r, &beta_pows1);
-                let ev2 = ev_fast::<R>(r, &beta_pows2);
-                transcript.absorb_field_element(&ev1);
-                transcript.absorb_field_element(&ev2);
+                flat.push(*r);
             }
         }
     }
-
-    // b claims: absorb ev(b[i], beta) and ev(b[i], beta^2).
-    for (i, bi) in b.iter().enumerate() {
-        let beta = betas[e0_len + i];
-        let beta2 = beta * beta;
-        let beta_pows1 = beta_pows::<R>(beta);
-        let beta_pows2 = beta_pows::<R>(beta2);
-        let ev1 = ev_fast::<R>(bi, &beta_pows1);
-        let ev2 = ev_fast::<R>(bi, &beta_pows2);
-        transcript.absorb_field_element(&ev1);
-        transcript.absorb_field_element(&ev2);
+    for bi in b {
+        flat.push(*bi);
     }
+    if flat.is_empty() {
+        return;
+    }
+
+    // Ajtai aggregate commitment to bind the entire vector with linear constraints in WE gate.
+    let agg_scheme =
+        AjtaiCommitmentScheme::<R>::seeded(b"setchk_out_e_agg", OUT_E_AGG_SEED, kappa, flat.len());
+    #[cfg(feature = "we_gate")]
+    let c_agg = agg_scheme
+        .commit_const_coeff_fast(&flat)
+        .map_err(|e| format!("setchk out_e agg commit failed: {e:?}"))
+        .expect("setchk out_e agg commit failed");
+    #[cfg(not(feature = "we_gate"))]
+    let c_agg = agg_scheme
+        .commit(&flat)
+        .map_err(|e| format!("setchk out_e agg commit failed: {e:?}"))
+        .expect("setchk out_e agg commit failed");
+    transcript.absorb_slice(c_agg.as_ref());
 }
 
 #[cfg(test)]
@@ -1587,10 +1640,10 @@ mod tests {
 
         let mut ts = PoseidonTranscript::empty::<PC>();
         let empty_m: Vec<Arc<SparseMatrix<R>>> = Vec::new();
-        let out = scin.set_check(ExternalMats::Ring(&empty_m), &mut ts);
+        let out = scin.set_check(ExternalMats::Ring(&empty_m), &mut ts, 2);
 
         let mut ts = PoseidonTranscript::empty::<PC>();
-        out.verify(&mut ts).unwrap();
+        out.verify(&mut ts, 2).unwrap();
     }
 
     #[test]
@@ -1609,10 +1662,10 @@ mod tests {
 
         let mut ts = PoseidonTranscript::empty::<PC>();
         let empty_m: Vec<Arc<SparseMatrix<R>>> = Vec::new();
-        let out = scin.set_check(ExternalMats::Ring(&empty_m), &mut ts);
+        let out = scin.set_check(ExternalMats::Ring(&empty_m), &mut ts, 2);
 
         let mut ts = PoseidonTranscript::empty::<PC>();
-        assert!(out.verify(&mut ts).is_err());
+        assert!(out.verify(&mut ts, 2).is_err());
     }
 
     #[test]
@@ -1628,10 +1681,10 @@ mod tests {
 
         let mut ts = PoseidonTranscript::empty::<PC>();
         let empty_m: Vec<Arc<SparseMatrix<R>>> = Vec::new();
-        let out = scin.set_check(ExternalMats::Ring(&empty_m), &mut ts);
+        let out = scin.set_check(ExternalMats::Ring(&empty_m), &mut ts, 2);
 
         let mut ts = PoseidonTranscript::empty::<PC>();
-        out.verify(&mut ts).unwrap();
+        out.verify(&mut ts, 2).unwrap();
     }
 
     #[test]
@@ -1651,10 +1704,10 @@ mod tests {
 
         let mut ts = PoseidonTranscript::empty::<PC>();
         let empty_m: Vec<Arc<SparseMatrix<R>>> = Vec::new();
-        let out = scin.set_check(ExternalMats::Ring(&empty_m), &mut ts);
+        let out = scin.set_check(ExternalMats::Ring(&empty_m), &mut ts, 2);
 
         let mut ts = PoseidonTranscript::empty::<PC>();
-        assert!(out.verify(&mut ts).is_err());
+        assert!(out.verify(&mut ts, 2).is_err());
     }
 
     #[test]
@@ -1677,10 +1730,10 @@ mod tests {
 
         let mut ts = PoseidonTranscript::empty::<PC>();
         let empty_m: Vec<Arc<SparseMatrix<R>>> = Vec::new();
-        let out = scin.set_check(ExternalMats::Ring(&empty_m), &mut ts);
+        let out = scin.set_check(ExternalMats::Ring(&empty_m), &mut ts, 2);
 
         let mut ts = PoseidonTranscript::empty::<PC>();
-        out.verify(&mut ts).unwrap();
+        out.verify(&mut ts, 2).unwrap();
     }
 
     #[test]
@@ -1705,10 +1758,10 @@ mod tests {
 
         let mut ts = PoseidonTranscript::empty::<PC>();
         let empty_m: Vec<Arc<SparseMatrix<R>>> = Vec::new();
-        let out = scin.set_check(ExternalMats::Ring(&empty_m), &mut ts);
+        let out = scin.set_check(ExternalMats::Ring(&empty_m), &mut ts, 2);
 
         let mut ts = PoseidonTranscript::empty::<PC>();
-        assert!(out.verify(&mut ts).is_err());
+        assert!(out.verify(&mut ts, 2).is_err());
     }
 
     #[test]
@@ -1745,9 +1798,49 @@ mod tests {
 
         let mut ts = PoseidonTranscript::empty::<PC>();
         let empty_m: Vec<Arc<SparseMatrix<R>>> = Vec::new();
-        let out = scin.set_check(ExternalMats::Ring(&empty_m), &mut ts);
+        let out = scin.set_check(ExternalMats::Ring(&empty_m), &mut ts, 2);
 
         let mut ts = PoseidonTranscript::empty::<PC>();
-        assert!(out.verify(&mut ts).is_err());
+        assert!(out.verify(&mut ts, 2).is_err());
+    }
+
+    #[test]
+    fn test_set_check_binding_high_coeff_changes_challenge() {
+        let n = 4;
+        let M = SparseMatrix::<R>::identity(n);
+        let ext = Arc::new(SparseMatrix::<R>::identity(n));
+
+        let scin = In {
+            sets: vec![MonomialSet::Matrix(M)],
+            nvars: log2(n) as usize,
+        };
+
+        let mut ts = PoseidonTranscript::empty::<PC>();
+        let ext_mats: Vec<Arc<SparseMatrix<R>>> = vec![ext];
+        let mut out = scin.set_check(ExternalMats::Ring(&ext_mats), &mut ts, 2);
+        let out_orig = out.clone();
+
+        // Flip a higher coefficient in out.e[1] (block 1) without touching out.e[0].
+        let mut r = out.e[1][0][0];
+        r.coeffs_mut()[1] = r.coeffs()[1] + <R as PolyRing>::BaseRing::ONE;
+        out.e[1][0][0] = r;
+
+        #[cfg(feature = "we_gate")]
+        {
+            let mut ts2 = PoseidonTranscript::empty::<PC>();
+            assert!(out.verify(&mut ts2, 2).is_err());
+        }
+        #[cfg(not(feature = "we_gate"))]
+        {
+            let mut ts1 = PoseidonTranscript::empty::<PC>();
+            out_orig.verify(&mut ts1, 2).unwrap();
+            let c1 = ts1.get_challenge();
+
+            let mut ts2 = PoseidonTranscript::empty::<PC>();
+            out.verify(&mut ts2, 2).unwrap();
+            let c2 = ts2.get_challenge();
+
+            assert_ne!(c1, c2, "binding should change downstream challenge");
+        }
     }
 }
