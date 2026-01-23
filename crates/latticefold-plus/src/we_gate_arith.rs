@@ -12,8 +12,10 @@ use crate::we_statement::WeParams;
 
 // Reuse symphony’s sparse dR1CS primitives and Poseidon arithmetizer.
 use symphony::dpp_poseidon::{
-    merge_sparse_dr1cs_share_one_with_glue, poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes,
-    Constraint, PoseidonByteWiring, PoseidonDr1csWiring, SparseDr1csInstance,
+    merge_sparse_dr1cs_share_one, merge_sparse_dr1cs_share_one_with_glue,
+    merge_sparse_dr1cs_share_one_with_glue_relaxed,
+    poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes, Constraint, PoseidonByteWiring,
+    PoseidonDr1csWiring, SparseDr1csInstance,
 };
 use symphony::dpp_sumcheck::Dr1csBuilder;
 use symphony::dpp_sumcheck::{sumcheck_verify_degree3, RingVars};
@@ -172,6 +174,413 @@ pub struct WeDr1csOutput<F: PrimeField> {
     pub assignment: Vec<F>,
     /// Number of public variables `l` (prefix of the assignment vector) intended as `x`.
     pub public_len: usize,
+}
+
+/// Shape-only WE gate output (arm-time artifact): fixed instance + public prefix length.
+#[derive(Clone, Debug)]
+pub struct WeDr1csShape<F: PrimeField> {
+    pub inst: SparseDr1csInstance<F>,
+    pub public_len: usize,
+}
+
+#[cfg(feature = "we_gate")]
+fn poseidon_trace_schedule_for_plus<R>(
+    public_inputs_len: usize,
+    params: &WeParams,
+    n_lin_proofs: usize,
+    mlen_mats: usize,
+) -> Result<PoseidonTranscriptTrace<BF<R>>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + Field,
+{
+    // Construct a dummy transcript trace that matches the *exact* op schedule expected by
+    // `build_we_dr1cs_for_plus_proof`'s offsets checker. Values are all zero; only lengths/order matter.
+    use crate::recording_transcript::PoseidonTraceOp as Op;
+
+    let d = R::dimension();
+
+    let mut ops: Vec<Op<BF<R>>> = Vec::new();
+    let mut squeezed_field: Vec<BF<R>> = Vec::new();
+    let mut squeezed_bytes: Vec<u8> = Vec::new();
+
+    fn push_absorb<BF: PrimeField>(ops: &mut Vec<Op<BF>>, len: usize) {
+        ops.push(Op::Absorb(vec![BF::ZERO; len]));
+    }
+    fn push_squeeze_field<BF: PrimeField>(
+        ops: &mut Vec<Op<BF>>,
+        squeezed_field: &mut Vec<BF>,
+        len: usize,
+    ) {
+        ops.push(Op::SqueezeField(vec![BF::ZERO; len]));
+        squeezed_field.extend(std::iter::repeat(BF::ZERO).take(len));
+    }
+    fn push_get_challenge<BF: PrimeField>(
+        ops: &mut Vec<Op<BF>>,
+        squeezed_field: &mut Vec<BF>,
+    ) {
+        // TracePoseidonTranscript::get_challenge: SqueezeField(len=1) then Absorb(len=1).
+        push_squeeze_field::<BF>(ops, squeezed_field, 1);
+        push_absorb::<BF>(ops, 1);
+    }
+    fn push_squeeze_bytes<BF: PrimeField>(
+        ops: &mut Vec<Op<BF>>,
+        squeezed_bytes: &mut Vec<u8>,
+        n: usize,
+    ) {
+        ops.push(Op::SqueezeBytes { n, out: vec![0u8; n] });
+        squeezed_bytes.extend(std::iter::repeat(0u8).take(n));
+    }
+
+    // Public inputs absorbed as base-field scalars (len=1).
+    for _ in 0..public_inputs_len {
+        push_absorb::<BF<R>>(&mut ops, 1);
+    }
+
+    // Π_lin proofs (ComR1CSProof::verify schedule).
+    // NOTE: For arm-time schedule purposes, the Π_lin proof content is irrelevant; only the
+    // number of proofs and their per-proof `nvars` matter. In LF+ this is fixed by params.
+    let nvars_lin = params.nvars_setchk as usize;
+    for _ in 0..n_lin_proofs {
+        let nvars = nvars_lin;
+        // r = transcript.get_challenges(nvars)
+        for _ in 0..nvars {
+            push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field);
+        }
+        // absorb (nvars, degree=3) as scalars
+        push_absorb::<BF<R>>(&mut ops, 1);
+        push_absorb::<BF<R>>(&mut ops, 1);
+        // rounds: 4 ring evals + challenge + explicit absorb
+        for _ in 0..nvars {
+            for _ in 0..4 {
+                push_absorb::<BF<R>>(&mut ops, d);
+            }
+            push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field);
+            push_absorb::<BF<R>>(&mut ops, 1);
+        }
+        // absorb (v,va,vb,vc) (ring, len=d each)
+        for _ in 0..4 {
+            push_absorb::<BF<R>>(&mut ops, d);
+        }
+    }
+
+    // --------------------------------------------------------------------
+    // CmProof::verify transcript schedule (Dcom prefix + CM proper).
+    // --------------------------------------------------------------------
+    // Current WE-gate binding assumes L=1 (single folded instance) for the exposed-prefix bind.
+    if n_lin_proofs != 1 {
+        return Err(
+            "poseidon_trace_schedule_for_plus: currently requires n_lin_proofs == 1 (prefix binding assumes L=1)"
+                .to_string(),
+        );
+    }
+    let l_instances = 1usize;
+    let kappa = params.kappa as usize;
+    let k_rg = params.k as usize;
+    let out_nvars = nvars_lin;
+    let out_e0_len = k_rg;
+    let out_b_len = 1usize;
+    let out_ej_len = d;
+    let dcom_evals_len = 1usize;
+    let dcom_eval_vec_len = 1 + mlen_mats;
+
+    // Dcom::verify: absorb witness commitments (cm_f, C_Mf, cm_mtau), each ring elem absorbed len=d.
+    // In the PlusProof shape we always have one folded instance, with κ ring elements per commitment.
+    for _ in 0..l_instances {
+        for _ in 0..kappa {
+            push_absorb::<BF<R>>(&mut ops, d); // cm_f[j]
+        }
+        for _ in 0..kappa {
+            push_absorb::<BF<R>>(&mut ops, d); // C_Mf[j]
+        }
+        for _ in 0..kappa {
+            push_absorb::<BF<R>>(&mut ops, d); // cm_mtau[j]
+        }
+    }
+
+    // Out::verify coins: per claim sample c (nvars), beta, alpha.
+    let nclaims = out_e0_len + out_b_len;
+    for _ in 0..nclaims {
+        for _ in 0..out_nvars {
+            push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field);
+        }
+        push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field); // beta
+        push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field); // alpha
+    }
+    if out_e0_len > 1 {
+        push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field); // rc
+    }
+    // MLSumcheck::verify_as_subprotocol header (nvars, degree=3).
+    push_absorb::<BF<R>>(&mut ops, 1);
+    push_absorb::<BF<R>>(&mut ops, 1);
+    for _ in 0..out_nvars {
+        for _ in 0..4 {
+            push_absorb::<BF<R>>(&mut ops, d);
+        }
+        push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field);
+        push_absorb::<BF<R>>(&mut ops, 1);
+    }
+    // absorb_evaluations_digest(out.e, out.b): 2 scalar absorbs per ring element.
+    //
+    // We must bind *all* `out.e` blocks (including those corresponding to external matrices,
+    // i.e. `mlen_mats > 0`) before sampling the CM short challenges, since downstream CM verifier
+    // math uses all blocks in linear combinations.
+    let e_blocks = 1usize + mlen_mats;
+    for _ in 0..e_blocks {
+        for _ in 0..out_e0_len {
+            for _ in 0..out_ej_len {
+                push_absorb::<BF<R>>(&mut ops, 1);
+                push_absorb::<BF<R>>(&mut ops, 1);
+            }
+        }
+    }
+    for _ in 0..out_b_len {
+        push_absorb::<BF<R>>(&mut ops, 1);
+        push_absorb::<BF<R>>(&mut ops, 1);
+    }
+    // rgchk::absorb_evaluations(dcom.evals): absorb a (as const-coeff rings, len=d) and c (ring, len=d).
+    for _ in 0..dcom_evals_len {
+        for _ in 0..dcom_eval_vec_len {
+            push_absorb::<BF<R>>(&mut ops, d);
+        }
+        for _ in 0..dcom_eval_vec_len {
+            push_absorb::<BF<R>>(&mut ops, d);
+        }
+    }
+    // CM short challenges: s(3) + s_prime(k*d) => need_short squeezes of n=d bytes.
+    let need_short = 3 + (params.k as usize) * d;
+    for _ in 0..need_short {
+        push_squeeze_bytes::<BF<R>>(&mut ops, &mut squeezed_bytes, d);
+    }
+    // absorb_comh: L × κ ring elements.
+    for _ in 0..(l_instances * kappa) {
+        push_absorb::<BF<R>>(&mut ops, d);
+    }
+    // c0/c1 = get_challenges(log_kappa) twice.
+    let log_kappa = ark_std::log2((params.kappa as usize).next_power_of_two()) as usize;
+    for _ in 0..(2 * log_kappa) {
+        push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field);
+    }
+    // Two CM sumchecks (degree=2) + eval table absorbs.
+    let nvars_cm = params.nvars_cm as usize;
+    for which_sc in 0..2 {
+        push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field); // rc
+        push_absorb::<BF<R>>(&mut ops, 1); // nvars
+        push_absorb::<BF<R>>(&mut ops, 1); // degree=2
+        for _ in 0..nvars_cm {
+            for _ in 0..3 {
+                push_absorb::<BF<R>>(&mut ops, d);
+            }
+            push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field);
+            push_absorb::<BF<R>>(&mut ops, 1);
+        }
+        // CM eval tables: L instances, with (1+mlen_mats) rows each, each row has 4 ring elems.
+        let _ = which_sc;
+        for _ in 0..l_instances {
+            for _ in 0..(1 + mlen_mats) {
+                for _ in 0..4 {
+                    push_absorb::<BF<R>>(&mut ops, d);
+                }
+            }
+        }
+    }
+
+    Ok(PoseidonTranscriptTrace {
+        ops,
+        absorbed: Vec::new(),
+        squeezed_field,
+        squeezed_bytes,
+    })
+}
+
+#[cfg(feature = "we_gate")]
+fn dummy_plus_proof_shape<R>(
+    params: &WeParams,
+    mlen_mats: usize,
+    _B: u128,
+    n_lin_proofs: usize,
+) -> Result<crate::plus::PlusProof<R, crate::r1cs::ComR1CSProof<R>>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + Field,
+{
+    use latticefold::utils::sumcheck::prover::ProverMsg;
+    use latticefold::utils::sumcheck::Proof;
+
+    // NOTE: Current WE-gate binding assumes L=1 (single folded instance) for the exposed-prefix bind.
+    if n_lin_proofs != 1 {
+        return Err("dummy_plus_proof_shape: currently requires n_lin_proofs == 1 (prefix binding assumes L=1)".to_string());
+    }
+
+    let nvars_lin = params.nvars_setchk as usize;
+    let nvars_cm = params.nvars_cm as usize;
+    let kappa = params.kappa as usize;
+    let d = R::dimension();
+    let k_rg = params.k as usize;
+
+    // Helper: degree-3 sumcheck proof with nvars rounds, each msg has 4 evals.
+    let sc_deg3 = || -> Proof<R> {
+        let msgs = (0..nvars_lin)
+            .map(|_| ProverMsg::new(vec![R::ZERO, R::ZERO, R::ZERO, R::ZERO]))
+            .collect::<Vec<_>>();
+        Proof::new(msgs)
+    };
+    // Helper: degree-2 sumcheck proof with nvars rounds, each msg has 3 evals.
+    let sc_deg2 = || -> Proof<R> {
+        let msgs = (0..nvars_cm)
+            .map(|_| ProverMsg::new(vec![R::ZERO, R::ZERO, R::ZERO]))
+            .collect::<Vec<_>>();
+        Proof::new(msgs)
+    };
+
+    // ComR1CSProof (Π_lin) skeleton.
+    let lproof = (0..n_lin_proofs)
+        .map(|_| crate::r1cs::ComR1CSProof::<R> {
+            sumcheck_proof: sc_deg3(),
+            nvars: nvars_lin,
+            r: vec![R::ZERO; nvars_lin],
+            v: R::ZERO,
+            va: R::ZERO,
+            vb: R::ZERO,
+            vc: R::ZERO,
+        })
+        .collect::<Vec<_>>();
+
+    // SetChk out: shapes
+    let out_e: Vec<Vec<Vec<R>>> = (0..(1 + mlen_mats))
+        .map(|_| {
+            // For each group, we have L*k ring vectors of length d.
+            (0..k_rg)
+                .map(|_| vec![R::ZERO; d])
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let out_b: Vec<R> = vec![R::ZERO; 1];
+
+    let out_sc = crate::setchk::Out::<R> {
+        nvars: nvars_lin,
+        r: vec![R::BaseRing::ZERO; nvars_lin],
+        sumcheck_proof: sc_deg3(),
+        e: out_e,
+        b: out_b,
+    };
+
+    // Dcom evals:
+    // - `v`: evaluation over `M_f`, represented as a base-ring vector of ring dimension `d`.
+    // - `a`: evaluation over `tau`, represented over `1+mlen_mats` chunks.
+    // - `b/c`: evaluations over `m_tau / f`, as ring vectors of length `1+mlen_mats`.
+    let eval_len = 1 + mlen_mats;
+    let dcom_evals = crate::rgchk::DcomEvals::<R> {
+        v: vec![R::BaseRing::ZERO; d],
+        a: vec![R::BaseRing::ZERO; eval_len],
+        b: vec![R::ZERO; eval_len],
+        c: vec![R::ZERO; eval_len],
+    };
+
+    let fcoms = crate::rgchk::FComs::<R> {
+        cm_f: vec![R::ZERO; kappa],
+        C_Mf: vec![R::ZERO; kappa],
+        cm_mtau: vec![R::ZERO; kappa],
+    };
+
+    let dcom = crate::rgchk::Dcom::<R> {
+        evals: vec![dcom_evals],
+        fcoms: vec![fcoms],
+        out: out_sc,
+        dparams: crate::rgchk::DecompParameters { b: params.decomp_b as u128, k: k_rg, l: params.l as usize },
+    };
+
+    // CmProof eval tables: per instance, rows length 1+Mlen.
+    let rows = (0..(1 + mlen_mats))
+        .map(|_| [R::ZERO, R::ZERO, R::ZERO, R::ZERO])
+        .collect::<Vec<_>>();
+    let ieval = crate::cm::InstanceEvals::new(rows);
+
+    let cmproof = crate::cm::CmProof::<R> {
+        dcom,
+        comh: vec![vec![R::ZERO; kappa]],
+        sumcheck_proofs: (sc_deg2(), sc_deg2()),
+        evals: (vec![ieval.clone()], vec![ieval]),
+    };
+
+    // DecompProof skeleton.
+    let vo_len = 1 + mlen_mats;
+    let v_pairs = vec![(R::ZERO, R::ZERO); vo_len];
+    let dproof = crate::decomp::DecompProof::<R> {
+        C: (vec![R::ZERO; kappa], vec![R::ZERO; kappa]),
+        v: (v_pairs.clone(), v_pairs.clone()),
+    };
+
+    let linb2x = crate::mlin::LinB2X::<R> {
+        cm_g: vec![R::ZERO; kappa],
+        ro: Vec::new(),
+        vo: v_pairs,
+    };
+
+    Ok(crate::plus::PlusProof::<R, crate::r1cs::ComR1CSProof<R>> {
+        linb2x,
+        lproof,
+        cmproof,
+        dproof,
+    })
+}
+
+/// Arm-time (shape-only) builder for the full LF+ Π_plus WE gate.
+///
+/// Returns a fixed dR1CS instance that depends only on statement/params and on the *shape*
+/// parameters (`public_inputs_len`, `mlen_mats`, `B`, and number of Π_lin proofs).
+#[cfg(feature = "we_gate")]
+pub fn build_we_dr1cs_for_plus_proof_shape<R>(
+    poseidon_cfg: &PoseidonConfig<BF<R>>,
+    params: &WeParams,
+    public_inputs_len: usize,
+    n_lin_proofs: usize,
+    mlen_mats: usize,
+    B: u128,
+) -> Result<WeDr1csShape<BF<R>>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + Field,
+{
+    let proof = dummy_plus_proof_shape::<R>(params, mlen_mats, B, n_lin_proofs)?;
+    let trace = poseidon_trace_schedule_for_plus::<R>(public_inputs_len, params, n_lin_proofs, mlen_mats)?;
+    let public_inputs = vec![BF::<R>::ZERO; public_inputs_len];
+    let out = build_we_dr1cs_for_plus_proof_with_options::<R>(
+        poseidon_cfg,
+        &trace,
+        params,
+        &public_inputs,
+        &proof,
+        mlen_mats,
+        B,
+        false, // shape-only: allow dummy witness values across glued vars
+    )?;
+    Ok(WeDr1csShape { inst: out.inst, public_len: out.public_len })
+}
+
+/// Witness-time builder for the full LF+ Π_plus WE gate.
+///
+/// This computes a satisfying assignment for the instance produced by
+/// `build_we_dr1cs_for_plus_proof_shape(...)` (same params/shapes), using a real transcript trace
+/// and proof.
+#[cfg(feature = "we_gate")]
+pub fn build_we_dr1cs_for_plus_proof_witness<R>(
+    poseidon_cfg: &PoseidonConfig<BF<R>>,
+    trace: &PoseidonTranscriptTrace<BF<R>>,
+    params: &WeParams,
+    public_inputs: &[BF<R>],
+    proof: &crate::plus::PlusProof<R, crate::r1cs::ComR1CSProof<R>>,
+    mlen_mats: usize,
+    B: u128,
+) -> Result<Vec<BF<R>>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + Field,
+{
+    Ok(
+        build_we_dr1cs_for_plus_proof::<R>(poseidon_cfg, trace, params, public_inputs, proof, mlen_mats, B)?
+            .assignment,
+    )
 }
 
 fn lf_ops_to_symphony_ops<F: PrimeField>(ops: &[LfPoseidonTraceOp<F>]) -> Vec<symphony::transcript::PoseidonTraceOp<F>> {
@@ -2073,13 +2482,30 @@ where
     R::BaseRing: Field,
 {
     // ev(x, beta) = Σ_{j=0..d-1} x_j * beta^j
+    //
+    // IMPORTANT (arm-before-proof correctness):
+    // Do *not* bake witness-time values of `beta^j` into the instance by using them as constant
+    // coefficients in a linear combination (e.g. `lc.push((b.assignment[beta_pow[j]], x_j))`).
+    //
+    // Instead, evaluate via Horner with `beta` as a variable:
+    //   (((x_{d-1})*beta + x_{d-2})*beta + ... + x_0).
+    //
+    // This keeps the constraint system statement-only at arm-time; only the assignment changes
+    // with transcript challenges.
     let d = x.d();
-    let beta_pows = scalar_pow_table::<BF<R>>(b, beta, d.saturating_sub(1));
-    let mut lc: Vec<(BF<R>, usize)> = Vec::with_capacity(d);
-    for j in 0..d {
-        lc.push((b.assignment[beta_pows[j]], x.coeffs[j]));
+    if d == 0 {
+        return b.one(); // unreachable for our rings, but keep total function.
     }
-    lc_to_var::<BF<R>>(b, lc)
+    if d == 1 {
+        return x.coeffs[0];
+    }
+
+    let mut acc = x.coeffs[d - 1];
+    for j in (0..(d - 1)).rev() {
+        let t = scalar_mul::<BF<R>>(b, acc, beta);
+        acc = scalar_add::<BF<R>>(b, t, x.coeffs[j]);
+    }
+    acc
 }
 
 fn absorb_field_elem_as_ring<R>(
@@ -2749,7 +3175,8 @@ where
     let base_constraints = parts.iter().map(|(i, _)| i.constraints.len()).sum::<usize>();
 
     let t_merge = std::time::Instant::now();
-    let (inst, assignment) = merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| e.to_string())?;
+    let (inst, assignment) =
+        merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| e.to_string())?;
     let _ = (t_pose, t_params, t_coin, t_cm, t_glue, base_constraints, t_merge);
 
     let public_len = 1 + 10 + public_inputs.len();
@@ -2984,6 +3411,33 @@ where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + Field,
 {
+    build_we_dr1cs_for_plus_proof_with_options::<R>(
+        poseidon_cfg,
+        trace,
+        params,
+        public_inputs,
+        proof,
+        mlen_mats,
+        B,
+        true, // witness-time: require glue-consistent assignments
+    )
+}
+
+#[cfg(feature = "we_gate")]
+fn build_we_dr1cs_for_plus_proof_with_options<R>(
+    poseidon_cfg: &PoseidonConfig<BF<R>>,
+    trace: &PoseidonTranscriptTrace<BF<R>>,
+    params: &WeParams,
+    public_inputs: &[BF<R>],
+    proof: &crate::plus::PlusProof<R, crate::r1cs::ComR1CSProof<R>>,
+    mlen_mats: usize,
+    B: u128,
+    check_glue_assignment_consistency: bool,
+) -> Result<WeDr1csOutput<BF<R>>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + Field,
+{
     let absorb_breakdown_on = std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1");
     if absorb_breakdown_on {
         absorb_reset();
@@ -3153,12 +3607,14 @@ where
             expect_get_challenge(&mut op_idx, &mut absorb_ops, &mut squeezed_field_elems)?;
             expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
         }
-        // absorb_evaluations_digest(out.e[0], out.b):
+        // absorb_evaluations_digest(out.e, out.b):
         // for each ring element r, absorb_field_element(ev(r,beta)) and absorb_field_element(ev(r,beta^2)).
-        for ej in &out.e[0] {
-            for _ in 0..ej.len() {
-                expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
-                expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+        for blk in &out.e {
+            for ej in blk {
+                for _ in 0..ej.len() {
+                    expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+                    expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+                }
             }
         }
         for _ in 0..out.b.len() {
@@ -3880,8 +4336,49 @@ where
         (cm_inst, cm_asg),         // 6
         (decomp_inst, decomp_asg), // 7
     ];
-    let (inst, assignment) =
-        merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| e.to_string())?;
+    // IMPORTANT (arm-before-proof correctness):
+    // Variable *unification* during merge can (in practice) lead to witness/shape mismatches
+    // when different construction-time dummy assignments are used (even though the glue graph
+    // is the same). To keep the arm-time instance identical to the witness-time instance,
+    // we use a deterministic "merge + explicit glue equality constraints" strategy here.
+    //
+    // This is logically equivalent to unification (adds equalities rather than identifying vars),
+    // and avoids any dependence on which variable becomes the UF representative.
+    fn merge_with_glue_constraints<F: PrimeField>(
+        parts: &[(SparseDr1csInstance<F>, Vec<F>)],
+        glue: &[(usize, usize, usize, usize)],
+    ) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {
+        let (mut inst, asg) = merge_sparse_dr1cs_share_one(parts)?;
+        // Compute per-part offsets in merged space (excluding var0).
+        let mut offsets: Vec<usize> = Vec::with_capacity(parts.len());
+        let mut cur = 0usize;
+        for (_inst, a) in parts {
+            offsets.push(cur);
+            cur += a.len().saturating_sub(1);
+        }
+        let remap = |part: usize, local: usize, offsets: &[usize]| -> usize {
+            if local == 0 { 0 } else { local + offsets[part] }
+        };
+        for &(pa, xa, pb, xb) in glue {
+            let ga = remap(pa, xa, &offsets);
+            let gb = remap(pb, xb, &offsets);
+            // (ga - gb) * 1 = 0
+            inst.constraints.push(Constraint {
+                a: vec![(F::ONE, ga), (-F::ONE, gb)],
+                b: vec![(F::ONE, 0)],
+                c: vec![(F::ZERO, 0)],
+            });
+        }
+        inst.nvars = asg.len();
+        Ok((inst, asg))
+    }
+    let (inst, assignment) = if check_glue_assignment_consistency {
+        // witness-time: strict merge is fine (and smaller), but keep consistent with shape-time
+        // by using explicit glue constraints here as well.
+        merge_with_glue_constraints(&parts, &glue)?
+    } else {
+        merge_with_glue_constraints(&parts, &glue)?
+    };
     if std::env::var("LFP_WE_GATE_OPMIX").is_ok() {
         eprintln!(
             "LF+ WE gate merged: nvars={} constraints={} (glue constraints={})",
@@ -3903,6 +4400,35 @@ where
 #[cfg(all(test, feature = "we_gate"))]
 #[allow(non_local_definitions)]
 mod tests {
+    #[cfg(feature = "parallel")]
+    fn init_rayon_stack() {
+        // Same mitigation as the SP1 oneproof harness:
+        // large-stack computations can end up on Rayon worker threads (smaller default stacks),
+        // causing intermittent stack overflows. Configure the *global* Rayon pool once.
+        //
+        // Override with `RAYON_STACK_SIZE_BYTES` (bytes). Default: 64 MiB.
+        let stack_bytes: usize = std::env::var("RAYON_STACK_SIZE_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(64 * 1024 * 1024);
+
+        let mut builder = rayon::ThreadPoolBuilder::new().stack_size(stack_bytes);
+
+        // Respect RAYON_NUM_THREADS if provided.
+        if let Some(n) = std::env::var("RAYON_NUM_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            builder = builder.num_threads(n);
+        }
+
+        // If Rayon was already initialized elsewhere, ignore and proceed.
+        let _ = builder.build_global();
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    fn init_rayon_stack() {}
+
     use super::*;
     use cyclotomic_rings::rings::GoldilocksPoseidonConfig as PC;
     use latticefold::arith::r1cs::R1CS;
@@ -4848,6 +5374,7 @@ mod tests {
 
     #[test]
     fn test_we_plus_prover_sparse_base_small_mock_sat() {
+        init_rayon_stack();
         // A small end-to-end test for the **production** SP1-style path:
         // - ComR1CSBase (A/B/C over base ring + const-coeff witness)
         // - PlusProverSparseBase::prove_sparse_base
@@ -5024,7 +5551,21 @@ mod tests {
             mlen: m0.len() as u64,
         };
 
-        let out = build_we_dr1cs_for_plus_proof::<RR>(
+        // Arm-before-proof split:
+        // 1) arm/shape: instance depends only on params + shapes
+        let shape = build_we_dr1cs_for_plus_proof_shape::<RR>(
+            &poseidon_cfg,
+            &params,
+            public_inputs.len(),
+            proof.lproof.len(),
+            m0.len(),
+            b_decomp,
+        )
+        .expect("build_we_dr1cs_for_plus_proof_shape");
+
+        // 2) witness: build the witness-time instance+assignment (same code path as production),
+        // and sanity-check it satisfies *itself* before checking against the armed shape.
+        let out_wit = build_we_dr1cs_for_plus_proof_with_options::<RR>(
             &poseidon_cfg,
             &trace,
             &params,
@@ -5032,9 +5573,52 @@ mod tests {
             &proof,
             m0.len(),
             b_decomp,
+            true, // witness-time: require glue-consistent assignments
         )
-        .expect("build_we_dr1cs_for_plus_proof");
-        out.inst.check(&out.assignment).expect("we gate dr1cs satisfied");
+        .expect("build_we_dr1cs_for_plus_proof_with_options (witness)");
+        out_wit
+            .inst
+            .check(&out_wit.assignment)
+            .expect("witness-time instance satisfied");
+
+        // Helpful debug if shape mismatches witness instance structure.
+        if shape.inst.nvars != out_wit.inst.nvars || shape.inst.constraints.len() != out_wit.inst.constraints.len() {
+            eprintln!(
+                "[test_we_plus_prover_sparse_base_small_mock_sat] shape vs witness mismatch: shape(nvars={}, constraints={}) witness(nvars={}, constraints={})",
+                shape.inst.nvars,
+                shape.inst.constraints.len(),
+                out_wit.inst.nvars,
+                out_wit.inst.constraints.len()
+            );
+        }
+        shape
+            .inst
+            .check(&out_wit.assignment)
+            .unwrap_or_else(|e| {
+                // Best-effort debug for the first failing constraint.
+                if let Some(idx_str) = e.strip_prefix("constraint ").and_then(|s| s.split_whitespace().next()) {
+                    if let Ok(idx) = idx_str.parse::<usize>() {
+                        if let Some(row) = shape.inst.constraints.get(idx) {
+                            fn eval_lc<F: ark_ff::PrimeField>(lc: &[(F, usize)], asg: &[F]) -> F {
+                                lc.iter()
+                                    .fold(F::ZERO, |acc, (c, i)| acc + (*c * asg[*i]))
+                            }
+                            let a = eval_lc::<BF<RR>>(&row.a, &out_wit.assignment);
+                            let b = eval_lc::<BF<RR>>(&row.b, &out_wit.assignment);
+                            let c = eval_lc::<BF<RR>>(&row.c, &out_wit.assignment);
+                            eprintln!(
+                                "[we_gate debug] failed constraint idx={} |a|={} |b|={} |c|={}  a*b==c? {}",
+                                idx,
+                                row.a.len(),
+                                row.b.len(),
+                                row.c.len(),
+                                a * b == c
+                            );
+                        }
+                    }
+                }
+                panic!("we gate dr1cs satisfied: {:?}", e)
+            });
     }
 }
 

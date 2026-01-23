@@ -1223,13 +1223,16 @@ impl<R: OverField + PolyRing> In<R> {
         let t_absorb = std::time::Instant::now();
         // Prover to Verifier messages (digest-absorb).
         //
-        // Instead of absorbing the full ring coefficient vectors for `e0` and `b` (which costs
+        // Instead of absorbing the full ring coefficient vectors for `e` and `b` (which costs
         // `R::dimension()` base-field absorbs per ring element), we absorb a compact digest:
         // for each ring element `r`, absorb `ev(r, beta)` and `ev(r, beta^2)` as base-ring scalars.
         //
-        // This preserves soundness binding under the monomiality check except with negligible
-        // probability over the sampled `beta`, while dramatically reducing Poseidon IO in the WE gate.
-        absorb_evaluations_digest(&e[0], &b, &betas, transcript);
+        // CRITICAL (soundness / FS binding):
+        // We must bind *all* `e` blocks to the transcript before downstream challenges are sampled
+        // (e.g. `CmProof::verify_with_mlen` samples `s/s_prime` after `Dcom::verify` and then uses
+        // all `out.e` blocks in linear combinations). If we only bind `e[0]`, a malicious prover
+        // can potentially adjust `e[1..]` without affecting transcript-derived challenges.
+        absorb_evaluations_digest(&e, &b, &betas, transcript);
         if profile {
             println!("[LF+ setchk] step3(absorb): {:?}", t_absorb.elapsed());
         }
@@ -1440,7 +1443,7 @@ impl<R: OverField> Out<R> {
 
         // Prover to Verifier messages
         let betas: Vec<R::BaseRing> = cba.iter().map(|(_c, beta, _a)| *beta).collect();
-        absorb_evaluations_digest(&self.e[0], &self.b, &betas, transcript);
+        absorb_evaluations_digest(&self.e, &self.b, &betas, transcript);
 
         use ark_std::One;
         let mut ver = R::zero();
@@ -1500,43 +1503,57 @@ impl<R: OverField> Out<R> {
 
 /// Digest-absorb the prover messages for `Out::verify`.
 ///
-/// Instead of absorbing every coefficient of every ring element in `e0`/`b`, absorb the scalar
+/// Instead of absorbing every coefficient of every ring element in `e`/`b`, absorb the scalar
 /// evaluations at the verifier's sampled points `beta` and `beta^2`.
 ///
 /// The betas must be provided in the same order as the verifier's `cba` sampling:
-/// first all `e0` claims (one beta per `e0[i]`), then all `b` claims (one beta per `b[i]`).
+/// first all `e[0]` claims (one beta per `e[0][i]`), then all `b` claims (one beta per `b[i]`).
 fn absorb_evaluations_digest<R: OverField + PolyRing>(
-    e0: &[Vec<R>],
+    e: &[Vec<Vec<R>>],
     b: &[R],
     betas: &[R::BaseRing],
     transcript: &mut impl Transcript<R>,
 ) where
     R::BaseRing: Ring,
 {
-    let nclaims = e0.len() + b.len();
+    let e0_len = e.get(0).map(|v| v.len()).unwrap_or(0);
+    let nclaims = e0_len + b.len();
     assert_eq!(
         betas.len(),
         nclaims,
         "absorb_evaluations_digest: betas length mismatch"
     );
 
-    // e0 claims: absorb ev(e0[i][lane], beta) and ev(e0[i][lane], beta^2) for each lane.
-    for (i, block) in e0.iter().enumerate() {
+    // Sanity: all `e` blocks must have the same outer length.
+    for (blk_idx, blk) in e.iter().enumerate() {
+        assert_eq!(
+            blk.len(),
+            e0_len,
+            "absorb_evaluations_digest: e[{blk_idx}] length mismatch"
+        );
+    }
+
+    // e claims: for each claim index `i` (beta = betas[i]), absorb evaluations for *all* blocks
+    // e[blk][i][lane] at beta and beta^2.
+    for i in 0..e0_len {
         let beta = betas[i];
         let beta2 = beta * beta;
         let beta_pows1 = beta_pows::<R>(beta);
         let beta_pows2 = beta_pows::<R>(beta2);
-        for r in block {
-            let ev1 = ev_fast::<R>(r, &beta_pows1);
-            let ev2 = ev_fast::<R>(r, &beta_pows2);
-            transcript.absorb_field_element(&ev1);
-            transcript.absorb_field_element(&ev2);
+        for blk in e {
+            let lane = &blk[i];
+            for r in lane {
+                let ev1 = ev_fast::<R>(r, &beta_pows1);
+                let ev2 = ev_fast::<R>(r, &beta_pows2);
+                transcript.absorb_field_element(&ev1);
+                transcript.absorb_field_element(&ev2);
+            }
         }
     }
 
     // b claims: absorb ev(b[i], beta) and ev(b[i], beta^2).
     for (i, bi) in b.iter().enumerate() {
-        let beta = betas[e0.len() + i];
+        let beta = betas[e0_len + i];
         let beta2 = beta * beta;
         let beta_pows1 = beta_pows::<R>(beta);
         let beta_pows2 = beta_pows::<R>(beta2);

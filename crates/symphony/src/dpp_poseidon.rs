@@ -156,6 +156,27 @@ pub fn merge_sparse_dr1cs_share_one_with_glue<F: PrimeField>(
     parts: &[(SparseDr1csInstance<F>, Vec<F>)],
     glue: &[(usize, usize, usize, usize)],
 ) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {
+    merge_sparse_dr1cs_share_one_with_glue_impl(parts, glue, true)
+}
+
+/// Same as `merge_sparse_dr1cs_share_one_with_glue`, but **does not** require glued variables
+/// to have identical witness values in the provided assignments.
+///
+/// This is useful for *shape-only* / arm-time builds that use dummy witness values: the merged
+/// instance (constraints + variable identification) is what matters, not the particular dummy
+/// assignment used during construction.
+pub fn merge_sparse_dr1cs_share_one_with_glue_relaxed<F: PrimeField>(
+    parts: &[(SparseDr1csInstance<F>, Vec<F>)],
+    glue: &[(usize, usize, usize, usize)],
+) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {
+    merge_sparse_dr1cs_share_one_with_glue_impl(parts, glue, false)
+}
+
+fn merge_sparse_dr1cs_share_one_with_glue_impl<F: PrimeField>(
+    parts: &[(SparseDr1csInstance<F>, Vec<F>)],
+    glue: &[(usize, usize, usize, usize)],
+    check_assignment_consistency: bool,
+) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {
     if parts.is_empty() {
         return Err("merge_sparse_dr1cs_share_one_with_glue: empty parts".to_string());
     }
@@ -290,8 +311,10 @@ pub fn merge_sparse_dr1cs_share_one_with_glue<F: PrimeField>(
     for i in 0..old_nvars {
         if let Some(&rep) = rep_of_global.get(&i) {
             if i != rep {
-                // Consistency check: glued assignments must match exactly.
-                if merged_assignment[i] != merged_assignment[rep] {
+                // Consistency check: glued assignments must match exactly (witness-time safety).
+                // For shape-only builds, callers may intentionally use arbitrary dummy values,
+                // so we optionally skip this check.
+                if check_assignment_consistency && merged_assignment[i] != merged_assignment[rep] {
                     return Err(format!(
                         "merge_sparse_dr1cs_share_one_with_glue: inconsistent glued assignment ({} != {})",
                         i, rep
