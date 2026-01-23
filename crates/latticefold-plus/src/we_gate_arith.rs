@@ -1687,14 +1687,13 @@ where
         kappa,
         out_flat_vals.len(),
     );
-    // Enforce const-coeff inputs (coeffs[1..] == 0).
-    for rv in &out_flat_vars {
-        for lane in 1..rv.d() {
-            b.enforce_var_eq_const(rv.coeffs[lane], BF::<R>::ZERO);
-        }
-    }
+    // IMPORTANT:
+    // `setchk::absorb_evaluations_digest` commits to the full `flat` vector; it only uses
+    // `commit_const_coeff_fast` as an optimization when the witness is const-coeff.
+    //
+    // For the WE gate, we must support the general case without assuming const-coeff shape here.
     let out_e_agg = out_e_agg_scheme
-        .commit_const_coeff_fast(&out_flat_vals)
+        .commit(&out_flat_vals)
         .map_err(|e| format!("WeGateDr1csBuilder: out_e_agg commit failed: {e:?}"))?
         .as_ref()
         .to_vec();
@@ -1713,10 +1712,14 @@ where
         absorb_dcom_out_e(rv.d());
     }
 
-    // Ajtai opening constraints: A_agg · out_flat = out_e_agg (linear over BF).
-    // Const-coeff messages: only lane 0 is variable; use basis[j] = R::ONE.
+    // Ajtai opening constraints: enforce `commit(flat) == out_e_agg`.
+    //
+    // Since the Ajtai matrix entries are *constants* (seeded), multiplication by `a_ij` is a
+    // fixed linear map on the coefficient vector of each `flat[j]` (negacyclic convolution).
+    // We therefore enforce the commitment relation using only linear constraints (no ring mul gadget).
     let n_out_agg = out_flat_vals.len();
     let d = R::dimension();
+    // Precompute Ajtai matrix columns `col[j] = commit(e_j)` once. Each `col[j][i]` is `a_ij`.
     let mut cols: Vec<Vec<R>> = Vec::with_capacity(n_out_agg);
     for j in 0..n_out_agg {
         let mut basis = vec![R::ZERO; n_out_agg];
@@ -1728,20 +1731,56 @@ where
             .to_vec();
         cols.push(col);
     }
-    for i in 0..kappa {
-        for lane_out in 0..d {
+    // Helper: compute `y = a * x` where `a` is a constant ring element and `x` is a ring var.
+    let mul_const_left = |b: &mut Dr1csBuilder<BF<R>>, a: &R, x: &RingVars| -> RingVars {
+        if x.d() != d || a.coeffs().len() != d {
+            panic!("mul_const_left: ring dimension mismatch");
+        }
+        let a_coeffs = a.coeffs();
+        let mut out: Vec<usize> = Vec::with_capacity(d);
+        for k_out in 0..d {
+            // y[k] = Σ_v (± a[u]) * x[v], where u = (k - v mod d), sign = + if k>=v else -.
+            let mut acc = BF::<R>::ZERO;
+            for v in 0..d {
+                let (u, sign) = if k_out >= v {
+                    (k_out - v, BF::<R>::ONE)
+                } else {
+                    (k_out + d - v, -BF::<R>::ONE)
+                };
+                let w = bf_from_base_ring::<R>(a_coeffs[u]) * sign;
+                if w == BF::<R>::ZERO {
+                    continue;
+                }
+                acc += w * b.assignment[x.coeffs[v]];
+            }
+            let yk = b.new_var(acc);
             let mut lc: Vec<(BF<R>, usize)> = Vec::new();
-            for j in 0..n_out_agg {
-                let coeff = cols[j][i].coeffs()[lane_out];
-                let bf = bf_from_base_ring::<R>(coeff);
-                if bf != BF::<R>::ZERO {
-                    lc.push((bf, out_flat_vars[j].coeffs[0]));
+            for v in 0..d {
+                let (u, sign) = if k_out >= v {
+                    (k_out - v, BF::<R>::ONE)
+                } else {
+                    (k_out + d - v, -BF::<R>::ONE)
+                };
+                let w = bf_from_base_ring::<R>(a_coeffs[u]) * sign;
+                if w != BF::<R>::ZERO {
+                    lc.push((w, x.coeffs[v]));
                 }
             }
-            let rhs_var = out_e_agg_vars[i].coeffs[lane_out];
-            lc.push((-BF::<R>::ONE, rhs_var));
+            lc.push((-BF::<R>::ONE, yk));
             b.enforce_lc_times_one_eq_const(lc);
+            out.push(yk);
         }
+        RingVars::new(out)
+    };
+    // Accumulate per-row commitment and equate to witness `out_e_agg_vars`.
+    for i in 0..kappa {
+        let mut acc = RingVars::new((0..d).map(|_| const_var(&mut b, BF::<R>::ZERO)).collect());
+        for j in 0..n_out_agg {
+            let aij = &cols[j][i];
+            let prod = mul_const_left(&mut b, aij, &out_flat_vars[j]);
+            acc = ring_add::<BF<R>>(&mut b, &acc, &prod);
+        }
+        ring_eq::<BF<R>>(&mut b, &acc, &out_e_agg_vars[i]);
     }
 
     // SetChk recombination: enforce ver == v_sc and digest-absorb out.e/out.b.
