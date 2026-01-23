@@ -13,7 +13,6 @@ use crate::we_statement::WeParams;
 // Reuse symphony’s sparse dR1CS primitives and Poseidon arithmetizer.
 use symphony::dpp_poseidon::{
     merge_sparse_dr1cs_share_one, merge_sparse_dr1cs_share_one_with_glue,
-    merge_sparse_dr1cs_share_one_with_glue_relaxed,
     poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes, Constraint, PoseidonByteWiring,
     PoseidonDr1csWiring, SparseDr1csInstance,
 };
@@ -1600,6 +1599,14 @@ where
     let mut ver_scalar = const_var(&mut b, BF::<R>::ZERO);
     b.enforce_var_eq_const(ver_scalar, BF::<R>::ZERO);
 
+    // CRITICAL (FS binding):
+    // Digest-absorb **all** `out.e` blocks using the betas sampled for `e[0]` claims.
+    //
+    // This matches `setchk.rs`'s `absorb_evaluations_digest(&e, &b, betas, transcript)` behavior:
+    // betas are sampled only for `e[0]` + `b`, but the transcript absorb must commit to every
+    // `e[blk][i][lane]` before later challenges (e.g. `s/s_prime`) are sampled.
+    //
+    // NOTE: The SetChk algebraic verification below still uses only `out.e[0]` (as before).
     for i in 0..out_sc.e[0].len() {
         let eq = eq_eval_vars::<BF<R>>(&mut b, &c_vars[i], &r_point_vars);
         let beta = beta_vars[i];
@@ -1610,17 +1617,24 @@ where
 
         let mut e_sum = const_var(&mut b, BF::<R>::ZERO);
         b.enforce_var_eq_const(e_sum, BF::<R>::ZERO);
-        for j in 0..out_sc.e[0][i].len() {
-            let ejv = &out_e_vars[0][i][j];
-            let ev1 = ring_eval_at_scalar::<R>(&mut b, ejv, beta);
-            let ev2 = ring_eval_at_scalar::<R>(&mut b, ejv, beta2);
-            absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat_prefix, ev1);
-            absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat_prefix, ev2);
-            absorb_dcom_out_e(2);
-            let ev1_sq = scalar_mul::<BF<R>>(&mut b, ev1, ev1);
-            let diff = scalar_sub::<BF<R>>(&mut b, ev1_sq, ev2);
-            let term = scalar_mul::<BF<R>>(&mut b, diff, alpha_pows[j]);
-            e_sum = scalar_add::<BF<R>>(&mut b, e_sum, term);
+        // Absorb all blocks e[blk][i][lane][j]
+        for blk in 0..out_e_vars.len() {
+            for lane in 0..out_e_vars[blk][i].len() {
+                let ejv = &out_e_vars[blk][i][lane];
+                let ev1 = ring_eval_at_scalar::<R>(&mut b, ejv, beta);
+                let ev2 = ring_eval_at_scalar::<R>(&mut b, ejv, beta2);
+                absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat_prefix, ev1);
+                absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat_prefix, ev2);
+                absorb_dcom_out_e(2);
+
+                // Only block 0 participates in the SetChk check.
+                if blk == 0 {
+                    let ev1_sq = scalar_mul::<BF<R>>(&mut b, ev1, ev1);
+                    let diff = scalar_sub::<BF<R>>(&mut b, ev1_sq, ev2);
+                    let term = scalar_mul::<BF<R>>(&mut b, diff, alpha_pows[lane]);
+                    e_sum = scalar_add::<BF<R>>(&mut b, e_sum, term);
+                }
+            }
         }
         let t = scalar_mul::<BF<R>>(&mut b, eq, e_sum);
         let t = scalar_mul::<BF<R>>(&mut b, t, rc_pows[i]);
