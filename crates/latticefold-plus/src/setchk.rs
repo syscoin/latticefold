@@ -16,13 +16,9 @@ use thiserror::Error;
 use std::sync::Arc;
 use std::time::Instant;
 use crate::utils::maybe_print_rss;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
-
-// Debug logging throttle for `absorb_evaluations_digest` const-coeff fast path.
-static SETCHK_OUT_E_AGG_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn is_const_coeff_ring<R: PolyRing>(x: &R) -> bool {
@@ -195,22 +191,6 @@ fn ev<R: PolyRing>(r: &R, x: R::BaseRing) -> R::BaseRing {
             },
         )
         .0
-}
-
-#[inline]
-fn is_const_coeff_flat<R: OverField + PolyRing>(flat: &[R]) -> bool
-where
-    R::BaseRing: Ring,
-{
-    for r in flat {
-        let coeffs = r.coeffs();
-        for lane_idx in 1..coeffs.len() {
-            if coeffs[lane_idx] != R::BaseRing::ZERO {
-                return false;
-            }
-        }
-    }
-    true
 }
 
 impl<R: OverField + PolyRing> In<R> {
@@ -1577,31 +1557,10 @@ fn absorb_evaluations_digest<R: OverField + PolyRing>(
     // Ajtai aggregate commitment to bind the entire vector with linear constraints in WE gate.
     let agg_scheme =
         AjtaiCommitmentScheme::<R>::seeded(b"setchk_out_e_agg", OUT_E_AGG_SEED, kappa, flat.len());
-    let is_cc = is_const_coeff_flat(&flat);
-    // Optional debug log: whether SP1/production hits the const-coeff commit fast path.
-    if std::env::var("LFP_SETCHK_OUT_E_AGG_LOG").ok().as_deref() == Some("1") {
-        let n = SETCHK_OUT_E_AGG_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n < 8 {
-            eprintln!(
-                "[setchk::out_e_agg] is_const_coeff_flat={} flat_len={} kappa={} ring_dim_d={}",
-                is_cc,
-                flat.len(),
-                kappa,
-                R::dimension()
-            );
-        }
-    }
-    let c_agg = if is_cc {
-        agg_scheme
-            .commit_const_coeff_fast(&flat)
-            .map_err(|e| format!("setchk out_e agg commit failed: {e:?}"))
-            .expect("setchk out_e agg commit failed")
-    } else {
-        agg_scheme
-            .commit(&flat)
-            .map_err(|e| format!("setchk out_e agg commit failed: {e:?}"))
-            .expect("setchk out_e agg commit failed")
-    };
+    let c_agg = agg_scheme
+        .commit(&flat)
+        .map_err(|e| format!("setchk out_e agg commit failed: {e:?}"))
+        .expect("setchk out_e agg commit failed");
     transcript.absorb_slice(c_agg.as_ref());
 }
 
