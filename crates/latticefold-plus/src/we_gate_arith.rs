@@ -1835,8 +1835,11 @@ where
             for &ai in &eval.a {
                 let a_var = b.new_var(bf_from_base_ring::<R>(ai));
                 a_l.push(a_var);
-                let a_ring = scalar_var_to_ringvars::<R>(&mut b, a_var);
-                absorb_flat_prefix.extend_from_slice(&a_ring.coeffs);
+                // `eval.a` are base-ring scalars in the real transcript (absorbed via
+                // `Transcript::absorb_field_element`), so in WE arithmetization we must absorb
+                // them as a single base-prime-field element (len=1), not as a const-coeff ring
+                // element (which would add `d-1` explicit zero absorbs).
+                absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat_prefix, a_var);
             }
             eval_a_vars.push(a_l);
 
