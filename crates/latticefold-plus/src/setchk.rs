@@ -194,47 +194,6 @@ fn ev<R: PolyRing>(r: &R, x: R::BaseRing) -> R::BaseRing {
 }
 
 #[inline]
-fn ensure_const_coeff_out<R: OverField + PolyRing>(
-    e: &[Vec<Vec<R>>],
-    b: &[R],
-) -> Result<(), SetCheckError<R>>
-where
-    R::BaseRing: Ring,
-{
-    for (blk, ek) in e.iter().enumerate() {
-        for (idx, lane) in ek.iter().enumerate() {
-            for (j, r) in lane.iter().enumerate() {
-                let coeffs = r.coeffs();
-                for lane_idx in 1..coeffs.len() {
-                    if coeffs[lane_idx] != R::BaseRing::ZERO {
-                        return Err(SetCheckError::NonConstCoeff {
-                            which: "e",
-                            blk,
-                            idx,
-                            lane: j,
-                        });
-                    }
-                }
-            }
-        }
-    }
-    for (idx, r) in b.iter().enumerate() {
-        let coeffs = r.coeffs();
-        for lane_idx in 1..coeffs.len() {
-            if coeffs[lane_idx] != R::BaseRing::ZERO {
-                return Err(SetCheckError::NonConstCoeff {
-                    which: "b",
-                    blk: 0,
-                    idx,
-                    lane: lane_idx,
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-#[inline]
 fn is_const_coeff_flat<R: OverField + PolyRing>(flat: &[R]) -> bool
 where
     R::BaseRing: Ring,
@@ -1296,11 +1255,6 @@ impl<R: OverField + PolyRing> In<R> {
         // transcript-derived challenges.
         //
         // We therefore absorb the full coefficient vectors for `e` and `b`.
-        // Sparse path assumes const-coeff outputs.
-        if !Ms_sparse.is_empty() {
-            ensure_const_coeff_out(&e, &b)
-                .expect("setchk: non-const coeff in out.e/out.b (sparse path)");
-        }
         absorb_evaluations_digest(&e, &b, transcript, kappa);
         if profile {
             println!("[LF+ setchk] step3(absorb): {:?}", t_absorb.elapsed());
