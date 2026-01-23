@@ -2673,7 +2673,7 @@ where
     }
 
     let psi_r = psi::<R>();
-    let mut acc = const_var(b, BF::<R>::ZERO);
+    let mut lc: Vec<(BF<R>, usize)> = Vec::new();
     for j in 0..d {
         let basis = unit_monomial::<R>(j);
         let w_br = (psi_r * basis).ct();
@@ -2681,10 +2681,13 @@ where
         if w == BF::<R>::ZERO {
             continue;
         }
-        let term = scalar_mul_const::<BF<R>>(b, x.coeffs[j], w);
-        acc = scalar_add::<BF<R>>(b, acc, term);
+        lc.push((w, x.coeffs[j]));
     }
-    acc
+    if lc.is_empty() {
+        const_var(b, BF::<R>::ZERO)
+    } else {
+        lc_to_var::<BF<R>>(b, lc)
+    }
 }
 
 fn lagrange_degree2<F: PrimeField>(b: &mut Dr1csBuilder<F>, r: usize) -> (usize, usize, usize) {
