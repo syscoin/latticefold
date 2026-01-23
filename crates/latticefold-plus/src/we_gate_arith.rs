@@ -791,6 +791,15 @@ fn lc_extend_scaled<F: PrimeField>(dst: &mut Lc<F>, scale: F, src: &Lc<F>) {
 }
 
 #[inline]
+fn lc_to_var_opt<F: PrimeField>(b: &mut Dr1csBuilder<F>, lc: Lc<F>) -> usize {
+    if lc.len() == 1 && lc[0].0 == F::ONE {
+        lc[0].1
+    } else {
+        lc_to_var::<F>(b, lc)
+    }
+}
+
+#[inline]
 fn scalar_mul_lc<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: Lc<F>, c: Lc<F>) -> usize {
     cm_bump(|cc| cc.scalar_mul += 1);
     let aval = eval_lc_val::<F>(b, &a);
@@ -884,13 +893,7 @@ fn poly_mul_karatsuba<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: &[usize], c: &[
     let c_lc: Vec<Lc<F>> = c.iter().map(|&v| vec![(F::ONE, v)]).collect();
     poly_mul_karatsuba_lc::<F>(b, &a_lc, &c_lc)
         .into_iter()
-        .map(|lc| {
-            if lc.len() == 1 && lc[0].0 == F::ONE {
-                lc[0].1
-            } else {
-                lc_to_var::<F>(b, lc)
-            }
-        })
+        .map(|lc| lc_to_var_opt::<F>(b, lc))
         .collect()
 }
 
@@ -903,18 +906,20 @@ fn ring_mul_negacyclic_karatsuba<F: PrimeField>(
     let d = x.d();
     assert_eq!(d, y.d());
     assert!(d.is_power_of_two());
-    let prod = poly_mul_karatsuba::<F>(b, &x.coeffs, &y.coeffs); // len 2d-1
-    debug_assert_eq!(prod.len(), 2 * d - 1);
+    let x_lc: Vec<Lc<F>> = x.coeffs.iter().map(|&v| vec![(F::ONE, v)]).collect();
+    let y_lc: Vec<Lc<F>> = y.coeffs.iter().map(|&v| vec![(F::ONE, v)]).collect();
+    let prod_lc = poly_mul_karatsuba_lc::<F>(b, &x_lc, &y_lc); // len 2d-1
+    debug_assert_eq!(prod_lc.len(), 2 * d - 1);
     let mut out = Vec::with_capacity(d);
     for k in 0..d {
-        let low = prod[k];
         let hi = k + d;
-        if hi < prod.len() {
-            out.push(scalar_sub::<F>(b, low, prod[hi]));
-        } else {
-            // Highest coefficient p[2d-1] is zero, so subtraction is unnecessary.
-            out.push(low);
+        let mut lc = Vec::new();
+        lc_extend_scaled(&mut lc, F::ONE, &prod_lc[k]);
+        if hi < prod_lc.len() {
+            lc_extend_scaled(&mut lc, -F::ONE, &prod_lc[hi]);
         }
+        // Highest coefficient p[2d-1] is zero, so subtraction is unnecessary.
+        out.push(lc_to_var_opt::<F>(b, lc));
     }
     RingVars::new(out)
 }
