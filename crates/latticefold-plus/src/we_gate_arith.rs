@@ -18,6 +18,10 @@ use symphony::dpp_poseidon::{
 };
 use symphony::dpp_sumcheck::Dr1csBuilder;
 use symphony::dpp_sumcheck::{sumcheck_verify_degree3, RingVars};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+static LC_TO_VAR_STATS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
 
 // -----------------------------------------------------------------------------
 // Optional op-count instrumentation (for tiny-field port estimates).
@@ -950,8 +954,17 @@ fn ring_eq<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: &RingVars) {
     }
 }
 
+#[track_caller]
 fn lc_to_var<F: PrimeField>(b: &mut Dr1csBuilder<F>, lc: Vec<(F, usize)>) -> usize {
     cm_bump(|c| c.lc_to_var += 1);
+    if std::env::var("LFP_LC_TO_VAR_HOT").is_ok() {
+        let loc = std::panic::Location::caller();
+        let key = format!("{}:{}", loc.file(), loc.line());
+        let stats = LC_TO_VAR_STATS.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(mut map) = stats.lock() {
+            *map.entry(key).or_insert(0) += 1;
+        }
+    }
     let val = lc
         .iter()
         .fold(F::ZERO, |acc, (c, idx)| acc + (*c * b.assignment[*idx]));
@@ -959,6 +972,28 @@ fn lc_to_var<F: PrimeField>(b: &mut Dr1csBuilder<F>, lc: Vec<(F, usize)>) -> usi
     // lc * 1 = v
     b.add_constraint(lc, vec![(F::ONE, b.one())], vec![(F::ONE, v)]);
     v
+}
+
+fn dump_lc_to_var_hottest() {
+    if std::env::var("LFP_LC_TO_VAR_HOT").is_err() {
+        return;
+    }
+    let stats = LC_TO_VAR_STATS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut entries: Vec<(String, u64)> = {
+        let mut map = stats.lock().expect("lc_to_var stats lock");
+        let out = map.drain().collect::<Vec<_>>();
+        out
+    };
+    if entries.is_empty() {
+        return;
+    }
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    let total: u64 = entries.iter().map(|(_, c)| *c).sum();
+    let top_n = 20usize.min(entries.len());
+    eprintln!("  lc_to_var hotspots (top {top_n}, total={total}):");
+    for (site, count) in entries.into_iter().take(top_n) {
+        eprintln!("    {count:>9}  {site}");
+    }
 }
 
 
@@ -4436,6 +4471,7 @@ where
             glue.len()
         );
     }
+    dump_lc_to_var_hottest();
     let public_len = 1 + 10 + public_inputs.len();
     Ok(WeDr1csOutput {
         inst,
