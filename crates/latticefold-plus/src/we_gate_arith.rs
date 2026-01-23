@@ -761,59 +761,82 @@ fn ring_scale<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, s: usize) ->
     RingVars::new(out)
 }
 
-fn poly_mul_karatsuba<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: &[usize], c: &[usize]) -> Vec<usize> {
+// -------------------------------------------------------------------------
+// Karatsuba optimization: avoid var-ifying pre-adds.
+//
+// Instead of computing (a0+a1) into fresh vars (linear constraints) and then
+// multiplying, represent sums as LCs and feed them directly into the mul
+// constraints (dR1CS supports LC * LC = LC).
+// -------------------------------------------------------------------------
+type Lc<F> = Vec<(F, usize)>;
+
+#[inline]
+fn eval_lc_val<F: PrimeField>(b: &Dr1csBuilder<F>, lc: &[(F, usize)]) -> F {
+    lc.iter()
+        .fold(F::ZERO, |acc, (cc, idx)| acc + (*cc * b.assignment[*idx]))
+}
+
+#[inline]
+fn scalar_mul_lc<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: Lc<F>, c: Lc<F>) -> usize {
+    cm_bump(|cc| cc.scalar_mul += 1);
+    let aval = eval_lc_val::<F>(b, &a);
+    let cval = eval_lc_val::<F>(b, &c);
+    let out = b.new_var(aval * cval);
+    b.add_constraint(a, c, vec![(F::ONE, out)]);
+    out
+}
+
+fn poly_mul_karatsuba_lc<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: &[Lc<F>], c: &[Lc<F>]) -> Vec<usize> {
     assert_eq!(a.len(), c.len());
     let n = a.len();
-    assert!(n.is_power_of_two(), "karatsuba requires power-of-two length");
+    assert!(n.is_power_of_two(), "karatsuba_lc requires power-of-two length");
     assert!(n > 0);
     if n == 1 {
-        return vec![scalar_mul::<F>(b, a[0], c[0])]; // length 2n-1 = 1
+        return vec![scalar_mul_lc::<F>(b, a[0].clone(), c[0].clone())];
     }
     let m = n / 2;
     let (a0, a1) = a.split_at(m);
     let (c0, c1) = c.split_at(m);
 
-    // z0 = a0*c0, z2 = a1*c1
-    let z0 = poly_mul_karatsuba::<F>(b, a0, c0); // len n-1
-    let z2 = poly_mul_karatsuba::<F>(b, a1, c1); // len n-1
+    let z0 = poly_mul_karatsuba_lc::<F>(b, a0, c0);
+    let z2 = poly_mul_karatsuba_lc::<F>(b, a1, c1);
 
-    // (a0+a1), (c0+c1)
-    let mut a01 = Vec::with_capacity(m);
-    let mut c01 = Vec::with_capacity(m);
-    for i in 0..m {
-        a01.push(scalar_add::<F>(b, a0[i], a1[i]));
-        c01.push(scalar_add::<F>(b, c0[i], c1[i]));
-    }
+    // a01/c01 as LCs (no constraints).
+    let a01: Vec<Lc<F>> = (0..m)
+        .map(|i| {
+            let mut lc = a0[i].clone();
+            lc.extend_from_slice(&a1[i]);
+            lc
+        })
+        .collect();
+    let c01: Vec<Lc<F>> = (0..m)
+        .map(|i| {
+            let mut lc = c0[i].clone();
+            lc.extend_from_slice(&c1[i]);
+            lc
+        })
+        .collect();
 
-    // z1 = (a0+a1)*(c0+c1)
-    let z1 = poly_mul_karatsuba::<F>(b, &a01, &c01); // len n-1
+    let z1 = poly_mul_karatsuba_lc::<F>(b, &a01, &c01);
 
-    // cross = z1 - z0 - z2
     debug_assert_eq!(z0.len(), n - 1);
     debug_assert_eq!(z1.len(), n - 1);
     debug_assert_eq!(z2.len(), n - 1);
-    let mut cross = Vec::with_capacity(n - 1);
-    for i in 0..(n - 1) {
-        // One linear constraint per coefficient:
-        // cross[i] = z1[i] - z0[i] - z2[i]
-        cross.push(lc_to_var::<F>(
-            b,
-            vec![(F::ONE, z1[i]), (-F::ONE, z0[i]), (-F::ONE, z2[i])],
-        ));
-    }
+    let cross_lc: Vec<Lc<F>> = (0..(n - 1))
+        .map(|i| vec![(F::ONE, z1[i]), (-F::ONE, z0[i]), (-F::ONE, z2[i])])
+        .collect();
 
-    // Assemble length-(2n-1) product:
-    // a*c = z0 + (cross << m) + (z2 << n)
+    // Assemble product without materializing `cross` vars.
     let mut res = Vec::with_capacity(2 * n - 1);
     for k in 0..(2 * n - 1) {
-        let mut terms: Vec<(F, usize)> = Vec::with_capacity(3);
+        let mut terms: Vec<(F, usize)> = Vec::with_capacity(6);
         if k < z0.len() {
             terms.push((F::ONE, z0[k]));
         }
         if k >= m {
             let idx = k - m;
-            if idx < cross.len() {
-                terms.push((F::ONE, cross[idx]));
+            if idx < cross_lc.len() {
+                terms.extend_from_slice(&cross_lc[idx]);
             }
         }
         if k >= n {
@@ -823,12 +846,25 @@ fn poly_mul_karatsuba<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: &[usize], c: &[
             }
         }
         match terms.len() {
-            0 => unreachable!("karatsuba assembly: missing term"),
-            1 => res.push(terms[0].1), // reuse the existing var; no constraint needed
-            _ => res.push(lc_to_var::<F>(b, terms)), // one linear constraint
+            0 => unreachable!("karatsuba_lc assembly: missing term"),
+            1 => res.push(terms[0].1),
+            _ => res.push(lc_to_var::<F>(b, terms)),
         }
     }
     res
+}
+
+fn poly_mul_karatsuba<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: &[usize], c: &[usize]) -> Vec<usize> {
+    assert_eq!(a.len(), c.len());
+    let n = a.len();
+    assert!(n.is_power_of_two(), "karatsuba requires power-of-two length");
+    assert!(n > 0);
+    if n == 1 {
+        return vec![scalar_mul_lc::<F>(b, vec![(F::ONE, a[0])], vec![(F::ONE, c[0])])];
+    }
+    let a_lc: Vec<Lc<F>> = a.iter().map(|&v| vec![(F::ONE, v)]).collect();
+    let c_lc: Vec<Lc<F>> = c.iter().map(|&v| vec![(F::ONE, v)]).collect();
+    poly_mul_karatsuba_lc::<F>(b, &a_lc, &c_lc)
 }
 
 fn ring_mul_negacyclic_karatsuba<F: PrimeField>(
@@ -1248,13 +1284,10 @@ fn eval_small_mle_ring<F: PrimeField>(
     // Direct translation of tensor_eval::eval_small_mle (skips zeros not needed here).
     assert!(!evals.is_empty(), "eval_small_mle_ring: empty evals");
     let d = evals[0].d();
-    let mut sum = Vec::with_capacity(d);
-    for _ in 0..d {
-        let vz = b.new_var(F::ZERO);
-        b.enforce_var_eq_const(vz, F::ZERO);
-        sum.push(vz);
-    }
-    let mut sum = RingVars::new(sum);
+    // Optimization (keep linear ops linear):
+    // Accumulate the ring sum as coefficient-wise linear combinations and only materialize
+    // once per coefficient at the end (instead of `ring_add` per term).
+    let mut acc_lc: Vec<Vec<(F, usize)>> = vec![Vec::new(); d];
 
     for (i, ev) in evals.iter().enumerate() {
         debug_assert_eq!(ev.d(), d);
@@ -1273,9 +1306,20 @@ fn eval_small_mle_ring<F: PrimeField>(
             w = new_w;
         }
         let scaled = ring_scale(b, ev, w);
-        sum = ring_add(b, &sum, &scaled);
+        for j in 0..d {
+            acc_lc[j].push((F::ONE, scaled.coeffs[j]));
+        }
     }
-    sum
+    let z = const_var::<F>(b, F::ZERO);
+    let mut out = Vec::with_capacity(d);
+    for j in 0..d {
+        match acc_lc[j].len() {
+            0 => out.push(z),
+            1 => out.push(acc_lc[j][0].1),
+            _ => out.push(lc_to_var::<F>(b, core::mem::take(&mut acc_lc[j]))),
+        }
+    }
+    RingVars::new(out)
 }
 
 fn eval_t_z_optimized_ring<R>(
