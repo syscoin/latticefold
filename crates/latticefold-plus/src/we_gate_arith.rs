@@ -18,11 +18,6 @@ use symphony::dpp_poseidon::{
 };
 use symphony::dpp_sumcheck::Dr1csBuilder;
 use symphony::dpp_sumcheck::{sumcheck_verify_degree3, RingVars};
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-
-static SCALAR_ADD_STATS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
-static SCALAR_MUL_STATS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
 
 // -----------------------------------------------------------------------------
 // Optional op-count instrumentation (for tiny-field port estimates).
@@ -994,31 +989,6 @@ fn lc_to_var<F: PrimeField>(b: &mut Dr1csBuilder<F>, lc: Vec<(F, usize)>) -> usi
     v
 }
 
-fn dump_scalar_hottest() {
-    if std::env::var("LFP_SCALAR_HOT").is_err() {
-        return;
-    }
-    let mut dump = |label: &str, stats: &OnceLock<Mutex<HashMap<String, u64>>>| {
-        let stats = stats.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut entries: Vec<(String, u64)> = {
-            let mut map = stats.lock().expect("scalar stats lock");
-            map.drain().collect::<Vec<_>>()
-        };
-        if entries.is_empty() {
-            return;
-        }
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
-        let total: u64 = entries.iter().map(|(_, c)| *c).sum();
-        let top_n = 20usize.min(entries.len());
-        eprintln!("  {label} hotspots (top {top_n}, total={total}):");
-        for (site, count) in entries.into_iter().take(top_n) {
-            eprintln!("    {count:>9}  {site}");
-        }
-    };
-    dump("scalar_add", &SCALAR_ADD_STATS);
-    dump("scalar_mul", &SCALAR_MUL_STATS);
-}
-
 
 
 fn const_var<F: PrimeField>(b: &mut Dr1csBuilder<F>, c: F) -> usize {
@@ -1277,17 +1247,8 @@ fn scalar_one_minus<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: usize) -> usize {
     v
 }
 
-#[track_caller]
 fn scalar_add<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: usize, y: usize) -> usize {
     cm_bump(|c| c.scalar_add += 1);
-    if std::env::var("LFP_SCALAR_HOT").is_ok() {
-        let loc = std::panic::Location::caller();
-        let key = format!("{}:{}", loc.file(), loc.line());
-        let stats = SCALAR_ADD_STATS.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Ok(mut map) = stats.lock() {
-            *map.entry(key).or_insert(0) += 1;
-        }
-    }
     let v = b.new_var(b.assignment[x] + b.assignment[y]);
     b.add_constraint(
         vec![(F::ONE, x), (F::ONE, y)],
@@ -2561,17 +2522,8 @@ fn scalar_sub_const<F: PrimeField>(b: &mut Dr1csBuilder<F>, r: usize, c: F) -> u
     v
 }
 
-#[track_caller]
 fn scalar_mul<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: usize, y: usize) -> usize {
     cm_bump(|cc| cc.scalar_mul += 1);
-    if std::env::var("LFP_SCALAR_HOT").is_ok() {
-        let loc = std::panic::Location::caller();
-        let key = format!("{}:{}", loc.file(), loc.line());
-        let stats = SCALAR_MUL_STATS.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Ok(mut map) = stats.lock() {
-            *map.entry(key).or_insert(0) += 1;
-        }
-    }
     let val = b.assignment[x] * b.assignment[y];
     let v = b.new_var(val);
     b.enforce_mul(x, y, v);
@@ -4515,7 +4467,6 @@ where
             glue.len()
         );
     }
-    dump_scalar_hottest();
     let public_len = 1 + 10 + public_inputs.len();
     Ok(WeDr1csOutput {
         inst,
