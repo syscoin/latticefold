@@ -4298,17 +4298,13 @@ where
     if std::env::var("LFP_WE_GATE_OPMIX").is_ok() {
         // Optional deeper split: how many Poseidon permutes happen before CM starts?
         // This removes ambiguity about “perm-heavy CM” vs “math-heavy CM”.
-        let pose_permutes_before_cm = {
-            use symphony::poseidon_trace::replay_ops;
-            match replay_ops(poseidon_cfg, &ops[..cm_ops_offset]) {
-                Ok(r) => r.permutes.len(),
-                Err(e) => {
-                    eprintln!("  poseidon replay(before_cm) failed: {e}");
-                    0usize
-                }
-            }
-        };
-        let pose_permutes_after_cm = pose_permutes.saturating_sub(pose_permutes_before_cm);
+        // NOTE: `pose_permutes` returned by the WE-mode Poseidon arithmetizer is 0 by design
+        // (WE mode does not replay a concrete trace). For op-mix estimates, count permutations
+        // implied by the *schedule* instead.
+        let pose_permutes_total = symphony::poseidon_trace::count_permutes_for_ops(poseidon_cfg, &ops);
+        let pose_permutes_before_cm =
+            symphony::poseidon_trace::count_permutes_for_ops(poseidon_cfg, &ops[..cm_ops_offset]);
+        let pose_permutes_after_cm = pose_permutes_total.saturating_sub(pose_permutes_before_cm);
 
         // Poseidon trace op mix (what the transcript did).
         let mut n_absorb = 0usize;
@@ -4348,7 +4344,7 @@ where
         eprintln!("LF+ WE gate op-mix (native base field) — for tiny-field estimates");
         eprintln!(
             "  poseidon trace: permutes={} absorb_ops={} absorb_elems={} squeeze_field_ops={} squeeze_field_elems={} squeeze_bytes_ops={} squeeze_bytes_total={}",
-            pose_permutes,
+            pose_permutes_total,
             n_absorb,
             absorb_elems,
             n_sq_field,

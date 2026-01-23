@@ -233,6 +233,93 @@ pub fn replay_ops<F: PrimeField>(
     Ok(PoseidonSpongeReplayResult { final_state: state, permutes })
 }
 
+/// Count the number of Poseidon permutations implied by an op **schedule**.
+///
+/// Unlike `replay_ops`, this does **not** check that recorded squeeze outputs match Poseidon.
+/// It only simulates the sponge mode/index transitions and counts where a permutation would occur.
+///
+/// This is useful for WE-gate *shape* arithmetization, where squeeze outputs are placeholders.
+pub fn count_permutes_for_ops<F: PrimeField>(cfg: &PoseidonConfig<F>, ops: &[PoseidonTraceOp<F>]) -> usize {
+    let mut permutes = 0usize;
+    let mut mode = DuplexSpongeMode::Absorbing { next_absorb_index: 0 };
+
+    // Arkworks squeeze-bytes uses: take (MODULUS_BIT_SIZE-1)/8 bytes from each squeezed field element.
+    let bytes_per_fe: usize = ((F::MODULUS_BIT_SIZE as usize).saturating_sub(1)) / 8;
+    let rate = cfg.rate;
+
+    for op in ops {
+        match op {
+            PoseidonTraceOp::Absorb(elems) => {
+                if elems.is_empty() {
+                    continue;
+                }
+                let mut absorb_index = match mode {
+                    DuplexSpongeMode::Absorbing { next_absorb_index } => next_absorb_index,
+                    DuplexSpongeMode::Squeezing { .. } => {
+                        permutes += 1; // squeezing -> absorbing permutes first
+                        0
+                    }
+                };
+                // absorb each element, permuting when absorb_index reaches rate
+                for _ in elems {
+                    if absorb_index == rate {
+                        permutes += 1;
+                        absorb_index = 0;
+                    }
+                    absorb_index += 1;
+                }
+                mode = DuplexSpongeMode::Absorbing { next_absorb_index: absorb_index };
+            }
+            PoseidonTraceOp::SqueezeField(out) => {
+                if out.is_empty() {
+                    continue;
+                }
+                let mut squeeze_index = match mode {
+                    DuplexSpongeMode::Squeezing { next_squeeze_index } => next_squeeze_index,
+                    DuplexSpongeMode::Absorbing { .. } => {
+                        permutes += 1; // absorbing -> squeezing permutes first
+                        0
+                    }
+                };
+                for _ in out {
+                    if squeeze_index == rate {
+                        permutes += 1;
+                        squeeze_index = 0;
+                    }
+                    squeeze_index += 1;
+                }
+                mode = DuplexSpongeMode::Squeezing { next_squeeze_index: squeeze_index };
+            }
+            PoseidonTraceOp::SqueezeBytes { n, .. } => {
+                if *n == 0 {
+                    continue;
+                }
+                // Convert to how many field elements are needed.
+                // If bytes_per_fe is 0 (tiny modulus), fall back to 1 byte per element.
+                let bpf = bytes_per_fe.max(1);
+                let need_fe = (*n + bpf - 1) / bpf;
+
+                let mut squeeze_index = match mode {
+                    DuplexSpongeMode::Squeezing { next_squeeze_index } => next_squeeze_index,
+                    DuplexSpongeMode::Absorbing { .. } => {
+                        permutes += 1;
+                        0
+                    }
+                };
+                for _ in 0..need_fe {
+                    if squeeze_index == rate {
+                        permutes += 1;
+                        squeeze_index = 0;
+                    }
+                    squeeze_index += 1;
+                }
+                mode = DuplexSpongeMode::Squeezing { next_squeeze_index: squeeze_index };
+            }
+        }
+    }
+    permutes
+}
+
 /// Find the **SqueezeBytes index** of the first `PoseidonTraceOp::SqueezeBytes` that occurs
 /// after observing an `PoseidonTraceOp::Absorb([marker])`.
 ///
