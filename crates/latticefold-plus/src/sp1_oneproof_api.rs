@@ -219,7 +219,10 @@ pub fn run_sp1_oneproof_we_gate_from_files(
     );
     let proof = prover.prove_sparse_base(std::slice::from_ref(&cr1cs), &public_inputs);
 
-    // Record verifier trace and build WE gate dR1CS; then extract witness tail.
+    // Record verifier trace, then:
+    // - arm the WE gate *shape* (instance depends only on params + sizes),
+    // - compute a satisfying witness assignment for that armed instance,
+    // - extract the witness tail for downstream lock scaffolding.
     let poseidon_cfg = PC::get_poseidon_config();
     let mut rec = crate::recording_transcript::TracePoseidonTranscript::<R>::empty::<PC>();
     for b in &public_inputs {
@@ -244,7 +247,17 @@ pub fn run_sp1_oneproof_we_gate_from_files(
         .map_err(|e| format!("cm proof verify: {e:?}"))?;
     let trace = rec.trace().clone();
 
-    let out = crate::we_gate_arith::build_we_dr1cs_for_plus_proof::<R>(
+    let shape = crate::we_gate_arith::build_we_dr1cs_for_plus_proof_shape::<R>(
+        &poseidon_cfg,
+        &we_params,
+        public_inputs.len(),
+        proof.lproof.len(),
+        m0.len(),
+        b_decomp,
+    )
+    .map_err(|e| format!("build_we_dr1cs_for_plus_proof_shape: {e}"))?;
+
+    let assignment = crate::we_gate_arith::build_we_dr1cs_for_plus_proof_witness::<R>(
         &poseidon_cfg,
         &trace,
         &we_params,
@@ -253,11 +266,17 @@ pub fn run_sp1_oneproof_we_gate_from_files(
         m0.len(),
         b_decomp,
     )
-    .map_err(|e| format!("build_we_dr1cs_for_plus_proof: {e}"))?;
+    .map_err(|e| format!("build_we_dr1cs_for_plus_proof_witness: {e}"))?;
+
+    // Sanity: the witness must satisfy the armed instance (this is the WE/decap contract).
+    shape
+        .inst
+        .check(&assignment)
+        .map_err(|e| format!("we gate armed instance not satisfied: {e}"))?;
 
     // Extract the WE gate witness tail (excluding public) and convert to u64 (canonical).
-    let public_len = out.public_len;
-    let tail = &out.assignment[public_len..];
+    let public_len = shape.public_len;
+    let tail = &assignment[public_len..];
     let mut dr1cs_assignment_tail_u64: Vec<u64> = Vec::with_capacity(tail.len());
     for x in tail {
         let bi = x.into_bigint();
