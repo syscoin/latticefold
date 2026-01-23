@@ -1538,5 +1538,40 @@ mod tests {
             poseidon_sponge_dr1cs_from_trace::<BF>(&cfg, &ops).expect("build dr1cs failed");
         inst.check(&assignment).unwrap();
     }
+
+    #[test]
+    fn test_we_mode_squeeze_bytes_are_constrained_by_state() {
+        use ark_crypto_primitives::sponge::{
+            poseidon::PoseidonSponge, CryptographicSponge,
+        };
+        use ark_ff::Field;
+        use stark_rings::PolyRing;
+
+        type BF = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
+        let cfg = <PC as cyclotomic_rings::rings::GetPoseidonParams<BF>>::get_poseidon_config();
+
+        // Build a small synthetic ops schedule and include a SqueezeBytes.
+        let mut rng = ark_std::test_rng();
+        let mut sponge = PoseidonSponge::<BF>::new(&cfg);
+        let mut ops: Vec<PoseidonTraceOp<BF>> = Vec::new();
+
+        let absorb = (0..(cfg.rate + 2)).map(|_| BF::rand(&mut rng)).collect::<Vec<_>>();
+        sponge.absorb(&absorb);
+        ops.push(PoseidonTraceOp::Absorb(absorb));
+
+        let bytes = sponge.squeeze_bytes(17);
+        ops.push(PoseidonTraceOp::SqueezeBytes { n: 17, out: bytes.clone() });
+
+        // WE/arm-before-proof mode: IO is not fixed, but bytes must still be derived from state.
+        let (inst, mut assignment, _replay, _byte_wit, _wiring, byte_wiring) =
+            poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes::<BF>(&cfg, &ops)
+                .expect("build we-mode dr1cs failed");
+        inst.check(&assignment).unwrap();
+
+        // Flip one squeezed byte var: should break satisfaction (bytes are no longer free).
+        let v0 = *byte_wiring.squeeze_byte_vars.first().expect("missing squeeze bytes");
+        assignment[v0] += BF::ONE;
+        assert!(inst.check(&assignment).is_err());
+    }
 }
 
