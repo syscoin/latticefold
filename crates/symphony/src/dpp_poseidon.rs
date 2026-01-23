@@ -1193,20 +1193,17 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                     let range_start = byte_wiring.squeeze_byte_vars.len();
                     let full_len = usable_bytes * num_elements;
 
-                    // Replay mode: derive bytes from witness values.
-                    // WE mode: use the recorded `out` (or dummy placeholders) only as initial
-                    // assignment values; constraints below enforce correctness/canonicality.
+                    // IMPORTANT (soundness): in WE mode, the squeezed bytes must be a *function*
+                    // of the sponge state, otherwise FS coins derived from bytes are forgeable.
+                    //
+                    // Therefore we always derive the initial byte witness from the current
+                    // squeezed field elements (like replay mode). The constraints below then
+                    // enforce that these bytes are the *canonical* low bytes of the field element
+                    // (i.e. of its integer representative in [0, p)).
                     let mut full_bytes: Vec<u8> = Vec::with_capacity(full_len);
-                    if arith_mode == PoseidonArithMode::ReplayFixed {
-                        for &v in &src_vars {
-                            let elem_bytes = b.assignment[v].into_bigint().to_bytes_le();
-                            full_bytes.extend_from_slice(&elem_bytes[..usable_bytes]);
-                        }
-                    } else {
-                        full_bytes.resize(full_len, 0u8);
-                        for (i, bb) in out.iter().copied().enumerate().take(full_len) {
-                            full_bytes[i] = bb;
-                        }
+                    for &v in &src_vars {
+                        let elem_bytes = b.assignment[v].into_bigint().to_bytes_le();
+                        full_bytes.extend_from_slice(&elem_bytes[..usable_bytes]);
                     }
                     debug_assert_eq!(full_bytes.len(), full_len);
 
@@ -1224,9 +1221,43 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                     }
                     let pow256k = acc; // 256^{usable_bytes}
 
+                    // Modulus decomposition: p = p0 + 256^k * p_hi, where k = usable_bytes.
+                    //
+                    // We enforce canonicality of the byte decomposition by constraining that the
+                    // reconstructed integer representation is < p. Since 256^k < p (by choice of
+                    // usable_bytes), this makes the low bytes uniquely determined by the field element.
+                    let mut p_bytes = F::MODULUS.to_bytes_le();
+                    // Ensure we have enough bytes for indexing.
+                    if p_bytes.len() < usable_bytes + 2 {
+                        p_bytes.resize(usable_bytes + 2, 0u8);
+                    }
+                    let p0_bytes = &p_bytes[..usable_bytes];
+                    let p0_minus1_val = {
+                        // p0 is the low k bytes of p (an integer < 256^k < p), so subtraction by 1 is safe.
+                        // Compute p0 as a field element via radix-256 evaluation, then subtract 1 in F.
+                        let mut p0 = F::ZERO;
+                        for (i, &bb) in p0_bytes.iter().enumerate() {
+                            p0 += pow256[i] * F::from(bb as u64);
+                        }
+                        p0 - F::ONE
+                    };
+                    let p_hi_u16: u16 = {
+                        // p_hi fits in at most 16 bits because `usable_bytes = floor((bits-1)/8)` implies
+                        // 8*k >= bits-8, hence p >> (8*k) < 2^8.
+                        let mut v: u16 = 0;
+                        let mut shift = 0u16;
+                        for i in 0..2 {
+                            v |= (p_bytes[usable_bytes + i] as u16) << shift;
+                            shift += 8;
+                        }
+                        v
+                    };
+                    let p_hi_f = F::from(p_hi_u16 as u64);
+
                     for e in 0..num_elements {
                         // Allocate byte vars for this element.
                         let mut byte_vars: Vec<usize> = Vec::with_capacity(usable_bytes);
+                        let mut byte_bits: Vec<[usize; 8]> = Vec::with_capacity(usable_bytes);
                         for i in 0..usable_bytes {
                             let bval = F::from(full_bytes[e * usable_bytes + i] as u64);
                             let bv = b.new_var(bval);
@@ -1234,7 +1265,7 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                                 b.enforce_var_eq_const(bv, bval);
                             } else {
                                 // WE mode: enforce byte is canonical (0..255) via bit decomposition.
-                                let mut bits: Vec<usize> = Vec::with_capacity(8);
+                                let mut bits: [usize; 8] = [0usize; 8];
                                 for bi in 0..8 {
                                     let bit = ((full_bytes[e * usable_bytes + i] >> bi) & 1) as u64;
                                     let vbit = b.new_var(if bit == 1 { F::ONE } else { F::ZERO });
@@ -1244,29 +1275,46 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                                         vec![(F::ONE, one), (-F::ONE, vbit)],
                                         vec![(F::ZERO, one)],
                                     );
-                                    bits.push(vbit);
+                                    bits[bi] = vbit;
                                 }
                                 // bv == Σ 2^j * bits[j]
                                 let mut lc: Vec<(F, usize)> = Vec::with_capacity(8);
                                 let mut p2 = F::ONE;
-                                for &vbit in &bits {
+                                for &vbit in bits.iter() {
                                     lc.push((p2, vbit));
                                     p2 = p2.double();
                                 }
                                 b.enforce_lc_times_one_eq_var(lc, bv);
+                                byte_bits.push(bits);
                             }
                             byte_vars.push(bv);
                             op_byte_vars.push(bv);
                         }
 
-                        // Link src element: src = Σ 256^i * byte_i + 256^k * high
+                        // Link src element to its canonical low bytes:
+                        //   src = low + 256^k * high
+                        // and enforce that the reconstructed integer (low + 256^k*high) is < p.
+                        //
+                        // Without the <p canonicality check, the low bytes are not uniquely
+                        // determined by the field element (bytes could be chosen arbitrarily with
+                        // a compensating high), which breaks FS binding in WE mode.
                         let src = src_vars[e];
                         let mut low = F::ZERO;
                         for i in 0..usable_bytes {
                             low += pow256[i] * b.assignment[byte_vars[i]];
                         }
-                        let high_val = (b.assignment[src] - low) * pow256k.inverse().unwrap();
+                        // Materialize `low` as a variable.
+                        let mut low_lc: Vec<(F, usize)> = Vec::with_capacity(usable_bytes);
+                        for i in 0..usable_bytes {
+                            low_lc.push((pow256[i], byte_vars[i]));
+                        }
+                        let low_var = b.new_var(low);
+                        b.enforce_lc_times_one_eq_var(low_lc, low_var);
+
+                        // Compute and allocate `high` from the current witness values.
+                        let high_val = (b.assignment[src] - b.assignment[low_var]) * pow256k.inverse().unwrap();
                         let high = b.new_var(high_val);
+
                         // src - Σ 256^i*byte_i - 256^k*high = 0
                         let mut lc: Vec<(F, usize)> = Vec::with_capacity(2 + usable_bytes);
                         lc.push((F::ONE, src));
@@ -1277,6 +1325,131 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                         let z = b.new_var(F::ZERO);
                         b.enforce_var_eq_const(z, F::ZERO);
                         b.enforce_lc_times_one_eq_var(lc, z);
+
+                        if arith_mode != PoseidonArithMode::ReplayFixed {
+                            // Canonicality constraints for WE mode.
+                            //
+                            // 1) Range-check high as an 8-bit integer via bit decomposition.
+                            //    (In practice `high` is < 256 because k = floor((bits-1)/8).)
+                            let mut high_bits: [usize; 8] = [0usize; 8];
+                            for bi in 0..8 {
+                                let bit = ((p0_minus1_val.into_bigint().to_bytes_le()[0] >> bi) & 1) as u64;
+                                // Use the computed high witness to initialize bits.
+                                let hb = ((high_val.into_bigint().to_bytes_le()[0] >> bi) & 1) as u64;
+                                let vbit = b.new_var(if hb == 1 { F::ONE } else { F::ZERO });
+                                b.add_constraint(
+                                    vec![(F::ONE, vbit)],
+                                    vec![(F::ONE, one), (-F::ONE, vbit)],
+                                    vec![(F::ZERO, one)],
+                                );
+                                high_bits[bi] = vbit;
+                                let _ = bit; // silence unused (kept for potential debugging)
+                            }
+                            // high == Σ 2^j * high_bits[j]
+                            let mut lc_h: Vec<(F, usize)> = Vec::with_capacity(8);
+                            let mut p2 = F::ONE;
+                            for &vbit in high_bits.iter() {
+                                lc_h.push((p2, vbit));
+                                p2 = p2.double();
+                            }
+                            b.enforce_lc_times_one_eq_var(lc_h, high);
+
+                            // 2) Enforce high <= p_hi by introducing an 8-bit slack:
+                            //    high + slack = p_hi.
+                            let slack_val_u64 = (p_hi_u16 as i64 - (high_val.into_bigint().to_bytes_le()[0] as i64)).max(0) as u64;
+                            let slack = b.new_var(F::from(slack_val_u64));
+                            // Range-check slack as a byte.
+                            let mut slack_bits: [usize; 8] = [0usize; 8];
+                            for bi in 0..8 {
+                                let sb = ((slack_val_u64 >> bi) & 1) as u64;
+                                let vbit = b.new_var(if sb == 1 { F::ONE } else { F::ZERO });
+                                b.add_constraint(
+                                    vec![(F::ONE, vbit)],
+                                    vec![(F::ONE, one), (-F::ONE, vbit)],
+                                    vec![(F::ZERO, one)],
+                                );
+                                slack_bits[bi] = vbit;
+                            }
+                            // slack == Σ 2^j * slack_bits[j]
+                            let mut lc_s: Vec<(F, usize)> = Vec::with_capacity(8);
+                            let mut p2s = F::ONE;
+                            for &vbit in slack_bits.iter() {
+                                lc_s.push((p2s, vbit));
+                                p2s = p2s.double();
+                            }
+                            b.enforce_lc_times_one_eq_var(lc_s, slack);
+                            // high + slack == p_hi
+                            let lc_hs = vec![(F::ONE, high), (F::ONE, slack), (-p_hi_f, one)];
+                            let z2 = b.new_var(F::ZERO);
+                            b.enforce_var_eq_const(z2, F::ZERO);
+                            b.enforce_lc_times_one_eq_var(lc_hs, z2);
+
+                            // 3) If slack == 0 (i.e. high == p_hi), enforce low <= p0-1.
+                            // Compute is_eq = Π_i (1 - slack_bit_i), which is 1 iff slack == 0.
+                            let mut is_eq = b.one();
+                            for &sb in slack_bits.iter() {
+                                // t = 1 - sb
+                                let t_val = F::ONE - b.assignment[sb];
+                                let t = b.new_var(t_val);
+                                b.enforce_lc_times_one_eq_var(vec![(F::ONE, one), (-F::ONE, sb)], t);
+                                // is_eq = is_eq * t
+                                let prod_val = b.assignment[is_eq] * b.assignment[t];
+                                let prod = b.new_var(prod_val);
+                                b.enforce_mul(is_eq, t, prod);
+                                is_eq = prod;
+                            }
+
+                            // diff = (p0-1 - low) * is_eq, and diff must be in [0, 256^k).
+                            let tmp_val = p0_minus1_val - b.assignment[low_var];
+                            let tmp = b.new_var(tmp_val);
+                            b.enforce_lc_times_one_eq_var(vec![(p0_minus1_val, one), (-F::ONE, low_var)], tmp);
+                            let diff_val = b.assignment[tmp] * b.assignment[is_eq];
+                            let diff = b.new_var(diff_val);
+                            b.enforce_mul(tmp, is_eq, diff);
+
+                            // Range-check `diff` by decomposing it into `usable_bytes` bytes.
+                            let mut diff_byte_vars: Vec<usize> = Vec::with_capacity(usable_bytes);
+                            let diff_bytes_le = diff_val.into_bigint().to_bytes_le();
+                            for i in 0..usable_bytes {
+                                let bb = diff_bytes_le.get(i).copied().unwrap_or(0u8);
+                                let bval = F::from(bb as u64);
+                                let bv = b.new_var(bval);
+                                // byte range check via bits
+                                let mut bits: [usize; 8] = [0usize; 8];
+                                for bi in 0..8 {
+                                    let bit = ((bb >> bi) & 1) as u64;
+                                    let vbit = b.new_var(if bit == 1 { F::ONE } else { F::ZERO });
+                                    b.add_constraint(
+                                        vec![(F::ONE, vbit)],
+                                        vec![(F::ONE, one), (-F::ONE, vbit)],
+                                        vec![(F::ZERO, one)],
+                                    );
+                                    bits[bi] = vbit;
+                                }
+                                let mut lc: Vec<(F, usize)> = Vec::with_capacity(8);
+                                let mut p2 = F::ONE;
+                                for &vbit in bits.iter() {
+                                    lc.push((p2, vbit));
+                                    p2 = p2.double();
+                                }
+                                b.enforce_lc_times_one_eq_var(lc, bv);
+                                diff_byte_vars.push(bv);
+                            }
+                            // diff == Σ 256^i * diff_byte_i
+                            let mut lc_d: Vec<(F, usize)> = Vec::with_capacity(usable_bytes);
+                            let mut val = F::ZERO;
+                            for i in 0..usable_bytes {
+                                lc_d.push((pow256[i], diff_byte_vars[i]));
+                                val += pow256[i] * b.assignment[diff_byte_vars[i]];
+                            }
+                            let diff_recomp = b.new_var(val);
+                            b.enforce_lc_times_one_eq_var(lc_d, diff_recomp);
+                            // Enforce diff == diff_recomp
+                            b.enforce_var_eq_var(diff, diff_recomp);
+
+                            // `byte_bits` is kept for potential future strengthening/debug; silence warnings.
+                            let _ = &byte_bits;
+                        }
                     }
 
                     // Expose only the first n bytes in trace order (truncated), as transcript output vars.
