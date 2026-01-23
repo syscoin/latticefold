@@ -4552,30 +4552,11 @@ where
     }
     let (inst, assignment) = merge_with_glue_constraints(&parts, &glue)?;
     if std::env::var("LFP_WE_GATE_OPMIX").is_ok() {
-        // LC “nnz” proxy: total number of (coeff,var) terms across all constraints.
-        // This is often a better predictor of prover time than raw constraint count when
-        // we introduce very wide linear constraints (e.g. Ajtai openings).
-        let mut nnz_total: usize = 0;
-        let mut nnz_max_row: usize = 0;
-        for row in &inst.constraints {
-            let nz = row.a.len() + row.b.len() + row.c.len();
-            nnz_total = nnz_total.saturating_add(nz);
-            nnz_max_row = nnz_max_row.max(nz);
-        }
-        let nnz_avg = if inst.constraints.is_empty() {
-            0.0
-        } else {
-            (nnz_total as f64) / (inst.constraints.len() as f64)
-        };
         eprintln!(
             "LF+ WE gate merged: nvars={} constraints={} (glue constraints={})",
             inst.nvars,
             inst.constraints.len(),
             glue.len()
-        );
-        eprintln!(
-            "LF+ WE gate merged: lc_nnz_total={} lc_nnz_avg={:.2} lc_nnz_max_row={}",
-            nnz_total, nnz_avg, nnz_max_row
         );
     }
     let public_len = 1 + 10 + public_inputs.len();
