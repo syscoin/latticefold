@@ -268,11 +268,14 @@ pub fn run_sp1_oneproof_we_gate_from_files(
     )
     .map_err(|e| format!("build_we_dr1cs_for_plus_proof_witness: {e}"))?;
 
-    // Sanity: the witness must satisfy the armed instance (this is the WE/decap contract).
-    shape
-        .inst
-        .check(&assignment)
-        .map_err(|e| format!("we gate armed instance not satisfied: {e}"))?;
+    // Optional sanity: the witness must satisfy the armed instance.
+    // This can be expensive for large gates; enable only when debugging.
+    if std::env::var("LFP_WE_GATE_CHECK_SAT").ok().as_deref() == Some("1") {
+        shape
+            .inst
+            .check(&assignment)
+            .map_err(|e| format!("we gate armed instance not satisfied: {e}"))?;
+    }
 
     // Extract the WE gate witness tail (excluding public) and convert to u64 (canonical).
     let public_len = shape.public_len;

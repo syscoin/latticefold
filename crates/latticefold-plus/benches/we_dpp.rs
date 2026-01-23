@@ -30,7 +30,9 @@ use stark_rings_linalg::{Matrix, SparseMatrix};
 use std::sync::Arc;
 
 use latticefold_plus::recording_transcript::TracePoseidonTranscript;
-use latticefold_plus::we_gate_arith::build_we_dr1cs_for_plus_proof;
+use latticefold_plus::we_gate_arith::{
+    build_we_dr1cs_for_plus_proof_shape, build_we_dr1cs_for_plus_proof_witness,
+};
 use latticefold_plus::we_statement::{
     digest32_to_bits_field, we_statement_hash_lf_plus, WeParams, LFP_WE_GATE_DIGEST_V1,
 };
@@ -86,7 +88,7 @@ fn bench_we_dpp(c: &mut Criterion) {
 
     // Ajtai matrix + monomial witness matrices (identity keeps `setchk` happy).
     //
-    // IMPORTANT: `build_we_dr1cs_for_plus_proof` enforces a prefix binding constraint:
+    // IMPORTANT: the WE gate enforces a prefix binding constraint:
     // `cm_f[j] == public_inputs[j]` for `j < min(kappa, 8)`.
     //
     // For this bench we keep `kappa=1`, so we must ensure `cm_f[0]` is a constant-coeff ring
@@ -175,9 +177,20 @@ fn bench_we_dpp(c: &mut Criterion) {
     let mut group = c.benchmark_group("we_dpp");
     group.sample_size(10);
 
-    group.bench_function(BenchmarkId::new("build_we_dr1cs_plus_proof", n), |bch| {
+    // Arm once (instance depends only on params + sizes).
+    let shape = build_we_dr1cs_for_plus_proof_shape::<R>(
+        &poseidon_cfg,
+        &params,
+        sp1_public_input_digest_bits.len(),
+        proof.lproof.len(),
+        M.len(),
+        B_bound,
+    )
+    .expect("build_we_dr1cs_for_plus_proof_shape");
+
+    group.bench_function(BenchmarkId::new("build_we_dr1cs_plus_witness", n), |bch| {
         bch.iter(|| {
-            let out = build_we_dr1cs_for_plus_proof::<R>(
+            let assignment = build_we_dr1cs_for_plus_proof_witness::<R>(
                 &poseidon_cfg,
                 &trace,
                 &params,
@@ -186,14 +199,14 @@ fn bench_we_dpp(c: &mut Criterion) {
                 M.len(),
                 B_bound,
             )
-            .expect("build_we_dr1cs_for_plus_proof");
-            out.inst.check(&out.assignment).expect("dr1cs satisfied");
+            .expect("build_we_dr1cs_for_plus_proof_witness");
+            shape.inst.check(&assignment).expect("dr1cs satisfied");
         })
     });
 
     group.bench_function(BenchmarkId::new("dpp_verify_plus_proof", n), |bch| {
-        // Build once outside the timed loop.
-        let out = build_we_dr1cs_for_plus_proof::<R>(
+        // Build witness once outside the timed loop.
+        let assignment = build_we_dr1cs_for_plus_proof_witness::<R>(
             &poseidon_cfg,
             &trace,
             &params,
@@ -202,14 +215,14 @@ fn bench_we_dpp(c: &mut Criterion) {
             M.len(),
             B_bound,
         )
-        .expect("build_we_dr1cs_for_plus_proof");
-        out.inst.check(&out.assignment).expect("dr1cs satisfied");
+        .expect("build_we_dr1cs_for_plus_proof_witness");
+        shape.inst.check(&assignment).expect("dr1cs satisfied");
 
         // Convert sparse dR1CS -> sparse dR1CS instance for the prototype RS FLPCP.
         //
         // IMPORTANT: avoid cloning multi-million sparse rows. Consume `out.inst.constraints` and
         // move `(a,b,c)` out of each row.
-        let (inst, assignment, public_len) = (out.inst, out.assignment, out.public_len);
+        let (inst, assignment, public_len) = (shape.inst.clone(), assignment, shape.public_len);
         let n = inst.nvars;
         let mut a = Vec::with_capacity(inst.constraints.len());
         let mut b = Vec::with_capacity(inst.constraints.len());

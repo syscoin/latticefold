@@ -5261,7 +5261,16 @@ mod tests {
             let poseidon_cfg = PCF::get_poseidon_config();
 
             let t2 = std::time::Instant::now();
-            let out = build_we_dr1cs_for_plus_proof::<RR>(
+            let shape = build_we_dr1cs_for_plus_proof_shape::<RR>(
+                &poseidon_cfg,
+                &params,
+                sp1_digest_bits.len(),
+                proof.lproof.len(),
+                m0.len(),
+                b_bound,
+            )
+            .expect("build we dr1cs shape");
+            let assignment = build_we_dr1cs_for_plus_proof_witness::<RR>(
                 &poseidon_cfg,
                 &trace,
                 &params,
@@ -5270,19 +5279,19 @@ mod tests {
                 m0.len(),
                 b_bound,
             )
-            .expect("build we dr1cs");
-            out.inst.check(&out.assignment).expect("dr1cs sat");
+            .expect("build we dr1cs witness");
+            shape.inst.check(&assignment).expect("dr1cs sat");
             eprintln!(
                 "[test_large_trace] build_we_dr1cs: {:?} (nvars={}, constraints={})",
                 t2.elapsed(),
-                out.inst.nvars,
-                out.inst.constraints.len()
+                shape.inst.nvars,
+                shape.inst.constraints.len()
             );
 
             // DPP verification (single query).
             let t3 = std::time::Instant::now();
             // Avoid cloning multi-million sparse rows: consume the constraints and move (a,b,c) out.
-            let (inst, assignment, public_len) = (out.inst, out.assignment, out.public_len);
+            let (inst, assignment, public_len) = (shape.inst, assignment, shape.public_len);
             let n = inst.nvars;
             let mut a = Vec::with_capacity(inst.constraints.len());
             let mut b = Vec::with_capacity(inst.constraints.len());
