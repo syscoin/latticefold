@@ -234,6 +234,22 @@ where
     Ok(())
 }
 
+#[inline]
+fn is_const_coeff_flat<R: OverField + PolyRing>(flat: &[R]) -> bool
+where
+    R::BaseRing: Ring,
+{
+    for r in flat {
+        let coeffs = r.coeffs();
+        for lane_idx in 1..coeffs.len() {
+            if coeffs[lane_idx] != R::BaseRing::ZERO {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 impl<R: OverField + PolyRing> In<R> {
     /// Monomial set check
     ///
@@ -1280,9 +1296,10 @@ impl<R: OverField + PolyRing> In<R> {
         // transcript-derived challenges.
         //
         // We therefore absorb the full coefficient vectors for `e` and `b`.
-        #[cfg(feature = "we_gate")]
-        if cfg!(debug_assertions) {
-            ensure_const_coeff_out(&e, &b).expect("setchk: non-const coeff in out.e/out.b");
+        // Sparse path assumes const-coeff outputs.
+        if !Ms_sparse.is_empty() {
+            ensure_const_coeff_out(&e, &b)
+                .expect("setchk: non-const coeff in out.e/out.b (sparse path)");
         }
         absorb_evaluations_digest(&e, &b, transcript, kappa);
         if profile {
@@ -1498,8 +1515,6 @@ impl<R: OverField> Out<R> {
         let v = subclaim.expected_evaluation;
 
         // Prover to Verifier messages
-        #[cfg(feature = "we_gate")]
-        ensure_const_coeff_out(&self.e, &self.b)?;
         absorb_evaluations_digest(&self.e, &self.b, transcript, kappa);
 
         use ark_std::One;
@@ -1604,16 +1619,17 @@ fn absorb_evaluations_digest<R: OverField + PolyRing>(
     // Ajtai aggregate commitment to bind the entire vector with linear constraints in WE gate.
     let agg_scheme =
         AjtaiCommitmentScheme::<R>::seeded(b"setchk_out_e_agg", OUT_E_AGG_SEED, kappa, flat.len());
-    #[cfg(feature = "we_gate")]
-    let c_agg = agg_scheme
-        .commit_const_coeff_fast(&flat)
-        .map_err(|e| format!("setchk out_e agg commit failed: {e:?}"))
-        .expect("setchk out_e agg commit failed");
-    #[cfg(not(feature = "we_gate"))]
-    let c_agg = agg_scheme
-        .commit(&flat)
-        .map_err(|e| format!("setchk out_e agg commit failed: {e:?}"))
-        .expect("setchk out_e agg commit failed");
+    let c_agg = if is_const_coeff_flat(&flat) {
+        agg_scheme
+            .commit_const_coeff_fast(&flat)
+            .map_err(|e| format!("setchk out_e agg commit failed: {e:?}"))
+            .expect("setchk out_e agg commit failed")
+    } else {
+        agg_scheme
+            .commit(&flat)
+            .map_err(|e| format!("setchk out_e agg commit failed: {e:?}"))
+            .expect("setchk out_e agg commit failed")
+    };
     transcript.absorb_slice(c_agg.as_ref());
 }
 
