@@ -157,3 +157,61 @@ pub fn encode_public_x<BF: PrimeField>(params: &WeParams, extra: &[BF]) -> Vec<B
     out
 }
 
+/// Deterministically derive the per-lock public coin seed.
+pub fn derive_lock_coin_seed(
+    armer_seed: [u8; 32],
+    stmt_digest: [u8; 32],
+    lock_j: u64,
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"LFP_LOCK_COIN_V1");
+    h.update(&armer_seed);
+    h.update(&stmt_digest);
+    h.update(&lock_j.to_le_bytes());
+    h.finalize().into()
+}
+
+/// Derive an armer-private secret vector from `(armer_seed, stmt_digest, lock_j)`.
+///
+/// The output length controls the entropy injected into hidden-query derivation.
+pub fn derive_armer_secret<BF: PrimeField>(
+    armer_seed: [u8; 32],
+    stmt_digest: [u8; 32],
+    lock_j: u64,
+    len: usize,
+) -> Vec<BF> {
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let mut h = Sha256::new();
+        h.update(b"LFP_ARMER_SECRET_V1");
+        h.update(&armer_seed);
+        h.update(&stmt_digest);
+        h.update(&lock_j.to_le_bytes());
+        h.update(&(i as u64).to_le_bytes());
+        let d: [u8; 32] = h.finalize().into();
+        out.push(BF::from_le_bytes_mod_order(&d));
+    }
+    out
+}
+
+/// Arm a Theorem-4.3 tiny-field lock using statement-bound coins + armer-private secret.
+///
+/// - `stmt_digest` binds to the WE statement (public inputs + params + gate digest).
+/// - `armer_seed` is private to each armer (N-of-N: each armer uses an independent seed).
+/// - `lock_j` is the armer’s lock index (unique per armer/lock).
+#[cfg(feature = "we_gate")]
+pub fn arm_theorem43_from_statement<F: PrimeField>(
+    dpp: &dpp::theorem43::Theorem43Dpp<F>,
+    stmt_digest: [u8; 32],
+    x: &[F],
+    armer_seed: [u8; 32],
+    lock_j: u64,
+) -> Result<dpp::theorem43::Theorem43LockArtifact<F>, String> {
+    // Statement-binding commitment: 256 boolean field elements.
+    let c_stmt = digest32_to_bits_field::<F>(stmt_digest);
+
+    // Armer-private secret mixed into the hidden-query derivation.
+    let armer_secret = derive_armer_secret::<F>(armer_seed, stmt_digest, lock_j, 4);
+
+    dpp.arm_fs(&c_stmt, x, &armer_secret)
+}
