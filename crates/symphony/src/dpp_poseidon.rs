@@ -762,6 +762,18 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes<F: PrimeField>(
     poseidon_sponge_dr1cs_from_trace_impl(cfg, ops, true, PoseidonArithMode::WeWitness)
 }
 
+/// WE/arm-before-proof mode, but **without** arithmetizing `SqueezeBytes`.
+///
+/// This is useful for estimating the marginal constraint cost of the `SqueezeBytes` byte
+/// canonicalization gadget (which can be large).
+pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes<F: PrimeField>(
+    cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+    ops: &[PoseidonTraceOp<F>],
+) -> Result<(SparseDr1csInstance<F>, Vec<F>, PoseidonDr1csWiring), ReplayErr> {
+    poseidon_sponge_dr1cs_from_trace_impl(cfg, ops, false, PoseidonArithMode::WeWitness)
+        .map(|(inst, asg, _replay, _bytes, wiring, _bw)| (inst, asg, wiring))
+}
+
 /// Like `poseidon_sponge_dr1cs_from_trace_with_wiring`, but also **arithmetizes `SqueezeBytes`**:
 /// - allocates byte variables,
 /// - constrains each byte is 8-bit,

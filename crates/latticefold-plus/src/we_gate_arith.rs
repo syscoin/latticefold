@@ -4332,6 +4332,13 @@ where
 
         // Constraint mix (what the WE gate arithmetization produced), by sub-part.
         let c_pose = pose_inst.constraints.len();
+        // Optional: measure the incremental cost of `SqueezeBytes` canonicalization.
+        let c_pose_no_bytes = symphony::dpp_poseidon::poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes::<BF<R>>(
+            poseidon_cfg,
+            &ops,
+        )
+        .map(|(inst, _asg, _w)| inst.constraints.len())
+        .unwrap_or(0usize);
         let c_params = params_inst.constraints.len();
         let c_lin = lin_inst.constraints.len();
         let c_stmt = stmt_inst.constraints.len();
@@ -4359,6 +4366,11 @@ where
         eprintln!(
             "  dr1cs constraints by part: poseidon={} params={} lin={} stmt_absorb={} cm_coins={} cm_fields={} cm_math={} decomp={}",
             c_pose, c_params, c_lin, c_stmt, c_coin, c_field, c_cm, c_decomp
+        );
+        eprintln!(
+            "  poseidon constraints(no_bytes)={} delta_squeeze_bytes={}",
+            c_pose_no_bytes,
+            c_pose.saturating_sub(c_pose_no_bytes)
         );
         eprintln!(
             "  cm_math op counts: ring_add={} ring_sub={} ring_scale={} ring_mul={} ring_eq={} lc_to_var={} scalar_add={} scalar_sub={} scalar_mul={} scalar_mul_const={} scalar_sub_const={} scalar_pow_table={} eq_eval_vars={} short_chal_from_bytes={} ct_psi_mul_ring={}",
