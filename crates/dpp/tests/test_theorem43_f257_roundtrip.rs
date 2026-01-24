@@ -49,7 +49,7 @@ fn test_theorem43_f257_arm_fs_prove_split_roundtrip() {
 
     // Arm (FS) without any proof.
     let art = dpp.arm_fs(&c_stmt, &x, &armer_secret).expect("arm_fs");
-    assert_eq!(art.accepting_set, [F257::ZERO, F257::ONE]);
+    assert_eq!(art.accepting_set, [F257::ONE, F257::from(2u64)]);
     assert_eq!(art.len, x.len() + dpp.proof_len());
 
     // Prove later using public coins only.

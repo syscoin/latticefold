@@ -1,8 +1,8 @@
-//! Tiny-field “lockable DPP” (A = {0,1}) for WE-style arming.
+//! Tiny-field “lockable DPP” (A = {1,2}) for WE-style arming.
 //!
 //! This module provides a **non-enumerating** variant suitable for “arm-before-proof” demos:
 //! - The armer samples a **single sparse query** `q`, but treats it as **toxic waste** (never published).
-//! - The armer publishes only **public coins** plus an **accepting set** `A={0,1}` and uses `q` only
+//! - The armer publishes only **public coins** plus an **accepting set** `A={1,2}` and uses `q` only
 //!   internally to form a lock artifact (in production: LWE hints / AEAD KDF inputs).
 //! - The prover/decapper later produces a proof **for the public coins**; decap uses the lock artifact
 //!   without ever revealing `q`.
@@ -12,7 +12,8 @@
 //! the query is hidden before the proof exists.
 //!
 //! Internally it uses the tiny-field gadgets from TR24-114 rev2 (Section 4.3.2–4.3.3):
-//! - UV → powering via Vandermonde (gives Sq accepting set {0,1})
+//! - UV → powering via Vandermonde (gives Sq accepting set {0,1}), then we apply an affine shift
+//!   to avoid the public target `0`.
 //! - Multiplication relation checked via (ρ,σ) linearization and the Sq test
 //! - Outer FLPCP for NP dR1CS provides (α,β,γ) = (E(Az)[i], E(Bz)[i], ...), with proof π₀=(z_w||w)
 
@@ -71,7 +72,7 @@ pub struct Theorem43ArmingStats {
 }
 
 impl<F: PrimeField> Theorem43LockArtifact<F> {
-    /// Compute the DPP “answer” \(a = \langle q, (x || \pi)\rangle\) using the hidden query.
+    /// Compute the DPP “answer” \(a = \langle q, (x || \pi)\rangle + 1\) using the hidden query.
     ///
     /// In production, this would be recovered implicitly via the LWE/AEAD decapsulation path,
     /// without ever exposing `q`.
@@ -82,7 +83,7 @@ impl<F: PrimeField> Theorem43LockArtifact<F> {
         let mut v = Vec::with_capacity(self.len);
         v.extend_from_slice(x);
         v.extend_from_slice(pi);
-        Ok(self.q.dot(&v))
+        Ok(self.q.dot(&v) + F::ONE)
     }
 
     /// Split the hidden query `q` into `(q_x, q_pi)` at the boundary `x_len`.
@@ -232,7 +233,7 @@ impl<F: PrimeField> Theorem43Dpp<F> {
 
         Ok(Theorem43LockArtifact {
             c_stmt,
-            accepting_set: [F::ZERO, F::ONE],
+            accepting_set: [F::ONE, F::from(2u64)],
             len,
             coins: Theorem43Coins { idx, lambda, rho, sigma },
             stats: Theorem43ArmingStats {
@@ -302,7 +303,7 @@ impl<F: PrimeField> Theorem43Dpp<F> {
 
         Ok(Theorem43LockArtifact {
             c_stmt: c_stmt.to_vec(),
-            accepting_set: [F::ZERO, F::ONE],
+            accepting_set: [F::ONE, F::from(2u64)],
             len,
             coins,
             stats: Theorem43ArmingStats {
@@ -367,7 +368,7 @@ impl<F: PrimeField> Theorem43Dpp<F> {
 
     #[inline]
     pub fn accept_answer(&self, a: &F) -> bool {
-        *a == F::ZERO || *a == F::ONE
+        *a == F::ONE || *a == F::from(2u64)
     }
 
     fn random_field_elem(&self, rng: &mut dyn RngCore) -> F {

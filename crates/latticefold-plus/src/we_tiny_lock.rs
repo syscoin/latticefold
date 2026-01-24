@@ -163,7 +163,7 @@ mod tests {
             lock_j,
         )
         .expect("arm_theorem43_from_statement_frog_emulated");
-        assert_eq!(art.accepting_set, [F257::ZERO, F257::ONE]);
+        assert_eq!(art.accepting_set, [F257::ONE, F257::from(2u64)]);
         assert_eq!(art.len, x.len() + dpp.proof_len());
 
         let pi = dpp.prove_for_query(&x, &z_w, &art.coins).expect("prove_for_query");

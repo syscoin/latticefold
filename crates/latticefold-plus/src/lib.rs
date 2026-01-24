@@ -26,8 +26,6 @@ pub mod recording_transcript;
 pub mod we_statement;
 #[cfg(feature = "we_gate")]
 pub mod we_gate_arith;
-#[cfg(feature = "we_gate")]
-pub mod we_frog_poseidon_f257;
 
 // SP1 shrink verifier R1LF loader helpers (feature-gated; research only).
 // We gate these under `we_gate` so the WE/DPP benches can reuse them.
