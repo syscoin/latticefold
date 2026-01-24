@@ -2693,43 +2693,53 @@ fn eq_eval_vars<F: PrimeField>(b: &mut Dr1csBuilder<F>, c: &[usize], r: &[usize]
 }
 
 struct ChallengeCursor<F: PrimeField> {
-    vals: Vec<F>,
-    idx: usize, // number of `get_challenge()` scalars consumed
-    vars: Vec<usize>,
+    /// Base-257 digit stream: concatenation of all `SqueezeField(len=CHALLENGE_DIGITS)` ops.
+    digits: Vec<F>,
+    /// Index into `digits` (number of digits consumed).
+    idx: usize,
+    /// All allocated digit vars, in order (for gluing to Poseidon squeeze-field vars).
+    digit_vars: Vec<usize>,
 }
 
 impl<F: PrimeField> ChallengeCursor<F> {
-    /// Cursor over the `get_challenge()` scalar stream induced by a Poseidon transcript trace.
+    /// Cursor over the `get_challenge()` stream induced by a Poseidon transcript trace.
     ///
-    /// The trace contains many ops; we interpret each `SqueezeField(len=CHALLENGE_DIGITS)` as one
-    /// `get_challenge()` call, combining base-257 digits into a single scalar (little-endian).
+    /// We treat each `SqueezeField(len=CHALLENGE_DIGITS)` op as one `get_challenge()` call returning
+    /// a base-field scalar derived from base-257 digits. This keeps a fixed schedule (no rejection)
+    /// and allows gluing the exact digit vars to the Poseidon wiring.
     fn new(trace: &PoseidonTranscriptTrace<F>) -> Self {
+        let mut digits = Vec::new();
+        for op in &trace.ops {
+            if let crate::recording_transcript::PoseidonTraceOp::SqueezeField(v) = op {
+                if v.len() == CHALLENGE_DIGITS {
+                    digits.extend_from_slice(v);
+                }
+            }
+        }
         Self {
-            vals: trace.challenge_scalars_base257_all(CHALLENGE_DIGITS),
+            digits,
             idx: 0,
-            vars: Vec::new(),
+            digit_vars: Vec::new(),
         }
     }
 
     fn next(&mut self, b: &mut Dr1csBuilder<F>) -> usize {
-        let v = self
-            .vals
-            .get(self.idx)
-            .copied()
-            .unwrap_or_else(|| panic!("challenge cursor oob at {}", self.idx));
-        self.idx += 1;
-        let var = b.new_var(v);
-        self.vars.push(var);
-        var
-    }
-
-    #[allow(dead_code)]
-    fn consumed(&self) -> usize {
-        self.idx
+        let slice = self
+            .digits
+            .get(self.idx..self.idx + CHALLENGE_DIGITS)
+            .unwrap_or_else(|| panic!("challenge cursor oob at digit {}", self.idx));
+        self.idx += CHALLENGE_DIGITS;
+        let mut local_digits = [0usize; CHALLENGE_DIGITS];
+        for (i, &dv) in slice.iter().enumerate() {
+            let v = b.new_var(dv);
+            self.digit_vars.push(v);
+            local_digits[i] = v;
+        }
+        combine_base257_digits::<F>(b, &local_digits)
     }
 
     fn all_vars(&self) -> &[usize] {
-        &self.vars
+        &self.digit_vars
     }
 }
 
@@ -3502,7 +3512,10 @@ where
     let mut absorb_idx = 0usize;
     for op in &ops {
         match op {
-            symphony::transcript::PoseidonTraceOp::SqueezeField(_) => expect_reabsorb = true,
+            symphony::transcript::PoseidonTraceOp::SqueezeField(v) if v.len() == CHALLENGE_DIGITS => {
+                // Only `get_challenge()` performs a Fiat–Shamir re-absorb.
+                expect_reabsorb = true
+            }
             symphony::transcript::PoseidonTraceOp::Absorb(_) => {
                 if expect_reabsorb {
                     if absorb_idx < is_reabsorb.len() {
@@ -4128,7 +4141,10 @@ where
             let mut absorb_idx = 0usize;
             for op in &ops {
                 match op {
-                    symphony::transcript::PoseidonTraceOp::SqueezeField(_) => expect_reabsorb = true,
+                    symphony::transcript::PoseidonTraceOp::SqueezeField(v) if v.len() == CHALLENGE_DIGITS => {
+                        // Only `get_challenge()` performs a Fiat–Shamir re-absorb.
+                        expect_reabsorb = true
+                    }
                     symphony::transcript::PoseidonTraceOp::SqueezeBytes { .. } => {}
                     symphony::transcript::PoseidonTraceOp::Absorb(_) => {
                         if expect_reabsorb {
