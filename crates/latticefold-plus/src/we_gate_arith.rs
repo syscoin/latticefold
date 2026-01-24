@@ -3931,7 +3931,7 @@ where
                 Ok(())
             };
 
-        let nbytes_scalar = prime_field_fixed_width_bytes::<BF<RR>>();
+        let nbytes_scalar = prime_field_fixed_width_bytes::<BF<R>>();
         let nbytes_ring = d * nbytes_scalar;
 
         for _ in 0..public_inputs.len() {
