@@ -1315,6 +1315,113 @@ fn enforce_bit<F: PrimeField>(b: &mut Dr1csBuilder<F>, bit_var: usize) {
     );
 }
 
+#[inline]
+fn prime_field_fixed_width_bytes<F: PrimeField>() -> usize {
+    ((F::MODULUS_BIT_SIZE as usize) + 7) / 8
+}
+
+/// Decompose a prime-field variable into **fixed-width** little-endian bytes, matching
+/// `prime_field_to_bytes_le_fixed` in `latticefold::transcript::bytes`.
+///
+/// Returns `nbytes = ceil(MODULUS_BIT_SIZE/8)` byte vars (each constrained 0..255) and enforces:
+/// - `x == Σ 256^i * byte[i] (mod F)`
+/// - the byte vector is the **canonical** representation (integer < MODULUS)
+fn prime_field_to_bytes_le_fixed_vars<F: PrimeField>(
+    b: &mut Dr1csBuilder<F>,
+    x_var: usize,
+) -> Vec<usize> {
+    let nbytes = prime_field_fixed_width_bytes::<F>();
+
+    // Witness bytes from the canonical bigint representation.
+    let mut le = b.assignment[x_var].into_bigint().to_bytes_le();
+    le.resize(nbytes, 0u8);
+
+    // Allocate byte vars and constrain them as 8-bit via bit decomposition.
+    let mut byte_vars: Vec<usize> = Vec::with_capacity(nbytes);
+    for &by in &le {
+        let v = b.new_var(F::from(by as u64));
+        enforce_byte::<F>(b, v);
+        byte_vars.push(v);
+    }
+
+    // Enforce recomposition: x - Σ 256^i * byte[i] == 0
+    let mut lc: Vec<(F, usize)> = Vec::with_capacity(1 + nbytes);
+    lc.push((F::ONE, x_var));
+    let base = F::from(256u64);
+    let mut pow = F::ONE;
+    for &bv in &byte_vars {
+        lc.push((-pow, bv));
+        pow *= base;
+    }
+    b.enforce_lc_times_one_eq_const(lc);
+
+    // Enforce canonicality: integer(bytes) < MODULUS.
+    //
+    // We do a bytewise subtraction: MODULUS - bytes = diff, with no final borrow and diff != 0.
+    let mut p_bytes = F::MODULUS.to_bytes_le();
+    p_bytes.resize(nbytes, 0u8);
+
+    let mut borrow = 0u64;
+    let mut borrow_vars: Vec<usize> = Vec::with_capacity(nbytes + 1);
+    let b0 = b.new_var(F::ZERO);
+    b.enforce_var_eq_const(b0, F::ZERO);
+    borrow_vars.push(b0);
+
+    let mut diff_byte_vars: Vec<usize> = Vec::with_capacity(nbytes);
+    for i in 0..nbytes {
+        let mi = p_bytes[i] as u64;
+        let bi = le[i] as u64;
+        let t_i64 = (mi as i64) - (bi as i64) - (borrow as i64);
+        let (t_u8, borrow_next) = if t_i64 < 0 {
+            ((t_i64 + 256) as u8, 1u64)
+        } else {
+            (t_i64 as u8, 0u64)
+        };
+        borrow = borrow_next;
+
+        let t_var = b.new_var(F::from(t_u8 as u64));
+        enforce_byte::<F>(b, t_var);
+        diff_byte_vars.push(t_var);
+
+        let bnext = b.new_var(if borrow_next == 1 { F::ONE } else { F::ZERO });
+        enforce_bit::<F>(b, bnext);
+        borrow_vars.push(bnext);
+
+        // Enforce: mi - byte[i] - borrow[i] == diff[i] - 256*borrow[i+1]
+        let one = b.one();
+        b.add_constraint(
+            vec![
+                (F::from(mi), one),
+                (-F::ONE, byte_vars[i]),
+                (-F::ONE, borrow_vars[i]),
+                (-F::ONE, t_var),
+                (F::from(256u64), bnext),
+            ],
+            vec![(F::ONE, one)],
+            vec![(F::ZERO, one)],
+        );
+    }
+
+    // No underflow in MODULUS - bytes.
+    b.enforce_var_eq_const(*borrow_vars.last().unwrap(), F::ZERO);
+
+    // diff != 0
+    let mut lc_diff: Vec<(F, usize)> = Vec::with_capacity(nbytes);
+    let mut pow = F::ONE;
+    for &dv in &diff_byte_vars {
+        lc_diff.push((pow, dv));
+        pow *= base;
+    }
+    let diff = lc_to_var::<F>(b, lc_diff);
+    let diff_val = b.assignment[diff];
+    let inv = b.new_var(diff_val.inverse().unwrap_or(F::ZERO));
+    let prod = b.new_var(diff_val * b.assignment[inv]);
+    b.enforce_mul(diff, inv, prod);
+    b.enforce_var_eq_const(prod, F::ONE);
+
+    byte_vars
+}
+
 fn f257_bytes_from_var<R>(b: &mut Dr1csBuilder<BF<R>>, x_var: usize) -> [usize; 2]
 where
     R: PolyRing,
@@ -2789,8 +2896,8 @@ fn absorb_field_elem_as_ring<R>(
     R: PolyRing,
     R::BaseRing: PrimeField,
 {
-    // Encode the scalar as fixed-width little-endian bytes (base-257), then absorb those bytes.
-    let bytes = f257_bytes_from_var::<R>(b, x0);
+    // Match transcript encoding: scalar -> fixed-width LE bytes, each absorbed as one F257 element.
+    let bytes = prime_field_to_bytes_le_fixed_vars::<BF<R>>(b, x0);
     absorb_flat.extend_from_slice(&bytes);
 }
 
@@ -2803,7 +2910,7 @@ fn absorb_ringvars_as_bytes<R>(
     R::BaseRing: PrimeField,
 {
     for &c in &rv.coeffs {
-        let bytes = f257_bytes_from_var::<R>(b, c);
+        let bytes = prime_field_to_bytes_le_fixed_vars::<BF<R>>(b, c);
         absorb_flat.extend_from_slice(&bytes);
     }
 }
@@ -3824,9 +3931,12 @@ where
                 Ok(())
             };
 
+        let nbytes_scalar = prime_field_fixed_width_bytes::<BF<RR>>();
+        let nbytes_ring = d * nbytes_scalar;
+
         for _ in 0..public_inputs.len() {
             // Public inputs are absorbed as base-field scalars (byte-encoded).
-            expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+            expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?;
         }
         for lp in &proof.lproof {
             let nvars = lp.nvars;
@@ -3836,21 +3946,21 @@ where
             for _ in 0..nvars {
                 expect_get_challenge(&mut op_idx, &mut absorb_ops, &mut squeezed_field_elems)?;
             }
-            // absorb (nvars, degree=3) as scalars
-            expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
-            expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+            // absorb (nvars, degree=3) as scalars (byte-encoded)
+            expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?;
+            expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?;
             for _ in 0..nvars {
                 for _ in 0..4 {
-                    // 4 ring evaluations per round (len=d each)
-                    expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+                    // 4 ring evaluations per round (byte-encoded ring)
+                    expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
                 }
                 // verifier challenge + (reabsorb + explicit absorb)
                 expect_get_challenge(&mut op_idx, &mut absorb_ops, &mut squeezed_field_elems)?;
-                expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+                expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?;
             }
             for _ in 0..4 {
-                // absorb (v,va,vb,vc) (ring, len=d each)
-                expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+                // absorb (v,va,vb,vc) (byte-encoded ring)
+                expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
             }
         }
 
@@ -3872,16 +3982,16 @@ where
         // - C_Mf (kappa ring elems)
         // - cm_mtau (kappa ring elems)
         //
-        // Each ring element is absorbed as `len=d` base-field elements by the transcript.
+        // Each ring element is absorbed as fixed-width LE bytes (len = d * nbytes_scalar).
         for f in &dcom.fcoms {
             for _ in 0..f.cm_f.len() {
-                expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+                expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
             }
             for _ in 0..f.C_Mf.len() {
-                expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+                expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
             }
             for _ in 0..f.cm_mtau.len() {
-                expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+                expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
             }
         }
 
@@ -3900,23 +4010,23 @@ where
             expect_get_challenge(&mut op_idx, &mut absorb_ops, &mut squeezed_field_elems)?;
         }
         // MLSumcheck::verify_as_subprotocol for SetChk (nvars, degree=3, claimed_sum=0)
-        expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?; // nvars
-        expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?; // degree=3
+        expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?; // nvars
+        expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?; // degree=3
         for _ in 0..out.nvars {
             // 4 ring evals
             for _ in 0..4 {
-                expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+                expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
             }
             // r_i + (reabsorb + explicit absorb)
             expect_get_challenge(&mut op_idx, &mut absorb_ops, &mut squeezed_field_elems)?;
-            expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+            expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?;
         }
         // absorb_evaluations_digest(out.e, out.b):
         // SetChk binds all outputs via an Ajtai aggregate commitment and absorbs that commitment.
         // (κ ring elements, each absorbed as len=d base-field elems).
         let kappa = dcom.fcoms.first().map(|f| f.cm_f.len()).unwrap_or(0);
         for _ in 0..kappa {
-            expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+            expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
         }
 
         // rgchk::absorb_evaluations(&dcom.evals):
@@ -3924,10 +4034,10 @@ where
         // - eval.c absorbed as ring elements (len=d each)
         for ev in &dcom.evals {
             for _ in 0..ev.a.len() {
-                expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+                expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?;
             }
             for _ in 0..ev.c.len() {
-                expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+                expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
             }
         }
 
@@ -3941,7 +4051,7 @@ where
         let l_instances = proof.cmproof.evals.0.len();
         let kappa = proof.cmproof.comh[0].len();
         for _ in 0..(l_instances * kappa) {
-            expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+            expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
         }
 
         // c0/c1 = get_challenges(log_kappa) twice.
@@ -3956,15 +4066,15 @@ where
             // rc = get_challenge
             expect_get_challenge(&mut op_idx, &mut absorb_ops, &mut squeezed_field_elems)?;
             // MLSumcheck::verify_as_subprotocol header (nvars, degree=2)
-            expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
-            expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+            expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?;
+            expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?;
             // rounds: 3 evals + get_challenge (reabsorb) + explicit absorb
             for _ in 0..nvars_cm {
                 for _ in 0..3 {
-                    expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+                    expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
                 }
                 expect_get_challenge(&mut op_idx, &mut absorb_ops, &mut squeezed_field_elems)?;
-                expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+                expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?;
             }
             // absorb_evaluations(evals)
             let evals = if which_sc == 0 { &proof.cmproof.evals.0 } else { &proof.cmproof.evals.1 };
@@ -3972,7 +4082,7 @@ where
                 for _row in ieval.rows() {
                     // Each row is [R;4]
                     for _ in 0..4 {
-                        expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+                        expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
                     }
                 }
             }
