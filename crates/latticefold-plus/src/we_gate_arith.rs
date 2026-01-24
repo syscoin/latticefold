@@ -608,6 +608,11 @@ fn enforce_reabsorb_equals_squeeze<F: PrimeField>(
                 if sq_len != out.len() {
                     return Err("poseidon squeeze length mismatch".to_string());
                 }
+                // Only `get_challenge()` does a Fiat–Shamir re-absorb. In LF+/WE, `squeeze_bytes(d)`
+                // is recorded as `SqueezeField(len=d)` but is NOT re-absorbed.
+                if out.len() != CHALLENGE_DIGITS {
+                    continue;
+                }
                 // IMPORTANT: `absorb_idx` tracks how many Absorb ops we've *already processed*.
                 // The re-absorb corresponding to this squeeze is the *next* Absorb op in the trace,
                 // i.e. it has index `absorb_idx` in `absorb_ranges`. Do NOT increment `absorb_idx`
@@ -4767,7 +4772,10 @@ mod tests {
         }
     }
 
-    impl<RR: OverField> Transcript<RR> for ReplayPoseidonTranscript<RR> {
+    impl<RR: OverField> Transcript<RR> for ReplayPoseidonTranscript<RR>
+    where
+        RR::BaseRing: PrimeField,
+    {
         type TranscriptConfig = ark_crypto_primitives::sponge::poseidon::PoseidonConfig<<RR::BaseRing as Field>::BasePrimeField>;
         fn new(_config: &Self::TranscriptConfig) -> Self {
             unreachable!("ReplayPoseidonTranscript::new(trace) should be used in tests")
@@ -4775,9 +4783,11 @@ mod tests {
 
         fn absorb(&mut self, v: &RR) {
             self.scratch.clear();
-            for c in v.coeffs() {
-                self.scratch.extend(c.to_base_prime_field_elements());
-            }
+            // Match the real transcript encoding: ring -> canonical fixed-width LE bytes,
+            // then each byte is absorbed as an F257 element (recorded in base ring as 0..=255).
+            let bytes = latticefold::transcript::bytes::ring_to_bytes_le_fixed::<RR>(v);
+            self.scratch
+                .extend(bytes.iter().map(|b| <RR::BaseRing as Field>::BasePrimeField::from(*b as u64)));
             let op = self.trace.ops.get(self.idx).expect("replay: op index oob").clone();
             match op {
                 crate::recording_transcript::PoseidonTraceOp::Absorb(elems) => {
@@ -4794,10 +4804,12 @@ mod tests {
         }
 
         fn absorb_field_element(&mut self, v: &RR::BaseRing) {
-            // Match `latticefold-plus` transcript encoding: scalar absorbs are absorbed directly
-            // as base-prime-field elements (NOT expanded into a constant-coeff ring element).
+            // Match the real transcript encoding: scalar -> fixed-width LE bytes,
+            // then absorb bytes as F257 elements (recorded as 0..=255 in base ring).
             self.scratch.clear();
-            self.scratch.extend(v.to_base_prime_field_elements());
+            let bytes = latticefold::transcript::bytes::prime_field_to_bytes_le_fixed::<RR::BaseRing>(v);
+            self.scratch
+                .extend(bytes.iter().map(|b| <RR::BaseRing as Field>::BasePrimeField::from(*b as u64)));
             let op = self.trace.ops.get(self.idx).expect("replay: op index oob").clone();
             match op {
                 crate::recording_transcript::PoseidonTraceOp::Absorb(elems) => {
@@ -4817,13 +4829,12 @@ mod tests {
         }
 
         fn get_challenge(&mut self) -> RR::BaseRing {
-            let ext = RR::BaseRing::extension_degree() as usize;
             let op0 = self.trace.ops.get(self.idx).expect("replay: op index oob").clone();
             let c = match op0 {
                 crate::recording_transcript::PoseidonTraceOp::SqueezeField(v) => v,
                 other => panic!("replay expected SqueezeField op, got {other:?} at idx {}", self.idx),
             };
-            assert_eq!(c.len(), ext, "replay squeeze_field length mismatch");
+            assert_eq!(c.len(), CHALLENGE_DIGITS, "replay get_challenge digit length mismatch");
             self.advance();
 
             // get_challenge reabsorbs the squeezed field elements; the trace records that as Absorb(c).
@@ -4836,8 +4847,17 @@ mod tests {
             };
             self.advance();
 
-            <RR::BaseRing as Field>::from_base_prime_field_elems(&c)
-                .expect("replay: wrong extension_degree")
+            // Combine base-257 digits (little-endian) into a base ring scalar.
+            let mut acc = RR::BaseRing::from(0u64);
+            let mut pow = RR::BaseRing::from(1u64);
+            let base = RR::BaseRing::from(257u64);
+            for d in &c {
+                let du64 = d.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u64;
+                debug_assert!(du64 < 257u64);
+                acc += RR::BaseRing::from(du64) * pow;
+                pow *= base;
+            }
+            acc
         }
 
         fn squeeze_bytes(&mut self, n: usize) -> Vec<u8> {
