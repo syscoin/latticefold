@@ -1823,10 +1823,10 @@ where
         let e1 = ring_to_ringvars::<R>(&mut b, &m.evaluations[1]);
         let e2 = ring_to_ringvars::<R>(&mut b, &m.evaluations[2]);
         let e3 = ring_to_ringvars::<R>(&mut b, &m.evaluations[3]);
-        absorb_flat_prefix.extend_from_slice(&e0.coeffs);
-        absorb_flat_prefix.extend_from_slice(&e1.coeffs);
-        absorb_flat_prefix.extend_from_slice(&e2.coeffs);
-        absorb_flat_prefix.extend_from_slice(&e3.coeffs);
+        absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat_prefix, &e0);
+        absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat_prefix, &e1);
+        absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat_prefix, &e2);
+        absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat_prefix, &e3);
         absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat_prefix, r_point_vars[round]);
         absorb_dcom_setchk_msgs(e0.coeffs.len() + e1.coeffs.len() + e2.coeffs.len() + e3.coeffs.len());
         absorb_dcom_setchk_r(1);
@@ -2396,9 +2396,9 @@ where
         // - prover message evaluations (3 ring elems)
         // - then absorbs the sampled randomness scalar r_i
         for (round, m) in msgs.iter().enumerate() {
-            absorb_flat.extend_from_slice(&m[0].coeffs);
-            absorb_flat.extend_from_slice(&m[1].coeffs);
-            absorb_flat.extend_from_slice(&m[2].coeffs);
+            absorb_ringvars_as_bytes::<R>(b, absorb_flat, &m[0]);
+            absorb_ringvars_as_bytes::<R>(b, absorb_flat, &m[1]);
+            absorb_ringvars_as_bytes::<R>(b, absorb_flat, &m[2]);
             absorb_field_elem_as_ring::<R>(b, absorb_flat, r_sc[round]);
             absorb_cm_sumcheck_msgs(m[0].coeffs.len() + m[1].coeffs.len() + m[2].coeffs.len());
             absorb_cm_sumcheck_r(1);
@@ -2521,10 +2521,10 @@ where
         for l in 0..l_instances {
             for row in &evals[l] {
                 // Each row is [R; 4], absorbed in order.
-                absorb_flat.extend_from_slice(&row[0].coeffs);
-                absorb_flat.extend_from_slice(&row[1].coeffs);
-                absorb_flat.extend_from_slice(&row[2].coeffs);
-                absorb_flat.extend_from_slice(&row[3].coeffs);
+                absorb_ringvars_as_bytes::<R>(b, absorb_flat, &row[0]);
+                absorb_ringvars_as_bytes::<R>(b, absorb_flat, &row[1]);
+                absorb_ringvars_as_bytes::<R>(b, absorb_flat, &row[2]);
+                absorb_ringvars_as_bytes::<R>(b, absorb_flat, &row[3]);
                 absorb_cm_absorb_evals(
                     row[0].coeffs.len() + row[1].coeffs.len() + row[2].coeffs.len() + row[3].coeffs.len(),
                 );
@@ -3784,10 +3784,10 @@ where
             let e1 = ring_to_ringvars::<R>(&mut b, &m.evaluations[1]);
             let e2 = ring_to_ringvars::<R>(&mut b, &m.evaluations[2]);
             let e3 = ring_to_ringvars::<R>(&mut b, &m.evaluations[3]);
-            absorb_flat.extend_from_slice(&e0.coeffs);
-            absorb_flat.extend_from_slice(&e1.coeffs);
-            absorb_flat.extend_from_slice(&e2.coeffs);
-            absorb_flat.extend_from_slice(&e3.coeffs);
+            absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat, &e0);
+            absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat, &e1);
+            absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat, &e2);
+            absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat, &e3);
             msg_vars.push([e0, e1, e2, e3]);
             let ri = ch.next(&mut b);
             // MLSumcheck verifier explicitly absorbs each sampled challenge as a scalar.
@@ -3805,10 +3805,10 @@ where
         let va = ring_to_ringvars::<R>(&mut b, &lp.va);
         let vb = ring_to_ringvars::<R>(&mut b, &lp.vb);
         let vc = ring_to_ringvars::<R>(&mut b, &lp.vc);
-        absorb_flat.extend_from_slice(&v.coeffs);
-        absorb_flat.extend_from_slice(&va.coeffs);
-        absorb_flat.extend_from_slice(&vb.coeffs);
-        absorb_flat.extend_from_slice(&vc.coeffs);
+        absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat, &v);
+        absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat, &va);
+        absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat, &vb);
+        absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat, &vc);
 
         // e = eq_eval(r_pre, r_sc) (scalar).
         let e = eq_eval_vars::<BF<R>>(&mut b, &r_pre, &r_sc);
@@ -4190,9 +4190,6 @@ where
             let mut all_squeezed_field: Vec<Vec<BF<R>>> = Vec::new();
             for op in &trace.ops {
                 if let crate::recording_transcript::PoseidonTraceOp::SqueezeField(v) = op {
-                    if v.len() != CHALLENGE_DIGITS {
-                        return Err("expected base-257 squeeze len=CHALLENGE_DIGITS".to_string());
-                    }
                     all_squeezed_field.push(v.clone());
                 }
             }
