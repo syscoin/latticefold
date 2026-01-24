@@ -1552,8 +1552,11 @@ where
     let nclaims_setchk = out_sc.e[0].len() + out_sc.b.len();
     let has_rc_setchk = out_sc.e[0].len() > 1;
 
+    // Number of `get_challenge()` scalar coins in the Dcom prefix.
     let expected_squeezes =
         nclaims_setchk * (nvars_setchk + 2) + if has_rc_setchk { 1 } else { 0 } + nvars_setchk;
+    // Each `get_challenge()` is recorded as `SqueezeField(len=CHALLENGE_DIGITS)` base-257 digits.
+    let expected_squeeze_elems = expected_squeezes * CHALLENGE_DIGITS;
     if ops_offset > trace.ops.len() {
         return Err("cm/dcom prefix: ops_offset out of range".to_string());
     }
@@ -1562,16 +1565,16 @@ where
             &trace.ops[ops_offset..],
             R::dimension(),
         );
-    if prefix_squeezes != expected_squeezes {
+    if prefix_squeezes != expected_squeeze_elems {
         return Err(format!(
             "cm/dcom prefix: squeeze_field count mismatch before bytes: expected {}, trace has {}",
-            expected_squeezes, prefix_squeezes
+            expected_squeeze_elems, prefix_squeezes
         ));
     }
     if squeezed_field_offset > trace.squeezed_field.len() {
         return Err("cm/dcom prefix: squeezed_field_offset out of range".to_string());
     }
-    if trace.squeezed_field.len() - squeezed_field_offset < expected_squeezes {
+    if trace.squeezed_field.len() - squeezed_field_offset < expected_squeeze_elems {
         return Err("cm/dcom prefix: trace.squeezed_field too short".to_string());
     }
 
@@ -1601,38 +1604,46 @@ where
         public_input_vars.push(b.new_var(x));
     }
 
-    // Allocate local squeeze vars with trace values (prefix coins).
-    let mut squeeze_field_vars: Vec<usize> = Vec::with_capacity(expected_squeezes);
+    // Allocate local digit vars with trace values (prefix coins).
+    let mut squeeze_field_vars: Vec<usize> = Vec::with_capacity(expected_squeeze_elems);
     for &v in trace
         .squeezed_field
         .iter()
         .skip(squeezed_field_offset)
-        .take(expected_squeezes)
+        .take(expected_squeeze_elems)
     {
         squeeze_field_vars.push(b.new_var(v));
     }
 
-    let mut cur_prefix = 0usize;
-    let take_prefix = |cur: &mut usize, n: usize, xs: &[usize]| -> Vec<usize> {
-        let out = xs[*cur..*cur + n].to_vec();
-        *cur += n;
-        out
-    };
     let mut c_vars: Vec<Vec<usize>> = Vec::with_capacity(nclaims_setchk);
     let mut beta_vars: Vec<usize> = Vec::with_capacity(nclaims_setchk);
     let mut alpha_vars: Vec<usize> = Vec::with_capacity(nclaims_setchk);
+
+    let mut cur_digit = 0usize;
+    let mut next_scalar = |b: &mut Dr1csBuilder<BF<R>>, digits: &[usize]| -> usize {
+        let slice = &digits[cur_digit..cur_digit + CHALLENGE_DIGITS];
+        cur_digit += CHALLENGE_DIGITS;
+        combine_base257_digits::<BF<R>>(b, slice)
+    };
     for _ in 0..nclaims_setchk {
-        c_vars.push(take_prefix(&mut cur_prefix, nvars_setchk, &squeeze_field_vars));
-        beta_vars.push(take_prefix(&mut cur_prefix, 1, &squeeze_field_vars)[0]);
-        alpha_vars.push(take_prefix(&mut cur_prefix, 1, &squeeze_field_vars)[0]);
+        let mut ci = Vec::with_capacity(nvars_setchk);
+        for _ in 0..nvars_setchk {
+            ci.push(next_scalar(&mut b, &squeeze_field_vars));
+        }
+        c_vars.push(ci);
+        beta_vars.push(next_scalar(&mut b, &squeeze_field_vars));
+        alpha_vars.push(next_scalar(&mut b, &squeeze_field_vars));
     }
     let rc_var = if has_rc_setchk {
-        Some(take_prefix(&mut cur_prefix, 1, &squeeze_field_vars)[0])
+        Some(next_scalar(&mut b, &squeeze_field_vars))
     } else {
         None
     };
-    let r_point_vars = take_prefix(&mut cur_prefix, nvars_setchk, &squeeze_field_vars);
-    debug_assert_eq!(cur_prefix, expected_squeezes);
+    let mut r_point_vars = Vec::with_capacity(nvars_setchk);
+    for _ in 0..nvars_setchk {
+        r_point_vars.push(next_scalar(&mut b, &squeeze_field_vars));
+    }
+    debug_assert_eq!(cur_digit, squeeze_field_vars.len());
 
     // Prefix absorb surface (non-reabsorb absorbs before first short SqueezeField).
     let mut absorb_flat_prefix: Vec<usize> = Vec::new();
