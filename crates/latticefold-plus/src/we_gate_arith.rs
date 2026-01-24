@@ -2738,6 +2738,11 @@ impl<F: PrimeField> ChallengeCursor<F> {
         combine_base257_digits::<F>(b, &local_digits)
     }
 
+    #[allow(dead_code)]
+    fn consumed(&self) -> usize {
+        self.idx / CHALLENGE_DIGITS
+    }
+
     fn all_vars(&self) -> &[usize] {
         &self.digit_vars
     }
@@ -3516,6 +3521,7 @@ where
                 // Only `get_challenge()` performs a Fiat–Shamir re-absorb.
                 expect_reabsorb = true
             }
+            symphony::transcript::PoseidonTraceOp::SqueezeField(_) => {}
             symphony::transcript::PoseidonTraceOp::Absorb(_) => {
                 if expect_reabsorb {
                     if absorb_idx < is_reabsorb.len() {
@@ -4145,6 +4151,7 @@ where
                         // Only `get_challenge()` performs a Fiat–Shamir re-absorb.
                         expect_reabsorb = true
                     }
+                    symphony::transcript::PoseidonTraceOp::SqueezeField(_) => {}
                     symphony::transcript::PoseidonTraceOp::SqueezeBytes { .. } => {}
                     symphony::transcript::PoseidonTraceOp::Absorb(_) => {
                         if expect_reabsorb {
