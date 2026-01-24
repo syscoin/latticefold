@@ -20,7 +20,38 @@ fn hex32(bytes: [u8; 32]) -> String {
     out
 }
 
+#[cfg(feature = "parallel")]
+fn init_rayon_stack() {
+    // Intermittent stack overflows can happen when a large-stack computation runs on a Rayon
+    // worker thread (smaller stack) instead of the main thread (larger stack). This becomes more
+    // likely with high parallelism (e.g. RAYON_NUM_THREADS=96).
+    //
+    // Mitigation: configure the global Rayon pool with an explicit (larger) stack size.
+    // Set `RAYON_STACK_SIZE_BYTES` to override (bytes). Default: 32 MiB.
+    let stack_bytes: usize = std::env::var("RAYON_STACK_SIZE_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(32 * 1024 * 1024);
+
+    let mut builder = rayon::ThreadPoolBuilder::new().stack_size(stack_bytes);
+
+    // Respect RAYON_NUM_THREADS if provided.
+    if let Some(n) = std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        builder = builder.num_threads(n);
+    }
+
+    // If Rayon was already initialized elsewhere, ignore and proceed.
+    let _ = builder.build_global();
+}
+
+#[cfg(not(feature = "parallel"))]
+fn init_rayon_stack() {}
+
 fn main() {
+    init_rayon_stack();
     let r1lf_path = std::env::var("SP1_R1LF").expect("Set SP1_R1LF=/path/to/shrink.r1lf");
     let witness_path =
         std::env::var("SP1_WITNESS").expect("Set SP1_WITNESS=/path/to/shrink_verifier.witness.bundle");

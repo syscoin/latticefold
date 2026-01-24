@@ -25,16 +25,14 @@ pub struct SparseDr1csInstance<F: PrimeField> {
 
 impl<F: PrimeField> SparseDr1csInstance<F> {
     pub fn eval_lc(terms: &[(F, usize)], assignment: &[F]) -> F {
-        if terms.len() > 64 {
-            terms
-                .par_iter()
-                .map(|(c, idx)| *c * assignment[*idx])
-                .reduce(|| F::ZERO, |a, b| a + b)
-        } else {
+        // IMPORTANT: keep this sequential.
+        //
+        // `check()` already parallelizes across constraints. Parallelizing inside each linear
+        // combination can introduce nested Rayon parallelism, which is high-overhead and can
+        // trigger stack overflows on large instances.
         terms
             .iter()
             .fold(F::ZERO, |acc, (c, idx)| acc + (*c * assignment[*idx]))
-        }
     }
 
     pub fn check(&self, assignment: &[F]) -> Result<(), String> {
@@ -158,8 +156,34 @@ pub fn merge_sparse_dr1cs_share_one_with_glue<F: PrimeField>(
     parts: &[(SparseDr1csInstance<F>, Vec<F>)],
     glue: &[(usize, usize, usize, usize)],
 ) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {
+    merge_sparse_dr1cs_share_one_with_glue_impl(parts, glue, true)
+}
+
+/// Same as `merge_sparse_dr1cs_share_one_with_glue`, but **does not** require glued variables
+/// to have identical witness values in the provided assignments.
+///
+/// This is useful for *shape-only* / arm-time builds that use dummy witness values: the merged
+/// instance (constraints + variable identification) is what matters, not the particular dummy
+/// assignment used during construction.
+pub fn merge_sparse_dr1cs_share_one_with_glue_relaxed<F: PrimeField>(
+    parts: &[(SparseDr1csInstance<F>, Vec<F>)],
+    glue: &[(usize, usize, usize, usize)],
+) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {
+    merge_sparse_dr1cs_share_one_with_glue_impl(parts, glue, false)
+}
+
+fn merge_sparse_dr1cs_share_one_with_glue_impl<F: PrimeField>(
+    parts: &[(SparseDr1csInstance<F>, Vec<F>)],
+    glue: &[(usize, usize, usize, usize)],
+    check_assignment_consistency: bool,
+) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {
     if parts.is_empty() {
         return Err("merge_sparse_dr1cs_share_one_with_glue: empty parts".to_string());
+    }
+
+    // Fast path: no glue => standard merge.
+    if glue.is_empty() {
+        return merge_sparse_dr1cs_share_one(parts);
     }
 
     // Compute offsets for each part (how much its non-const vars are shifted by in merged space).
@@ -180,8 +204,139 @@ pub fn merge_sparse_dr1cs_share_one_with_glue<F: PrimeField>(
         if local == 0 { 0 } else { local + offsets[part_idx] }
     };
 
-    let total_constraints: usize =
-        parts.iter().map(|(inst, _)| inst.constraints.len()).sum::<usize>() + glue.len();
+    // --------------------------------------------------------------------
+    // Variable unification for glue:
+    // Instead of adding explicit equality constraints, we *identify* glued variables
+    // into a single variable (like an R1CS variable rename), shrinking nvars and also
+    // eliminating glue constraints.
+    //
+    // This is safe because glue is only used to equate variables that are intended to be
+    // exactly equal (e.g. Poseidon squeeze vars == verifier coin vars, or shared witness
+    // variables across sub-circuits). If two glued vars have different assignments, we
+    // return an error (the caller constructed an inconsistent witness).
+    // --------------------------------------------------------------------
+    use std::collections::HashMap;
+
+    // Collect all *global* indices that appear in glue.
+    let mut idx_map: HashMap<usize, usize> = HashMap::with_capacity(glue.len() * 2);
+    let mut idxs: Vec<usize> = Vec::with_capacity(glue.len() * 2);
+    let mut glue_pairs: Vec<(usize, usize)> = Vec::with_capacity(glue.len());
+
+    let get_id = |g: usize, idx_map: &mut HashMap<usize, usize>, idxs: &mut Vec<usize>| -> usize {
+        if let Some(&id) = idx_map.get(&g) {
+            id
+        } else {
+            let id = idxs.len();
+            idxs.push(g);
+            idx_map.insert(g, id);
+            id
+        }
+    };
+
+    for &(pa, xa, pb, xb) in glue {
+        if pa >= parts.len() || pb >= parts.len() {
+            return Err("merge_sparse_dr1cs_share_one_with_glue: glue part idx out of range".to_string());
+        }
+        let ga = remap_global(pa, xa, &offsets);
+        let gb = remap_global(pb, xb, &offsets);
+        let ia = get_id(ga, &mut idx_map, &mut idxs);
+        let ib = get_id(gb, &mut idx_map, &mut idxs);
+        glue_pairs.push((ia, ib));
+    }
+
+    // Union-find over the glued variable set.
+    let m = idxs.len();
+    let mut parent: Vec<usize> = (0..m).collect();
+    let mut rank: Vec<u8> = vec![0u8; m];
+
+    let find = |mut x: usize, parent: &mut [usize]| -> usize {
+        // Path compression
+        let mut root = x;
+        while parent[root] != root {
+            root = parent[root];
+        }
+        while parent[x] != x {
+            let p = parent[x];
+            parent[x] = root;
+            x = p;
+        }
+        root
+    };
+
+    let union = |a: usize, b: usize, parent: &mut [usize], rank: &mut [u8]| {
+        let ra = find(a, parent);
+        let rb = find(b, parent);
+        if ra == rb {
+            return;
+        }
+        let (mut ra, mut rb) = (ra, rb);
+        if rank[ra] < rank[rb] {
+            core::mem::swap(&mut ra, &mut rb);
+        }
+        parent[rb] = ra;
+        if rank[ra] == rank[rb] {
+            rank[ra] = rank[ra].saturating_add(1);
+        }
+    };
+
+    for (a, b) in glue_pairs {
+        union(a, b, &mut parent, &mut rank);
+    }
+
+    // For each UF root, choose a representative global index (min global index).
+    let mut rep_global_for_root: Vec<usize> = vec![usize::MAX; m];
+    for local_id in 0..m {
+        let r = find(local_id, &mut parent);
+        let g = idxs[local_id];
+        let slot = &mut rep_global_for_root[r];
+        if *slot == usize::MAX || g < *slot {
+            *slot = g;
+        }
+    }
+
+    // Map each glued global index -> its representative global index.
+    let mut rep_of_global: HashMap<usize, usize> = HashMap::with_capacity(m);
+    for local_id in 0..m {
+        let r = find(local_id, &mut parent);
+        let rep_g = rep_global_for_root[r];
+        let g = idxs[local_id];
+        rep_of_global.insert(g, rep_g);
+    }
+
+    // Build a compacted assignment by dropping non-representative glued vars.
+    let old_nvars = merged_assignment.len();
+    let mut new_index: Vec<usize> = vec![usize::MAX; old_nvars];
+    let mut new_assignment: Vec<F> = Vec::with_capacity(old_nvars);
+
+    for i in 0..old_nvars {
+        if let Some(&rep) = rep_of_global.get(&i) {
+            if i != rep {
+                // Consistency check: glued assignments must match exactly (witness-time safety).
+                // For shape-only builds, callers may intentionally use arbitrary dummy values,
+                // so we optionally skip this check.
+                if check_assignment_consistency && merged_assignment[i] != merged_assignment[rep] {
+                    return Err(format!(
+                        "merge_sparse_dr1cs_share_one_with_glue: inconsistent glued assignment ({} != {})",
+                        i, rep
+                    ));
+                }
+                continue; // drop this var
+            }
+        }
+        new_index[i] = new_assignment.len();
+        new_assignment.push(merged_assignment[i]);
+    }
+    // Fill indices for dropped vars: map to representative's new index.
+    for (&g, &rep) in rep_of_global.iter() {
+        if g != rep {
+            new_index[g] = new_index[rep];
+        }
+    }
+    if new_index[0] != 0 || new_assignment.get(0).copied().unwrap_or(F::ZERO) != F::ONE {
+        return Err("merge_sparse_dr1cs_share_one_with_glue: internal error (const-1 slot)".to_string());
+    }
+
+    let total_constraints: usize = parts.iter().map(|(inst, _)| inst.constraints.len()).sum::<usize>();
     let mut merged_constraints: Vec<Constraint<F>> = Vec::with_capacity(total_constraints);
 
     // Merge constraints with remapped indices.
@@ -192,8 +347,7 @@ pub fn merge_sparse_dr1cs_share_one_with_glue<F: PrimeField>(
     // bottleneck and appear “single-core bound” in system monitors. In that case, we allow a
     // parallel remap that preserves constraint order and does not allocate *extra* constraints
     // beyond the final merged list (it still must allocate the final `merged_constraints`).
-    let use_parallel_merge =
-        total_constraints >= 2_000_000;
+    let use_parallel_merge = total_constraints >= 2_000_000;
 
     if use_parallel_merge {
         let remapped_parts: Vec<Vec<Constraint<F>>> = parts
@@ -201,7 +355,10 @@ pub fn merge_sparse_dr1cs_share_one_with_glue<F: PrimeField>(
             .enumerate()
             .map(|(part_idx, (inst, _asg))| {
                 let offset = offsets[part_idx];
-                let remap_idx = |idx: usize| -> usize { if idx == 0 { 0 } else { idx + offset } };
+                let remap_idx = |idx: usize| -> usize {
+                    let g = if idx == 0 { 0 } else { idx + offset };
+                    new_index[g]
+                };
                 let remap_lc = |lc: &[(F, usize)]| -> Vec<(F, usize)> {
                     let mut out = Vec::with_capacity(lc.len());
                     for (c, i) in lc {
@@ -226,7 +383,10 @@ pub fn merge_sparse_dr1cs_share_one_with_glue<F: PrimeField>(
     } else {
         for (part_idx, (inst, _asg)) in parts.iter().enumerate() {
             let offset = offsets[part_idx];
-            let remap_idx = |idx: usize| -> usize { if idx == 0 { 0 } else { idx + offset } };
+            let remap_idx = |idx: usize| -> usize {
+                let g = if idx == 0 { 0 } else { idx + offset };
+                new_index[g]
+            };
             for row in &inst.constraints {
                 let remap_lc = |lc: &[(F, usize)]| -> Vec<(F, usize)> {
                     let mut out = Vec::with_capacity(lc.len());
@@ -244,26 +404,12 @@ pub fn merge_sparse_dr1cs_share_one_with_glue<F: PrimeField>(
         }
     }
 
-    // Add glue constraints: (x - y) * 1 = 0.
-    for &(pa, xa, pb, xb) in glue {
-        if pa >= parts.len() || pb >= parts.len() {
-            return Err("merge_sparse_dr1cs_share_one_with_glue: glue part idx out of range".to_string());
-        }
-        let ga = remap_global(pa, xa, &offsets);
-        let gb = remap_global(pb, xb, &offsets);
-        merged_constraints.push(Constraint {
-            a: vec![(F::ONE, ga), (-F::ONE, gb)],
-            b: vec![(F::ONE, 0)],
-            c: vec![(F::ZERO, 0)],
-        });
-    }
-
     Ok((
         SparseDr1csInstance {
-            nvars: merged_assignment.len(),
+            nvars: new_assignment.len(),
             constraints: merged_constraints,
         },
-        merged_assignment,
+        new_assignment,
     ))
 }
 
@@ -588,9 +734,44 @@ pub fn poseidon_sponge_dr1cs_from_trace_with_wiring<F: PrimeField>(
     ),
     ReplayErr,
 > {
-    poseidon_sponge_dr1cs_from_trace_impl(cfg, ops, false).map(|(inst, asg, replay, bytes, wiring, _bw)| {
-        (inst, asg, replay, bytes, wiring)
-    })
+    poseidon_sponge_dr1cs_from_trace_impl(cfg, ops, false, PoseidonArithMode::ReplayFixed).map(
+        |(inst, asg, replay, bytes, wiring, _bw)| (inst, asg, replay, bytes, wiring),
+    )
+}
+
+/// Like `poseidon_sponge_dr1cs_from_trace_with_wiring_and_bytes`, but suitable for
+/// **arm-before-proof WE**: it does **not** bake recorded trace IO values into constraints, and
+/// it does **not** require replay consistency.
+///
+/// This makes the dR1CS instance depend only on the operation schedule (lengths) and Poseidon
+/// parameters, not on a specific transcript realization.
+pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes<F: PrimeField>(
+    cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+    ops: &[PoseidonTraceOp<F>],
+) -> Result<
+    (
+        SparseDr1csInstance<F>,
+        Vec<F>,
+        PoseidonSpongeReplayResult<F>,
+        Vec<ByteSqueezeWitness>,
+        PoseidonDr1csWiring,
+        PoseidonByteWiring,
+    ),
+    ReplayErr,
+> {
+    poseidon_sponge_dr1cs_from_trace_impl(cfg, ops, true, PoseidonArithMode::WeWitness)
+}
+
+/// WE/arm-before-proof mode, but **without** arithmetizing `SqueezeBytes`.
+///
+/// This is useful for estimating the marginal constraint cost of the `SqueezeBytes` byte
+/// canonicalization gadget (which can be large).
+pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes<F: PrimeField>(
+    cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+    ops: &[PoseidonTraceOp<F>],
+) -> Result<(SparseDr1csInstance<F>, Vec<F>, PoseidonDr1csWiring), ReplayErr> {
+    poseidon_sponge_dr1cs_from_trace_impl(cfg, ops, false, PoseidonArithMode::WeWitness)
+        .map(|(inst, asg, _replay, _bytes, wiring, _bw)| (inst, asg, wiring))
 }
 
 /// Like `poseidon_sponge_dr1cs_from_trace_with_wiring`, but also **arithmetizes `SqueezeBytes`**:
@@ -611,13 +792,23 @@ pub fn poseidon_sponge_dr1cs_from_trace_with_wiring_and_bytes<F: PrimeField>(
     ),
     ReplayErr,
 > {
-    poseidon_sponge_dr1cs_from_trace_impl(cfg, ops, true)
+    poseidon_sponge_dr1cs_from_trace_impl(cfg, ops, true, PoseidonArithMode::ReplayFixed)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PoseidonArithMode {
+    /// “Replay mode”: enforce Absorb/Squeeze outputs match the recorded trace values and run
+    /// sanity checks against a replay.
+    ReplayFixed,
+    /// “WE mode”: do not bake recorded trace values into constraints.
+    WeWitness,
 }
 
 fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
     cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
     ops: &[PoseidonTraceOp<F>],
     with_bytes: bool,
+    arith_mode: PoseidonArithMode,
 ) -> Result<
     (
         SparseDr1csInstance<F>,
@@ -629,8 +820,16 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
     ),
     ReplayErr,
 > {
-    // First replay to ensure the ops are consistent and to get permute boundaries.
-    let replay = replay_ops(cfg, ops)?;
+    // In WE mode we must not require replay consistency (arming has no concrete trace yet),
+    // and we must not bake recorded trace outputs into constraints.
+    let replay = if arith_mode == PoseidonArithMode::ReplayFixed {
+        replay_ops(cfg, ops)?
+    } else {
+        PoseidonSpongeReplayResult {
+            final_state: vec![F::ZERO; cfg.rate + cfg.capacity],
+            permutes: Vec::new(),
+        }
+    };
 
     let t = cfg.rate + cfg.capacity;
     let mut b = Dr1csBuilder::<F>::new();
@@ -655,20 +854,27 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
     // Helper: apply a Poseidon permutation to the current `state_vars`.
     let mut permute_ptr: usize = 0;
     let mut apply_perm = |b: &mut Dr1csBuilder<F>, state_vars: &mut Vec<usize>| -> Result<(), ReplayErr> {
-        if permute_ptr >= replay.permutes.len() {
-            return Err(ReplayErr::Invalid("permute ptr out of range".to_string()));
-        }
-        let before = replay.permutes[permute_ptr].before.clone();
-        let (after_state, round_states) = permute_with_round_trace(cfg, &before)?;
-
-        // Ensure the current state witness matches `before` (sanity; not a constraint).
-        for i in 0..t {
-            if b.assignment[state_vars[i]] != before[i] {
-                return Err(ReplayErr::Mismatch(format!(
-                    "state mismatch before permute #{permute_ptr} at i={i}"
-                )));
+        let (after_state, round_states) = if arith_mode == PoseidonArithMode::ReplayFixed {
+            if permute_ptr >= replay.permutes.len() {
+                return Err(ReplayErr::Invalid("permute ptr out of range".to_string()));
             }
-        }
+            let before = replay.permutes[permute_ptr].before.clone();
+            let (after_state, round_states) = permute_with_round_trace(cfg, &before)?;
+
+            // Ensure the current state witness matches `before` (sanity; not a constraint).
+            for i in 0..t {
+                if b.assignment[state_vars[i]] != before[i] {
+                    return Err(ReplayErr::Mismatch(format!(
+                        "state mismatch before permute #{permute_ptr} at i={i}"
+                    )));
+                }
+            }
+            (after_state, round_states)
+        } else {
+            // WE mode: no replay-derived sanity checks.
+            let before = (0..t).map(|i| b.assignment[state_vars[i]]).collect::<Vec<_>>();
+            permute_with_round_trace(cfg, &before)?
+        };
 
         let full_rounds_over_2 = cfg.full_rounds / 2;
         let total_rounds = cfg.full_rounds + cfg.partial_rounds;
@@ -816,24 +1022,28 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                 }
             }
 
-            // Sanity against traced round state.
-            let expected = &round_states[r];
-            for i in 0..t {
-                if b.assignment[next_vars[i]] != expected[i] {
-                    return Err(ReplayErr::Mismatch(format!(
-                        "round {r} state mismatch at i={i} for permute #{permute_ptr}"
-                    )));
+            if arith_mode == PoseidonArithMode::ReplayFixed {
+                // Sanity against traced round state.
+                let expected = &round_states[r];
+                for i in 0..t {
+                    if b.assignment[next_vars[i]] != expected[i] {
+                        return Err(ReplayErr::Mismatch(format!(
+                            "round {r} state mismatch at i={i} for permute #{permute_ptr}"
+                        )));
+                    }
                 }
             }
             *state_vars = next_vars;
         }
 
-        // Final sanity against permute-after.
-        for i in 0..t {
-            if b.assignment[state_vars[i]] != after_state[i] {
-                return Err(ReplayErr::Mismatch(format!(
-                    "after state mismatch at i={i} for permute #{permute_ptr}"
-                )));
+        if arith_mode == PoseidonArithMode::ReplayFixed {
+            // Final sanity against permute-after.
+            for i in 0..t {
+                if b.assignment[state_vars[i]] != after_state[i] {
+                    return Err(ReplayErr::Mismatch(format!(
+                        "after state mismatch at i={i} for permute #{permute_ptr}"
+                    )));
+                }
             }
         }
         permute_ptr += 1;
@@ -863,9 +1073,11 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                         absorb_index = 0;
                     }
 
-                    // Materialize element as a fixed var (so it can be part of the witness vector).
                     let e_var = b.new_var(e);
-                    b.enforce_var_eq_const(e_var, e);
+                    if arith_mode == PoseidonArithMode::ReplayFixed {
+                        // Replay mode: fix absorb inputs to the recorded trace values.
+                        b.enforce_var_eq_const(e_var, e);
+                    }
                     wiring.absorb_vars.push(e_var);
                     range_len += 1;
 
@@ -905,12 +1117,17 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                     let take = core::cmp::min(cfg.rate - squeeze_index, out.len() - produced);
                     for j in 0..take {
                         let pos = cfg.capacity + squeeze_index + j;
-                        let expected = out[produced + j];
-                        let v = b.new_var(expected);
-                        b.enforce_var_eq_const(v, expected);
-                        // v == state[pos]
-                        b.enforce_var_eq_var(state_vars[pos], v);
-                        wiring.squeeze_field_vars.push(v);
+                        if arith_mode == PoseidonArithMode::ReplayFixed {
+                            let expected = out[produced + j];
+                            let v = b.new_var(expected);
+                            b.enforce_var_eq_const(v, expected);
+                            // v == state[pos]
+                            b.enforce_var_eq_var(state_vars[pos], v);
+                            wiring.squeeze_field_vars.push(v);
+                        } else {
+                            // WE mode: expose the state element as the squeeze output var.
+                            wiring.squeeze_field_vars.push(state_vars[pos]);
+                        }
                     }
                     produced += take;
                     squeeze_index += take;
@@ -960,15 +1177,17 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                     }
                 }
 
-                // Compute bytes from witness values and check they match recorded.
-                let mut bytes: Vec<u8> = Vec::with_capacity(usable_bytes * num_elements);
-                for &v in &src_vars {
-                    let elem_bytes = b.assignment[v].into_bigint().to_bytes_le();
-                    bytes.extend_from_slice(&elem_bytes[..usable_bytes]);
-                }
-                bytes.truncate(*n);
-                if &bytes != out {
-                    return Err(ReplayErr::Mismatch("SqueezeBytes bytes mismatch".to_string()));
+                if arith_mode == PoseidonArithMode::ReplayFixed {
+                    // Compute bytes from witness values and check they match recorded.
+                    let mut bytes: Vec<u8> = Vec::with_capacity(usable_bytes * num_elements);
+                    for &v in &src_vars {
+                        let elem_bytes = b.assignment[v].into_bigint().to_bytes_le();
+                        bytes.extend_from_slice(&elem_bytes[..usable_bytes]);
+                    }
+                    bytes.truncate(*n);
+                    if &bytes != out {
+                        return Err(ReplayErr::Mismatch("SqueezeBytes bytes mismatch".to_string()));
+                    }
                 }
 
                 byte_witnesses.push(ByteSqueezeWitness {
@@ -986,7 +1205,13 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                     let range_start = byte_wiring.squeeze_byte_vars.len();
                     let full_len = usable_bytes * num_elements;
 
-                    // Build full bytes from current witness values (untruncated).
+                    // IMPORTANT (soundness): in WE mode, the squeezed bytes must be a *function*
+                    // of the sponge state, otherwise FS coins derived from bytes are forgeable.
+                    //
+                    // Therefore we always derive the initial byte witness from the current
+                    // squeezed field elements (like replay mode). The constraints below then
+                    // enforce that these bytes are the *canonical* low bytes of the field element
+                    // (i.e. of its integer representative in [0, p)).
                     let mut full_bytes: Vec<u8> = Vec::with_capacity(full_len);
                     for &v in &src_vars {
                         let elem_bytes = b.assignment[v].into_bigint().to_bytes_le();
@@ -1008,29 +1233,100 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                     }
                     let pow256k = acc; // 256^{usable_bytes}
 
+                    // Modulus decomposition: p = p0 + 256^k * p_hi, where k = usable_bytes.
+                    //
+                    // We enforce canonicality of the byte decomposition by constraining that the
+                    // reconstructed integer representation is < p. Since 256^k < p (by choice of
+                    // usable_bytes), this makes the low bytes uniquely determined by the field element.
+                    let mut p_bytes = F::MODULUS.to_bytes_le();
+                    // Ensure we have enough bytes for indexing.
+                    if p_bytes.len() < usable_bytes + 2 {
+                        p_bytes.resize(usable_bytes + 2, 0u8);
+                    }
+                    let p0_bytes = &p_bytes[..usable_bytes];
+                    let p0_minus1_val = {
+                        // p0 is the low k bytes of p (an integer < 256^k < p), so subtraction by 1 is safe.
+                        // Compute p0 as a field element via radix-256 evaluation, then subtract 1 in F.
+                        let mut p0 = F::ZERO;
+                        for (i, &bb) in p0_bytes.iter().enumerate() {
+                            p0 += pow256[i] * F::from(bb as u64);
+                        }
+                        p0 - F::ONE
+                    };
+                    let p_hi_u16: u16 = {
+                        // p_hi fits in at most 16 bits because `usable_bytes = floor((bits-1)/8)` implies
+                        // 8*k >= bits-8, hence p >> (8*k) < 2^8.
+                        let mut v: u16 = 0;
+                        let mut shift = 0u16;
+                        for i in 0..2 {
+                            v |= (p_bytes[usable_bytes + i] as u16) << shift;
+                            shift += 8;
+                        }
+                        v
+                    };
+                    let p_hi_f = F::from(p_hi_u16 as u64);
+
                     for e in 0..num_elements {
                         // Allocate byte vars for this element.
-                        //
-                        // IMPORTANT: these bytes are already fixed by the recorded trace
-                        // (`enforce_var_eq_const`), so additional bit-decomposition constraints
-                        // are unnecessary for soundness of this arithmetization and are very costly.
                         let mut byte_vars: Vec<usize> = Vec::with_capacity(usable_bytes);
+                        let mut byte_bits: Vec<[usize; 8]> = Vec::with_capacity(usable_bytes);
                         for i in 0..usable_bytes {
                             let bval = F::from(full_bytes[e * usable_bytes + i] as u64);
                             let bv = b.new_var(bval);
-                            b.enforce_var_eq_const(bv, bval);
+                            if arith_mode == PoseidonArithMode::ReplayFixed {
+                                b.enforce_var_eq_const(bv, bval);
+                            } else {
+                                // WE mode: enforce byte is canonical (0..255) via bit decomposition.
+                                let mut bits: [usize; 8] = [0usize; 8];
+                                for bi in 0..8 {
+                                    let bit = ((full_bytes[e * usable_bytes + i] >> bi) & 1) as u64;
+                                    let vbit = b.new_var(if bit == 1 { F::ONE } else { F::ZERO });
+                                    // boolean: vbit * (1 - vbit) = 0
+                                    b.add_constraint(
+                                        vec![(F::ONE, vbit)],
+                                        vec![(F::ONE, one), (-F::ONE, vbit)],
+                                        vec![(F::ZERO, one)],
+                                    );
+                                    bits[bi] = vbit;
+                                }
+                                // bv == Σ 2^j * bits[j]
+                                let mut lc: Vec<(F, usize)> = Vec::with_capacity(8);
+                                let mut p2 = F::ONE;
+                                for &vbit in bits.iter() {
+                                    lc.push((p2, vbit));
+                                    p2 = p2.double();
+                                }
+                                b.enforce_lc_times_one_eq_var(lc, bv);
+                                byte_bits.push(bits);
+                            }
                             byte_vars.push(bv);
                             op_byte_vars.push(bv);
                         }
 
-                        // Link src element: src = Σ 256^i * byte_i + 256^k * high
+                        // Link src element to its canonical low bytes:
+                        //   src = low + 256^k * high
+                        // and enforce that the reconstructed integer (low + 256^k*high) is < p.
+                        //
+                        // Without the <p canonicality check, the low bytes are not uniquely
+                        // determined by the field element (bytes could be chosen arbitrarily with
+                        // a compensating high), which breaks FS binding in WE mode.
                         let src = src_vars[e];
                         let mut low = F::ZERO;
                         for i in 0..usable_bytes {
                             low += pow256[i] * b.assignment[byte_vars[i]];
                         }
-                        let high_val = (b.assignment[src] - low) * pow256k.inverse().unwrap();
+                        // Materialize `low` as a variable.
+                        let mut low_lc: Vec<(F, usize)> = Vec::with_capacity(usable_bytes);
+                        for i in 0..usable_bytes {
+                            low_lc.push((pow256[i], byte_vars[i]));
+                        }
+                        let low_var = b.new_var(low);
+                        b.enforce_lc_times_one_eq_var(low_lc, low_var);
+
+                        // Compute and allocate `high` from the current witness values.
+                        let high_val = (b.assignment[src] - b.assignment[low_var]) * pow256k.inverse().unwrap();
                         let high = b.new_var(high_val);
+
                         // src - Σ 256^i*byte_i - 256^k*high = 0
                         let mut lc: Vec<(F, usize)> = Vec::with_capacity(2 + usable_bytes);
                         lc.push((F::ONE, src));
@@ -1041,6 +1337,131 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                         let z = b.new_var(F::ZERO);
                         b.enforce_var_eq_const(z, F::ZERO);
                         b.enforce_lc_times_one_eq_var(lc, z);
+
+                        if arith_mode != PoseidonArithMode::ReplayFixed {
+                            // Canonicality constraints for WE mode.
+                            //
+                            // 1) Range-check high as an 8-bit integer via bit decomposition.
+                            //    (In practice `high` is < 256 because k = floor((bits-1)/8).)
+                            let mut high_bits: [usize; 8] = [0usize; 8];
+                            for bi in 0..8 {
+                                let bit = ((p0_minus1_val.into_bigint().to_bytes_le()[0] >> bi) & 1) as u64;
+                                // Use the computed high witness to initialize bits.
+                                let hb = ((high_val.into_bigint().to_bytes_le()[0] >> bi) & 1) as u64;
+                                let vbit = b.new_var(if hb == 1 { F::ONE } else { F::ZERO });
+                                b.add_constraint(
+                                    vec![(F::ONE, vbit)],
+                                    vec![(F::ONE, one), (-F::ONE, vbit)],
+                                    vec![(F::ZERO, one)],
+                                );
+                                high_bits[bi] = vbit;
+                                let _ = bit; // silence unused (kept for potential debugging)
+                            }
+                            // high == Σ 2^j * high_bits[j]
+                            let mut lc_h: Vec<(F, usize)> = Vec::with_capacity(8);
+                            let mut p2 = F::ONE;
+                            for &vbit in high_bits.iter() {
+                                lc_h.push((p2, vbit));
+                                p2 = p2.double();
+                            }
+                            b.enforce_lc_times_one_eq_var(lc_h, high);
+
+                            // 2) Enforce high <= p_hi by introducing an 8-bit slack:
+                            //    high + slack = p_hi.
+                            let slack_val_u64 = (p_hi_u16 as i64 - (high_val.into_bigint().to_bytes_le()[0] as i64)).max(0) as u64;
+                            let slack = b.new_var(F::from(slack_val_u64));
+                            // Range-check slack as a byte.
+                            let mut slack_bits: [usize; 8] = [0usize; 8];
+                            for bi in 0..8 {
+                                let sb = ((slack_val_u64 >> bi) & 1) as u64;
+                                let vbit = b.new_var(if sb == 1 { F::ONE } else { F::ZERO });
+                                b.add_constraint(
+                                    vec![(F::ONE, vbit)],
+                                    vec![(F::ONE, one), (-F::ONE, vbit)],
+                                    vec![(F::ZERO, one)],
+                                );
+                                slack_bits[bi] = vbit;
+                            }
+                            // slack == Σ 2^j * slack_bits[j]
+                            let mut lc_s: Vec<(F, usize)> = Vec::with_capacity(8);
+                            let mut p2s = F::ONE;
+                            for &vbit in slack_bits.iter() {
+                                lc_s.push((p2s, vbit));
+                                p2s = p2s.double();
+                            }
+                            b.enforce_lc_times_one_eq_var(lc_s, slack);
+                            // high + slack == p_hi
+                            let lc_hs = vec![(F::ONE, high), (F::ONE, slack), (-p_hi_f, one)];
+                            let z2 = b.new_var(F::ZERO);
+                            b.enforce_var_eq_const(z2, F::ZERO);
+                            b.enforce_lc_times_one_eq_var(lc_hs, z2);
+
+                            // 3) If slack == 0 (i.e. high == p_hi), enforce low <= p0-1.
+                            // Compute is_eq = Π_i (1 - slack_bit_i), which is 1 iff slack == 0.
+                            let mut is_eq = b.one();
+                            for &sb in slack_bits.iter() {
+                                // t = 1 - sb
+                                let t_val = F::ONE - b.assignment[sb];
+                                let t = b.new_var(t_val);
+                                b.enforce_lc_times_one_eq_var(vec![(F::ONE, one), (-F::ONE, sb)], t);
+                                // is_eq = is_eq * t
+                                let prod_val = b.assignment[is_eq] * b.assignment[t];
+                                let prod = b.new_var(prod_val);
+                                b.enforce_mul(is_eq, t, prod);
+                                is_eq = prod;
+                            }
+
+                            // diff = (p0-1 - low) * is_eq, and diff must be in [0, 256^k).
+                            let tmp_val = p0_minus1_val - b.assignment[low_var];
+                            let tmp = b.new_var(tmp_val);
+                            b.enforce_lc_times_one_eq_var(vec![(p0_minus1_val, one), (-F::ONE, low_var)], tmp);
+                            let diff_val = b.assignment[tmp] * b.assignment[is_eq];
+                            let diff = b.new_var(diff_val);
+                            b.enforce_mul(tmp, is_eq, diff);
+
+                            // Range-check `diff` by decomposing it into `usable_bytes` bytes.
+                            let mut diff_byte_vars: Vec<usize> = Vec::with_capacity(usable_bytes);
+                            let diff_bytes_le = diff_val.into_bigint().to_bytes_le();
+                            for i in 0..usable_bytes {
+                                let bb = diff_bytes_le.get(i).copied().unwrap_or(0u8);
+                                let bval = F::from(bb as u64);
+                                let bv = b.new_var(bval);
+                                // byte range check via bits
+                                let mut bits: [usize; 8] = [0usize; 8];
+                                for bi in 0..8 {
+                                    let bit = ((bb >> bi) & 1) as u64;
+                                    let vbit = b.new_var(if bit == 1 { F::ONE } else { F::ZERO });
+                                    b.add_constraint(
+                                        vec![(F::ONE, vbit)],
+                                        vec![(F::ONE, one), (-F::ONE, vbit)],
+                                        vec![(F::ZERO, one)],
+                                    );
+                                    bits[bi] = vbit;
+                                }
+                                let mut lc: Vec<(F, usize)> = Vec::with_capacity(8);
+                                let mut p2 = F::ONE;
+                                for &vbit in bits.iter() {
+                                    lc.push((p2, vbit));
+                                    p2 = p2.double();
+                                }
+                                b.enforce_lc_times_one_eq_var(lc, bv);
+                                diff_byte_vars.push(bv);
+                            }
+                            // diff == Σ 256^i * diff_byte_i
+                            let mut lc_d: Vec<(F, usize)> = Vec::with_capacity(usable_bytes);
+                            let mut val = F::ZERO;
+                            for i in 0..usable_bytes {
+                                lc_d.push((pow256[i], diff_byte_vars[i]));
+                                val += pow256[i] * b.assignment[diff_byte_vars[i]];
+                            }
+                            let diff_recomp = b.new_var(val);
+                            b.enforce_lc_times_one_eq_var(lc_d, diff_recomp);
+                            // Enforce diff == diff_recomp
+                            b.enforce_var_eq_var(diff, diff_recomp);
+
+                            // `byte_bits` is kept for potential future strengthening/debug; silence warnings.
+                            let _ = &byte_bits;
+                        }
                     }
 
                     // Expose only the first n bytes in trace order (truncated), as transcript output vars.
@@ -1058,7 +1479,7 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
         }
     }
 
-    if permute_ptr != replay.permutes.len() {
+    if arith_mode == PoseidonArithMode::ReplayFixed && permute_ptr != replay.permutes.len() {
         return Err(ReplayErr::Invalid(format!(
             "permute count mismatch: used {permute_ptr}, replay has {}",
             replay.permutes.len()
@@ -1128,6 +1549,41 @@ mod tests {
         let (inst, assignment, _replay, _bytes) =
             poseidon_sponge_dr1cs_from_trace::<BF>(&cfg, &ops).expect("build dr1cs failed");
         inst.check(&assignment).unwrap();
+    }
+
+    #[test]
+    fn test_we_mode_squeeze_bytes_are_constrained_by_state() {
+        use ark_crypto_primitives::sponge::{
+            poseidon::PoseidonSponge, CryptographicSponge,
+        };
+        use ark_ff::Field;
+        use stark_rings::PolyRing;
+
+        type BF = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
+        let cfg = <PC as cyclotomic_rings::rings::GetPoseidonParams<BF>>::get_poseidon_config();
+
+        // Build a small synthetic ops schedule and include a SqueezeBytes.
+        let mut rng = ark_std::test_rng();
+        let mut sponge = PoseidonSponge::<BF>::new(&cfg);
+        let mut ops: Vec<PoseidonTraceOp<BF>> = Vec::new();
+
+        let absorb = (0..(cfg.rate + 2)).map(|_| BF::rand(&mut rng)).collect::<Vec<_>>();
+        sponge.absorb(&absorb);
+        ops.push(PoseidonTraceOp::Absorb(absorb));
+
+        let bytes = sponge.squeeze_bytes(17);
+        ops.push(PoseidonTraceOp::SqueezeBytes { n: 17, out: bytes.clone() });
+
+        // WE/arm-before-proof mode: IO is not fixed, but bytes must still be derived from state.
+        let (inst, mut assignment, _replay, _byte_wit, _wiring, byte_wiring) =
+            poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes::<BF>(&cfg, &ops)
+                .expect("build we-mode dr1cs failed");
+        inst.check(&assignment).unwrap();
+
+        // Flip one squeezed byte var: should break satisfaction (bytes are no longer free).
+        let v0 = *byte_wiring.squeeze_byte_vars.first().expect("missing squeeze bytes");
+        assignment[v0] += BF::ONE;
+        assert!(inst.check(&assignment).is_err());
     }
 }
 
