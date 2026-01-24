@@ -1315,6 +1315,63 @@ fn enforce_bit<F: PrimeField>(b: &mut Dr1csBuilder<F>, bit_var: usize) {
     );
 }
 
+/// Deterministic byte-view of an F257 digit `d ∈ {0..=256}` used by LF+/WE:
+///   byte(d) = if d == 256 { 0 } else { d }.
+///
+/// Returned var is constrained to be 8-bit (via `enforce_byte`) as soon as downstream
+/// code calls `short_challenge_coeff_from_byte`.
+fn f257_digit_to_byte_view<R>(
+    b: &mut Dr1csBuilder<BF<R>>,
+    digit_var: usize,
+) -> usize
+where
+    R: PolyRing,
+    R::BaseRing: PrimeField,
+{
+    // diff = digit - 256
+    let diff_val = b.assignment[digit_var] - BF::<R>::from(256u64);
+    let diff = b.new_var(diff_val);
+    b.enforce_lc_times_one_eq_const(vec![
+        (BF::<R>::ONE, digit_var),
+        (-BF::<R>::from(256u64), b.one()),
+        (-BF::<R>::ONE, diff),
+    ]);
+
+    // is_eq256 ∈ {0,1} indicates diff==0.
+    let is_eq256 = b.new_var(if diff_val == BF::<R>::ZERO {
+        BF::<R>::ONE
+    } else {
+        BF::<R>::ZERO
+    });
+    enforce_bit::<BF<R>>(b, is_eq256);
+
+    // diff * is_eq256 == 0
+    let z = b.new_var(diff_val * b.assignment[is_eq256]);
+    b.enforce_mul(diff, is_eq256, z);
+    b.enforce_var_eq_const(z, BF::<R>::ZERO);
+
+    // (diff != 0) => is_eq256 == 0
+    // Use inverse trick: diff * inv = 1 - is_eq256
+    let inv = b.new_var(diff_val.inverse().unwrap_or(BF::<R>::ZERO));
+    let prod = b.new_var(diff_val * b.assignment[inv]);
+    b.enforce_mul(diff, inv, prod);
+    b.enforce_lc_times_one_eq_const(vec![
+        (BF::<R>::ONE, prod),
+        (BF::<R>::ONE, is_eq256),
+        (-BF::<R>::ONE, b.one()),
+    ]);
+
+    // byte = digit - 256*is_eq256
+    let byte_val = b.assignment[digit_var] - BF::<R>::from(256u64) * b.assignment[is_eq256];
+    let byte = b.new_var(byte_val);
+    b.enforce_lc_times_one_eq_const(vec![
+        (BF::<R>::ONE, digit_var),
+        (-BF::<R>::from(256u64), is_eq256),
+        (-BF::<R>::ONE, byte),
+    ]);
+    byte
+}
+
 #[inline]
 fn prime_field_fixed_width_bytes<F: PrimeField>() -> usize {
     ((F::MODULUS_BIT_SIZE as usize) + 7) / 8
@@ -2168,8 +2225,7 @@ where
     }
     let mut byte_vars = Vec::new();
     for &dv in &short_digit_vars {
-        let [v0, _v1] = f257_bytes_from_var::<R>(&mut b, dv);
-        byte_vars.push(v0);
+        byte_vars.push(f257_digit_to_byte_view::<R>(&mut b, dv));
     }
     let mut rings = Vec::with_capacity(need_short);
     for i in 0..need_short {
@@ -2637,8 +2693,7 @@ where
     // Convert digits to bytes via F257 canonical byte view (256 -> 0).
     let mut byte_vars = Vec::with_capacity(need_bytes);
     for &dv in &digit_vars {
-        let [v0, _v1] = f257_bytes_from_var::<R>(&mut b, dv);
-        byte_vars.push(v0);
+        byte_vars.push(f257_digit_to_byte_view::<R>(&mut b, dv));
     }
 
     // Reconstruct ring elements, chunking by d bytes.
@@ -3622,8 +3677,42 @@ where
     ];
     let base_constraints = parts.iter().map(|(i, _)| i.constraints.len()).sum::<usize>();
 
-    let (inst, assignment) =
-        merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| e.to_string())?;
+    let (inst, assignment) = merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| {
+        // Add part-local index info for inconsistent-glue errors.
+        let msg = e.to_string();
+        if let Some((a, b)) = msg
+            .strip_prefix("merge_sparse_dr1cs_share_one_with_glue: inconsistent glued assignment (")
+            .and_then(|s| s.strip_suffix(")"))
+            .and_then(|s| s.split_once(" != "))
+            .and_then(|(x, y)| Some((x.parse::<usize>().ok()?, y.parse::<usize>().ok()?)))
+        {
+            // Compute the same offsets as the merge helper.
+            let mut offsets: Vec<usize> = Vec::with_capacity(parts.len());
+            let mut cur = 0usize;
+            for (_inst, asg) in &parts {
+                offsets.push(cur);
+                cur += asg.len().saturating_sub(1);
+            }
+            let locate = |g: usize| -> Option<(usize, usize)> {
+                if g == 0 {
+                    return Some((0, 0));
+                }
+                for (pi, (inst, _asg)) in parts.iter().enumerate() {
+                    let off = offsets[pi];
+                    let start = off + 1;
+                    let end = off + inst.nvars; // inclusive end for local last var
+                    if g >= start && g < end {
+                        return Some((pi, g - off));
+                    }
+                }
+                None
+            };
+            let la = locate(a);
+            let lb = locate(b);
+            return format!("{msg} [global {a} -> {la:?}, global {b} -> {lb:?}]");
+        }
+        msg
+    })?;
 
     let public_len = 1 + 10 + public_inputs.len();
     Ok(WeDr1csOutput { inst, assignment, public_len })
