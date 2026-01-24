@@ -137,7 +137,6 @@ fn absorb_take() -> AbsorbBreakdown {
 #[inline] fn absorb_dcom_setchk_msgs(n: usize) { ABSORB_DCOM_SETCHK_MSGS.fetch_add(n as u64, Ordering::Relaxed); }
 #[inline] fn absorb_dcom_setchk_r(n: usize) { ABSORB_DCOM_SETCHK_R.fetch_add(n as u64, Ordering::Relaxed); }
 #[inline] fn absorb_dcom_out_e(n: usize) { ABSORB_DCOM_OUT_E.fetch_add(n as u64, Ordering::Relaxed); }
-#[inline] fn absorb_dcom_out_b(n: usize) { ABSORB_DCOM_OUT_B.fetch_add(n as u64, Ordering::Relaxed); }
 #[inline] fn absorb_cm_comh(n: usize) { ABSORB_CM_COMH.fetch_add(n as u64, Ordering::Relaxed); }
 #[inline] fn absorb_cm_sumcheck_params(n: usize) { ABSORB_CM_SC_PARAMS.fetch_add(n as u64, Ordering::Relaxed); }
 #[inline] fn absorb_cm_sumcheck_msgs(n: usize) { ABSORB_CM_SC_MSGS.fetch_add(n as u64, Ordering::Relaxed); }
@@ -227,14 +226,7 @@ where
         push_squeeze_field::<BF>(ops, squeezed_field, CHALLENGE_DIGITS);
         push_absorb::<BF>(ops, CHALLENGE_DIGITS);
     }
-    fn push_squeeze_bytes<BF: PrimeField>(
-        ops: &mut Vec<Op<BF>>,
-        squeezed_bytes: &mut Vec<u8>,
-        n: usize,
-    ) {
-        ops.push(Op::SqueezeBytes { n, out: vec![0u8; n] });
-        squeezed_bytes.extend(std::iter::repeat(0u8).take(n));
-    }
+  
 
     // Public inputs absorbed as base-field scalars (bytes).
     for _ in 0..public_inputs_len {
@@ -284,7 +276,6 @@ where
     let out_nvars = nvars_lin;
     let out_e0_len = k_rg;
     let out_b_len = 1usize;
-    let out_ej_len = d;
     let dcom_evals_len = 1usize;
     let dcom_eval_vec_len = 1 + mlen_mats;
 
@@ -361,7 +352,7 @@ where
     }
     // Two CM sumchecks (degree=2) + eval table absorbs.
     let nvars_cm = params.nvars_cm as usize;
-    for which_sc in 0..2 {
+    for _ in 0..2 {
         push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field); // rc
         push_absorb::<BF<R>>(&mut ops, coeff_bytes); // nvars
         push_absorb::<BF<R>>(&mut ops, coeff_bytes); // degree=2
@@ -373,7 +364,6 @@ where
             push_absorb::<BF<R>>(&mut ops, coeff_bytes);
         }
         // CM eval tables: L instances, with (1+mlen_mats) rows each, each row has 4 ring elems.
-        let _ = which_sc;
         for _ in 0..l_instances {
             for _ in 0..(1 + mlen_mats) {
                 for _ in 0..4 {
@@ -395,7 +385,6 @@ where
 fn dummy_plus_proof_shape<R>(
     params: &WeParams,
     mlen_mats: usize,
-    _B: u128,
     n_lin_proofs: usize,
 ) -> Result<crate::plus::PlusProof<R, crate::r1cs::ComR1CSProof<R>>, String>
 where
@@ -526,7 +515,7 @@ where
 /// Arm-time (shape-only) builder for the full LF+ Π_plus WE gate.
 ///
 /// Returns a fixed dR1CS instance that depends only on statement/params and on the *shape*
-/// parameters (`public_inputs_len`, `mlen_mats`, `B`, and number of Π_lin proofs).
+/// parameters (`public_inputs_len`, `mlen_mats`, and number of Π_lin proofs).
 #[cfg(feature = "we_gate")]
 pub fn build_we_dr1cs_for_plus_proof_shape<R>(
     poseidon_cfg: &PoseidonConfig<BF<R>>,
@@ -534,13 +523,13 @@ pub fn build_we_dr1cs_for_plus_proof_shape<R>(
     public_inputs_len: usize,
     n_lin_proofs: usize,
     mlen_mats: usize,
-    B: u128,
 ) -> Result<WeDr1csShape<BF<R>>, String>
 where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + Field + PrimeField,
 {
-    let proof = dummy_plus_proof_shape::<R>(params, mlen_mats, B, n_lin_proofs)?;
+    let B = params.decomp_b as u128;
+    let proof = dummy_plus_proof_shape::<R>(params, mlen_mats, n_lin_proofs)?;
     let trace = poseidon_trace_schedule_for_plus::<R>(public_inputs_len, params, n_lin_proofs, mlen_mats)?;
     let public_inputs = vec![BF::<R>::ZERO; public_inputs_len];
     let out = build_we_dr1cs_for_plus_proof_internal::<R>(
@@ -877,21 +866,6 @@ fn poly_mul_karatsuba_lc<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: &[Lc<F>], c:
     res
 }
 
-fn poly_mul_karatsuba<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: &[usize], c: &[usize]) -> Vec<usize> {
-    assert_eq!(a.len(), c.len());
-    let n = a.len();
-    assert!(n.is_power_of_two(), "karatsuba requires power-of-two length");
-    assert!(n > 0);
-    if n == 1 {
-        return vec![scalar_mul_lc::<F>(b, vec![(F::ONE, a[0])], vec![(F::ONE, c[0])])];
-    }
-    let a_lc: Vec<Lc<F>> = a.iter().map(|&v| vec![(F::ONE, v)]).collect();
-    let c_lc: Vec<Lc<F>> = c.iter().map(|&v| vec![(F::ONE, v)]).collect();
-    poly_mul_karatsuba_lc::<F>(b, &a_lc, &c_lc)
-        .into_iter()
-        .map(|lc| lc_to_var_opt::<F>(b, lc))
-        .collect()
-}
 
 fn ring_mul_negacyclic_karatsuba<F: PrimeField>(
     b: &mut Dr1csBuilder<F>,
@@ -1123,7 +1097,6 @@ where
     let d = R::dimension();
     let need_short = 3 + k * d;
     let need_field = 2 * log_kappa + 2 + 2 * nvars;
-    let need_field_digits = need_field * CHALLENGE_DIGITS;
 
     if ops_offset > trace.ops.len() {
         return Err("cm_challenge_op_wiring: ops_offset out of range".to_string());
@@ -1559,7 +1532,6 @@ where
 {
     use latticefold::utils::sumcheck::Proof as ScProof;
 
-    let d = R::dimension();
     let l_instances = proof.evals.0.len();
     let ell = proof.dcom.dparams.l;
 
@@ -2096,7 +2068,7 @@ where
         field_digit_vars.push(b.new_var(dv));
     }
     let mut cur_digit = 0usize;
-    let mut next_chal = |cur: &mut usize, digits: &[usize], b: &mut Dr1csBuilder<BF<R>>| -> usize {
+    let next_chal = |cur: &mut usize, digits: &[usize], b: &mut Dr1csBuilder<BF<R>>| -> usize {
         let slice = &digits[*cur..*cur + CHALLENGE_DIGITS];
         *cur += CHALLENGE_DIGITS;
         combine_base257_digits::<BF<R>>(b, slice)
@@ -2938,7 +2910,7 @@ where
     let mut b_params = Dr1csBuilder::<BF<R>>::new();
     b_params.enforce_var_eq_const(b_params.one(), BF::<R>::ONE);
     for &x in &params.to_field_vec::<BF<R>>() {
-        let _ = b_params.new_var(x);
+        b_params.new_var(x);
     }
     let (params_inst, params_asg) = b_params.into_instance();
 
@@ -2999,7 +2971,7 @@ where
     let mut b_params = Dr1csBuilder::<BF<R>>::new();
     b_params.enforce_var_eq_const(b_params.one(), BF::<R>::ONE);
     for &x in &params.to_field_vec::<BF<R>>() {
-        let _ = b_params.new_var(x);
+        b_params.new_var(x);
     }
     let (params_inst, params_asg) = b_params.into_instance();
 
@@ -3053,7 +3025,7 @@ where
     let mut b_params = Dr1csBuilder::<BF<R>>::new();
     b_params.enforce_var_eq_const(b_params.one(), BF::<R>::ONE);
     for &x in &params.to_field_vec::<BF<R>>() {
-        let _ = b_params.new_var(x);
+        b_params.new_var(x);
     }
     let (params_inst, params_asg) = b_params.into_instance();
 
@@ -3116,7 +3088,7 @@ where
         digit_vars.push(b_fields.new_var(dv));
     }
     let mut cur_digit = 0usize;
-    let mut next_chal = |cur: &mut usize, digits: &[usize], b: &mut Dr1csBuilder<BF<R>>| -> usize {
+    let next_chal = |cur: &mut usize, digits: &[usize], b: &mut Dr1csBuilder<BF<R>>| -> usize {
         let slice = &digits[*cur..*cur + CHALLENGE_DIGITS];
         *cur += CHALLENGE_DIGITS;
         combine_base257_digits::<BF<R>>(b, slice)
@@ -3205,43 +3177,40 @@ where
 
     // Build independent parts in parallel (they only get glued/merged later).
     let (
-        (pose_inst, pose_asg, pose_wiring, byte_wiring, t_pose),
-        (params_inst, params_asg, params_vars, pub_input_vars, t_params),
-        (coin_inst, coin_asg, coin_wiring, op_wiring, t_coin),
-        (cm_inst, cm_asg, cm_wiring, t_cm),
+        (pose_inst, pose_asg, pose_wiring, byte_wiring),
+        (params_inst, params_asg, params_vars, pub_input_vars),
+        (coin_inst, coin_asg, coin_wiring, op_wiring),
+        (cm_inst, cm_asg, cm_wiring),
     ) = {
         let pose_build = || {
-            let t = std::time::Instant::now();
-    let (mut pose_inst, pose_asg, _replay, _byte_wit, pose_wiring, byte_wiring) =
-        poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
-            .map_err(|e| format!("poseidon arith failed: {e}"))?;
-    enforce_reabsorb_equals_squeeze::<BF<R>>(&mut pose_inst, &pose_wiring, &ops)?;
-            Ok::<_, String>((pose_inst, pose_asg, pose_wiring, byte_wiring, t.elapsed()))
+            let (mut pose_inst, pose_asg, _replay, _byte_wit, pose_wiring, byte_wiring) =
+                poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
+                    .map_err(|e| format!("poseidon arith failed: {e}"))?;
+            enforce_reabsorb_equals_squeeze::<BF<R>>(&mut pose_inst, &pose_wiring, &ops)?;
+            Ok::<_, String>((pose_inst, pose_asg, pose_wiring, byte_wiring))
         };
         let params_build = || {
-            let t = std::time::Instant::now();
-    let mut b_params = Dr1csBuilder::<BF<R>>::new();
-    b_params.enforce_var_eq_const(b_params.one(), BF::<R>::ONE);
-    let mut params_vars = Vec::with_capacity(9);
-    for &x in &params.to_field_vec::<BF<R>>() {
-        params_vars.push(b_params.new_var(x));
-    }
-    let mut pub_input_vars = Vec::with_capacity(public_inputs.len());
-    for &x in public_inputs {
-            let v = b_params.new_var(x);
-            pub_input_vars.push(v);
-    }
-    let (params_inst, params_asg) = b_params.into_instance();
-            Ok::<_, String>((params_inst, params_asg, params_vars, pub_input_vars, t.elapsed()))
+            let mut b_params = Dr1csBuilder::<BF<R>>::new();
+            b_params.enforce_var_eq_const(b_params.one(), BF::<R>::ONE);
+            let mut params_vars = Vec::with_capacity(9);
+            for &x in &params.to_field_vec::<BF<R>>() {
+                params_vars.push(b_params.new_var(x));
+            }
+            let mut pub_input_vars = Vec::with_capacity(public_inputs.len());
+            for &x in public_inputs {
+                let v = b_params.new_var(x);
+                pub_input_vars.push(v);
+            }
+            let (params_inst, params_asg) = b_params.into_instance();
+            Ok::<_, String>((params_inst, params_asg, params_vars, pub_input_vars))
         };
         let coin_build = || {
-            let t = std::time::Instant::now();
-    let (coin_inst, coin_asg, coin_wiring) = cm_short_challenges_dr1cs::<R>(trace, k, 0)?;
-    let op_wiring = cm_challenge_op_wiring::<R>(trace, k, log_kappa, nvars, 0)?;
-            Ok::<_, String>((coin_inst, coin_asg, coin_wiring, op_wiring, t.elapsed()))
+            let (coin_inst, coin_asg, coin_wiring) =
+                cm_short_challenges_dr1cs::<R>(trace, k, 0)?;
+            let op_wiring = cm_challenge_op_wiring::<R>(trace, k, log_kappa, nvars, 0)?;
+            Ok::<_, String>((coin_inst, coin_asg, coin_wiring, op_wiring))
         };
         let cm_build = || {
-            let t = std::time::Instant::now();
             let (cm_inst, cm_asg, cm_wiring) =
                 cm_verifier_math_dr1cs::<R>(
                     trace,
@@ -3256,7 +3225,7 @@ where
                     squeezed_field_offset,
                     true, // include_public_inputs_in_absorb
                 )?;
-            Ok::<_, String>((cm_inst, cm_asg, cm_wiring, t.elapsed()))
+            Ok::<_, String>((cm_inst, cm_asg, cm_wiring))
         };
 
         #[cfg(feature = "parallel")]
@@ -3274,8 +3243,6 @@ where
 
     let (pose_byte_vars, pose_field_digits) =
         cm_poseidon_challenge_vars::<R>(&pose_wiring, &byte_wiring, &op_wiring)?;
-
-    let t_glue = std::time::Instant::now();
 
     if pose_byte_vars.len() != coin_wiring.digit_vars.len() {
         return Err("poseidon/coin digit length mismatch".to_string());
@@ -3326,7 +3293,7 @@ where
         digit_vars.push(b_fields.new_var(dv));
     }
     let mut cur_digit = 0usize;
-    let mut next_chal = |cur: &mut usize, digits: &[usize], b: &mut Dr1csBuilder<BF<R>>| -> usize {
+    let next_chal = |cur: &mut usize, digits: &[usize], b: &mut Dr1csBuilder<BF<R>>| -> usize {
         let slice = &digits[*cur..*cur + CHALLENGE_DIGITS];
         *cur += CHALLENGE_DIGITS;
         combine_base257_digits::<BF<R>>(b, slice)
@@ -3517,10 +3484,8 @@ where
     ];
     let base_constraints = parts.iter().map(|(i, _)| i.constraints.len()).sum::<usize>();
 
-    let t_merge = std::time::Instant::now();
     let (inst, assignment) =
         merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| e.to_string())?;
-    let _ = (t_pose, t_params, t_coin, t_cm, t_glue, base_constraints, t_merge);
 
     let public_len = 1 + 10 + public_inputs.len();
     Ok(WeDr1csOutput { inst, assignment, public_len })
@@ -4022,7 +3987,7 @@ where
 
     // Build independent parts in parallel (they only get glued/merged later).
     let (
-        (pose_inst, pose_asg, pose_wiring, byte_wiring, is_reabsorb, pose_permutes),
+        (pose_inst, pose_asg, pose_wiring, byte_wiring, is_reabsorb),
         (params_inst, params_asg, params_vars, pub_input_vars),
         (lin_inst, lin_asg, lin_ch_vars, lin_absorb_flat),
         (coin_inst, coin_asg, coin_wiring, op_wiring),
@@ -4035,8 +4000,6 @@ where
                 poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
                     .map_err(|e| format!("poseidon arith failed: {e}"))?;
             enforce_reabsorb_equals_squeeze::<BF<R>>(&mut pose_inst, &pose_wiring, &ops)?;
-            let pose_permutes = replay.permutes.len();
-
             // Global reabsorb flags for absorb-op indexing.
             let mut is_reabsorb = vec![false; pose_wiring.absorb_ranges.len()];
             let mut expect_reabsorb = false;
@@ -4062,7 +4025,6 @@ where
                 pose_wiring,
                 byte_wiring,
                 is_reabsorb,
-                pose_permutes,
             ))
         };
 
@@ -4129,7 +4091,7 @@ where
                 digit_vars.push(b_fields.new_var(dv));
             }
             let mut cur_digit = 0usize;
-            let mut next_chal =
+            let next_chal =
                 |cur: &mut usize, digits: &[usize], b: &mut Dr1csBuilder<BF<R>>| -> usize {
                     let slice = &digits[*cur..*cur + CHALLENGE_DIGITS];
                     *cur += CHALLENGE_DIGITS;
@@ -4761,7 +4723,7 @@ mod tests {
         }
 
         // If Rayon was already initialized elsewhere, ignore and proceed.
-        let _ = builder.build_global();
+        drop(builder.build_global());
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -4949,11 +4911,11 @@ mod tests {
         // Record a small trace with a mix of squeezes.
         let mut rec = TracePoseidonTranscript::<R>::empty::<PC>();
         rec.absorb(&<R as stark_rings::Ring>::ONE);
-        let _junk = rec.squeeze_bytes(8); // not CHALLENGE_DIGITS; should be ignored for scalar challenges
+        drop(rec.squeeze_bytes(8)); // not CHALLENGE_DIGITS; should be ignored for scalar challenges
 
         let n_chals = 5usize;
         for _ in 0..n_chals {
-            let _ = rec.get_challenge();
+            rec.get_challenge();
         }
         let trace = rec.trace().clone();
 
@@ -5017,14 +4979,14 @@ mod tests {
 
         // Run verifier to get the real transcript coin stream (r_i).
         let mut rec = crate::recording_transcript::TracePoseidonTranscript::<R>::empty::<PC>();
-        let _sub = MLSumcheck::<R, _>::verify_as_subprotocol(
+        drop(MLSumcheck::<R, _>::verify_as_subprotocol(
             &mut rec,
             nvars,
             2,
             claimed_sum,
             &proof,
         )
-        .unwrap();
+        .unwrap());
         let trace = rec.trace().clone();
 
         // Build dR1CS for sumcheck verify (standalone, with challenges from trace.squeezed_field).
@@ -5052,7 +5014,7 @@ mod tests {
         }
 
         let claim0 = ring_to_ringvars::<R>(&mut b, &claimed_sum);
-        let _final_claim = sumcheck_verify_degree2::<F>(&mut b, claim0, &msg_vars, &r_sc).unwrap();
+        drop(sumcheck_verify_degree2::<F>(&mut b, claim0, &msg_vars, &r_sc).unwrap());
 
         let (inst, asg) = b.into_instance();
         inst.check(&asg).unwrap();
@@ -5616,7 +5578,6 @@ mod tests {
                 sp1_digest_bits.len(),
                 proof.lproof.len(),
                 m0.len(),
-                b_bound,
             )
             .expect("build we dr1cs shape");
             let assignment = build_we_dr1cs_for_plus_proof_witness::<RR>(
@@ -5737,7 +5698,7 @@ mod tests {
             );
 
             let t_xbig = std::time::Instant::now();
-            let _x_big = x_small.iter().copied().map(lift_to_big::<FSmall>).collect::<Vec<_>>();
+            drop(x_small.iter().copied().map(lift_to_big::<FSmall>).collect::<Vec<_>>());
             eprintln!("[test_large_trace] lift x_small->x_big: {:?}", t_xbig.elapsed());
 
             let (a_small, b_small, c_small) = if idx < k_rows {
@@ -5966,7 +5927,6 @@ mod tests {
             public_inputs.len(),
             proof.lproof.len(),
             m0.len(),
-            b_decomp,
         )
         .expect("build_we_dr1cs_for_plus_proof_shape");
 

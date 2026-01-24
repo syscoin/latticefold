@@ -253,7 +253,6 @@ pub fn run_sp1_oneproof_we_gate_from_files(
         public_inputs.len(),
         proof.lproof.len(),
         m0.len(),
-        b_decomp,
     )
     .map_err(|e| format!("build_we_dr1cs_for_plus_proof_shape: {e}"))?;
 
