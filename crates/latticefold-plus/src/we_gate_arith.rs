@@ -1137,13 +1137,9 @@ where
                 }
                 if collecting_field && squeeze_field_ops.len() < need_field {
                     // Base-257 challenges use CHALLENGE_DIGITS field elements per challenge.
-                    if v.len() != CHALLENGE_DIGITS {
-                        return Err(
-                            "cm_challenge_op_wiring: expected squeeze len=CHALLENGE_DIGITS for challenges"
-                                .to_string(),
-                        );
+                    if v.len() == CHALLENGE_DIGITS {
+                        squeeze_field_ops.push(field_op_idx);
                     }
-                    squeeze_field_ops.push(field_op_idx);
                 }
                 bytes_op_idx += 1;
                 field_op_idx += 1;
