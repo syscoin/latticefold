@@ -5364,12 +5364,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "slow: arms LF+ tiny-field gate (F257) and decapsulates a streamed proof"]
+    #[ignore = "very slow in debug: runs full DPP prove+decap; run with `--release`"]
     fn test_tiny_gate_ringlwe_lock_roundtrip_small() {
         use crate::lockable_ringlwe::RingLweParams;
         use crate::we_statement::encode_public_x;
         use crate::we_tiny_lock::arm_lfplus_we_gate_tiny_ringlwe_streaming;
         use dpp::dr1cs_flpcp::Dr1csQueryScratch;
+        use std::time::Instant;
         use rand::{rngs::StdRng, SeedableRng};
 
         // Minimal-but-valid params to keep the schedule small.
@@ -5448,6 +5449,7 @@ mod tests {
         let (inst, asg) = merge_sparse_dr1cs_share_one(&parts).expect("merge parts");
 
         // Armer builds the shape (should match our satisfiable inst).
+        let t_shape = Instant::now();
         let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
             &params,
             public_inputs_len,
@@ -5460,6 +5462,13 @@ mod tests {
         assert_eq!(shape.inst.nvars, inst.nvars);
         assert_eq!(shape.inst.constraints.len(), inst.constraints.len());
         shape.inst.check(&asg).expect("shape should be satisfied by asg");
+        eprintln!(
+            "[tiny_gate] built shape in {:?}: public_len={} nvars={} constraints={}",
+            t_shape.elapsed(),
+            shape.public_len,
+            shape.inst.nvars,
+            shape.inst.constraints.len()
+        );
 
         // Arm and then prove+decap using the satisfying assignment split into (x || z_w).
         let stmt_digest = [3u8; 32];
@@ -5477,6 +5486,7 @@ mod tests {
         // avoid feature-gated import drift.
         let _scratch_ty: Option<Dr1csQueryScratch<F257>> = None;
 
+        let t_arm = Instant::now();
         let ctx = arm_lfplus_we_gate_tiny_ringlwe_streaming::<R>(
             &params,
             public_inputs_len,
@@ -5492,19 +5502,28 @@ mod tests {
             &mut rng,
         )
         .expect("arm_lfplus_we_gate_tiny_ringlwe_streaming");
+        eprintln!(
+            "[tiny_gate] armed in {:?}: proof_len={}",
+            t_arm.elapsed(),
+            ctx.proof_len()
+        );
 
         let x = encode_public_x::<F257>(&params, &[]);
         assert_eq!(x.len(), shape.public_len);
         assert_eq!(&asg[..shape.public_len], x.as_slice(), "satisfying assignment public prefix mismatch");
         let z_w = asg[shape.public_len..].to_vec();
 
+        let t_prove = Instant::now();
         let mut pi = Vec::new();
         ctx.prove_stream(&x, &z_w, &mut |chunk| pi.extend_from_slice(&chunk))
             .expect("prove_stream");
         assert_eq!(pi.len(), ctx.proof_len());
+        eprintln!("[tiny_gate] proved in {:?}", t_prove.elapsed());
 
+        let t_decap = Instant::now();
         let a = ctx.lock.decap_answer(&x, &pi).expect("decap_answer");
         assert!(a == F257::from(1u64) || a == F257::from(2u64));
+        eprintln!("[tiny_gate] decap in {:?}", t_decap.elapsed());
 
         // Negative check: tweak proof and ensure decap fails.
         let mut pi_bad = pi.clone();
