@@ -689,7 +689,7 @@ fn enforce_reabsorb_equals_squeeze<F: PrimeField>(
 }
 
 type BF<R> = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
-const CHALLENGE_DIGITS: usize = 12;
+const CHALLENGE_DIGITS: usize = 8;
 
 fn ring_to_ringvars<R>(
     b: &mut Dr1csBuilder<BF<R>>,
@@ -1308,15 +1308,78 @@ fn scalar_pow_table<F: PrimeField>(b: &mut Dr1csBuilder<F>, base: usize, max_exp
     pows
 }
 
+/// Reconstruct a bounded scalar challenge from a fixed-size F257 digit block.
+///
+/// Semantics must match `latticefold-plus/src/transcript.rs:get_challenge`:
+/// - digit vars are constrained to be in `{0..=256}` by mapping to byte view and range-checking
+/// - byte view maps `256 -> 0`, else identity
+/// - the scalar is the u32 packed from the first 4 bytes (little-endian)
 fn combine_base257_digits<F: PrimeField>(b: &mut Dr1csBuilder<F>, digits: &[usize]) -> usize {
-    let mut lc: Vec<(F, usize)> = Vec::with_capacity(digits.len());
-    let mut pow = F::ONE;
-    let base = F::from(257u64);
-    for &d in digits {
-        lc.push((pow, d));
-        pow *= base;
+    if digits.len() != CHALLENGE_DIGITS {
+        panic!(
+            "combine_base257_digits: expected {} digits, got {}",
+            CHALLENGE_DIGITS,
+            digits.len()
+        );
     }
-    lc_to_var::<F>(b, lc)
+
+    // digit -> byte view (256 -> 0) with 8-bit range check.
+    //
+    // IMPORTANT: this is an *integer* mapping, not field-specific:
+    //   byte = digit - 256*is_eq256, where is_eq256 ∈ {0,1} and is_eq256 <-> (digit==256).
+    let digit_to_byte = |b: &mut Dr1csBuilder<F>, digit_var: usize| -> usize {
+        let c256 = F::from(256u64);
+
+        // diff = digit - 256
+        let diff_val = b.assignment[digit_var] - c256;
+        let diff = b.new_var(diff_val);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, digit_var),
+            (-c256, b.one()),
+            (-F::ONE, diff),
+        ]);
+
+        // is_eq256 ∈ {0,1} indicates diff==0.
+        let is_eq256 = b.new_var(if diff_val == F::ZERO { F::ONE } else { F::ZERO });
+        enforce_bit::<F>(b, is_eq256);
+
+        // diff * is_eq256 == 0
+        let z = b.new_var(diff_val * b.assignment[is_eq256]);
+        b.enforce_mul(diff, is_eq256, z);
+        b.enforce_var_eq_const(z, F::ZERO);
+
+        // inverse trick: diff * inv = 1 - is_eq256
+        let inv = b.new_var(diff_val.inverse().unwrap_or(F::ZERO));
+        let prod = b.new_var(diff_val * b.assignment[inv]);
+        b.enforce_mul(diff, inv, prod);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, prod),
+            (F::ONE, is_eq256),
+            (-F::ONE, b.one()),
+        ]);
+
+        // byte = digit - 256*is_eq256
+        let byte_val = b.assignment[digit_var] - c256 * b.assignment[is_eq256];
+        let byte = b.new_var(byte_val);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, digit_var),
+            (-c256, is_eq256),
+            (-F::ONE, byte),
+        ]);
+        enforce_byte::<F>(b, byte);
+        byte
+    };
+
+    let b0 = digit_to_byte(b, digits[0]);
+    let b1 = digit_to_byte(b, digits[1]);
+    let b2 = digit_to_byte(b, digits[2]);
+    let b3 = digit_to_byte(b, digits[3]);
+
+    // u32 little-endian pack in the field.
+    let w1 = F::from(256u64);
+    let w2 = F::from(256u64 * 256u64);
+    let w3 = F::from(256u64 * 256u64 * 256u64);
+    lc_to_var::<F>(b, vec![(F::ONE, b0), (w1, b1), (w2, b2), (w3, b3)])
 }
 
 fn enforce_byte<F: PrimeField>(b: &mut Dr1csBuilder<F>, byte_var: usize) {
@@ -5228,7 +5291,7 @@ mod tests {
         // Record a small trace with a mix of squeezes.
         let mut rec = TracePoseidonTranscript::<R>::empty::<PC>();
         rec.absorb(&<R as stark_rings::Ring>::ONE);
-        drop(rec.squeeze_bytes(8)); // not CHALLENGE_DIGITS; should be ignored for scalar challenges
+        drop(rec.squeeze_bytes(9)); // not CHALLENGE_DIGITS; should be ignored for scalar challenges
 
         let n_chals = 5usize;
         for _ in 0..n_chals {

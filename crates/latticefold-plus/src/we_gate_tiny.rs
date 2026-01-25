@@ -811,6 +811,110 @@ pub fn build_poseidon_f257_with_frog_coin_rejection_glue_from_ops_with_wiring(
     Ok((inst, asg, wiring_out))
 }
 
+/// Poseidon(F257) + fixed-tries rejection sampler for `n_coins` Frog scalar coins.
+///
+/// Each coin consumes `tries` occurrences of `SqueezeField(len=8)` (i.e. `tries*8` digits) and
+/// selects the first candidate `< p_frog`. Enforces `found=1` per coin.
+pub fn build_poseidon_f257_with_frog_rejection_coins_from_ops_with_wiring(
+    cfg: Option<&PoseidonConfig<F257>>,
+    ops: &[PoseidonTraceOp<F257>],
+    n_coins: usize,
+    tries: usize,
+) -> Result<(SparseDr1csInstance<F257>, Vec<F257>, Vec<FrogRejectionCoinWiring>), String> {
+    if n_coins == 0 {
+        return Err("n_coins must be > 0".to_string());
+    }
+    let (pose_inst, pose_asg, wiring, _byte_wiring) =
+        build_poseidon_f257_from_ops_with_wiring_and_bytes(cfg, ops)?;
+
+    // Collect SqueezeField(len=8) ranges.
+    let mut ranges: Vec<(usize, usize)> = wiring
+        .squeeze_field_ranges
+        .iter()
+        .copied()
+        .filter(|(_s, l)| *l == DIGITS_PER_TRY)
+        .collect();
+    if ranges.len() < n_coins * tries {
+        return Err(format!(
+            "need {} SqueezeField(len=8) ops (got {})",
+            n_coins * tries,
+            ranges.len()
+        ));
+    }
+    ranges.truncate(n_coins * tries);
+
+    // Build one glue subsystem containing all coins.
+    let mut gb = Dr1csBuilder::<F257>::new();
+    gb.enforce_var_eq_const(gb.one(), F257::ONE);
+
+    // Local copies of all digit vars in order.
+    let mut digit_vars_local: Vec<usize> = Vec::with_capacity(n_coins * tries * DIGITS_PER_TRY);
+    let mut digit_vars_global: Vec<usize> = Vec::with_capacity(n_coins * tries * DIGITS_PER_TRY);
+    for (start, len) in &ranges {
+        for v in &wiring.squeeze_field_vars[*start..*start + *len] {
+            digit_vars_global.push(*v);
+            digit_vars_local.push(gb.new_var(pose_asg[*v]));
+        }
+    }
+    debug_assert_eq!(digit_vars_global.len(), digit_vars_local.len());
+
+    // Run per-coin sampler over contiguous chunks.
+    let mut wirings: Vec<FrogRejectionCoinWiring> = Vec::with_capacity(n_coins);
+    let mut coin_limbs_local_all: Vec<[usize; LIMBS_U64]> = Vec::with_capacity(n_coins);
+    let mut found_local_all: Vec<usize> = Vec::with_capacity(n_coins);
+    for coin_idx in 0..n_coins {
+        let off = coin_idx * tries * DIGITS_PER_TRY;
+        let digits = &digit_vars_local[off..off + tries * DIGITS_PER_TRY];
+        let (coin_local, found_local) =
+            sample_frog_coin_unrolled_rejection_8_digits::<F257>(&mut gb, digits, tries);
+        gb.enforce_var_eq_const(found_local, F257::ONE);
+        coin_limbs_local_all.push(coin_local);
+        found_local_all.push(found_local);
+    }
+
+    let (glue_inst, glue_asg) = gb.into_instance();
+    let glue_nvars = glue_inst.nvars;
+
+    // Merge poseidon + glue.
+    let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(&[
+        (pose_inst, pose_asg),
+        (glue_inst, glue_asg),
+    ])
+    .map_err(|e| format!("merge poseidon+rejection_glue failed: {e}"))?;
+
+    // Glue digit vars: pose digit == local copied digit.
+    let pose_nvars = inst.nvars - (glue_nvars - 1);
+    let glue_offset = pose_nvars - 1;
+    for i in 0..digit_vars_global.len() {
+        let pose_global = digit_vars_global[i];
+        let glue_local = digit_vars_local[i];
+        let glue_global = if glue_local == 0 { 0 } else { glue_local + glue_offset };
+        enforce_var_eq::<F257>(&mut inst, pose_global, glue_global);
+    }
+
+    let to_glue_global = |glue_local: usize| -> usize {
+        if glue_local == 0 { 0 } else { glue_local + glue_offset }
+    };
+    for coin_idx in 0..n_coins {
+        let off = coin_idx * tries * DIGITS_PER_TRY;
+        let digit_vars = digit_vars_global[off..off + tries * DIGITS_PER_TRY].to_vec();
+        let found_bit = to_glue_global(found_local_all[coin_idx]);
+        let coin_limbs = coin_limbs_local_all[coin_idx]
+            .iter()
+            .copied()
+            .map(to_glue_global)
+            .collect::<Vec<_>>();
+        wirings.push(FrogRejectionCoinWiring {
+            digit_vars,
+            found_bit,
+            coin_limbs,
+            tries,
+        });
+    }
+
+    Ok((inst, asg, wirings))
+}
+
 /// Build the Poseidon transcript subrelation **over F257** from an op schedule.
 ///
 /// This is the correct transcript-layer arithmetization for the Theorem-4.3 tiny-field WE gate:
@@ -914,7 +1018,7 @@ mod tests {
         // transcript ops directly over F257.
         let mut tr = symphony::transcript::TracePoseidonTranscript::<FrogRing>::empty::<()>();
         tr.absorb_field_element(&<FrogRing as stark_rings::PolyRing>::BaseRing::from(123u64));
-        let _c = tr.get_challenge(); // SqueezeField(12) + Absorb(12)
+        let _c = tr.get_challenge(); // SqueezeField(8) + Absorb(8)
         let _b = tr.squeeze_bytes(17); // SqueezeBytes(17) (no reabsorb)
 
         let ops: Vec<PoseidonTraceOp<F257>> = tr.trace().ops.clone();
@@ -1042,6 +1146,34 @@ mod tests {
             build_poseidon_f257_with_frog_coin_rejection_glue_from_ops_with_wiring(None, &ops, tries)
                 .expect("build_poseidon_f257_with_frog_coin_rejection_glue_from_ops_with_wiring");
         inst.check(&asg).expect("poseidon+rejection coin demo satisfied");
+    }
+
+    #[test]
+    fn test_poseidon_plus_rejection_two_coins_satisfies() {
+        use ark_crypto_primitives::sponge::{poseidon::PoseidonSponge, CryptographicSponge};
+
+        let cfg = f257_poseidon_config();
+        let mut sponge = PoseidonSponge::<F257>::new(&cfg);
+        let tries: usize = DEFAULT_REJECTION_TRIES;
+        let n_coins: usize = 2;
+
+        let mut ops: Vec<PoseidonTraceOp<F257>> = Vec::new();
+        let a = vec![F257::from(123u64)];
+        sponge.absorb(&a);
+        ops.push(PoseidonTraceOp::Absorb(a));
+        for _ in 0..(n_coins * tries) {
+            let c = sponge.squeeze_field_elements::<F257>(DIGITS_PER_TRY);
+            ops.push(PoseidonTraceOp::SqueezeField(c.clone()));
+            sponge.absorb(&c);
+            ops.push(PoseidonTraceOp::Absorb(c));
+        }
+
+        let (inst, asg, w) = build_poseidon_f257_with_frog_rejection_coins_from_ops_with_wiring(
+            None, &ops, n_coins, tries,
+        )
+        .expect("build_poseidon_f257_with_frog_rejection_coins_from_ops_with_wiring");
+        assert_eq!(w.len(), n_coins);
+        inst.check(&asg).expect("poseidon+2 rejection coins satisfied");
     }
 }
 

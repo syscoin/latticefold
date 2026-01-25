@@ -31,38 +31,34 @@ pub struct PoseidonTranscriptTrace<BF: PrimeField> {
 impl<BF: PrimeField> PoseidonTranscriptTrace<BF> {
     /// Reconstruct `get_challenge()` scalars from the recorded trace.
     ///
-    /// The trace stores Poseidon sponge squeeze outputs as **base-257 digits** (each digit is a BF
+    /// The trace stores Poseidon sponge squeeze outputs as **F257 digits** (each digit is a BF
     /// element in the range \(0..=256\)). Each `get_challenge()` consumes `digits_per_challenge`
-    /// digits (currently 12 in LF/LF+), interprets them in little-endian base-257, and returns:
-    /// \[
-    ///   c = \sum_{i=0}^{d-1} digit_i \cdot 257^i
-    /// \]
+    /// digits (currently 8 in LF/LF+), interprets them in **byte view** (256 -> 0), and returns
+    /// the u32 formed by the first 4 bytes (little-endian).
     ///
     /// This helper extracts exactly the `SqueezeField` ops whose vector length equals
     /// `digits_per_challenge`, combines them, and returns the first `n` reconstructed challenges.
     pub fn challenge_scalars_base257(&self, digits_per_challenge: usize, n: usize) -> Vec<BF> {
         let mut out = Vec::with_capacity(n);
-        let base = BF::from(257u64);
         for op in &self.ops {
             if let PoseidonTraceOp::SqueezeField(digits) = op {
                 if digits.len() != digits_per_challenge {
                     continue;
                 }
-                let mut acc = BF::ZERO;
-                let mut pow = BF::ONE;
-                for d in digits {
-                    // Values should be lifted digits 0..=256.
-                    let du64 = d
+                // Pack the first 4 digits into a u32 in byte view (256 -> 0).
+                let mut bs = [0u8; 4];
+                for i in 0..4 {
+                    let du16 = digits[i]
                         .into_bigint()
                         .to_bytes_le()
                         .get(0)
                         .copied()
-                        .unwrap_or(0) as u64;
-                    debug_assert!(du64 < 257u64);
-                    acc += BF::from(du64) * pow;
-                    pow *= base;
+                        .unwrap_or(0) as u16;
+                    debug_assert!(du16 < 257u16);
+                    bs[i] = if du16 == 256 { 0u8 } else { du16 as u8 };
                 }
-                out.push(acc);
+                let x = u32::from_le_bytes(bs);
+                out.push(BF::from(x as u64));
                 if out.len() == n {
                     break;
                 }
@@ -169,8 +165,10 @@ where
     }
 
     fn get_challenge(&mut self) -> R::BaseRing {
-        // Fixed-length base-257 digits (no rejection) to keep a fixed schedule.
-        const CHALLENGE_DIGITS: usize = 12;
+        // Fixed-length digit schedule (no rejection) to keep a fixed schedule.
+        // See `crate::transcript::PoseidonTranscript::get_challenge` for semantics:
+        // pack the first 4 digits (byte view, 256 -> 0) into a u32.
+        const CHALLENGE_DIGITS: usize = 8;
         let c = self.sponge.squeeze_field_elements::<F257>(CHALLENGE_DIGITS);
         self.metrics.squeezed_field_elems += c.len() as u64;
         let lifted = c
@@ -183,16 +181,19 @@ where
         // `get_challenge` re-absorbs the squeezed elements to evolve the sponge state.
         self.absorb_f257_elems_vec(c.clone());
 
-        let mut acc = R::BaseRing::from(0u64);
-        let mut pow = R::BaseRing::from(1u64);
-        let base = R::BaseRing::from(257u64);
-        for e in &c {
-            let d = e.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u64;
-            debug_assert!(d < 257u64);
-            acc += R::BaseRing::from(d) * pow;
-            pow *= base;
+        let mut bs = [0u8; 4];
+        for i in 0..4 {
+            let d = c[i]
+                .into_bigint()
+                .to_bytes_le()
+                .get(0)
+                .copied()
+                .unwrap_or(0) as u16;
+            debug_assert!(d < 257u16);
+            bs[i] = if d == 256 { 0u8 } else { d as u8 };
         }
-        acc
+        let x = u32::from_le_bytes(bs);
+        R::BaseRing::from(x as u64)
     }
 
     fn squeeze_bytes(&mut self, n: usize) -> Vec<u8> {

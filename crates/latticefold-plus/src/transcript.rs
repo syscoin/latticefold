@@ -113,24 +113,32 @@ where
     }
 
     fn get_challenge(&mut self) -> R::BaseRing {
-        // Fixed-length base-257 digits (no rejection) to keep a fixed schedule.
-        const CHALLENGE_DIGITS: usize = 12;
+        // Fixed-length digit schedule (no rejection) to keep a fixed transcript schedule.
+        //
+        // IMPORTANT (bounded-int CM math):
+        // We interpret the squeezed F257 digits in **byte view** (256 -> 0) and pack the first
+        // 4 bytes into a u32. This keeps scalar challenges < 2^32, which is required for the
+        // "no-wrap" bounded-integer model to remain sound through degree-2/3 polynomial steps.
+        const CHALLENGE_DIGITS: usize = 8; // schedule-only; we pack 4 bytes.
         let elems = self.sponge.squeeze_field_elements::<F257>(CHALLENGE_DIGITS);
         self.metrics.squeezed_field_elems += elems.len() as u64;
         // Re-absorb squeezed elements (Fiat-Shamir)
         self.metrics.absorbed_elems += elems.len() as u64;
         self.sponge.absorb(&elems);
 
-        let mut acc = R::BaseRing::from(0u64);
-        let mut pow = R::BaseRing::from(1u64);
-        let base = R::BaseRing::from(257u64);
-        for e in &elems {
-            let d = e.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u64;
-            debug_assert!(d < 257u64);
-            acc += R::BaseRing::from(d) * pow;
-            pow *= base;
+        let mut bs = [0u8; 4];
+        for i in 0..4 {
+            let d = elems[i]
+                .into_bigint()
+                .to_bytes_le()
+                .get(0)
+                .copied()
+                .unwrap_or(0) as u16;
+            debug_assert!(d < 257u16);
+            bs[i] = if d == 256 { 0u8 } else { d as u8 };
         }
-        acc
+        let x = u32::from_le_bytes(bs);
+        R::BaseRing::from(x as u64)
     }
 
     fn squeeze_bytes(&mut self, n: usize) -> Vec<u8> {
