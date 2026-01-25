@@ -332,17 +332,80 @@ fn add_bal16_same_len(
     (out, carry)
 }
 
+/// Negate a balanced base-16 digit vector (little-endian), producing digits in [-8,7].
+///
+/// Input digits must be in [-8,7]. Output represents `-x` over integers (no wrap),
+/// using a carry chain with carry in [-2,2].
+fn neg_bal16_digits(b: &mut Dr1csBuilder<F257>, x: &[usize]) -> (Vec<usize>, usize /* carry_out */) {
+    let n = x.len();
+    let mut out: Vec<usize> = Vec::with_capacity(n);
+    let mut carry_i32: i32 = 0;
+    let mut carry = b.new_var(F257::ZERO);
+    b.enforce_var_eq_const(carry, F257::ZERO);
+
+    for i in 0..n {
+        let xi = f257_to_i32_bal(b.assignment[x[i]]);
+        let sum = (-xi) + carry_i32;
+        let mut carry_next = if sum >= 0 { (sum + 8) / 16 } else { -(((-sum) + 8) / 16) };
+        let mut rem = sum - 16 * carry_next;
+        while rem > 7 {
+            carry_next += 1;
+            rem -= 16;
+        }
+        while rem < -8 {
+            carry_next -= 1;
+            rem += 16;
+        }
+        debug_assert!((-2..=2).contains(&carry_next));
+        debug_assert!((-8..=7).contains(&rem));
+
+        let out_digit = alloc_bal16_digit(b, rem as i8);
+        let carry_next_var = alloc_carry_pm2(b, carry_next);
+
+        // -x_i + carry - out_i - 16*carry_next = 0  <=>  carry - x_i - out_i - 16*carry_next = 0
+        b.enforce_lc_times_one_eq_const(vec![
+            (F257::ONE, carry),
+            (-F257::ONE, x[i]),
+            (-F257::ONE, out_digit),
+            (-F257::from(16u64), carry_next_var),
+        ]);
+
+        out.push(out_digit);
+        carry_i32 = carry_next;
+        carry = carry_next_var;
+    }
+
+    (out, carry)
+}
+
+/// Subtract two balanced base-16 digit vectors of the same length: `a - c`.
+///
+/// Returns `(digits, carry_out)` where digits are in [-8,7] and carry_out in [-2,2].
+fn sub_bal16_same_len(
+    b: &mut Dr1csBuilder<F257>,
+    a: &[usize],
+    c: &[usize],
+) -> (Vec<usize>, usize /* carry_out */) {
+    assert_eq!(a.len(), c.len());
+    let (neg_c, carry_neg) = neg_bal16_digits(b, c);
+    // Enforce no overflow in negation (carry should be 0 for typical fixed-width usage).
+    // We leave it unconstrained here; caller can decide whether to enforce 0.
+    let _ = carry_neg;
+    add_bal16_same_len(b, a, &neg_c)
+}
+
 /// Multiply a 3-digit balanced base-16 integer by a balanced-u32 (9 digits).
 ///
 /// This matches the dominant CM pattern "small coeff (≈12 bits) × u32 challenge".
 /// Output is 12 digits: 11 balanced digits in [-8,7] plus a final carry digit in [-11,11].
-fn mul_bal16_3_by_u32(
+#[inline]
+fn mul_bal16_3_by_digits9(
     b: &mut Dr1csBuilder<F257>,
     coeff3: &[usize; 3],
-    u32_bal16_9: &[usize],
+    digits9: &[usize],
 ) -> [usize; 12] {
-    assert_eq!(u32_bal16_9.len(), 9, "u32_bal16_9 must have len 9");
-    let out = mul_bal16_small(b, coeff3, u32_bal16_9);
+    assert_eq!(digits9.len(), 9, "digits9 must have len 9");
+    let out = mul_bal16_small(b, coeff3, digits9);
     debug_assert_eq!(out.len(), 12);
     let mut r = [0usize; 12];
     for i in 0..12 {
@@ -351,20 +414,73 @@ fn mul_bal16_3_by_u32(
     r
 }
 
+/// Multiply a 3-digit balanced base-16 integer by an 18-digit balanced base-16 integer.
+///
+/// Intended for scaling by `u^2` (where `u` is u32-ish), since `u^2` is represented as 18 digits.
+/// Output is 21 digits (little-endian): 20 balanced digits in [-8,7] plus a final carry digit in [-11,11].
+#[inline]
+fn mul_bal16_3_by_digits18(
+    b: &mut Dr1csBuilder<F257>,
+    coeff3: &[usize; 3],
+    digits18: &[usize],
+) -> [usize; 21] {
+    assert_eq!(digits18.len(), 18, "digits18 must have len 18");
+    let out = mul_bal16_small(b, coeff3, digits18);
+    debug_assert_eq!(out.len(), 21);
+    let mut r = [0usize; 21];
+    for i in 0..21 {
+        r[i] = out[i];
+    }
+    r
+}
+
+/// Multiply a 3-digit balanced base-16 integer by a balanced-u32 (9 digits).
+///
+/// Wrapper around `mul_bal16_3_by_digits9` for historical naming.
+fn mul_bal16_3_by_u32(
+    b: &mut Dr1csBuilder<F257>,
+    coeff3: &[usize; 3],
+    u32_bal16_9: &[usize],
+) -> [usize; 12] {
+    mul_bal16_3_by_digits9(b, coeff3, u32_bal16_9)
+}
+
 /// Scale a vector of short-challenge coefficients (3 balanced base-16 digits each)
 /// by a bounded-u32 challenge (9 balanced digits).
 ///
 /// Returns per-coeff products as 12 base-16 digits.
+#[inline]
+fn scale_short_coeffs_by_digits9(
+    b: &mut Dr1csBuilder<F257>,
+    coeffs3: &[[usize; 3]],
+    digits9: &[usize],
+) -> Vec<[usize; 12]> {
+    assert_eq!(digits9.len(), 9);
+    coeffs3
+        .iter()
+        .map(|c3| mul_bal16_3_by_digits9(b, c3, digits9))
+        .collect()
+}
+
+#[inline]
+fn scale_short_coeffs_by_digits18(
+    b: &mut Dr1csBuilder<F257>,
+    coeffs3: &[[usize; 3]],
+    digits18: &[usize],
+) -> Vec<[usize; 21]> {
+    assert_eq!(digits18.len(), 18);
+    coeffs3
+        .iter()
+        .map(|c3| mul_bal16_3_by_digits18(b, c3, digits18))
+        .collect()
+}
+
 fn scale_short_coeffs_by_u32(
     b: &mut Dr1csBuilder<F257>,
     coeffs3: &[[usize; 3]],
     u32_digits9: &[usize],
 ) -> Vec<[usize; 12]> {
-    assert_eq!(u32_digits9.len(), 9);
-    coeffs3
-        .iter()
-        .map(|c3| mul_bal16_3_by_u32(b, c3, u32_digits9))
-        .collect()
+    scale_short_coeffs_by_digits9(b, coeffs3, u32_digits9)
 }
 
 /// Rebalance the final digit of a `mul_bal16_small` product.
@@ -476,6 +592,136 @@ fn mul_bal16_9_by_9_u32ish(
     let (mut out, carry) = add_bal16_same_len(b, &t01, &s2_pad);
     out.push(carry);
     out
+}
+
+/// Multiply two u32-ish balanced base-16 integers (9 digits each) and return a fixed-width output.
+///
+/// Output length is `out_len` digits (little-endian). If the raw product has fewer digits, we pad with 0.
+/// If it has more digits, we *enforce* the truncated high digits are 0 (so the result is truly fixed-width).
+fn mul_u32ish9_to_fixed_bal16(
+    b: &mut Dr1csBuilder<F257>,
+    a9: &[usize],
+    b9: &[usize],
+    out_len: usize,
+) -> Vec<usize> {
+    assert_eq!(a9.len(), 9);
+    assert_eq!(b9.len(), 9);
+    assert!(out_len >= 16, "u32*u32 fits in 16 nibbles; use >=16 for headroom");
+
+    let zero = alloc_bal16_digit(b, 0);
+    let raw = mul_bal16_9_by_9_u32ish(b, a9, b9);
+    if raw.len() <= out_len {
+        let mut out = raw;
+        out.extend(std::iter::repeat(zero).take(out_len - out.len()));
+        return out;
+    }
+
+    // Enforce dropped high digits are exactly 0.
+    for &dv in &raw[out_len..] {
+        b.enforce_var_eq_const(dv, F257::ZERO);
+    }
+    raw[..out_len].to_vec()
+}
+
+/// Multiply an arbitrary-length balanced base-16 integer by a 9-digit balanced-u32-ish integer.
+///
+/// This is implemented by chunking `a` into 3-digit blocks and using the existing `3×9` gadget.
+fn mul_bal16_long_by_u32ish9(
+    b: &mut Dr1csBuilder<F257>,
+    a: &[usize],
+    b9: &[usize],
+) -> Vec<usize> {
+    assert_eq!(b9.len(), 9);
+    if a.is_empty() {
+        return vec![alloc_bal16_digit(b, 0)];
+    }
+    let zero = alloc_bal16_digit(b, 0);
+    let blocks = (a.len() + 2) / 3;
+
+    // Accumulate in a fixed length with enough headroom.
+    // Each block contributes up to 13 digits (after rebalance), shifted by 3*blk.
+    let target_len = 3 * blocks + 13 + 1;
+    let mut acc = vec![zero; target_len];
+
+    for blk in 0..blocks {
+        let start = blk * 3;
+        let end = core::cmp::min(start + 3, a.len());
+        let mut coeff3 = [zero; 3];
+        for j in 0..(end - start) {
+            coeff3[j] = a[start + j];
+        }
+        let raw = mul_bal16_small(b, &coeff3, b9); // len 12
+        let reb = rebalance_tail_pm11_to_pm2(b, &raw); // len 13
+        let shifted = shift_pad_bal16(&reb, blk * 3, target_len, zero);
+        let (new_acc, carry) = add_bal16_same_len(b, &acc, &shifted);
+        acc = new_acc;
+        // propagate carry into next digit by appending then trimming (keep fixed target_len)
+        // carry is in [-2,2], so we can just add it into the top digit with normalization.
+        let top = acc[target_len - 1];
+        let carry_digit = carry;
+        let (top_sum, top_carry) = add_bal16_same_len(b, &[top], &[carry_digit]);
+        acc[target_len - 1] = top_sum[0];
+        // Enforce overflow beyond target_len is zero.
+        b.enforce_var_eq_const(top_carry, F257::ZERO);
+    }
+    acc
+}
+
+/// Multiply two arbitrary-length balanced base-16 integers (little-endian).
+///
+/// Requires each input digit var to be constrained to `[-8,7]` (as produced by the alloc/helpers).
+/// The output is a balanced base-16 digit vector (little-endian) whose length depends on inputs.
+///
+/// Implementation strategy:
+/// - chunk the shorter input into 3-digit blocks
+/// - multiply each block (3×|long|) via `mul_bal16_small`
+/// - rebalance the tail carry, shift by 3*blk, and accumulate with `add_bal16_same_len`
+fn mul_bal16_long_by_long(
+    b: &mut Dr1csBuilder<F257>,
+    a: &[usize],
+    bb: &[usize],
+) -> Vec<usize> {
+    if a.is_empty() || bb.is_empty() {
+        return vec![alloc_bal16_digit(b, 0)];
+    }
+    if a.len().min(bb.len()) <= 3 {
+        let raw = mul_bal16_small(b, a, bb);
+        // Normalize tail carry so downstream addition logic can treat it uniformly.
+        return rebalance_tail_pm11_to_pm2(b, &raw);
+    }
+
+    // Ensure `short` is the shorter input.
+    let (short, long) = if a.len() <= bb.len() { (a, bb) } else { (bb, a) };
+
+    let zero = alloc_bal16_digit(b, 0);
+    let blocks = (short.len() + 2) / 3;
+
+    // For each block: mul_bal16_small(3 × long_len) returns (long_len + 3 + 1carry) digits,
+    // then rebalance adds one more digit.
+    let per_block_len = long.len() + 3 + 1 + 1; // = long.len() + 5
+    let target_len = per_block_len + 3 * (blocks - 1) + 2; // +2 headroom for accumulation carry
+    let mut acc = vec![zero; target_len];
+
+    for blk in 0..blocks {
+        let start = blk * 3;
+        let end = core::cmp::min(start + 3, short.len());
+        let mut coeff3 = [zero; 3];
+        for j in 0..(end - start) {
+            coeff3[j] = short[start + j];
+        }
+        let raw = mul_bal16_small(b, &coeff3, long);
+        let reb = rebalance_tail_pm11_to_pm2(b, &raw);
+        let shifted = shift_pad_bal16(&reb, blk * 3, target_len, zero);
+        let (new_acc, carry) = add_bal16_same_len(b, &acc, &shifted);
+        acc = new_acc;
+
+        // Fold the per-add carry into the top digit and enforce no overflow beyond target_len.
+        let top = acc[target_len - 1];
+        let (top_sum, top_carry) = add_bal16_same_len(b, &[top], &[carry]);
+        acc[target_len - 1] = top_sum[0];
+        b.enforce_var_eq_const(top_carry, F257::ZERO);
+    }
+    acc
 }
 
 /// Multiply two balanced base-16 digit vectors (little-endian), specialized for the case
@@ -890,7 +1136,7 @@ fn digit_to_byte_var<F: PrimeField>(b: &mut Dr1csBuilder<F>, d: usize) -> usize 
 fn bounded_u32_from_8_digits_base128(
     b: &mut Dr1csBuilder<F257>,
     digits: &[usize; DIGITS_PER_TRY],
-) -> ([usize; LIMBS_U32], [usize; 4], Vec<usize>) {
+) -> ([usize; LIMBS_U32], [usize; 4], Vec<usize>, Vec<usize>) {
     // First 4 digits -> bytes in 0..255.
     let mut bytes = [0usize; 4];
     for i in 0..4 {
@@ -899,6 +1145,7 @@ fn bounded_u32_from_8_digits_base128(
 
     // Balanced base-16 digits (len 9) for the same u32 (used by CM mul gadgets).
     let bal16_digits = u32_bytes_to_bal16_digits(b, bytes);
+    let bal16_sq_digits = mul_u32ish9_to_fixed_bal16(b, &bal16_digits, &bal16_digits, 18);
 
     // Bits 0..31 of the u32, little-endian.
     let mut bits32: [usize; 32] = [0usize; 32];
@@ -937,7 +1184,7 @@ fn bounded_u32_from_8_digits_base128(
         limbs[li] = limb;
     }
 
-    (limbs, bytes, bal16_digits)
+    (limbs, bytes, bal16_digits, bal16_sq_digits)
 }
 
 fn base128_add10<F: PrimeField>(
@@ -1635,6 +1882,11 @@ pub struct BoundedU32ChallengeWiring {
     pub limbs: [usize; LIMBS_U32],
     /// Balanced base-16 digits (little-endian), length 9, representing the same u32 value.
     pub bal16_digits: Vec<usize>,
+    /// Balanced base-16 digits (little-endian), length 18, representing `u^2` as an integer.
+    ///
+    /// This is a common derived scalar in CM (e.g. `beta2 = beta*beta`) and avoids going back to
+    /// in-field multiplication for u32-ish values.
+    pub bal16_sq_digits: Vec<usize>,
 }
 
 /// Wiring for short challenges `short_challenge(128)` over a ring of dimension `ring_dim`.
@@ -1686,6 +1938,185 @@ pub struct TinyCoinOpWiring {
     pub u32_squeeze_ops: Vec<usize>,
     /// `SqueezeField(len=8)` op indices for Frog rejection candidates (length must be `n_coins*tries`).
     pub frog_squeeze_ops: Vec<usize>,
+}
+
+/// Wiring for a simple “first CM digit-mul surface” stage:
+/// multiply one short-challenge block's coefficients by one bounded-u32 challenge using the digit backend.
+#[derive(Clone, Debug)]
+pub struct CmDigitMulSurfaceWiring {
+    pub short_block_idx: usize,
+    pub u32_idx: usize,
+    /// Per coefficient product digits (len 12 each), in ring coefficient order.
+    pub products: Vec<[usize; 12]>,
+    /// Same products as `products`, but with the tail carry normalized so all digits are in `[-8,7]`
+    /// plus one final carry digit in `[-2,2]`.
+    ///
+    /// This is the preferred representation for downstream additions/accumulations.
+    pub products13: Vec<[usize; 13]>,
+    /// Optional accumulated sum of all coefficient products as balanced base-16 digits (little-endian).
+    ///
+    /// This is the first “real consumption” step beyond per-coeff products: it forces the circuit
+    /// to actually add up the products (still purely at the digit level).
+    pub sum_digits: Vec<usize>,
+
+    /// Accumulated sum across **all requested digit-mul surfaces** in the batch builder.
+    ///
+    /// This is a convenience wiring to support “scale then add then add ...” consumption patterns.
+    /// All surfaces returned by a single builder call will carry the same `sum_all_pairs_digits`.
+    pub sum_all_pairs_digits: Vec<usize>,
+
+    /// Coefficient-wise sum across **all requested digit-mul surfaces**.
+    ///
+    /// Length = `ring_dim`; each entry is a balanced base-16 digit vector (little-endian) of length 16.
+    /// This matches the CM pattern “scale (per coefficient) then add”, and is the next consumption hook
+    /// we’ll use to build real CM accumulations.
+    pub sum_all_pairs_coeffwise: Vec<Vec<usize>>,
+}
+
+/// Like `CmDigitMulSurfaceWiring`, but multiplies a short-challenge block by **u32^2** (18 digits).
+#[derive(Clone, Debug)]
+pub struct CmDigitMulSqSurfaceWiring {
+    pub short_block_idx: usize,
+    pub u32_idx: usize,
+    /// Per coefficient product digits (len 21 each), in ring coefficient order.
+    pub products21: Vec<[usize; 21]>,
+    /// Same products as `products21`, but normalized to 22 digits (tail carry split to `[-8,7]` + `[-2,2]`).
+    pub products22: Vec<[usize; 22]>,
+    /// Sum of all coefficient products (balanced base-16 digits, little-endian), fixed length 24.
+    pub sum_digits: Vec<usize>,
+    /// Sum across all requested sq-surfaces in the batch, fixed length 24.
+    pub sum_all_pairs_digits: Vec<usize>,
+    /// Coefficient-wise sum across all requested sq-surfaces, length ring_dim, each fixed length 24.
+    pub sum_all_pairs_coeffwise: Vec<Vec<usize>>,
+}
+
+#[inline]
+fn rebalance_prod12_to_prod13(
+    b: &mut Dr1csBuilder<F257>,
+    p12: &[usize; 12],
+) -> [usize; 13] {
+    let v12 = p12.to_vec();
+    let v13 = rebalance_tail_pm11_to_pm2(b, &v12);
+    debug_assert_eq!(v13.len(), 13);
+    let mut out = [0usize; 13];
+    for i in 0..13 {
+        out[i] = v13[i];
+    }
+    out
+}
+
+#[inline]
+fn rebalance_prod21_to_prod22(
+    b: &mut Dr1csBuilder<F257>,
+    p21: &[usize; 21],
+) -> [usize; 22] {
+    let v21 = p21.to_vec();
+    let v22 = rebalance_tail_pm11_to_pm2(b, &v21);
+    debug_assert_eq!(v22.len(), 22);
+    let mut out = [0usize; 22];
+    for i in 0..22 {
+        out[i] = v22[i];
+    }
+    out
+}
+
+fn sum_product_digits_bal16(
+    b: &mut Dr1csBuilder<F257>,
+    products13: &[[usize; 13]],
+    target_len: usize,
+) -> Vec<usize> {
+    assert!(target_len >= 13);
+    let zero = alloc_bal16_digit(b, 0);
+
+    // Start at zero.
+    let mut acc = vec![zero; target_len];
+
+    for p13 in products13 {
+        let padded = shift_pad_bal16(p13, 0, target_len, zero);
+        let (new_acc, carry) = add_bal16_same_len(b, &acc, &padded);
+        acc = new_acc;
+        // For the envelope sizes we use (e.g. ring_dim<=64, coeff in [-128,127]), a modest target_len
+        // (like 16) is enough so this final carry should be 0.
+        b.enforce_var_eq_const(carry, F257::ZERO);
+    }
+    acc
+}
+
+fn sum_product_digits_bal16_22(
+    b: &mut Dr1csBuilder<F257>,
+    products22: &[[usize; 22]],
+    target_len: usize,
+) -> Vec<usize> {
+    assert!(target_len >= 22);
+    let zero = alloc_bal16_digit(b, 0);
+    let mut acc = vec![zero; target_len];
+    for p22 in products22 {
+        let padded = shift_pad_bal16(p22, 0, target_len, zero);
+        let (new_acc, carry) = add_bal16_same_len(b, &acc, &padded);
+        acc = new_acc;
+        b.enforce_var_eq_const(carry, F257::ZERO);
+    }
+    acc
+}
+
+fn sum_bal16_vectors_fixed_len(
+    b: &mut Dr1csBuilder<F257>,
+    vecs: &[Vec<usize>],
+    len: usize,
+) -> Vec<usize> {
+    let zero = alloc_bal16_digit(b, 0);
+    let mut acc = vec![zero; len];
+    for v in vecs {
+        assert_eq!(v.len(), len);
+        let (new_acc, carry) = add_bal16_same_len(b, &acc, v);
+        acc = new_acc;
+        b.enforce_var_eq_const(carry, F257::ZERO);
+    }
+    acc
+}
+
+fn sum_products13_coeffwise_fixed_len(
+    b: &mut Dr1csBuilder<F257>,
+    per_surface_products13: &[Vec<[usize; 13]>],
+    ring_dim: usize,
+    out_len: usize,
+) -> Vec<Vec<usize>> {
+    let zero = alloc_bal16_digit(b, 0);
+    let mut out: Vec<Vec<usize>> = Vec::with_capacity(ring_dim);
+    for coeff_idx in 0..ring_dim {
+        let mut acc = vec![zero; out_len];
+        for surf in per_surface_products13 {
+            let p13 = &surf[coeff_idx];
+            let padded = shift_pad_bal16(p13, 0, out_len, zero);
+            let (new_acc, carry) = add_bal16_same_len(b, &acc, &padded);
+            acc = new_acc;
+            b.enforce_var_eq_const(carry, F257::ZERO);
+        }
+        out.push(acc);
+    }
+    out
+}
+
+fn sum_products22_coeffwise_fixed_len(
+    b: &mut Dr1csBuilder<F257>,
+    per_surface_products22: &[Vec<[usize; 22]>],
+    ring_dim: usize,
+    out_len: usize,
+) -> Vec<Vec<usize>> {
+    let zero = alloc_bal16_digit(b, 0);
+    let mut out: Vec<Vec<usize>> = Vec::with_capacity(ring_dim);
+    for coeff_idx in 0..ring_dim {
+        let mut acc = vec![zero; out_len];
+        for surf in per_surface_products22 {
+            let p22 = &surf[coeff_idx];
+            let padded = shift_pad_bal16(p22, 0, out_len, zero);
+            let (new_acc, carry) = add_bal16_same_len(b, &acc, &padded);
+            acc = new_acc;
+            b.enforce_var_eq_const(carry, F257::ZERO);
+        }
+        out.push(acc);
+    }
+    out
 }
 
 /// Infer the CM coin op wiring from a Poseidon op schedule.
@@ -2104,12 +2535,14 @@ pub fn build_poseidon_f257_with_cm_coin_surface_from_ops_with_wiring(
                     d[i] = local_digits[cursor + i];
                 }
                 cursor += DIGITS_PER_TRY;
-                let (limbs, bytes, bal16_digits) = bounded_u32_from_8_digits_base128(&mut gb, &d);
+                let (limbs, bytes, bal16_digits, bal16_sq_digits) =
+                    bounded_u32_from_8_digits_base128(&mut gb, &d);
                 u32s.push(BoundedU32ChallengeWiring {
                     digit_vars: d.to_vec(),
                     byte_vars: bytes,
                     limbs,
                     bal16_digits,
+                    bal16_sq_digits,
                 });
             }
         }
@@ -2160,6 +2593,7 @@ pub fn build_poseidon_f257_with_cm_coin_surface_from_ops_with_wiring(
             byte_vars: w.byte_vars.map(to_glue_global),
             limbs: w.limbs.map(to_glue_global),
             bal16_digits: w.bal16_digits.into_iter().map(to_glue_global).collect(),
+            bal16_sq_digits: w.bal16_sq_digits.into_iter().map(to_glue_global).collect(),
         })
         .collect::<Vec<_>>();
 
@@ -2258,12 +2692,13 @@ pub fn build_poseidon_f257_with_cm_coins_and_frog_rejection_from_ops_with_wiring
             d[i] = local_digits[cursor + i];
         }
         cursor += DIGITS_PER_TRY;
-        let (limbs, bytes, bal16_digits) = bounded_u32_from_8_digits_base128(&mut gb, &d);
+        let (limbs, bytes, bal16_digits, bal16_sq_digits) = bounded_u32_from_8_digits_base128(&mut gb, &d);
         u32s.push(BoundedU32ChallengeWiring {
             digit_vars: d.to_vec(),
             byte_vars: bytes,
             limbs,
             bal16_digits,
+            bal16_sq_digits,
         });
     }
 
@@ -2329,6 +2764,7 @@ pub fn build_poseidon_f257_with_cm_coins_and_frog_rejection_from_ops_with_wiring
             byte_vars: w.byte_vars.map(to_glue_global),
             limbs: w.limbs.map(to_glue_global),
             bal16_digits: w.bal16_digits.into_iter().map(to_glue_global).collect(),
+            bal16_sq_digits: w.bal16_sq_digits.into_iter().map(to_glue_global).collect(),
         })
         .collect::<Vec<_>>();
 
@@ -2356,6 +2792,572 @@ pub fn build_poseidon_f257_with_cm_coins_and_frog_rejection_from_ops_with_wiring
     Ok((inst, asg, shorts_global, u32s_global, frog_wirings))
 }
 
+/// Build Poseidon(F257) + CM coin surface + one digit-mul surface:
+/// take `shorts[short_block_idx]` and multiply all its coeffs by `u32s[u32_idx]`.
+pub fn build_poseidon_f257_with_cm_coins_frog_and_first_digit_mul_from_ops_with_wiring(
+    cfg: Option<&PoseidonConfig<F257>>,
+    ops: &[PoseidonTraceOp<F257>],
+    ring_dim: usize,
+    wiring: &TinyCoinOpWiring,
+    n_coins: usize,
+    tries: usize,
+    short_block_idx: usize,
+    u32_idx: usize,
+) -> Result<
+    (
+        SparseDr1csInstance<F257>,
+        Vec<F257>,
+        Vec<ShortChallengeWiring>,
+        Vec<BoundedU32ChallengeWiring>,
+        Vec<FrogRejectionCoinWiring>,
+        CmDigitMulSurfaceWiring,
+    ),
+    String,
+> {
+    let pairs = vec![(short_block_idx, u32_idx)];
+    let (inst, asg, shorts, u32s, frogs, surfaces) =
+        build_poseidon_f257_with_cm_coins_frog_and_digit_mul_surfaces_from_ops_with_wiring(
+            cfg, ops, ring_dim, wiring, n_coins, tries, &pairs,
+        )?;
+    let surface = surfaces
+        .into_iter()
+        .next()
+        .ok_or_else(|| "expected one surface".to_string())?;
+    Ok((inst, asg, shorts, u32s, frogs, surface))
+}
+
+/// Build Poseidon(F257) + CM coin surface + Frog coins + a batch of **u32^2 digit-mul surfaces**.
+///
+/// Each pair `(short_block_idx, u32_idx)` requests multiplying all coeffs in that short block by
+/// the squared u32 challenge `u32s[u32_idx]^2` (represented as 18 balanced base-16 digits).
+pub fn build_poseidon_f257_with_cm_coins_frog_and_digit_mul_sq_surfaces_from_ops_with_wiring(
+    cfg: Option<&PoseidonConfig<F257>>,
+    ops: &[PoseidonTraceOp<F257>],
+    ring_dim: usize,
+    wiring: &TinyCoinOpWiring,
+    n_coins: usize,
+    tries: usize,
+    pairs: &[(usize, usize)],
+) -> Result<
+    (
+        SparseDr1csInstance<F257>,
+        Vec<F257>,
+        Vec<ShortChallengeWiring>,
+        Vec<BoundedU32ChallengeWiring>,
+        Vec<FrogRejectionCoinWiring>,
+        Vec<CmDigitMulSqSurfaceWiring>,
+    ),
+    String,
+> {
+    let (pose_inst, pose_asg, pose_wiring, _byte_wiring) =
+        build_poseidon_f257_from_ops_with_wiring_and_bytes(cfg, ops)?;
+
+    let short_ranges =
+        squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.short_squeeze_ops)?;
+    let u32_ranges =
+        squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.u32_squeeze_ops)?;
+    let frog_ranges =
+        squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.frog_squeeze_ops)?;
+
+    if n_coins == 0 {
+        return Err("n_coins must be > 0".to_string());
+    }
+    if wiring.frog_squeeze_ops.len() != n_coins * tries {
+        return Err("frog_squeeze_ops length mismatch".to_string());
+    }
+
+    let mut gb = Dr1csBuilder::<F257>::new();
+    gb.enforce_var_eq_const(gb.one(), F257::ONE);
+
+    // Copy digit vars in a deterministic order (via a memo map).
+    let mut local_map: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    #[inline]
+    fn copy_digit(
+        gb: &mut Dr1csBuilder<F257>,
+        pose_asg: &[F257],
+        local_map: &mut std::collections::BTreeMap<usize, usize>,
+        gv: usize,
+    ) -> usize {
+        if let Some(&lv) = local_map.get(&gv) {
+            return lv;
+        }
+        let lv = gb.new_var(pose_asg[gv]);
+        local_map.insert(gv, lv);
+        lv
+    }
+
+    for &(si, ui) in pairs {
+        if si >= short_ranges.len() {
+            return Err(format!("short_block_idx {si} out of range"));
+        }
+        if ui >= u32_ranges.len() {
+            return Err(format!("u32_idx {ui} out of range"));
+        }
+    }
+
+    // Materialize required short blocks.
+    let mut short_locals: std::collections::BTreeMap<usize, ShortChallengeWiring> = std::collections::BTreeMap::new();
+    for &(si, _ui) in pairs {
+        if short_locals.contains_key(&si) {
+            continue;
+        }
+        let (s_start, s_len) = short_ranges[si];
+        if s_len != ring_dim {
+            return Err(format!("short block {si} length mismatch (got {s_len}, expected {ring_dim})"));
+        }
+        let short_digits_global = &pose_wiring.squeeze_field_vars[s_start..s_start + s_len];
+        let short_digits_local: Vec<usize> = short_digits_global
+            .iter()
+            .copied()
+            .map(|gv| copy_digit(&mut gb, &pose_asg, &mut local_map, gv))
+            .collect();
+        let (short_bvars, short_coeffs, short_coeff_digits) =
+            short_challenge_from_digits_128(&mut gb, &short_digits_local, ring_dim);
+        short_locals.insert(si, ShortChallengeWiring {
+            digit_vars: short_digits_local,
+            byte_vars: short_bvars,
+            coeff_vars: short_coeffs,
+            coeff_bal16_digits: short_coeff_digits,
+        });
+    }
+
+    // Materialize required u32 blocks.
+    let mut u32_locals: std::collections::BTreeMap<usize, BoundedU32ChallengeWiring> = std::collections::BTreeMap::new();
+    for &(_si, ui) in pairs {
+        if u32_locals.contains_key(&ui) {
+            continue;
+        }
+        let (u_start, u_len) = u32_ranges[ui];
+        if u_len != DIGITS_PER_TRY {
+            return Err(format!("u32 block {ui} length mismatch (got {u_len}, expected {DIGITS_PER_TRY})"));
+        }
+        let u_digits_global = &pose_wiring.squeeze_field_vars[u_start..u_start + u_len];
+        let mut u_digits_local = [0usize; DIGITS_PER_TRY];
+        for i in 0..DIGITS_PER_TRY {
+            u_digits_local[i] = copy_digit(&mut gb, &pose_asg, &mut local_map, u_digits_global[i]);
+        }
+        let (u_limbs, u_bytes, u_bal16, u_bal16_sq) =
+            bounded_u32_from_8_digits_base128(&mut gb, &u_digits_local);
+        u32_locals.insert(ui, BoundedU32ChallengeWiring {
+            digit_vars: u_digits_local.to_vec(),
+            byte_vars: u_bytes,
+            limbs: u_limbs,
+            bal16_digits: u_bal16,
+            bal16_sq_digits: u_bal16_sq,
+        });
+    }
+
+    // Build requested sq digit-mul surfaces.
+    let mut surfaces_local: Vec<CmDigitMulSqSurfaceWiring> = Vec::with_capacity(pairs.len());
+    for &(si, ui) in pairs {
+        let s = short_locals.get(&si).expect("short local present");
+        let u = u32_locals.get(&ui).expect("u32 local present");
+        let products21 = scale_short_coeffs_by_digits18(&mut gb, &s.coeff_bal16_digits, &u.bal16_sq_digits);
+        let products22 = products21
+            .iter()
+            .map(|p21| rebalance_prod21_to_prod22(&mut gb, p21))
+            .collect::<Vec<_>>();
+        let sum_digits = sum_product_digits_bal16_22(&mut gb, &products22, 24);
+        surfaces_local.push(CmDigitMulSqSurfaceWiring {
+            short_block_idx: si,
+            u32_idx: ui,
+            products21,
+            products22,
+            sum_digits,
+            sum_all_pairs_digits: Vec::new(),
+            sum_all_pairs_coeffwise: Vec::new(),
+        });
+    }
+
+    let all_sum_digits = sum_bal16_vectors_fixed_len(
+        &mut gb,
+        &surfaces_local.iter().map(|s| s.sum_digits.clone()).collect::<Vec<_>>(),
+        24,
+    );
+    let all_sum_coeffwise = sum_products22_coeffwise_fixed_len(
+        &mut gb,
+        &surfaces_local.iter().map(|s| s.products22.clone()).collect::<Vec<_>>(),
+        ring_dim,
+        24,
+    );
+    for s in &mut surfaces_local {
+        s.sum_all_pairs_digits = all_sum_digits.clone();
+        s.sum_all_pairs_coeffwise = all_sum_coeffwise.clone();
+    }
+
+    // Frog candidates.
+    let mut frog_digit_vars_local: Vec<usize> = Vec::with_capacity(n_coins * tries * DIGITS_PER_TRY);
+    let mut frog_digit_vars_global: Vec<usize> = Vec::with_capacity(n_coins * tries * DIGITS_PER_TRY);
+    for &(start, len) in &frog_ranges {
+        if len != DIGITS_PER_TRY {
+            return Err("frog squeeze len mismatch".to_string());
+        }
+        for v in &pose_wiring.squeeze_field_vars[start..start + len] {
+            frog_digit_vars_global.push(*v);
+            frog_digit_vars_local.push(copy_digit(&mut gb, &pose_asg, &mut local_map, *v));
+        }
+    }
+    let mut frog_wirings_local: Vec<FrogRejectionCoinWiring> = Vec::with_capacity(n_coins);
+    let mut coin_limbs_local_all: Vec<[usize; LIMBS_U64]> = Vec::with_capacity(n_coins);
+    let mut found_local_all: Vec<usize> = Vec::with_capacity(n_coins);
+    for coin_idx in 0..n_coins {
+        let off = coin_idx * tries * DIGITS_PER_TRY;
+        let digits = &frog_digit_vars_local[off..off + tries * DIGITS_PER_TRY];
+        let (coin_local, found_local) =
+            sample_frog_coin_unrolled_rejection_8_digits::<F257>(&mut gb, digits, tries);
+        gb.enforce_var_eq_const(found_local, F257::ONE);
+        coin_limbs_local_all.push(coin_local);
+        found_local_all.push(found_local);
+    }
+
+    let (glue_inst, glue_asg) = gb.into_instance();
+    let glue_nvars = glue_inst.nvars;
+
+    let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(&[
+        (pose_inst, pose_asg),
+        (glue_inst, glue_asg),
+    ])
+    .map_err(|e| format!("merge poseidon+cm+frog+sqmul failed: {e}"))?;
+
+    // Glue copied digit vars.
+    let pose_nvars = inst.nvars - (glue_nvars - 1);
+    let glue_offset = pose_nvars - 1;
+    for (gv, lv) in local_map.iter() {
+        let pose_global = *gv;
+        let glue_local = *lv;
+        let glue_global = if glue_local == 0 { 0 } else { glue_local + glue_offset };
+        enforce_var_eq::<F257>(&mut inst, pose_global, glue_global);
+    }
+
+    let to_glue_global = |glue_local: usize| -> usize {
+        if glue_local == 0 { 0 } else { glue_local + glue_offset }
+    };
+
+    let shorts_out = short_locals
+        .into_iter()
+        .map(|(_idx, w)| ShortChallengeWiring {
+            digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
+            byte_vars: w.byte_vars.into_iter().map(to_glue_global).collect(),
+            coeff_vars: w.coeff_vars.into_iter().map(to_glue_global).collect(),
+            coeff_bal16_digits: w
+                .coeff_bal16_digits
+                .into_iter()
+                .map(|a| a.map(to_glue_global))
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let u32s_out = u32_locals
+        .into_iter()
+        .map(|(_idx, w)| BoundedU32ChallengeWiring {
+            digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
+            byte_vars: w.byte_vars.map(to_glue_global),
+            limbs: w.limbs.map(to_glue_global),
+            bal16_digits: w.bal16_digits.into_iter().map(to_glue_global).collect(),
+            bal16_sq_digits: w.bal16_sq_digits.into_iter().map(to_glue_global).collect(),
+        })
+        .collect::<Vec<_>>();
+
+    for coin_idx in 0..n_coins {
+        let off = coin_idx * tries * DIGITS_PER_TRY;
+        let digit_vars = frog_digit_vars_global[off..off + tries * DIGITS_PER_TRY].to_vec();
+        let found_bit = to_glue_global(found_local_all[coin_idx]);
+        let coin_limbs = coin_limbs_local_all[coin_idx]
+            .iter()
+            .copied()
+            .map(to_glue_global)
+            .collect::<Vec<_>>();
+        frog_wirings_local.push(FrogRejectionCoinWiring { digit_vars, found_bit, coin_limbs, tries });
+    }
+
+    let surfaces = surfaces_local
+        .into_iter()
+        .map(|s| CmDigitMulSqSurfaceWiring {
+            short_block_idx: s.short_block_idx,
+            u32_idx: s.u32_idx,
+            products21: s.products21.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
+            products22: s.products22.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
+            sum_digits: s.sum_digits.into_iter().map(to_glue_global).collect(),
+            sum_all_pairs_digits: s.sum_all_pairs_digits.into_iter().map(to_glue_global).collect(),
+            sum_all_pairs_coeffwise: s
+                .sum_all_pairs_coeffwise
+                .into_iter()
+                .map(|v| v.into_iter().map(to_glue_global).collect())
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+
+    Ok((inst, asg, shorts_out, u32s_out, frog_wirings_local, surfaces))
+}
+
+/// Build Poseidon(F257) + CM coin surface + Frog coins + a batch of digit-mul surfaces.
+///
+/// Each pair `(short_block_idx, u32_idx)` requests multiplying all coeffs in that short block by
+/// the bounded-u32 challenge at `u32_idx`.
+pub fn build_poseidon_f257_with_cm_coins_frog_and_digit_mul_surfaces_from_ops_with_wiring(
+    cfg: Option<&PoseidonConfig<F257>>,
+    ops: &[PoseidonTraceOp<F257>],
+    ring_dim: usize,
+    wiring: &TinyCoinOpWiring,
+    n_coins: usize,
+    tries: usize,
+    pairs: &[(usize, usize)],
+) -> Result<
+    (
+        SparseDr1csInstance<F257>,
+        Vec<F257>,
+        Vec<ShortChallengeWiring>,
+        Vec<BoundedU32ChallengeWiring>,
+        Vec<FrogRejectionCoinWiring>,
+        Vec<CmDigitMulSurfaceWiring>,
+    ),
+    String,
+> {
+    let (pose_inst, pose_asg, pose_wiring, _byte_wiring) =
+        build_poseidon_f257_from_ops_with_wiring_and_bytes(cfg, ops)?;
+
+    // Resolve ranges from op indices.
+    let short_ranges =
+        squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.short_squeeze_ops)?;
+    let u32_ranges =
+        squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.u32_squeeze_ops)?;
+    let frog_ranges =
+        squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.frog_squeeze_ops)?;
+
+    if n_coins == 0 {
+        return Err("n_coins must be > 0".to_string());
+    }
+    if wiring.frog_squeeze_ops.len() != n_coins * tries {
+        return Err("frog_squeeze_ops length mismatch".to_string());
+    }
+
+    // Build glue circuit (coins + mul surface).
+    let mut gb = Dr1csBuilder::<F257>::new();
+    gb.enforce_var_eq_const(gb.one(), F257::ONE);
+
+    // Copy digit vars for shorts, u32s, and frog candidates in appearance order.
+    let mut local_map: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    #[inline]
+    fn copy_digit(
+        gb: &mut Dr1csBuilder<F257>,
+        pose_asg: &[F257],
+        local_map: &mut std::collections::BTreeMap<usize, usize>,
+        gv: usize,
+    ) -> usize {
+        if let Some(&lv) = local_map.get(&gv) {
+            return lv;
+        }
+        let lv = gb.new_var(pose_asg[gv]);
+        local_map.insert(gv, lv);
+        lv
+    }
+
+    // Determine which short/u32 blocks we need.
+    for &(si, ui) in pairs {
+        if si >= short_ranges.len() {
+            return Err(format!("short_block_idx {si} out of range"));
+        }
+        if ui >= u32_ranges.len() {
+            return Err(format!("u32_idx {ui} out of range"));
+        }
+    }
+
+    // Materialize required short blocks.
+    let mut short_locals: std::collections::BTreeMap<usize, ShortChallengeWiring> = std::collections::BTreeMap::new();
+    for &(si, _ui) in pairs {
+        if short_locals.contains_key(&si) {
+            continue;
+        }
+        let (s_start, s_len) = short_ranges[si];
+        if s_len != ring_dim {
+            return Err(format!("short block {si} length mismatch (got {s_len}, expected {ring_dim})"));
+        }
+        let short_digits_global = &pose_wiring.squeeze_field_vars[s_start..s_start + s_len];
+        let short_digits_local: Vec<usize> = short_digits_global
+            .iter()
+            .copied()
+            .map(|gv| copy_digit(&mut gb, &pose_asg, &mut local_map, gv))
+            .collect();
+        let (short_bvars, short_coeffs, short_coeff_digits) =
+            short_challenge_from_digits_128(&mut gb, &short_digits_local, ring_dim);
+        short_locals.insert(si, ShortChallengeWiring {
+            digit_vars: short_digits_local,
+            byte_vars: short_bvars,
+            coeff_vars: short_coeffs,
+            coeff_bal16_digits: short_coeff_digits,
+        });
+    }
+
+    // Materialize required u32 blocks.
+    let mut u32_locals: std::collections::BTreeMap<usize, BoundedU32ChallengeWiring> = std::collections::BTreeMap::new();
+    for &(_si, ui) in pairs {
+        if u32_locals.contains_key(&ui) {
+            continue;
+        }
+        let (u_start, u_len) = u32_ranges[ui];
+        if u_len != DIGITS_PER_TRY {
+            return Err(format!("u32 block {ui} length mismatch (got {u_len}, expected {DIGITS_PER_TRY})"));
+        }
+        let u_digits_global = &pose_wiring.squeeze_field_vars[u_start..u_start + u_len];
+        let mut u_digits_local = [0usize; DIGITS_PER_TRY];
+        for i in 0..DIGITS_PER_TRY {
+            u_digits_local[i] = copy_digit(&mut gb, &pose_asg, &mut local_map, u_digits_global[i]);
+        }
+        let (u_limbs, u_bytes, u_bal16, u_bal16_sq) =
+            bounded_u32_from_8_digits_base128(&mut gb, &u_digits_local);
+        u32_locals.insert(ui, BoundedU32ChallengeWiring {
+            digit_vars: u_digits_local.to_vec(),
+            byte_vars: u_bytes,
+            limbs: u_limbs,
+            bal16_digits: u_bal16,
+            bal16_sq_digits: u_bal16_sq,
+        });
+    }
+
+    // Build requested digit-mul surfaces.
+    let mut surfaces_local: Vec<CmDigitMulSurfaceWiring> = Vec::with_capacity(pairs.len());
+    for &(si, ui) in pairs {
+        let s = short_locals.get(&si).expect("short local present");
+        let u = u32_locals.get(&ui).expect("u32 local present");
+        let products = scale_short_coeffs_by_u32(&mut gb, &s.coeff_bal16_digits, &u.bal16_digits);
+        let products13 = products
+            .iter()
+            .map(|p12| rebalance_prod12_to_prod13(&mut gb, p12))
+            .collect::<Vec<_>>();
+        let sum_digits = sum_product_digits_bal16(&mut gb, &products13, 16);
+        surfaces_local.push(CmDigitMulSurfaceWiring {
+            short_block_idx: si,
+            u32_idx: ui,
+            products,
+            products13,
+            sum_digits,
+            sum_all_pairs_digits: Vec::new(), // filled after we know all surfaces
+            sum_all_pairs_coeffwise: Vec::new(), // filled after we know all surfaces
+        });
+    }
+
+    // Batch-level accumulation across all requested surfaces (sum of sums).
+    let all_sum_digits = sum_bal16_vectors_fixed_len(
+        &mut gb,
+        &surfaces_local.iter().map(|s| s.sum_digits.clone()).collect::<Vec<_>>(),
+        16,
+    );
+    let all_sum_coeffwise = sum_products13_coeffwise_fixed_len(
+        &mut gb,
+        &surfaces_local.iter().map(|s| s.products13.clone()).collect::<Vec<_>>(),
+        ring_dim,
+        16,
+    );
+    for s in &mut surfaces_local {
+        s.sum_all_pairs_digits = all_sum_digits.clone();
+        s.sum_all_pairs_coeffwise = all_sum_coeffwise.clone();
+    }
+
+    // Frog coins (same as existing builder): copy all frog candidate digit vars and run sampler.
+    let mut frog_digit_vars_local: Vec<usize> = Vec::with_capacity(n_coins * tries * DIGITS_PER_TRY);
+    let mut frog_digit_vars_global: Vec<usize> = Vec::with_capacity(n_coins * tries * DIGITS_PER_TRY);
+    for &(start, len) in &frog_ranges {
+        if len != DIGITS_PER_TRY {
+            return Err("frog squeeze len mismatch".to_string());
+        }
+        for v in &pose_wiring.squeeze_field_vars[start..start + len] {
+            frog_digit_vars_global.push(*v);
+            frog_digit_vars_local.push(copy_digit(&mut gb, &pose_asg, &mut local_map, *v));
+        }
+    }
+    let mut frog_wirings_local: Vec<FrogRejectionCoinWiring> = Vec::with_capacity(n_coins);
+    let mut coin_limbs_local_all: Vec<[usize; LIMBS_U64]> = Vec::with_capacity(n_coins);
+    let mut found_local_all: Vec<usize> = Vec::with_capacity(n_coins);
+    for coin_idx in 0..n_coins {
+        let off = coin_idx * tries * DIGITS_PER_TRY;
+        let digits = &frog_digit_vars_local[off..off + tries * DIGITS_PER_TRY];
+        let (coin_local, found_local) =
+            sample_frog_coin_unrolled_rejection_8_digits::<F257>(&mut gb, digits, tries);
+        gb.enforce_var_eq_const(found_local, F257::ONE);
+        coin_limbs_local_all.push(coin_local);
+        found_local_all.push(found_local);
+        frog_wirings_local.push(FrogRejectionCoinWiring {
+            digit_vars: frog_digit_vars_local[off..off + tries * DIGITS_PER_TRY].to_vec(),
+            found_bit: found_local,
+            coin_limbs: coin_local.to_vec(),
+            tries,
+        });
+    }
+
+    let (glue_inst, glue_asg) = gb.into_instance();
+    let glue_nvars = glue_inst.nvars;
+
+    // Merge poseidon + glue.
+    let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(&[
+        (pose_inst, pose_asg),
+        (glue_inst, glue_asg),
+    ])
+    .map_err(|e| format!("merge poseidon+cm+frog+mul_glue failed: {e}"))?;
+
+    // Add explicit equality constraints between pose vars and their local copies.
+    let pose_nvars = inst.nvars - (glue_nvars - 1);
+    let glue_offset = pose_nvars - 1;
+    for (&gv, &lv) in local_map.iter() {
+        let gg = if lv == 0 { 0 } else { lv + glue_offset };
+        enforce_var_eq::<F257>(&mut inst, gv, gg);
+    }
+
+    let to_glue_global = |glue_local: usize| -> usize {
+        if glue_local == 0 { 0 } else { glue_local + glue_offset }
+    };
+
+    // Return only the derived shorts/u32s (those referenced by pairs), in sorted index order.
+    let shorts_out = short_locals
+        .into_iter()
+        .map(|(_idx, w)| ShortChallengeWiring {
+            digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
+            byte_vars: w.byte_vars.into_iter().map(to_glue_global).collect(),
+            coeff_vars: w.coeff_vars.into_iter().map(to_glue_global).collect(),
+            coeff_bal16_digits: w
+                .coeff_bal16_digits
+                .into_iter()
+                .map(|a| a.map(to_glue_global))
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let u32s_out = u32_locals
+        .into_iter()
+        .map(|(_idx, w)| BoundedU32ChallengeWiring {
+            digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
+            byte_vars: w.byte_vars.map(to_glue_global),
+            limbs: w.limbs.map(to_glue_global),
+            bal16_digits: w.bal16_digits.into_iter().map(to_glue_global).collect(),
+            bal16_sq_digits: w.bal16_sq_digits.into_iter().map(to_glue_global).collect(),
+        })
+        .collect::<Vec<_>>();
+    let frog_wirings = frog_wirings_local
+        .into_iter()
+        .map(|w| FrogRejectionCoinWiring {
+            digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
+            found_bit: to_glue_global(w.found_bit),
+            coin_limbs: w.coin_limbs.into_iter().map(to_glue_global).collect(),
+            tries: w.tries,
+        })
+        .collect::<Vec<_>>();
+
+    let surfaces = surfaces_local
+        .into_iter()
+        .map(|s| CmDigitMulSurfaceWiring {
+            short_block_idx: s.short_block_idx,
+            u32_idx: s.u32_idx,
+            products: s.products.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
+            products13: s.products13.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
+            sum_digits: s.sum_digits.into_iter().map(to_glue_global).collect(),
+            sum_all_pairs_digits: s.sum_all_pairs_digits.into_iter().map(to_glue_global).collect(),
+            sum_all_pairs_coeffwise: s
+                .sum_all_pairs_coeffwise
+                .into_iter()
+                .map(|v| v.into_iter().map(to_glue_global).collect())
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+
+    Ok((inst, asg, shorts_out, u32s_out, frog_wirings, surfaces))
+}
 /// Build the Poseidon transcript subrelation **over F257** from an op schedule.
 ///
 /// This is the correct transcript-layer arithmetization for the Theorem-4.3 tiny-field WE gate:
@@ -2749,7 +3751,8 @@ mod tests {
             dvars[i] = b.new_var(F257::from(ds[i] as u64));
         }
 
-        let (limbs, bytes, bal16_digits) = bounded_u32_from_8_digits_base128(&mut b, &dvars);
+        let (limbs, bytes, bal16_digits, bal16_sq_digits) =
+            bounded_u32_from_8_digits_base128(&mut b, &dvars);
 
         // Expected u32 from byte view of first 4 digits.
         let bv = |x: u16| if x == 256 { 0u8 } else { x as u8 };
@@ -2773,6 +3776,15 @@ mod tests {
             pow *= 16;
         }
         assert_eq!(acc as u64, exp as u64);
+
+        // Check square digits decode to exp^2.
+        let mut sq_acc: i128 = 0;
+        let mut pow: i128 = 1;
+        for &v in &bal16_sq_digits {
+            sq_acc += (f257_to_i32_bal(b.assignment[v]) as i128) * pow;
+            pow *= 16;
+        }
+        assert_eq!(sq_acc, (exp as i128) * (exp as i128));
 
         let (inst, asg) = b.into_instance();
         inst.check(&asg).expect("bounded u32 gadget satisfied");
@@ -2808,7 +3820,7 @@ mod tests {
         for i in 0..8 {
             dvars[i] = b.new_var(F257::from(ds[i] as u64));
         }
-        let (_limbs, _bytes, u32_digits) = bounded_u32_from_8_digits_base128(&mut b, &dvars);
+        let (_limbs, _bytes, u32_digits, _u32_sq_digits) = bounded_u32_from_8_digits_base128(&mut b, &dvars);
         assert_eq!(u32_digits.len(), 9);
 
         let prod = mul_bal16_3_by_u32(&mut b, &coeff3, &u32_digits);
@@ -2825,6 +3837,113 @@ mod tests {
         for &vv in &prod {
             acc += (f257_to_i32_bal(asg[vv]) as i128) * pow;
             pow *= 16;
+        }
+        assert_eq!(acc, expected);
+    }
+
+    #[test]
+    fn test_short_coeff_digits_times_digits9_roundtrip() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xD16175_9u64);
+        let mut b = Dr1csBuilder::<F257>::new();
+        b.enforce_var_eq_const(b.one(), F257::ONE);
+
+        // random small coeff in [-128,127]
+        let coeff: i32 = rng.gen_range(-128..=127);
+        // random 36-ish-bit scalar to keep i128 decode safe and stay "u32-ish envelope"
+        let x: i128 = rng.gen_range(-(1i128 << 35)..(1i128 << 35));
+
+        // coeff -> 3 balanced base16 digits
+        let mut cur = coeff as i128;
+        let mut c3 = [0usize; 3];
+        for i in 0..3 {
+            let mut r = ((cur % 16) + 16) % 16;
+            if r >= 8 {
+                r -= 16;
+            }
+            c3[i] = alloc_bal16_digit(&mut b, r as i8);
+            cur = (cur - (r as i128)) / 16;
+        }
+        debug_assert_eq!(cur, 0);
+
+        // x -> 9 balanced digits (little-endian), with a final carry digit possibly nonzero.
+        let x_digits = {
+            let mut xx = x;
+            let mut out: Vec<usize> = Vec::with_capacity(9);
+            for _ in 0..9 {
+                let mut r = ((xx % 16) + 16) % 16;
+                if r >= 8 {
+                    r -= 16;
+                }
+                out.push(alloc_bal16_digit(&mut b, r as i8));
+                xx = (xx - (r as i128)) / 16;
+            }
+            out
+        };
+
+        let prod12 = mul_bal16_3_by_digits9(&mut b, &c3, &x_digits);
+
+        // Decode prod (base16) and compare to native.
+        let mut acc: i128 = 0;
+        let mut pow: i128 = 1;
+        for &dv in &prod12 {
+            acc += (f257_to_i32_bal(b.assignment[dv]) as i128) * pow;
+            pow *= 16;
+        }
+        assert_eq!(acc, (coeff as i128) * x);
+
+        let (inst, asg) = b.into_instance();
+        inst.check(&asg).expect("digits9 mul satisfied");
+    }
+
+    #[test]
+    fn test_short_coeff_digits_times_u32_sq_digits18_roundtrip() {
+        // Multiply one short coeff by (u32)^2 using the derived 18-digit representation.
+        let mut b = Dr1csBuilder::<F257>::new();
+        b.enforce_var_eq_const(b.one(), F257::ONE);
+
+        // Short challenge coeff from a fixed byte (range ends up in [-128,127]).
+        let by = alloc_byte::<F257>(&mut b, 205);
+        let coeff = short_challenge_coeff_from_byte_var::<F257>(&mut b, by.byte, 256);
+        let v = f257_to_i32_bal(b.assignment[coeff]);
+        let mut d0 = v % 16;
+        if d0 > 7 { d0 -= 16; }
+        if d0 < -8 { d0 += 16; }
+        let d1 = (v - d0) / 16;
+        let d0v = alloc_bal16_digit(&mut b, d0 as i8);
+        let d1v = alloc_bal16_digit(&mut b, d1 as i8);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F257::ONE, coeff),
+            (-F257::ONE, d0v),
+            (-F257::from(16u64), d1v),
+        ]);
+        let coeff3 = [d0v, d1v, alloc_bal16_digit(&mut b, 0)];
+
+        // Bounded u32 from digits; also returns u^2 digits (len 18).
+        let ds: [u16; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        let mut dvars = [0usize; 8];
+        for i in 0..8 {
+            dvars[i] = b.new_var(F257::from(ds[i] as u64));
+        }
+        let (_limbs, _bytes, _u32_digits, u32_sq_digits) =
+            bounded_u32_from_8_digits_base128(&mut b, &dvars);
+        assert_eq!(u32_sq_digits.len(), 18);
+
+        let prod = mul_bal16_3_by_digits18(&mut b, &coeff3, &u32_sq_digits);
+
+        let (inst, asg) = b.into_instance();
+        inst.check(&asg).expect("coeff*u32^2 digit mul satisfiable");
+
+        let u32v = u32::from_le_bytes([1u8, 2u8, 3u8, 4u8]) as i128;
+        let expected = (v as i128) * (u32v * u32v);
+
+        let mut acc: i128 = 0;
+        let mut pow: i128 = 1;
+        for (idx, &vv) in prod.iter().enumerate() {
+            acc += (f257_to_i32_bal(asg[vv]) as i128) * pow;
+            if idx + 1 < prod.len() {
+                pow *= 16;
+            }
         }
         assert_eq!(acc, expected);
     }
@@ -2876,6 +3995,44 @@ mod tests {
             let expected: i128 = (x as i128) * (y as i128);
             assert_eq!(acc, expected);
         }
+    }
+
+    #[test]
+    fn test_mul_u32ish9_to_fixed_bal16_roundtrip_small() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xBEEF_900Du64);
+        let mut b = Dr1csBuilder::<F257>::new();
+        b.enforce_var_eq_const(b.one(), F257::ONE);
+
+        for _ in 0..50 {
+            let x: u32 = rng.gen();
+            let y: u32 = rng.gen();
+
+            // u32 -> bytes -> 9 digits (balanced)
+            let xb = x.to_le_bytes();
+            let yb = y.to_le_bytes();
+            let x_vars = xb.map(|by| b.new_var(F257::from(by as u64)));
+            let y_vars = yb.map(|by| b.new_var(F257::from(by as u64)));
+            let x9 = u32_bytes_to_bal16_digits(&mut b, x_vars.to_vec().try_into().unwrap());
+            let y9 = u32_bytes_to_bal16_digits(&mut b, y_vars.to_vec().try_into().unwrap());
+            debug_assert_eq!(x9.len(), 9);
+            debug_assert_eq!(y9.len(), 9);
+
+            let prod = mul_u32ish9_to_fixed_bal16(&mut b, &x9, &y9, 18);
+            assert_eq!(prod.len(), 18);
+
+            // Decode.
+            let mut acc: i128 = 0;
+            let mut pow: i128 = 1;
+            for &dv in &prod {
+                acc += (f257_to_i32_bal(b.assignment[dv]) as i128) * pow;
+                pow *= 16;
+            }
+            assert_eq!(acc, (x as i128) * (y as i128));
+        }
+
+        let (inst, asg) = b.into_instance();
+        inst.check(&asg).expect("u32ish fixed mul satisfied");
     }
 
     #[test]
@@ -3070,6 +4227,489 @@ mod tests {
         assert_eq!(u32s.len(), 1);
         assert_eq!(frogs.len(), 1);
         assert_eq!(frogs[0].tries, tries);
+    }
+
+    #[test]
+    fn test_poseidon_plus_cm_coins_frog_and_first_digit_mul_surface_satisfies() {
+        use ark_crypto_primitives::sponge::{poseidon::PoseidonSponge, CryptographicSponge};
+
+        let cfg = f257_poseidon_config();
+        let mut sponge = PoseidonSponge::<F257>::new(&cfg);
+        let ring_dim: usize = 64;
+
+        // Same schedule as the existing combined test, but we will also build the digit-mul surface.
+        let mut ops: Vec<PoseidonTraceOp<F257>> = Vec::new();
+        let a = vec![F257::from(9u64)];
+        sponge.absorb(&a);
+        ops.push(PoseidonTraceOp::Absorb(a));
+
+        let _short_digits = sponge.squeeze_field_elements::<F257>(ring_dim);
+        ops.push(PoseidonTraceOp::SqueezeField(_short_digits));
+
+        let c0 = sponge.squeeze_field_elements::<F257>(DIGITS_PER_TRY);
+        ops.push(PoseidonTraceOp::SqueezeField(c0.clone()));
+        sponge.absorb(&c0);
+        ops.push(PoseidonTraceOp::Absorb(c0));
+
+        let tries: usize = 2;
+        let cand0 = sponge.squeeze_field_elements::<F257>(DIGITS_PER_TRY);
+        ops.push(PoseidonTraceOp::SqueezeField(cand0.clone()));
+        sponge.absorb(&cand0);
+        ops.push(PoseidonTraceOp::Absorb(cand0));
+        let cand1 = sponge.squeeze_field_elements::<F257>(DIGITS_PER_TRY);
+        ops.push(PoseidonTraceOp::SqueezeField(cand1.clone()));
+        sponge.absorb(&cand1);
+        ops.push(PoseidonTraceOp::Absorb(cand1));
+
+        // SqueezeField op indices: 0=short, 1=u32, 2=cand0, 3=cand1
+        let wiring = TinyCoinOpWiring {
+            short_squeeze_ops: vec![0],
+            u32_squeeze_ops: vec![1],
+            frog_squeeze_ops: vec![2, 3],
+        };
+
+        let (inst, asg, shorts, u32s, frogs, mul_surface) =
+            build_poseidon_f257_with_cm_coins_frog_and_first_digit_mul_from_ops_with_wiring(
+                None, &ops, ring_dim, &wiring, 1, tries, 0, 0,
+            )
+            .expect("build poseidon+cm+frog+mul");
+        inst.check(&asg).expect("poseidon+cm+frog+mul satisfied");
+        assert_eq!(shorts.len(), 1);
+        assert_eq!(u32s.len(), 1);
+        assert_eq!(frogs.len(), 1);
+        assert_eq!(mul_surface.short_block_idx, 0);
+        assert_eq!(mul_surface.u32_idx, 0);
+        assert_eq!(mul_surface.products.len(), ring_dim);
+        assert_eq!(mul_surface.products13.len(), ring_dim);
+        assert_eq!(mul_surface.sum_digits.len(), 16);
+        assert_eq!(mul_surface.sum_all_pairs_digits.len(), 16);
+        assert_eq!(mul_surface.sum_all_pairs_coeffwise.len(), ring_dim);
+        assert_eq!(mul_surface.sum_all_pairs_coeffwise[0].len(), 16);
+    }
+
+    #[test]
+    fn test_poseidon_plus_cm_coins_frog_and_two_digit_mul_surfaces_satisfies() {
+        use ark_crypto_primitives::sponge::{poseidon::PoseidonSponge, CryptographicSponge};
+
+        let cfg = f257_poseidon_config();
+        let mut sponge = PoseidonSponge::<F257>::new(&cfg);
+        let ring_dim: usize = 64;
+
+        // Schedule:
+        // Absorb(1),
+        // Short0: SqueezeField(64),
+        // Short1: SqueezeField(64),
+        // u32_0:  SqueezeField(8)+Absorb(8),
+        // u32_1:  SqueezeField(8)+Absorb(8),
+        // frog candidates (tries=2): 2x [SqueezeField(8)+Absorb(8)]
+        let mut ops: Vec<PoseidonTraceOp<F257>> = Vec::new();
+        let a = vec![F257::from(3u64)];
+        sponge.absorb(&a);
+        ops.push(PoseidonTraceOp::Absorb(a));
+
+        let s0 = sponge.squeeze_field_elements::<F257>(ring_dim);
+        ops.push(PoseidonTraceOp::SqueezeField(s0));
+        let s1 = sponge.squeeze_field_elements::<F257>(ring_dim);
+        ops.push(PoseidonTraceOp::SqueezeField(s1));
+
+        let u0 = sponge.squeeze_field_elements::<F257>(DIGITS_PER_TRY);
+        ops.push(PoseidonTraceOp::SqueezeField(u0.clone()));
+        sponge.absorb(&u0);
+        ops.push(PoseidonTraceOp::Absorb(u0));
+
+        let u1 = sponge.squeeze_field_elements::<F257>(DIGITS_PER_TRY);
+        ops.push(PoseidonTraceOp::SqueezeField(u1.clone()));
+        sponge.absorb(&u1);
+        ops.push(PoseidonTraceOp::Absorb(u1));
+
+        let tries: usize = 2;
+        for _ in 0..(1 * tries) {
+            let v = sponge.squeeze_field_elements::<F257>(DIGITS_PER_TRY);
+            ops.push(PoseidonTraceOp::SqueezeField(v.clone()));
+            sponge.absorb(&v);
+            ops.push(PoseidonTraceOp::Absorb(v));
+        }
+
+        // SqueezeField op indices: 0=s0, 1=s1, 2=u0, 3=u1, 4=cand0, 5=cand1
+        let wiring = TinyCoinOpWiring {
+            short_squeeze_ops: vec![0, 1],
+            u32_squeeze_ops: vec![2, 3],
+            frog_squeeze_ops: vec![4, 5],
+        };
+
+        let pairs = vec![(0usize, 0usize), (1usize, 1usize)];
+        let (inst, asg, shorts, u32s, frogs, surfaces) =
+            build_poseidon_f257_with_cm_coins_frog_and_digit_mul_surfaces_from_ops_with_wiring(
+                None, &ops, ring_dim, &wiring, 1, tries, &pairs,
+            )
+            .expect("build poseidon+cm+frog+mul batch");
+        inst.check(&asg).expect("poseidon+cm+frog+mul batch satisfied");
+        assert_eq!(shorts.len(), 2);
+        assert_eq!(u32s.len(), 2);
+        assert_eq!(frogs.len(), 1);
+        assert_eq!(surfaces.len(), 2);
+        for s in &surfaces {
+            assert_eq!(s.products.len(), ring_dim);
+            assert_eq!(s.products13.len(), ring_dim);
+            assert_eq!(s.sum_digits.len(), 16);
+            assert_eq!(s.sum_all_pairs_digits.len(), 16);
+            assert_eq!(s.sum_all_pairs_coeffwise.len(), ring_dim);
+            assert_eq!(s.sum_all_pairs_coeffwise[0].len(), 16);
+        }
+    }
+
+    #[test]
+    fn test_sum_all_pairs_digits_matches_sum_of_surface_sums() {
+        use ark_crypto_primitives::sponge::{poseidon::PoseidonSponge, CryptographicSponge};
+
+        let cfg = f257_poseidon_config();
+        let mut sponge = PoseidonSponge::<F257>::new(&cfg);
+        let ring_dim: usize = 64;
+
+        let mut ops: Vec<PoseidonTraceOp<F257>> = Vec::new();
+        let a = vec![F257::from(11u64)];
+        sponge.absorb(&a);
+        ops.push(PoseidonTraceOp::Absorb(a));
+
+        // Two short blocks and two u32 blocks.
+        for _ in 0..2 {
+            let short = sponge.squeeze_field_elements::<F257>(ring_dim);
+            ops.push(PoseidonTraceOp::SqueezeField(short.clone()));
+        }
+        for _ in 0..2 {
+            let u0 = sponge.squeeze_field_elements::<F257>(DIGITS_PER_TRY);
+            ops.push(PoseidonTraceOp::SqueezeField(u0.clone()));
+            sponge.absorb(&u0);
+            ops.push(PoseidonTraceOp::Absorb(u0.clone()));
+        }
+
+        // Frog candidates (tries=1, n_coins=1) just to satisfy API.
+        let tries: usize = 1;
+        let cand = sponge.squeeze_field_elements::<F257>(DIGITS_PER_TRY);
+        ops.push(PoseidonTraceOp::SqueezeField(cand.clone()));
+        sponge.absorb(&cand);
+        ops.push(PoseidonTraceOp::Absorb(cand));
+
+        // SqueezeField op indices: 0,1 shorts; 2,3 u32s; 4 frog cand
+        let wiring = TinyCoinOpWiring {
+            short_squeeze_ops: vec![0, 1],
+            u32_squeeze_ops: vec![2, 3],
+            frog_squeeze_ops: vec![4],
+        };
+
+        let pairs = vec![(0usize, 0usize), (1usize, 1usize)];
+        let (_inst, asg, _shorts, _u32s, _frogs, surfaces) =
+            build_poseidon_f257_with_cm_coins_frog_and_digit_mul_surfaces_from_ops_with_wiring(
+                None, &ops, ring_dim, &wiring, 1, tries, &pairs,
+            )
+            .expect("build");
+
+        let decode16 = |digits: &[usize]| -> i128 {
+            let mut acc: i128 = 0;
+            let mut pow: i128 = 1;
+            for &dv in digits {
+                acc += (f257_to_i32_bal(asg[dv]) as i128) * pow;
+                pow *= 16;
+            }
+            acc
+        };
+
+        let s0 = decode16(&surfaces[0].sum_digits);
+        let s1 = decode16(&surfaces[1].sum_digits);
+        let all0 = decode16(&surfaces[0].sum_all_pairs_digits);
+        let all1 = decode16(&surfaces[1].sum_all_pairs_digits);
+        assert_eq!(all0, s0 + s1);
+        assert_eq!(all1, s0 + s1);
+    }
+
+    #[test]
+    fn test_sum_all_pairs_coeffwise_matches_sum_of_products() {
+        use ark_crypto_primitives::sponge::{poseidon::PoseidonSponge, CryptographicSponge};
+
+        let cfg = f257_poseidon_config();
+        let mut sponge = PoseidonSponge::<F257>::new(&cfg);
+        let ring_dim: usize = 32; // keep coeffs small (u=16) and test fast
+
+        let mut ops: Vec<PoseidonTraceOp<F257>> = Vec::new();
+        let a = vec![F257::from(11u64)];
+        sponge.absorb(&a);
+        ops.push(PoseidonTraceOp::Absorb(a));
+
+        // Two short blocks and two u32 blocks.
+        for _ in 0..2 {
+            let short = sponge.squeeze_field_elements::<F257>(ring_dim);
+            ops.push(PoseidonTraceOp::SqueezeField(short.clone()));
+        }
+        for _ in 0..2 {
+            let u0 = sponge.squeeze_field_elements::<F257>(DIGITS_PER_TRY);
+            ops.push(PoseidonTraceOp::SqueezeField(u0.clone()));
+            sponge.absorb(&u0);
+            ops.push(PoseidonTraceOp::Absorb(u0.clone()));
+        }
+
+        // Frog candidates (tries=1, n_coins=1) just to satisfy API.
+        let tries: usize = 1;
+        let cand = sponge.squeeze_field_elements::<F257>(DIGITS_PER_TRY);
+        ops.push(PoseidonTraceOp::SqueezeField(cand.clone()));
+        sponge.absorb(&cand);
+        ops.push(PoseidonTraceOp::Absorb(cand));
+
+        // SqueezeField op indices: 0,1 shorts; 2,3 u32s; 4 frog cand
+        let wiring = TinyCoinOpWiring {
+            short_squeeze_ops: vec![0, 1],
+            u32_squeeze_ops: vec![2, 3],
+            frog_squeeze_ops: vec![4],
+        };
+
+        let pairs = vec![(0usize, 0usize), (1usize, 1usize)];
+        let (_inst, asg, _shorts, _u32s, _frogs, surfaces) =
+            build_poseidon_f257_with_cm_coins_frog_and_digit_mul_surfaces_from_ops_with_wiring(
+                None, &ops, ring_dim, &wiring, 1, tries, &pairs,
+            )
+            .expect("build");
+
+        let decode = |digits: &[usize]| -> i128 {
+            let mut acc: i128 = 0;
+            let mut pow: i128 = 1;
+            for &dv in digits {
+                acc += (f257_to_i32_bal(asg[dv]) as i128) * pow;
+                pow *= 16;
+            }
+            acc
+        };
+
+        // Check a few coefficient indices.
+        for &i in &[0usize, 1, 7, 13, ring_dim - 1] {
+            let p0 = decode(&surfaces[0].products13[i]);
+            let p1 = decode(&surfaces[1].products13[i]);
+            let acci = decode(&surfaces[0].sum_all_pairs_coeffwise[i]);
+            assert_eq!(acci, p0 + p1);
+        }
+    }
+
+    #[test]
+    fn test_digit_mul_sq_surface_sum_matches_values_ring64() {
+        use ark_crypto_primitives::sponge::{poseidon::PoseidonSponge, CryptographicSponge};
+
+        let cfg = f257_poseidon_config();
+        let mut sponge = PoseidonSponge::<F257>::new(&cfg);
+        let ring_dim: usize = 64;
+
+        let mut ops: Vec<PoseidonTraceOp<F257>> = Vec::new();
+        let a = vec![F257::from(11u64)];
+        sponge.absorb(&a);
+        ops.push(PoseidonTraceOp::Absorb(a));
+
+        let short = sponge.squeeze_field_elements::<F257>(ring_dim);
+        ops.push(PoseidonTraceOp::SqueezeField(short.clone()));
+        let u0 = sponge.squeeze_field_elements::<F257>(DIGITS_PER_TRY);
+        ops.push(PoseidonTraceOp::SqueezeField(u0.clone()));
+        sponge.absorb(&u0);
+        ops.push(PoseidonTraceOp::Absorb(u0.clone()));
+
+        // Frog candidates (tries=1, n_coins=1) just to satisfy API.
+        let tries: usize = 1;
+        let cand = sponge.squeeze_field_elements::<F257>(DIGITS_PER_TRY);
+        ops.push(PoseidonTraceOp::SqueezeField(cand.clone()));
+        sponge.absorb(&cand);
+        ops.push(PoseidonTraceOp::Absorb(cand));
+
+        let wiring = TinyCoinOpWiring {
+            short_squeeze_ops: vec![0],
+            u32_squeeze_ops: vec![1],
+            frog_squeeze_ops: vec![2],
+        };
+        let pairs = vec![(0usize, 0usize)];
+
+        let (inst, asg, _shorts, _u32s, _frogs, surfaces) =
+            build_poseidon_f257_with_cm_coins_frog_and_digit_mul_sq_surfaces_from_ops_with_wiring(
+                None, &ops, ring_dim, &wiring, 1, tries, &pairs,
+            )
+            .expect("build sq surfaces");
+        inst.check(&asg).expect("sq surfaces satisfied");
+
+        // Decode u32 from first 4 digits (byte-view 256->0), then square.
+        let mut ubytes = [0u8; 4];
+        for i in 0..4 {
+            let du16 = u0[i]
+                .into_bigint()
+                .to_bytes_le()
+                .get(0)
+                .copied()
+                .unwrap_or(0) as u16;
+            ubytes[i] = if du16 == 256 { 0 } else { du16 as u8 };
+        }
+        let u32v: i128 = u32::from_le_bytes(ubytes) as i128;
+        let u32sq: i128 = u32v * u32v;
+
+        // Decode expected coeffs from `short_challenge(128)` semantics (u=4 for ring_dim=64).
+        let u = 1u64 << (128 / ring_dim);
+        let half = (u / 2) as i64;
+        let mut expected: i128 = 0;
+        for i in 0..ring_dim {
+            let du16 = short[i]
+                .into_bigint()
+                .to_bytes_le()
+                .get(0)
+                .copied()
+                .unwrap_or(0) as u16;
+            let by: u8 = if du16 == 256 { 0 } else { du16 as u8 };
+            let low = (by as u64) & (u - 1);
+            let coeff = (low as i64) - half;
+            expected += (coeff as i128) * u32sq;
+        }
+
+        // Decode computed sum_digits (len 24).
+        let sum_digits = &surfaces[0].sum_digits;
+        assert_eq!(sum_digits.len(), 24);
+        let mut acc: i128 = 0;
+        let mut pow: i128 = 1;
+        for &dv in sum_digits {
+            acc += (f257_to_i32_bal(asg[dv]) as i128) * pow;
+            pow *= 16;
+        }
+        assert_eq!(acc, expected);
+    }
+
+    #[test]
+    fn test_digit_mul_surface_sum_matches_values_ring64() {
+        // Use ring_dim=64 (the production CM setting) so short coeffs are tiny (u=4),
+        // and compare the digit-sum against native arithmetic in i128.
+        use ark_crypto_primitives::sponge::{poseidon::PoseidonSponge, CryptographicSponge};
+
+        let cfg = f257_poseidon_config();
+        let mut sponge = PoseidonSponge::<F257>::new(&cfg);
+        let ring_dim: usize = 64;
+
+        let mut ops: Vec<PoseidonTraceOp<F257>> = Vec::new();
+        let a = vec![F257::from(11u64)];
+        sponge.absorb(&a);
+        ops.push(PoseidonTraceOp::Absorb(a));
+
+        let short = sponge.squeeze_field_elements::<F257>(ring_dim);
+        ops.push(PoseidonTraceOp::SqueezeField(short.clone()));
+        let u0 = sponge.squeeze_field_elements::<F257>(DIGITS_PER_TRY);
+        ops.push(PoseidonTraceOp::SqueezeField(u0.clone()));
+        sponge.absorb(&u0);
+        ops.push(PoseidonTraceOp::Absorb(u0.clone()));
+
+        // Frog candidates (tries=1, n_coins=1) just to satisfy API.
+        let tries: usize = 1;
+        let cand = sponge.squeeze_field_elements::<F257>(DIGITS_PER_TRY);
+        ops.push(PoseidonTraceOp::SqueezeField(cand.clone()));
+        sponge.absorb(&cand);
+        ops.push(PoseidonTraceOp::Absorb(cand));
+
+        // SqueezeField op indices: 0=short, 1=u32, 2=cand
+        let wiring = TinyCoinOpWiring {
+            short_squeeze_ops: vec![0],
+            u32_squeeze_ops: vec![1],
+            frog_squeeze_ops: vec![2],
+        };
+
+        let pairs = vec![(0usize, 0usize)];
+        let (inst, asg, shorts, u32s, _frogs, surfaces) =
+            build_poseidon_f257_with_cm_coins_frog_and_digit_mul_surfaces_from_ops_with_wiring(
+                None, &ops, ring_dim, &wiring, 1, tries, &pairs,
+            )
+            .expect("build poseidon+mul+sum");
+        inst.check(&asg).expect("poseidon+mul+sum satisfied");
+        assert_eq!(shorts.len(), 1);
+        assert_eq!(u32s.len(), 1);
+        assert_eq!(surfaces.len(), 1);
+
+        // Decode expected sum from the digits the sponge produced.
+        let mut ubytes = [0u8; 4];
+        for i in 0..4 {
+            let du16 = u0[i]
+                .into_bigint()
+                .to_bytes_le()
+                .get(0)
+                .copied()
+                .unwrap_or(0) as u16;
+            ubytes[i] = if du16 == 256 { 0 } else { du16 as u8 };
+        }
+        let u32v: i128 = u32::from_le_bytes(ubytes) as i128;
+        let u = 1u64 << (128 / ring_dim);
+        let half = (u / 2) as i64;
+
+        let mut expected: i128 = 0;
+        for i in 0..ring_dim {
+            let du16 = short[i]
+                .into_bigint()
+                .to_bytes_le()
+                .get(0)
+                .copied()
+                .unwrap_or(0) as u16;
+            let by: u8 = if du16 == 256 { 0 } else { du16 as u8 };
+            let low = (by as u64) & (u - 1);
+            let coeff = (low as i64) - half; // in [-half, half-1]
+            expected += (coeff as i128) * u32v;
+        }
+
+        // Decode computed sum digits (base-16).
+        let sum_digits = &surfaces[0].sum_digits;
+        let mut acc: i128 = 0;
+        let mut pow: i128 = 1;
+        for &dv in sum_digits {
+            acc += (f257_to_i32_bal(asg[dv]) as i128) * pow;
+            pow *= 16;
+        }
+        assert_eq!(acc, expected);
+    }
+
+    #[test]
+    fn test_rebalance_prod12_to_prod13_decodes_same() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5EED_13u64);
+        let mut b = Dr1csBuilder::<F257>::new();
+        b.enforce_var_eq_const(b.one(), F257::ONE);
+
+        // Random coeff in [-128,127] and random scalar in a u32-ish envelope.
+        let coeff: i128 = rng.gen_range(-128i128..=127i128);
+        let x: i128 = rng.gen_range(-(1i128 << 32)..(1i128 << 32));
+
+        // coeff -> 3 balanced digits
+        let mut cur = coeff;
+        let mut c3 = [0usize; 3];
+        for i in 0..3 {
+            let mut r = ((cur % 16) + 16) % 16;
+            if r >= 8 { r -= 16; }
+            c3[i] = alloc_bal16_digit(&mut b, r as i8);
+            cur = (cur - r) / 16;
+        }
+        debug_assert_eq!(cur, 0);
+
+        // x -> 9 balanced digits
+        let x_digits = {
+            let mut xx = x;
+            let mut out: Vec<usize> = Vec::with_capacity(9);
+            for _ in 0..9 {
+                let mut r = ((xx % 16) + 16) % 16;
+                if r >= 8 { r -= 16; }
+                out.push(alloc_bal16_digit(&mut b, r as i8));
+                xx = (xx - r) / 16;
+            }
+            out
+        };
+
+        let p12 = mul_bal16_3_by_digits9(&mut b, &c3, &x_digits);
+        let p13 = rebalance_prod12_to_prod13(&mut b, &p12);
+
+        let decode = |digits: &[usize]| -> i128 {
+            let mut acc: i128 = 0;
+            let mut pow: i128 = 1;
+            for &dv in digits {
+                acc += (f257_to_i32_bal(b.assignment[dv]) as i128) * pow;
+                pow *= 16;
+            }
+            acc
+        };
+        assert_eq!(decode(&p12), decode(&p13));
+        assert_eq!(decode(&p13), coeff * x);
+
+        let (inst, asg) = b.into_instance();
+        inst.check(&asg).expect("rebalance prod satisfied");
     }
 
     #[test]
@@ -3346,6 +4986,168 @@ mod tests {
         let c_i = decode(&asg, &c);
         let sum_i = decode(&asg, &sum) + (super::f257_to_i32_bal(asg[carry]) as i128) * 16i128.pow(sum.len() as u32);
         assert_eq!(sum_i, a_i + c_i);
+    }
+
+    #[test]
+    fn test_neg_and_sub_bal16_roundtrip() {
+        // Check negation and subtraction decode correctly for random small-ish values.
+        use rand::Rng;
+        let mut rng = ark_std::test_rng();
+
+        for _ in 0..200 {
+            let x: i64 = rng.gen_range(-(1i64 << 31)..(1i64 << 31));
+            let y: i64 = rng.gen_range(-(1i64 << 31)..(1i64 << 31));
+
+            // Encode into 9 balanced digits (enough for 32-bit-ish values).
+            fn to_bal16(mut v: i64) -> [i8; 9] {
+                let mut out = [0i8; 9];
+                for i in 0..9 {
+                    let mut d = (v % 16) as i32;
+                    if d > 7 { d -= 16; }
+                    if d < -8 { d += 16; }
+                    out[i] = d as i8;
+                    v = (v - d as i64) / 16;
+                }
+                out
+            }
+            let xd = to_bal16(x);
+            let yd = to_bal16(y);
+
+            let mut b = Dr1csBuilder::<F257>::new();
+            b.enforce_var_eq_const(b.one(), F257::ONE);
+            let xvars: Vec<usize> = xd.iter().map(|&d| alloc_bal16_digit(&mut b, d)).collect();
+            let yvars: Vec<usize> = yd.iter().map(|&d| alloc_bal16_digit(&mut b, d)).collect();
+
+            let (nx, c0) = neg_bal16_digits(&mut b, &xvars);
+            let (diff, c1) = sub_bal16_same_len(&mut b, &xvars, &yvars);
+
+            // For fixed-width 9-digit inputs, enforce no overflow.
+            b.enforce_var_eq_const(c0, F257::ZERO);
+            b.enforce_var_eq_const(c1, F257::ZERO);
+
+            let (inst, asg) = b.into_instance();
+            inst.check(&asg).expect("neg/sub satisfiable");
+
+            let decode = |ds: &[usize]| -> i128 {
+                let mut acc: i128 = 0;
+                let mut pow: i128 = 1;
+                for &v in ds {
+                    acc += (f257_to_i32_bal(asg[v]) as i128) * pow;
+                    pow *= 16;
+                }
+                acc
+            };
+            assert_eq!(decode(&nx), -(x as i128));
+            assert_eq!(decode(&diff), (x as i128) - (y as i128));
+        }
+    }
+
+    #[test]
+    fn test_mul_bal16_long_by_u32ish9_roundtrip() {
+        // Multiply a moderately-sized integer by a u32-ish integer via chunking.
+        // (Keep decoded values within i128 to avoid overflow in the test.)
+        use rand::Rng;
+        let mut rng = ark_std::test_rng();
+
+        for _ in 0..50 {
+            // Build a random ~48-bit signed integer.
+            let mag: i128 = (rng.gen::<u64>() & ((1u64 << 48) - 1)) as i128;
+            let sign: i128 = if rng.gen::<bool>() { 1 } else { -1 };
+            let a: i128 = sign * mag;
+            let b_u32: u32 = rng.gen();
+            let b_i: i128 = b_u32 as i128;
+
+            // Encode a into balanced base-16 digits (len 16 is enough for ~64 bits).
+            let mut a_tmp = a;
+            let mut a_digs: Vec<i8> = Vec::with_capacity(16);
+            for _ in 0..16 {
+                let mut d = (a_tmp % 16) as i32;
+                if d > 7 { d -= 16; }
+                if d < -8 { d += 16; }
+                a_digs.push(d as i8);
+                a_tmp = (a_tmp - d as i128) / 16;
+            }
+            assert_eq!(a_tmp, 0);
+
+            let mut b = Dr1csBuilder::<F257>::new();
+            b.enforce_var_eq_const(b.one(), F257::ONE);
+            let a_vars: Vec<usize> = a_digs.iter().map(|&d| alloc_bal16_digit(&mut b, d)).collect();
+            let bb = b_u32.to_le_bytes();
+            let b_bytes = [
+                alloc_byte::<F257>(&mut b, bb[0]).byte,
+                alloc_byte::<F257>(&mut b, bb[1]).byte,
+                alloc_byte::<F257>(&mut b, bb[2]).byte,
+                alloc_byte::<F257>(&mut b, bb[3]).byte,
+            ];
+            let b9 = u32_bytes_to_bal16_digits(&mut b, b_bytes);
+            let prod = mul_bal16_long_by_u32ish9(&mut b, &a_vars, &b9);
+
+            let (inst, asg) = b.into_instance();
+            inst.check(&asg).expect("long*u32ish satisfiable");
+
+            let mut acc: i128 = 0;
+            let mut pow: i128 = 1;
+            for (idx, &dv) in prod.iter().enumerate() {
+                acc += (f257_to_i32_bal(asg[dv]) as i128) * pow;
+                if idx + 1 < prod.len() {
+                    pow *= 16;
+                }
+            }
+            assert_eq!(acc, a * b_i);
+        }
+    }
+
+    #[test]
+    fn test_mul_bal16_long_by_long_roundtrip_small() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xA11CE5EED_u64);
+        let mut b = Dr1csBuilder::<F257>::new();
+        b.enforce_var_eq_const(b.one(), F257::ONE);
+
+        let to_digits = |b: &mut Dr1csBuilder<F257>, mut x: i128, max_len: usize| -> Vec<usize> {
+            let zero = alloc_bal16_digit(b, 0);
+            if x == 0 {
+                return vec![zero];
+            }
+            let mut out: Vec<usize> = Vec::new();
+            for _ in 0..max_len {
+                if x == 0 {
+                    break;
+                }
+                // Balanced remainder in [-8,7].
+                let mut r = (x % 16) as i32;
+                if r < 0 {
+                    r += 16;
+                }
+                if r >= 8 {
+                    r -= 16;
+                }
+                out.push(alloc_bal16_digit(b, r as i8));
+                x = (x - (r as i128)) / 16;
+            }
+            out
+        };
+
+        // Keep sizes modest so native product fits in i128 comfortably.
+        for _ in 0..50 {
+            let a: i128 = rng.gen_range(-(1i128 << 40)..(1i128 << 40));
+            let c: i128 = rng.gen_range(-(1i128 << 40)..(1i128 << 40));
+            let ad = to_digits(&mut b, a, 20);
+            let cd = to_digits(&mut b, c, 20);
+            let prod = mul_bal16_long_by_long(&mut b, &ad, &cd);
+
+            // Decode result.
+            let mut acc: i128 = 0;
+            let mut pow: i128 = 1;
+            for &dv in &prod {
+                acc += (f257_to_i32_bal(b.assignment[dv]) as i128) * pow;
+                pow *= 16;
+            }
+            assert_eq!(acc, a * c);
+        }
+
+        let (inst, asg) = b.into_instance();
+        inst.check(&asg).expect("mul_bal16_long_by_long satisfied");
     }
 
     #[test]

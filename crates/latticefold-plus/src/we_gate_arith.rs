@@ -5,9 +5,11 @@
 
 use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
 use ark_ff::{BigInteger, Field, PrimeField};
+use latticefold::transcript::poseidon::F257;
 use stark_rings::{psi, unit_monomial, CoeffRing, OverField, PolyRing, Zq};
 
 use crate::recording_transcript::{PoseidonTraceOp as LfPoseidonTraceOp, PoseidonTranscriptTrace};
+use crate::we_gate_tiny as tiny;
 use crate::we_statement::WeParams;
 
 // Reuse symphony’s sparse dR1CS primitives and Poseidon arithmetizer.
@@ -613,6 +615,43 @@ where
         build_we_dr1cs_for_plus_proof::<R>(poseidon_cfg, trace, params, public_inputs, proof, mlen_mats, B)?
             .assignment,
     )
+}
+
+/// Arm-time (shape-only) builder for the **tiny-field** (F257) WE gate transcript layer.
+///
+/// This currently arithmetizes only the Poseidon(F257) transcript schedule for Π_plus, lifted from
+/// the existing recorder trace schedule. It is the starting point for the full Thm-4.3 tiny-field gate.
+#[cfg(feature = "we_gate")]
+pub fn build_we_dr1cs_for_plus_proof_shape_tiny<R>(
+    params: &WeParams,
+    public_inputs_len: usize,
+    n_lin_proofs: usize,
+    mlen_mats: usize,
+) -> Result<WeDr1csShape<F257>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + Field + PrimeField,
+{
+    // Build a dummy schedule trace (values are zero; only op ordering/lengths matter).
+    let trace =
+        poseidon_trace_schedule_for_plus::<R>(public_inputs_len, params, n_lin_proofs, mlen_mats)?;
+    let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<R>>(&trace.ops)?;
+    let (inst, _asg) = tiny::build_poseidon_f257_from_ops(None, &ops_f257)?;
+    Ok(WeDr1csShape { inst, public_len: 1 })
+}
+
+/// Witness-time builder for the **tiny-field** (F257) transcript layer.
+#[cfg(feature = "we_gate")]
+pub fn build_we_dr1cs_for_plus_proof_witness_tiny<R>(
+    trace: &PoseidonTranscriptTrace<BF<R>>,
+) -> Result<Vec<F257>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + Field + PrimeField,
+{
+    let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<R>>(&trace.ops)?;
+    let (_inst, asg) = tiny::build_poseidon_f257_from_ops(None, &ops_f257)?;
+    Ok(asg)
 }
 
 fn lf_ops_to_symphony_ops<F: PrimeField>(ops: &[LfPoseidonTraceOp<F>]) -> Vec<symphony::transcript::PoseidonTraceOp<F>> {
@@ -5655,6 +5694,39 @@ mod tests {
         let mut replay = ReplayPoseidonTranscript::<RR>::new(&trace);
         proof.verify(&M, &mut replay).expect("cm verify (replay)");
         assert_eq!(replay.idx, replay.trace.ops.len(), "replay should consume full trace");
+    }
+
+    #[test]
+    #[ignore = "slow: builds full Π_plus transcript schedule into Poseidon(F257) dR1CS"]
+    fn test_plus_poseidon_schedule_lifts_to_f257_and_satisfies() {
+        use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as RR;
+        use stark_rings::PolyRing;
+
+        // Small-ish params; we only care about schedule validity.
+        let params = WeParams {
+            nvars_setchk: 4,
+            degree_setchk: 3,
+            nvars_cm: 4,
+            degree_cm: 2,
+            kappa: 2,
+            ring_dim_d: RR::dimension() as u64,
+            decomp_b: 16,
+            k: 1,
+            l: 4,
+            mlen: 1,
+        };
+        let public_inputs_len = 4usize;
+        let n_lin_proofs = 1usize;
+        let mlen_mats = 1usize;
+
+        let trace =
+            poseidon_trace_schedule_for_plus::<RR>(public_inputs_len, &params, n_lin_proofs, mlen_mats)
+                .expect("poseidon_trace_schedule_for_plus");
+        let ops_f257 = crate::we_gate_tiny::lift_recording_trace_ops_to_f257::<BF<RR>>(&trace.ops)
+            .expect("lift trace ops to f257");
+        let (inst, asg) =
+            crate::we_gate_tiny::build_poseidon_f257_from_ops(None, &ops_f257).expect("poseidon f257");
+        inst.check(&asg).expect("poseidon f257 schedule satisfiable");
     }
 
     #[test]
