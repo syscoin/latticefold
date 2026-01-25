@@ -112,7 +112,7 @@ where
     // Merge params prefix first so the DPP public prefix matches `[1] || WeParams`.
     // (The DPP/FLPCP expects the first `public_len` variables to be the public input vector `x`.)
     let parts = vec![(params_inst, params_asg), (inst_pose, asg_pose)];
-    let (inst, _asg) = merge_sparse_dr1cs_share_one(&parts).map_err(|e| e.to_string())?;
+    let (inst, _asg) = merge_sparse_dr1cs_share_one(parts).map_err(|e| e.to_string())?;
 
     Ok(WeDr1csShape { inst, public_len: 1 + 10 })
 }
@@ -3341,7 +3341,7 @@ where
 
     let parts = vec![(pose_inst, pose_asg), (params_inst, params_asg), (lin_inst, lin_asg)];
     let (inst, assignment) =
-        merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| e.to_string())?;
+        merge_sparse_dr1cs_share_one_with_glue(parts, &glue).map_err(|e| e.to_string())?;
 
     // Public prefix: [1] + params (fixed 9 scalars)
     let public_len = 1 + 10;
@@ -3401,7 +3401,7 @@ where
 
     let parts = vec![(pose_inst, pose_asg), (params_inst, params_asg), (coin_inst, coin_asg)];
     let (inst, assignment) =
-        merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| e.to_string())?;
+        merge_sparse_dr1cs_share_one_with_glue(parts, &glue).map_err(|e| e.to_string())?;
 
     let public_len = 1 + 10;
     Ok((WeDr1csOutput { inst, assignment, public_len }, coin_wiring))
@@ -3547,7 +3547,7 @@ where
         (field_inst, field_asg),
     ];
     let (inst, assignment) =
-        merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| e.to_string())?;
+        merge_sparse_dr1cs_share_one_with_glue(parts, &glue).map_err(|e| e.to_string())?;
 
     let public_len = 1 + 10;
     Ok((
@@ -3963,7 +3963,7 @@ where
     }
     let _base_constraints = parts.iter().map(|(i, _)| i.constraints.len()).sum::<usize>();
 
-    let (inst, assignment) = merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| {
+    let (inst, assignment) = merge_sparse_dr1cs_share_one_with_glue(parts, &glue).map_err(|e| {
         // Add part-local index info for inconsistent-glue errors.
         let msg = e.to_string();
         if let Some((a, b)) = msg
@@ -5345,7 +5345,7 @@ mod tests {
         let (params_inst, params_asg) = b_params.into_instance();
 
         let parts = vec![(params_inst, params_asg), (inst_pose, asg_pose)];
-        let (inst, asg) = merge_sparse_dr1cs_share_one(&parts).expect("merge parts");
+        let (inst, asg) = merge_sparse_dr1cs_share_one(parts).expect("merge parts");
 
         // Sanity: consistent sizes.
         assert_eq!(asg.len(), inst.nvars);
@@ -5446,7 +5446,7 @@ mod tests {
         let (params_inst, params_asg) = b_params.into_instance();
 
         let parts = vec![(params_inst, params_asg), (inst_pose, asg_pose)];
-        let (inst, asg) = merge_sparse_dr1cs_share_one(&parts).expect("merge parts");
+        let (inst, asg) = merge_sparse_dr1cs_share_one(parts).expect("merge parts");
 
         // Armer builds the shape (should match our satisfiable inst).
         let t_shape = Instant::now();

@@ -2305,7 +2305,7 @@ pub fn build_poseidon_f257_with_frog_coin_rejection_glue_from_ops_with_wiring(
     let (glue_inst, glue_asg) = gb.into_instance();
     let glue_nvars = glue_inst.nvars;
 
-    let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(&[
+    let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(vec![
         (pose_inst, pose_asg),
         (glue_inst, glue_asg),
     ])
@@ -2399,7 +2399,7 @@ pub fn build_poseidon_f257_with_frog_rejection_coins_from_ops_with_wiring(
     let glue_nvars = glue_inst.nvars;
 
     // Merge poseidon + glue.
-    let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(&[
+    let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(vec![
         (pose_inst, pose_asg),
         (glue_inst, glue_asg),
     ])
@@ -2553,7 +2553,7 @@ pub fn build_poseidon_f257_with_cm_coin_surface_from_ops_with_wiring(
     let glue_nvars = glue_inst.nvars;
 
     // Merge poseidon + glue.
-    let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(&[
+    let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(vec![
         (pose_inst, pose_asg),
         (glue_inst, glue_asg),
     ])
@@ -2724,7 +2724,7 @@ pub fn build_poseidon_f257_with_cm_coins_and_frog_rejection_from_ops_with_wiring
     let glue_nvars = glue_inst.nvars;
 
     // Merge poseidon + glue.
-    let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(&[
+    let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(vec![
         (pose_inst, pose_asg),
         (glue_inst, glue_asg),
     ])
@@ -3013,7 +3013,7 @@ pub fn build_poseidon_f257_with_cm_coins_frog_and_digit_mul_sq_surfaces_from_ops
     let (glue_inst, glue_asg) = gb.into_instance();
     let glue_nvars = glue_inst.nvars;
 
-    let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(&[
+    let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(vec![
         (pose_inst, pose_asg),
         (glue_inst, glue_asg),
     ])
@@ -3287,7 +3287,7 @@ pub fn build_poseidon_f257_with_cm_coins_frog_and_digit_mul_surfaces_from_ops_wi
     let glue_nvars = glue_inst.nvars;
 
     // Merge poseidon + glue.
-    let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(&[
+    let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(vec![
         (pose_inst, pose_asg),
         (glue_inst, glue_asg),
     ])
@@ -3532,7 +3532,7 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
     let glue_nvars = glue_inst.nvars;
 
     // Merge poseidon + glue.
-    let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(&[
+    let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(vec![
         (pose_inst, pose_asg),
         (glue_inst, glue_asg),
     ])

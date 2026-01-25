@@ -432,6 +432,20 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
         Self: Sync,
     {
         if Self::is_f257() && self.rank == 3 {
+            // This fast path assumes the canonical Layout A evaluation order, i.e.
+            // `positions == witness_positions_star()`. We keep the API generic for callers,
+            // but we defensively check the invariant in debug builds to avoid silent misuse.
+            #[cfg(debug_assertions)]
+            {
+                if let Ok(expected) = self.witness_positions_star() {
+                    debug_assert_eq!(
+                        positions,
+                        expected.as_slice(),
+                        "TensorRsMulCode::eval_e_at_positions (F257 rank=3) requires positions == witness_positions_star()"
+                    );
+                }
+            }
+
             let base_k = self.base_k;
             let side = 2 * base_k - 1;
             if side > self.base_n {
@@ -684,6 +698,8 @@ impl<F: PrimeField, C: MulCode<F> + Sync> ChunkedMulCodeDr1csNpFlpcpSparse<F, C>
         witness_pos: &[usize],
         x: &[F],
         z_w: &[F],
+        x_u16: Option<&[u16]>,
+        z_u16: Option<&[u16]>,
     ) -> Result<Vec<F>, String> {
         let k = inst.k();
         let k_star = self.k_star();
@@ -692,8 +708,8 @@ impl<F: PrimeField, C: MulCode<F> + Sync> ChunkedMulCodeDr1csNpFlpcpSparse<F, C>
         }
 
         let (y_a, y_b) = join(
-            || mat_vec_sparse_np(&inst.a, x, z_w, self.l),
-            || mat_vec_sparse_np(&inst.b, x, z_w, self.l),
+            || mat_vec_sparse_np(&inst.a, x, z_w, self.l, x_u16, z_u16),
+            || mat_vec_sparse_np(&inst.b, x, z_w, self.l, x_u16, z_u16),
         );
         if y_a.len() != k || y_b.len() != k {
             return Err("bad mat-vec size".to_string());
@@ -760,8 +776,25 @@ impl<F: PrimeField, C: MulCode<F> + Sync> ChunkedMulCodeDr1csNpFlpcpSparse<F, C>
             return Err("witness positions length mismatch".to_string());
         }
 
+        // F257 optimization: converting `z_w` to u16 is expensive; do it once for all blocks.
+        let (x_u16, z_u16) = if is_f257_field::<F>() {
+            (
+                Some(x.iter().copied().map(f_to_u16).collect::<Vec<_>>()),
+                Some(z_w.iter().copied().map(f_to_u16).collect::<Vec<_>>()),
+            )
+        } else {
+            (None, None)
+        };
+
         for (b, inst) in self.blocks.iter().enumerate() {
-            let w_eval = self.compute_block_w_eval(inst, &witness_pos, x, z_w)?;
+            let w_eval = self.compute_block_w_eval(
+                inst,
+                &witness_pos,
+                x,
+                z_w,
+                x_u16.as_deref(),
+                z_u16.as_deref(),
+            )?;
             on_chunk(b, &w_eval);
             pi.extend_from_slice(&w_eval);
         }
@@ -872,7 +905,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
 
         for inst in self.blocks.iter() {
             let w_eval = self
-                .compute_block_w_eval(inst, &witness_pos, x, z_w)
+                .compute_block_w_eval(inst, &witness_pos, x, z_w, None, None)
                 .expect("block w_eval failed");
             pi.extend_from_slice(&w_eval);
         }
@@ -961,8 +994,8 @@ impl<F: PrimeField, C: MulCode<F> + Sync> MulCodeDr1csNpFlpcpSparse<F, C> {
         }
 
         let (y_a, y_b) = join(
-            || mat_vec_sparse_np(&self.inst.a, x, z_w, self.l),
-            || mat_vec_sparse_np(&self.inst.b, x, z_w, self.l),
+            || mat_vec_sparse_np(&self.inst.a, x, z_w, self.l, None, None),
+            || mat_vec_sparse_np(&self.inst.b, x, z_w, self.l, None, None),
         );
         if y_a.len() != k || y_b.len() != k {
             return Err("bad mat-vec size".to_string());
@@ -1485,8 +1518,8 @@ impl<F: PrimeField + FftField> RsDr1csNpFlpcpSparse<F> {
         // This copy can dominate runtime and look “single-threaded”.
         // A and B mat-vecs are independent: run concurrently.
         let (y_a, y_b) = join(
-            || mat_vec_sparse_np(&self.inst.a, x, z_w, self.l),
-            || mat_vec_sparse_np(&self.inst.b, x, z_w, self.l),
+            || mat_vec_sparse_np(&self.inst.a, x, z_w, self.l, None, None),
+            || mat_vec_sparse_np(&self.inst.b, x, z_w, self.l, None, None),
         );
         // Extrapolations are independent and often dominate: run concurrently.
         let (y_a_tail, y_b_tail) = join(
@@ -1515,10 +1548,10 @@ impl<F: PrimeField + FftField> RsDr1csNpFlpcpSparse<F> {
         let k = self.inst.k();
         // Compute y_a, y_b, y_c concurrently.
         let (y_a, (y_b, y_c)) = join(
-            || mat_vec_sparse_np(&self.inst.a, x, z_w, self.l),
+            || mat_vec_sparse_np(&self.inst.a, x, z_w, self.l, None, None),
             || join(
-                || mat_vec_sparse_np(&self.inst.b, x, z_w, self.l),
-                || mat_vec_sparse_np(&self.inst.c, x, z_w, self.l),
+                || mat_vec_sparse_np(&self.inst.b, x, z_w, self.l, None, None),
+                || mat_vec_sparse_np(&self.inst.c, x, z_w, self.l, None, None),
             ),
         );
         // Compute tails.
@@ -1768,12 +1801,57 @@ fn mat_vec_sparse<F: PrimeField>(m: &[SparseVec<F>], x: &[F]) -> Vec<F> {
     }
 }
 
-fn mat_vec_sparse_np<F: PrimeField>(m: &[SparseVec<F>], x: &[F], z_w: &[F], l: usize) -> Vec<F> {
+fn mat_vec_sparse_np<F: PrimeField>(
+    m: &[SparseVec<F>],
+    x: &[F],
+    z_w: &[F],
+    l: usize,
+    x_u16: Option<&[u16]>,
+    z_u16: Option<&[u16]>,
+) -> Vec<F> {
     debug_assert_eq!(x.len(), l);
     debug_assert_eq!(l + z_w.len(), m.first().map(|_| l + z_w.len()).unwrap_or(l + z_w.len()));
     if is_f257_field::<F>() {
-        let x_u16 = x.iter().map(|v| f_to_u16(*v)).collect::<Vec<_>>();
-        let z_u16 = z_w.iter().map(|v| f_to_u16(*v)).collect::<Vec<_>>();
+        let (x_u16, z_u16) = match (x_u16, z_u16) {
+            (Some(xu), Some(zu)) => {
+                debug_assert_eq!(xu.len(), l);
+                debug_assert_eq!(zu.len(), z_w.len());
+                (xu, zu)
+            }
+            _ => {
+                // Fallback: build local caches.
+                let xu = x.iter().copied().map(f_to_u16).collect::<Vec<_>>();
+                let zu = z_w.iter().copied().map(f_to_u16).collect::<Vec<_>>();
+                // SAFETY: we only use these within this call, so keep them owned.
+                // To avoid code duplication below, handle this case separately.
+                if m.len() >= 256 {
+                    return m
+                        .par_iter()
+                        .map(|row| {
+                            let mut acc = 0u16;
+                            for (c, idx) in row.terms.iter().copied() {
+                                let coeff = f_to_u16(c);
+                                let v = if idx < l { xu[idx] } else { zu[idx - l] };
+                                acc = add_mod(acc, mul_mod(coeff, v));
+                            }
+                            F::from(acc as u64)
+                        })
+                        .collect();
+                }
+                return m
+                    .iter()
+                    .map(|row| {
+                        let mut acc = 0u16;
+                        for (c, idx) in row.terms.iter().copied() {
+                            let coeff = f_to_u16(c);
+                            let v = if idx < l { xu[idx] } else { zu[idx - l] };
+                            acc = add_mod(acc, mul_mod(coeff, v));
+                        }
+                        F::from(acc as u64)
+                    })
+                    .collect();
+            }
+        };
         if m.len() >= 256 {
             m.par_iter()
                 .map(|row| {
@@ -1932,7 +2010,7 @@ fn mul_mod(a: u16, b: u16) -> u16 {
     ((a as u32 * b as u32) % p) as u16
 }
 
-fn is_f257_field<F: PrimeField>() -> bool {
+pub(crate) fn is_f257_field<F: PrimeField>() -> bool {
     let bytes = F::MODULUS.to_bytes_le();
     let mut acc: u64 = 0;
     for (i, b) in bytes.iter().enumerate().take(8) {
@@ -1941,7 +2019,7 @@ fn is_f257_field<F: PrimeField>() -> bool {
     acc == 257
 }
 
-fn f_to_u16<F: PrimeField>(v: F) -> u16 {
+pub(crate) fn f_to_u16<F: PrimeField>(v: F) -> u16 {
     let bytes = v.into_bigint().to_bytes_le();
     let mut acc: u16 = 0;
     if !bytes.is_empty() {

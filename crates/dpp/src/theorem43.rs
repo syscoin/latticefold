@@ -24,7 +24,10 @@ use std::marker::PhantomData;
 use latticefold::transcript::bytes::field_to_bytes_le_fixed;
 use latticefold::transcript::poseidon::{f257_poseidon_config, F257};
 
-use crate::dr1cs_flpcp::{ChunkedMulCodeDr1csNpFlpcpSparse, Dr1csNpFlpcpSparseApi, Dr1csQueryScratch, MulCode, QuerySink};
+use crate::dr1cs_flpcp::{
+    f_to_u16, is_f257_field, ChunkedMulCodeDr1csNpFlpcpSparse, Dr1csNpFlpcpSparseApi,
+    Dr1csQueryScratch, MulCode, QuerySink,
+};
 use crate::sparse::SparseVec;
 
 /// Coins defining the single lockable query.
@@ -330,8 +333,25 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Theorem43Dpp<F, ChunkedMulCodeDr1csNpF
             return Err("witness positions length mismatch".to_string());
         }
 
+        // F257 optimization: avoid repeatedly converting the (huge) witness slice to u16.
+        let (x_u16, z_u16) = if is_f257_field::<F>() {
+            (
+                Some(x.iter().copied().map(f_to_u16).collect::<Vec<_>>()),
+                Some(z_w.iter().copied().map(f_to_u16).collect::<Vec<_>>()),
+            )
+        } else {
+            (None, None)
+        };
+
         for (b, inst) in flpcp.blocks.iter().enumerate() {
-            let w_eval = flpcp.compute_block_w_eval(inst, &witness_pos, x, z_w)?;
+            let w_eval = flpcp.compute_block_w_eval(
+                inst,
+                &witness_pos,
+                x,
+                z_w,
+                x_u16.as_deref(),
+                z_u16.as_deref(),
+            )?;
             acc0.add_block(b, &w_eval)?;
             acc1.add_block(b, &w_eval)?;
             acc2.add_block(b, &w_eval)?;

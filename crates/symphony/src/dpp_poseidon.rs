@@ -148,16 +148,20 @@ impl<F: PrimeField> SparseDr1csInstance<F> {
 /// - var 0 is shared across all parts
 /// - all other variables are appended, and constraints are re-indexed accordingly
 pub fn merge_sparse_dr1cs_share_one<F: PrimeField>(
-    parts: &[(SparseDr1csInstance<F>, Vec<F>)],
+    mut parts: Vec<(SparseDr1csInstance<F>, Vec<F>)>,
 ) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {
     if parts.is_empty() {
         return Err("merge_sparse_dr1cs_share_one: empty parts".to_string());
     }
 
-    let mut merged_assignment: Vec<F> = vec![F::ONE];
-    let mut merged_constraints: Vec<Constraint<F>> = Vec::new();
+    let total_constraints: usize = parts.iter().map(|(inst, _)| inst.constraints.len()).sum();
+    let total_assignment_len: usize = parts.iter().map(|(_, asg)| asg.len()).sum();
 
-    for (inst, asg) in parts {
+    let mut merged_assignment: Vec<F> = Vec::with_capacity(total_assignment_len.saturating_sub(parts.len()) + 1);
+    merged_assignment.push(F::ONE);
+    let mut merged_constraints: Vec<Constraint<F>> = Vec::with_capacity(total_constraints);
+
+    for (mut inst, asg) in parts.drain(..) {
         if asg.is_empty() || asg[0] != F::ONE {
             return Err("merge_sparse_dr1cs_share_one: each part must have assignment[0]=1".to_string());
         }
@@ -167,20 +171,27 @@ pub fn merge_sparse_dr1cs_share_one<F: PrimeField>(
 
         // Map part var0 -> merged var0, and shift the rest by current offset.
         let offset = merged_assignment.len() - 1;
-        let remap_idx = |idx: usize| -> usize { if idx == 0 { 0 } else { idx + offset } };
-
-        for row in &inst.constraints {
-            let remap_lc = |lc: &[(F, usize)]| -> Vec<(F, usize)> {
-                lc.iter().map(|(c, i)| (*c, remap_idx(*i))).collect()
-            };
-            merged_constraints.push(Constraint {
-                a: remap_lc(&row.a),
-                b: remap_lc(&row.b),
-                c: remap_lc(&row.c),
-            });
+        if offset != 0 {
+            for row in inst.constraints.iter_mut() {
+                for (_c, idx) in row.a.iter_mut() {
+                    if *idx != 0 {
+                        *idx += offset;
+                    }
+                }
+                for (_c, idx) in row.b.iter_mut() {
+                    if *idx != 0 {
+                        *idx += offset;
+                    }
+                }
+                for (_c, idx) in row.c.iter_mut() {
+                    if *idx != 0 {
+                        *idx += offset;
+                    }
+                }
+            }
         }
 
-        // Append assignment sans constant slot.
+        merged_constraints.extend(inst.constraints.drain(..));
         merged_assignment.extend_from_slice(&asg[1..]);
     }
 
@@ -199,7 +210,7 @@ pub fn merge_sparse_dr1cs_share_one<F: PrimeField>(
 /// `glue` entries are `(part_a, var_a, part_b, var_b)` in **local** indices.
 /// The merged instance enforces `var_a == var_b` for each glue entry.
 pub fn merge_sparse_dr1cs_share_one_with_glue<F: PrimeField>(
-    parts: &[(SparseDr1csInstance<F>, Vec<F>)],
+    parts: Vec<(SparseDr1csInstance<F>, Vec<F>)>,
     glue: &[(usize, usize, usize, usize)],
 ) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {
     merge_sparse_dr1cs_share_one_with_glue_impl(parts, glue, true)
@@ -212,14 +223,14 @@ pub fn merge_sparse_dr1cs_share_one_with_glue<F: PrimeField>(
 /// instance (constraints + variable identification) is what matters, not the particular dummy
 /// assignment used during construction.
 pub fn merge_sparse_dr1cs_share_one_with_glue_relaxed<F: PrimeField>(
-    parts: &[(SparseDr1csInstance<F>, Vec<F>)],
+    parts: Vec<(SparseDr1csInstance<F>, Vec<F>)>,
     glue: &[(usize, usize, usize, usize)],
 ) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {
     merge_sparse_dr1cs_share_one_with_glue_impl(parts, glue, false)
 }
 
 fn merge_sparse_dr1cs_share_one_with_glue_impl<F: PrimeField>(
-    parts: &[(SparseDr1csInstance<F>, Vec<F>)],
+    mut parts: Vec<(SparseDr1csInstance<F>, Vec<F>)>,
     glue: &[(usize, usize, usize, usize)],
     check_assignment_consistency: bool,
 ) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {
@@ -252,7 +263,7 @@ fn merge_sparse_dr1cs_share_one_with_glue_impl<F: PrimeField>(
         ),
     );
     // #endregion
-    for (inst, asg) in parts {
+    for (inst, asg) in parts.iter() {
         if asg.is_empty() || asg[0] != F::ONE {
             return Err("merge_sparse_dr1cs_share_one_with_glue: each part must have assignment[0]=1".to_string());
         }
