@@ -10,6 +10,52 @@ use crate::poseidon_trace::{permute_with_round_trace, PoseidonReplayError};
 use crate::poseidon_trace::{replay_ops, PoseidonReplayError as ReplayErr, PoseidonSpongeReplayResult};
 use crate::transcript::PoseidonTraceOp;
 
+fn escape_json_str(input: &str) -> String {
+    input
+        .chars()
+        .flat_map(|c| match c {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            '\r' => "\\r".chars().collect::<Vec<_>>(),
+            '\t' => "\\t".chars().collect::<Vec<_>>(),
+            _ => vec![c],
+        })
+        .collect()
+}
+
+fn debug_log(hypothesis_id: &str, location: &str, message: &str, data_json: &str) {
+    use std::io::Write;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let id = format!(
+        "log_{}_{}",
+        timestamp,
+        location
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>()
+    );
+    let payload = format!(
+        "{{\"id\":\"{}\",\"timestamp\":{},\"location\":\"{}\",\"message\":\"{}\",\"data\":{},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"{}\"}}",
+        escape_json_str(&id),
+        timestamp,
+        escape_json_str(location),
+        escape_json_str(message),
+        data_json,
+        escape_json_str(hypothesis_id),
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/Users/jagsidhu/work/Documents/GitHub/PVUGC/.cursor/debug.log")
+    {
+        let _ = writeln!(f, "{payload}");
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Constraint<F: PrimeField> {
     pub a: Vec<(F, usize)>,
@@ -189,6 +235,23 @@ fn merge_sparse_dr1cs_share_one_with_glue_impl<F: PrimeField>(
     // Compute offsets for each part (how much its non-const vars are shifted by in merged space).
     let mut offsets: Vec<usize> = Vec::with_capacity(parts.len());
     let mut merged_assignment: Vec<F> = vec![F::ONE];
+    let total_constraints: usize = parts.iter().map(|(inst, _)| inst.constraints.len()).sum();
+    let total_assignment_len: usize = parts.iter().map(|(_, asg)| asg.len()).sum();
+    // #region agent log
+    debug_log(
+        "H1",
+        "dpp_poseidon.rs:merge_sparse_dr1cs_share_one_with_glue_impl:entry",
+        "merge entry",
+        &format!(
+            "{{\"parts_len\":{},\"glue_len\":{},\"check_assignment_consistency\":{},\"total_constraints\":{},\"total_assignment_len\":{}}}",
+            parts.len(),
+            glue.len(),
+            check_assignment_consistency,
+            total_constraints,
+            total_assignment_len
+        ),
+    );
+    // #endregion
     for (inst, asg) in parts {
         if asg.is_empty() || asg[0] != F::ONE {
             return Err("merge_sparse_dr1cs_share_one_with_glue: each part must have assignment[0]=1".to_string());
@@ -243,6 +306,19 @@ fn merge_sparse_dr1cs_share_one_with_glue_impl<F: PrimeField>(
         let ib = get_id(gb, &mut idx_map, &mut idxs);
         glue_pairs.push((ia, ib));
     }
+    // #region agent log
+    debug_log(
+        "H2",
+        "dpp_poseidon.rs:merge_sparse_dr1cs_share_one_with_glue_impl:glue_map",
+        "glue mapping built",
+        &format!(
+            "{{\"idxs_len\":{},\"glue_pairs_len\":{},\"offsets_len\":{}}}",
+            idxs.len(),
+            glue_pairs.len(),
+            offsets.len()
+        ),
+    );
+    // #endregion
 
     // Union-find over the glued variable set.
     let m = idxs.len();
@@ -315,6 +391,40 @@ fn merge_sparse_dr1cs_share_one_with_glue_impl<F: PrimeField>(
                 // For shape-only builds, callers may intentionally use arbitrary dummy values,
                 // so we optionally skip this check.
                 if check_assignment_consistency && merged_assignment[i] != merged_assignment[rep] {
+                    let locate = |g: usize| -> Option<(usize, usize)> {
+                        if g == 0 {
+                            return Some((0, 0));
+                        }
+                        for (pi, (inst, _asg)) in parts.iter().enumerate() {
+                            let off = offsets[pi];
+                            let start = off + 1;
+                            let end = off + inst.nvars;
+                            if g >= start && g < end {
+                                return Some((pi, g - off));
+                            }
+                        }
+                        None
+                    };
+                    let (li_part, li_local) = locate(i).unwrap_or((usize::MAX, usize::MAX));
+                    let (lr_part, lr_local) = locate(rep).unwrap_or((usize::MAX, usize::MAX));
+                    // #region agent log
+                    debug_log(
+                        "H3",
+                        "dpp_poseidon.rs:merge_sparse_dr1cs_share_one_with_glue_impl:inconsistent",
+                        "inconsistent glued assignment",
+                        &format!(
+                            "{{\"g\":{},\"rep\":{},\"g_part\":{},\"g_local\":{},\"rep_part\":{},\"rep_local\":{},\"g_val\":\"{}\",\"rep_val\":\"{}\"}}",
+                            i,
+                            rep,
+                            li_part,
+                            li_local,
+                            lr_part,
+                            lr_local,
+                            escape_json_str(&format!("{}", merged_assignment[i])),
+                            escape_json_str(&format!("{}", merged_assignment[rep]))
+                        ),
+                    );
+                    // #endregion
                     return Err(format!(
                         "merge_sparse_dr1cs_share_one_with_glue: inconsistent glued assignment ({} != {})",
                         i, rep
@@ -404,6 +514,19 @@ fn merge_sparse_dr1cs_share_one_with_glue_impl<F: PrimeField>(
         }
     }
 
+    // #region agent log
+    debug_log(
+        "H4",
+        "dpp_poseidon.rs:merge_sparse_dr1cs_share_one_with_glue_impl:exit",
+        "merge exit",
+        &format!(
+            "{{\"old_nvars\":{},\"new_nvars\":{},\"merged_constraints\":{}}}",
+            old_nvars,
+            new_assignment.len(),
+            merged_constraints.len()
+        ),
+    );
+    // #endregion
     Ok((
         SparseDr1csInstance {
             nvars: new_assignment.len(),
