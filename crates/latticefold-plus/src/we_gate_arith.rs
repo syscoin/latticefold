@@ -13,7 +13,8 @@ use crate::we_statement::WeParams;
 // Reuse symphony’s sparse dR1CS primitives and Poseidon arithmetizer.
 use symphony::dpp_poseidon::{
     merge_sparse_dr1cs_share_one, merge_sparse_dr1cs_share_one_with_glue,
-    poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes, Constraint, PoseidonByteWiring,
+    poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes,
+    poseidon_sponge_dr1cs_from_trace_with_wiring_and_bytes, Constraint, PoseidonByteWiring,
     PoseidonDr1csWiring, SparseDr1csInstance,
 };
 use symphony::dpp_sumcheck::Dr1csBuilder;
@@ -3381,7 +3382,7 @@ where
     ) = {
         let pose_build = || {
             let (mut pose_inst, pose_asg, _replay, _byte_wit, pose_wiring, byte_wiring) =
-                poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
+                poseidon_sponge_dr1cs_from_trace_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
                     .map_err(|e| format!("poseidon arith failed: {e}"))?;
             enforce_reabsorb_equals_squeeze::<BF<R>>(&mut pose_inst, &pose_wiring, &ops)?;
             Ok::<_, String>((pose_inst, pose_asg, pose_wiring, byte_wiring))
