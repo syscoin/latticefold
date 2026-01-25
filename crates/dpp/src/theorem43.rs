@@ -324,8 +324,14 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Theorem43Dpp<F, ChunkedMulCodeDr1csNpF
 
         on_chunk(z_w.to_vec());
 
+        // Depends only on code parameters; compute once and reuse.
+        let witness_pos = flpcp.code.witness_positions_star()?;
+        if witness_pos.len() != k_star {
+            return Err("witness positions length mismatch".to_string());
+        }
+
         for (b, inst) in flpcp.blocks.iter().enumerate() {
-            let w_eval = flpcp.compute_block_w_eval(inst, x, z_w)?;
+            let w_eval = flpcp.compute_block_w_eval(inst, &witness_pos, x, z_w)?;
             acc0.add_block(b, &w_eval)?;
             acc1.add_block(b, &w_eval)?;
             acc2.add_block(b, &w_eval)?;

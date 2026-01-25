@@ -496,12 +496,12 @@ impl<F: PrimeField, C: MulCode<F> + Sync> ChunkedMulCodeDr1csNpFlpcpSparse<F, C>
     pub(crate) fn compute_block_w_eval(
         &self,
         inst: &Dr1csInstanceSparse<F>,
+        witness_pos: &[usize],
         x: &[F],
         z_w: &[F],
     ) -> Result<Vec<F>, String> {
         let k = inst.k();
         let k_star = self.k_star();
-        let witness_pos = self.code.witness_positions_star()?;
         if witness_pos.len() != k_star {
             return Err("witness positions length mismatch".to_string());
         }
@@ -531,7 +531,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> ChunkedMulCodeDr1csNpFlpcpSparse<F, C>
                     Ok(())
                 })?;
         } else {
-            for (j, idx) in witness_pos.into_iter().enumerate() {
+            for (j, &idx) in witness_pos.iter().enumerate() {
                 let mut ea = F::ZERO;
                 let mut eb = F::ZERO;
                 self.code.row_e_stream(idx, &mut |i, c| {
@@ -577,8 +577,14 @@ impl<F: PrimeField, C: MulCode<F> + Sync> ChunkedMulCodeDr1csNpFlpcpSparse<F, C>
         let mut pi = Vec::with_capacity(self.m());
         pi.extend_from_slice(z_w);
 
+        // This depends only on code parameters, so compute once and reuse across blocks.
+        let witness_pos = self.code.witness_positions_star()?;
+        if witness_pos.len() != self.k_star() {
+            return Err("witness positions length mismatch".to_string());
+        }
+
         for (b, inst) in self.blocks.iter().enumerate() {
-            let w_eval = self.compute_block_w_eval(inst, x, z_w)?;
+            let w_eval = self.compute_block_w_eval(inst, &witness_pos, x, z_w)?;
             on_chunk(b, &w_eval);
             pi.extend_from_slice(&w_eval);
         }
@@ -680,9 +686,16 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         let mut pi = Vec::with_capacity(self.m());
         pi.extend_from_slice(z_w);
 
+        // This depends only on code parameters, so compute once and reuse across blocks.
+        let witness_pos = self
+            .code
+            .witness_positions_star()
+            .expect("witness positions");
+        assert_eq!(witness_pos.len(), self.k_star());
+
         for inst in self.blocks.iter() {
             let w_eval = self
-                .compute_block_w_eval(inst, x, z_w)
+                .compute_block_w_eval(inst, &witness_pos, x, z_w)
                 .expect("block w_eval failed");
             pi.extend_from_slice(&w_eval);
         }
