@@ -3963,6 +3963,17 @@ where
     }
     let _base_constraints = parts.iter().map(|(i, _)| i.constraints.len()).sum::<usize>();
 
+    // Precompute per-part offsets/ranges for error reporting (must happen before we move `parts`).
+    let parts_len = parts.len();
+    let mut offsets: Vec<usize> = Vec::with_capacity(parts_len);
+    let mut cur = 0usize;
+    let mut part_nvars: Vec<usize> = Vec::with_capacity(parts_len);
+    for (inst, asg) in &parts {
+        offsets.push(cur);
+        cur += asg.len().saturating_sub(1);
+        part_nvars.push(inst.nvars);
+    }
+
     let (inst, assignment) = merge_sparse_dr1cs_share_one_with_glue(parts, &glue).map_err(|e| {
         // Add part-local index info for inconsistent-glue errors.
         let msg = e.to_string();
@@ -3972,21 +3983,14 @@ where
             .and_then(|s| s.split_once(" != "))
             .and_then(|(x, y)| Some((x.parse::<usize>().ok()?, y.parse::<usize>().ok()?)))
         {
-            // Compute the same offsets as the merge helper.
-            let mut offsets: Vec<usize> = Vec::with_capacity(parts.len());
-            let mut cur = 0usize;
-            for (_inst, asg) in &parts {
-                offsets.push(cur);
-                cur += asg.len().saturating_sub(1);
-            }
             let locate = |g: usize| -> Option<(usize, usize)> {
                 if g == 0 {
                     return Some((0, 0));
                 }
-                for (pi, (inst, _asg)) in parts.iter().enumerate() {
+                for pi in 0..parts_len {
                     let off = offsets[pi];
                     let start = off + 1;
-                    let end = off + inst.nvars; // inclusive end for local last var
+                    let end = off + part_nvars[pi]; // exclusive end
                     if g >= start && g < end {
                         return Some((pi, g - off));
                     }
@@ -5169,17 +5173,18 @@ where
     // This is logically equivalent to unification (adds equalities rather than identifying vars),
     // and avoids any dependence on which variable becomes the UF representative.
     fn merge_with_glue_constraints<F: PrimeField>(
-        parts: &[(SparseDr1csInstance<F>, Vec<F>)],
+        parts: Vec<(SparseDr1csInstance<F>, Vec<F>)>,
         glue: &[(usize, usize, usize, usize)],
     ) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {
-        let (mut inst, asg) = merge_sparse_dr1cs_share_one(parts)?;
-        // Compute per-part offsets in merged space (excluding var0).
+        // Compute per-part offsets in merged space (excluding var0) before we move `parts`.
         let mut offsets: Vec<usize> = Vec::with_capacity(parts.len());
         let mut cur = 0usize;
-        for (_inst, a) in parts {
+        for (_inst, a) in &parts {
             offsets.push(cur);
             cur += a.len().saturating_sub(1);
         }
+
+        let (mut inst, asg) = merge_sparse_dr1cs_share_one(parts)?;
         let remap = |part: usize, local: usize, offsets: &[usize]| -> usize {
             if local == 0 { 0 } else { local + offsets[part] }
         };
@@ -5196,7 +5201,7 @@ where
         inst.nvars = asg.len();
         Ok((inst, asg))
     }
-    let (inst, assignment) = merge_with_glue_constraints(&parts, &glue)?;
+    let (inst, assignment) = merge_with_glue_constraints(parts, &glue)?;
     if std::env::var("LFP_WE_GATE_OPMIX").is_ok() {
         eprintln!(
             "LF+ WE gate merged: nvars={} constraints={} (glue constraints={})",
