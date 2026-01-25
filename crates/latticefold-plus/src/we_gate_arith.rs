@@ -5207,17 +5207,21 @@ mod tests {
             };
             self.advance();
 
-            // Combine base-257 digits (little-endian) into a base ring scalar.
-            let mut acc = RR::BaseRing::from(0u64);
-            let mut pow = RR::BaseRing::from(1u64);
-            let base = RR::BaseRing::from(257u64);
-            for d in &c {
-                let du64 = d.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u64;
-                debug_assert!(du64 < 257u64);
-                acc += RR::BaseRing::from(du64) * pow;
-                pow *= base;
+            // Match `latticefold-plus/src/transcript.rs:get_challenge`:
+            // interpret digits in byte view (256 -> 0), then pack first 4 bytes into u32 (LE).
+            let mut bs = [0u8; 4];
+            for i in 0..4 {
+                let du16 = c[i]
+                    .into_bigint()
+                    .to_bytes_le()
+                    .get(0)
+                    .copied()
+                    .unwrap_or(0) as u16;
+                debug_assert!(du16 < 257u16);
+                bs[i] = if du16 == 256 { 0u8 } else { du16 as u8 };
             }
-            acc
+            let x = u32::from_le_bytes(bs);
+            RR::BaseRing::from(x as u64)
         }
 
         fn squeeze_bytes(&mut self, n: usize) -> Vec<u8> {
