@@ -42,6 +42,43 @@ fn first_squeeze_field_op_index_of_len(
     ))
 }
 
+/// Collect `SqueezeField(len=CHALLENGE_DIGITS)` indices that correspond to `get_challenge()`.
+///
+/// In our transcript/trace, `get_challenge()` is recorded as:
+/// - `SqueezeField(len=CHALLENGE_DIGITS)`
+/// - `Absorb(len=CHALLENGE_DIGITS)` (Fiat–Shamir re-absorb)
+///
+/// This helper returns indices in the **SqueezeField-occurrence index space** (same convention as
+/// `first_squeeze_field_op_index_of_len` and `TinyCoinOpWiring`).
+#[cfg(feature = "we_gate")]
+fn collect_get_challenge_squeeze_field_indices(
+    ops: &[symphony::transcript::PoseidonTraceOp<F257>],
+    sf_start: usize,
+    sf_end: usize,
+) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut sf_idx = 0usize;
+    for (i, op) in ops.iter().enumerate() {
+        if let symphony::transcript::PoseidonTraceOp::SqueezeField(v) = op {
+            let my_sf = sf_idx;
+            sf_idx += 1;
+            if my_sf < sf_start || my_sf >= sf_end {
+                continue;
+            }
+            if v.len() != CHALLENGE_DIGITS {
+                continue;
+            }
+            // get_challenge() immediately re-absorbs the squeezed elements.
+            if let Some(symphony::transcript::PoseidonTraceOp::Absorb(a)) = ops.get(i + 1) {
+                if a.len() == CHALLENGE_DIGITS {
+                    out.push(my_sf);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Build a tiny-field (F257) Poseidon+CM-coin+digit-mul-surface dR1CS for Π_plus schedule.
 ///
 /// This is a *WE-arith wiring checkpoint*: it does not implement full CM verifier math yet, but it
@@ -70,6 +107,10 @@ where
 
     // The CM segment begins at the first `SqueezeField(len=ring_dim)` (short challenges).
     let squeeze_field_op_offset = first_squeeze_field_op_index_of_len(&ops_f257, ring_dim)?;
+    // Also collect the *prefix* get_challenge() squeezes so the tiny gate has access to all
+    // transcript scalar coins before CM begins (needed for full verifier arithmetization).
+    let prefix_u32_squeeze_ops =
+        collect_get_challenge_squeeze_field_indices(&ops_f257, 0, squeeze_field_op_offset);
     let wiring_rel = tiny::infer_cm_coin_op_wiring_from_ops(
         &ops_f257,
         ring_dim,
@@ -90,6 +131,10 @@ where
         .into_iter()
         .map(|i| i + squeeze_field_op_offset)
         .collect();
+    // Prepend prefix u32 challenges (keeps op order stable).
+    wiring_abs
+        .u32_squeeze_ops
+        .splice(0..0, prefix_u32_squeeze_ops.into_iter());
     wiring_abs.frog_squeeze_ops = Vec::new();
 
     let (inst_pose, asg_pose, _shorts, _u32s, _surfaces) =
