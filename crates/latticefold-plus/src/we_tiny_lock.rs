@@ -119,8 +119,6 @@ pub(crate) fn arm_we_ringlwe_from_dr1cs_streaming<F: PrimeField + FftField>(
     rep_id: u64,
     params: RingLweParams,
     rng: &mut impl rand::RngCore,
-    scratch: &mut Dr1csQueryScratch<F>,
-    acc: &mut QueryBlockAccumulator,
 ) -> Result<WeRingLweStreamingContext<F>, String> {
     if x.len() != public_len {
         return Err("arm_we_ringlwe_from_dr1cs_streaming: x length != public_len".to_string());
@@ -131,6 +129,8 @@ pub(crate) fn arm_we_ringlwe_from_dr1cs_streaming<F: PrimeField + FftField>(
     let blocks = chunk_dr1cs_sparse(inst, k_block);
     let flpcp = ChunkedMulCodeDr1csNpFlpcpSparse::<F, _>::new(blocks, public_len, code)?;
     let dpp = Theorem43Dpp::<F, _>::new(flpcp)?;
+    let mut scratch = dpp.query_scratch();
+    let mut acc = QueryBlockAccumulator::new(dpp.proof_len())?;
     let lock = arm_theorem43_ringlwe_from_statement(
         &dpp,
         stmt_digest,
@@ -141,8 +141,8 @@ pub(crate) fn arm_we_ringlwe_from_dr1cs_streaming<F: PrimeField + FftField>(
         rep_id,
         params,
         rng,
-        scratch,
-        acc,
+        &mut scratch,
+        &mut acc,
     )?;
     Ok(WeRingLweStreamingContext { lock, dpp })
 }
@@ -172,8 +172,6 @@ pub(crate) fn arm_lfplus_we_gate_tiny_ringlwe_streaming<R>(
     rep_id: u64,
     ringlwe_params: RingLweParams,
     rng: &mut impl rand::RngCore,
-    scratch: &mut Dr1csQueryScratch<F257>,
-    acc: &mut QueryBlockAccumulator,
 ) -> Result<WeRingLweStreamingContext<F257>, String>
 where
     R: OverField + CoeffRing + PolyRing,
@@ -209,8 +207,6 @@ where
         rep_id,
         ringlwe_params,
         rng,
-        scratch,
-        acc,
     )
 }
 

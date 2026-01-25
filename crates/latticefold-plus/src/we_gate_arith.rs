@@ -5362,6 +5362,155 @@ mod tests {
         assert_eq!(shape.inst.constraints.len(), inst.constraints.len());
     }
 
+    #[test]
+    #[ignore = "slow: arms LF+ tiny-field gate (F257) and decapsulates a streamed proof"]
+    fn test_tiny_gate_ringlwe_lock_roundtrip_small() {
+        use crate::lockable_ringlwe::RingLweParams;
+        use crate::we_statement::encode_public_x;
+        use crate::we_tiny_lock::arm_lfplus_we_gate_tiny_ringlwe_streaming;
+        use dpp::dr1cs_flpcp::Dr1csQueryScratch;
+        use rand::{rngs::StdRng, SeedableRng};
+
+        // Minimal-but-valid params to keep the schedule small.
+        let ring_dim = <R as PolyRing>::dimension() as u64;
+        let params = WeParams {
+            nvars_setchk: 1,
+            degree_setchk: 3,
+            nvars_cm: 1,
+            degree_cm: 2,
+            kappa: 1,
+            ring_dim_d: ring_dim,
+            decomp_b: 16,
+            k: 1,
+            l: 1,
+            mlen: 0,
+        };
+        let public_inputs_len = 0usize;
+        let n_lin_proofs = 1usize; // schedule builder currently assumes L=1
+        let mlen_mats = 0usize;
+        let pairs: Vec<(usize, usize)> = vec![(0, 0)];
+
+        // Build a satisfiable assignment for the *same* instance shape the armer uses.
+        let trace = super::poseidon_trace_schedule_for_plus::<R>(public_inputs_len, &params, n_lin_proofs, mlen_mats)
+            .expect("poseidon_trace_schedule_for_plus");
+        let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<R>>(&trace.ops)
+            .expect("lift_recording_trace_ops_to_f257");
+
+        let squeeze_field_op_offset =
+            super::first_squeeze_field_op_index_of_len(&ops_f257, <R as PolyRing>::dimension())
+                .expect("first short SqueezeField(len=ring_dim) exists");
+        let k = params.k as usize;
+        let log_kappa = ark_std::log2((params.kappa as usize).next_power_of_two()) as usize;
+        let nvars_cm = params.nvars_cm as usize;
+        let wiring_rel = tiny::infer_cm_coin_op_wiring_from_ops(
+            &ops_f257,
+            <R as PolyRing>::dimension(),
+            k,
+            log_kappa,
+            nvars_cm,
+            squeeze_field_op_offset,
+            0,
+        )
+        .expect("infer_cm_coin_op_wiring_from_ops");
+        let mut wiring_abs = tiny::TinyCoinOpWiring::default();
+        wiring_abs.short_squeeze_ops = wiring_rel
+            .short_squeeze_ops
+            .into_iter()
+            .map(|i| i + squeeze_field_op_offset)
+            .collect();
+        wiring_abs.u32_squeeze_ops = wiring_rel
+            .u32_squeeze_ops
+            .into_iter()
+            .map(|i| i + squeeze_field_op_offset)
+            .collect();
+        wiring_abs.frog_squeeze_ops = Vec::new();
+
+        let (inst_pose, asg_pose, _shorts, _u32s, _surfaces) =
+            tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
+                None,
+                &ops_f257,
+                <R as PolyRing>::dimension(),
+                &wiring_abs,
+                &pairs,
+            )
+            .expect("build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring");
+
+        // Params prefix (must be public / statement-bound).
+        let mut b_params = Dr1csBuilder::<F257>::new();
+        b_params.enforce_var_eq_const(b_params.one(), F257::from(1u64));
+        for &x in &params.to_field_vec::<F257>() {
+            b_params.new_var(x);
+        }
+        let (params_inst, params_asg) = b_params.into_instance();
+
+        let parts = vec![(inst_pose, asg_pose), (params_inst, params_asg)];
+        let (inst, asg) = merge_sparse_dr1cs_share_one(&parts).expect("merge parts");
+
+        // Armer builds the shape (should match our satisfiable inst).
+        let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
+            &params,
+            public_inputs_len,
+            n_lin_proofs,
+            mlen_mats,
+            &pairs,
+        )
+        .expect("build_we_dr1cs_for_plus_proof_shape_tiny");
+        assert_eq!(shape.public_len, 1 + 10);
+        assert_eq!(shape.inst.nvars, inst.nvars);
+        assert_eq!(shape.inst.constraints.len(), inst.constraints.len());
+        shape.inst.check(&asg).expect("shape should be satisfied by asg");
+
+        // Arm and then prove+decap using the satisfying assignment split into (x || z_w).
+        let stmt_digest = [3u8; 32];
+        let armer_seed = [7u8; 32];
+        let lock_j = 0u64;
+
+        let ringlwe_params = RingLweParams {
+            binomial_k: 0,
+            noise_bound: 0,
+            ..RingLweParams::default()
+        };
+
+        let mut rng = StdRng::seed_from_u64(42);
+        // These are no longer needed by the public arming helper, but keep a type-use here to
+        // avoid feature-gated import drift.
+        let _scratch_ty: Option<Dr1csQueryScratch<F257>> = None;
+
+        let ctx = arm_lfplus_we_gate_tiny_ringlwe_streaming::<R>(
+            &params,
+            public_inputs_len,
+            n_lin_proofs,
+            mlen_mats,
+            &pairs,
+            stmt_digest,
+            armer_seed,
+            lock_j,
+            0,
+            0,
+            ringlwe_params,
+            &mut rng,
+        )
+        .expect("arm_lfplus_we_gate_tiny_ringlwe_streaming");
+
+        let x = encode_public_x::<F257>(&params, &[]);
+        assert_eq!(x.len(), shape.public_len);
+        assert_eq!(&asg[..shape.public_len], x.as_slice(), "satisfying assignment public prefix mismatch");
+        let z_w = asg[shape.public_len..].to_vec();
+
+        let mut pi = Vec::new();
+        ctx.prove_stream(&x, &z_w, &mut |chunk| pi.extend_from_slice(&chunk))
+            .expect("prove_stream");
+        assert_eq!(pi.len(), ctx.proof_len());
+
+        let a = ctx.lock.decap_answer(&x, &pi).expect("decap_answer");
+        assert!(a == F257::from(1u64) || a == F257::from(2u64));
+
+        // Negative check: tweak proof and ensure decap fails.
+        let mut pi_bad = pi.clone();
+        pi_bad[0] += F257::from(1u64);
+        assert!(ctx.lock.decap_answer(&x, &pi_bad).is_err());
+    }
+
     #[derive(MontConfig)]
     #[modulus = "39402006196394479212279040100143613805079739270465446667948293404245721771496870329047266088258938001861606973112319"]
     #[generator = "2"]
