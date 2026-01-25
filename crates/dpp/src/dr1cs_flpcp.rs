@@ -68,6 +68,46 @@ pub trait MulCode<F: PrimeField> {
     ///   `row_e_star(idx)[..k]` can be used for the `Cz - w_low || 0` term.
     fn witness_positions_star(&self) -> Result<Vec<usize>, String>;
 
+    /// Evaluate `E(y)[positions[j]]` for a batch of indices without allocating `row_e`.
+    ///
+    /// Canonical path for prover hot loop: callers precompute `positions` once (typically
+    /// `witness_positions_star()`), then reuse it across blocks.
+    ///
+    /// Default implementation is correct but may be slow for large batches; code families
+    /// with structure (e.g. tensor RS over F257) should override this.
+    fn eval_e_at_positions(&self, positions: &[usize], y: &[F]) -> Result<Vec<F>, String>
+    where
+        Self: Sync,
+    {
+        let k = self.dim_k();
+        if y.len() != k {
+            return Err("eval_e_at_positions: bad y length".to_string());
+        }
+        if positions.len() >= 256 {
+            let out = positions
+                .par_iter()
+                .map(|&idx| -> Result<F, String> {
+                    let mut acc = F::ZERO;
+                    self.row_e_stream(idx, &mut |i, c| {
+                        acc += c * y[i];
+                    })?;
+                    Ok(acc)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(out)
+        } else {
+            let mut out = Vec::with_capacity(positions.len());
+            for &idx in positions {
+                let mut acc = F::ZERO;
+                self.row_e_stream(idx, &mut |i, c| {
+                    acc += c * y[i];
+                })?;
+                out.push(acc);
+            }
+            Ok(out)
+        }
+    }
+
     /// Stream coefficients for E(·)[idx] without allocating a full vector.
     fn row_e_stream(&self, idx: usize, f: &mut dyn FnMut(usize, F)) -> Result<(), String> {
         let row = self.row_e(idx)?;
@@ -387,6 +427,151 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
         Ok(())
     }
 
+    fn eval_e_at_positions(&self, positions: &[usize], y: &[F]) -> Result<Vec<F>, String>
+    where
+        Self: Sync,
+    {
+        if Self::is_f257() && self.rank == 3 {
+            let base_k = self.base_k;
+            let side = 2 * base_k - 1;
+            if side > self.base_n {
+                return Err("eval_e_at_positions: side out of range".to_string());
+            }
+            let k = self.dim_k();
+            if y.len() != k {
+                return Err("eval_e_at_positions: bad y length".to_string());
+            }
+            let k_star = self.dim_k_star();
+            if positions.len() != k_star {
+                return Err("eval_e_at_positions: bad positions length".to_string());
+            }
+
+            // Convert once (this is on the prover hot path).
+            let y_u16 = y.iter().copied().map(f_to_u16).collect::<Vec<_>>();
+
+            // Tensor layout conventions:
+            // - Message y is indexed as flat = i0 + i1*base_k + i2*base_k^2 (dim0 least-significant).
+            // - We evaluate E(y) on the side^3 grid of coordinates (c0,c1,c2) with 0<=c*<side.
+            // - Output grid is indexed as g = c0 + c1*side + c2*side^2 (same digit order).
+            let stride_y1 = base_k;
+            let stride_y2 = base_k * base_k;
+            let stride_g1 = side;
+            let stride_g2 = side * side;
+
+            // Pass 1: interpolate along dim0.
+            let mut t0 = vec![0u16; side * base_k * base_k];
+            for i2 in 0..base_k {
+                for i1 in 0..base_k {
+                    let base_y = i1 * stride_y1 + i2 * stride_y2;
+                    let out_base = stride_g1 * (i1 + base_k * i2);
+                    for c0 in 0..side {
+                        let lam0 = &self.lam_k_u16[c0 * base_k..(c0 + 1) * base_k];
+                        let mut acc = 0u16;
+                        for i0 in 0..base_k {
+                            acc = add_mod(acc, mul_mod(lam0[i0], y_u16[base_y + i0]));
+                        }
+                        t0[out_base + c0] = acc;
+                    }
+                }
+            }
+
+            // Pass 2: interpolate along dim1.
+            let mut t1 = vec![0u16; side * side * base_k];
+            for i2 in 0..base_k {
+                for c0 in 0..side {
+                    let out_base = stride_g1 * (c0 + side * i2);
+                    for c1 in 0..side {
+                        let lam1 = &self.lam_k_u16[c1 * base_k..(c1 + 1) * base_k];
+                        let mut acc = 0u16;
+                        for i1 in 0..base_k {
+                            let v = t0[c0 + side * (i1 + base_k * i2)];
+                            acc = add_mod(acc, mul_mod(lam1[i1], v));
+                        }
+                        t1[out_base + c1] = acc;
+                    }
+                }
+            }
+
+            // Pass 3: interpolate along dim2.
+            let mut out_grid = vec![0u16; side * side * side];
+            for c2 in 0..side {
+                let lam2 = &self.lam_k_u16[c2 * base_k..(c2 + 1) * base_k];
+                for c1 in 0..side {
+                    for c0 in 0..side {
+                        let mut acc = 0u16;
+                        for i2 in 0..base_k {
+                            let v = t1[c1 + side * (c0 + side * i2)];
+                            acc = add_mod(acc, mul_mod(lam2[i2], v));
+                        }
+                        out_grid[c0 + c1 * stride_g1 + c2 * stride_g2] = acc;
+                    }
+                }
+            }
+
+            // Emit in the exact order of `witness_positions_star()` (Layout A).
+            // NOTE: callers in this crate always pass `positions = witness_positions_star()`.
+            let mut out = Vec::with_capacity(k_star);
+
+            // Low cube.
+            for i2 in 0..base_k {
+                for i1 in 0..base_k {
+                    for i0 in 0..base_k {
+                        let g = i0 + i1 * stride_g1 + i2 * stride_g2;
+                        out.push(F::from(out_grid[g] as u64));
+                    }
+                }
+            }
+            if out.len() != k {
+                return Err("eval_e_at_positions: low cube length mismatch".to_string());
+            }
+            // Rest of side-cube, skipping low cube points.
+            for c2 in 0..side {
+                for c1 in 0..side {
+                    for c0 in 0..side {
+                        if c0 < base_k && c1 < base_k && c2 < base_k {
+                            continue;
+                        }
+                        let g = c0 + c1 * stride_g1 + c2 * stride_g2;
+                        out.push(F::from(out_grid[g] as u64));
+                    }
+                }
+            }
+            if out.len() != k_star {
+                return Err("eval_e_at_positions: total length mismatch".to_string());
+            }
+            return Ok(out);
+        }
+
+        // Fallback for non-F257 or non-rank-3: correct but potentially slow.
+        let k = self.dim_k();
+        if y.len() != k {
+            return Err("eval_e_at_positions: bad y length".to_string());
+        }
+        if positions.len() >= 256 {
+            let out = positions
+                .par_iter()
+                .map(|&idx| -> Result<F, String> {
+                    let mut acc = F::ZERO;
+                    self.row_e_stream(idx, &mut |i, c| {
+                        acc += c * y[i];
+                    })?;
+                    Ok(acc)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(out)
+        } else {
+            let mut out = Vec::with_capacity(positions.len());
+            for &idx in positions {
+                let mut acc = F::ZERO;
+                self.row_e_stream(idx, &mut |i, c| {
+                    acc += c * y[i];
+                })?;
+                out.push(acc);
+            }
+            Ok(out)
+        }
+    }
+
     fn witness_positions_star(&self) -> Result<Vec<usize>, String> {
         let k = self.dim_k();
         let k_star = self.dim_k_star();
@@ -514,31 +699,23 @@ impl<F: PrimeField, C: MulCode<F> + Sync> ChunkedMulCodeDr1csNpFlpcpSparse<F, C>
             return Err("bad mat-vec size".to_string());
         }
 
+        // Canonical path: evaluate E(y_a), E(y_b) at the precomputed witness positions once,
+        // then multiply componentwise.
+        let ea = self.code.eval_e_at_positions(witness_pos, &y_a)?;
+        let eb = self.code.eval_e_at_positions(witness_pos, &y_b)?;
+        if ea.len() != k_star || eb.len() != k_star {
+            return Err("bad eval_e_at_positions length".to_string());
+        }
+
         let mut w_eval = vec![F::ZERO; k_star];
         if k_star >= 256 {
             w_eval
                 .par_iter_mut()
                 .enumerate()
-                .try_for_each(|(j, out)| -> Result<(), String> {
-                    let idx = witness_pos[j];
-                    let mut ea = F::ZERO;
-                    let mut eb = F::ZERO;
-                    self.code.row_e_stream(idx, &mut |i, c| {
-                        ea += c * y_a[i];
-                        eb += c * y_b[i];
-                    })?;
-                    *out = ea * eb;
-                    Ok(())
-                })?;
+                .for_each(|(j, out)| *out = ea[j] * eb[j]);
         } else {
-            for (j, &idx) in witness_pos.iter().enumerate() {
-                let mut ea = F::ZERO;
-                let mut eb = F::ZERO;
-                self.code.row_e_stream(idx, &mut |i, c| {
-                    ea += c * y_a[i];
-                    eb += c * y_b[i];
-                })?;
-                w_eval[j] = ea * eb;
+            for j in 0..k_star {
+                w_eval[j] = ea[j] * eb[j];
             }
         }
         Ok(w_eval)
@@ -792,15 +969,14 @@ impl<F: PrimeField, C: MulCode<F> + Sync> MulCodeDr1csNpFlpcpSparse<F, C> {
         }
 
         // Build w by evaluating E(Az) and E(Bz) at systematic E* positions.
+        let ea = self.code.eval_e_at_positions(&witness_pos, &y_a)?;
+        let eb = self.code.eval_e_at_positions(&witness_pos, &y_b)?;
+        if ea.len() != k_star || eb.len() != k_star {
+            return Err("bad eval_e_at_positions length".to_string());
+        }
         let mut w = Vec::with_capacity(k_star);
-        for idx in witness_pos {
-            let mut ea = F::ZERO;
-            let mut eb = F::ZERO;
-            self.code.row_e_stream(idx, &mut |i, c| {
-                ea += c * y_a[i];
-                eb += c * y_b[i];
-            })?;
-            w.push(ea * eb);
+        for j in 0..k_star {
+            w.push(ea[j] * eb[j]);
         }
 
         let mut pi = Vec::with_capacity(z_w.len() + w.len());
