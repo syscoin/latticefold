@@ -109,8 +109,9 @@ where
     }
     let (params_inst, params_asg) = b_params.into_instance();
 
-    // Merge Poseidon/coins part with params prefix (no glue).
-    let parts = vec![(inst_pose, asg_pose), (params_inst, params_asg)];
+    // Merge params prefix first so the DPP public prefix matches `[1] || WeParams`.
+    // (The DPP/FLPCP expects the first `public_len` variables to be the public input vector `x`.)
+    let parts = vec![(params_inst, params_asg), (inst_pose, asg_pose)];
     let (inst, _asg) = merge_sparse_dr1cs_share_one(&parts).map_err(|e| e.to_string())?;
 
     Ok(WeDr1csShape { inst, public_len: 1 + 10 })
@@ -5343,7 +5344,7 @@ mod tests {
         }
         let (params_inst, params_asg) = b_params.into_instance();
 
-        let parts = vec![(inst_pose, asg_pose), (params_inst, params_asg)];
+        let parts = vec![(params_inst, params_asg), (inst_pose, asg_pose)];
         let (inst, asg) = merge_sparse_dr1cs_share_one(&parts).expect("merge parts");
 
         // Sanity: consistent sizes.
@@ -5443,7 +5444,7 @@ mod tests {
         }
         let (params_inst, params_asg) = b_params.into_instance();
 
-        let parts = vec![(inst_pose, asg_pose), (params_inst, params_asg)];
+        let parts = vec![(params_inst, params_asg), (inst_pose, asg_pose)];
         let (inst, asg) = merge_sparse_dr1cs_share_one(&parts).expect("merge parts");
 
         // Armer builds the shape (should match our satisfiable inst).
