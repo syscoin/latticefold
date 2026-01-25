@@ -50,7 +50,7 @@ fn debug_log(hypothesis_id: &str, location: &str, message: &str, data_json: &str
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/Users/jagsidhu/work/Documents/GitHub/PVUGC/.cursor/debug.log")
+        .open("./debug.log")
     {
         let _ = writeln!(f, "{payload}");
     }
