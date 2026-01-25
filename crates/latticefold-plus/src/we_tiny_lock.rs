@@ -227,25 +227,41 @@ fn chunk_dr1cs_sparse<F: PrimeField>(inst: Dr1csInstanceSparse<F>, k_block: usiz
         return vec![inst];
     }
     let total = inst.k();
-    let mut blocks = Vec::new();
-    let mut i = 0usize;
-    while i < total {
-        let end = usize::min(i + k_block, total);
-        let mut a = inst.a[i..end].to_vec();
-        let mut b = inst.b[i..end].to_vec();
-        let mut c = inst.c[i..end].to_vec();
+    if total == 0 {
+        return vec![inst];
+    }
+
+    // IMPORTANT: avoid cloning the (potentially huge) sparse rows.
+    // We consume the instance vectors by value and split them into blocks via `split_off`.
+    let mut a_all = inst.a;
+    let mut b_all = inst.b;
+    let mut c_all = inst.c;
+    let n = inst.n;
+
+    let nblocks = (total + k_block - 1) / k_block;
+    let mut blocks = Vec::with_capacity(nblocks);
+
+    while !a_all.is_empty() {
+        let take = usize::min(k_block, a_all.len());
+
+        let a_tail = a_all.split_off(take);
+        let b_tail = b_all.split_off(take);
+        let c_tail = c_all.split_off(take);
+
+        let mut a = std::mem::replace(&mut a_all, a_tail);
+        let mut b = std::mem::replace(&mut b_all, b_tail);
+        let mut c = std::mem::replace(&mut c_all, c_tail);
+
         // Pad with zero rows if needed.
         while a.len() < k_block {
             a.push(SparseVec::new(Vec::new()));
             b.push(SparseVec::new(Vec::new()));
             c.push(SparseVec::new(Vec::new()));
         }
-        blocks.push(Dr1csInstanceSparse { n: inst.n, a, b, c });
-        i = end;
+        blocks.push(Dr1csInstanceSparse { n, a, b, c });
     }
-    if blocks.is_empty() {
-        blocks.push(inst);
-    }
+
+    debug_assert_eq!(blocks.len(), nblocks);
     blocks
 }
 
