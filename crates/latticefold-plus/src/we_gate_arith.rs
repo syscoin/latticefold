@@ -5486,13 +5486,11 @@ mod tests {
         // avoid feature-gated import drift.
         let _scratch_ty: Option<Dr1csQueryScratch<F257>> = None;
 
+        let public_len = shape.public_len;
         let t_arm = Instant::now();
         let ctx = arm_lfplus_we_gate_tiny_ringlwe_streaming::<R>(
+            shape,
             &params,
-            public_inputs_len,
-            n_lin_proofs,
-            mlen_mats,
-            &pairs,
             stmt_digest,
             armer_seed,
             lock_j,
@@ -5509,9 +5507,9 @@ mod tests {
         );
 
         let x = encode_public_x::<F257>(&params, &[]);
-        assert_eq!(x.len(), shape.public_len);
-        assert_eq!(&asg[..shape.public_len], x.as_slice(), "satisfying assignment public prefix mismatch");
-        let z_w = asg[shape.public_len..].to_vec();
+        assert_eq!(x.len(), public_len);
+        assert_eq!(&asg[..public_len], x.as_slice(), "satisfying assignment public prefix mismatch");
+        let z_w = asg[public_len..].to_vec();
 
         let t_prove = Instant::now();
         let mut pi = Vec::new();

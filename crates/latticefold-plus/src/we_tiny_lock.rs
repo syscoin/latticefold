@@ -160,11 +160,8 @@ pub(crate) fn arm_we_ringlwe_from_dr1cs_streaming<F: PrimeField + FftField>(
 ///   exports additional public inputs.
 #[cfg(feature = "we_gate")]
 pub(crate) fn arm_lfplus_we_gate_tiny_ringlwe_streaming<R>(
+    shape: we_gate_arith::WeDr1csShape<F257>,
     params: &WeParams,
-    public_inputs_len: usize,
-    n_lin_proofs: usize,
-    mlen_mats: usize,
-    pairs: &[(usize, usize)],
     stmt_digest: [u8; 32],
     armer_seed: [u8; 32],
     lock_j: u64,
@@ -177,14 +174,6 @@ where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + ark_ff::Field + ark_ff::PrimeField,
 {
-    let shape = we_gate_arith::build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
-        params,
-        public_inputs_len,
-        n_lin_proofs,
-        mlen_mats,
-        pairs,
-    )?;
-
     let x: Vec<F257> = match shape.public_len {
         1 => vec![F257::from(1u64)],
         // If/when the tiny gate includes the standard params prefix, use the canonical encoding.
