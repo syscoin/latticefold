@@ -5336,8 +5336,9 @@ mod tests {
             mlen: 0,
         };
 
-        // Exercise one digit-mul surface.
-        let pairs: Vec<(usize, usize)> = vec![(0, 0)];
+        // Exercise one digit-mul surface (use the first *CM* u32 coin, not a prefix coin).
+        // We compute the prefix get_challenge squeezes and offset the u32 index accordingly.
+        let mut pairs: Vec<(usize, usize)> = vec![(0, 0)];
 
         // Rebuild the instance + assignment directly (so we can call `check()`).
         // Note: current schedule builder assumes exactly one Π_lin proof due to the
@@ -5375,6 +5376,15 @@ mod tests {
             .map(|i| i + squeeze_field_op_offset)
             .collect();
         wiring_abs.frog_squeeze_ops = Vec::new();
+        // Prepend prefix get_challenge u32 squeezes (same as the shape builder).
+        let prefix_u32_squeeze_ops =
+            super::collect_get_challenge_squeeze_field_indices(&ops_f257, 0, squeeze_field_op_offset);
+        let prefix_cnt = prefix_u32_squeeze_ops.len();
+        wiring_abs
+            .u32_squeeze_ops
+            .splice(0..0, prefix_u32_squeeze_ops.into_iter());
+        // Update pairs to point at the first CM u32 block.
+        pairs[0].1 = prefix_cnt;
 
         let (inst_pose, asg_pose, _shorts, _u32s, _surfaces) =
             tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
@@ -5440,7 +5450,8 @@ mod tests {
         let public_inputs_len = 0usize;
         let n_lin_proofs = 1usize; // schedule builder currently assumes L=1
         let mlen_mats = 0usize;
-        let pairs: Vec<(usize, usize)> = vec![(0, 0)];
+        // Use the first *CM* u32 coin, not a prefix coin.
+        let mut pairs: Vec<(usize, usize)> = vec![(0, 0)];
 
         // Build a satisfiable assignment for the *same* instance shape the armer uses.
         let trace = super::poseidon_trace_schedule_for_plus::<R>(public_inputs_len, &params, n_lin_proofs, mlen_mats)
@@ -5476,6 +5487,14 @@ mod tests {
             .map(|i| i + squeeze_field_op_offset)
             .collect();
         wiring_abs.frog_squeeze_ops = Vec::new();
+        // Prepend prefix get_challenge u32 squeezes (same as the shape builder).
+        let prefix_u32_squeeze_ops =
+            super::collect_get_challenge_squeeze_field_indices(&ops_f257, 0, squeeze_field_op_offset);
+        let prefix_cnt = prefix_u32_squeeze_ops.len();
+        wiring_abs
+            .u32_squeeze_ops
+            .splice(0..0, prefix_u32_squeeze_ops.into_iter());
+        pairs[0].1 = prefix_cnt;
 
         let (inst_pose, asg_pose, _shorts, _u32s, _surfaces) =
             tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
