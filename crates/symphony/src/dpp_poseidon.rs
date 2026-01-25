@@ -50,7 +50,7 @@ fn debug_log(hypothesis_id: &str, location: &str, message: &str, data_json: &str
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("./debug.log")
+        .open("/tmp/debug.log")
     {
         let _ = writeln!(f, "{payload}");
     }
