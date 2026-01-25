@@ -21,6 +21,52 @@ use latticefold::commitment::AjtaiCommitmentScheme;
 use crate::setchk::OUT_E_AGG_SEED;
 use symphony::dpp_sumcheck::{sumcheck_verify_degree3, RingVars};
 
+fn escape_json_str(input: &str) -> String {
+    input
+        .chars()
+        .flat_map(|c| match c {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            '\r' => "\\r".chars().collect::<Vec<_>>(),
+            '\t' => "\\t".chars().collect::<Vec<_>>(),
+            _ => vec![c],
+        })
+        .collect()
+}
+
+fn debug_log(hypothesis_id: &str, location: &str, message: &str, data_json: &str) {
+    use std::io::Write;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let id = format!(
+        "log_{}_{}",
+        timestamp,
+        location
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>()
+    );
+    let payload = format!(
+        "{{\"id\":\"{}\",\"timestamp\":{},\"location\":\"{}\",\"message\":\"{}\",\"data\":{},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"{}\"}}",
+        escape_json_str(&id),
+        timestamp,
+        escape_json_str(location),
+        escape_json_str(message),
+        data_json,
+        escape_json_str(hypothesis_id),
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/debug.log")
+    {
+        let _ = writeln!(f, "{payload}");
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Optional op-count instrumentation (for tiny-field port estimates).
 //
@@ -3637,6 +3683,69 @@ where
         (field_inst, field_asg), // 3
         (cm_inst, cm_asg),       // 4
     ];
+    {
+        // #region agent log
+        let mut offsets: Vec<usize> = Vec::with_capacity(parts.len());
+        let mut cur = 0usize;
+        for (_inst, asg) in &parts {
+            offsets.push(cur);
+            cur += asg.len().saturating_sub(1);
+        }
+        let mut mismatch: Option<(usize, usize, usize, usize, usize, usize, String, String)> = None;
+        for &(pa, xa, pb, xb) in &glue {
+            if pa >= parts.len() || pb >= parts.len() {
+                continue;
+            }
+            let asg_a = &parts[pa].1;
+            let asg_b = &parts[pb].1;
+            if xa >= asg_a.len() || xb >= asg_b.len() {
+                continue;
+            }
+            let va = asg_a[xa];
+            let vb = asg_b[xb];
+            if va != vb {
+                let ga = if xa == 0 { 0 } else { xa + offsets[pa] };
+                let gb = if xb == 0 { 0 } else { xb + offsets[pb] };
+                mismatch = Some((
+                    pa,
+                    xa,
+                    ga,
+                    pb,
+                    xb,
+                    gb,
+                    format!("{}", va),
+                    format!("{}", vb),
+                ));
+                break;
+            }
+        }
+        if let Some((pa, xa, ga, pb, xb, gb, va, vb)) = mismatch {
+            debug_log(
+                "H5",
+                "we_gate_arith.rs:build_we_dr1cs_for_cm_proof:glue_mismatch",
+                "glue mismatch before merge",
+                &format!(
+                    "{{\"pa\":{},\"xa\":{},\"ga\":{},\"pb\":{},\"xb\":{},\"gb\":{},\"va\":\"{}\",\"vb\":\"{}\"}}",
+                    pa,
+                    xa,
+                    ga,
+                    pb,
+                    xb,
+                    gb,
+                    escape_json_str(&va),
+                    escape_json_str(&vb)
+                ),
+            );
+        } else {
+            debug_log(
+                "H5",
+                "we_gate_arith.rs:build_we_dr1cs_for_cm_proof:glue_mismatch",
+                "no glue mismatch before merge",
+                &format!("{{\"glue_len\":{}}}", glue.len()),
+            );
+        }
+        // #endregion
+    }
     let _base_constraints = parts.iter().map(|(i, _)| i.constraints.len()).sum::<usize>();
 
     let (inst, assignment) = merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| {
