@@ -23,6 +23,99 @@ use latticefold::commitment::AjtaiCommitmentScheme;
 use crate::setchk::OUT_E_AGG_SEED;
 use symphony::dpp_sumcheck::{sumcheck_verify_degree3, RingVars};
 
+#[cfg(feature = "we_gate")]
+fn first_squeeze_field_op_index_of_len(
+    ops: &[symphony::transcript::PoseidonTraceOp<F257>],
+    len: usize,
+) -> Result<usize, String> {
+    let mut sf_idx = 0usize;
+    for op in ops {
+        if let symphony::transcript::PoseidonTraceOp::SqueezeField(v) = op {
+            if v.len() == len {
+                return Ok(sf_idx);
+            }
+            sf_idx += 1;
+        }
+    }
+    Err(format!(
+        "first_squeeze_field_op_index_of_len: no SqueezeField(len={len}) op found"
+    ))
+}
+
+/// Build a tiny-field (F257) Poseidon+CM-coin+digit-mul-surface dR1CS for Π_plus schedule.
+///
+/// This is a *WE-arith wiring checkpoint*: it does not implement full CM verifier math yet, but it
+/// ensures that we can (a) lift the Π_plus transcript schedule to F257, (b) derive CM coins, and
+/// (c) materialize digit-mul surfaces for requested `(short_block_idx, u32_idx)` pairs.
+#[cfg(feature = "we_gate")]
+pub fn build_we_dr1cs_for_plus_proof_shape_tiny_cm_coin_mul_surfaces<R>(
+    params: &WeParams,
+    public_inputs_len: usize,
+    n_lin_proofs: usize,
+    mlen_mats: usize,
+    pairs: &[(usize, usize)],
+) -> Result<WeDr1csShape<F257>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + Field + PrimeField,
+{
+    let trace =
+        poseidon_trace_schedule_for_plus::<R>(public_inputs_len, params, n_lin_proofs, mlen_mats)?;
+    let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<R>>(&trace.ops)?;
+
+    let ring_dim = R::dimension();
+    let k = params.k as usize;
+    let log_kappa = ark_std::log2((params.kappa as usize).next_power_of_two()) as usize;
+    let nvars_cm = params.nvars_cm as usize;
+
+    // The CM segment begins at the first `SqueezeField(len=ring_dim)` (short challenges).
+    let squeeze_field_op_offset = first_squeeze_field_op_index_of_len(&ops_f257, ring_dim)?;
+    let wiring_rel = tiny::infer_cm_coin_op_wiring_from_ops(
+        &ops_f257,
+        ring_dim,
+        k,
+        log_kappa,
+        nvars_cm,
+        squeeze_field_op_offset,
+        0, // frog_need (not used on this path yet)
+    )?;
+    let mut wiring_abs = tiny::TinyCoinOpWiring::default();
+    wiring_abs.short_squeeze_ops = wiring_rel
+        .short_squeeze_ops
+        .into_iter()
+        .map(|i| i + squeeze_field_op_offset)
+        .collect();
+    wiring_abs.u32_squeeze_ops = wiring_rel
+        .u32_squeeze_ops
+        .into_iter()
+        .map(|i| i + squeeze_field_op_offset)
+        .collect();
+    wiring_abs.frog_squeeze_ops = Vec::new();
+
+    let (inst_pose, asg_pose, _shorts, _u32s, _surfaces) =
+        tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
+            None,
+            &ops_f257,
+            ring_dim,
+            &wiring_abs,
+            pairs,
+        )?;
+
+    // Public statement params prefix (arm-time bound).
+    let mut b_params = Dr1csBuilder::<F257>::new();
+    b_params.enforce_var_eq_const(b_params.one(), F257::from(1u64));
+    for &x in &params.to_field_vec::<F257>() {
+        b_params.new_var(x);
+    }
+    let (params_inst, params_asg) = b_params.into_instance();
+
+    // Merge Poseidon/coins part with params prefix (no glue).
+    let parts = vec![(inst_pose, asg_pose), (params_inst, params_asg)];
+    let (inst, _asg) = merge_sparse_dr1cs_share_one(&parts).map_err(|e| e.to_string())?;
+
+    Ok(WeDr1csShape { inst, public_len: 1 + 10 })
+}
+
 fn escape_json_str(input: &str) -> String {
     input
         .chars()
@@ -617,41 +710,34 @@ where
     )
 }
 
-/// Arm-time (shape-only) builder for the **tiny-field** (F257) WE gate transcript layer.
+/// Arm-time (shape-only) builder for the **tiny-field** (F257) WE gate (Π_plus schedule).
 ///
-/// This currently arithmetizes only the Poseidon(F257) transcript schedule for Π_plus, lifted from
-/// the existing recorder trace schedule. It is the starting point for the full Thm-4.3 tiny-field gate.
+/// This is the current “real” tiny-field entrypoint:
+/// - lifts the Π_plus transcript schedule to Poseidon(F257),
+/// - derives CM-facing coins (short challenges + bounded u32 challenges),
+/// - materializes digit-mul surfaces for requested `(short_block_idx, u32_idx)` pairs.
+///
+/// It is intentionally a *slice* of the full WE gate: it’s the smallest end-to-end artifact that
+/// proves we can bind the Π_plus schedule and start consuming the digit backend for CM math.
 #[cfg(feature = "we_gate")]
 pub fn build_we_dr1cs_for_plus_proof_shape_tiny<R>(
     params: &WeParams,
     public_inputs_len: usize,
     n_lin_proofs: usize,
     mlen_mats: usize,
+    pairs: &[(usize, usize)],
 ) -> Result<WeDr1csShape<F257>, String>
 where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + Field + PrimeField,
 {
-    // Build a dummy schedule trace (values are zero; only op ordering/lengths matter).
-    let trace =
-        poseidon_trace_schedule_for_plus::<R>(public_inputs_len, params, n_lin_proofs, mlen_mats)?;
-    let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<R>>(&trace.ops)?;
-    let (inst, _asg) = tiny::build_poseidon_f257_from_ops(None, &ops_f257)?;
-    Ok(WeDr1csShape { inst, public_len: 1 })
-}
-
-/// Witness-time builder for the **tiny-field** (F257) transcript layer.
-#[cfg(feature = "we_gate")]
-pub fn build_we_dr1cs_for_plus_proof_witness_tiny<R>(
-    trace: &PoseidonTranscriptTrace<BF<R>>,
-) -> Result<Vec<F257>, String>
-where
-    R: OverField + CoeffRing + PolyRing,
-    R::BaseRing: Zq + Field + PrimeField,
-{
-    let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<R>>(&trace.ops)?;
-    let (_inst, asg) = tiny::build_poseidon_f257_from_ops(None, &ops_f257)?;
-    Ok(asg)
+    build_we_dr1cs_for_plus_proof_shape_tiny_cm_coin_mul_surfaces::<R>(
+        params,
+        public_inputs_len,
+        n_lin_proofs,
+        mlen_mats,
+        pairs,
+    )
 }
 
 fn lf_ops_to_symphony_ops<F: PrimeField>(ops: &[LfPoseidonTraceOp<F>]) -> Vec<symphony::transcript::PoseidonTraceOp<F>> {
@@ -838,6 +924,17 @@ fn ring_scale<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, s: usize) ->
         out.push(v);
     }
     RingVars::new(out)
+}
+
+/// Enforce that a ring element is **const-coeff** (only coefficient 0 may be nonzero).
+///
+/// In the SP1-only WE-gate, this is the right way to “assume const-coeff”: make it explicit in the
+/// relation so the prover cannot stuff higher coefficients.
+#[inline]
+fn enforce_const_coeff0_ringvars<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars) {
+    for i in 1..x.d() {
+        b.enforce_var_eq_const(x.coeffs[i], F::ZERO);
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -1793,6 +1890,7 @@ fn cm_verifier_math_dr1cs<R>(
     ops_offset: usize,
     squeezed_field_offset: usize,
     include_public_inputs_in_absorb: bool,
+    const_coeff0_only: bool,
 ) -> Result<
     (
         SparseDr1csInstance<BF<R>>,
@@ -2011,7 +2109,11 @@ where
         for ej in ek {
             let mut ej_vars: Vec<RingVars> = Vec::with_capacity(ej.len());
             for r in ej {
-                ej_vars.push(ring_to_ringvars::<R>(&mut b, r));
+                let rv = ring_to_ringvars::<R>(&mut b, r);
+                if const_coeff0_only {
+                    enforce_const_coeff0_ringvars::<BF<R>>(&mut b, &rv);
+                }
+                ej_vars.push(rv);
             }
             ek_vars.push(ej_vars);
         }
@@ -2019,7 +2121,11 @@ where
     }
     let mut out_b_vars: Vec<RingVars> = Vec::with_capacity(out_sc.b.len());
     for bb in &out_sc.b {
-        out_b_vars.push(ring_to_ringvars::<R>(&mut b, bb));
+        let rv = ring_to_ringvars::<R>(&mut b, bb);
+        if const_coeff0_only {
+            enforce_const_coeff0_ringvars::<BF<R>>(&mut b, &rv);
+        }
+        out_b_vars.push(rv);
     }
 
     // Ajtai aggregate commitment binding for out.e/out.b (cheap, linear constraints).
@@ -2438,7 +2544,12 @@ where
                 for col in 0..d {
                     let uij = &out_e_vars[ni][l * k + blk][col];
                     let sij = &short_wiring.s_prime_flat[blk * d + col];
-                    let prod = ring_mul_negacyclic::<BF<R>>(&mut b, uij, sij);
+                    let prod = if const_coeff0_only {
+                        // If `uij` is const-coeff, multiplication is per-coeff scaling by `uij[0]`.
+                        ring_scale::<BF<R>>(&mut b, sij, uij.coeffs[0])
+                    } else {
+                        ring_mul_negacyclic::<BF<R>>(&mut b, uij, sij)
+                    };
                     acc = ring_add::<BF<R>>(&mut b, &acc, &prod);
                 }
             }
@@ -3523,6 +3634,7 @@ where
                     ops_offset,
                     squeezed_field_offset,
                     true, // include_public_inputs_in_absorb
+                    params.decomp_b == 16, // const_coeff0_only (SP1/R1LF: const-coeff base-ring lifts)
                 )?;
             Ok::<_, String>((cm_inst, cm_asg, cm_wiring))
         };
@@ -4551,6 +4663,7 @@ where
                 cm_ops_offset,
                 cm_squeezed_field_offset,
                 false, // include_public_inputs_in_absorb
+                params.decomp_b == 16, // const_coeff0_only (SP1/R1LF: const-coeff base-ring lifts)
             );
             if do_count {
                 CM_COUNTING.with(|c| c.set(false));
@@ -5148,6 +5261,183 @@ mod tests {
     use crate::recording_transcript::TracePoseidonTranscript;
     use crate::rgchk::{DecompParameters, Rg, RgInstance};
     use crate::cm::Cm;
+
+    #[test]
+    #[ignore = "slow: builds full Cm proof + WE dR1CS; SP1-style const-coeff mode"]
+    fn test_we_cm_proof_constcoeff0_mode_satisfies_small() {
+        // This exercises the `const_coeff0_only` fast path in `cm_verifier_math_dr1cs`
+        // (enabled when `params.decomp_b == 16`, matching SP1/R1LF settings).
+        type PCF = cyclotomic_rings::rings::FrogPoseidonConfig;
+        use ark_ff::Zero;
+        use cyclotomic_rings::rings::GetPoseidonParams;
+        use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as RR;
+        use stark_rings::PolyRing;
+
+        // Tiny-ish params.
+        let k = 1usize;
+        let kappa = 1usize;
+        let ell = 8usize;
+        let b = 16u128; // <- enables const-coeff mode in WE arithmetization
+        let d = RR::dimension();
+        let tau_unpadded_len = kappa * (k * d) * ell * d;
+        let n = tau_unpadded_len.next_power_of_two();
+        let nvars = ark_std::log2(n) as usize;
+
+        let dparams = DecompParameters { b, k, l: ell };
+
+        // Const-coeff statement / witness: all ring values are embedded base scalars.
+        let public_inputs = vec![<BF<RR> as ark_ff::Field>::ONE];
+        let mut f = vec![RR::from(<RR as PolyRing>::BaseRing::zero()); n];
+        f[0] = RR::from(public_inputs[0]);
+
+        let mut A = Matrix::<RR>::zero(kappa, n);
+        A.vals[0][0] = RR::from(<RR as PolyRing>::BaseRing::ONE);
+
+        let inst = RgInstance::from_f(f, &A, &dparams);
+        let rg = Rg {
+            nvars,
+            instances: vec![inst],
+            dparams: dparams.clone(),
+        };
+        let cm = Cm { rg };
+        let M: Vec<std::sync::Arc<SparseMatrix<RR>>> =
+            vec![std::sync::Arc::new(SparseMatrix::identity(n))];
+
+        // Build proof + trace (recording verifier ops).
+        let mut ts = crate::transcript::PoseidonTranscript::empty::<PCF>();
+        let (_com, proof) = cm.prove(&M, &public_inputs, &mut ts);
+        let mut rec = TracePoseidonTranscript::<RR>::empty::<PCF>();
+        for b in &public_inputs {
+            rec.absorb_field_element(b);
+        }
+        proof.verify(&M, &mut rec).expect("cm verify");
+        let trace = rec.trace().clone();
+
+        let params = WeParams {
+            nvars_setchk: nvars as u64,
+            degree_setchk: 3,
+            nvars_cm: nvars as u64,
+            degree_cm: 2,
+            kappa: kappa as u64,
+            ring_dim_d: RR::dimension() as u64,
+            decomp_b: b as u64,
+            k: k as u64,
+            l: ell as u64,
+            mlen: M.len() as u64,
+        };
+        let poseidon_cfg = PCF::get_poseidon_config();
+
+        let out = build_we_dr1cs_for_cm_proof::<RR>(
+            &poseidon_cfg,
+            &trace,
+            &params,
+            &public_inputs,
+            &proof,
+            M.len(),
+        )
+        .expect("build we dr1cs");
+        out.inst.check(&out.assignment).expect("should satisfy");
+    }
+
+    #[test]
+    #[ignore = "slow: builds Poseidon(F257) dR1CS schedule + checks all constraints"]
+    fn test_tiny_gate_shape_builds_and_constraints_check_small() {
+        // Keep this test tiny: we just want to validate the F257-instance wiring
+        // (Poseidon(F257) + CM coins + digit-mul surfaces) is satisfiable and statement-bound.
+        //
+        // IMPORTANT: do not make this a full Π_plus E2E test; those are slow and already exist as ignored tests.
+
+        // Minimal-but-valid params to keep the schedule small.
+        let ring_dim = <R as PolyRing>::dimension() as u64;
+        let params = WeParams {
+            nvars_setchk: 1,
+            degree_setchk: 3,
+            nvars_cm: 1,
+            degree_cm: 2,
+            kappa: 1,
+            ring_dim_d: ring_dim,
+            decomp_b: 16,
+            k: 1,
+            l: 1,
+            mlen: 0,
+        };
+
+        // Exercise one digit-mul surface.
+        let pairs: Vec<(usize, usize)> = vec![(0, 0)];
+
+        // Rebuild the instance + assignment directly (so we can call `check()`).
+        // Note: current schedule builder assumes exactly one Π_lin proof due to the
+        // prefix-binding conventions (L=1) used elsewhere in this module.
+        let trace = super::poseidon_trace_schedule_for_plus::<R>(0, &params, 1, 0)
+            .expect("poseidon_trace_schedule_for_plus");
+        let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<R>>(&trace.ops)
+            .expect("lift_recording_trace_ops_to_f257");
+
+        let squeeze_field_op_offset =
+            super::first_squeeze_field_op_index_of_len(&ops_f257, <R as PolyRing>::dimension())
+                .expect("first short SqueezeField(len=ring_dim) exists");
+        let k = params.k as usize;
+        let log_kappa = ark_std::log2((params.kappa as usize).next_power_of_two()) as usize;
+        let nvars_cm = params.nvars_cm as usize;
+        let wiring_rel = tiny::infer_cm_coin_op_wiring_from_ops(
+            &ops_f257,
+            <R as PolyRing>::dimension(),
+            k,
+            log_kappa,
+            nvars_cm,
+            squeeze_field_op_offset,
+            0,
+        )
+        .expect("infer_cm_coin_op_wiring_from_ops");
+        let mut wiring_abs = tiny::TinyCoinOpWiring::default();
+        wiring_abs.short_squeeze_ops = wiring_rel
+            .short_squeeze_ops
+            .into_iter()
+            .map(|i| i + squeeze_field_op_offset)
+            .collect();
+        wiring_abs.u32_squeeze_ops = wiring_rel
+            .u32_squeeze_ops
+            .into_iter()
+            .map(|i| i + squeeze_field_op_offset)
+            .collect();
+        wiring_abs.frog_squeeze_ops = Vec::new();
+
+        let (inst_pose, asg_pose, _shorts, _u32s, _surfaces) =
+            tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
+                None,
+                &ops_f257,
+                <R as PolyRing>::dimension(),
+                &wiring_abs,
+                &pairs,
+            )
+            .expect("build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring");
+
+        // Params prefix (must be public / statement-bound).
+        let mut b_params = Dr1csBuilder::<F257>::new();
+        b_params.enforce_var_eq_const(b_params.one(), F257::from(1u64));
+        for &x in &params.to_field_vec::<F257>() {
+            b_params.new_var(x);
+        }
+        let (params_inst, params_asg) = b_params.into_instance();
+
+        let parts = vec![(inst_pose, asg_pose), (params_inst, params_asg)];
+        let (inst, asg) = merge_sparse_dr1cs_share_one(&parts).expect("merge parts");
+
+        // Sanity: consistent sizes.
+        assert_eq!(asg.len(), inst.nvars);
+        assert!(inst.nvars > 0);
+        assert!(!inst.constraints.is_empty());
+
+        // Core validation: all constraints are satisfied by the assignment.
+        inst.check(&asg).expect("dr1cs check");
+
+        // And the exported shape builder should now report params prefix public length.
+        let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<R>(&params, 0, 1, 0, &pairs)
+            .expect("build_we_dr1cs_for_plus_proof_shape_tiny");
+        assert_eq!(shape.public_len, 1 + 10);
+        assert_eq!(shape.inst.nvars, inst.nvars);
+        assert_eq!(shape.inst.constraints.len(), inst.constraints.len());
+    }
 
     #[derive(MontConfig)]
     #[modulus = "39402006196394479212279040100143613805079739270465446667948293404245721771496870329047266088258938001861606973112319"]

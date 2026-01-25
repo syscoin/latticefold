@@ -9,6 +9,7 @@
 //!   serving as a stand-in for LWE hints in the real lock layer.
 
 use ark_ff::{FftField, PrimeField};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
 use dpp::dr1cs_flpcp::{ChunkedMulCodeDr1csNpFlpcpSparse, Dr1csInstanceSparse, MulCode, TensorRsMulCode};
@@ -21,6 +22,15 @@ use crate::lockable_ringlwe::{arm_ringlwe_lock, RingLweLockArtifact, RingLwePara
 use crate::lockable_ringlwe::QueryBlockAccumulator;
 
 pub use crate::we_statement::arm_theorem43_from_statement;
+
+#[cfg(feature = "we_gate")]
+use crate::we_gate_arith;
+#[cfg(feature = "we_gate")]
+use crate::we_statement::WeParams;
+#[cfg(feature = "we_gate")]
+use latticefold::transcript::poseidon::F257;
+#[cfg(feature = "we_gate")]
+use stark_rings::{CoeffRing, OverField, PolyRing, Zq};
 
 /// Extract the public coins from a lock artifact (convenience).
 pub fn public_coins<F: PrimeField>(art: &Theorem43LockArtifact<F>) -> Theorem43Coins<F> {
@@ -135,6 +145,73 @@ pub(crate) fn arm_we_ringlwe_from_dr1cs_streaming<F: PrimeField + FftField>(
         acc,
     )?;
     Ok(WeRingLweStreamingContext { lock, dpp })
+}
+
+/// Arm the **LF+ tiny-field WE gate** (Poseidon(F257) + CM-coin surfaces) as a Theorem-4.3 lock.
+///
+/// This is the main wiring from:
+/// - `we_gate_arith::build_we_dr1cs_for_plus_proof_shape_tiny` (arm-time instance construction)
+/// into:
+/// - `arm_we_ringlwe_from_dr1cs_streaming` (Theorem-4.3 + Ring-LWE wrapper).
+///
+/// Notes:
+/// - The statement binding is carried by `stmt_digest` via `c_stmt` inside `arm_theorem43_from_statement`.
+/// - `x` is currently a minimal public prefix (typically just `[1]`) unless/until the tiny gate
+///   exports additional public inputs.
+#[cfg(feature = "we_gate")]
+pub(crate) fn arm_lfplus_we_gate_tiny_ringlwe_streaming<R>(
+    params: &WeParams,
+    public_inputs_len: usize,
+    n_lin_proofs: usize,
+    mlen_mats: usize,
+    pairs: &[(usize, usize)],
+    stmt_digest: [u8; 32],
+    armer_seed: [u8; 32],
+    lock_j: u64,
+    block_id: usize,
+    rep_id: u64,
+    ringlwe_params: RingLweParams,
+    rng: &mut impl rand::RngCore,
+    scratch: &mut Dr1csQueryScratch<F257>,
+    acc: &mut QueryBlockAccumulator,
+) -> Result<WeRingLweStreamingContext<F257>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + ark_ff::Field + ark_ff::PrimeField,
+{
+    let shape = we_gate_arith::build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
+        params,
+        public_inputs_len,
+        n_lin_proofs,
+        mlen_mats,
+        pairs,
+    )?;
+
+    let x: Vec<F257> = match shape.public_len {
+        1 => vec![F257::from(1u64)],
+        // If/when the tiny gate includes the standard params prefix, use the canonical encoding.
+        11 => crate::we_statement::encode_public_x::<F257>(params, &[]),
+        other => {
+            return Err(format!(
+                "arm_lfplus_we_gate_tiny_ringlwe_streaming: unsupported public_len={other}"
+            ))
+        }
+    };
+
+    arm_we_ringlwe_from_dr1cs_streaming::<F257>(
+        shape.inst,
+        shape.public_len,
+        stmt_digest,
+        &x,
+        armer_seed,
+        lock_j,
+        block_id,
+        rep_id,
+        ringlwe_params,
+        rng,
+        scratch,
+        acc,
+    )
 }
 
 fn dr1cs_from_symphony<F: PrimeField>(inst: SymDr1cs<F>) -> Dr1csInstanceSparse<F> {

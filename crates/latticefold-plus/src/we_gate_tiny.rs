@@ -3358,6 +3358,249 @@ pub fn build_poseidon_f257_with_cm_coins_frog_and_digit_mul_surfaces_from_ops_wi
 
     Ok((inst, asg, shorts_out, u32s_out, frog_wirings, surfaces))
 }
+
+/// Build Poseidon(F257) + CM coin surface + a batch of digit-mul surfaces (NO Frog coins).
+///
+/// Each pair `(short_block_idx, u32_idx)` requests multiplying all coeffs in that short block by
+/// the bounded-u32 challenge at `u32_idx`.
+pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
+    cfg: Option<&PoseidonConfig<F257>>,
+    ops: &[PoseidonTraceOp<F257>],
+    ring_dim: usize,
+    wiring: &TinyCoinOpWiring,
+    pairs: &[(usize, usize)],
+) -> Result<
+    (
+        SparseDr1csInstance<F257>,
+        Vec<F257>,
+        Vec<ShortChallengeWiring>,
+        Vec<BoundedU32ChallengeWiring>,
+        Vec<CmDigitMulSurfaceWiring>,
+    ),
+    String,
+> {
+    let (pose_inst, pose_asg, pose_wiring, _byte_wiring) =
+        build_poseidon_f257_from_ops_with_wiring_and_bytes(cfg, ops)?;
+
+    // Resolve ranges from op indices.
+    let short_ranges =
+        squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.short_squeeze_ops)?;
+    let u32_ranges =
+        squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.u32_squeeze_ops)?;
+
+    // Build glue circuit (coins + mul surface).
+    let mut gb = Dr1csBuilder::<F257>::new();
+    gb.enforce_var_eq_const(gb.one(), F257::ONE);
+
+    // Copy digit vars for shorts and u32s in appearance order.
+    let mut local_map: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    #[inline]
+    fn copy_digit(
+        gb: &mut Dr1csBuilder<F257>,
+        pose_asg: &[F257],
+        local_map: &mut std::collections::BTreeMap<usize, usize>,
+        gv: usize,
+    ) -> usize {
+        if let Some(&lv) = local_map.get(&gv) {
+            return lv;
+        }
+        let lv = gb.new_var(pose_asg[gv]);
+        local_map.insert(gv, lv);
+        lv
+    }
+
+    // Determine which short/u32 blocks we need.
+    for &(si, ui) in pairs {
+        if si >= short_ranges.len() {
+            return Err(format!("short_block_idx {si} out of range"));
+        }
+        if ui >= u32_ranges.len() {
+            return Err(format!("u32_idx {ui} out of range"));
+        }
+    }
+
+    // Materialize required short blocks.
+    let mut short_locals: std::collections::BTreeMap<usize, ShortChallengeWiring> =
+        std::collections::BTreeMap::new();
+    for &(si, _ui) in pairs {
+        if short_locals.contains_key(&si) {
+            continue;
+        }
+        let (s_start, s_len) = short_ranges[si];
+        if s_len != ring_dim {
+            return Err(format!(
+                "short block {si} length mismatch (got {s_len}, expected {ring_dim})"
+            ));
+        }
+        let short_digits_global = &pose_wiring.squeeze_field_vars[s_start..s_start + s_len];
+        let short_digits_local: Vec<usize> = short_digits_global
+            .iter()
+            .copied()
+            .map(|gv| copy_digit(&mut gb, &pose_asg, &mut local_map, gv))
+            .collect();
+        let (short_bvars, short_coeffs, short_coeff_digits) =
+            short_challenge_from_digits_128(&mut gb, &short_digits_local, ring_dim);
+        short_locals.insert(
+            si,
+            ShortChallengeWiring {
+                digit_vars: short_digits_local,
+                byte_vars: short_bvars,
+                coeff_vars: short_coeffs,
+                coeff_bal16_digits: short_coeff_digits,
+            },
+        );
+    }
+
+    // Materialize required u32 blocks.
+    let mut u32_locals: std::collections::BTreeMap<usize, BoundedU32ChallengeWiring> =
+        std::collections::BTreeMap::new();
+    for &(_si, ui) in pairs {
+        if u32_locals.contains_key(&ui) {
+            continue;
+        }
+        let (u_start, u_len) = u32_ranges[ui];
+        if u_len != DIGITS_PER_TRY {
+            return Err(format!(
+                "u32 block {ui} length mismatch (got {u_len}, expected {DIGITS_PER_TRY})"
+            ));
+        }
+        let u_digits_global = &pose_wiring.squeeze_field_vars[u_start..u_start + u_len];
+        let mut u_digits_local = [0usize; DIGITS_PER_TRY];
+        for i in 0..DIGITS_PER_TRY {
+            u_digits_local[i] = copy_digit(&mut gb, &pose_asg, &mut local_map, u_digits_global[i]);
+        }
+        let (u_limbs, u_bytes, u_bal16, u_bal16_sq) =
+            bounded_u32_from_8_digits_base128(&mut gb, &u_digits_local);
+        u32_locals.insert(
+            ui,
+            BoundedU32ChallengeWiring {
+                digit_vars: u_digits_local.to_vec(),
+                byte_vars: u_bytes,
+                limbs: u_limbs,
+                bal16_digits: u_bal16,
+                bal16_sq_digits: u_bal16_sq,
+            },
+        );
+    }
+
+    // Build requested digit-mul surfaces.
+    let mut surfaces_local: Vec<CmDigitMulSurfaceWiring> = Vec::with_capacity(pairs.len());
+    for &(si, ui) in pairs {
+        let s = short_locals.get(&si).expect("short local present");
+        let u = u32_locals.get(&ui).expect("u32 local present");
+        let products = scale_short_coeffs_by_u32(&mut gb, &s.coeff_bal16_digits, &u.bal16_digits);
+        let products13 = products
+            .iter()
+            .map(|p12| rebalance_prod12_to_prod13(&mut gb, p12))
+            .collect::<Vec<_>>();
+        let sum_digits = sum_product_digits_bal16(&mut gb, &products13, 16);
+        surfaces_local.push(CmDigitMulSurfaceWiring {
+            short_block_idx: si,
+            u32_idx: ui,
+            products,
+            products13,
+            sum_digits,
+            sum_all_pairs_digits: Vec::new(), // filled after we know all surfaces
+            sum_all_pairs_coeffwise: Vec::new(), // filled after we know all surfaces
+        });
+    }
+
+    // Batch-level accumulation across all requested surfaces (sum of sums).
+    let all_sum_digits = sum_bal16_vectors_fixed_len(
+        &mut gb,
+        &surfaces_local
+            .iter()
+            .map(|s| s.sum_digits.clone())
+            .collect::<Vec<_>>(),
+        16,
+    );
+    let all_sum_coeffwise = sum_products13_coeffwise_fixed_len(
+        &mut gb,
+        &surfaces_local
+            .iter()
+            .map(|s| s.products13.clone())
+            .collect::<Vec<_>>(),
+        ring_dim,
+        16,
+    );
+    for s in &mut surfaces_local {
+        s.sum_all_pairs_digits = all_sum_digits.clone();
+        s.sum_all_pairs_coeffwise = all_sum_coeffwise.clone();
+    }
+
+    let (glue_inst, glue_asg) = gb.into_instance();
+    let glue_nvars = glue_inst.nvars;
+
+    // Merge poseidon + glue.
+    let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(&[
+        (pose_inst, pose_asg),
+        (glue_inst, glue_asg),
+    ])
+    .map_err(|e| format!("merge poseidon+cm+mul_glue failed: {e}"))?;
+
+    // Add explicit equality constraints between pose vars and their local copies.
+    let pose_nvars = inst.nvars - (glue_nvars - 1);
+    let glue_offset = pose_nvars - 1;
+    for (&gv, &lv) in local_map.iter() {
+        let gg = if lv == 0 { 0 } else { lv + glue_offset };
+        enforce_var_eq::<F257>(&mut inst, gv, gg);
+    }
+
+    let to_glue_global = |glue_local: usize| -> usize {
+        if glue_local == 0 { 0 } else { glue_local + glue_offset }
+    };
+
+    // Return only the derived shorts/u32s (those referenced by pairs), in sorted index order.
+    let shorts_out = short_locals
+        .into_iter()
+        .map(|(_idx, w)| ShortChallengeWiring {
+            digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
+            byte_vars: w.byte_vars.into_iter().map(to_glue_global).collect(),
+            coeff_vars: w.coeff_vars.into_iter().map(to_glue_global).collect(),
+            coeff_bal16_digits: w
+                .coeff_bal16_digits
+                .into_iter()
+                .map(|a| a.map(to_glue_global))
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let u32s_out = u32_locals
+        .into_iter()
+        .map(|(_idx, w)| BoundedU32ChallengeWiring {
+            digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
+            byte_vars: w.byte_vars.map(to_glue_global),
+            limbs: w.limbs.map(to_glue_global),
+            bal16_digits: w.bal16_digits.into_iter().map(to_glue_global).collect(),
+            bal16_sq_digits: w.bal16_sq_digits.into_iter().map(to_glue_global).collect(),
+        })
+        .collect::<Vec<_>>();
+    let surfaces_out = surfaces_local
+        .into_iter()
+        .map(|s| CmDigitMulSurfaceWiring {
+            short_block_idx: s.short_block_idx,
+            u32_idx: s.u32_idx,
+            products: s
+                .products
+                .into_iter()
+                .map(|p| p.map(to_glue_global))
+                .collect(),
+            products13: s
+                .products13
+                .into_iter()
+                .map(|p| p.map(to_glue_global))
+                .collect(),
+            sum_digits: s.sum_digits.into_iter().map(to_glue_global).collect(),
+            sum_all_pairs_digits: s.sum_all_pairs_digits.into_iter().map(to_glue_global).collect(),
+            sum_all_pairs_coeffwise: s
+                .sum_all_pairs_coeffwise
+                .into_iter()
+                .map(|v| v.into_iter().map(to_glue_global).collect())
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+
+    Ok((inst, asg, shorts_out, u32s_out, surfaces_out))
+}
 /// Build the Poseidon transcript subrelation **over F257** from an op schedule.
 ///
 /// This is the correct transcript-layer arithmetization for the Theorem-4.3 tiny-field WE gate:
