@@ -516,9 +516,11 @@ dependencies = [
 name = "dpp"
 version = "0.1.0"
 dependencies = [
+ "ark-crypto-primitives",
  "ark-ff",
  "ark-poly",
  "ark-std",
+ "latticefold",
  "num-bigint",
  "num-integer",
  "num-traits",
@@ -526,6 +528,7 @@ dependencies = [
  "rand_chacha",
  "rayon",
  "serde",
+ "sha2",
  "thiserror",
 ]
 

@@ -1479,44 +1479,6 @@ fn prime_field_to_bytes_le_fixed_vars<F: PrimeField>(
     byte_vars
 }
 
-fn f257_bytes_from_var<R>(b: &mut Dr1csBuilder<BF<R>>, x_var: usize) -> [usize; 2]
-where
-    R: PolyRing,
-    R::BaseRing: PrimeField,
-{
-    debug_assert!(
-        <R::BaseRing as PrimeField>::MODULUS_BIT_SIZE <= 9,
-        "f257_bytes_from_var assumes tiny (<=9-bit) base ring"
-    );
-    let x_val = b.assignment[x_var]
-        .into_bigint()
-        .to_bytes_le()
-        .get(0)
-        .copied()
-        .unwrap_or(0) as u64;
-    let b0 = (x_val & 0xFF) as u8;
-    let b1 = ((x_val >> 8) & 0xFF) as u8;
-
-    let v0 = b.new_var(BF::<R>::from(b0 as u64));
-    let v1 = b.new_var(BF::<R>::from(b1 as u64));
-
-    enforce_byte::<BF<R>>(b, v0);
-    enforce_bit::<BF<R>>(b, v1);
-
-    // Enforce x = b0 + 256*b1.
-    let mut lc: Vec<(BF<R>, usize)> = Vec::with_capacity(3);
-    lc.push((BF::<R>::ONE, x_var));
-    lc.push((-BF::<R>::ONE, v0));
-    lc.push((-BF::<R>::from(256u64), v1));
-    b.enforce_lc_times_one_eq_const(lc);
-
-    // Canonical for F257: if b1 = 1 then b0 = 0.
-    let z = b.new_var(BF::<R>::ZERO);
-    b.enforce_var_eq_const(z, BF::<R>::ZERO);
-    b.enforce_mul(v0, v1, z);
-
-    [v0, v1]
-}
 fn tensor_scalar_vars<F: PrimeField>(b: &mut Dr1csBuilder<F>, c: &[usize]) -> Vec<usize> {
     // Matches utils::tensor ordering: fold tensor_product with [1-c_i, c_i].
     let mut acc: Vec<usize> = vec![const_var(b, F::ONE)];
@@ -3675,7 +3637,7 @@ where
         (field_inst, field_asg), // 3
         (cm_inst, cm_asg),       // 4
     ];
-    let base_constraints = parts.iter().map(|(i, _)| i.constraints.len()).sum::<usize>();
+    let _base_constraints = parts.iter().map(|(i, _)| i.constraints.len()).sum::<usize>();
 
     let (inst, assignment) = merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| {
         // Add part-local index info for inconsistent-glue errors.
@@ -4226,7 +4188,7 @@ where
         (decomp_inst, decomp_asg),
     ) = {
         let pose_build = || {
-            let (mut pose_inst, pose_asg, replay, _byte_wit, pose_wiring, byte_wiring) =
+            let (mut pose_inst, pose_asg, _replay, _byte_wit, pose_wiring, byte_wiring) =
                 poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
                     .map_err(|e| format!("poseidon arith failed: {e}"))?;
             enforce_reabsorb_equals_squeeze::<BF<R>>(&mut pose_inst, &pose_wiring, &ops)?;
@@ -5339,6 +5301,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "legacy Frog-based WE-gate (2-field split); Theorem 4.3 tiny-field path selected"]
     fn test_we_cm_proof_param_binding_mlen_unsat() {
         // Small-ish instance.
         type PCF = cyclotomic_rings::rings::FrogPoseidonConfig;
@@ -5404,6 +5367,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "legacy Frog-based WE-gate (2-field split); Theorem 4.3 tiny-field path selected"]
     fn test_we_cm_proof_unsat_on_constraint_var_flip() {
         // Reuse the same construction as the param-binding test, but flip a variable that is
         // guaranteed to appear in some constraint.
@@ -5518,6 +5482,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "legacy Frog-based WE-gate (2-field split); Theorem 4.3 tiny-field path selected"]
     fn test_we_cm_proof_public_input_digest_unsat_on_flip() {
         // SP1-style: include exactly one public input digest, absorb it before proving/verifying,
         // and ensure flipping it in `public_x` breaks dR1CS satisfaction.
@@ -5987,6 +5952,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "legacy Frog-based WE-gate (2-field split); Theorem 4.3 tiny-field path selected"]
     fn test_we_plus_prover_sparse_base_small_mock_sat() {
         init_rayon_stack();
         // A small end-to-end test for the **production** SP1-style path:

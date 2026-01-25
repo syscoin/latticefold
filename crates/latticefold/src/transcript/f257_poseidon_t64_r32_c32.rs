@@ -22,8 +22,6 @@ pub const PARTIAL_ROUNDS: usize = 56;
 pub const ALPHA: u64 = 5;
 pub const RATE: usize = 32;
 pub const CAPACITY: usize = 32;
-pub const WIDTH: usize = RATE + CAPACITY;
-pub const N_ROUNDS: usize = FULL_ROUNDS + PARTIAL_ROUNDS;
 
 pub const MDS_U16: [[u16; 64]; 64] = [
     [74, 234, 223, 149, 246, 181, 25, 169, 66, 24, 186, 247, 201, 244, 151, 165, 210, 96, 205, 127, 3, 65, 184, 26, 20, 209, 176, 152, 216, 46, 83, 53, 139, 135, 18, 28, 63, 5, 215, 164, 177, 245, 188, 224, 250, 44, 218, 116, 124, 38, 113, 134, 159, 54, 15, 17, 158, 140, 114, 220, 51, 85, 255, 2],
