@@ -29,6 +29,9 @@ use symphony::transcript::PoseidonTraceOp;
 ///
 /// This is used only for *boundary canonicalization* of 64-bit challenges.
 const FROG_P: u64 = 15912092521325583641u64;
+const LIMB_BASE_U64: u64 = 128;
+const LIMB_BITS: usize = 7;
+const LIMBS_U64: usize = 10; // ceil(64/7)=10
 
 #[derive(Clone, Debug)]
 struct ByteVar {
@@ -82,6 +85,43 @@ fn alloc_u64_as_bytes_le<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: u64) -> [Byt
     let bytes = x.to_le_bytes();
     for i in 0..8 {
         out[i] = alloc_byte::<F>(b, bytes[i]);
+    }
+    out
+}
+
+fn decompose_existing_byte_var_to_bits<F: PrimeField>(
+    b: &mut Dr1csBuilder<F>,
+    byte_var: usize,
+) -> [usize; 8] {
+    // Constrain: byte_var = Σ 2^i * bit_i, with bit_i boolean.
+    let mut bits = [0usize; 8];
+    let v8 = b.assignment[byte_var]
+        .into_bigint()
+        .to_bytes_le()
+        .get(0)
+        .copied()
+        .unwrap_or(0) as u16;
+    // We expect Poseidon "byte wiring" vars to already be in 0..=255.
+    debug_assert!(v8 <= 255);
+    for i in 0..8 {
+        bits[i] = alloc_bool::<F>(b, ((v8 >> i) & 1) == 1);
+    }
+    let mut lc = vec![(F::ONE, byte_var)];
+    let mut pow = F::ONE;
+    for i in 0..8 {
+        lc.push((-pow, bits[i]));
+        pow *= F::from(2u64);
+    }
+    b.enforce_lc_times_one_eq_const(lc);
+    bits
+}
+
+fn frog_p_base128_digits_le() -> [u8; LIMBS_U64] {
+    let mut out = [0u8; LIMBS_U64];
+    let mut t = FROG_P;
+    for i in 0..LIMBS_U64 {
+        out[i] = (t & (LIMB_BASE_U64 - 1)) as u8;
+        t >>= LIMB_BITS;
     }
     out
 }
@@ -187,84 +227,17 @@ fn enforce_var_eq<F: PrimeField>(inst: &mut SparseDr1csInstance<F>, x: usize, y:
 /// given an unconstrained 64-bit integer `u` as 8 little-endian bytes, produce
 /// `(q, z)` such that:
 /// - `q ∈ {0,1}`
-/// - `u = z + q * p_frog` as an **integer** (no wrap), enforced via base-256 carries
-/// - the top carry is 0, preventing the `+2^64` wrap cheat.
+/// - `u = z + q * p_frog` as an **integer** (no wrap), enforced via base-128 borrows over a
+///   bit-derived base-128 limb view of `u`.
 ///
 /// This is the "single subtract" reduction justified by \(2^{64} < 2p\).
-fn reduce_u64_mod_frog_from_bytes<F: PrimeField>(
-    b: &mut Dr1csBuilder<F>,
-    u_bytes: &[ByteVar; 8],
-) -> (usize /* q bit */, [ByteVar; 8] /* z bytes */) {
-    // Witness compute.
-    let mut u_buf = [0u8; 8];
-    for i in 0..8 {
-        u_buf[i] = b.assignment[u_bytes[i].byte]
-            .into_bigint()
-            .to_bytes_le()
-            .get(0)
-            .copied()
-            .unwrap_or(0);
-    }
-    let u = u64::from_le_bytes(u_buf);
-    let q_u8: u8 = if u >= FROG_P { 1 } else { 0 };
-    let q = alloc_bool::<F>(b, q_u8 == 1);
-    let z_u64 = u.wrapping_sub((q_u8 as u64) * FROG_P);
-    let z_bytes = alloc_u64_as_bytes_le::<F>(b, z_u64);
-
-    // Enforce base-256 carry constraints:
-    // z_i + q*p_i + carry_i = u_i + 256*carry_{i+1}, with carry_0=0, carry_8=0.
-    let p_bytes = FROG_P.to_le_bytes();
-
-    let carry0 = b.new_var(F::ZERO);
-    b.enforce_var_eq_const(carry0, F::ZERO);
-    let mut carry_i = carry0;
-    let mut carry_val: u16 = 0;
-    for i in 0..8 {
-        let zi = z_u64.to_le_bytes()[i] as u16;
-        let pi = p_bytes[i] as u16;
-        let sum = zi + (q_u8 as u16) * pi + carry_val;
-        let carry_next_val: u8 = (sum >> 8) as u8;
-        debug_assert!(carry_next_val <= 1);
-        carry_val = (carry_next_val as u16) & 1;
-
-        let carry_next_bit = if i == 7 {
-            // Enforce carry_8 == 0 (no wrap by +2^64).
-            let v = b.new_var(F::ZERO);
-            b.enforce_var_eq_const(v, F::ZERO);
-            v
-        } else {
-            // carry is at most 1 for byte-wise addition here.
-            alloc_bool::<F>(b, carry_next_val == 1)
-        };
-
-        // z_i + q*p_i + carry_i - u_i - 256*carry_{i+1} == 0
-        let mut lc: Vec<(F, usize)> = Vec::new();
-        lc.push((F::ONE, z_bytes[i].byte));
-        if p_bytes[i] != 0 {
-            lc.push((F::from(p_bytes[i] as u64), q));
-        }
-        lc.push((F::ONE, carry_i));
-        lc.push((-F::ONE, u_bytes[i].byte));
-        lc.push((-F::from(256u64), carry_next_bit));
-        b.enforce_lc_times_one_eq_const(lc);
-
-        carry_i = carry_next_bit;
-    }
-
-    // Canonicality: enforce z < p_frog so the mapping is unique (prevents choosing "wrong q").
-    let z_lt_p = u64_lt_const_le_bytes::<F>(b, &z_bytes, FROG_P);
-    b.enforce_var_eq_const(z_lt_p, F::ONE);
-
-    (q, z_bytes)
-}
-
-/// Same as `reduce_u64_mod_frog_from_bytes`, but takes raw byte variables that are
+/// Takes raw byte variables that are
 /// already constrained to be 8-bit (e.g. Poseidon `SqueezeBytes` wiring).
 #[allow(dead_code)]
 fn reduce_u64_mod_frog_from_byte_vars<F: PrimeField>(
     b: &mut Dr1csBuilder<F>,
     u_byte_vars: &[usize; 8],
-) -> (usize /* q bit */, [ByteVar; 8] /* z bytes */) {
+) -> (usize /* q bit */, [usize; LIMBS_U64] /* z base-128 limbs */) {
     // Witness compute.
     let mut u_buf = [0u8; 8];
     for i in 0..8 {
@@ -278,47 +251,167 @@ fn reduce_u64_mod_frog_from_byte_vars<F: PrimeField>(
     let u = u64::from_le_bytes(u_buf);
     let q_u8: u8 = if u >= FROG_P { 1 } else { 0 };
     let q = alloc_bool::<F>(b, q_u8 == 1);
-    let z_u64 = u.wrapping_sub((q_u8 as u64) * FROG_P);
-    let z_bytes = alloc_u64_as_bytes_le::<F>(b, z_u64);
 
-    let p_bytes = FROG_P.to_le_bytes();
-    let carry0 = b.new_var(F::ZERO);
-    b.enforce_var_eq_const(carry0, F::ZERO);
-    let mut carry_i = carry0;
-    let mut carry_val: u16 = 0;
+    // Decompose u_byte_vars into 64 bits.
+    let mut u_bits: Vec<usize> = Vec::with_capacity(64);
     for i in 0..8 {
-        let zi = z_u64.to_le_bytes()[i] as u16;
-        let pi = p_bytes[i] as u16;
-        let sum = zi + (q_u8 as u16) * pi + carry_val;
-        let carry_next_val: u8 = (sum >> 8) as u8;
-        debug_assert!(carry_next_val <= 1);
-        carry_val = (carry_next_val as u16) & 1;
+        let bits = decompose_existing_byte_var_to_bits::<F>(b, u_byte_vars[i]);
+        u_bits.extend_from_slice(&bits);
+    }
+    debug_assert_eq!(u_bits.len(), 64);
 
-        let carry_next_bit = if i == 7 {
+    // Allocate base-128 limbs for u derived from bits: limb_j = Σ 2^k * bit_{7j+k}.
+    let mut u_limbs = [0usize; LIMBS_U64];
+    for j in 0..LIMBS_U64 {
+        // Witness limb value from native u.
+        let limb_val = ((u >> (LIMB_BITS * j)) & (LIMB_BASE_U64 - 1)) as u64;
+        let limb_var = b.new_var(F::from(limb_val));
+        let mut lc = vec![(F::ONE, limb_var)];
+        let mut pow = F::ONE;
+        for k in 0..LIMB_BITS {
+            let bit_idx = LIMB_BITS * j + k;
+            if bit_idx < 64 {
+                lc.push((-pow, u_bits[bit_idx]));
+            }
+            pow *= F::from(2u64);
+        }
+        b.enforce_lc_times_one_eq_const(lc);
+        u_limbs[j] = limb_var;
+    }
+
+    // Enforce q matches u >= p by comparing u_limbs (base-128) against p.
+    let p_digits = frog_p_base128_digits_le();
+    let mut borrow = b.new_var(F::ZERO);
+    b.enforce_var_eq_const(borrow, F::ZERO);
+    let mut borrow_final = borrow;
+    for i in 0..LIMBS_U64 {
+        // Witness borrow_{i+1} from integers.
+        let ui = ((u >> (LIMB_BITS * i)) & (LIMB_BASE_U64 - 1)) as i16;
+        let pi = p_digits[i] as i16;
+        let bi = if i == 0 { 0i16 } else { borrow_final as i16 };
+        let _ = (ui, pi, bi);
+
+        let bnext = if i == LIMBS_U64 - 1 {
+            // dummy; will be constrained by the LC.
+            alloc_bool::<F>(b, u < FROG_P)
+        } else {
+            // witness below
+            let t = (ui as i32) - (pi as i32) - (if i == 0 { 0 } else { 0 });
+            alloc_bool::<F>(b, t < 0)
+        };
+        // We'll overwrite with a proper witness-based borrow bit next.
+        drop(bnext);
+    }
+
+    // Proper comparator: run a base-128 borrow chain on (u - p) with witnessed borrows.
+    let mut bor = b.new_var(F::ZERO);
+    b.enforce_var_eq_const(bor, F::ZERO);
+    for i in 0..LIMBS_U64 {
+        let ui = ((u >> (LIMB_BITS * i)) & (LIMB_BASE_U64 - 1)) as i16;
+        let pi = p_digits[i] as i16;
+        let bi = if i == 0 {
+            0i16
+        } else {
+            b.assignment[bor]
+                .into_bigint()
+                .to_bytes_le()
+                .get(0)
+                .copied()
+                .unwrap_or(0) as i16
+        };
+        let mut t = ui - pi - bi;
+        let bor_next_u8 = if t < 0 { 1u8 } else { 0u8 };
+        if t < 0 {
+            t += LIMB_BASE_U64 as i16;
+        }
+        let diff_i = b.new_var(F::from((t as u64) & (LIMB_BASE_U64 - 1)));
+        // Range-check diff_i to 7 bits by reusing bits (cheap): allocate 7 bools.
+        let mut dbits = [0usize; LIMB_BITS];
+        for k in 0..LIMB_BITS {
+            dbits[k] = alloc_bool::<F>(b, (((t as u8) >> k) & 1) == 1);
+        }
+        let mut lc_diff = vec![(F::ONE, diff_i)];
+        let mut pow = F::ONE;
+        for k in 0..LIMB_BITS {
+            lc_diff.push((-pow, dbits[k]));
+            pow *= F::from(2u64);
+        }
+        b.enforce_lc_times_one_eq_const(lc_diff);
+
+        let bor_next = alloc_bool::<F>(b, bor_next_u8 == 1);
+        // u_i - p_i - bor_i + base*bor_{i+1} - diff_i == 0
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, u_limbs[i]),
+            (-F::from(p_digits[i] as u64), b.one()),
+            (-F::ONE, bor),
+            (F::from(LIMB_BASE_U64), bor_next),
+            (-F::ONE, diff_i),
+        ]);
+        bor = bor_next;
+    }
+    // is_ge = 1 - final_borrow
+    let is_ge = b.new_var(F::ONE - b.assignment[bor]);
+    b.enforce_lc_times_one_eq_const(vec![(F::ONE, is_ge), (F::ONE, bor), (-F::ONE, b.one())]);
+    b.enforce_lc_times_one_eq_const(vec![(F::ONE, q), (-F::ONE, is_ge)]);
+
+    // Now compute z limbs as witness and enforce u = z + q*p + base*borrow chain (same as subtraction).
+    let z_u64 = if q_u8 == 1 { u - FROG_P } else { u };
+    let mut z_limbs = [0usize; LIMBS_U64];
+    for i in 0..LIMBS_U64 {
+        let zi = ((z_u64 >> (LIMB_BITS * i)) & (LIMB_BASE_U64 - 1)) as u64;
+        z_limbs[i] = b.new_var(F::from(zi));
+        // Range-check z limb to 7 bits.
+        let mut zbits = [0usize; LIMB_BITS];
+        for k in 0..LIMB_BITS {
+            zbits[k] = alloc_bool::<F>(b, (((zi as u8) >> k) & 1) == 1);
+        }
+        let mut lc_z = vec![(F::ONE, z_limbs[i])];
+        let mut pow = F::ONE;
+        for k in 0..LIMB_BITS {
+            lc_z.push((-pow, zbits[k]));
+            pow *= F::from(2u64);
+        }
+        b.enforce_lc_times_one_eq_const(lc_z);
+    }
+
+    // Base-128 borrow constraints for u - q*p - z = 0, with final borrow=0.
+    let mut borrow2 = b.new_var(F::ZERO);
+    b.enforce_var_eq_const(borrow2, F::ZERO);
+    for i in 0..LIMBS_U64 {
+        let ui = ((u >> (LIMB_BITS * i)) & (LIMB_BASE_U64 - 1)) as i16;
+        let zi = ((z_u64 >> (LIMB_BITS * i)) & (LIMB_BASE_U64 - 1)) as i16;
+        let pi = p_digits[i] as i16;
+        let bi = if i == 0 {
+            0i16
+        } else {
+            b.assignment[borrow2]
+                .into_bigint()
+                .to_bytes_le()
+                .get(0)
+                .copied()
+                .unwrap_or(0) as i16
+        };
+        let rhs = ui - (q_u8 as i16) * pi - bi - zi;
+        let bor_next_u8 = if rhs < 0 { 1u8 } else { 0u8 };
+        let bor_next = if i == LIMBS_U64 - 1 {
             let v = b.new_var(F::ZERO);
             b.enforce_var_eq_const(v, F::ZERO);
             v
         } else {
-            alloc_bool::<F>(b, carry_next_val == 1)
+            alloc_bool::<F>(b, bor_next_u8 == 1)
         };
-
-        let mut lc: Vec<(F, usize)> = Vec::new();
-        lc.push((F::ONE, z_bytes[i].byte));
-        if p_bytes[i] != 0 {
-            lc.push((F::from(p_bytes[i] as u64), q));
-        }
-        lc.push((F::ONE, carry_i));
-        lc.push((-F::ONE, u_byte_vars[i]));
-        lc.push((-F::from(256u64), carry_next_bit));
-        b.enforce_lc_times_one_eq_const(lc);
-
-        carry_i = carry_next_bit;
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, u_limbs[i]),
+            (-F::from(p_digits[i] as u64), q),
+            (-F::ONE, borrow2),
+            (F::from(LIMB_BASE_U64), bor_next),
+            (-F::ONE, z_limbs[i]),
+        ]);
+        borrow2 = bor_next;
     }
+    b.enforce_var_eq_const(borrow2, F::ZERO);
 
-    let z_lt_p = u64_lt_const_le_bytes::<F>(b, &z_bytes, FROG_P);
-    b.enforce_var_eq_const(z_lt_p, F::ONE);
-
-    (q, z_bytes)
+    (q, z_limbs)
 }
 
 /// Build a small "glue demo" relation:
@@ -428,12 +521,19 @@ mod tests {
             .unwrap_or(0)
     }
 
-    fn bytes_to_u64_le<F: PrimeField>(b: &Dr1csBuilder<F>, x: &[ByteVar; 8]) -> u64 {
-        let mut buf = [0u8; 8];
-        for i in 0..8 {
-            buf[i] = var_to_u8::<F>(b, x[i].byte);
+    fn limbs_to_u64_base128<F: PrimeField>(b: &Dr1csBuilder<F>, limbs: &[usize; LIMBS_U64]) -> u64 {
+        let mut acc: u64 = 0;
+        for i in (0..LIMBS_U64).rev() {
+            let di = b.assignment[limbs[i]]
+                .into_bigint()
+                .to_bytes_le()
+                .get(0)
+                .copied()
+                .unwrap_or(0) as u64;
+            acc <<= LIMB_BITS;
+            acc |= di & (LIMB_BASE_U64 - 1);
         }
-        u64::from_le_bytes(buf)
+        acc
     }
 
     #[test]
@@ -455,16 +555,20 @@ mod tests {
     }
 
     #[test]
-    fn test_reduce_u64_mod_frog_from_bytes_no_wrap() {
+    fn test_reduce_u64_mod_frog_from_byte_vars_no_wrap() {
         let mut b = Dr1csBuilder::<F257>::new();
         b.enforce_var_eq_const(b.one(), F257::ONE);
 
         let u = FROG_P + 12345;
-        let u_bytes = alloc_u64_as_bytes_le::<F257>(&mut b, u);
-        let (_q, _z) = reduce_u64_mod_frog_from_bytes::<F257>(&mut b, &u_bytes);
+        let mut u_byte_vars = [0usize; 8];
+        for (i, v) in u.to_le_bytes().into_iter().enumerate() {
+            let bv = alloc_byte::<F257>(&mut b, v);
+            u_byte_vars[i] = bv.byte;
+        }
+        let (_q, _z) = reduce_u64_mod_frog_from_byte_vars::<F257>(&mut b, &u_byte_vars);
 
         let (inst, asg) = b.into_instance();
-        inst.check(&asg).expect("reduce_u64_mod_frog_from_bytes dR1CS satisfied");
+        inst.check(&asg).expect("reduce_u64_mod_frog_from_byte_vars dR1CS satisfied");
     }
 
     #[test]
@@ -473,12 +577,16 @@ mod tests {
         b.enforce_var_eq_const(b.one(), F257::ONE);
 
         let u = 42u64;
-        let u_bytes = alloc_u64_as_bytes_le::<F257>(&mut b, u);
-        let (q, z) = reduce_u64_mod_frog_from_bytes::<F257>(&mut b, &u_bytes);
+        let mut u_byte_vars = [0usize; 8];
+        for (i, v) in u.to_le_bytes().into_iter().enumerate() {
+            let bv = alloc_byte::<F257>(&mut b, v);
+            u_byte_vars[i] = bv.byte;
+        }
+        let (q, z) = reduce_u64_mod_frog_from_byte_vars::<F257>(&mut b, &u_byte_vars);
 
         // q should be 0, z == u.
         assert_eq!(var_to_u8::<F257>(&b, q), 0);
-        assert_eq!(bytes_to_u64_le::<F257>(&b, &z), u);
+        assert_eq!(limbs_to_u64_base128::<F257>(&b, &z), u);
 
         let (inst, asg) = b.into_instance();
         inst.check(&asg).expect("branch u<p satisfied");
@@ -490,12 +598,16 @@ mod tests {
         b.enforce_var_eq_const(b.one(), F257::ONE);
 
         let u = FROG_P + 424242u64;
-        let u_bytes = alloc_u64_as_bytes_le::<F257>(&mut b, u);
-        let (q, z) = reduce_u64_mod_frog_from_bytes::<F257>(&mut b, &u_bytes);
+        let mut u_byte_vars = [0usize; 8];
+        for (i, v) in u.to_le_bytes().into_iter().enumerate() {
+            let bv = alloc_byte::<F257>(&mut b, v);
+            u_byte_vars[i] = bv.byte;
+        }
+        let (q, z) = reduce_u64_mod_frog_from_byte_vars::<F257>(&mut b, &u_byte_vars);
 
         // q should be 1, z == u - p.
         assert_eq!(var_to_u8::<F257>(&b, q), 1);
-        assert_eq!(bytes_to_u64_le::<F257>(&b, &z), u - FROG_P);
+        assert_eq!(limbs_to_u64_base128::<F257>(&b, &z), u - FROG_P);
 
         let (inst, asg) = b.into_instance();
         inst.check(&asg).expect("branch u>=p satisfied");
@@ -507,8 +619,12 @@ mod tests {
         b.enforce_var_eq_const(b.one(), F257::ONE);
 
         let u = FROG_P + 7u64;
-        let u_bytes = alloc_u64_as_bytes_le::<F257>(&mut b, u);
-        let (q, _z) = reduce_u64_mod_frog_from_bytes::<F257>(&mut b, &u_bytes);
+        let mut u_byte_vars = [0usize; 8];
+        for (i, v) in u.to_le_bytes().into_iter().enumerate() {
+            let bv = alloc_byte::<F257>(&mut b, v);
+            u_byte_vars[i] = bv.byte;
+        }
+        let (q, _z) = reduce_u64_mod_frog_from_byte_vars::<F257>(&mut b, &u_byte_vars);
 
         let (inst, mut asg) = b.into_instance();
         // Flip q (should be 1 -> set to 0) without adjusting anything else.
