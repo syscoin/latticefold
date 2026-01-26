@@ -1086,64 +1086,52 @@ fn poly_mul_toom4_lc<F: PrimeField>(
     let (c1, rest) = rest.split_at(m);
     let (c2, c3) = rest.split_at(m);
 
-    // Evaluate at points: a(t) = a0 + t a1 + t^2 a2 + t^3 a3, coefficient-wise (each coeff is an LC).
-    let mut a_eval: Vec<Vec<Lc<F>>> = Vec::with_capacity(7);
-    let mut c_eval: Vec<Vec<Lc<F>>> = Vec::with_capacity(7);
+    // Evaluate at each point and recursively multiply.
+    //
+    // Performance: reuse `a_eval_buf/c_eval_buf` across points to avoid repeated heap churn.
+    let mut w_eval: Vec<Vec<Lc<F>>> = Vec::with_capacity(7);
+    let mut a_eval_buf: Vec<Lc<F>> = (0..m).map(|_| Vec::new()).collect();
+    let mut c_eval_buf: Vec<Lc<F>> = (0..m).map(|_| Vec::new()).collect();
     for &t in pts {
         let t2 = t * t;
         let t3 = t2 * t;
-        let mut ae = Vec::with_capacity(m);
-        let mut ce = Vec::with_capacity(m);
         for i in 0..m {
-            let mut lc_a = Vec::new();
-            lc_add_scaled_into::<F>(&mut lc_a, F::ONE, &a0[i]);
-            lc_add_scaled_into::<F>(&mut lc_a, t, &a1[i]);
-            lc_add_scaled_into::<F>(&mut lc_a, t2, &a2[i]);
-            lc_add_scaled_into::<F>(&mut lc_a, t3, &a3[i]);
-            ae.push(lc_a);
+            // a(t)[i] = a0[i] + t a1[i] + t^2 a2[i] + t^3 a3[i]
+            let out_a = &mut a_eval_buf[i];
+            out_a.clear();
+            out_a.reserve(a0[i].len() + a1[i].len() + a2[i].len() + a3[i].len());
+            lc_add_scaled_into::<F>(out_a, F::ONE, &a0[i]);
+            lc_add_scaled_into::<F>(out_a, t, &a1[i]);
+            lc_add_scaled_into::<F>(out_a, t2, &a2[i]);
+            lc_add_scaled_into::<F>(out_a, t3, &a3[i]);
 
-            let mut lc_c = Vec::new();
-            lc_add_scaled_into::<F>(&mut lc_c, F::ONE, &c0[i]);
-            lc_add_scaled_into::<F>(&mut lc_c, t, &c1[i]);
-            lc_add_scaled_into::<F>(&mut lc_c, t2, &c2[i]);
-            lc_add_scaled_into::<F>(&mut lc_c, t3, &c3[i]);
-            ce.push(lc_c);
+            // c(t)[i] = c0[i] + t c1[i] + t^2 c2[i] + t^3 c3[i]
+            let out_c = &mut c_eval_buf[i];
+            out_c.clear();
+            out_c.reserve(c0[i].len() + c1[i].len() + c2[i].len() + c3[i].len());
+            lc_add_scaled_into::<F>(out_c, F::ONE, &c0[i]);
+            lc_add_scaled_into::<F>(out_c, t, &c1[i]);
+            lc_add_scaled_into::<F>(out_c, t2, &c2[i]);
+            lc_add_scaled_into::<F>(out_c, t3, &c3[i]);
         }
-        a_eval.push(ae);
-        c_eval.push(ce);
-    }
-
-    // Pointwise products (recursive): w(t) = a(t) * c(t), each is length (2m-1).
-    let mut w_eval: Vec<Vec<Lc<F>>> = Vec::with_capacity(7);
-    for i in 0..7 {
-        w_eval.push(poly_mul_toom4_lc::<F>(b, &a_eval[i], &c_eval[i], inv_v, pts));
+        w_eval.push(poly_mul_toom4_lc::<F>(b, &a_eval_buf, &c_eval_buf, inv_v, pts));
     }
     debug_assert_eq!(w_eval[0].len(), 2 * m - 1);
 
-    // Interpolate coefficient blocks c_j (j=0..6), each length (2m-1).
-    let mut blocks: Vec<Vec<Lc<F>>> = (0..7).map(|_| vec![Vec::new(); 2 * m - 1]).collect();
+    // Interpolate and assemble directly into the full convolution (len 2n-1 = 8m-1),
+    // avoiding an intermediate `blocks[7][2m-1]` allocation.
+    let mut res: Vec<Lc<F>> = (0..(2 * n - 1)).map(|_| Vec::new()).collect();
     for k in 0..(2 * m - 1) {
-        // w_k is values at points (length 7) for this coefficient position.
         for j in 0..7 {
-            let mut lc: Lc<F> = Vec::new();
+            let idx = j * m + k;
+            let dst = &mut res[idx];
             for i in 0..7 {
                 let coef = inv_v[j][i];
                 if coef.is_zero() {
                     continue;
                 }
-                lc_add_scaled_into::<F>(&mut lc, coef, &w_eval[i][k]);
+                lc_add_scaled_into::<F>(dst, coef, &w_eval[i][k]);
             }
-            blocks[j][k] = lc;
-        }
-    }
-
-    // Assemble full convolution length 2n-1 = 8m-1 by shifting blocks by j*m.
-    let mut res: Vec<Lc<F>> = (0..(2 * n - 1)).map(|_| Vec::new()).collect();
-    for j in 0..7 {
-        let base = j * m;
-        for k in 0..(2 * m - 1) {
-            let idx = base + k;
-            lc_add_scaled_into::<F>(&mut res[idx], F::ONE, &blocks[j][k]);
         }
     }
     res
