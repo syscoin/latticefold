@@ -1495,16 +1495,39 @@ where
     let l_instances = proof.evals.0.len();
     let ell = proof.dcom.dparams.l;
     // ---------------------------------------------------------------------
-    // Const-coeff mode detection (SP1/R1LF):
+    // Const-coeff mode detection (SP1/R1LF inference):
     //
-    // If `decomp_b == 16`, the SP1 matrices/witnesses are expected to be lifted into the ring
-    // as **const-coeff** elements (only coefficient 0 may be nonzero). In that mode we:
+    // In native SP1/R1LF, matrices and the large trace witness are **base-field** objects that get
+    // lifted into the ring via the canonical const-coeff embedding (only coefficient 0 is nonzero).
+    // That property is not automatically enforced by the verifier unless the arithmetized relation
+    // adds constraints.
+    //
+    // Here we **infer** "SP1 const-coeff mode" from statement-bound params (so the instance shape
+    // stays arm-time deterministic), and when enabled we:
     // - enforce const-coeff shape in-circuit for soundness
     // - use cheaper arithmetic gadgets where possible
+    //
+    // NOTE: This is an inference, not a protocol-level flag. If you want this to be future-proof,
+    // add an explicit statement-bound mode bit in `WeParams` (preferred), but we avoid that API
+    // change here.
     // ---------------------------------------------------------------------
-    let const_coeff0_only = params.decomp_b == 16;
-    if const_coeff0_only && (proof.dcom.dparams.b as u64) != 16 {
-        return Err("CmProof: const-coeff mode mismatch (params.decomp_b==16 but dcom.dparams.b!=16)".to_string());
+    let const_coeff0_only = (d == 64) && (params.decomp_b == 12);
+    // Hygiene: ensure the proof's embedded dparams agree with statement-bound params.
+    if (proof.dcom.dparams.b as u64) != params.decomp_b {
+        return Err(format!(
+            "CmProof: dcom.dparams.b mismatch with WeParams (dcom={} params={})",
+            proof.dcom.dparams.b,
+            params.decomp_b
+        ));
+    }
+    if std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1") {
+        println!(
+            "[we_gate/cm] const_coeff0_only={} (d={}, decomp_b={}, reason={})",
+            const_coeff0_only,
+            d,
+            params.decomp_b,
+            if const_coeff0_only { "inferred_sp1" } else { "generic" }
+        );
     }
 
     if proof.sumcheck_proofs.0.msgs().len() != nvars || proof.sumcheck_proofs.1.msgs().len() != nvars {
