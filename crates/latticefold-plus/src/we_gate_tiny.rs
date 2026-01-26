@@ -35,8 +35,6 @@ const LIMBS_U64: usize = 10; // ceil(64/7)=10
 const DIGITS_PER_TRY: usize = 8; // base-257 digits per rejection attempt
 const DEFAULT_REJECTION_TRIES: usize = 10;
 const LIMBS_U32: usize = 5; // ceil(32/7)=5
-// SP1 BabyBear prime (31-bit) used by the lift (default/test value).
-const BABYBEAR_P_U32: u32 = 2013265921; // 0x78000001
 
 #[derive(Clone, Debug)]
 struct ByteVar {
@@ -1553,131 +1551,6 @@ fn u32_lt_const_le_bytes<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &[ByteVar; 4
         eq_hi = bool_and::<F>(b, eq_hi, eq_byte);
     }
     lt
-}
-
-/// Wiring for a BabyBear element encoded as 4 little-endian bytes, constrained to be a canonical
-/// 31-bit value in `[0, p_bb)`.
-#[derive(Clone, Debug)]
-pub struct BabyBear31Wiring {
-    /// The 4 byte vars (little-endian), each constrained to be 8-bit.
-    pub byte_vars: [usize; 4],
-    /// The MSB bit (bit 31) of the u32 encoding (must be 0).
-    pub bit31: usize,
-    /// Balanced base-16 digits (little-endian), length 9, representing the same u32 value.
-    pub bal16_digits: Vec<usize>,
-}
-
-/// Wiring for a **centered** BabyBear value derived from canonical bytes.
-///
-/// If the canonical u32 value is `x ∈ [0, p_bb)`, the centered integer is:
-/// - `x` if `x <= floor(p_bb/2)`
-/// - `x - p_bb` otherwise (negative)
-#[derive(Clone, Debug)]
-pub struct BabyBearCenteredWiring {
-    /// Canonical BabyBear byte encoding (u32 LE), constrained to `[0, p_bb)`.
-    pub byte_vars: [usize; 4],
-    /// Whether `x > floor(p_bb/2)` (boolean).
-    pub is_neg: usize,
-    /// Balanced base-16 digits (little-endian), length 9, representing the centered integer.
-    pub centered_bal16_digits: Vec<usize>,
-}
-
-/// Constrain 4 byte vars to be a canonical SP1 BabyBear element encoding:
-/// - u32 little-endian
-/// - bit31 == 0 (31-bit)
-/// - value < p_bb
-///
-/// Returns balanced base-16 digits for the same u32 (for downstream bounded integer gadgets).
-pub fn babybear31_from_u32_byte_vars_with_modulus(
-    b: &mut Dr1csBuilder<F257>,
-    byte_vars_le: [usize; 4],
-    p_bb: u32,
-) -> BabyBear31Wiring {
-    debug_assert!(p_bb < (1u32 << 31), "expected 31-bit modulus");
-    // Build ByteVar views (with explicit bit decompositions).
-    let b0 = ByteVar { byte: byte_vars_le[0], bits: decompose_existing_byte_var_to_bits::<F257>(b, byte_vars_le[0]) };
-    let b1 = ByteVar { byte: byte_vars_le[1], bits: decompose_existing_byte_var_to_bits::<F257>(b, byte_vars_le[1]) };
-    let b2 = ByteVar { byte: byte_vars_le[2], bits: decompose_existing_byte_var_to_bits::<F257>(b, byte_vars_le[2]) };
-    let b3 = ByteVar { byte: byte_vars_le[3], bits: decompose_existing_byte_var_to_bits::<F257>(b, byte_vars_le[3]) };
-    let bytes = [b0, b1, b2, b3];
-
-    // Enforce 31-bit encoding: bit 31 (MSB of byte 3) is 0.
-    let bit31 = bytes[3].bits[7];
-    b.enforce_var_eq_const(bit31, F257::ZERO);
-
-    // Enforce x < p_bb.
-    let lt_p = u32_lt_const_le_bytes::<F257>(b, &bytes, p_bb);
-    b.enforce_var_eq_const(lt_p, F257::ONE);
-
-    // Produce balanced base-16 digits.
-    let bal16_digits = u32_bytes_to_bal16_digits(b, byte_vars_le);
-
-    BabyBear31Wiring { byte_vars: byte_vars_le, bit31, bal16_digits }
-}
-
-/// Constrain bytes to a canonical BabyBear encoding and return the **centered** value in balanced base-16.
-pub fn babybear_centered_from_u32_byte_vars_with_modulus(
-    b: &mut Dr1csBuilder<F257>,
-    byte_vars_le: [usize; 4],
-    p_bb: u32,
-) -> BabyBearCenteredWiring {
-    let w = babybear31_from_u32_byte_vars_with_modulus(b, byte_vars_le, p_bb);
-    let half: u32 = p_bb / 2;
-
-    // x <= half  <=>  x < half+1
-    let bytes = [
-        ByteVar { byte: w.byte_vars[0], bits: decompose_existing_byte_var_to_bits::<F257>(b, w.byte_vars[0]) },
-        ByteVar { byte: w.byte_vars[1], bits: decompose_existing_byte_var_to_bits::<F257>(b, w.byte_vars[1]) },
-        ByteVar { byte: w.byte_vars[2], bits: decompose_existing_byte_var_to_bits::<F257>(b, w.byte_vars[2]) },
-        ByteVar { byte: w.byte_vars[3], bits: decompose_existing_byte_var_to_bits::<F257>(b, w.byte_vars[3]) },
-    ];
-    let le_half = u32_lt_const_le_bytes::<F257>(b, &bytes, half + 1);
-    let is_neg = bool_not::<F257>(b, le_half);
-
-    // Build balanced base-16 digits for (-p_bb) in length 9 (host-known, statement-driven).
-    let mut neg_p: i128 = -(p_bb as i128);
-    let mut neg_p_digits_i8: [i8; 9] = [0i8; 9];
-    for i in 0..9 {
-        let mut d = (neg_p % 16) as i32; // in [-15,15]
-        if d > 7 { d -= 16; }
-        if d < -8 { d += 16; }
-        neg_p_digits_i8[i] = d as i8;
-        neg_p = (neg_p - d as i128) / 16;
-    }
-    debug_assert_eq!(neg_p, 0, "neg_p did not fit in 9 balanced digits");
-
-    // Masked (-p) digits: either all-zero or (-p) depending on is_neg.
-    let zero_digit = alloc_bal16_digit(b, 0);
-    let mut masked_neg_p: Vec<usize> = Vec::with_capacity(9);
-    for &di in &neg_p_digits_i8 {
-        let dvar = alloc_bal16_digit(b, di);
-        let mv = b.new_var(b.assignment[dvar] * b.assignment[is_neg]);
-        b.enforce_mul(dvar, is_neg, mv);
-        masked_neg_p.push(mv);
-    }
-    // If is_neg=0, masked_neg_p should be all 0; we don't enforce that directly (it follows from mul),
-    // but we keep the explicit zero digit for later padding patterns.
-    let _ = zero_digit;
-
-    // centered = x + is_neg * (-p)
-    let (centered_digits, carry) = add_bal16_same_len(b, &w.bal16_digits, &masked_neg_p);
-    // The centered value is guaranteed to fit in 9 digits for 31-bit primes; enforce no overflow.
-    b.enforce_var_eq_const(carry, F257::ZERO);
-
-    BabyBearCenteredWiring {
-        byte_vars: w.byte_vars,
-        is_neg,
-        centered_bal16_digits: centered_digits,
-    }
-}
-
-/// Default BabyBear modulus wiring (SP1).
-#[inline]
-pub fn babybear31_from_u32_byte_vars(
-    b: &mut Dr1csBuilder<F257>,
-    byte_vars_le: [usize; 4],
-) -> BabyBear31Wiring {
-    babybear31_from_u32_byte_vars_with_modulus(b, byte_vars_le, BABYBEAR_P_U32)
 }
 
 #[inline]
@@ -3375,7 +3248,6 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         Vec<F257>,
         Vec<ShortChallengeWiring>,
         Vec<BoundedU32ChallengeWiring>,
-        Vec<BabyBearCenteredWiring>,
         Vec<usize>, // tcch0 residues per instance (F257 vars)
         Vec<usize>, // tcch1 residues per instance (F257 vars)
         Vec<CmDigitMulSurfaceWiring>,
@@ -3486,7 +3358,6 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
     // --------------------------------------------------------------------
     // CM math port (stage 0): compute tcch0/tcch1 *residues* (in F257) from the transcript.
     //
-    // This reintroduces the CM-aligned `tcch` hook **without** any ConstCoeff0/BabyBear enforcement.
     // We work purely with residues in F257:
     // - parse `absorb_comh` ring elements as bytes (already F257 vars in the Poseidon schedule),
     // - extract a residue for coefficient-0 via the identity 256 ≡ -1 (mod 257):
@@ -4287,7 +4158,6 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         })
         .collect::<Vec<_>>();
 
-    let bb_centered_out: Vec<BabyBearCenteredWiring> = Vec::new();
     let tcch0_out: Vec<usize> = tcch0_local.into_iter().map(to_glue_global).collect();
     let tcch1_out: Vec<usize> = tcch1_local.into_iter().map(to_glue_global).collect();
 
@@ -4296,7 +4166,6 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         asg,
         shorts_out,
         u32s_out,
-        bb_centered_out,
         tcch0_out,
         tcch1_out,
         surfaces_out,
@@ -4411,111 +4280,6 @@ mod tests {
             acc |= di & (LIMB_BASE_U64 - 1);
         }
         acc as u32
-    }
-
-    #[test]
-    fn test_babybear31_from_u32_bytes_satisfies_and_decodes() {
-        let mut b = Dr1csBuilder::<F257>::new();
-        b.enforce_var_eq_const(b.one(), F257::ONE);
-
-        // Some representative values in [0, p_bb).
-        let half: u32 = BABYBEAR_P_U32 / 2;
-        let vals: [u32; 5] = [0, 1, half, half + 1, BABYBEAR_P_U32 - 1];
-        for &x in &vals {
-            let xb = x.to_le_bytes();
-            let bytes = [
-                alloc_byte::<F257>(&mut b, xb[0]).byte,
-                alloc_byte::<F257>(&mut b, xb[1]).byte,
-                alloc_byte::<F257>(&mut b, xb[2]).byte,
-                alloc_byte::<F257>(&mut b, xb[3]).byte,
-            ];
-            let w = babybear31_from_u32_byte_vars(&mut b, bytes);
-            assert_eq!(w.bal16_digits.len(), 9);
-
-            // Decode balanced base-16 digits and check it matches x.
-            let mut acc: i128 = 0;
-            let mut pow: i128 = 1;
-            for &dv in &w.bal16_digits {
-                acc += (f257_to_i32_bal(b.assignment[dv]) as i128) * pow;
-                pow *= 16;
-            }
-            assert_eq!(acc as u32, x);
-        }
-
-        let (inst, asg) = b.into_instance();
-        inst.check(&asg).expect("babybear31 gadget satisfied");
-    }
-
-    #[test]
-    fn test_babybear31_rejects_noncanonical() {
-        // Case 1: x == p_bb is not allowed (must be < p_bb).
-        {
-            let mut b = Dr1csBuilder::<F257>::new();
-            b.enforce_var_eq_const(b.one(), F257::ONE);
-            let xb = BABYBEAR_P_U32.to_le_bytes();
-            let bytes = [
-                alloc_byte::<F257>(&mut b, xb[0]).byte,
-                alloc_byte::<F257>(&mut b, xb[1]).byte,
-                alloc_byte::<F257>(&mut b, xb[2]).byte,
-                alloc_byte::<F257>(&mut b, xb[3]).byte,
-            ];
-            let _ = babybear31_from_u32_byte_vars_with_modulus(&mut b, bytes, BABYBEAR_P_U32);
-            let (inst, asg) = b.into_instance();
-            assert!(inst.check(&asg).is_err(), "expected x==p_bb to be rejected");
-        }
-
-        // Case 2: bit31 set (>= 2^31) is rejected by the 31-bit constraint.
-        {
-            let mut b = Dr1csBuilder::<F257>::new();
-            b.enforce_var_eq_const(b.one(), F257::ONE);
-            let xb = 0x8000_0000u32.to_le_bytes();
-            let bytes = [
-                alloc_byte::<F257>(&mut b, xb[0]).byte,
-                alloc_byte::<F257>(&mut b, xb[1]).byte,
-                alloc_byte::<F257>(&mut b, xb[2]).byte,
-                alloc_byte::<F257>(&mut b, xb[3]).byte,
-            ];
-            let _ = babybear31_from_u32_byte_vars(&mut b, bytes);
-            let (inst, asg) = b.into_instance();
-            assert!(inst.check(&asg).is_err(), "expected bit31-set value to be rejected");
-        }
-    }
-
-    #[test]
-    fn test_babybear_centered_from_u32_bytes_matches_centering() {
-        // Check that the centered digits decode to x or x-p depending on x<=p/2.
-        let p: u32 = BABYBEAR_P_U32;
-        let half: u32 = p / 2;
-        let vals: [u32; 6] = [0, 1, half - 1, half, half + 1, p - 1];
-
-        for &x in &vals {
-            let mut b = Dr1csBuilder::<F257>::new();
-            b.enforce_var_eq_const(b.one(), F257::ONE);
-
-            let xb = x.to_le_bytes();
-            let bytes = [
-                alloc_byte::<F257>(&mut b, xb[0]).byte,
-                alloc_byte::<F257>(&mut b, xb[1]).byte,
-                alloc_byte::<F257>(&mut b, xb[2]).byte,
-                alloc_byte::<F257>(&mut b, xb[3]).byte,
-            ];
-            let w = babybear_centered_from_u32_byte_vars_with_modulus(&mut b, bytes, p);
-            assert_eq!(w.centered_bal16_digits.len(), 9);
-
-            let (inst, asg) = b.into_instance();
-            inst.check(&asg).expect("centered babybear gadget satisfied");
-
-            // Decode centered digits.
-            let mut acc: i128 = 0;
-            let mut pow: i128 = 1;
-            for &dv in &w.centered_bal16_digits {
-                acc += (f257_to_i32_bal(asg[dv]) as i128) * pow;
-                pow *= 16;
-            }
-
-            let expected: i128 = if x <= half { x as i128 } else { (x as i128) - (p as i128) };
-            assert_eq!(acc, expected);
-        }
     }
 
     #[test]
@@ -4979,63 +4743,6 @@ mod tests {
 
         let (inst, asg) = b.into_instance();
         inst.check(&asg).expect("u32ish fixed mul satisfied");
-    }
-
-    #[test]
-    fn test_centered_babybear_times_u32_challenge_roundtrip() {
-        // Multiply a centered BabyBear scalar (from canonical bytes) by a bounded-u32 (bytes),
-        // using the 9×9 balanced base-16 digit multiplier.
-        use rand::Rng;
-        let mut rng = ark_std::test_rng();
-        let p: u32 = BABYBEAR_P_U32;
-        let half: u32 = p / 2;
-
-        for _ in 0..50 {
-            // Sample canonical BabyBear element in [0,p).
-            let x: u32 = rng.gen_range(0..p);
-            // Sample an arbitrary u32 challenge value.
-            let y: u32 = rng.gen();
-
-            let mut b = Dr1csBuilder::<F257>::new();
-            b.enforce_var_eq_const(b.one(), F257::ONE);
-
-            let xb = x.to_le_bytes();
-            let yb = y.to_le_bytes();
-            let x_bytes = [
-                alloc_byte::<F257>(&mut b, xb[0]).byte,
-                alloc_byte::<F257>(&mut b, xb[1]).byte,
-                alloc_byte::<F257>(&mut b, xb[2]).byte,
-                alloc_byte::<F257>(&mut b, xb[3]).byte,
-            ];
-            let y_bytes = [
-                alloc_byte::<F257>(&mut b, yb[0]).byte,
-                alloc_byte::<F257>(&mut b, yb[1]).byte,
-                alloc_byte::<F257>(&mut b, yb[2]).byte,
-                alloc_byte::<F257>(&mut b, yb[3]).byte,
-            ];
-
-            let x_cent = babybear_centered_from_u32_byte_vars_with_modulus(&mut b, x_bytes, p);
-            let y_digits = u32_bytes_to_bal16_digits(&mut b, y_bytes);
-
-            assert_eq!(x_cent.centered_bal16_digits.len(), 9);
-            assert_eq!(y_digits.len(), 9);
-
-            let prod_digits = mul_bal16_9_by_9_u32ish(&mut b, &x_cent.centered_bal16_digits, &y_digits);
-
-            let (inst, asg) = b.into_instance();
-            inst.check(&asg).expect("centered bb * u32 mul satisfiable");
-
-            // Decode product digits.
-            let mut acc: i128 = 0;
-            let mut pow: i128 = 1;
-            for &dv in &prod_digits {
-                acc += (f257_to_i32_bal(asg[dv]) as i128) * pow;
-                pow *= 16;
-            }
-            let x_centered: i128 = if x <= half { x as i128 } else { (x as i128) - (p as i128) };
-            let expected: i128 = x_centered * (y as i128);
-            assert_eq!(acc, expected);
-        }
     }
 
     #[test]
