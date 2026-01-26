@@ -1087,6 +1087,20 @@ fn ring_scale<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, s: usize) ->
     RingVars::new(out)
 }
 
+/// Scale a ring element by a **constant** scalar (no mul constraints).
+///
+/// This uses a single linear constraint per coefficient (`scalar_mul_const`), and is safe
+/// whenever the scalar is statement-bound (e.g. powers of `decomp_b`).
+#[inline]
+fn ring_scale_const<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, c: F) -> RingVars {
+    cm_bump(|cc| cc.ring_scale += 1);
+    let mut out = Vec::with_capacity(x.d());
+    for i in 0..x.d() {
+        out.push(scalar_mul_const::<F>(b, x.coeffs[i], c));
+    }
+    RingVars::new(out)
+}
+
 // -------------------------------------------------------------------------
 // Karatsuba optimization: avoid var-ifying pre-adds.
 //
@@ -1119,6 +1133,46 @@ fn lc_to_var_opt<F: PrimeField>(b: &mut Dr1csBuilder<F>, lc: Lc<F>) -> usize {
     } else {
         lc_to_var::<F>(b, lc)
     }
+}
+
+// -------------------------------------------------------------------------
+// Lazy ring accumulation using LCs (reduces linear constraints).
+//
+// Many CM math loops build ring sums via repeated `ring_add`, which materializes each intermediate
+// coefficient as a fresh var (1 linear constraint per coeff per add). Instead, we accumulate each
+// coefficient as a linear combination and only materialize once at the end.
+// -------------------------------------------------------------------------
+
+type RingLc<F> = Vec<Lc<F>>;
+
+#[inline]
+fn ring_lc_zero<F: PrimeField>(d: usize) -> RingLc<F> {
+    (0..d).map(|_| Vec::new()).collect()
+}
+
+#[inline]
+fn ring_lc_add_ringvars<F: PrimeField>(acc: &mut RingLc<F>, x: &RingVars, scale: F) {
+    debug_assert_eq!(acc.len(), x.d());
+    if scale.is_zero() {
+        return;
+    }
+    for i in 0..x.d() {
+        acc[i].push((scale, x.coeffs[i]));
+    }
+}
+
+#[inline]
+fn ring_lc_to_ringvars<F: PrimeField>(b: &mut Dr1csBuilder<F>, acc: RingLc<F>) -> RingVars {
+    let d = acc.len();
+    let mut out = Vec::with_capacity(d);
+    for lc in acc {
+        if lc.is_empty() {
+            out.push(const_var::<F>(b, F::ZERO));
+        } else {
+            out.push(lc_to_var_opt::<F>(b, lc));
+        }
+    }
+    RingVars::new(out)
 }
 
 #[inline]
@@ -1269,6 +1323,205 @@ fn ring_mul_negacyclic_naive<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVar
     RingVars::new(out)
 }
 
+// -------------------------------------------------------------------------
+// Toom-4 optimization (NTT-free) for d=64
+//
+// Karatsuba on length-64 costs 3^6 = 729 mul-constraints per ring-mul.
+// A Toom-4 split (n = 4*m) with 7 evaluation points gives ~7^3 = 343 mul-constraints.
+//
+// We implement a generic Toom-4 polynomial multiplication over LCs:
+// - evaluation/interpolation are pure linear combinations (no constraints)
+// - only the recursive pointwise multiplications introduce mul constraints.
+//
+// This is intended for FrogRing64-scale CM math where ring_mul dominates scalar_mul.
+// -------------------------------------------------------------------------
+
+#[inline]
+fn lc_add_scaled_into<F: PrimeField>(dst: &mut Lc<F>, scale: F, src: &Lc<F>) {
+    lc_extend_scaled(dst, scale, src);
+}
+
+fn invert_matrix_7<F: PrimeField>(mut a: [[F; 7]; 7]) -> [[F; 7]; 7] {
+    // Gauss–Jordan inversion over the field.
+    let mut inv = [[F::ZERO; 7]; 7];
+    for i in 0..7 {
+        inv[i][i] = F::ONE;
+    }
+
+    for col in 0..7 {
+        // Find a pivot (should exist for our Vandermonde points).
+        let mut piv = col;
+        while piv < 7 && a[piv][col].is_zero() {
+            piv += 1;
+        }
+        assert!(piv < 7, "invert_matrix_7: singular matrix");
+        if piv != col {
+            a.swap(piv, col);
+            inv.swap(piv, col);
+        }
+
+        let inv_piv = a[col][col].inverse().expect("invert_matrix_7: zero pivot");
+        for j in 0..7 {
+            a[col][j] *= inv_piv;
+            inv[col][j] *= inv_piv;
+        }
+
+        for r in 0..7 {
+            if r == col {
+                continue;
+            }
+            let f = a[r][col];
+            if f.is_zero() {
+                continue;
+            }
+            for j in 0..7 {
+                a[r][j] -= f * a[col][j];
+                inv[r][j] -= f * inv[col][j];
+            }
+        }
+    }
+    inv
+}
+
+fn toom4_vandermonde_inv<F: PrimeField>() -> ([[F; 7]; 7], [F; 7]) {
+    // Points for block-polynomial interpolation: degree <= 6
+    // Use small symmetric integers (avoid 1/2): 0, 1, -1, 2, -2, 3, -3.
+    let pts = [
+        F::from(0u64),
+        F::from(1u64),
+        -F::from(1u64),
+        F::from(2u64),
+        -F::from(2u64),
+        F::from(3u64),
+        -F::from(3u64),
+    ];
+    let mut v = [[F::ZERO; 7]; 7];
+    for (i, &t) in pts.iter().enumerate() {
+        let mut pow = F::ONE;
+        for j in 0..7 {
+            v[i][j] = pow;
+            pow *= t;
+        }
+    }
+    // We want coefficients c0..c6 from values at pts: c = V^{-1} * w
+    let inv = invert_matrix_7::<F>(v);
+    (inv, pts)
+}
+
+fn poly_mul_toom4_lc<F: PrimeField>(
+    b: &mut Dr1csBuilder<F>,
+    a: &[Lc<F>],
+    c: &[Lc<F>],
+    inv_v: &[[F; 7]; 7],
+    pts: &[F; 7],
+) -> Vec<Lc<F>> {
+    assert_eq!(a.len(), c.len());
+    let n = a.len();
+    assert!(n.is_power_of_two(), "toom4_lc requires pow2 length");
+    assert!(n > 0);
+    if n == 1 {
+        let prod = scalar_mul_lc::<F>(b, a[0].clone(), c[0].clone());
+        return vec![vec![(F::ONE, prod)]];
+    }
+    // Require a Toom-4 split.
+    assert!(n % 4 == 0, "toom4_lc requires n divisible by 4");
+    let m = n / 4;
+
+    let (a0, rest) = a.split_at(m);
+    let (a1, rest) = rest.split_at(m);
+    let (a2, a3) = rest.split_at(m);
+    let (c0, rest) = c.split_at(m);
+    let (c1, rest) = rest.split_at(m);
+    let (c2, c3) = rest.split_at(m);
+
+    // Evaluate at points: a(t) = a0 + t a1 + t^2 a2 + t^3 a3, coefficient-wise (each coeff is an LC).
+    let mut a_eval: Vec<Vec<Lc<F>>> = Vec::with_capacity(7);
+    let mut c_eval: Vec<Vec<Lc<F>>> = Vec::with_capacity(7);
+    for &t in pts {
+        let t2 = t * t;
+        let t3 = t2 * t;
+        let mut ae = Vec::with_capacity(m);
+        let mut ce = Vec::with_capacity(m);
+        for i in 0..m {
+            let mut lc_a = Vec::new();
+            lc_add_scaled_into::<F>(&mut lc_a, F::ONE, &a0[i]);
+            lc_add_scaled_into::<F>(&mut lc_a, t, &a1[i]);
+            lc_add_scaled_into::<F>(&mut lc_a, t2, &a2[i]);
+            lc_add_scaled_into::<F>(&mut lc_a, t3, &a3[i]);
+            ae.push(lc_a);
+
+            let mut lc_c = Vec::new();
+            lc_add_scaled_into::<F>(&mut lc_c, F::ONE, &c0[i]);
+            lc_add_scaled_into::<F>(&mut lc_c, t, &c1[i]);
+            lc_add_scaled_into::<F>(&mut lc_c, t2, &c2[i]);
+            lc_add_scaled_into::<F>(&mut lc_c, t3, &c3[i]);
+            ce.push(lc_c);
+        }
+        a_eval.push(ae);
+        c_eval.push(ce);
+    }
+
+    // Pointwise products (recursive): w(t) = a(t) * c(t), each is length (2m-1).
+    let mut w_eval: Vec<Vec<Lc<F>>> = Vec::with_capacity(7);
+    for i in 0..7 {
+        w_eval.push(poly_mul_toom4_lc::<F>(b, &a_eval[i], &c_eval[i], inv_v, pts));
+    }
+    debug_assert_eq!(w_eval[0].len(), 2 * m - 1);
+
+    // Interpolate coefficient blocks c_j (j=0..6), each length (2m-1).
+    let mut blocks: Vec<Vec<Lc<F>>> = (0..7).map(|_| vec![Vec::new(); 2 * m - 1]).collect();
+    for k in 0..(2 * m - 1) {
+        // w_k is values at points (length 7) for this coefficient position.
+        for j in 0..7 {
+            let mut lc: Lc<F> = Vec::new();
+            for i in 0..7 {
+                let coef = inv_v[j][i];
+                if coef.is_zero() {
+                    continue;
+                }
+                lc_add_scaled_into::<F>(&mut lc, coef, &w_eval[i][k]);
+            }
+            blocks[j][k] = lc;
+        }
+    }
+
+    // Assemble full convolution length 2n-1 = 8m-1 by shifting blocks by j*m.
+    let mut res: Vec<Lc<F>> = (0..(2 * n - 1)).map(|_| Vec::new()).collect();
+    for j in 0..7 {
+        let base = j * m;
+        for k in 0..(2 * m - 1) {
+            let idx = base + k;
+            lc_add_scaled_into::<F>(&mut res[idx], F::ONE, &blocks[j][k]);
+        }
+    }
+    res
+}
+
+fn ring_mul_negacyclic_toom4<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: &RingVars) -> RingVars {
+    // Toom-4 convolution (len 2d-1) then fold mod (X^d + 1): c[k] = p[k] - p[k+d].
+    let d = x.d();
+    assert_eq!(d, y.d());
+    assert!(d.is_power_of_two());
+    assert!(d % 4 == 0);
+
+    let (inv_v, pts) = toom4_vandermonde_inv::<F>();
+    let x_lc: Vec<Lc<F>> = x.coeffs.iter().map(|&v| vec![(F::ONE, v)]).collect();
+    let y_lc: Vec<Lc<F>> = y.coeffs.iter().map(|&v| vec![(F::ONE, v)]).collect();
+    let prod_lc = poly_mul_toom4_lc::<F>(b, &x_lc, &y_lc, &inv_v, &pts); // len 2d-1
+    debug_assert_eq!(prod_lc.len(), 2 * d - 1);
+    let mut out = Vec::with_capacity(d);
+    for k in 0..d {
+        let hi = k + d;
+        let mut lc = Vec::new();
+        lc_extend_scaled(&mut lc, F::ONE, &prod_lc[k]);
+        if hi < prod_lc.len() {
+            lc_extend_scaled(&mut lc, -F::ONE, &prod_lc[hi]);
+        }
+        out.push(lc_to_var_opt::<F>(b, lc));
+    }
+    RingVars::new(out)
+}
+
 fn ring_mul_negacyclic<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: &RingVars) -> RingVars {
     cm_bump(|c| c.ring_mul_negacyclic += 1);
     let d = x.d();
@@ -1276,6 +1529,10 @@ fn ring_mul_negacyclic<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: 
     // Karatsuba cuts mul count (64^2 -> 3^6 = 729) for d=64 and is algebraically identical.
     // Fall back to the signed schoolbook for non-pow2 dimensions.
     if d.is_power_of_two() && d > 1 {
+        // For d=64 (FrogRing64), Toom-4 beats Karatsuba without requiring NTT roots.
+        if d == 64 {
+            return ring_mul_negacyclic_toom4::<F>(b, x, y);
+        }
         return ring_mul_negacyclic_karatsuba::<F>(b, x, y);
     }
     ring_mul_negacyclic_naive::<F>(b, x, y)
@@ -2371,8 +2628,8 @@ where
     // SetChk recombination: enforce ver == v_sc and digest-absorb out.e/out.b.
     let rc_pow_base = rc_var.unwrap_or_else(|| const_var(&mut b, BF::<R>::ONE));
     let rc_pows = scalar_pow_table::<BF<R>>(&mut b, rc_pow_base, nclaims_setchk.saturating_sub(1));
-    let mut ver_scalar = const_var(&mut b, BF::<R>::ZERO);
-    b.enforce_var_eq_const(ver_scalar, BF::<R>::ZERO);
+    // Accumulate verifier scalar as an LC to avoid O(n) scalar_add constraints.
+    let mut ver_lc: Lc<BF<R>> = Vec::new();
 
     // CRITICAL (FS binding):
     // The transcript absorbs the Ajtai aggregate commitment for out.e/out.b (above),
@@ -2386,8 +2643,8 @@ where
         let alpha_pows =
             scalar_pow_table::<BF<R>>(&mut b, alpha, out_sc.e[0][i].len().saturating_sub(1));
 
-        let mut e_sum = const_var(&mut b, BF::<R>::ZERO);
-        b.enforce_var_eq_const(e_sum, BF::<R>::ZERO);
+        // e_sum = Σ term as a scalar LC (no scalar_add chain).
+        let mut e_sum_lc: Lc<BF<R>> = Vec::new();
         // Absorb all blocks e[blk][i][lane][j]
         for blk in 0..out_e_vars.len() {
             for lane in 0..out_e_vars[blk][i].len() {
@@ -2400,13 +2657,18 @@ where
                     let ev1_sq = scalar_mul::<BF<R>>(&mut b, ev1, ev1);
                     let diff = scalar_sub::<BF<R>>(&mut b, ev1_sq, ev2);
                     let term = scalar_mul::<BF<R>>(&mut b, diff, alpha_pows[lane]);
-                    e_sum = scalar_add::<BF<R>>(&mut b, e_sum, term);
+                    e_sum_lc.push((BF::<R>::ONE, term));
                 }
             }
         }
+        let e_sum = if e_sum_lc.is_empty() {
+            const_var(&mut b, BF::<R>::ZERO)
+        } else {
+            lc_to_var_opt::<BF<R>>(&mut b, e_sum_lc)
+        };
         let t = scalar_mul::<BF<R>>(&mut b, eq, e_sum);
         let t = scalar_mul::<BF<R>>(&mut b, t, rc_pows[i]);
-        ver_scalar = scalar_add::<BF<R>>(&mut b, ver_scalar, t);
+        ver_lc.push((BF::<R>::ONE, t));
     }
     for i in 0..out_sc.b.len() {
         let offset = out_sc.e[0].len();
@@ -2423,8 +2685,13 @@ where
         let t = scalar_mul::<BF<R>>(&mut b, eq, alpha);
         let t = scalar_mul::<BF<R>>(&mut b, t, b_claim);
         let t = scalar_mul::<BF<R>>(&mut b, t, rc_pows[idx]);
-        ver_scalar = scalar_add::<BF<R>>(&mut b, ver_scalar, t);
+        ver_lc.push((BF::<R>::ONE, t));
     }
+    let ver_scalar = if ver_lc.is_empty() {
+        const_var(&mut b, BF::<R>::ZERO)
+    } else {
+        lc_to_var_opt::<BF<R>>(&mut b, ver_lc)
+    };
     let ver_ring = scalar_var_to_ringvars::<R>(&mut b, ver_scalar);
     ring_eq::<BF<R>>(&mut b, &ver_ring, &v_sc);
 
@@ -2443,11 +2710,12 @@ where
         let L = dcom.evals.len();
         let k_rg = dcom.dparams.k;
         let decomp_b = dcom.dparams.b;
-        let mut dppow_vars: Vec<usize> = Vec::with_capacity(k_rg);
+        // Precompute powers of `decomp_b` as statement-bound constants (used in the rgchk checks).
+        let mut dppow_const: Vec<BF<R>> = Vec::with_capacity(k_rg);
         for i in 0..k_rg {
             let base = R::BaseRing::from(decomp_b);
             let p_br = ark_ff::Field::pow(&base, [i as u64]);
-            dppow_vars.push(const_var(&mut b, bf_from_base_ring::<R>(p_br)));
+            dppow_const.push(bf_from_base_ring::<R>(p_br));
         }
 
         let mut eval_a_vars: Vec<Vec<usize>> = Vec::with_capacity(L);
@@ -2503,12 +2771,13 @@ where
             let base = l * k_rg;
             for ni in 0..out_sc.e.len() {
                 for col in 0..d {
-                    let mut acc = ring_zero.clone();
+                    let mut acc_lc = ring_lc_zero::<BF<R>>(d);
                     for i in 0..k_rg {
                         let ui_col = &out_e_vars[ni][base + i][col];
-                        let scaled = ring_scale::<BF<R>>(&mut b, ui_col, dppow_vars[i]);
-                        acc = ring_add::<BF<R>>(&mut b, &acc, &scaled);
+                        let scaled = ring_scale_const::<BF<R>>(&mut b, ui_col, dppow_const[i]);
+                        ring_lc_add_ringvars::<BF<R>>(&mut acc_lc, &scaled, BF::<R>::ONE);
                     }
+                    let acc = ring_lc_to_ringvars::<BF<R>>(&mut b, acc_lc);
                     let ct = ct_psi_mul_ring::<R>(&mut b, &acc);
                     let expected = if ni == 0 {
                         *eval_v_vars[l]
@@ -2682,16 +2951,16 @@ where
             if out_e_vars[ni].len() < (l + 1) * k {
                 return Err("CmProof: dcom.out.e too short for L,k".to_string());
             }
-            let mut acc = scalar_to_ringvars::<R>(&mut b, BF::<R>::ZERO);
+            let mut acc_lc = ring_lc_zero::<BF<R>>(d);
             for blk in 0..k {
                 for col in 0..d {
                     let uij = &out_e_vars[ni][l * k + blk][col];
                     let sij = &short_wiring.s_prime_flat[blk * d + col];
                     let prod = ring_mul_negacyclic::<BF<R>>(&mut b, uij, sij);
-                    acc = ring_add::<BF<R>>(&mut b, &acc, &prod);
+                    ring_lc_add_ringvars::<BF<R>>(&mut acc_lc, &prod, BF::<R>::ONE);
                 }
             }
-            u_l.push(acc);
+            u_l.push(ring_lc_to_ringvars::<BF<R>>(&mut b, acc_lc));
         }
         u_vars.push(u_l);
     }
@@ -2706,18 +2975,18 @@ where
     let mut tcch0: Vec<RingVars> = Vec::with_capacity(l_instances);
     let mut tcch1: Vec<RingVars> = Vec::with_capacity(l_instances);
     for l in 0..l_instances {
-        let mut acc0 = scalar_to_ringvars::<R>(&mut b, BF::<R>::ZERO);
-        let mut acc1 = scalar_to_ringvars::<R>(&mut b, BF::<R>::ZERO);
+        let mut acc0_lc = ring_lc_zero::<BF<R>>(d);
+        let mut acc1_lc = ring_lc_zero::<BF<R>>(d);
         for j in 0..kappa {
             // tensor_c{0,1}[j] are BF scalars. Multiplying a ring element by a constant-coeff ring
             // is exactly per-coefficient scaling (avoid a full negacyclic multiply gadget).
             let s0 = ring_scale::<BF<R>>(&mut b, &comh_vars[l][j], tensor_c0[j]);
             let s1 = ring_scale::<BF<R>>(&mut b, &comh_vars[l][j], tensor_c1[j]);
-            acc0 = ring_add::<BF<R>>(&mut b, &acc0, &s0);
-            acc1 = ring_add::<BF<R>>(&mut b, &acc1, &s1);
+            ring_lc_add_ringvars::<BF<R>>(&mut acc0_lc, &s0, BF::<R>::ONE);
+            ring_lc_add_ringvars::<BF<R>>(&mut acc1_lc, &s1, BF::<R>::ONE);
         }
-        tcch0.push(acc0);
-        tcch1.push(acc1);
+        tcch0.push(ring_lc_to_ringvars::<BF<R>>(&mut b, acc0_lc));
+        tcch1.push(ring_lc_to_ringvars::<BF<R>>(&mut b, acc1_lc));
     }
 
     // --- Precompute constants for eval_t_z_optimized ---
@@ -2820,7 +3089,7 @@ where
         }
 
         let rc_pows = scalar_pow_table::<BF<R>>(b, rc, max_pow);
-        let mut claimed_sum = scalar_to_ringvars::<R>(b, BF::<R>::ZERO);
+        let mut claimed_sum_lc = ring_lc_zero::<BF<R>>(d);
 
         for (l, eval) in proof.dcom.evals.iter().enumerate() {
             let l_idx = l * (4 + 4 * mlen_chunks_usize);
@@ -2828,7 +3097,7 @@ where
             let a0 = b.new_var(bf_from_base_ring::<R>(eval.a[0]));
             let a0pow = scalar_mul::<BF<R>>(b, a0, rc_pows[l_idx]);
             let a0t = scalar_var_to_ringvars::<R>(b, a0pow);
-            claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &a0t);
+            ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &a0t, BF::<R>::ONE);
 
             // b/c are ring
             let b0 = ring_to_ringvars::<R>(b, &eval.b[0]);
@@ -2836,33 +3105,34 @@ where
             let t_b0 = ring_scale::<BF<R>>(b, &b0, rc_pows[l_idx + 1]);
             let t_c0 = ring_scale::<BF<R>>(b, &c0, rc_pows[l_idx + 2]);
             let t_u0 = ring_scale::<BF<R>>(b, &u_vars[l][0], rc_pows[l_idx + 3]);
-            claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_b0);
-            claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_c0);
-            claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_u0);
+            ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_b0, BF::<R>::ONE);
+            ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_c0, BF::<R>::ONE);
+            ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_u0, BF::<R>::ONE);
 
             for i in 0..mlen_chunks_usize {
                 let idx = l_idx + 4 + i * 4;
                 let ai = b.new_var(bf_from_base_ring::<R>(eval.a[1 + i]));
                 let aipow = scalar_mul::<BF<R>>(b, ai, rc_pows[idx]);
                 let ai_t = scalar_var_to_ringvars::<R>(b, aipow);
-                claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &ai_t);
+                ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &ai_t, BF::<R>::ONE);
 
                 let bi = ring_to_ringvars::<R>(b, &eval.b[1 + i]);
                 let ci = ring_to_ringvars::<R>(b, &eval.c[1 + i]);
                 let t_bi = ring_scale::<BF<R>>(b, &bi, rc_pows[idx + 1]);
-                claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_bi);
+                ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_bi, BF::<R>::ONE);
                 let t_ci = ring_scale::<BF<R>>(b, &ci, rc_pows[idx + 2]);
-                claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_ci);
+                ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_ci, BF::<R>::ONE);
                 let t_ui = ring_scale::<BF<R>>(b, &u_vars[l][1 + i], rc_pows[idx + 3]);
-                claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_ui);
+                ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_ui, BF::<R>::ONE);
             }
 
             let t_tcch0 = ring_scale::<BF<R>>(b, &tcch0[l], rc_pows[z_idx]);
-            claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_tcch0);
+            ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_tcch0, BF::<R>::ONE);
             let t_tcch1 = ring_scale::<BF<R>>(b, &tcch1[l], rc_pows[z_idx + 1]);
-            claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_tcch1);
+            ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_tcch1, BF::<R>::ONE);
         }
 
+        let claimed_sum = ring_lc_to_ringvars::<BF<R>>(b, claimed_sum_lc);
         let subclaim_eval = sumcheck_verify_degree2::<BF<R>>(b, claimed_sum, msgs, r_sc)?;
 
         // t(z) eval at ro (independent of l)
@@ -2885,50 +3155,52 @@ where
 
         // eq(r, ro) where r is the transcript-derived SetChk point
         let eq = eq_eval_vars::<BF<R>>(b, &r_point_vars, r_sc);
-        let mut eval_acc = scalar_to_ringvars::<R>(b, BF::<R>::ZERO);
+        let mut eval_acc_lc = ring_lc_zero::<BF<R>>(d);
 
         for l in 0..l_instances {
             let l_idx = l * (4 + 4 * mlen_chunks_usize);
-            let mut inner = scalar_to_ringvars::<R>(b, BF::<R>::ZERO);
+            let mut inner_lc = ring_lc_zero::<BF<R>>(d);
             // First group (tau,m_tau,f,h) is evals[l][0]
             let e00 = &evals[l][0][0];
             let e01 = &evals[l][0][1];
             let e02 = &evals[l][0][2];
             let e03 = &evals[l][0][3];
             let t_e00 = ring_scale::<BF<R>>(b, e00, rc_pows[l_idx]);
-            inner = ring_add::<BF<R>>(b, &inner, &t_e00);
+            ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_e00, BF::<R>::ONE);
             let t_e01 = ring_scale::<BF<R>>(b, e01, rc_pows[l_idx + 1]);
-            inner = ring_add::<BF<R>>(b, &inner, &t_e01);
+            ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_e01, BF::<R>::ONE);
             let t_e02 = ring_scale::<BF<R>>(b, e02, rc_pows[l_idx + 2]);
-            inner = ring_add::<BF<R>>(b, &inner, &t_e02);
+            ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_e02, BF::<R>::ONE);
             let t_e03 = ring_scale::<BF<R>>(b, e03, rc_pows[l_idx + 3]);
-            inner = ring_add::<BF<R>>(b, &inner, &t_e03);
+            ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_e03, BF::<R>::ONE);
             // M chunks
             for i in 0..mlen_chunks_usize {
                 let idx = l_idx + 4 + i * 4;
                 let Mi = &evals[l][1 + i];
                 let t_m0 = ring_scale::<BF<R>>(b, &Mi[0], rc_pows[idx]);
-                inner = ring_add::<BF<R>>(b, &inner, &t_m0);
+                ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_m0, BF::<R>::ONE);
                 let t_m1 = ring_scale::<BF<R>>(b, &Mi[1], rc_pows[idx + 1]);
-                inner = ring_add::<BF<R>>(b, &inner, &t_m1);
+                ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_m1, BF::<R>::ONE);
                 let t_m2 = ring_scale::<BF<R>>(b, &Mi[2], rc_pows[idx + 2]);
-                inner = ring_add::<BF<R>>(b, &inner, &t_m2);
+                ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_m2, BF::<R>::ONE);
                 let t_m3 = ring_scale::<BF<R>>(b, &Mi[3], rc_pows[idx + 3]);
-                inner = ring_add::<BF<R>>(b, &inner, &t_m3);
+                ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_m3, BF::<R>::ONE);
             }
             // eq * inner
+            let inner = ring_lc_to_ringvars::<BF<R>>(b, inner_lc);
             let eq_inner = ring_scale::<BF<R>>(b, &inner, eq);
-            eval_acc = ring_add::<BF<R>>(b, &eval_acc, &eq_inner);
+            ring_lc_add_ringvars::<BF<R>>(&mut eval_acc_lc, &eq_inner, BF::<R>::ONE);
 
             // Add t(z) terms (uses el[0][0])
             let t0e = ring_mul_negacyclic::<BF<R>>(b, &t0, e00);
             let t1e = ring_mul_negacyclic::<BF<R>>(b, &t1, e00);
             let t0e_s = ring_scale::<BF<R>>(b, &t0e, rc_pows[z_idx]);
-            eval_acc = ring_add::<BF<R>>(b, &eval_acc, &t0e_s);
+            ring_lc_add_ringvars::<BF<R>>(&mut eval_acc_lc, &t0e_s, BF::<R>::ONE);
             let t1e_s = ring_scale::<BF<R>>(b, &t1e, rc_pows[z_idx + 1]);
-            eval_acc = ring_add::<BF<R>>(b, &eval_acc, &t1e_s);
+            ring_lc_add_ringvars::<BF<R>>(&mut eval_acc_lc, &t1e_s, BF::<R>::ONE);
         }
 
+        let eval_acc = ring_lc_to_ringvars::<BF<R>>(b, eval_acc_lc);
         ring_eq::<BF<R>>(b, &subclaim_eval, &eval_acc);
 
         // After sumcheck verification, Cm verifier absorbs the per-instance eval tables.
