@@ -3552,9 +3552,15 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
                         .ok_or("tiny gate: pose_wiring.absorb_ranges oob")?;
                     // absorb_idx increments regardless of region.
                     absorb_idx += 1;
-                    // Only collect absorbs in the window (after last short squeeze, before first CM u32 squeeze).
+                    // Only collect absorbs in the window:
+                    // after the last short squeeze, and before the first CM u32 squeeze.
+                    //
+                    // Note: at an `Absorb` op, `squeeze_field_op_idx` is the count of *already seen*
+                    // `SqueezeField` ops. If the next squeeze is exactly `first_cm_u32_op`, then
+                    // `squeeze_field_op_idx == first_cm_u32_op` while we are still inside the
+                    // `absorb_comh` segment. Therefore we use `<=` here (not `<`).
                     let _ = v; // schedule-only
-                    if after_short && squeeze_field_op_idx < first_cm_u32_op {
+                    if after_short && squeeze_field_op_idx <= first_cm_u32_op {
                         comh_absorb_ranges.push((ab_start, ab_len));
                     }
                 }
