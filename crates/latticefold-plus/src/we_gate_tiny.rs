@@ -3609,12 +3609,74 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
     for &(si, ui) in pairs {
         let s = short_locals.get(&si).expect("short local present");
         let u = u32_locals.get(&ui).expect("u32 local present");
+
+        // Same “semantic live” hook as the u32 surfaces, but for u^2:
+        //   (coeff mod 257) * (u^2 mod 257) == (product mod 257).
+        let pow16_22: [F257; 22] = {
+            let mut p = [F257::ZERO; 22];
+            let mut cur = F257::ONE;
+            let sixteen = F257::from(16u64);
+            for i in 0..22 {
+                p[i] = cur;
+                cur *= sixteen;
+            }
+            p
+        };
+        let u_sq_res = {
+            debug_assert_eq!(u.bal16_sq_digits.len(), 18);
+            let mut acc = F257::ZERO;
+            for i in 0..18 {
+                acc += gb.assignment[u.bal16_sq_digits[i]] * pow16_22[i];
+            }
+            let v = gb.new_var(acc);
+            let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + 18);
+            lc.push((F257::ONE, v));
+            for i in 0..18 {
+                lc.push((-pow16_22[i], u.bal16_sq_digits[i]));
+            }
+            gb.enforce_lc_times_one_eq_const(lc);
+            v
+        };
+
         let products21 =
             scale_short_coeffs_by_digits18(&mut gb, &s.coeff_bal16_digits, &u.bal16_sq_digits);
         let products22 = products21
             .iter()
             .map(|p21| rebalance_prod21_to_prod22(&mut gb, p21))
             .collect::<Vec<_>>();
+
+        // Residue checks for each coefficient product (u^2).
+        debug_assert_eq!(products22.len(), ring_dim);
+        debug_assert_eq!(s.coeff_bal16_digits.len(), ring_dim);
+        for j in 0..ring_dim {
+            let c3 = &s.coeff_bal16_digits[j];
+            let coeff_val = gb.assignment[c3[0]]
+                + gb.assignment[c3[1]] * F257::from(16u64)
+                + gb.assignment[c3[2]] * F257::from(256u64);
+            let coeff_res = gb.new_var(coeff_val);
+            gb.enforce_lc_times_one_eq_const(vec![
+                (F257::ONE, coeff_res),
+                (-F257::ONE, c3[0]),
+                (-F257::from(16u64), c3[1]),
+                (-F257::from(256u64), c3[2]),
+            ]);
+
+            let p22 = &products22[j];
+            let mut prod_val = F257::ZERO;
+            for i in 0..22 {
+                prod_val += gb.assignment[p22[i]] * pow16_22[i];
+            }
+            let prod_res = gb.new_var(prod_val);
+            let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + 22);
+            lc.push((F257::ONE, prod_res));
+            for i in 0..22 {
+                lc.push((-pow16_22[i], p22[i]));
+            }
+            gb.enforce_lc_times_one_eq_const(lc);
+
+            gb.enforce_mul(coeff_res, u_sq_res, prod_res);
+        }
+
         let sum_digits = sum_product_digits_bal16_22(&mut gb, &products22, 24);
         surfaces_sq_local.push(CmDigitMulSqSurfaceWiring {
             short_block_idx: si,
