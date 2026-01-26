@@ -3377,6 +3377,7 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         Vec<BoundedU32ChallengeWiring>,
         Vec<CmDigitMulSurfaceWiring>,
         Vec<CmDigitMulSqSurfaceWiring>,
+        PoseidonDr1csWiring,
     ),
     String,
 > {
@@ -3388,6 +3389,7 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.short_squeeze_ops)?;
     let u32_ranges =
         squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.u32_squeeze_ops)?;
+
 
     // Build glue circuit (coins + mul surface).
     let mut gb = Dr1csBuilder::<F257>::new();
@@ -3663,7 +3665,7 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         })
         .collect::<Vec<_>>();
 
-    Ok((inst, asg, shorts_out, u32s_out, surfaces_out, surfaces_sq_out))
+    Ok((inst, asg, shorts_out, u32s_out, surfaces_out, surfaces_sq_out, pose_wiring))
 }
 /// Build the Poseidon transcript subrelation **over F257** from an op schedule.
 ///

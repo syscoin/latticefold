@@ -137,7 +137,7 @@ where
         .splice(0..0, prefix_u32_squeeze_ops.into_iter());
     wiring_abs.frog_squeeze_ops = Vec::new();
 
-    let (inst_pose, asg_pose, _shorts, _u32s, _surfaces_mul, _surfaces_sq) =
+    let (inst_pose, asg_pose, _shorts, _u32s, _surfaces_mul, _surfaces_sq, _pose_wiring) =
         tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
             None,
             &ops_f257,
@@ -5386,7 +5386,7 @@ mod tests {
         // Update pairs to point at the first CM u32 block.
         pairs[0].1 = prefix_cnt;
 
-        let (inst_pose, asg_pose, _shorts, _u32s, _surfaces_mul, _surfaces_sq) =
+        let (inst_pose, asg_pose, _shorts, _u32s, _surfaces_mul, _surfaces_sq, _pose_wiring) =
             tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
                 None,
                 &ops_f257,
@@ -5496,7 +5496,7 @@ mod tests {
             .splice(0..0, prefix_u32_squeeze_ops.into_iter());
         pairs[0].1 = prefix_cnt;
 
-        let (inst_pose, asg_pose, _shorts, _u32s, _surfaces_mul, _surfaces_sq) =
+        let (inst_pose, asg_pose, _shorts, _u32s, _surfaces_mul, _surfaces_sq, _pose_wiring) =
             tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
                 None,
                 &ops_f257,
