@@ -3552,6 +3552,78 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         }
     }
 
+    // Minimal “ConstCoeff0 consumption” hook:
+    // tie one centered BabyBear value times one u32 coin to digit-level multiplication.
+    //
+    // This is a small, shape-fixed step that starts exercising the ConstCoeff0-centered representation
+    // with the same balanced-base16 machinery we’ll use for real CM math.
+    if bb_centered_locals.is_empty() {
+        return Err("tiny gate: ConstCoeff0 enabled but no absorbed ring elements were detected".to_string());
+    }
+    if !u32_ranges.is_empty() {
+        // Use the very first u32 block in the wiring (includes any prefix `get_challenge` coins).
+        let u0 = u32_locals.get(&0).ok_or("tiny gate: expected u32_locals[0]")?;
+        let x0 = &bb_centered_locals[0];
+        debug_assert_eq!(x0.centered_bal16_digits.len(), 9);
+        debug_assert_eq!(u0.bal16_digits.len(), 9);
+
+        // Residues mod 257.
+        let mut pow16_18 = [F257::ZERO; 18];
+        let mut cur = F257::ONE;
+        let sixteen = F257::from(16u64);
+        for i in 0..18 {
+            pow16_18[i] = cur;
+            cur *= sixteen;
+        }
+        let x_res = {
+            let mut acc = F257::ZERO;
+            for i in 0..9 {
+                acc += gb.assignment[x0.centered_bal16_digits[i]] * pow16_18[i];
+            }
+            let v = gb.new_var(acc);
+            let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + 9);
+            lc.push((F257::ONE, v));
+            for i in 0..9 {
+                lc.push((-pow16_18[i], x0.centered_bal16_digits[i]));
+            }
+            gb.enforce_lc_times_one_eq_const(lc);
+            v
+        };
+        let u_res = {
+            let mut acc = F257::ZERO;
+            for i in 0..9 {
+                acc += gb.assignment[u0.bal16_digits[i]] * pow16_18[i];
+            }
+            let v = gb.new_var(acc);
+            let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + 9);
+            lc.push((F257::ONE, v));
+            for i in 0..9 {
+                lc.push((-pow16_18[i], u0.bal16_digits[i]));
+            }
+            gb.enforce_lc_times_one_eq_const(lc);
+            v
+        };
+
+        // Digit-level multiplication and residue check.
+        let prod_digits = mul_bal16_9_by_9_u32ish(&mut gb, &x0.centered_bal16_digits, &u0.bal16_digits);
+        let prod_res = {
+            let mut acc = F257::ZERO;
+            let take = core::cmp::min(18, prod_digits.len());
+            for i in 0..take {
+                acc += gb.assignment[prod_digits[i]] * pow16_18[i];
+            }
+            let v = gb.new_var(acc);
+            let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + take);
+            lc.push((F257::ONE, v));
+            for i in 0..take {
+                lc.push((-pow16_18[i], prod_digits[i]));
+            }
+            gb.enforce_lc_times_one_eq_const(lc);
+            v
+        };
+        gb.enforce_mul(x_res, u_res, prod_res);
+    }
+
     // Build requested digit-mul surfaces (u32).
     let mut surfaces_mul_local: Vec<CmDigitMulSurfaceWiring> = Vec::with_capacity(pairs.len());
     // Field-level accumulators for "sum across all requested surfaces, per ring coefficient".
