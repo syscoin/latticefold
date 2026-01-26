@@ -1133,11 +1133,20 @@ fn poly_mul_toom4_lc<F: PrimeField>(
     let (c1, rest) = rest.split_at(m);
     let (c2, c3) = rest.split_at(m);
 
-    // Evaluate at each point and recursively multiply.
+    // Evaluate at each point and recursively multiply, then interpolate directly into the output.
     //
-    // Performance: reuse `a_eval_buf/c_eval_buf` across points to avoid repeated heap churn.
-    let mut w_eval: Vec<Vec<Lc<F>>> = Vec::with_capacity(7);
+    // Performance:
+    // - reuse `a_eval_buf/c_eval_buf` across points (scratch),
+    // - avoid allocating/storing the full `w_eval[7][2m-1]` table by streaming interpolation.
     let (scratch_idx, mut a_eval_buf, mut c_eval_buf) = toom4_scratch_take::<F>(scratch, m);
+
+    // Column-sparsity of inv_v for our fixed points:
+    // - column 0 is only nonzero for rows {0,2,4,6}
+    // - columns 1..6 are nonzero for rows {1,2,3,4,5,6}
+    const JNZ0: [usize; 4] = [0, 2, 4, 6];
+    const JNZ1: [usize; 6] = [1, 2, 3, 4, 5, 6];
+
+    let mut res: Vec<Lc<F>> = (0..(2 * n - 1)).map(|_| Vec::new()).collect();
 
     for p in 0..7 {
         let t = pts[p];
@@ -1162,7 +1171,8 @@ fn poly_mul_toom4_lc<F: PrimeField>(
             lc_add_scaled_into::<F>(out_c, t2, &c2[i]);
             lc_add_scaled_into::<F>(out_c, t3, &c3[i]);
         }
-        w_eval.push(poly_mul_toom4_lc::<F>(
+
+        let w = poly_mul_toom4_lc::<F>(
             b,
             &a_eval_buf,
             &c_eval_buf,
@@ -1171,45 +1181,30 @@ fn poly_mul_toom4_lc<F: PrimeField>(
             pts2,
             pts3,
             scratch,
-        ));
+        );
+
+        // Interpolate this evaluation point into output:
+        // block[j][k] += inv_v[j][p] * w[k], and then block[j] shifts by j*m.
+        let rows: &[usize] = if p == 0 { &JNZ0 } else { &JNZ1 };
+        for k in 0..(2 * m - 1) {
+            let wk = &w[k];
+            let wk_len = wk.len();
+            for &j in rows {
+                let coef = inv_v[j][p];
+                // Safety: rows set matches known sparsity; still skip if coef==0 defensively.
+                if coef.is_zero() {
+                    continue;
+                }
+                let idx = j * m + k;
+                res[idx].reserve(wk_len);
+                lc_add_scaled_into::<F>(&mut res[idx], coef, wk);
+            }
+        }
     }
-    debug_assert_eq!(w_eval[0].len(), 2 * m - 1);
 
     // Return scratch buffers to the cache (keep capacities).
     toom4_scratch_put::<F>(scratch, scratch_idx, a_eval_buf, c_eval_buf);
 
-    // Interpolate and assemble directly into the full convolution (len 2n-1 = 8m-1),
-    // avoiding an intermediate `blocks[7][2m-1]` allocation.
-    //
-    // Performance:
-    // - Each output coefficient is written exactly once (unique `(j,k) -> idx`), so we can reserve
-    //   capacity up-front and avoid realloc during `lc_extend_scaled`.
-    // - `inv_v` has some structural zeros for these evaluation points; skip them without branching
-    //   by iterating over precomputed nonzero index sets.
-    const NZ0: [usize; 1] = [0];
-    const NZ1: [usize; 6] = [1, 2, 3, 4, 5, 6];
-    const NZ2: [usize; 7] = [0, 1, 2, 3, 4, 5, 6];
-    const NZ3: [usize; 6] = [1, 2, 3, 4, 5, 6];
-    const NZ4: [usize; 7] = [0, 1, 2, 3, 4, 5, 6];
-    const NZ5: [usize; 6] = [1, 2, 3, 4, 5, 6];
-    const NZ6: [usize; 7] = [0, 1, 2, 3, 4, 5, 6];
-    const NZ: [&[usize]; 7] = [&NZ0, &NZ1, &NZ2, &NZ3, &NZ4, &NZ5, &NZ6];
-    let mut res: Vec<Lc<F>> = (0..(2 * n - 1)).map(|_| Vec::new()).collect();
-    for k in 0..(2 * m - 1) {
-        for j in 0..7 {
-            let idx = j * m + k;
-            let dst = &mut res[idx];
-            // Reserve once: sum of input LC sizes for this interpolation row.
-            let mut cap = 0usize;
-            for &i in NZ[j] {
-                cap += w_eval[i][k].len();
-            }
-            dst.reserve(cap);
-            for &i in NZ[j] {
-                lc_add_scaled_into::<F>(dst, inv_v[j][i], &w_eval[i][k]);
-            }
-        }
-    }
     res
 }
 
