@@ -3538,6 +3538,8 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         // Residue checks for each coefficient product.
         debug_assert_eq!(products13.len(), ring_dim);
         debug_assert_eq!(s.coeff_bal16_digits.len(), ring_dim);
+        let mut sum_prod_res = gb.new_var(F257::ZERO);
+        gb.enforce_var_eq_const(sum_prod_res, F257::ZERO);
         for j in 0..ring_dim {
             let c3 = &s.coeff_bal16_digits[j];
             // coeff residue: c0 + 16*c1 + 256*c2
@@ -3567,9 +3569,45 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
 
             // coeff_res * u_res == prod_res  (in F257)
             gb.enforce_mul(coeff_res, u_res, prod_res);
+
+            // Accumulate Σ_j prod_res[j] (in F257) to later tie to the digit-level sum.
+            let next_sum = gb.new_var(gb.assignment[sum_prod_res] + gb.assignment[prod_res]);
+            gb.enforce_lc_times_one_eq_const(vec![
+                (F257::ONE, next_sum),
+                (-F257::ONE, sum_prod_res),
+                (-F257::ONE, prod_res),
+            ]);
+            sum_prod_res = next_sum;
         }
 
         let sum_digits = sum_product_digits_bal16(&mut gb, &products13, 16);
+        // Tie the digit-level accumulated sum to the field-level accumulated residue mod 257.
+        // sum_digits_res = Σ 16^i * sum_digits[i]
+        {
+            debug_assert_eq!(sum_digits.len(), 16);
+            let mut pow16_16 = [F257::ZERO; 16];
+            let mut cur = F257::ONE;
+            let sixteen = F257::from(16u64);
+            for i in 0..16 {
+                pow16_16[i] = cur;
+                cur *= sixteen;
+            }
+            let mut acc = F257::ZERO;
+            for i in 0..16 {
+                acc += gb.assignment[sum_digits[i]] * pow16_16[i];
+            }
+            let sum_digits_res = gb.new_var(acc);
+            let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + 16);
+            lc.push((F257::ONE, sum_digits_res));
+            for i in 0..16 {
+                lc.push((-pow16_16[i], sum_digits[i]));
+            }
+            gb.enforce_lc_times_one_eq_const(lc);
+            gb.enforce_lc_times_one_eq_const(vec![
+                (F257::ONE, sum_digits_res),
+                (-F257::ONE, sum_prod_res),
+            ]);
+        }
         surfaces_mul_local.push(CmDigitMulSurfaceWiring {
             short_block_idx: si,
             u32_idx: ui,
@@ -3648,6 +3686,8 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         // Residue checks for each coefficient product (u^2).
         debug_assert_eq!(products22.len(), ring_dim);
         debug_assert_eq!(s.coeff_bal16_digits.len(), ring_dim);
+        let mut sum_prod_res = gb.new_var(F257::ZERO);
+        gb.enforce_var_eq_const(sum_prod_res, F257::ZERO);
         for j in 0..ring_dim {
             let c3 = &s.coeff_bal16_digits[j];
             let coeff_val = gb.assignment[c3[0]]
@@ -3675,9 +3715,43 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
             gb.enforce_lc_times_one_eq_const(lc);
 
             gb.enforce_mul(coeff_res, u_sq_res, prod_res);
+
+            let next_sum = gb.new_var(gb.assignment[sum_prod_res] + gb.assignment[prod_res]);
+            gb.enforce_lc_times_one_eq_const(vec![
+                (F257::ONE, next_sum),
+                (-F257::ONE, sum_prod_res),
+                (-F257::ONE, prod_res),
+            ]);
+            sum_prod_res = next_sum;
         }
 
         let sum_digits = sum_product_digits_bal16_22(&mut gb, &products22, 24);
+        // Tie digit-level sum (len 24) to Σ prod_res[j] mod 257.
+        {
+            debug_assert_eq!(sum_digits.len(), 24);
+            let mut pow16_24 = [F257::ZERO; 24];
+            let mut cur = F257::ONE;
+            let sixteen = F257::from(16u64);
+            for i in 0..24 {
+                pow16_24[i] = cur;
+                cur *= sixteen;
+            }
+            let mut acc = F257::ZERO;
+            for i in 0..24 {
+                acc += gb.assignment[sum_digits[i]] * pow16_24[i];
+            }
+            let sum_digits_res = gb.new_var(acc);
+            let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + 24);
+            lc.push((F257::ONE, sum_digits_res));
+            for i in 0..24 {
+                lc.push((-pow16_24[i], sum_digits[i]));
+            }
+            gb.enforce_lc_times_one_eq_const(lc);
+            gb.enforce_lc_times_one_eq_const(vec![
+                (F257::ONE, sum_digits_res),
+                (-F257::ONE, sum_prod_res),
+            ]);
+        }
         surfaces_sq_local.push(CmDigitMulSqSurfaceWiring {
             short_block_idx: si,
             u32_idx: ui,
