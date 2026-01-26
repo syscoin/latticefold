@@ -3488,6 +3488,11 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
 
     // Build requested digit-mul surfaces (u32).
     let mut surfaces_mul_local: Vec<CmDigitMulSurfaceWiring> = Vec::with_capacity(pairs.len());
+    // Field-level accumulators for "sum across all requested surfaces, per ring coefficient".
+    // These will be tied to `sum_all_pairs_coeffwise` digit vectors after they are computed.
+    let zero_f = gb.new_var(F257::ZERO);
+    gb.enforce_var_eq_const(zero_f, F257::ZERO);
+    let mut sum_prod_res_coeff_total: Vec<usize> = vec![zero_f; ring_dim];
     for &(si, ui) in pairs {
         let s = short_locals.get(&si).expect("short local present");
         let u = u32_locals.get(&ui).expect("u32 local present");
@@ -3578,6 +3583,16 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
                 (-F257::ONE, prod_res),
             ]);
             sum_prod_res = next_sum;
+
+            // Accumulate per-coefficient totals across all requested surfaces.
+            let prev = sum_prod_res_coeff_total[j];
+            let next = gb.new_var(gb.assignment[prev] + gb.assignment[prod_res]);
+            gb.enforce_lc_times_one_eq_const(vec![
+                (F257::ONE, next),
+                (-F257::ONE, prev),
+                (-F257::ONE, prod_res),
+            ]);
+            sum_prod_res_coeff_total[j] = next;
         }
 
         let sum_digits = sum_product_digits_bal16(&mut gb, &products13, 16);
@@ -3637,6 +3652,36 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         ring_dim,
         16,
     );
+    // Tie per-coefficient digit sums to the accumulated field residues.
+    {
+        debug_assert_eq!(all_sum_coeffwise.len(), ring_dim);
+        let mut pow16_16 = [F257::ZERO; 16];
+        let mut cur = F257::ONE;
+        let sixteen = F257::from(16u64);
+        for i in 0..16 {
+            pow16_16[i] = cur;
+            cur *= sixteen;
+        }
+        for j in 0..ring_dim {
+            let digs = &all_sum_coeffwise[j];
+            debug_assert_eq!(digs.len(), 16);
+            let mut acc = F257::ZERO;
+            for i in 0..16 {
+                acc += gb.assignment[digs[i]] * pow16_16[i];
+            }
+            let res = gb.new_var(acc);
+            let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + 16);
+            lc.push((F257::ONE, res));
+            for i in 0..16 {
+                lc.push((-pow16_16[i], digs[i]));
+            }
+            gb.enforce_lc_times_one_eq_const(lc);
+            gb.enforce_lc_times_one_eq_const(vec![
+                (F257::ONE, res),
+                (-F257::ONE, sum_prod_res_coeff_total[j]),
+            ]);
+        }
+    }
     for s in &mut surfaces_mul_local {
         s.sum_all_pairs_digits = all_sum_digits.clone();
         s.sum_all_pairs_coeffwise = all_sum_coeffwise.clone();
@@ -3644,6 +3689,8 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
 
     // Build requested digit-mul surfaces (u32^2).
     let mut surfaces_sq_local: Vec<CmDigitMulSqSurfaceWiring> = Vec::with_capacity(pairs.len());
+    // Field-level accumulators for squared surfaces, per coefficient.
+    let mut sum_prod_res_coeff_total_sq: Vec<usize> = vec![zero_f; ring_dim];
     for &(si, ui) in pairs {
         let s = short_locals.get(&si).expect("short local present");
         let u = u32_locals.get(&ui).expect("u32 local present");
@@ -3723,6 +3770,16 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
                 (-F257::ONE, prod_res),
             ]);
             sum_prod_res = next_sum;
+
+            // Accumulate per-coefficient totals across all requested sq-surfaces.
+            let prev = sum_prod_res_coeff_total_sq[j];
+            let next = gb.new_var(gb.assignment[prev] + gb.assignment[prod_res]);
+            gb.enforce_lc_times_one_eq_const(vec![
+                (F257::ONE, next),
+                (-F257::ONE, prev),
+                (-F257::ONE, prod_res),
+            ]);
+            sum_prod_res_coeff_total_sq[j] = next;
         }
 
         let sum_digits = sum_product_digits_bal16_22(&mut gb, &products22, 24);
@@ -3781,6 +3838,36 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         ring_dim,
         24,
     );
+    // Tie per-coefficient squared digit sums to the accumulated field residues.
+    {
+        debug_assert_eq!(all_sq_sum_coeffwise.len(), ring_dim);
+        let mut pow16_24 = [F257::ZERO; 24];
+        let mut cur = F257::ONE;
+        let sixteen = F257::from(16u64);
+        for i in 0..24 {
+            pow16_24[i] = cur;
+            cur *= sixteen;
+        }
+        for j in 0..ring_dim {
+            let digs = &all_sq_sum_coeffwise[j];
+            debug_assert_eq!(digs.len(), 24);
+            let mut acc = F257::ZERO;
+            for i in 0..24 {
+                acc += gb.assignment[digs[i]] * pow16_24[i];
+            }
+            let res = gb.new_var(acc);
+            let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + 24);
+            lc.push((F257::ONE, res));
+            for i in 0..24 {
+                lc.push((-pow16_24[i], digs[i]));
+            }
+            gb.enforce_lc_times_one_eq_const(lc);
+            gb.enforce_lc_times_one_eq_const(vec![
+                (F257::ONE, res),
+                (-F257::ONE, sum_prod_res_coeff_total_sq[j]),
+            ]);
+        }
+    }
     for s in &mut surfaces_sq_local {
         s.sum_all_pairs_digits = all_sq_sum_digits.clone();
         s.sum_all_pairs_coeffwise = all_sq_sum_coeffwise.clone();
