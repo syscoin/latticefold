@@ -3521,41 +3521,41 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
                 "tiny gate: inferred coeff_bytes={coeff_bytes} < 4; cannot enforce BabyBear canonicality"
             ));
         }
-        {
-                for &(ab_start, ab_len) in &pose_wiring.absorb_ranges {
-                    if ab_len < reb || (ab_len % reb) != 0 {
-                        continue;
-                    }
-                    let n_blocks = ab_len / reb;
-                    for blk in 0..n_blocks {
-                        let blk_start = ab_start + blk * reb;
+        for &(ab_start, ab_len) in &pose_wiring.absorb_ranges {
+            if ab_len < reb || (ab_len % reb) != 0 {
+                continue;
+            }
+            let n_blocks = ab_len / reb;
+            for blk in 0..n_blocks {
+                let blk_start = ab_start + blk * reb;
 
-                        // Enforce coeff>=1 bytes are zero.
-                        for j in (blk_start + coeff_bytes)..(blk_start + reb) {
-                            let gv = pose_wiring.absorb_vars[j];
-                            let lv = copy_digit(&mut gb, &pose_asg, &mut local_map, gv);
-                            gb.enforce_var_eq_const(lv, F257::ZERO);
-                        }
-
-                        // BabyBear-canonical coeff0 (embedded in low 32 bits).
-                        for j in (blk_start + 4)..(blk_start + coeff_bytes) {
-                            let gv = pose_wiring.absorb_vars[j];
-                            let lv = copy_digit(&mut gb, &pose_asg, &mut local_map, gv);
-                            gb.enforce_var_eq_const(lv, F257::ZERO);
-                        }
-
-                        let mut bb = [0usize; 4];
-                        for i in 0..4 {
-                            let gv = pose_wiring.absorb_vars[blk_start + i];
-                            let lv = copy_digit(&mut gb, &pose_asg, &mut local_map, gv);
-                            // Range-check as byte.
-                            let _ = decompose_existing_byte_var_to_bits::<F257>(&mut gb, lv);
-                            bb[i] = lv;
-                        }
-                        let w = babybear_centered_from_u32_byte_vars_with_modulus(&mut gb, bb, BABYBEAR_P_U32);
-                        bb_centered_locals.push(w);
-                    }
+                // Enforce coeff>=1 bytes are zero.
+                for j in (blk_start + coeff_bytes)..(blk_start + reb) {
+                    let gv = pose_wiring.absorb_vars[j];
+                    let lv = copy_digit(&mut gb, &pose_asg, &mut local_map, gv);
+                    gb.enforce_var_eq_const(lv, F257::ZERO);
                 }
+
+                // BabyBear-canonical coeff0 (embedded in low 32 bits).
+                for j in (blk_start + 4)..(blk_start + coeff_bytes) {
+                    let gv = pose_wiring.absorb_vars[j];
+                    let lv = copy_digit(&mut gb, &pose_asg, &mut local_map, gv);
+                    gb.enforce_var_eq_const(lv, F257::ZERO);
+                }
+
+                let mut bb = [0usize; 4];
+                for i in 0..4 {
+                    let gv = pose_wiring.absorb_vars[blk_start + i];
+                    let lv = copy_digit(&mut gb, &pose_asg, &mut local_map, gv);
+                    // Range-check as byte.
+                    let _ = decompose_existing_byte_var_to_bits::<F257>(&mut gb, lv);
+                    bb[i] = lv;
+                }
+                let w =
+                    babybear_centered_from_u32_byte_vars_with_modulus(&mut gb, bb, BABYBEAR_P_U32);
+                bb_centered_locals.push(w);
+            }
+        }
     }
 
     // Build requested digit-mul surfaces (u32).
