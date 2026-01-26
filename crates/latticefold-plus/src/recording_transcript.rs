@@ -146,7 +146,10 @@ where
     #[inline]
     fn lift_f257_to_base_ring(x: &F257) -> R::BaseRing {
         // F257 elements are always in 0..=256; lift that integer into the transcript's base ring.
-        let d = x.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u64;
+        let bytes = x.into_bigint().to_bytes_le();
+        let lo = bytes.get(0).copied().unwrap_or(0) as u16;
+        let hi = bytes.get(1).copied().unwrap_or(0) as u16;
+        let d = (lo | (hi << 8)) as u64;
         debug_assert!(d < 257u64);
         R::BaseRing::from(d)
     }
