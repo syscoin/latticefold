@@ -804,6 +804,46 @@ fn lc_to_var_opt<F: PrimeField>(b: &mut Dr1csBuilder<F>, lc: Lc<F>) -> usize {
     }
 }
 
+// -------------------------------------------------------------------------
+// Lazy ring accumulation using LCs (reduces linear constraints).
+//
+// Many CM math loops build ring sums via repeated `ring_add`, which materializes each intermediate
+// coefficient as a fresh var (1 linear constraint per coeff per add). Instead, we accumulate each
+// coefficient as a linear combination and only materialize once at the end.
+// -------------------------------------------------------------------------
+
+type RingLc<F> = Vec<Lc<F>>;
+
+#[inline]
+fn ring_lc_zero<F: PrimeField>(d: usize) -> RingLc<F> {
+    (0..d).map(|_| Vec::new()).collect()
+}
+
+#[inline]
+fn ring_lc_add_ringvars<F: PrimeField>(acc: &mut RingLc<F>, x: &RingVars, scale: F) {
+    debug_assert_eq!(acc.len(), x.d());
+    if scale.is_zero() {
+        return;
+    }
+    for i in 0..x.d() {
+        acc[i].push((scale, x.coeffs[i]));
+    }
+}
+
+#[inline]
+fn ring_lc_to_ringvars<F: PrimeField>(b: &mut Dr1csBuilder<F>, acc: RingLc<F>) -> RingVars {
+    let d = acc.len();
+    let mut out = Vec::with_capacity(d);
+    for lc in acc {
+        if lc.is_empty() {
+            out.push(const_var::<F>(b, F::ZERO));
+        } else {
+            out.push(lc_to_var_opt::<F>(b, lc));
+        }
+    }
+    RingVars::new(out)
+}
+
 #[inline]
 fn scalar_mul_lc<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: Lc<F>, c: Lc<F>) -> usize {
     cm_bump(|cc| cc.scalar_mul += 1);
@@ -2150,12 +2190,13 @@ where
             let base = l * k_rg;
             for ni in 0..out_sc.e.len() {
                 for col in 0..d {
-                    let mut acc = ring_zero.clone();
+                    let mut acc_lc = ring_lc_zero::<BF<R>>(d);
                     for i in 0..k_rg {
                         let ui_col = &out_e_vars[ni][base + i][col];
                         let scaled = ring_scale_const::<BF<R>>(&mut b, ui_col, dppow_const[i]);
-                        acc = ring_add::<BF<R>>(&mut b, &acc, &scaled);
+                        ring_lc_add_ringvars::<BF<R>>(&mut acc_lc, &scaled, BF::<R>::ONE);
                     }
+                    let acc = ring_lc_to_ringvars::<BF<R>>(&mut b, acc_lc);
                     let ct = ct_psi_mul_ring::<R>(&mut b, &acc);
                     let expected = if ni == 0 {
                         *eval_v_vars[l]
@@ -2330,16 +2371,16 @@ where
             if out_e_vars[ni].len() < (l + 1) * k {
                 return Err("CmProof: dcom.out.e too short for L,k".to_string());
             }
-            let mut acc = scalar_to_ringvars::<R>(&mut b, BF::<R>::ZERO);
+            let mut acc_lc = ring_lc_zero::<BF<R>>(d);
             for blk in 0..k {
                 for col in 0..d {
                     let uij = &out_e_vars[ni][l * k + blk][col];
                     let sij = &short_wiring.s_prime_flat[blk * d + col];
                     let prod = ring_mul_negacyclic::<BF<R>>(&mut b, uij, sij);
-                    acc = ring_add::<BF<R>>(&mut b, &acc, &prod);
+                    ring_lc_add_ringvars::<BF<R>>(&mut acc_lc, &prod, BF::<R>::ONE);
                 }
             }
-            u_l.push(acc);
+            u_l.push(ring_lc_to_ringvars::<BF<R>>(&mut b, acc_lc));
         }
         u_vars.push(u_l);
     }
@@ -2354,18 +2395,18 @@ where
     let mut tcch0: Vec<RingVars> = Vec::with_capacity(l_instances);
     let mut tcch1: Vec<RingVars> = Vec::with_capacity(l_instances);
     for l in 0..l_instances {
-        let mut acc0 = scalar_to_ringvars::<R>(&mut b, BF::<R>::ZERO);
-        let mut acc1 = scalar_to_ringvars::<R>(&mut b, BF::<R>::ZERO);
+        let mut acc0_lc = ring_lc_zero::<BF<R>>(d);
+        let mut acc1_lc = ring_lc_zero::<BF<R>>(d);
         for j in 0..kappa {
             // tensor_c{0,1}[j] are BF scalars. Multiplying a ring element by a constant-coeff ring
             // is exactly per-coefficient scaling (avoid a full negacyclic multiply gadget).
             let s0 = ring_scale::<BF<R>>(&mut b, &comh_vars[l][j], tensor_c0[j]);
             let s1 = ring_scale::<BF<R>>(&mut b, &comh_vars[l][j], tensor_c1[j]);
-            acc0 = ring_add::<BF<R>>(&mut b, &acc0, &s0);
-            acc1 = ring_add::<BF<R>>(&mut b, &acc1, &s1);
+            ring_lc_add_ringvars::<BF<R>>(&mut acc0_lc, &s0, BF::<R>::ONE);
+            ring_lc_add_ringvars::<BF<R>>(&mut acc1_lc, &s1, BF::<R>::ONE);
         }
-        tcch0.push(acc0);
-        tcch1.push(acc1);
+        tcch0.push(ring_lc_to_ringvars::<BF<R>>(&mut b, acc0_lc));
+        tcch1.push(ring_lc_to_ringvars::<BF<R>>(&mut b, acc1_lc));
     }
 
     // --- Precompute constants for eval_t_z_optimized ---
@@ -2468,7 +2509,7 @@ where
         }
 
         let rc_pows = scalar_pow_table::<BF<R>>(b, rc, max_pow);
-        let mut claimed_sum = scalar_to_ringvars::<R>(b, BF::<R>::ZERO);
+        let mut claimed_sum_lc = ring_lc_zero::<BF<R>>(d);
 
         for (l, eval) in proof.dcom.evals.iter().enumerate() {
             let l_idx = l * (4 + 4 * mlen_chunks_usize);
@@ -2476,7 +2517,7 @@ where
             let a0 = b.new_var(bf_from_base_ring::<R>(eval.a[0]));
             let a0pow = scalar_mul::<BF<R>>(b, a0, rc_pows[l_idx]);
             let a0t = scalar_var_to_ringvars::<R>(b, a0pow);
-            claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &a0t);
+            ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &a0t, BF::<R>::ONE);
 
             // b/c are ring
             let b0 = ring_to_ringvars::<R>(b, &eval.b[0]);
@@ -2484,33 +2525,34 @@ where
             let t_b0 = ring_scale::<BF<R>>(b, &b0, rc_pows[l_idx + 1]);
             let t_c0 = ring_scale::<BF<R>>(b, &c0, rc_pows[l_idx + 2]);
             let t_u0 = ring_scale::<BF<R>>(b, &u_vars[l][0], rc_pows[l_idx + 3]);
-            claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_b0);
-            claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_c0);
-            claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_u0);
+            ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_b0, BF::<R>::ONE);
+            ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_c0, BF::<R>::ONE);
+            ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_u0, BF::<R>::ONE);
 
             for i in 0..mlen_chunks_usize {
                 let idx = l_idx + 4 + i * 4;
                 let ai = b.new_var(bf_from_base_ring::<R>(eval.a[1 + i]));
                 let aipow = scalar_mul::<BF<R>>(b, ai, rc_pows[idx]);
                 let ai_t = scalar_var_to_ringvars::<R>(b, aipow);
-                claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &ai_t);
+                ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &ai_t, BF::<R>::ONE);
 
                 let bi = ring_to_ringvars::<R>(b, &eval.b[1 + i]);
                 let ci = ring_to_ringvars::<R>(b, &eval.c[1 + i]);
                 let t_bi = ring_scale::<BF<R>>(b, &bi, rc_pows[idx + 1]);
-                claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_bi);
+                ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_bi, BF::<R>::ONE);
                 let t_ci = ring_scale::<BF<R>>(b, &ci, rc_pows[idx + 2]);
-                claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_ci);
+                ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_ci, BF::<R>::ONE);
                 let t_ui = ring_scale::<BF<R>>(b, &u_vars[l][1 + i], rc_pows[idx + 3]);
-                claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_ui);
+                ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_ui, BF::<R>::ONE);
             }
 
             let t_tcch0 = ring_scale::<BF<R>>(b, &tcch0[l], rc_pows[z_idx]);
-            claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_tcch0);
+            ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_tcch0, BF::<R>::ONE);
             let t_tcch1 = ring_scale::<BF<R>>(b, &tcch1[l], rc_pows[z_idx + 1]);
-            claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_tcch1);
+            ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_tcch1, BF::<R>::ONE);
         }
 
+        let claimed_sum = ring_lc_to_ringvars::<BF<R>>(b, claimed_sum_lc);
         let subclaim_eval = sumcheck_verify_degree2::<BF<R>>(b, claimed_sum, msgs, r_sc)?;
 
         // t(z) eval at ro (independent of l)
@@ -2533,50 +2575,52 @@ where
 
         // eq(r, ro) where r is the transcript-derived SetChk point
         let eq = eq_eval_vars::<BF<R>>(b, &r_point_vars, r_sc);
-        let mut eval_acc = scalar_to_ringvars::<R>(b, BF::<R>::ZERO);
+        let mut eval_acc_lc = ring_lc_zero::<BF<R>>(d);
 
         for l in 0..l_instances {
             let l_idx = l * (4 + 4 * mlen_chunks_usize);
-            let mut inner = scalar_to_ringvars::<R>(b, BF::<R>::ZERO);
+            let mut inner_lc = ring_lc_zero::<BF<R>>(d);
             // First group (tau,m_tau,f,h) is evals[l][0]
             let e00 = &evals[l][0][0];
             let e01 = &evals[l][0][1];
             let e02 = &evals[l][0][2];
             let e03 = &evals[l][0][3];
             let t_e00 = ring_scale::<BF<R>>(b, e00, rc_pows[l_idx]);
-            inner = ring_add::<BF<R>>(b, &inner, &t_e00);
+            ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_e00, BF::<R>::ONE);
             let t_e01 = ring_scale::<BF<R>>(b, e01, rc_pows[l_idx + 1]);
-            inner = ring_add::<BF<R>>(b, &inner, &t_e01);
+            ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_e01, BF::<R>::ONE);
             let t_e02 = ring_scale::<BF<R>>(b, e02, rc_pows[l_idx + 2]);
-            inner = ring_add::<BF<R>>(b, &inner, &t_e02);
+            ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_e02, BF::<R>::ONE);
             let t_e03 = ring_scale::<BF<R>>(b, e03, rc_pows[l_idx + 3]);
-            inner = ring_add::<BF<R>>(b, &inner, &t_e03);
+            ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_e03, BF::<R>::ONE);
             // M chunks
             for i in 0..mlen_chunks_usize {
                 let idx = l_idx + 4 + i * 4;
                 let Mi = &evals[l][1 + i];
                 let t_m0 = ring_scale::<BF<R>>(b, &Mi[0], rc_pows[idx]);
-                inner = ring_add::<BF<R>>(b, &inner, &t_m0);
+                ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_m0, BF::<R>::ONE);
                 let t_m1 = ring_scale::<BF<R>>(b, &Mi[1], rc_pows[idx + 1]);
-                inner = ring_add::<BF<R>>(b, &inner, &t_m1);
+                ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_m1, BF::<R>::ONE);
                 let t_m2 = ring_scale::<BF<R>>(b, &Mi[2], rc_pows[idx + 2]);
-                inner = ring_add::<BF<R>>(b, &inner, &t_m2);
+                ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_m2, BF::<R>::ONE);
                 let t_m3 = ring_scale::<BF<R>>(b, &Mi[3], rc_pows[idx + 3]);
-                inner = ring_add::<BF<R>>(b, &inner, &t_m3);
+                ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_m3, BF::<R>::ONE);
             }
             // eq * inner
+            let inner = ring_lc_to_ringvars::<BF<R>>(b, inner_lc);
             let eq_inner = ring_scale::<BF<R>>(b, &inner, eq);
-            eval_acc = ring_add::<BF<R>>(b, &eval_acc, &eq_inner);
+            ring_lc_add_ringvars::<BF<R>>(&mut eval_acc_lc, &eq_inner, BF::<R>::ONE);
 
             // Add t(z) terms (uses el[0][0])
             let t0e = ring_mul_negacyclic::<BF<R>>(b, &t0, e00);
             let t1e = ring_mul_negacyclic::<BF<R>>(b, &t1, e00);
             let t0e_s = ring_scale::<BF<R>>(b, &t0e, rc_pows[z_idx]);
-            eval_acc = ring_add::<BF<R>>(b, &eval_acc, &t0e_s);
+            ring_lc_add_ringvars::<BF<R>>(&mut eval_acc_lc, &t0e_s, BF::<R>::ONE);
             let t1e_s = ring_scale::<BF<R>>(b, &t1e, rc_pows[z_idx + 1]);
-            eval_acc = ring_add::<BF<R>>(b, &eval_acc, &t1e_s);
+            ring_lc_add_ringvars::<BF<R>>(&mut eval_acc_lc, &t1e_s, BF::<R>::ONE);
         }
 
+        let eval_acc = ring_lc_to_ringvars::<BF<R>>(b, eval_acc_lc);
         ring_eq::<BF<R>>(b, &subclaim_eval, &eval_acc);
 
         // After sumcheck verification, Cm verifier absorbs the per-instance eval tables.
