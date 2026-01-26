@@ -3483,6 +3483,98 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         );
     }
 
+    // --------------------------------------------------------------------
+    // CM math port (stage 0): decode `absorb_comh` ring elements as coefficient bytes and
+    // canonicalize each coefficient as a 64-bit field element mod `FROG_P`.
+    //
+    // This does NOT implement CM verifier arithmetic yet; it just makes the committed ring
+    // elements *available* in a structured, range-checked form for downstream gadgets.
+    // --------------------------------------------------------------------
+    //
+    // Transcript convention (LF+): ring elements are absorbed as fixed-width LE bytes per coeff,
+    // concatenated in coefficient order. For the Frog 64-bit base field, coeff_bytes = 8.
+    //
+    // We locate the `absorb_comh` window purely from the transcript schedule:
+    // - after the last short-challenge SqueezeField(len=ring_dim)
+    // - before the first CM u32 `get_challenge` squeeze (c0[0])
+    if ring_dim > 0 && !wiring.short_squeeze_ops.is_empty() && !wiring.u32_squeeze_ops.is_empty() {
+        const COEFF_BYTES: usize = 8; // 64-bit base field element encoding
+        let reb = ring_dim * COEFF_BYTES;
+
+        let last_short_op = *wiring
+            .short_squeeze_ops
+            .iter()
+            .max()
+            .expect("non-empty short_squeeze_ops");
+        let first_short_op = *wiring
+            .short_squeeze_ops
+            .iter()
+            .min()
+            .expect("non-empty short_squeeze_ops");
+
+        // Prefix u32 squeezes happen before the first short squeeze; skip them.
+        let cm_u32_start = wiring
+            .u32_squeeze_ops
+            .iter()
+            .filter(|&&idx| idx < first_short_op)
+            .count();
+        if cm_u32_start < wiring.u32_squeeze_ops.len() {
+            let first_cm_u32_op = wiring.u32_squeeze_ops[cm_u32_start];
+
+            // Collect Absorb ranges in the absorb_comh window.
+            let mut absorb_idx = 0usize;
+            let mut squeeze_field_op_idx = 0usize;
+            let mut after_short = false;
+            let mut comh_absorb_ranges: Vec<(usize, usize)> = Vec::new();
+            for op in ops {
+                match op {
+                    PoseidonTraceOp::Absorb(_v) => {
+                        let (ab_start, ab_len) = *pose_wiring
+                            .absorb_ranges
+                            .get(absorb_idx)
+                            .ok_or("tiny gate: pose_wiring.absorb_ranges oob")?;
+                        absorb_idx += 1;
+                        if after_short && squeeze_field_op_idx <= first_cm_u32_op {
+                            comh_absorb_ranges.push((ab_start, ab_len));
+                        }
+                    }
+                    PoseidonTraceOp::SqueezeField(_v) => {
+                        if squeeze_field_op_idx == last_short_op {
+                            after_short = true;
+                        }
+                        squeeze_field_op_idx += 1;
+                    }
+                    PoseidonTraceOp::SqueezeBytes { .. } => {}
+                }
+            }
+
+            // Decode each absorbed ring element (possibly multiple per Absorb op).
+            // We do not assume any const-coeff shape: all coefficients are decoded.
+            let mut _comh_coeff_limbs: Vec<[usize; LIMBS_U64]> = Vec::new();
+            for &(ab_start, ab_len) in &comh_absorb_ranges {
+                if ab_len < reb || (ab_len % reb) != 0 {
+                    continue;
+                }
+                let n_blocks = ab_len / reb;
+                for blk in 0..n_blocks {
+                    let blk_start = ab_start + blk * reb;
+                    for coeff in 0..ring_dim {
+                        let off = blk_start + coeff * COEFF_BYTES;
+                        let mut bytes8 = [0usize; 8];
+                        for j in 0..8 {
+                            let gv = pose_wiring.absorb_vars[off + j];
+                            let lv = copy_digit(&mut gb, &pose_asg, &mut local_map, gv);
+                            // Range-check as byte (8-bit).
+                            let _ = decompose_existing_byte_var_to_bits::<F257>(&mut gb, lv);
+                            bytes8[j] = lv;
+                        }
+                        let (_q, z) = reduce_u64_mod_frog_from_byte_vars::<F257>(&mut gb, &bytes8);
+                        _comh_coeff_limbs.push(z);
+                    }
+                }
+            }
+        }
+    }
 
     // Build requested digit-mul surfaces (u32).
     let mut surfaces_mul_local: Vec<CmDigitMulSurfaceWiring> = Vec::with_capacity(pairs.len());
