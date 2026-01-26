@@ -11,6 +11,7 @@ use stark_rings::{psi, unit_monomial, CoeffRing, OverField, PolyRing, Zq};
 use crate::recording_transcript::{PoseidonTraceOp as LfPoseidonTraceOp, PoseidonTranscriptTrace};
 use crate::we_gate_tiny as tiny;
 use crate::we_statement::WeParams;
+use crate::transcript::DEFAULT_REJECTION_TRIES;
 
 // Reuse symphony’s sparse dR1CS primitives and Poseidon arithmetizer.
 use symphony::dpp_poseidon::{
@@ -3456,11 +3457,14 @@ fn eq_eval_vars<F: PrimeField>(b: &mut Dr1csBuilder<F>, c: &[usize], r: &[usize]
 }
 
 struct ChallengeCursor<F: PrimeField> {
-    /// Base-257 digit stream: concatenation of all `SqueezeField(len=CHALLENGE_DIGITS)` ops.
-    digits: Vec<F>,
-    /// Index into `digits` (number of digits consumed).
-    idx: usize,
-    /// All allocated digit vars, in order (for gluing to Poseidon squeeze-field vars).
+    /// Candidate digit blocks: one entry per `SqueezeField(len=CHALLENGE_DIGITS)` op.
+    ///
+    /// Under fixed-tries rejection, each logical `get_challenge()` contributes
+    /// `DEFAULT_REJECTION_TRIES` such blocks.
+    blocks: Vec<Vec<F>>,
+    /// Index into `blocks` (number of blocks consumed).
+    blk_idx: usize,
+    /// All allocated digit vars (flattened), in order (for gluing to Poseidon squeeze-field vars).
     digit_vars: Vec<usize>,
 }
 
@@ -3468,47 +3472,190 @@ impl<F: PrimeField> ChallengeCursor<F> {
     /// Cursor over the `get_challenge()` stream induced by a Poseidon transcript trace.
     ///
     /// We treat each `SqueezeField(len=CHALLENGE_DIGITS)` op as one `get_challenge()` call returning
-    /// a base-field scalar derived from base-257 digits. This keeps a fixed schedule (no rejection)
-    /// and allows gluing the exact digit vars to the Poseidon wiring.
+    /// a base-field scalar derived from base-257 digits.
+    ///
+    /// IMPORTANT: with LF+ fixed-tries rejection sampling, each logical `get_challenge()` is
+    /// represented by `DEFAULT_REJECTION_TRIES` consecutive `SqueezeField(len=CHALLENGE_DIGITS)` ops
+    /// (each followed by `Absorb(len=CHALLENGE_DIGITS)` in the trace). We group those blocks and
+    /// select the first acceptable candidate inside the circuit.
     fn new(trace: &PoseidonTranscriptTrace<F>) -> Self {
-        let mut digits = Vec::new();
+        let mut blocks: Vec<Vec<F>> = Vec::new();
         for op in &trace.ops {
             if let crate::recording_transcript::PoseidonTraceOp::SqueezeField(v) = op {
                 if v.len() == CHALLENGE_DIGITS {
-                    digits.extend_from_slice(v);
+                    blocks.push(v.clone());
                 }
             }
         }
         Self {
-            digits,
-            idx: 0,
+            blocks,
+            blk_idx: 0,
             digit_vars: Vec::new(),
         }
     }
 
     fn next(&mut self, b: &mut Dr1csBuilder<F>) -> usize {
-        let slice = self
-            .digits
-            .get(self.idx..self.idx + CHALLENGE_DIGITS)
-            .unwrap_or_else(|| panic!("challenge cursor oob at digit {}", self.idx));
-        self.idx += CHALLENGE_DIGITS;
-        let mut local_digits = [0usize; CHALLENGE_DIGITS];
-        for (i, &dv) in slice.iter().enumerate() {
-            let v = b.new_var(dv);
-            self.digit_vars.push(v);
-            local_digits[i] = v;
+        let tries = DEFAULT_REJECTION_TRIES;
+        let chunk = self
+            .blocks
+            .get(self.blk_idx..self.blk_idx + tries)
+            .unwrap_or_else(|| panic!("challenge cursor oob at block {}", self.blk_idx));
+        self.blk_idx += tries;
+
+        // Allocate digit vars for all tries (so we can glue them to Poseidon wiring).
+        let mut digit_vars_all: Vec<usize> = Vec::with_capacity(tries * CHALLENGE_DIGITS);
+        for blk in chunk {
+            debug_assert_eq!(blk.len(), CHALLENGE_DIGITS);
+            for &d in blk {
+                let v = b.new_var(d);
+                self.digit_vars.push(v);
+                digit_vars_all.push(v);
+            }
         }
-        combine_base257_digits::<F>(b, &local_digits)
+        combine_base257_digits_fixed_tries::<F>(b, &digit_vars_all, tries)
     }
 
     #[allow(dead_code)]
     fn consumed(&self) -> usize {
-        self.idx / CHALLENGE_DIGITS
+        self.blk_idx / DEFAULT_REJECTION_TRIES
     }
 
     fn all_vars(&self) -> &[usize] {
         &self.digit_vars
     }
+}
+
+/// Reconstruct a bounded scalar challenge from **fixed-tries** base-257 digit candidates.
+///
+/// Input is `tries * CHALLENGE_DIGITS` digit vars, ordered by try then digit index.
+/// Semantics match `recording_transcript::TracePoseidonTranscript::get_challenge`:
+/// select the first try whose first 4 digits are all != 256, then pack those 4 digits (byte view)
+/// into a u32 (little-endian) represented in the field.
+fn combine_base257_digits_fixed_tries<F: PrimeField>(
+    b: &mut Dr1csBuilder<F>,
+    digits_all: &[usize],
+    tries: usize,
+) -> usize {
+    assert_eq!(digits_all.len(), tries * CHALLENGE_DIGITS);
+    let c256 = F::from(256u64);
+
+    // Returns (byte, is_eq256_bit).
+    let digit_to_byte_and_eq256 = |b: &mut Dr1csBuilder<F>, digit_var: usize| -> (usize, usize) {
+        // diff = digit - 256
+        let diff_val = b.assignment[digit_var] - c256;
+        let diff = b.new_var(diff_val);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, digit_var),
+            (-c256, b.one()),
+            (-F::ONE, diff),
+        ]);
+
+        // is_eq256 ∈ {0,1} indicates diff==0.
+        let is_eq256 = b.new_var(if diff_val == F::ZERO { F::ONE } else { F::ZERO });
+        enforce_bit::<F>(b, is_eq256);
+
+        // diff * is_eq256 == 0
+        let z = b.new_var(diff_val * b.assignment[is_eq256]);
+        b.enforce_mul(diff, is_eq256, z);
+        b.enforce_var_eq_const(z, F::ZERO);
+
+        // inverse trick: diff * inv = 1 - is_eq256
+        let inv = b.new_var(diff_val.inverse().unwrap_or(F::ZERO));
+        let prod = b.new_var(diff_val * b.assignment[inv]);
+        b.enforce_mul(diff, inv, prod);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, prod),
+            (F::ONE, is_eq256),
+            (-F::ONE, b.one()),
+        ]);
+
+        // byte = digit - 256*is_eq256
+        let byte_val = b.assignment[digit_var] - c256 * b.assignment[is_eq256];
+        let byte = b.new_var(byte_val);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, digit_var),
+            (-c256, is_eq256),
+            (-F::ONE, byte),
+        ]);
+        enforce_byte::<F>(b, byte);
+
+        (byte, is_eq256)
+    };
+
+    // Selection: pick the earliest acceptable try.
+    let mut found = b.new_var(F::ZERO);
+    enforce_bit::<F>(b, found);
+    b.enforce_var_eq_const(found, F::ZERO);
+
+    let mut out = b.new_var(F::ZERO);
+    b.enforce_var_eq_const(out, F::ZERO);
+
+    let one = b.one();
+    for t in 0..tries {
+        let base = t * CHALLENGE_DIGITS;
+        let (b0, e0) = digit_to_byte_and_eq256(b, digits_all[base + 0]);
+        let (b1, e1) = digit_to_byte_and_eq256(b, digits_all[base + 1]);
+        let (b2, e2) = digit_to_byte_and_eq256(b, digits_all[base + 2]);
+        let (b3, e3) = digit_to_byte_and_eq256(b, digits_all[base + 3]);
+
+        // ok = (1-e0)*(1-e1)*(1-e2)*(1-e3)
+        let one_minus = |b: &mut Dr1csBuilder<F>, x: usize| -> usize {
+            let v = b.new_var(F::ONE - b.assignment[x]);
+            b.enforce_lc_times_one_eq_const(vec![(F::ONE, v), (F::ONE, x), (-F::ONE, one)]);
+            v
+        };
+        let o0 = one_minus(b, e0);
+        let o1 = one_minus(b, e1);
+        let o2 = one_minus(b, e2);
+        let o3 = one_minus(b, e3);
+        let ok01 = b.new_var(b.assignment[o0] * b.assignment[o1]);
+        b.enforce_mul(o0, o1, ok01);
+        let ok23 = b.new_var(b.assignment[o2] * b.assignment[o3]);
+        b.enforce_mul(o2, o3, ok23);
+        let ok = b.new_var(b.assignment[ok01] * b.assignment[ok23]);
+        b.enforce_mul(ok01, ok23, ok);
+        enforce_bit::<F>(b, ok);
+
+        // select = ok * (1-found)
+        let not_found = one_minus(b, found);
+        let select = b.new_var(b.assignment[ok] * b.assignment[not_found]);
+        b.enforce_mul(ok, not_found, select);
+        enforce_bit::<F>(b, select);
+
+        // u32 = b0 + 256*b1 + 256^2*b2 + 256^3*b3
+        let w1 = F::from(256u64);
+        let w2 = F::from(256u64 * 256u64);
+        let w3 = F::from(256u64 * 256u64 * 256u64);
+        let u32_var = lc_to_var::<F>(b, vec![(F::ONE, b0), (w1, b1), (w2, b2), (w3, b3)]);
+
+        // out += select * u32_var
+        let term = b.new_var(b.assignment[select] * b.assignment[u32_var]);
+        b.enforce_mul(select, u32_var, term);
+        let next_out = b.new_var(b.assignment[out] + b.assignment[term]);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, next_out),
+            (-F::ONE, out),
+            (-F::ONE, term),
+        ]);
+        out = next_out;
+
+        // found = found OR ok  (since bits: found' = found + ok - found*ok)
+        let found_ok = b.new_var(b.assignment[found] * b.assignment[ok]);
+        b.enforce_mul(found, ok, found_ok);
+        let next_found = b.new_var(b.assignment[found] + b.assignment[ok] - b.assignment[found_ok]);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, next_found),
+            (-F::ONE, found),
+            (-F::ONE, ok),
+            (F::ONE, found_ok),
+        ]);
+        found = next_found;
+        enforce_bit::<F>(b, found);
+    }
+
+    // Fixed-shape: require we found an acceptable try.
+    b.enforce_var_eq_const(found, F::ONE);
+    out
 }
 
 fn comr1cs_verifier_math_dr1cs<R>(
@@ -6090,39 +6237,61 @@ mod tests {
         }
 
         fn get_challenge(&mut self) -> RR::BaseRing {
-            let op0 = self.trace.ops.get(self.idx).expect("replay: op index oob").clone();
-            let c = match op0 {
-                crate::recording_transcript::PoseidonTraceOp::SqueezeField(v) => v,
-                other => panic!("replay expected SqueezeField op, got {other:?} at idx {}", self.idx),
-            };
-            assert_eq!(c.len(), CHALLENGE_DIGITS, "replay get_challenge digit length mismatch");
-            self.advance();
+            // Fixed-tries rejection schedule: DEFAULT_REJECTION_TRIES repetitions of
+            //   SqueezeField(len=CHALLENGE_DIGITS) then Absorb(len=CHALLENGE_DIGITS),
+            // then select the first try whose first 4 digits are all != 256.
+            let mut chosen = [0u8; 4];
+            let mut found = false;
+            for _ in 0..DEFAULT_REJECTION_TRIES {
+                let op0 = self.trace.ops.get(self.idx).expect("replay: op index oob").clone();
+                let c = match op0 {
+                    crate::recording_transcript::PoseidonTraceOp::SqueezeField(v) => v,
+                    other => panic!("replay expected SqueezeField op, got {other:?} at idx {}", self.idx),
+                };
+                assert_eq!(c.len(), CHALLENGE_DIGITS, "replay get_challenge digit length mismatch");
+                self.advance();
 
-            // get_challenge reabsorbs the squeezed field elements; the trace records that as Absorb(c).
-            let op1 = self.trace.ops.get(self.idx).expect("replay: op index oob").clone();
-            match op1 {
-                crate::recording_transcript::PoseidonTraceOp::Absorb(v) => {
-                    assert_eq!(v.as_slice(), c.as_slice(), "replay reabsorb mismatch");
+                // Each try reabsorbs the squeezed digits.
+                let op1 = self.trace.ops.get(self.idx).expect("replay: op index oob").clone();
+                match op1 {
+                    crate::recording_transcript::PoseidonTraceOp::Absorb(v) => {
+                        assert_eq!(v.as_slice(), c.as_slice(), "replay reabsorb mismatch");
+                    }
+                    other => panic!("replay expected reabsorb Absorb op after SqueezeField, got {other:?}"),
+                };
+                self.advance();
+
+                if found {
+                    continue;
                 }
-                other => panic!("replay expected reabsorb Absorb op after SqueezeField, got {other:?}"),
-            };
-            self.advance();
-
-            // Match `latticefold-plus/src/transcript.rs:get_challenge`:
-            // interpret digits in byte view (256 -> 0), then pack first 4 bytes into u32 (LE).
-            let mut bs = [0u8; 4];
-            for i in 0..4 {
-                let du16 = c[i]
-                    .into_bigint()
-                    .to_bytes_le()
-                    .get(0)
-                    .copied()
-                    .unwrap_or(0) as u16;
-                debug_assert!(du16 < 257u16);
-                bs[i] = if du16 == 256 { 0u8 } else { du16 as u8 };
+                // Accept iff none of the first 4 digits is 256; pack the first 4 digits (byte view) into u32.
+                let mut ok = true;
+                let mut bs = [0u8; 4];
+                for i in 0..4 {
+                    let du16 = c[i]
+                        .into_bigint()
+                        .to_bytes_le()
+                        .get(0)
+                        .copied()
+                        .unwrap_or(0) as u16;
+                    debug_assert!(du16 < 257u16);
+                    if du16 == 256 {
+                        ok = false;
+                        break;
+                    }
+                    bs[i] = du16 as u8;
+                }
+                if ok {
+                    chosen = bs;
+                    found = true;
+                }
             }
-            let x = u32::from_le_bytes(bs);
-            RR::BaseRing::from(x as u64)
+            assert!(
+                found,
+                "ReplayPoseidonTranscript::get_challenge exhausted {} rejection tries",
+                DEFAULT_REJECTION_TRIES
+            );
+            RR::BaseRing::from(u32::from_le_bytes(chosen) as u64)
         }
 
         fn squeeze_bytes(&mut self, n: usize) -> Vec<u8> {

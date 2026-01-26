@@ -94,11 +94,18 @@ impl<BF: PrimeField> PoseidonTranscriptTrace<BF> {
 
     /// Convenience: reconstruct **all** `get_challenge()` scalars present in the trace.
     pub fn challenge_scalars_base257_all(&self, digits_per_challenge: usize) -> Vec<BF> {
-        let n = self
+        let n_squeezes = self
             .ops
             .iter()
             .filter(|op| matches!(op, PoseidonTraceOp::SqueezeField(v) if v.len() == digits_per_challenge))
             .count();
+        assert!(
+            n_squeezes % DEFAULT_REJECTION_TRIES == 0,
+            "challenge_scalars_base257_all: squeeze count {} not divisible by DEFAULT_REJECTION_TRIES={}",
+            n_squeezes,
+            DEFAULT_REJECTION_TRIES
+        );
+        let n = n_squeezes / DEFAULT_REJECTION_TRIES;
         self.challenge_scalars_base257(digits_per_challenge, n)
     }
 }
