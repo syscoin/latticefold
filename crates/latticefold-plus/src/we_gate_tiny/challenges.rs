@@ -75,14 +75,24 @@ pub fn infer_cm_coin_op_wiring_from_ops(
     let mut u32_try_blocks_seen = 0usize;
 
     // First pass: count squeeze-field ops, and select indices in the desired order.
-    for op in ops {
+    //
+    // IMPORTANT: only treat `SqueezeField(len=8)` as a `get_challenge()` try if it is immediately
+    // followed by `Absorb(len=8)`. This avoids accidentally consuming other squeeze-field ops
+    // (e.g. `squeeze_bytes`) that happen to have len=8 but are *not* part of the fixed-tries
+    // `get_challenge` schedule.
+    for (op_i, op) in ops.iter().enumerate() {
         if let PoseidonTraceOp::SqueezeField(v) = op {
+            let next_is_reabsorb_try = matches!(
+                ops.get(op_i + 1),
+                Some(PoseidonTraceOp::Absorb(a)) if a.len() == DIGITS_PER_TRY
+            );
             if squeeze_field_op_idx >= squeeze_field_op_offset {
                 if v.len() == ring_dim && out.short_squeeze_ops.len() < short_need {
                     out.short_squeeze_ops
                         .push(squeeze_field_op_idx - squeeze_field_op_offset);
                 } else if out.short_squeeze_ops.len() == short_need
                     && v.len() == DIGITS_PER_TRY
+                    && next_is_reabsorb_try
                     && u32_try_blocks_seen < u32_need * tries
                 {
                     // One logical u32 challenge corresponds to `tries` consecutive squeeze blocks.
@@ -95,6 +105,7 @@ pub fn infer_cm_coin_op_wiring_from_ops(
                 } else if out.short_squeeze_ops.len() == short_need
                     && out.u32_squeeze_ops.len() == u32_need
                     && v.len() == DIGITS_PER_TRY
+                    && next_is_reabsorb_try
                     && out.frog_squeeze_ops.len() < frog_need
                 {
                     out.frog_squeeze_ops
