@@ -1087,17 +1087,6 @@ fn ring_scale<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, s: usize) ->
     RingVars::new(out)
 }
 
-/// Enforce that a ring element is **const-coeff** (only coefficient 0 may be nonzero).
-///
-/// In the SP1-only WE-gate, this is the right way to “assume const-coeff”: make it explicit in the
-/// relation so the prover cannot stuff higher coefficients.
-#[inline]
-fn enforce_const_coeff0_ringvars<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars) {
-    for i in 1..x.d() {
-        b.enforce_var_eq_const(x.coeffs[i], F::ZERO);
-    }
-}
-
 // -------------------------------------------------------------------------
 // Karatsuba optimization: avoid var-ifying pre-adds.
 //
@@ -2051,7 +2040,6 @@ fn cm_verifier_math_dr1cs<R>(
     ops_offset: usize,
     squeezed_field_offset: usize,
     include_public_inputs_in_absorb: bool,
-    const_coeff0_only: bool,
 ) -> Result<
     (
         SparseDr1csInstance<BF<R>>,
@@ -2271,9 +2259,6 @@ where
             let mut ej_vars: Vec<RingVars> = Vec::with_capacity(ej.len());
             for r in ej {
                 let rv = ring_to_ringvars::<R>(&mut b, r);
-                if const_coeff0_only {
-                    enforce_const_coeff0_ringvars::<BF<R>>(&mut b, &rv);
-                }
                 ej_vars.push(rv);
             }
             ek_vars.push(ej_vars);
@@ -2283,9 +2268,6 @@ where
     let mut out_b_vars: Vec<RingVars> = Vec::with_capacity(out_sc.b.len());
     for bb in &out_sc.b {
         let rv = ring_to_ringvars::<R>(&mut b, bb);
-        if const_coeff0_only {
-            enforce_const_coeff0_ringvars::<BF<R>>(&mut b, &rv);
-        }
         out_b_vars.push(rv);
     }
 
@@ -2705,12 +2687,7 @@ where
                 for col in 0..d {
                     let uij = &out_e_vars[ni][l * k + blk][col];
                     let sij = &short_wiring.s_prime_flat[blk * d + col];
-                    let prod = if const_coeff0_only {
-                        // If `uij` is const-coeff, multiplication is per-coeff scaling by `uij[0]`.
-                        ring_scale::<BF<R>>(&mut b, sij, uij.coeffs[0])
-                    } else {
-                        ring_mul_negacyclic::<BF<R>>(&mut b, uij, sij)
-                    };
+                    let prod = ring_mul_negacyclic::<BF<R>>(&mut b, uij, sij);
                     acc = ring_add::<BF<R>>(&mut b, &acc, &prod);
                 }
             }
@@ -3795,7 +3772,6 @@ where
                     ops_offset,
                     squeezed_field_offset,
                     true, // include_public_inputs_in_absorb
-                    params.decomp_b == 16, // const_coeff0_only (SP1/R1LF: const-coeff base-ring lifts)
                 )?;
             Ok::<_, String>((cm_inst, cm_asg, cm_wiring))
         };
@@ -4828,7 +4804,6 @@ where
                 cm_ops_offset,
                 cm_squeezed_field_offset,
                 false, // include_public_inputs_in_absorb
-                params.decomp_b == 16, // const_coeff0_only (SP1/R1LF: const-coeff base-ring lifts)
             );
             if do_count {
                 CM_COUNTING.with(|c| c.set(false));
