@@ -1494,6 +1494,18 @@ where
     let d = R::dimension();
     let l_instances = proof.evals.0.len();
     let ell = proof.dcom.dparams.l;
+    // ---------------------------------------------------------------------
+    // Const-coeff mode detection (SP1/R1LF):
+    //
+    // If `decomp_b == 16`, the SP1 matrices/witnesses are expected to be lifted into the ring
+    // as **const-coeff** elements (only coefficient 0 may be nonzero). In that mode we:
+    // - enforce const-coeff shape in-circuit for soundness
+    // - use cheaper arithmetic gadgets where possible
+    // ---------------------------------------------------------------------
+    let const_coeff0_only = params.decomp_b == 16;
+    if const_coeff0_only && (proof.dcom.dparams.b as u64) != 16 {
+        return Err("CmProof: const-coeff mode mismatch (params.decomp_b==16 but dcom.dparams.b!=16)".to_string());
+    }
 
     if proof.sumcheck_proofs.0.msgs().len() != nvars || proof.sumcheck_proofs.1.msgs().len() != nvars {
         return Err("CmProof: sumcheck proof length mismatch".to_string());
@@ -1682,7 +1694,11 @@ where
         for ej in ek {
             let mut ej_vars: Vec<RingVars> = Vec::with_capacity(ej.len());
             for r in ej {
-                ej_vars.push(ring_to_ringvars::<R>(&mut b, r));
+                let rv = ring_to_ringvars::<R>(&mut b, r);
+                if const_coeff0_only {
+                    enforce_const_coeff0_ringvars::<BF<R>>(&mut b, &rv);
+                }
+                ej_vars.push(rv);
             }
             ek_vars.push(ej_vars);
         }
@@ -1690,7 +1706,11 @@ where
     }
     let mut out_b_vars: Vec<RingVars> = Vec::with_capacity(out_sc.b.len());
     for bb in &out_sc.b {
-        out_b_vars.push(ring_to_ringvars::<R>(&mut b, bb));
+        let rv = ring_to_ringvars::<R>(&mut b, bb);
+        if const_coeff0_only {
+            enforce_const_coeff0_ringvars::<BF<R>>(&mut b, &rv);
+        }
+        out_b_vars.push(rv);
     }
 
     // Ajtai aggregate commitment binding for out.e/out.b (cheap, linear constraints).
@@ -1928,7 +1948,11 @@ where
                     let mut acc = ring_zero.clone();
                     for i in 0..k_rg {
                         let ui_col = &out_e_vars[ni][base + i][col];
-                        let scaled = ring_scale::<BF<R>>(&mut b, ui_col, dppow_vars[i]);
+                        let scaled = if const_coeff0_only {
+                            ring_scale_constcoeff0::<BF<R>>(&mut b, ui_col, dppow_vars[i])
+                        } else {
+                            ring_scale::<BF<R>>(&mut b, ui_col, dppow_vars[i])
+                        };
                         acc = ring_add::<BF<R>>(&mut b, &acc, &scaled);
                     }
                     let ct = ct_psi_mul_ring::<R>(&mut b, &acc);
@@ -2110,7 +2134,12 @@ where
                 for col in 0..d {
                     let uij = &out_e_vars[ni][l * k + blk][col];
                     let sij = &short_wiring.s_prime_flat[blk * d + col];
-                    let prod = ring_mul_negacyclic::<BF<R>>(&mut b, uij, sij);
+                    let prod = if const_coeff0_only {
+                        // If `uij` is const-coeff, multiplication is per-coeff scaling by `uij[0]`.
+                        ring_scale::<BF<R>>(&mut b, sij, uij.coeffs[0])
+                    } else {
+                        ring_mul_negacyclic::<BF<R>>(&mut b, uij, sij)
+                    };
                     acc = ring_add::<BF<R>>(&mut b, &acc, &prod);
                 }
             }
