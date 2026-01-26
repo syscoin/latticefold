@@ -3935,6 +3935,61 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         }
     }
 
+    // ------------------------------------------------------------
+    // ConstCoeff0 enforcement hook (SP1 / WE gate mode).
+    //
+    // Detect a "ring element byte length" as the smallest Absorb length divisible by `ring_dim`.
+    // For any Absorb whose length is a multiple of that value, enforce that within each ring-element
+    // block, all bytes corresponding to coefficients 1..(ring_dim-1) are zero.
+    //
+    // This is statement-only (depends only on op lengths) and enables the ConstCoeff0 fast path
+    // once we start consuming absorbed ring elements in CM math.
+    // ------------------------------------------------------------
+    if ring_dim > 1 {
+        let mut ring_elem_bytes: Option<usize> = None;
+        for &(_st, ln) in &pose_wiring.absorb_ranges {
+            if ln % ring_dim == 0 && ln > ring_dim {
+                ring_elem_bytes = Some(match ring_elem_bytes {
+                    None => ln,
+                    Some(cur) => cur.min(ln),
+                });
+            }
+        }
+        if let Some(reb) = ring_elem_bytes {
+            let coeff_bytes = reb / ring_dim;
+            if coeff_bytes > 0 {
+                let mut aidx = 0usize;
+                for op in ops {
+                    if let PoseidonTraceOp::Absorb(v) = op {
+                        let (ab_start, ab_len) = *pose_wiring
+                            .absorb_ranges
+                            .get(aidx)
+                            .ok_or("poseidon wiring absorb_ranges oob (constcoeff0)")?;
+                        aidx += 1;
+                        let _ = v; // schedule-only: lengths already checked by wiring
+                        if ab_len < reb || (ab_len % reb) != 0 {
+                            continue;
+                        }
+                        let n_blocks = ab_len / reb;
+                        for blk in 0..n_blocks {
+                            let blk_start = ab_start + blk * reb;
+                            // Bytes for coeff 0: [0..coeff_bytes)
+                            // Bytes for coeff >= 1: [coeff_bytes..reb)
+                            for j in (blk_start + coeff_bytes)..(blk_start + reb) {
+                                let v_ab = pose_wiring.absorb_vars[j];
+                                inst.constraints.push(Constraint {
+                                    a: vec![(F257::ONE, v_ab)],
+                                    b: vec![(F257::ONE, 0)],
+                                    c: vec![(F257::ZERO, 0)],
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Add explicit equality constraints between pose vars and their local copies.
     let pose_nvars = inst.nvars - (glue_nvars - 1);
     let glue_offset = pose_nvars - 1;
