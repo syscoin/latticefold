@@ -6134,6 +6134,20 @@ mod tests {
                     show("A", &con.a);
                     show("B", &con.b);
                     show("C", &con.c);
+
+                    // Also print the concrete z-values for the vars appearing in A (common for glue/equality failures).
+                    if con.a.len() <= 8 {
+                        for (c, idx) in &con.a {
+                            if *idx == 0 {
+                                eprintln!("[tiny_gate] A term: coeff={c:?} var=ONE value=1");
+                            } else {
+                                eprintln!(
+                                    "[tiny_gate] A term: coeff={c:?} var={idx} value={:?}",
+                                    asg[*idx]
+                                );
+                            }
+                        }
+                    }
                 } else {
                     eprintln!(
                         "[tiny_gate] failing constraint idx={ci} out of range (constraints={})",
