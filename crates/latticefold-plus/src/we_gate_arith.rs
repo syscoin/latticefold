@@ -2057,8 +2057,8 @@ where
     // SetChk recombination: enforce ver == v_sc and digest-absorb out.e/out.b.
     let rc_pow_base = rc_var.unwrap_or_else(|| const_var(&mut b, BF::<R>::ONE));
     let rc_pows = scalar_pow_table::<BF<R>>(&mut b, rc_pow_base, nclaims_setchk.saturating_sub(1));
-    let mut ver_scalar = const_var(&mut b, BF::<R>::ZERO);
-    b.enforce_var_eq_const(ver_scalar, BF::<R>::ZERO);
+    // Accumulate verifier scalar as an LC to avoid O(n) scalar_add constraints.
+    let mut ver_lc: Lc<BF<R>> = Vec::new();
 
     // CRITICAL (FS binding):
     // The transcript absorbs the Ajtai aggregate commitment for out.e/out.b (above),
@@ -2072,8 +2072,8 @@ where
         let alpha_pows =
             scalar_pow_table::<BF<R>>(&mut b, alpha, out_sc.e[0][i].len().saturating_sub(1));
 
-        let mut e_sum = const_var(&mut b, BF::<R>::ZERO);
-        b.enforce_var_eq_const(e_sum, BF::<R>::ZERO);
+        // e_sum = Σ term as a scalar LC (no scalar_add chain).
+        let mut e_sum_lc: Lc<BF<R>> = Vec::new();
         // Absorb all blocks e[blk][i][lane][j]
         for blk in 0..out_e_vars.len() {
             for lane in 0..out_e_vars[blk][i].len() {
@@ -2086,13 +2086,18 @@ where
                     let ev1_sq = scalar_mul::<BF<R>>(&mut b, ev1, ev1);
                     let diff = scalar_sub::<BF<R>>(&mut b, ev1_sq, ev2);
                     let term = scalar_mul::<BF<R>>(&mut b, diff, alpha_pows[lane]);
-                    e_sum = scalar_add::<BF<R>>(&mut b, e_sum, term);
+                    e_sum_lc.push((BF::<R>::ONE, term));
                 }
             }
         }
+        let e_sum = if e_sum_lc.is_empty() {
+            const_var(&mut b, BF::<R>::ZERO)
+        } else {
+            lc_to_var_opt::<BF<R>>(&mut b, e_sum_lc)
+        };
         let t = scalar_mul::<BF<R>>(&mut b, eq, e_sum);
         let t = scalar_mul::<BF<R>>(&mut b, t, rc_pows[i]);
-        ver_scalar = scalar_add::<BF<R>>(&mut b, ver_scalar, t);
+        ver_lc.push((BF::<R>::ONE, t));
     }
     for i in 0..out_sc.b.len() {
         let offset = out_sc.e[0].len();
@@ -2109,8 +2114,13 @@ where
         let t = scalar_mul::<BF<R>>(&mut b, eq, alpha);
         let t = scalar_mul::<BF<R>>(&mut b, t, b_claim);
         let t = scalar_mul::<BF<R>>(&mut b, t, rc_pows[idx]);
-        ver_scalar = scalar_add::<BF<R>>(&mut b, ver_scalar, t);
+        ver_lc.push((BF::<R>::ONE, t));
     }
+    let ver_scalar = if ver_lc.is_empty() {
+        const_var(&mut b, BF::<R>::ZERO)
+    } else {
+        lc_to_var_opt::<BF<R>>(&mut b, ver_lc)
+    };
     let ver_ring = scalar_var_to_ringvars::<R>(&mut b, ver_scalar);
     ring_eq::<BF<R>>(&mut b, &ver_ring, &v_sc);
 
