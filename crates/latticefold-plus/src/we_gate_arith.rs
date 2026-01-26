@@ -146,11 +146,15 @@ where
             pairs,
         )?;
 
-    // Public statement params prefix (arm-time bound).
+    // Public statement prefix (arm-time bound): [ONE] || [10×WeParams] || [public_inputs...]
     let mut b_params = Dr1csBuilder::<F257>::new();
     b_params.enforce_var_eq_const(b_params.one(), F257::from(1u64));
     for &x in &params.to_field_vec::<F257>() {
         b_params.new_var(x);
+    }
+    // Reserve slots for public inputs (statement-defined); values are provided at proof time.
+    for _ in 0..public_inputs_len {
+        b_params.new_var(F257::from(0u64));
     }
     let (params_inst, params_asg) = b_params.into_instance();
 
@@ -159,7 +163,7 @@ where
     let parts = vec![(params_inst, params_asg), (inst_pose, asg_pose)];
     let (inst, _asg) = merge_sparse_dr1cs_share_one(parts).map_err(|e| e.to_string())?;
 
-    Ok(WeDr1csShape { inst, public_len: 1 + 10 })
+    Ok(WeDr1csShape { inst, public_len: 1 + 10 + public_inputs_len })
 }
 
 fn escape_json_str(input: &str) -> String {
@@ -5497,7 +5501,7 @@ mod tests {
             &pairs,
         )
         .expect("build_we_dr1cs_for_plus_proof_shape_tiny");
-        assert_eq!(shape.public_len, 1 + 10);
+        assert_eq!(shape.public_len, 1 + 10 + public_inputs_len);
         assert_eq!(shape.inst.nvars, inst.nvars);
         assert_eq!(shape.inst.constraints.len(), inst.constraints.len());
         shape.inst.check(&asg).expect("shape should be satisfied by asg");
