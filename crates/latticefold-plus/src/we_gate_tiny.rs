@@ -3376,6 +3376,8 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         Vec<ShortChallengeWiring>,
         Vec<BoundedU32ChallengeWiring>,
         Vec<BabyBearCenteredWiring>,
+        Vec<usize>, // tcch0 residues per instance (F257 vars)
+        Vec<usize>, // tcch1 residues per instance (F257 vars)
         Vec<CmDigitMulSurfaceWiring>,
         Vec<CmDigitMulSqSurfaceWiring>,
         PoseidonDr1csWiring,
@@ -3494,6 +3496,9 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
     //   element (bit31==0 and < p_bb), enabling centered integer arithmetic later.
     // ------------------------------------------------------------
     let mut bb_centered_locals: Vec<BabyBearCenteredWiring> = Vec::new();
+    // Local (glue-builder) vars for tcch0/tcch1 residues per instance.
+    let mut tcch0_local: Vec<usize> = Vec::new();
+    let mut tcch1_local: Vec<usize> = Vec::new();
     if ring_dim > 1 {
         let mut ring_elem_bytes: Option<usize> = None;
         for &(_st, ln) in &pose_wiring.absorb_ranges {
@@ -3774,6 +3779,10 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         }
 
         // Compute tcch0/tcch1 per instance (in F257 residues).
+        tcch0_local.clear();
+        tcch1_local.clear();
+        tcch0_local.reserve(l_instances);
+        tcch1_local.reserve(l_instances);
         for l in 0..l_instances {
             let base = l * kappa;
             let mut acc0 = gb.new_var(F257::ZERO);
@@ -3803,8 +3812,8 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
                 acc1 = next1;
             }
             // Keep `acc0/acc1` as constrained witnesses; later CM math will consume them.
-            let _ = acc0;
-            let _ = acc1;
+            tcch0_local.push(acc0);
+            tcch1_local.push(acc1);
         }
     }
 
@@ -4348,12 +4357,17 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         })
         .collect::<Vec<_>>();
 
+    let tcch0_out = tcch0_local.into_iter().map(to_glue_global).collect::<Vec<_>>();
+    let tcch1_out = tcch1_local.into_iter().map(to_glue_global).collect::<Vec<_>>();
+
     Ok((
         inst,
         asg,
         shorts_out,
         u32s_out,
         bb_centered_out,
+        tcch0_out,
+        tcch1_out,
         surfaces_out,
         surfaces_sq_out,
         pose_wiring,
