@@ -6378,6 +6378,8 @@ mod tests {
         assert_eq!(expected.len(), n_chals);
 
         // Extract the digit blocks that correspond to get_challenge squeezes.
+        // With fixed-tries rejection, each logical challenge contributes
+        // `DEFAULT_REJECTION_TRIES` blocks of `SqueezeField(len=CHALLENGE_DIGITS)`.
         let digit_blocks = trace
             .ops
             .iter()
@@ -6390,14 +6392,22 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<Vec<F>>>();
-        assert_eq!(digit_blocks.len(), n_chals);
+        assert_eq!(digit_blocks.len(), n_chals * crate::transcript::DEFAULT_REJECTION_TRIES);
 
-        // In-circuit reconstruction using `combine_base257_digits`.
+        // In-circuit reconstruction using the fixed-tries combiner.
         let mut b = Dr1csBuilder::<F>::new();
         b.enforce_var_eq_const(b.one(), F::ONE);
-        for (i, digits) in digit_blocks.iter().enumerate() {
-            let digit_vars = digits.iter().copied().map(|d| b.new_var(d)).collect::<Vec<_>>();
-            let c_var = combine_base257_digits::<F>(&mut b, &digit_vars);
+        let tries = crate::transcript::DEFAULT_REJECTION_TRIES;
+        for i in 0..n_chals {
+            let mut digit_vars_all: Vec<usize> = Vec::with_capacity(tries * CHALLENGE_DIGITS);
+            for t in 0..tries {
+                let blk = &digit_blocks[i * tries + t];
+                assert_eq!(blk.len(), CHALLENGE_DIGITS);
+                for &d in blk {
+                    digit_vars_all.push(b.new_var(d));
+                }
+            }
+            let c_var = combine_base257_digits_fixed_tries::<F>(&mut b, &digit_vars_all, tries);
             assert_eq!(b.assignment[c_var], expected[i]);
         }
 
