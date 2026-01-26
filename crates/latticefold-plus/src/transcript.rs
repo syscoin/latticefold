@@ -2,19 +2,21 @@ use ark_crypto_primitives::sponge::{
     poseidon::{PoseidonConfig, PoseidonSponge},
     CryptographicSponge,
 };
-use ark_ff::{Field, PrimeField};
-use cyclotomic_rings::rings::GetPoseidonParams;
+use ark_ff::{BigInteger, PrimeField};
+use ark_std::marker::PhantomData;
 use latticefold::transcript::Transcript;
+use latticefold::transcript::bytes::{prime_field_to_bytes_le_fixed, ring_to_bytes_le_fixed};
+use latticefold::transcript::poseidon::{f257_poseidon_config, F257};
 use stark_rings::OverField;
 
 /// Lightweight transcript metrics to estimate Poseidon sponge work.
 ///
-/// Counts are in units of the Poseidon sponge's **base prime field** elements.
+/// Counts are in units of the Poseidon sponge's **F257 elements** (one per byte).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PoseidonTranscriptMetrics {
-    /// Number of base-prime-field elements absorbed into the sponge.
+    /// Number of F257 elements absorbed into the sponge (== bytes absorbed).
     pub absorbed_elems: u64,
-    /// Number of base-prime-field elements squeezed as challenges (`get_challenge`).
+    /// Number of F257 elements squeezed during `get_challenge`.
     pub squeezed_field_elems: u64,
     /// Number of bytes squeezed via `squeeze_bytes`.
     pub squeezed_bytes: u64,
@@ -47,13 +49,17 @@ impl PoseidonTranscriptMetrics {
 /// generic / requirement on `SuitableRing`.
 #[derive(Clone)]
 pub struct PoseidonTranscript<R: OverField> {
-    sponge: PoseidonSponge<<R::BaseRing as Field>::BasePrimeField>,
+    sponge: PoseidonSponge<F257>,
     metrics: PoseidonTranscriptMetrics,
+    _marker: PhantomData<R>,
 }
 
-impl<R: OverField> PoseidonTranscript<R> {
-    pub fn empty<P: GetPoseidonParams<<<R>::BaseRing as Field>::BasePrimeField>>() -> Self {
-        Self::new(&P::get_poseidon_config())
+impl<R: OverField> PoseidonTranscript<R>
+where
+    R::BaseRing: PrimeField,
+{
+    pub fn empty<P>() -> Self {
+        Self::new(&f257_poseidon_config())
     }
 
     /// Get current transcript metrics.
@@ -63,71 +69,90 @@ impl<R: OverField> PoseidonTranscript<R> {
 
     /// Print a summary of transcript work.
     /// 
-    /// Uses Goldilocks-like parameters (64-bit field, rate=8 for Poseidon2).
+    /// Uses the F257 transcript sponge parameters (rate=8).
     pub fn print_metrics(&self) {
         let m = &self.metrics;
         println!("=== LF+ Transcript Metrics ===");
-        println!("  Absorbed base-field elems: {}", m.absorbed_elems);
+        println!("  Absorbed F257 elems:       {}", m.absorbed_elems);
         println!("  Squeezed field elems:      {}", m.squeezed_field_elems);
         println!("  Squeezed bytes:            {}", m.squeezed_bytes);
-        // Goldilocks-style: rate=8 for Poseidon2, 8 bytes per field elem
-        let perms_p2 = m.estimated_permutations(8, 8);
-        // Conservative: rate=2 for standard Poseidon
-        let perms_p1 = m.estimated_permutations(2, 8);
-        println!("  Est. Poseidon2 permutations (rate=8): {}", perms_p2);
-        println!("  Est. Poseidon permutations (rate=2):  {}", perms_p1);
+        // F257: one byte per field element.
+        let perms = m.estimated_permutations(8, 1);
+        println!("  Est. Poseidon permutations (rate=8): {}", perms);
         println!("==============================");
     }
 }
 
-impl<R: OverField> Transcript<R> for PoseidonTranscript<R> {
-    type TranscriptConfig = PoseidonConfig<<R::BaseRing as Field>::BasePrimeField>;
+impl<R: OverField> Transcript<R> for PoseidonTranscript<R>
+where
+    R::BaseRing: PrimeField,
+{
+    type TranscriptConfig = PoseidonConfig<F257>;
 
     fn new(config: &Self::TranscriptConfig) -> Self {
-        let sponge = PoseidonSponge::<<R::BaseRing as Field>::BasePrimeField>::new(config);
+        let sponge = PoseidonSponge::<F257>::new(config);
         Self { 
             sponge,
             metrics: PoseidonTranscriptMetrics::default(),
+            _marker: PhantomData,
         }
     }
 
     fn absorb(&mut self, v: &R) {
-        let elems: Vec<_> = v.coeffs()
-            .iter()
-            .flat_map(|x| x.to_base_prime_field_elements())
-            .collect();
-        self.metrics.absorbed_elems += elems.len() as u64;
-        self.sponge.absorb(&elems);
+        let bytes = ring_to_bytes_le_fixed::<R>(v);
+        self.metrics.absorbed_elems += bytes.len() as u64;
+        self.sponge
+            .absorb(&bytes.iter().map(|b| F257::from(*b as u64)).collect::<Vec<_>>());
     }
 
     fn absorb_field_element(&mut self, v: &R::BaseRing) {
-        // IMPORTANT (encoding):
-        // Absorb base-ring field elements directly into the sponge (as base-prime-field elems),
-        // instead of converting to a constant-coeff ring element and absorbing `d` coefficients.
-        //
-        // This reduces transcript IO (and thus WE-gate Poseidon constraints) by ~`R::dimension()`
-        // for scalar absorbs, while keeping ring-element absorbs unchanged.
-        let elems: Vec<_> = v.to_base_prime_field_elements().collect();
-        self.metrics.absorbed_elems += elems.len() as u64;
-        self.sponge.absorb(&elems);
+        let bytes = prime_field_to_bytes_le_fixed::<R::BaseRing>(v);
+        self.metrics.absorbed_elems += bytes.len() as u64;
+        self.sponge
+            .absorb(&bytes.iter().map(|b| F257::from(*b as u64)).collect::<Vec<_>>());
     }
 
     fn get_challenge(&mut self) -> R::BaseRing {
-        let extension_degree = R::BaseRing::extension_degree();
-        let c = self
-            .sponge
-            .squeeze_field_elements(extension_degree as usize);
-        self.metrics.squeezed_field_elems += extension_degree as u64;
+        // Fixed-length digit schedule (no rejection) to keep a fixed transcript schedule.
+        //
+        // IMPORTANT (bounded-int CM math):
+        // We interpret the squeezed F257 digits in **byte view** (256 -> 0) and pack the first
+        // 4 bytes into a u32. This keeps scalar challenges < 2^32, which is required for the
+        // "no-wrap" bounded-integer model to remain sound through degree-2/3 polynomial steps.
+        const CHALLENGE_DIGITS: usize = 8; // schedule-only; we pack 4 bytes.
+        let elems = self.sponge.squeeze_field_elements::<F257>(CHALLENGE_DIGITS);
+        self.metrics.squeezed_field_elems += elems.len() as u64;
         // Re-absorb squeezed elements (Fiat-Shamir)
-        self.metrics.absorbed_elems += c.len() as u64;
-        self.sponge.absorb(&c);
-        <R::BaseRing as Field>::from_base_prime_field_elems(&c)
-            .expect("something went wrong: c does not contain extension_degree elements")
+        self.metrics.absorbed_elems += elems.len() as u64;
+        self.sponge.absorb(&elems);
+
+        let mut bs = [0u8; 4];
+        for i in 0..4 {
+            let d = elems[i]
+                .into_bigint()
+                .to_bytes_le()
+                .get(0)
+                .copied()
+                .unwrap_or(0) as u16;
+            debug_assert!(d < 257u16);
+            bs[i] = if d == 256 { 0u8 } else { d as u8 };
+        }
+        let x = u32::from_le_bytes(bs);
+        R::BaseRing::from(x as u64)
     }
 
     fn squeeze_bytes(&mut self, n: usize) -> Vec<u8> {
+        let elems = self.sponge.squeeze_field_elements::<F257>(n);
+        self.metrics.squeezed_field_elems += elems.len() as u64;
         self.metrics.squeezed_bytes += n as u64;
-        self.sponge.squeeze_bytes(n)
+        elems
+            .iter()
+            .map(|e| {
+                let d = e.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u16;
+                debug_assert!(d < 257u16);
+                if d == 256 { 0u8 } else { d as u8 }
+            })
+            .collect()
     }
 }
 
@@ -135,10 +160,12 @@ pub fn squeeze_challenges<R: OverField>(
     transcript: &mut impl Transcript<R>,
     name: &str,
     n: usize,
-) -> Vec<R::BaseRing> {
-    transcript.absorb_field_element(&<R::BaseRing as Field>::from_base_prime_field(
-        <R::BaseRing as Field>::BasePrimeField::from_be_bytes_mod_order(name.as_bytes()),
-    ));
+) -> Vec<R::BaseRing>
+where
+    R::BaseRing: PrimeField,
+{
+    let dom = <R::BaseRing as PrimeField>::from_be_bytes_mod_order(name.as_bytes());
+    transcript.absorb_field_element(&dom);
 
     transcript.get_challenges(n)
 }
@@ -147,7 +174,10 @@ pub fn squeeze_rchallenges<R: OverField>(
     transcript: &mut impl Transcript<R>,
     name: &str,
     n: usize,
-) -> Vec<R> {
+) -> Vec<R>
+where
+    R::BaseRing: PrimeField,
+{
     squeeze_challenges(transcript, name, n)
         .into_iter()
         .map(|z| R::from(z))

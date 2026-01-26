@@ -2,9 +2,11 @@ use ark_crypto_primitives::sponge::{
     poseidon::{PoseidonConfig, PoseidonSponge},
     CryptographicSponge,
 };
-use ark_ff::{Field, PrimeField};
-use cyclotomic_rings::rings::GetPoseidonParams;
+use ark_ff::{BigInteger, PrimeField};
+use ark_std::marker::PhantomData;
 use latticefold::transcript::Transcript;
+use latticefold::transcript::bytes::{prime_field_to_bytes_le_fixed, ring_to_bytes_le_fixed};
+use latticefold::transcript::poseidon::{f257_poseidon_config, F257};
 use stark_rings::OverField;
 
 
@@ -14,27 +16,31 @@ use stark_rings::OverField;
 /// generic / requirement on `SuitableRing`.
 #[derive(Clone)]
 pub struct PoseidonTranscript<R: OverField> {
-    sponge: PoseidonSponge<<R::BaseRing as Field>::BasePrimeField>,
+    sponge: PoseidonSponge<F257>,
     metrics: PoseidonTranscriptMetrics,
-    scratch: Vec<<R::BaseRing as Field>::BasePrimeField>,
+    scratch: Vec<F257>,
+    _marker: PhantomData<R>,
 }
 
 /// Lightweight transcript metrics to estimate Poseidon sponge work in `R_cp` / `R_WE`.
 ///
-/// Counts are in units of the Poseidon sponge's **base prime field** elements.
+/// Counts are in units of the Poseidon sponge's **F257 elements** (one per byte).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PoseidonTranscriptMetrics {
-    /// Number of base-prime-field elements absorbed into the sponge.
+    /// Number of F257 elements absorbed into the sponge (== bytes absorbed).
     pub absorbed_elems: u64,
-    /// Number of base-prime-field elements squeezed as challenges (`get_challenge`).
+    /// Number of F257 elements squeezed during `get_challenge`.
     pub squeezed_field_elems: u64,
     /// Number of bytes squeezed via `squeeze_bytes`.
     pub squeezed_bytes: u64,
 }
 
-impl<R: OverField> PoseidonTranscript<R> {
-    pub fn empty<P: GetPoseidonParams<<<R>::BaseRing as Field>::BasePrimeField>>() -> Self {
-        Self::new(&P::get_poseidon_config())
+impl<R: OverField> PoseidonTranscript<R>
+where
+    R::BaseRing: PrimeField,
+{
+    pub fn empty<P>() -> Self {
+        Self::new(&f257_poseidon_config())
     }
 
     pub fn metrics(&self) -> PoseidonTranscriptMetrics {
@@ -68,29 +74,30 @@ pub struct PoseidonTranscriptTrace<BF: PrimeField> {
 
 #[derive(Clone)]
 pub struct TracePoseidonTranscript<R: OverField> {
-    sponge: PoseidonSponge<<R::BaseRing as Field>::BasePrimeField>,
+    sponge: PoseidonSponge<F257>,
     metrics: PoseidonTranscriptMetrics,
-    scratch: Vec<<R::BaseRing as Field>::BasePrimeField>,
-    trace: PoseidonTranscriptTrace<<R::BaseRing as Field>::BasePrimeField>,
+    scratch: Vec<F257>,
+    trace: PoseidonTranscriptTrace<F257>,
+    _marker: PhantomData<R>,
 }
 
-impl<R: OverField> TracePoseidonTranscript<R> {
-    pub fn empty<P: GetPoseidonParams<<<R>::BaseRing as Field>::BasePrimeField>>() -> Self {
-        Self::new(&P::get_poseidon_config())
+impl<R: OverField> TracePoseidonTranscript<R>
+where
+    R::BaseRing: PrimeField,
+{
+    pub fn empty<P>() -> Self {
+        Self::new(&f257_poseidon_config())
     }
 
     pub fn metrics(&self) -> PoseidonTranscriptMetrics {
         self.metrics
     }
 
-    pub fn trace(&self) -> &PoseidonTranscriptTrace<<R::BaseRing as Field>::BasePrimeField> {
+    pub fn trace(&self) -> &PoseidonTranscriptTrace<F257> {
         &self.trace
     }
 
-    fn absorb_base_prime_field_elems_vec(
-        &mut self,
-        elems: Vec<<R::BaseRing as Field>::BasePrimeField>,
-    ) {
+    fn absorb_f257_elems_vec(&mut self, elems: Vec<F257>) {
         self.metrics.absorbed_elems += elems.len() as u64;
         self.sponge.absorb(&elems);
         self.trace.absorbed.extend_from_slice(&elems);
@@ -98,49 +105,69 @@ impl<R: OverField> TracePoseidonTranscript<R> {
     }
 }
 
-impl<R: OverField> Transcript<R> for TracePoseidonTranscript<R> {
-    type TranscriptConfig = PoseidonConfig<<R::BaseRing as Field>::BasePrimeField>;
+impl<R: OverField> Transcript<R> for TracePoseidonTranscript<R>
+where
+    R::BaseRing: PrimeField,
+{
+    type TranscriptConfig = PoseidonConfig<F257>;
 
     fn new(config: &Self::TranscriptConfig) -> Self {
-        let sponge = PoseidonSponge::<<R::BaseRing as Field>::BasePrimeField>::new(config);
+        let sponge = PoseidonSponge::<F257>::new(config);
         Self {
             sponge,
             metrics: PoseidonTranscriptMetrics::default(),
             scratch: Vec::with_capacity(64),
             trace: PoseidonTranscriptTrace::default(),
+            _marker: PhantomData,
         }
     }
 
     fn absorb(&mut self, v: &R) {
         self.scratch.clear();
-        for c in v.coeffs() {
-            self.scratch.extend(c.to_base_prime_field_elements());
-        }
+        let bytes = ring_to_bytes_le_fixed::<R>(v);
+        self.scratch.extend(bytes.iter().map(|b| F257::from(*b as u64)));
         let elems = self.scratch.clone();
-        self.absorb_base_prime_field_elems_vec(elems);
+        self.absorb_f257_elems_vec(elems);
     }
 
     fn absorb_field_element(&mut self, v: &R::BaseRing) {
         self.scratch.clear();
-        self.scratch.extend(v.to_base_prime_field_elements());
+        let bytes = prime_field_to_bytes_le_fixed::<R::BaseRing>(v);
+        self.scratch.extend(bytes.iter().map(|b| F257::from(*b as u64)));
         let elems = self.scratch.clone();
-        self.absorb_base_prime_field_elems_vec(elems);
+        self.absorb_f257_elems_vec(elems);
     }
 
     fn get_challenge(&mut self) -> R::BaseRing {
-        let extension_degree = R::BaseRing::extension_degree();
-        let c = self
-            .sponge
-            .squeeze_field_elements(extension_degree as usize);
-        self.metrics.squeezed_field_elems += c.len() as u64;
-        self.trace.squeezed_field.extend_from_slice(&c);
-        self.trace.ops.push(PoseidonTraceOp::SqueezeField(c.clone()));
+        let modulus_le = <R::BaseRing as PrimeField>::MODULUS.to_bytes_le();
+        let mut m: u64 = 0;
+        for (i, b) in modulus_le.iter().take(8).enumerate() {
+            m |= (*b as u64) << (8 * i);
+        }
+        assert!(m != 0, "unexpected zero modulus");
 
-        // `get_challenge` re-absorbs the squeezed elements to evolve the sponge state.
-        self.absorb_base_prime_field_elems_vec(c.clone());
+        loop {
+            let c = self.sponge.squeeze_field_elements::<F257>(8);
+            self.metrics.squeezed_field_elems += c.len() as u64;
+            self.trace.squeezed_field.extend_from_slice(&c);
+            self.trace.ops.push(PoseidonTraceOp::SqueezeField(c.clone()));
 
-        <R::BaseRing as Field>::from_base_prime_field_elems(&c)
-            .expect("something went wrong: c does not contain extension_degree elements")
+            // `get_challenge` re-absorbs the squeezed elements to evolve the sponge state.
+            self.absorb_f257_elems_vec(c.clone());
+
+            let mut acc: u128 = 0;
+            let mut pow: u128 = 1;
+            for e in &c {
+                let d = e.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u16;
+                debug_assert!(d < 257u16);
+                acc += (d as u128) * pow;
+                pow *= 257u128;
+            }
+            let x = acc as u64;
+            if x < m {
+                return R::BaseRing::from(x);
+            }
+        }
     }
 
     fn squeeze_bytes(&mut self, n: usize) -> Vec<u8> {
@@ -152,24 +179,27 @@ impl<R: OverField> Transcript<R> for TracePoseidonTranscript<R> {
     }
 }
 
-impl<R: OverField> Transcript<R> for PoseidonTranscript<R> {
-    type TranscriptConfig = PoseidonConfig<<R::BaseRing as Field>::BasePrimeField>;
+impl<R: OverField> Transcript<R> for PoseidonTranscript<R>
+where
+    R::BaseRing: PrimeField,
+{
+    type TranscriptConfig = PoseidonConfig<F257>;
 
     fn new(config: &Self::TranscriptConfig) -> Self {
-        let sponge = PoseidonSponge::<<R::BaseRing as Field>::BasePrimeField>::new(config);
+        let sponge = PoseidonSponge::<F257>::new(config);
         Self {
             sponge,
             metrics: PoseidonTranscriptMetrics::default(),
             // Small default; will grow as needed (e.g. absorbing a full ring element).
             scratch: Vec::with_capacity(64),
+            _marker: PhantomData,
         }
     }
 
     fn absorb(&mut self, v: &R) {
         self.scratch.clear();
-        for c in v.coeffs() {
-            self.scratch.extend(c.to_base_prime_field_elements());
-        }
+        let bytes = ring_to_bytes_le_fixed::<R>(v);
+        self.scratch.extend(bytes.iter().map(|b| F257::from(*b as u64)));
         self.metrics.absorbed_elems += self.scratch.len() as u64;
         self.sponge.absorb(&self.scratch);
     }
@@ -185,22 +215,40 @@ impl<R: OverField> Transcript<R> for PoseidonTranscript<R> {
     /// For SP1 one-proof mode (ℓ=47, l_h=512): reduces J absorption from ~385k elements to ~24k.
     fn absorb_field_element(&mut self, v: &R::BaseRing) {
         self.scratch.clear();
-        self.scratch.extend(v.to_base_prime_field_elements());
+        let bytes = prime_field_to_bytes_le_fixed::<R::BaseRing>(v);
+        self.scratch.extend(bytes.iter().map(|b| F257::from(*b as u64)));
         self.metrics.absorbed_elems += self.scratch.len() as u64;
         self.sponge.absorb(&self.scratch);
     }
 
     fn get_challenge(&mut self) -> R::BaseRing {
-        let extension_degree = R::BaseRing::extension_degree();
-        let c = self
-            .sponge
-            .squeeze_field_elements(extension_degree as usize);
-        self.metrics.squeezed_field_elems += c.len() as u64;
-        // `get_challenge` re-absorbs the squeezed elements to evolve the sponge state.
-        self.metrics.absorbed_elems += c.len() as u64;
-        self.sponge.absorb(&c);
-        <R::BaseRing as Field>::from_base_prime_field_elems(&c)
-            .expect("something went wrong: c does not contain extension_degree elements")
+        let modulus_le = <R::BaseRing as PrimeField>::MODULUS.to_bytes_le();
+        let mut m: u64 = 0;
+        for (i, b) in modulus_le.iter().take(8).enumerate() {
+            m |= (*b as u64) << (8 * i);
+        }
+        assert!(m != 0, "unexpected zero modulus");
+
+        loop {
+            let c = self.sponge.squeeze_field_elements::<F257>(8);
+            self.metrics.squeezed_field_elems += c.len() as u64;
+            // `get_challenge` re-absorbs the squeezed elements to evolve the sponge state.
+            self.metrics.absorbed_elems += c.len() as u64;
+            self.sponge.absorb(&c);
+
+            let mut acc: u128 = 0;
+            let mut pow: u128 = 1;
+            for e in &c {
+                let d = e.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u16;
+                debug_assert!(d < 257u16);
+                acc += (d as u128) * pow;
+                pow *= 257u128;
+            }
+            let x = acc as u64;
+            if x < m {
+                return R::BaseRing::from(x);
+            }
+        }
     }
 
     fn squeeze_bytes(&mut self, n: usize) -> Vec<u8> {
@@ -213,10 +261,12 @@ pub fn squeeze_challenges<R: OverField>(
     transcript: &mut impl Transcript<R>,
     name: &str,
     n: usize,
-) -> Vec<R::BaseRing> {
-    transcript.absorb_field_element(&<R::BaseRing as Field>::from_base_prime_field(
-        <R::BaseRing as Field>::BasePrimeField::from_be_bytes_mod_order(name.as_bytes()),
-    ));
+) -> Vec<R::BaseRing>
+where
+    R::BaseRing: PrimeField,
+{
+    let dom = <R::BaseRing as PrimeField>::from_be_bytes_mod_order(name.as_bytes());
+    transcript.absorb_field_element(&dom);
 
     transcript.get_challenges(n)
 }
@@ -225,7 +275,10 @@ pub fn squeeze_rchallenges<R: OverField>(
     transcript: &mut impl Transcript<R>,
     name: &str,
     n: usize,
-) -> Vec<R> {
+) -> Vec<R>
+where
+    R::BaseRing: PrimeField,
+{
     squeeze_challenges(transcript, name, n)
         .into_iter()
         .map(|z| R::from(z))

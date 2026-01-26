@@ -142,7 +142,7 @@ impl WeGateDr1csBuilder {
         for inst_part in cfs_parts_nested {
             cfs_parts.extend(inst_part);
         }
-        let (cfs_inst, cfs_asg) = merge_sparse_dr1cs_share_one(&cfs_parts)?;
+        let (cfs_inst, cfs_asg) = merge_sparse_dr1cs_share_one(cfs_parts)?;
 
         let mut parts: Vec<(
             SparseDr1csInstance<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>,
@@ -566,7 +566,7 @@ impl WeGateDr1csBuilder {
             parts.extend(inst_part);
         }
 
-        merge_sparse_dr1cs_share_one(&parts)
+        merge_sparse_dr1cs_share_one(parts)
     }
 
     /// Build the arithmetized **R_cp** fragment including:
@@ -612,7 +612,7 @@ impl WeGateDr1csBuilder {
             cfs_had_u,
             cfs_mon_b,
         )?;
-        merge_sparse_dr1cs_share_one_with_glue(&parts, &glue)
+        merge_sparse_dr1cs_share_one_with_glue(parts, &glue)
     }
 
     /// Build and merge:
@@ -977,7 +977,7 @@ impl WeGateDr1csBuilder {
         }
         glue.push((0, gamma_pose_var, bind_part_idx, gamma_local));
 
-        merge_sparse_dr1cs_share_one_with_glue(&parts, &glue)
+        merge_sparse_dr1cs_share_one_with_glue(parts, &glue)
     }
 }
 

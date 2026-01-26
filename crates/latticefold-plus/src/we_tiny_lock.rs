@@ -4,135 +4,295 @@
 //! and an armer-private secret, using the Theorem-4.3 tiny-field DPP lockable query generator.
 //!
 //! Notes:
-//! - This is intended for tiny fields (e.g., F257) where the accepting set is `{0,1}`.
+//! - This is intended for tiny fields (e.g., F257) where the accepting set is `{1,2}`.
 //! - The lock artifact contains *public coins* and keeps the hidden query inside (as toxic waste),
 //!   serving as a stand-in for LWE hints in the real lock layer.
 
-use ark_crypto_primitives::sponge::{poseidon::PoseidonSponge, CryptographicSponge};
-use ark_ff::{BigInteger, FftField, PrimeField};
+use ark_ff::{FftField, PrimeField};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
-use dpp::dr1cs_flpcp::{Dr1csInstanceSparse, RsDr1csNpFlpcpSparse};
+use dpp::dr1cs_flpcp::{ChunkedMulCodeDr1csNpFlpcpSparse, Dr1csInstanceSparse, MulCode, TensorRsMulCode};
 use dpp::theorem43::{Theorem43Coins, Theorem43Dpp, Theorem43LockArtifact};
+use dpp::dr1cs_flpcp::Dr1csQueryScratch;
 use dpp::SparseVec;
+use symphony::dpp_poseidon::SparseDr1csInstance as SymDr1cs;
 
-use cyclotomic_rings::rings::{FrogPoseidonConfig, GetPoseidonParams};
-use stark_rings::cyclotomic_ring::models::frog_ring::Fq;
-
+use crate::lockable_ringlwe::{arm_ringlwe_lock, RingLweLockArtifact, RingLweParams};
+use crate::lockable_ringlwe::QueryBlockAccumulator;
 
 pub use crate::we_statement::arm_theorem43_from_statement;
+
+#[cfg(feature = "we_gate")]
+use crate::we_gate_arith;
+#[cfg(feature = "we_gate")]
+use crate::we_statement::WeParams;
+#[cfg(feature = "we_gate")]
+use latticefold::transcript::poseidon::F257;
+#[cfg(feature = "we_gate")]
+use stark_rings::{CoeffRing, OverField, PolyRing, Zq};
 
 /// Extract the public coins from a lock artifact (convenience).
 pub fn public_coins<F: PrimeField>(art: &Theorem43LockArtifact<F>) -> Theorem43Coins<F> {
     art.coins.clone()
 }
 
-/// Build a minimal NP-style RS FLPCP instance for a 1-constraint multiply relation.
-///
-/// Constraint: z0 * z1 = z2 over `n_total = 3` variables.
-/// Set `l_public` to control how many leading variables are public.
-pub fn toy_mul_flpcp<F: PrimeField + FftField>(l_public: usize) -> RsDr1csNpFlpcpSparse<F> {
-    let n_total = 3usize;
-    assert!(l_public <= n_total);
-    let a_row = SparseVec::new(vec![(F::ONE, 0)]);
-    let b_row = SparseVec::new(vec![(F::ONE, 1)]);
-    let c_row = SparseVec::new(vec![(F::ONE, 2)]);
-    let inst = Dr1csInstanceSparse::<F> {
-        n: n_total,
-        a: vec![a_row],
-        b: vec![b_row],
-        c: vec![c_row],
-    };
-    let k_rows = inst.k();
-    let ell = 2 * k_rows;
-    RsDr1csNpFlpcpSparse::<F>::new(inst, l_public, ell)
-}
+// NOTE: test-only helpers live in the test module.
 
-/// Arm a Theorem-4.3 tiny-field lock using **Frog Poseidon** to derive coins and UV bits.
+/// Arm a Theorem-4.3 tiny-field lock and wrap it in a Ring-LWE backend.
 ///
-/// This emulates the Frog Poseidon sponge outside the tiny field and feeds the derived
-/// coins/UV bits into the tiny-field Theorem-4.3 lock.
-pub fn arm_theorem43_from_statement_frog_emulated<F: PrimeField>(
-    dpp: &Theorem43Dpp<F>,
+/// This produces a compact public lock artifact that does not reveal the hidden query.
+pub(crate) fn arm_theorem43_ringlwe_from_statement<F: PrimeField, C: MulCode<F> + Sync>(
+    dpp: &Theorem43Dpp<F, ChunkedMulCodeDr1csNpFlpcpSparse<F, C>>,
     stmt_digest: [u8; 32],
     x: &[F],
     armer_seed: [u8; 32],
     lock_j: u64,
-) -> Result<Theorem43LockArtifact<F>, String> {
-    // Statement-binding commitment in the tiny field.
+    block_id: usize,
+    rep_id: u64,
+    params: RingLweParams,
+    rng: &mut impl rand::RngCore,
+    scratch: &mut Dr1csQueryScratch<F>,
+    acc: &mut QueryBlockAccumulator,
+) -> Result<RingLweLockArtifact<F>, String> {
     let c_stmt = crate::we_statement::digest32_to_bits_field::<F>(stmt_digest);
-
-    // Frog Poseidon sponge.
-    let cfg = FrogPoseidonConfig::get_poseidon_config();
-    let mut sponge = PoseidonSponge::<Fq>::new(&cfg);
-    sponge.absorb(&Fq::from(43u64)); // domain sep (matches theorem43)
-
-    // Absorb c_stmt and x, mapped into Frog base field.
-    for b in &c_stmt {
-        let fq = Fq::from(b.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u64);
-        sponge.absorb(&fq);
-    }
-    for xi in x {
-        let fq = Fq::from_le_bytes_mod_order(&xi.into_bigint().to_bytes_le());
-        sponge.absorb(&fq);
-    }
-
-    // Squeeze public coins in Frog, then map into the tiny field.
-    let idx_fq = sponge.squeeze_field_elements::<Fq>(1)[0];
-    let idx_u = fq_to_u64(idx_fq);
-    let idx = (idx_u as usize) % dpp.ell();
-    let lambda = fq_to_small::<F>(sponge.squeeze_field_elements::<Fq>(1)[0]);
-    let rho = fq_to_small::<F>(sponge.squeeze_field_elements::<Fq>(1)[0]);
-    let sigma = fq_to_small::<F>(sponge.squeeze_field_elements::<Fq>(1)[0]);
-    let coins = Theorem43Coins { idx, lambda, rho, sigma };
-
-    // Mix in armer-private secret for hidden-query derivation.
     let armer_secret = crate::we_statement::derive_armer_secret::<F>(armer_seed, stmt_digest, lock_j, 4);
-    for s in &armer_secret {
-        let fq = Fq::from_le_bytes_mod_order(&s.into_bigint().to_bytes_le());
-        sponge.absorb(&fq);
+    let art = dpp.arm(&c_stmt, x, &armer_secret, block_id, rep_id)?;
+    let pi_len = dpp.proof_len();
+    let mut err: Option<String> = None;
+    let offset_f = dpp
+        .stream_query_terms_for_pi(x, &art.coins, &art.coeffs, scratch, &mut |pi_idx, coeff| {
+            if err.is_some() {
+                return;
+            }
+            if let Err(e) = acc.add_term(&coeff, pi_idx) {
+                err = Some(e);
+            }
+        })?;
+    if let Some(e) = err {
+        return Err(e);
     }
-
-    // Derive UV bits from Frog sponge output.
-    let q_minus_1 = field_modulus_u64::<F>()?
-        .saturating_sub(1) as usize;
-    let bits_src = sponge.squeeze_field_elements::<Fq>(q_minus_1);
-    let mut q_bits: Vec<u8> = Vec::with_capacity(q_minus_1);
-    for (i, b) in bits_src.into_iter().enumerate() {
-        let mut u = fq_to_u64(b);
-        u ^= i as u64;
-        q_bits.push((u & 1) as u8);
-    }
-
-    dpp.arm_with_coins_and_uv_bits(c_stmt, x, coins, &q_bits)
+    let q_blocks = acc.into_blocks();
+    arm_ringlwe_lock(
+        c_stmt,
+        art.accepting_set,
+        art.coins,
+        offset_f,
+        x.len(),
+        pi_len,
+        q_blocks,
+        params,
+        rng,
+    )
 }
 
-fn fq_to_u64(x: Fq) -> u64 {
-    let bytes = x.into_bigint().to_bytes_le();
-    let mut buf = [0u8; 8];
-    let n = bytes.len().min(8);
-    buf[..n].copy_from_slice(&bytes[..n]);
-    u64::from_le_bytes(buf)
+/// Streaming arming helper that keeps the chunked FLPCP backend available for proof streaming.
+pub struct WeRingLweStreamingContext<F: PrimeField + FftField> {
+    pub lock: RingLweLockArtifact<F>,
+    pub dpp: Theorem43Dpp<F, ChunkedMulCodeDr1csNpFlpcpSparse<F, TensorRsMulCode<F>>>,
 }
 
-fn fq_to_small<F: PrimeField>(x: Fq) -> F {
-    F::from_le_bytes_mod_order(&x.into_bigint().to_bytes_le())
-}
-
-fn field_modulus_u64<F: PrimeField>() -> Result<u64, String> {
-    let bytes = F::MODULUS.to_bytes_le();
-    if bytes.len() > 8 {
-        return Err("field modulus does not fit u64".to_string());
+impl<F: PrimeField + FftField> WeRingLweStreamingContext<F> {
+    pub fn prove_stream(
+        &self,
+        x: &[F],
+        z_w: &[F],
+        on_chunk: &mut dyn FnMut(Vec<F>),
+    ) -> Result<(), String> {
+        self.dpp.prove_for_query_stream(x, z_w, &self.lock.coins, on_chunk)
     }
-    let mut buf = [0u8; 8];
-    buf[..bytes.len()].copy_from_slice(&bytes);
-    Ok(u64::from_le_bytes(buf))
+
+    pub fn proof_len(&self) -> usize {
+        self.dpp.proof_len()
+    }
+}
+
+/// Arm a Ring-LWE lock and return a streaming context for chunked proof generation.
+pub(crate) fn arm_we_ringlwe_from_dr1cs_streaming<F: PrimeField + FftField>(
+    dr1cs: SymDr1cs<F>,
+    public_len: usize,
+    stmt_digest: [u8; 32],
+    x: &[F],
+    armer_seed: [u8; 32],
+    lock_j: u64,
+    block_id: usize,
+    rep_id: u64,
+    params: RingLweParams,
+    rng: &mut impl rand::RngCore,
+) -> Result<WeRingLweStreamingContext<F>, String> {
+    if x.len() != public_len {
+        return Err("arm_we_ringlwe_from_dr1cs_streaming: x length != public_len".to_string());
+    }
+    let inst = dr1cs_from_symphony(dr1cs);
+    let code = TensorRsMulCode::<F>::new(48, 3)?;
+    let k_block = code.dim_k();
+    let blocks = chunk_dr1cs_sparse(inst, k_block);
+    let flpcp = ChunkedMulCodeDr1csNpFlpcpSparse::<F, _>::new(blocks, public_len, code)?;
+    let dpp = Theorem43Dpp::<F, _>::new(flpcp)?;
+    let mut scratch = dpp.query_scratch();
+    let mut acc = QueryBlockAccumulator::new(dpp.proof_len())?;
+    let lock = arm_theorem43_ringlwe_from_statement(
+        &dpp,
+        stmt_digest,
+        x,
+        armer_seed,
+        lock_j,
+        block_id,
+        rep_id,
+        params,
+        rng,
+        &mut scratch,
+        &mut acc,
+    )?;
+    Ok(WeRingLweStreamingContext { lock, dpp })
+}
+
+/// Arm the **LF+ tiny-field WE gate** (Poseidon(F257) + CM-coin surfaces) as a Theorem-4.3 lock.
+///
+/// This is the main wiring from:
+/// - `we_gate_arith::build_we_dr1cs_for_plus_proof_shape_tiny` (arm-time instance construction)
+/// into:
+/// - `arm_we_ringlwe_from_dr1cs_streaming` (Theorem-4.3 + Ring-LWE wrapper).
+///
+/// Notes:
+/// - The statement binding is carried by `stmt_digest` via `c_stmt` inside `arm_theorem43_from_statement`.
+/// - `x` is currently a minimal public prefix (typically just `[1]`) unless/until the tiny gate
+///   exports additional public inputs.
+#[cfg(feature = "we_gate")]
+pub(crate) fn arm_lfplus_we_gate_tiny_ringlwe_streaming<R>(
+    shape: we_gate_arith::WeDr1csShape<F257>,
+    params: &WeParams,
+    stmt_digest: [u8; 32],
+    armer_seed: [u8; 32],
+    lock_j: u64,
+    block_id: usize,
+    rep_id: u64,
+    ringlwe_params: RingLweParams,
+    rng: &mut impl rand::RngCore,
+) -> Result<WeRingLweStreamingContext<F257>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + ark_ff::Field + ark_ff::PrimeField,
+{
+    let x: Vec<F257> = match shape.public_len {
+        1 => vec![F257::from(1u64)],
+        // If/when the tiny gate includes the standard params prefix, use the canonical encoding.
+        11 => crate::we_statement::encode_public_x::<F257>(params, &[]),
+        other => {
+            return Err(format!(
+                "arm_lfplus_we_gate_tiny_ringlwe_streaming: unsupported public_len={other}"
+            ))
+        }
+    };
+
+    arm_we_ringlwe_from_dr1cs_streaming::<F257>(
+        shape.inst,
+        shape.public_len,
+        stmt_digest,
+        &x,
+        armer_seed,
+        lock_j,
+        block_id,
+        rep_id,
+        ringlwe_params,
+        rng,
+    )
+}
+
+fn dr1cs_from_symphony<F: PrimeField>(inst: SymDr1cs<F>) -> Dr1csInstanceSparse<F> {
+    let mut a = Vec::with_capacity(inst.constraints.len());
+    let mut b = Vec::with_capacity(inst.constraints.len());
+    let mut c = Vec::with_capacity(inst.constraints.len());
+    for mut row in inst.constraints {
+        a.push(SparseVec::new(std::mem::take(&mut row.a)));
+        b.push(SparseVec::new(std::mem::take(&mut row.b)));
+        c.push(SparseVec::new(std::mem::take(&mut row.c)));
+    }
+    Dr1csInstanceSparse { n: inst.nvars, a, b, c }
+}
+
+fn chunk_dr1cs_sparse<F: PrimeField>(inst: Dr1csInstanceSparse<F>, k_block: usize) -> Vec<Dr1csInstanceSparse<F>> {
+    if k_block == 0 {
+        return vec![inst];
+    }
+    let total = inst.k();
+    if total == 0 {
+        return vec![inst];
+    }
+
+    // IMPORTANT: avoid cloning the (potentially huge) sparse rows.
+    // We consume the instance vectors by value and split them into blocks via `split_off`.
+    let mut a_all = inst.a;
+    let mut b_all = inst.b;
+    let mut c_all = inst.c;
+    let n = inst.n;
+
+    let nblocks = (total + k_block - 1) / k_block;
+    let mut blocks = Vec::with_capacity(nblocks);
+
+    while !a_all.is_empty() {
+        let take = usize::min(k_block, a_all.len());
+
+        let a_tail = a_all.split_off(take);
+        let b_tail = b_all.split_off(take);
+        let c_tail = c_all.split_off(take);
+
+        let mut a = std::mem::replace(&mut a_all, a_tail);
+        let mut b = std::mem::replace(&mut b_all, b_tail);
+        let mut c = std::mem::replace(&mut c_all, c_tail);
+
+        // Pad with zero rows if needed.
+        while a.len() < k_block {
+            a.push(SparseVec::new(Vec::new()));
+            b.push(SparseVec::new(Vec::new()));
+            c.push(SparseVec::new(Vec::new()));
+        }
+        blocks.push(Dr1csInstanceSparse { n, a, b, c });
+    }
+
+    debug_assert_eq!(blocks.len(), nblocks);
+    blocks
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ark_ff::{Field, Fp64, MontBackend, MontConfig};
+    use rand::{rngs::StdRng, SeedableRng};
+    use dpp::dr1cs_flpcp::{ChunkedMulCodeDr1csNpFlpcpSparse, TensorRsMulCode};
+    fn tiny_mul_chunked_dpp<F: PrimeField>() -> Theorem43Dpp<F, ChunkedMulCodeDr1csNpFlpcpSparse<F, TensorRsMulCode<F>>> {
+        let n_total = 3usize;
+        let a_row = SparseVec::new(vec![(F::ONE, 0)]);
+        let b_row = SparseVec::new(vec![(F::ONE, 1)]);
+        let c_row = SparseVec::new(vec![(F::ONE, 2)]);
+        let inst = Dr1csInstanceSparse::<F> {
+            n: n_total,
+            a: vec![a_row],
+            b: vec![b_row],
+            c: vec![c_row],
+        };
+        let code = TensorRsMulCode::<F>::new(2, 1).expect("tensor code");
+        let k_block = code.dim_k();
+        let blocks = chunk_dr1cs_sparse(inst, k_block);
+        let flpcp = ChunkedMulCodeDr1csNpFlpcpSparse::<F, _>::new(blocks, 1, code)
+            .expect("chunked flpcp");
+        Theorem43Dpp::<F, _>::new(flpcp).expect("theorem43 new")
+    }
+
+    fn collect_streamed_pi<F: PrimeField>(
+        dpp: &Theorem43Dpp<F, ChunkedMulCodeDr1csNpFlpcpSparse<F, TensorRsMulCode<F>>>,
+        x: &[F],
+        z_w: &[F],
+        coins: &Theorem43Coins<F>,
+    ) -> Vec<F> {
+        let mut pi = Vec::new();
+        dpp.prove_for_query_stream(x, z_w, coins, &mut |chunk| {
+            pi.extend_from_slice(&chunk);
+        })
+        .expect("prove_for_query_stream");
+        pi
+    }
+
 
     #[derive(MontConfig)]
     #[modulus = "257"]
@@ -142,8 +302,7 @@ mod tests {
 
     #[test]
     fn test_tiny_lock_arm_before_proof_roundtrip() {
-        let flpcp = toy_mul_flpcp::<F257>(1);
-        let dpp = Theorem43Dpp::<F257>::new(flpcp.clone()).expect("theorem43 new");
+        let dpp = tiny_mul_chunked_dpp::<F257>();
 
         let z0 = F257::from(2u64);
         let z1 = F257::from(5u64);
@@ -155,22 +314,184 @@ mod tests {
         let armer_seed = [7u8; 32];
         let lock_j = 0u64;
 
-        let art = arm_theorem43_from_statement_frog_emulated::<F257>(
+        let art = arm_theorem43_from_statement::<F257>(
             &dpp,
             stmt_digest,
             &x,
             armer_seed,
             lock_j,
+            0,
+            0,
         )
-        .expect("arm_theorem43_from_statement_frog_emulated");
-        assert_eq!(art.accepting_set, [F257::ZERO, F257::ONE]);
+        .expect("arm_theorem43_from_statement");
+        assert_eq!(art.accepting_set, [F257::ONE, F257::from(2u64)]);
         assert_eq!(art.len, x.len() + dpp.proof_len());
 
-        let pi = dpp.prove_for_query(&x, &z_w, &art.coins).expect("prove_for_query");
+        let pi = collect_streamed_pi(&dpp, &x, &z_w, &art.coins);
         assert_eq!(pi.len(), dpp.proof_len());
 
-        let a_full = art.answer_for(&x, &pi).expect("answer_for");
-        let (q_x, q_pi) = art.split_query(x.len(), pi.len()).expect("split_query");
-        assert_eq!(a_full, q_x.dot(&x) + q_pi.dot(&pi));
+        let _a_full = dpp
+            .answer_for_stream(&art, &x, &pi)
+            .expect("answer_for_stream");
+    }
+
+    #[test]
+    fn test_tiny_lock_ringlwe_roundtrip() {
+        let dpp = tiny_mul_chunked_dpp::<F257>();
+
+        let z0 = F257::from(2u64);
+        let z1 = F257::from(5u64);
+        let z2 = z0 * z1;
+        let x = vec![z0];
+        let z_w = vec![z1, z2];
+
+        let stmt_digest: [u8; 32] = Sha256::digest(b"LFP_TINY_LOCK_STMT_RINGLWE_V1").into();
+        let armer_seed = [9u8; 32];
+        let lock_j = 0u64;
+
+        let params = RingLweParams {
+            // Use zero-noise parameters for a strict functional test.
+            binomial_k: 0,
+            noise_bound: 0,
+            ..RingLweParams::default()
+        };
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut scratch = dpp.query_scratch();
+        let mut acc = QueryBlockAccumulator::new(dpp.proof_len()).expect("acc");
+        let lock = arm_theorem43_ringlwe_from_statement(
+            &dpp,
+            stmt_digest,
+            &x,
+            armer_seed,
+            lock_j,
+            0,
+            0,
+            params,
+            &mut rng,
+            &mut scratch,
+            &mut acc,
+        )
+        .expect("arm_theorem43_ringlwe_from_statement");
+
+        let pi = collect_streamed_pi(&dpp, &x, &z_w, &lock.coins);
+        let a = lock.decap_answer(&x, &pi).expect("decap_answer");
+        assert!(a == F257::ONE || a == F257::from(2u64));
+
+        // Negative check: tweak proof and ensure decap fails.
+        let mut pi_bad = pi.clone();
+        pi_bad[0] += F257::ONE;
+        assert!(lock.decap_answer(&x, &pi_bad).is_err());
+    }
+
+    #[test]
+    fn test_tiny_lock_ringlwe_roundtrip_streaming() {
+        let dpp = tiny_mul_chunked_dpp::<F257>();
+
+        let z0 = F257::from(2u64);
+        let z1 = F257::from(5u64);
+        let z2 = z0 * z1;
+        let x = vec![z0];
+        let z_w = vec![z1, z2];
+
+        let stmt_digest: [u8; 32] = Sha256::digest(b"LFP_TINY_LOCK_STMT_RINGLWE_STREAM_V1").into();
+        let armer_seed = [11u8; 32];
+        let lock_j = 0u64;
+
+        let params = RingLweParams {
+            binomial_k: 0,
+            noise_bound: 0,
+            ..RingLweParams::default()
+        };
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut scratch = dpp.query_scratch();
+        let mut acc = QueryBlockAccumulator::new(dpp.proof_len()).expect("acc");
+        let lock = arm_theorem43_ringlwe_from_statement(
+            &dpp,
+            stmt_digest,
+            &x,
+            armer_seed,
+            lock_j,
+            0,
+            0,
+            params,
+            &mut rng,
+            &mut scratch,
+            &mut acc,
+        )
+        .expect("arm_theorem43_ringlwe_from_statement");
+
+        let mut chunks = Vec::new();
+        dpp.prove_for_query_stream(&x, &z_w, &lock.coins, &mut |chunk| chunks.push(chunk))
+            .expect("prove_for_query_stream");
+        let a = lock
+            .decap_answer_stream(&x, dpp.proof_len(), chunks)
+            .expect("decap_answer_stream");
+        assert!(a == F257::ONE || a == F257::from(2u64));
+    }
+
+    #[test]
+    #[ignore]
+    fn test_tiny_lock_ringlwe_roundtrip_with_noise_stats() {
+        let dpp = tiny_mul_chunked_dpp::<F257>();
+
+        let z0 = F257::from(2u64);
+        let z1 = F257::from(5u64);
+        let z2 = z0 * z1;
+        let x = vec![z0];
+        let z_w = vec![z1, z2];
+
+        let stmt_digest: [u8; 32] = Sha256::digest(b"LFP_TINY_LOCK_STMT_RINGLWE_V1").into();
+        let armer_seed = [9u8; 32];
+        let lock_j = 0u64;
+
+        let params = RingLweParams {
+            binomial_k: 12,
+            noise_bound: 48,
+            ..RingLweParams::default()
+        };
+
+        let trials = 100usize;
+        let mut ok_tight = 0usize;
+        let mut ok_loose = 0usize;
+        let mut rng = StdRng::seed_from_u64(12345);
+        let mut acc = QueryBlockAccumulator::new(dpp.proof_len()).expect("acc");
+        for _ in 0..trials {
+            let mut scratch = dpp.query_scratch();
+            let lock = arm_theorem43_ringlwe_from_statement(
+                &dpp,
+                stmt_digest,
+                &x,
+                armer_seed,
+                lock_j,
+                0,
+                0,
+                params.clone(),
+                &mut rng,
+                &mut scratch,
+                &mut acc,
+            )
+            .expect("arm_theorem43_ringlwe_from_statement");
+
+            let pi = collect_streamed_pi(&dpp, &x, &z_w, &lock.coins);
+            let mut lock_tight = lock.clone();
+            lock_tight.params.noise_bound = 48;
+            if lock_tight.decap_answer(&x, &pi).is_ok() {
+                ok_tight += 1;
+            }
+
+            let mut lock_loose = lock.clone();
+            lock_loose.params.noise_bound = lock_tight.params.noise_bound * 2;
+            if lock_loose.decap_answer(&x, &pi).is_ok() {
+                ok_loose += 1;
+            }
+        }
+
+        println!(
+            "ringlwe noisy decap success: tight={ok_tight}/{trials}, loose={ok_loose}/{trials}"
+        );
+
+        // Sanity: loose bound should strictly dominate tight bound.
+        assert!(ok_loose > ok_tight, "expected ok_loose > ok_tight");
+        assert!(ok_loose > 0, "loose bound should succeed sometimes");
     }
 }

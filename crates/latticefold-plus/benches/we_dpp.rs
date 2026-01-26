@@ -184,7 +184,6 @@ fn bench_we_dpp(c: &mut Criterion) {
         sp1_public_input_digest_bits.len(),
         proof.lproof.len(),
         M.len(),
-        B_bound,
     )
     .expect("build_we_dr1cs_for_plus_proof_shape");
 
