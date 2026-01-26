@@ -1511,14 +1511,14 @@ where
     // add an explicit statement-bound mode bit in `WeParams` (preferred), but we avoid that API
     // change here.
     // ---------------------------------------------------------------------
-    // SP1/R1LF currently uses either:
-    // - the Frog64 hardcoded safe params: decomp_b=12, or
-    // - the generic boundedness choice: decomp_b=d/2 (=32 when d=64).
+    // SP1-only gate policy:
+    // This WE gate is intended for the SP1/R1LF case only, where witness/matrices are base-field
+    // lifts into the ring and therefore const-coeff. We therefore *always* enable the const-coeff
+    // fast path, and enforce const-coeff shape in-circuit for soundness.
     //
-    // Both correspond to the same *structural* fact we care about here: base-field lifts are
-    // const-coeff ring elements.
-    let const_coeff0_only =
-        (d == 64) && (params.decomp_b == 12 || params.decomp_b == (d as u64 / 2));
+    // If you ever want a generic (non-SP1) WE gate, introduce an explicit statement-bound mode bit
+    // in `WeParams` and branch on that instead.
+    // SP1-only: always build the const-coeff optimized relation.
     // Hygiene: ensure the proof's embedded dparams agree with statement-bound params.
     if (proof.dcom.dparams.b as u64) != params.decomp_b {
         return Err(format!(
@@ -1528,18 +1528,9 @@ where
         ));
     }
     if std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1") {
-        let reason = if const_coeff0_only {
-            if params.decomp_b == 12 {
-                "inferred_sp1_decomp_b12"
-            } else {
-                "inferred_sp1_decomp_b_d_over_2"
-            }
-        } else {
-            "generic"
-        };
         println!(
-            "[we_gate/cm] const_coeff0_only={} (d={}, decomp_b={}, reason={})",
-            const_coeff0_only, d, params.decomp_b, reason
+            "[we_gate/cm] const_coeff0_only=true (d={}, decomp_b={}, reason=sp1_only_gate)",
+            d, params.decomp_b
         );
     }
 
@@ -1731,9 +1722,7 @@ where
             let mut ej_vars: Vec<RingVars> = Vec::with_capacity(ej.len());
             for r in ej {
                 let rv = ring_to_ringvars::<R>(&mut b, r);
-                if const_coeff0_only {
-                    enforce_const_coeff0_ringvars::<BF<R>>(&mut b, &rv);
-                }
+                enforce_const_coeff0_ringvars::<BF<R>>(&mut b, &rv);
                 ej_vars.push(rv);
             }
             ek_vars.push(ej_vars);
@@ -1743,9 +1732,7 @@ where
     let mut out_b_vars: Vec<RingVars> = Vec::with_capacity(out_sc.b.len());
     for bb in &out_sc.b {
         let rv = ring_to_ringvars::<R>(&mut b, bb);
-        if const_coeff0_only {
-            enforce_const_coeff0_ringvars::<BF<R>>(&mut b, &rv);
-        }
+        enforce_const_coeff0_ringvars::<BF<R>>(&mut b, &rv);
         out_b_vars.push(rv);
     }
 
@@ -1984,11 +1971,7 @@ where
                     let mut acc = ring_zero.clone();
                     for i in 0..k_rg {
                         let ui_col = &out_e_vars[ni][base + i][col];
-                        let scaled = if const_coeff0_only {
-                            ring_scale_constcoeff0::<BF<R>>(&mut b, ui_col, dppow_vars[i])
-                        } else {
-                            ring_scale::<BF<R>>(&mut b, ui_col, dppow_vars[i])
-                        };
+                        let scaled = ring_scale_constcoeff0::<BF<R>>(&mut b, ui_col, dppow_vars[i]);
                         acc = ring_add::<BF<R>>(&mut b, &acc, &scaled);
                     }
                     let ct = ct_psi_mul_ring::<R>(&mut b, &acc);
@@ -2170,12 +2153,8 @@ where
                 for col in 0..d {
                     let uij = &out_e_vars[ni][l * k + blk][col];
                     let sij = &short_wiring.s_prime_flat[blk * d + col];
-                    let prod = if const_coeff0_only {
-                        // If `uij` is const-coeff, multiplication is per-coeff scaling by `uij[0]`.
-                        ring_scale::<BF<R>>(&mut b, sij, uij.coeffs[0])
-                    } else {
-                        ring_mul_negacyclic::<BF<R>>(&mut b, uij, sij)
-                    };
+                    // uij is enforced const-coeff, so multiplication is per-coeff scaling by uij[0].
+                    let prod = ring_scale::<BF<R>>(&mut b, sij, uij.coeffs[0]);
                     acc = ring_add::<BF<R>>(&mut b, &acc, &prod);
                 }
             }
@@ -2255,12 +2234,10 @@ where
                 let v1 = ring_to_ringvars::<R>(b, &vals[1]);
                 let v2 = ring_to_ringvars::<R>(b, &vals[2]);
                 let v3 = ring_to_ringvars::<R>(b, &vals[3]);
-                if const_coeff0_only {
-                    enforce_const_coeff0_ringvars::<BF<R>>(b, &v0);
-                    enforce_const_coeff0_ringvars::<BF<R>>(b, &v1);
-                    enforce_const_coeff0_ringvars::<BF<R>>(b, &v2);
-                    enforce_const_coeff0_ringvars::<BF<R>>(b, &v3);
-                }
+                enforce_const_coeff0_ringvars::<BF<R>>(b, &v0);
+                enforce_const_coeff0_ringvars::<BF<R>>(b, &v1);
+                enforce_const_coeff0_ringvars::<BF<R>>(b, &v2);
+                enforce_const_coeff0_ringvars::<BF<R>>(b, &v3);
                 row.push([v0, v1, v2, v3]);
             }
             out.push(row);
@@ -2327,20 +2304,10 @@ where
             // b/c are ring
             let b0 = ring_to_ringvars::<R>(b, &eval.b[0]);
             let c0 = ring_to_ringvars::<R>(b, &eval.c[0]);
-            if const_coeff0_only {
-                enforce_const_coeff0_ringvars::<BF<R>>(b, &b0);
-                enforce_const_coeff0_ringvars::<BF<R>>(b, &c0);
-            }
-            let t_b0 = if const_coeff0_only {
-                ring_scale_constcoeff0::<BF<R>>(b, &b0, rc_pows[l_idx + 1])
-            } else {
-                ring_scale::<BF<R>>(b, &b0, rc_pows[l_idx + 1])
-            };
-            let t_c0 = if const_coeff0_only {
-                ring_scale_constcoeff0::<BF<R>>(b, &c0, rc_pows[l_idx + 2])
-            } else {
-                ring_scale::<BF<R>>(b, &c0, rc_pows[l_idx + 2])
-            };
+            enforce_const_coeff0_ringvars::<BF<R>>(b, &b0);
+            enforce_const_coeff0_ringvars::<BF<R>>(b, &c0);
+            let t_b0 = ring_scale_constcoeff0::<BF<R>>(b, &b0, rc_pows[l_idx + 1]);
+            let t_c0 = ring_scale_constcoeff0::<BF<R>>(b, &c0, rc_pows[l_idx + 2]);
             let t_u0 = ring_scale::<BF<R>>(b, &u_vars[l][0], rc_pows[l_idx + 3]);
             claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_b0);
             claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_c0);
@@ -2355,21 +2322,11 @@ where
 
                 let bi = ring_to_ringvars::<R>(b, &eval.b[1 + i]);
                 let ci = ring_to_ringvars::<R>(b, &eval.c[1 + i]);
-                if const_coeff0_only {
-                    enforce_const_coeff0_ringvars::<BF<R>>(b, &bi);
-                    enforce_const_coeff0_ringvars::<BF<R>>(b, &ci);
-                }
-                let t_bi = if const_coeff0_only {
-                    ring_scale_constcoeff0::<BF<R>>(b, &bi, rc_pows[idx + 1])
-                } else {
-                    ring_scale::<BF<R>>(b, &bi, rc_pows[idx + 1])
-                };
+                enforce_const_coeff0_ringvars::<BF<R>>(b, &bi);
+                enforce_const_coeff0_ringvars::<BF<R>>(b, &ci);
+                let t_bi = ring_scale_constcoeff0::<BF<R>>(b, &bi, rc_pows[idx + 1]);
                 claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_bi);
-                let t_ci = if const_coeff0_only {
-                    ring_scale_constcoeff0::<BF<R>>(b, &ci, rc_pows[idx + 2])
-                } else {
-                    ring_scale::<BF<R>>(b, &ci, rc_pows[idx + 2])
-                };
+                let t_ci = ring_scale_constcoeff0::<BF<R>>(b, &ci, rc_pows[idx + 2]);
                 claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_ci);
                 let t_ui = ring_scale::<BF<R>>(b, &u_vars[l][1 + i], rc_pows[idx + 3]);
                 claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_ui);
@@ -2413,81 +2370,35 @@ where
             let e01 = &evals[l][0][1];
             let e02 = &evals[l][0][2];
             let e03 = &evals[l][0][3];
-            let t_e00 = if const_coeff0_only {
-                ring_scale_constcoeff0::<BF<R>>(b, e00, rc_pows[l_idx])
-            } else {
-                ring_scale::<BF<R>>(b, e00, rc_pows[l_idx])
-            };
+            let t_e00 = ring_scale_constcoeff0::<BF<R>>(b, e00, rc_pows[l_idx]);
             inner = ring_add::<BF<R>>(b, &inner, &t_e00);
-            let t_e01 = if const_coeff0_only {
-                ring_scale_constcoeff0::<BF<R>>(b, e01, rc_pows[l_idx + 1])
-            } else {
-                ring_scale::<BF<R>>(b, e01, rc_pows[l_idx + 1])
-            };
+            let t_e01 = ring_scale_constcoeff0::<BF<R>>(b, e01, rc_pows[l_idx + 1]);
             inner = ring_add::<BF<R>>(b, &inner, &t_e01);
-            let t_e02 = if const_coeff0_only {
-                ring_scale_constcoeff0::<BF<R>>(b, e02, rc_pows[l_idx + 2])
-            } else {
-                ring_scale::<BF<R>>(b, e02, rc_pows[l_idx + 2])
-            };
+            let t_e02 = ring_scale_constcoeff0::<BF<R>>(b, e02, rc_pows[l_idx + 2]);
             inner = ring_add::<BF<R>>(b, &inner, &t_e02);
-            let t_e03 = if const_coeff0_only {
-                ring_scale_constcoeff0::<BF<R>>(b, e03, rc_pows[l_idx + 3])
-            } else {
-                ring_scale::<BF<R>>(b, e03, rc_pows[l_idx + 3])
-            };
+            let t_e03 = ring_scale_constcoeff0::<BF<R>>(b, e03, rc_pows[l_idx + 3]);
             inner = ring_add::<BF<R>>(b, &inner, &t_e03);
             // M chunks
             for i in 0..mlen_chunks_usize {
                 let idx = l_idx + 4 + i * 4;
                 let Mi = &evals[l][1 + i];
-                let t_m0 = if const_coeff0_only {
-                    ring_scale_constcoeff0::<BF<R>>(b, &Mi[0], rc_pows[idx])
-                } else {
-                    ring_scale::<BF<R>>(b, &Mi[0], rc_pows[idx])
-                };
+                let t_m0 = ring_scale_constcoeff0::<BF<R>>(b, &Mi[0], rc_pows[idx]);
                 inner = ring_add::<BF<R>>(b, &inner, &t_m0);
-                let t_m1 = if const_coeff0_only {
-                    ring_scale_constcoeff0::<BF<R>>(b, &Mi[1], rc_pows[idx + 1])
-                } else {
-                    ring_scale::<BF<R>>(b, &Mi[1], rc_pows[idx + 1])
-                };
+                let t_m1 = ring_scale_constcoeff0::<BF<R>>(b, &Mi[1], rc_pows[idx + 1]);
                 inner = ring_add::<BF<R>>(b, &inner, &t_m1);
-                let t_m2 = if const_coeff0_only {
-                    ring_scale_constcoeff0::<BF<R>>(b, &Mi[2], rc_pows[idx + 2])
-                } else {
-                    ring_scale::<BF<R>>(b, &Mi[2], rc_pows[idx + 2])
-                };
+                let t_m2 = ring_scale_constcoeff0::<BF<R>>(b, &Mi[2], rc_pows[idx + 2]);
                 inner = ring_add::<BF<R>>(b, &inner, &t_m2);
-                let t_m3 = if const_coeff0_only {
-                    ring_scale_constcoeff0::<BF<R>>(b, &Mi[3], rc_pows[idx + 3])
-                } else {
-                    ring_scale::<BF<R>>(b, &Mi[3], rc_pows[idx + 3])
-                };
+                let t_m3 = ring_scale_constcoeff0::<BF<R>>(b, &Mi[3], rc_pows[idx + 3]);
                 inner = ring_add::<BF<R>>(b, &inner, &t_m3);
             }
             // eq * inner
-            if const_coeff0_only {
-                enforce_const_coeff0_ringvars::<BF<R>>(b, &inner);
-            }
-            let eq_inner = if const_coeff0_only {
-                ring_scale_constcoeff0::<BF<R>>(b, &inner, eq)
-            } else {
-                ring_scale::<BF<R>>(b, &inner, eq)
-            };
+            enforce_const_coeff0_ringvars::<BF<R>>(b, &inner);
+            let eq_inner = ring_scale_constcoeff0::<BF<R>>(b, &inner, eq);
             eval_acc = ring_add::<BF<R>>(b, &eval_acc, &eq_inner);
 
             // Add t(z) terms (uses el[0][0])
-            let t0e = if const_coeff0_only {
-                ring_scale::<BF<R>>(b, &t0, e00.coeffs[0])
-            } else {
-                ring_mul_negacyclic::<BF<R>>(b, &t0, e00)
-            };
-            let t1e = if const_coeff0_only {
-                ring_scale::<BF<R>>(b, &t1, e00.coeffs[0])
-            } else {
-                ring_mul_negacyclic::<BF<R>>(b, &t1, e00)
-            };
+            let t0e = ring_scale::<BF<R>>(b, &t0, e00.coeffs[0]);
+            let t1e = ring_scale::<BF<R>>(b, &t1, e00.coeffs[0]);
             let t0e_s = ring_scale::<BF<R>>(b, &t0e, rc_pows[z_idx]);
             eval_acc = ring_add::<BF<R>>(b, &eval_acc, &t0e_s);
             let t1e_s = ring_scale::<BF<R>>(b, &t1e, rc_pows[z_idx + 1]);
