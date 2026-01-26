@@ -137,7 +137,7 @@ where
         .splice(0..0, prefix_u32_squeeze_ops.into_iter());
     wiring_abs.frog_squeeze_ops = Vec::new();
 
-    let (inst_pose, asg_pose, _shorts, _u32s, _surfaces_mul, _surfaces_sq, _pose_wiring) =
+    let (inst_pose, asg_pose, _shorts, _u32s, _surfaces_mul, _surfaces_sq, pose_wiring) =
         tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
             None,
             &ops_f257,
@@ -161,7 +161,61 @@ where
     // Merge params prefix first so the DPP public prefix matches `[1] || WeParams`.
     // (The DPP/FLPCP expects the first `public_len` variables to be the public input vector `x`.)
     let parts = vec![(params_inst, params_asg), (inst_pose, asg_pose)];
-    let (inst, _asg) = merge_sparse_dr1cs_share_one(parts).map_err(|e| e.to_string())?;
+    let (mut inst, _asg) = merge_sparse_dr1cs_share_one(parts).map_err(|e| e.to_string())?;
+
+    // ------------------------------------------------------------
+    // Glue statement public inputs into the transcript prefix.
+    //
+    // In the real verifier transcript, public inputs (e.g. SP1 digest bits as base-field elements)
+    // are absorbed *before* any challenges are squeezed. Our tiny-field transcript arithmetization
+    // therefore must bind the public prefix variables to the first `public_inputs_len` `Absorb`
+    // ops of the Poseidon(F257) schedule.
+    //
+    // Current statement convention for public inputs in this tiny gate: each public input is a
+    // single bit/value in F257, and we bind it to the *first byte* of the absorbed base-field
+    // element; the remaining absorbed bytes are constrained to 0. This matches absorbing a
+    // base-field element `0/1` under little-endian fixed-width encoding.
+    // ------------------------------------------------------------
+    if public_inputs_len > 0 {
+        let coeff_bytes = ((<R::BaseRing as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8;
+        // Variable offset of the Poseidon part inside `inst` (excluding var0).
+        let pose_offset = (1 + 10 + public_inputs_len) - 1; // params_inst.nvars - 1
+        if pose_wiring.absorb_ranges.len() < public_inputs_len {
+            return Err("tiny gate: not enough Absorb ops for public inputs".to_string());
+        }
+        for i in 0..public_inputs_len {
+            let pub_var = 1usize + 10usize + i;
+            let (ab_start, ab_len) = pose_wiring.absorb_ranges[i];
+            if ab_len != coeff_bytes {
+                return Err(format!(
+                    "tiny gate: public input absorb len mismatch (got {ab_len}, expected {coeff_bytes})"
+                ));
+            }
+            for j in 0..ab_len {
+                let v_ab_local = pose_wiring.absorb_vars[ab_start + j];
+                let v_ab = if v_ab_local == 0 {
+                    0
+                } else {
+                    v_ab_local + pose_offset
+                };
+                if j == 0 {
+                    // v_ab == pub_var
+                    inst.constraints.push(Constraint {
+                        a: vec![(F257::ONE, v_ab), (-F257::ONE, pub_var)],
+                        b: vec![(F257::ONE, 0)],
+                        c: vec![(F257::ZERO, 0)],
+                    });
+                } else {
+                    // v_ab == 0
+                    inst.constraints.push(Constraint {
+                        a: vec![(F257::ONE, v_ab)],
+                        b: vec![(F257::ONE, 0)],
+                        c: vec![(F257::ZERO, 0)],
+                    });
+                }
+            }
+        }
+    }
 
     Ok(WeDr1csShape { inst, public_len: 1 + 10 + public_inputs_len })
 }
