@@ -6094,9 +6094,57 @@ mod tests {
         )
         .expect("build_we_dr1cs_for_plus_proof_witness_tiny");
         assert_eq!(asg.len(), shape.inst.nvars);
-        shape.inst
-            .check(&asg)
-            .expect("shape should be satisfied by witness assignment");
+        // If satisfiability fails, dump the failing constraint so we can pinpoint whether
+        // this is a Poseidon/glue mismatch or an actual verifier-math bug.
+        if let Err(e) = shape.inst.check(&asg) {
+            fn parse_failed_constraint_idx(msg: &str) -> Option<usize> {
+                // Expected format (from symphony): "constraint N failed"
+                let needle = "constraint ";
+                let i = msg.find(needle)? + needle.len();
+                let rest = &msg[i..];
+                let j = rest.find(' ')?;
+                rest[..j].parse::<usize>().ok()
+            }
+            fn dot<F: PrimeField>(a: &[(F, usize)], z: &[F]) -> F {
+                let mut acc = F::ZERO;
+                for (c, idx) in a {
+                    let v = if *idx == 0 { F::ONE } else { z[*idx] };
+                    acc += *c * v;
+                }
+                acc
+            }
+
+            eprintln!("[tiny_gate] DR1CS unsat: {e}");
+            if let Some(ci) = parse_failed_constraint_idx(&e) {
+                if let Some(con) = shape.inst.constraints.get(ci) {
+                    let av = dot(&con.a, &asg);
+                    let bv = dot(&con.b, &asg);
+                    let cv = dot(&con.c, &asg);
+                    let res = av * bv - cv;
+                    eprintln!(
+                        "[tiny_gate] failing constraint idx={ci}  (A·z)={av:?} (B·z)={bv:?} (C·z)={cv:?}  residual=A·B-C={res:?}"
+                    );
+                    eprintln!("[tiny_gate] constraint a-len={} b-len={} c-len={}", con.a.len(), con.b.len(), con.c.len());
+                    // Print a small prefix of each term list (enough to see which vars are involved).
+                    let show = |name: &str, terms: &Vec<(F257, usize)>| {
+                        let k = terms.len().min(12);
+                        eprintln!("[tiny_gate] {name} first {k} terms: {:?}", &terms[..k]);
+                    };
+                    // NOTE: `Constraint` here is over `F257` in this test.
+                    show("A", &con.a);
+                    show("B", &con.b);
+                    show("C", &con.c);
+                } else {
+                    eprintln!(
+                        "[tiny_gate] failing constraint idx={ci} out of range (constraints={})",
+                        shape.inst.constraints.len()
+                    );
+                }
+            } else {
+                eprintln!("[tiny_gate] could not parse failing constraint index from error");
+            }
+            panic!("shape should be satisfied by witness assignment: {e}");
+        }
         eprintln!(
             "[tiny_gate] built shape in {:?}: public_len={} nvars={} constraints={}",
             t_shape.elapsed(),
