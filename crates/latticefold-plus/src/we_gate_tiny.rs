@@ -3515,7 +3515,62 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
                 "tiny gate: inferred coeff_bytes={coeff_bytes} < 4; cannot enforce BabyBear canonicality"
             ));
         }
-        for &(ab_start, ab_len) in &pose_wiring.absorb_ranges {
+        // Identify the `absorb_comh` segment: absorbs after the last short squeeze and before the
+        // first CM u32 squeeze (c0[0]).
+        let last_short_op = wiring
+            .short_squeeze_ops
+            .iter()
+            .copied()
+            .max()
+            .ok_or("tiny gate: expected at least one short_squeeze_op")?;
+        let first_short_op = wiring
+            .short_squeeze_ops
+            .iter()
+            .copied()
+            .min()
+            .ok_or("tiny gate: expected at least one short_squeeze_op")?;
+        let cm_u32_start = wiring
+            .u32_squeeze_ops
+            .iter()
+            .filter(|&&idx| idx < first_short_op)
+            .count();
+        if cm_u32_start >= wiring.u32_squeeze_ops.len() {
+            return Err("tiny gate: CM u32 start index out of range".to_string());
+        }
+        let first_cm_u32_op = wiring.u32_squeeze_ops[cm_u32_start];
+
+        let mut absorb_idx = 0usize;
+        let mut squeeze_field_op_idx = 0usize;
+        let mut after_short = false;
+        let mut comh_absorb_ranges: Vec<(usize, usize)> = Vec::new();
+        for op in ops {
+            match op {
+                PoseidonTraceOp::Absorb(v) => {
+                    let (ab_start, ab_len) = *pose_wiring
+                        .absorb_ranges
+                        .get(absorb_idx)
+                        .ok_or("tiny gate: pose_wiring.absorb_ranges oob")?;
+                    // absorb_idx increments regardless of region.
+                    absorb_idx += 1;
+                    // Only collect absorbs in the window (after last short squeeze, before first CM u32 squeeze).
+                    let _ = v; // schedule-only
+                    if after_short && squeeze_field_op_idx < first_cm_u32_op {
+                        comh_absorb_ranges.push((ab_start, ab_len));
+                    }
+                }
+                PoseidonTraceOp::SqueezeField(_v) => {
+                    if squeeze_field_op_idx == last_short_op {
+                        after_short = true;
+                    }
+                    squeeze_field_op_idx += 1;
+                }
+                PoseidonTraceOp::SqueezeBytes { .. } => {}
+            }
+        }
+
+        // Enforce ConstCoeff0 + BabyBear canonicality on *comh* absorbs, and extract centered values.
+        let mut n_comh_elems = 0usize;
+        for &(ab_start, ab_len) in &comh_absorb_ranges {
             if ab_len < reb || (ab_len % reb) != 0 {
                 continue;
             }
@@ -3548,100 +3603,202 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
                 let w =
                     babybear_centered_from_u32_byte_vars_with_modulus(&mut gb, bb, BABYBEAR_P_U32);
                 bb_centered_locals.push(w);
+                n_comh_elems += 1;
             }
         }
-    }
 
-    // Minimal “ConstCoeff0 consumption” hook:
-    // tie one centered BabyBear value times one u32 coin to digit-level multiplication.
-    //
-    // This is a small, shape-fixed step that starts exercising the ConstCoeff0-centered representation
-    // with the same balanced-base16 machinery we’ll use for real CM math.
-    if bb_centered_locals.is_empty() {
-        return Err(
-            "tiny gate: ConstCoeff0 enabled but no absorbed ring elements were detected".to_string(),
-        );
-    }
-    if !u32_ranges.is_empty() {
-        // Use the first **CM** u32 block, not a prefix `get_challenge` coin.
-        // CM schedule: short squeezes (len=ring_dim) happen before CM u32 squeezes (len=8),
-        // so prefix u32 squeezes are exactly those with op-index < first short-squeeze op.
-        let first_short_op = wiring
-            .short_squeeze_ops
-            .iter()
-            .copied()
-            .min()
-            .ok_or("tiny gate: expected at least one short_squeeze_op")?;
-        let cm_u32_start = wiring
-            .u32_squeeze_ops
-            .iter()
-            .filter(|&&idx| idx < first_short_op)
-            .count();
-        if cm_u32_start >= u32_ranges.len() {
-            return Err("tiny gate: CM u32 start index out of range".to_string());
+        if n_comh_elems == 0 {
+            return Err("tiny gate: no ring elements found in absorb_comh segment".to_string());
         }
-        let u0 = u32_locals
-            .get(&cm_u32_start)
-            .ok_or("tiny gate: expected u32_locals[cm_u32_start]")?;
-        let x0 = &bb_centered_locals[0];
-        debug_assert_eq!(x0.centered_bal16_digits.len(), 9);
-        debug_assert_eq!(u0.bal16_digits.len(), 9);
 
-        // Residues mod 257.
-        let mut pow16_18 = [F257::ZERO; 18];
+        // --------------------------------------------------------------------
+        // First real CM-shaped computation over `comh` (ConstCoeff0 mode):
+        //
+        // - derive log_kappa from (u32 schedule, #comh elements),
+        // - derive c0/c1 scalars (mod 257 residues of u32 coins),
+        // - build tensor(c0), tensor(c1),
+        // - compute tcch0[l] = Σ_j tensor_c0[j] * comh[l][j]   (mod 257)
+        //   and similarly tcch1.
+        //
+        // This is still only the *tiny-field residue* view, but it exercises the real schedule and
+        // the ConstCoeff0-centered ring element representation in a protocol-aligned way.
+        // --------------------------------------------------------------------
+        let cm_u32_need = wiring.u32_squeeze_ops.len().saturating_sub(cm_u32_start);
+        // Find a (log_kappa, nvars_cm) that matches the u32 schedule and partitions comh elements.
+        let mut log_kappa: Option<usize> = None;
+        let mut nvars_cm_guess: Option<usize> = None;
+        for lg in 1usize..=20 {
+            let kappa = 1usize << lg;
+            if n_comh_elems % kappa != 0 {
+                continue;
+            }
+            // cm_u32_need = 2*lg + 2 + 2*nvars_cm
+            if cm_u32_need < 2 * lg + 2 {
+                continue;
+            }
+            let rem = cm_u32_need - (2 * lg + 2);
+            if rem % 2 != 0 {
+                continue;
+            }
+            let nv = rem / 2;
+            if nv == 0 {
+                continue;
+            }
+            log_kappa = Some(lg);
+            nvars_cm_guess = Some(nv);
+            break;
+        }
+        let log_kappa = log_kappa.ok_or("tiny gate: could not infer log_kappa from schedule")?;
+        let _nvars_cm = nvars_cm_guess.ok_or("tiny gate: could not infer nvars_cm from schedule")?;
+        let kappa = 1usize << log_kappa;
+        let l_instances = n_comh_elems / kappa;
+
+        // c0 and c1 are the first 2*log_kappa CM u32 coins.
+        let c0_start = cm_u32_start;
+        let c1_start = cm_u32_start + log_kappa;
+        if c1_start + log_kappa > u32_ranges.len() {
+            return Err("tiny gate: not enough u32 coins for c0/c1".to_string());
+        }
+
+        // Helper: residue of a 9-digit balanced base-16 u32-ish number.
+        let mut pow16_9 = [F257::ZERO; 9];
         let mut cur = F257::ONE;
         let sixteen = F257::from(16u64);
-        for i in 0..18 {
-            pow16_18[i] = cur;
+        for i in 0..9 {
+            pow16_9[i] = cur;
             cur *= sixteen;
         }
-        let x_res = {
+        #[inline]
+        fn u32_res(
+            gb: &mut Dr1csBuilder<F257>,
+            digits9: &[usize],
+            pow16_9: &[F257; 9],
+        ) -> usize {
+            debug_assert_eq!(digits9.len(), 9);
             let mut acc = F257::ZERO;
             for i in 0..9 {
-                acc += gb.assignment[x0.centered_bal16_digits[i]] * pow16_18[i];
+                acc += gb.assignment[digits9[i]] * pow16_9[i];
             }
             let v = gb.new_var(acc);
             let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + 9);
             lc.push((F257::ONE, v));
             for i in 0..9 {
-                lc.push((-pow16_18[i], x0.centered_bal16_digits[i]));
+                lc.push((-pow16_9[i], digits9[i]));
             }
             gb.enforce_lc_times_one_eq_const(lc);
             v
-        };
-        let u_res = {
-            let mut acc = F257::ZERO;
-            for i in 0..9 {
-                acc += gb.assignment[u0.bal16_digits[i]] * pow16_18[i];
-            }
-            let v = gb.new_var(acc);
-            let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + 9);
-            lc.push((F257::ONE, v));
-            for i in 0..9 {
-                lc.push((-pow16_18[i], u0.bal16_digits[i]));
-            }
-            gb.enforce_lc_times_one_eq_const(lc);
-            v
-        };
+        }
 
-        // Digit-level multiplication and residue check.
-        let prod_digits = mul_bal16_9_by_9_u32ish(&mut gb, &x0.centered_bal16_digits, &u0.bal16_digits);
-        let prod_res = {
+        // Build c0/c1 scalar vars in F257.
+        let mut c0_vars: Vec<usize> = Vec::with_capacity(log_kappa);
+        let mut c1_vars: Vec<usize> = Vec::with_capacity(log_kappa);
+        for i in 0..log_kappa {
+            let u = u32_locals
+                .get(&(c0_start + i))
+                .ok_or("tiny gate: missing u32_locals for c0")?;
+            c0_vars.push(u32_res(&mut gb, &u.bal16_digits, &pow16_9));
+        }
+        for i in 0..log_kappa {
+            let u = u32_locals
+                .get(&(c1_start + i))
+                .ok_or("tiny gate: missing u32_locals for c1")?;
+            c1_vars.push(u32_res(&mut gb, &u.bal16_digits, &pow16_9));
+        }
+
+        // Tensor weights in F257: fold tensor_product with [1-c_i, c_i].
+        #[inline]
+        fn tensor_vars(gb: &mut Dr1csBuilder<F257>, c: &[usize]) -> Vec<usize> {
+            let mut acc: Vec<usize> = vec![gb.new_var(F257::ONE)];
+            gb.enforce_var_eq_const(acc[0], F257::ONE);
+            for &ci in c {
+                let one_minus = gb.new_var(F257::ONE - gb.assignment[ci]);
+                gb.enforce_lc_times_one_eq_const(vec![
+                    (F257::ONE, one_minus),
+                    (F257::ONE, ci),
+                    (-F257::ONE, gb.one()),
+                ]);
+                let mut next = Vec::with_capacity(acc.len() * 2);
+                for &t in &acc {
+                    // t*(1-ci)
+                    let v0 = gb.new_var(gb.assignment[t] * gb.assignment[one_minus]);
+                    gb.enforce_mul(t, one_minus, v0);
+                    next.push(v0);
+                    // t*ci
+                    let v1 = gb.new_var(gb.assignment[t] * gb.assignment[ci]);
+                    gb.enforce_mul(t, ci, v1);
+                    next.push(v1);
+                }
+                acc = next;
+            }
+            acc
+        }
+
+        let tensor_c0 = tensor_vars(&mut gb, &c0_vars);
+        let tensor_c1 = tensor_vars(&mut gb, &c1_vars);
+        debug_assert_eq!(tensor_c0.len(), kappa);
+        debug_assert_eq!(tensor_c1.len(), kappa);
+
+        // coh residues (mod 257) from centered digits.
+        let mut pow16_9c = [F257::ZERO; 9];
+        let mut cur2 = F257::ONE;
+        for i in 0..9 {
+            pow16_9c[i] = cur2;
+            cur2 *= sixteen;
+        }
+        #[inline]
+        fn coh_res(
+            gb: &mut Dr1csBuilder<F257>,
+            w: &BabyBearCenteredWiring,
+            pow16_9c: &[F257; 9],
+        ) -> usize {
+            debug_assert_eq!(w.centered_bal16_digits.len(), 9);
             let mut acc = F257::ZERO;
-            let take = core::cmp::min(18, prod_digits.len());
-            for i in 0..take {
-                acc += gb.assignment[prod_digits[i]] * pow16_18[i];
+            for i in 0..9 {
+                acc += gb.assignment[w.centered_bal16_digits[i]] * pow16_9c[i];
             }
             let v = gb.new_var(acc);
-            let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + take);
+            let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + 9);
             lc.push((F257::ONE, v));
-            for i in 0..take {
-                lc.push((-pow16_18[i], prod_digits[i]));
+            for i in 0..9 {
+                lc.push((-pow16_9c[i], w.centered_bal16_digits[i]));
             }
             gb.enforce_lc_times_one_eq_const(lc);
             v
-        };
-        gb.enforce_mul(x_res, u_res, prod_res);
+        }
+
+        // Compute tcch0/tcch1 per instance (in F257 residues).
+        for l in 0..l_instances {
+            let base = l * kappa;
+            let mut acc0 = gb.new_var(F257::ZERO);
+            gb.enforce_var_eq_const(acc0, F257::ZERO);
+            let mut acc1 = gb.new_var(F257::ZERO);
+            gb.enforce_var_eq_const(acc1, F257::ZERO);
+            for j in 0..kappa {
+                let ch = &bb_centered_locals[base + j];
+                let ch_res = coh_res(&mut gb, ch, &pow16_9c);
+                let m0 = gb.new_var(gb.assignment[tensor_c0[j]] * gb.assignment[ch_res]);
+                gb.enforce_mul(tensor_c0[j], ch_res, m0);
+                let m1 = gb.new_var(gb.assignment[tensor_c1[j]] * gb.assignment[ch_res]);
+                gb.enforce_mul(tensor_c1[j], ch_res, m1);
+                let next0 = gb.new_var(gb.assignment[acc0] + gb.assignment[m0]);
+                gb.enforce_lc_times_one_eq_const(vec![
+                    (F257::ONE, next0),
+                    (-F257::ONE, acc0),
+                    (-F257::ONE, m0),
+                ]);
+                acc0 = next0;
+                let next1 = gb.new_var(gb.assignment[acc1] + gb.assignment[m1]);
+                gb.enforce_lc_times_one_eq_const(vec![
+                    (F257::ONE, next1),
+                    (-F257::ONE, acc1),
+                    (-F257::ONE, m1),
+                ]);
+                acc1 = next1;
+            }
+            // Keep `acc0/acc1` as constrained witnesses; later CM math will consume them.
+            let _ = acc0;
+            let _ = acc1;
+        }
     }
 
     // Build requested digit-mul surfaces (u32).
