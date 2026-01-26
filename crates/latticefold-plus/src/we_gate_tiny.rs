@@ -3486,6 +3486,79 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         );
     }
 
+    // ------------------------------------------------------------
+    // ConstCoeff0 (and BabyBear) enforcement on absorbed ring elements.
+    //
+    // We do this inside the glue builder so we can range-check / decode bytes and so that these
+    // constraints are tied to Poseidon absorb variables via the existing `local_map` equalities.
+    //
+    // Heuristic (schedule-only): find the smallest Absorb length divisible by `ring_dim`, treat it
+    // as `ring_dim * coeff_bytes`. For any Absorb whose length is a multiple of that, enforce:
+    // - bytes for coefficients 1..(ring_dim-1) are 0  (ConstCoeff0)
+    // - within coeff0, bytes[4..coeff_bytes) are 0 and the low 4 bytes form a canonical BabyBear
+    //   element (bit31==0 and < p_bb), enabling centered integer arithmetic later.
+    // ------------------------------------------------------------
+    if ring_dim > 1 {
+        let mut ring_elem_bytes: Option<usize> = None;
+        for &(_st, ln) in &pose_wiring.absorb_ranges {
+            if ln % ring_dim == 0 && ln > ring_dim {
+                ring_elem_bytes = Some(match ring_elem_bytes {
+                    None => ln,
+                    Some(cur) => cur.min(ln),
+                });
+            }
+        }
+        let reb = ring_elem_bytes.ok_or("tiny gate: could not infer ring element absorb length for ConstCoeff0")?;
+        let coeff_bytes = reb / ring_dim;
+        if coeff_bytes == 0 {
+            return Err("tiny gate: inferred coeff_bytes=0 (unexpected)".to_string());
+        }
+        // SP1-only: coeff0 must carry a canonical BabyBear element in 4 bytes.
+        if coeff_bytes < 4 {
+            return Err(format!(
+                "tiny gate: inferred coeff_bytes={coeff_bytes} < 4; cannot enforce BabyBear canonicality"
+            ));
+        }
+        {
+                for &(ab_start, ab_len) in &pose_wiring.absorb_ranges {
+                    if ab_len < reb || (ab_len % reb) != 0 {
+                        continue;
+                    }
+                    let n_blocks = ab_len / reb;
+                    for blk in 0..n_blocks {
+                        let blk_start = ab_start + blk * reb;
+
+                        // Enforce coeff>=1 bytes are zero.
+                        for j in (blk_start + coeff_bytes)..(blk_start + reb) {
+                            let gv = pose_wiring.absorb_vars[j];
+                            let lv = copy_digit(&mut gb, &pose_asg, &mut local_map, gv);
+                            gb.enforce_var_eq_const(lv, F257::ZERO);
+                        }
+
+                        // BabyBear-canonical coeff0 (embedded in low 32 bits).
+                        for j in (blk_start + 4)..(blk_start + coeff_bytes) {
+                            let gv = pose_wiring.absorb_vars[j];
+                            let lv = copy_digit(&mut gb, &pose_asg, &mut local_map, gv);
+                            gb.enforce_var_eq_const(lv, F257::ZERO);
+                        }
+
+                        let mut bb = [0usize; 4];
+                        for i in 0..4 {
+                            let gv = pose_wiring.absorb_vars[blk_start + i];
+                            let lv = copy_digit(&mut gb, &pose_asg, &mut local_map, gv);
+                            // Range-check as byte.
+                            let _ = decompose_existing_byte_var_to_bits::<F257>(&mut gb, lv);
+                            bb[i] = lv;
+                        }
+                        let _w = babybear31_from_u32_byte_vars_with_modulus(
+                            &mut gb,
+                            bb,
+                            BABYBEAR_P_U32,
+                        );
+                    }
+                }
+    }
+
     // Build requested digit-mul surfaces (u32).
     let mut surfaces_mul_local: Vec<CmDigitMulSurfaceWiring> = Vec::with_capacity(pairs.len());
     // Field-level accumulators for "sum across all requested surfaces, per ring coefficient".
@@ -3932,61 +4005,6 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
                 }
             }
             PoseidonTraceOp::SqueezeBytes { .. } => {}
-        }
-    }
-
-    // ------------------------------------------------------------
-    // ConstCoeff0 enforcement hook (SP1 / WE gate mode).
-    //
-    // Detect a "ring element byte length" as the smallest Absorb length divisible by `ring_dim`.
-    // For any Absorb whose length is a multiple of that value, enforce that within each ring-element
-    // block, all bytes corresponding to coefficients 1..(ring_dim-1) are zero.
-    //
-    // This is statement-only (depends only on op lengths) and enables the ConstCoeff0 fast path
-    // once we start consuming absorbed ring elements in CM math.
-    // ------------------------------------------------------------
-    if ring_dim > 1 {
-        let mut ring_elem_bytes: Option<usize> = None;
-        for &(_st, ln) in &pose_wiring.absorb_ranges {
-            if ln % ring_dim == 0 && ln > ring_dim {
-                ring_elem_bytes = Some(match ring_elem_bytes {
-                    None => ln,
-                    Some(cur) => cur.min(ln),
-                });
-            }
-        }
-        if let Some(reb) = ring_elem_bytes {
-            let coeff_bytes = reb / ring_dim;
-            if coeff_bytes > 0 {
-                let mut aidx = 0usize;
-                for op in ops {
-                    if let PoseidonTraceOp::Absorb(v) = op {
-                        let (ab_start, ab_len) = *pose_wiring
-                            .absorb_ranges
-                            .get(aidx)
-                            .ok_or("poseidon wiring absorb_ranges oob (constcoeff0)")?;
-                        aidx += 1;
-                        let _ = v; // schedule-only: lengths already checked by wiring
-                        if ab_len < reb || (ab_len % reb) != 0 {
-                            continue;
-                        }
-                        let n_blocks = ab_len / reb;
-                        for blk in 0..n_blocks {
-                            let blk_start = ab_start + blk * reb;
-                            // Bytes for coeff 0: [0..coeff_bytes)
-                            // Bytes for coeff >= 1: [coeff_bytes..reb)
-                            for j in (blk_start + coeff_bytes)..(blk_start + reb) {
-                                let v_ab = pose_wiring.absorb_vars[j];
-                                inst.constraints.push(Constraint {
-                                    a: vec![(F257::ONE, v_ab)],
-                                    b: vec![(F257::ONE, 0)],
-                                    c: vec![(F257::ZERO, 0)],
-                                });
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
 
