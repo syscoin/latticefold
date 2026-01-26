@@ -1087,20 +1087,6 @@ fn ring_scale<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, s: usize) ->
     RingVars::new(out)
 }
 
-/// Scale a ring element by a **constant** scalar (no mul constraints).
-///
-/// This uses a single linear constraint per coefficient (`scalar_mul_const`), and is safe
-/// whenever the scalar is statement-bound (e.g. powers of `decomp_b`).
-#[inline]
-fn ring_scale_const<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, c: F) -> RingVars {
-    cm_bump(|cc| cc.ring_scale += 1);
-    let mut out = Vec::with_capacity(x.d());
-    for i in 0..x.d() {
-        out.push(scalar_mul_const::<F>(b, x.coeffs[i], c));
-    }
-    RingVars::new(out)
-}
-
 // -------------------------------------------------------------------------
 // Karatsuba optimization: avoid var-ifying pre-adds.
 //
@@ -1341,51 +1327,15 @@ fn lc_add_scaled_into<F: PrimeField>(dst: &mut Lc<F>, scale: F, src: &Lc<F>) {
     lc_extend_scaled(dst, scale, src);
 }
 
-fn invert_matrix_7<F: PrimeField>(mut a: [[F; 7]; 7]) -> [[F; 7]; 7] {
-    // Gauss–Jordan inversion over the field.
-    let mut inv = [[F::ZERO; 7]; 7];
-    for i in 0..7 {
-        inv[i][i] = F::ONE;
-    }
-
-    for col in 0..7 {
-        // Find a pivot (should exist for our Vandermonde points).
-        let mut piv = col;
-        while piv < 7 && a[piv][col].is_zero() {
-            piv += 1;
-        }
-        assert!(piv < 7, "invert_matrix_7: singular matrix");
-        if piv != col {
-            a.swap(piv, col);
-            inv.swap(piv, col);
-        }
-
-        let inv_piv = a[col][col].inverse().expect("invert_matrix_7: zero pivot");
-        for j in 0..7 {
-            a[col][j] *= inv_piv;
-            inv[col][j] *= inv_piv;
-        }
-
-        for r in 0..7 {
-            if r == col {
-                continue;
-            }
-            let f = a[r][col];
-            if f.is_zero() {
-                continue;
-            }
-            for j in 0..7 {
-                a[r][j] -= f * a[col][j];
-                inv[r][j] -= f * inv[col][j];
-            }
-        }
-    }
-    inv
-}
-
 fn toom4_vandermonde_inv<F: PrimeField>() -> ([[F; 7]; 7], [F; 7]) {
-    // Points for block-polynomial interpolation: degree <= 6
-    // Use small symmetric integers (avoid 1/2): 0, 1, -1, 2, -2, 3, -3.
+    // Points for block-polynomial interpolation: degree <= 6.
+    //
+    // We deliberately use small symmetric integers (avoid 1/2): 0, 1, -1, 2, -2, 3, -3.
+    //
+    // IMPORTANT (performance):
+    // The Vandermonde inverse for these fixed points is constant. Computing it with Gauss–Jordan
+    // inside every `ring_mul_negacyclic_toom4` call is pure host-side overhead (and was observed
+    // to increase dR1CS build time). We therefore use a precomputed rational inverse.
     let pts = [
         F::from(0u64),
         F::from(1u64),
@@ -1395,16 +1345,34 @@ fn toom4_vandermonde_inv<F: PrimeField>() -> ([[F; 7]; 7], [F; 7]) {
         F::from(3u64),
         -F::from(3u64),
     ];
-    let mut v = [[F::ZERO; 7]; 7];
-    for (i, &t) in pts.iter().enumerate() {
-        let mut pow = F::ONE;
-        for j in 0..7 {
-            v[i][j] = pow;
-            pow *= t;
+
+    // Inverse(Vandermonde(pts)) entries as `nums / 720`.
+    // Derived once offline via exact rational Gauss–Jordan.
+    const NUMS: [[i64; 7]; 7] = [
+        [720, 0, 0, 0, 0, 0, 0],
+        [0, 540, -540, -108, 108, 12, -12],
+        [-980, 540, 540, -54, -54, 4, 4],
+        [0, -195, 195, 120, -120, -15, 15],
+        [280, -195, -195, 60, 60, -5, -5],
+        [0, 15, -15, -12, 12, 3, -3],
+        [-20, 15, 15, -6, -6, 1, 1],
+    ];
+
+    let inv720 = F::from(720u64)
+        .inverse()
+        .expect("toom4_vandermonde_inv: 720 must be invertible in PrimeField");
+    let mut inv = [[F::ZERO; 7]; 7];
+    for r in 0..7 {
+        for c in 0..7 {
+            let n = NUMS[r][c];
+            let nn = if n >= 0 {
+                F::from(n as u64)
+            } else {
+                -F::from((-n) as u64)
+            };
+            inv[r][c] = nn * inv720;
         }
     }
-    // We want coefficients c0..c6 from values at pts: c = V^{-1} * w
-    let inv = invert_matrix_7::<F>(v);
     (inv, pts)
 }
 
@@ -2797,8 +2765,10 @@ where
                     let mut acc_lc = ring_lc_zero::<BF<R>>(d);
                     for i in 0..k_rg {
                         let ui_col = &out_e_vars[ni][base + i][col];
-                        let scaled = ring_scale_const::<BF<R>>(&mut b, ui_col, dppow_const[i]);
-                        ring_lc_add_ringvars::<BF<R>>(&mut acc_lc, &scaled, BF::<R>::ONE);
+                        // Avoid materializing `dppow_const[i] * ui_col` into fresh vars.
+                        // Since `acc_lc` is a pure linear accumulator, we can inject the scaling
+                        // directly as LC coefficients (eliminates `scalar_mul_const` constraints here).
+                        ring_lc_add_ringvars::<BF<R>>(&mut acc_lc, ui_col, dppow_const[i]);
                     }
                     let acc = ring_lc_to_ringvars::<BF<R>>(&mut b, acc_lc);
                     let ct = ct_psi_mul_ring::<R>(&mut b, &acc);
