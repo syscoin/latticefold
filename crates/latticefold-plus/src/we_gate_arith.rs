@@ -385,82 +385,57 @@ where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + PrimeField,
 {
-    // Construct a dummy transcript trace that matches the *exact* op schedule expected by
-    // `build_we_dr1cs_for_plus_proof`'s offsets checker. Values are all zero; only lengths/order matter.
-    use crate::recording_transcript::PoseidonTraceOp as Op;
+    // IMPORTANT: We must return a *self-consistent* transcript trace whose squeeze outputs match
+    // the sponge state evolution induced by the absorbs. This is required now that the tiny gate
+    // enforces Fiat–Shamir chaining (`get_challenge` re-absorbs its squeeze output).
+    //
+    // We still use all-zero inputs for this schedule generator (shape-only), but we run the real
+    // transcript logic so the recorded `SqueezeField` outputs are consistent.
+    use crate::recording_transcript::TracePoseidonTranscript;
+    use latticefold::transcript::Transcript;
 
     let d = R::dimension();
+    let mut tr = TracePoseidonTranscript::<R>::empty::<()>();
 
-    let mut ops: Vec<Op<BF<R>>> = Vec::new();
-    let mut squeezed_field: Vec<BF<R>> = Vec::new();
-    let mut squeezed_bytes: Vec<u8> = Vec::new();
-    let coeff_bytes = ((<R::BaseRing as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8;
-    let ring_bytes = R::dimension() * coeff_bytes;
-
-    fn push_absorb<BF: PrimeField>(ops: &mut Vec<Op<BF>>, len: usize) {
-        ops.push(Op::Absorb(vec![BF::ZERO; len]));
-    }
-    fn push_squeeze_field<BF: PrimeField>(
-        ops: &mut Vec<Op<BF>>,
-        squeezed_field: &mut Vec<BF>,
-        len: usize,
-    ) {
-        ops.push(Op::SqueezeField(vec![BF::ZERO; len]));
-        squeezed_field.extend(std::iter::repeat(BF::ZERO).take(len));
-    }
-    fn push_get_challenge<BF: PrimeField>(
-        ops: &mut Vec<Op<BF>>,
-        squeezed_field: &mut Vec<BF>,
-    ) {
-        // TracePoseidonTranscript::get_challenge: SqueezeField(len=CHALLENGE_DIGITS)
-        // then Absorb(len=CHALLENGE_DIGITS).
-        push_squeeze_field::<BF>(ops, squeezed_field, CHALLENGE_DIGITS);
-        push_absorb::<BF>(ops, CHALLENGE_DIGITS);
-    }
-  
-
-    // Public inputs absorbed as base-field scalars (bytes).
+    // Public inputs absorbed as base-field scalars.
     for _ in 0..public_inputs_len {
-        push_absorb::<BF<R>>(&mut ops, coeff_bytes);
+        tr.absorb_field_element(&BF::<R>::ZERO);
     }
 
     // Π_lin proofs (ComR1CSProof::verify schedule).
-    // NOTE: For arm-time schedule purposes, the Π_lin proof content is irrelevant; only the
-    // number of proofs and their per-proof `nvars` matter. In LF+ this is fixed by params.
     let nvars_lin = params.nvars_setchk as usize;
     for _ in 0..n_lin_proofs {
-        let nvars = nvars_lin;
         // r = transcript.get_challenges(nvars)
-        for _ in 0..nvars {
-            push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field);
+        for _ in 0..nvars_lin {
+            let _ = tr.get_challenge();
         }
         // absorb (nvars, degree=3) as scalars
-        push_absorb::<BF<R>>(&mut ops, coeff_bytes);
-        push_absorb::<BF<R>>(&mut ops, coeff_bytes);
+        tr.absorb_field_element(&BF::<R>::ZERO);
+        tr.absorb_field_element(&BF::<R>::ZERO);
         // rounds: 4 ring evals + challenge + explicit absorb
-        for _ in 0..nvars {
+        for _ in 0..nvars_lin {
             for _ in 0..4 {
-                push_absorb::<BF<R>>(&mut ops, ring_bytes);
+                tr.absorb(&R::ZERO);
             }
-            push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field);
-            push_absorb::<BF<R>>(&mut ops, coeff_bytes);
+            let _ = tr.get_challenge();
+            tr.absorb_field_element(&BF::<R>::ZERO);
         }
         // absorb (v,va,vb,vc) (ring, len=d each)
         for _ in 0..4 {
-            push_absorb::<BF<R>>(&mut ops, ring_bytes);
+            tr.absorb(&R::ZERO);
         }
     }
 
     // --------------------------------------------------------------------
     // CmProof::verify transcript schedule (Dcom prefix + CM proper).
     // --------------------------------------------------------------------
-    // Current WE-gate binding assumes L=1 (single folded instance) for the exposed-prefix bind.
     if n_lin_proofs != 1 {
         return Err(
             "poseidon_trace_schedule_for_plus: currently requires n_lin_proofs == 1 (prefix binding assumes L=1)"
                 .to_string(),
         );
     }
+
     let l_instances = 1usize;
     let kappa = params.kappa as usize;
     let k_rg = params.k as usize;
@@ -470,17 +445,16 @@ where
     let dcom_evals_len = 1usize;
     let dcom_eval_vec_len = 1 + mlen_mats;
 
-    // Dcom::verify: absorb witness commitments (cm_f, C_Mf, cm_mtau), each ring elem absorbed len=d.
-    // In the PlusProof shape we always have one folded instance, with κ ring elements per commitment.
+    // Dcom::verify: absorb witness commitments (cm_f, C_Mf, cm_mtau), each ring elem.
     for _ in 0..l_instances {
         for _ in 0..kappa {
-            push_absorb::<BF<R>>(&mut ops, ring_bytes); // cm_f[j]
+            tr.absorb(&R::ZERO);
         }
         for _ in 0..kappa {
-            push_absorb::<BF<R>>(&mut ops, ring_bytes); // C_Mf[j]
+            tr.absorb(&R::ZERO);
         }
         for _ in 0..kappa {
-            push_absorb::<BF<R>>(&mut ops, ring_bytes); // cm_mtau[j]
+            tr.absorb(&R::ZERO);
         }
     }
 
@@ -488,88 +462,84 @@ where
     let nclaims = out_e0_len + out_b_len;
     for _ in 0..nclaims {
         for _ in 0..out_nvars {
-            push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field);
+            let _ = tr.get_challenge();
         }
-        push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field); // beta
-        push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field); // alpha
+        let _ = tr.get_challenge(); // beta
+        let _ = tr.get_challenge(); // alpha
     }
     if out_e0_len > 1 {
-        push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field); // rc
+        let _ = tr.get_challenge(); // rc
     }
-    // MLSumcheck::verify_as_subprotocol header (nvars, degree=3).
-    push_absorb::<BF<R>>(&mut ops, coeff_bytes);
-    push_absorb::<BF<R>>(&mut ops, coeff_bytes);
+
+    // MLSumcheck::verify_as_subprotocol header (nvars, degree=3) as scalars.
+    tr.absorb_field_element(&BF::<R>::ZERO);
+    tr.absorb_field_element(&BF::<R>::ZERO);
     for _ in 0..out_nvars {
         for _ in 0..4 {
-            push_absorb::<BF<R>>(&mut ops, ring_bytes);
+            tr.absorb(&R::ZERO);
         }
-        push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field);
-        push_absorb::<BF<R>>(&mut ops, coeff_bytes);
+        let _ = tr.get_challenge();
+        tr.absorb_field_element(&BF::<R>::ZERO);
     }
-    // absorb_evaluations_digest(out.e, out.b): Ajtai aggregate commitment (kappa ring elems).
-    //
-    // We must bind *all* `out.e` blocks (including those corresponding to external matrices,
-    // i.e. `mlen_mats > 0`) before sampling the CM short challenges, since downstream CM verifier
-    // math uses all blocks in linear combinations.
 
+    // absorb_evaluations_digest(out.e, out.b): Ajtai aggregate commitment (kappa ring elems).
     for _ in 0..kappa {
-        push_absorb::<BF<R>>(&mut ops, ring_bytes);
+        tr.absorb(&R::ZERO);
     }
+
     // rgchk::absorb_evaluations(dcom.evals):
-    // - absorb eval.a as base-ring scalars (bytes per scalar)
-    // - absorb eval.c as ring elements (len=d each)
+    // - absorb eval.a as base-ring scalars
+    // - absorb eval.c as ring elements
     for _ in 0..dcom_evals_len {
         for _ in 0..dcom_eval_vec_len {
-            push_absorb::<BF<R>>(&mut ops, coeff_bytes);
+            tr.absorb_field_element(&BF::<R>::ZERO);
         }
         for _ in 0..dcom_eval_vec_len {
-            push_absorb::<BF<R>>(&mut ops, ring_bytes);
+            tr.absorb(&R::ZERO);
         }
     }
-    // CM short challenges: s(3) + s_prime(k*d) => need_short squeezes of n=d digits.
+
+    // CM short challenges: s(3) + s_prime(k*d) => need_short squeezes of n=d bytes.
     let need_short = 3 + (params.k as usize) * d;
     for _ in 0..need_short {
-        push_squeeze_field::<BF<R>>(&mut ops, &mut squeezed_field, d);
-        squeezed_bytes.extend(std::iter::repeat(0u8).take(d));
+        let _ = tr.squeeze_bytes(d);
     }
+
     // absorb_comh: L × κ ring elements.
     for _ in 0..(l_instances * kappa) {
-        push_absorb::<BF<R>>(&mut ops, ring_bytes);
+        tr.absorb(&R::ZERO);
     }
+
     // c0/c1 = get_challenges(log_kappa) twice.
     let log_kappa = ark_std::log2((params.kappa as usize).next_power_of_two()) as usize;
     for _ in 0..(2 * log_kappa) {
-        push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field);
+        let _ = tr.get_challenge();
     }
+
     // Two CM sumchecks (degree=2) + eval table absorbs.
     let nvars_cm = params.nvars_cm as usize;
     for _ in 0..2 {
-        push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field); // rc
-        push_absorb::<BF<R>>(&mut ops, coeff_bytes); // nvars
-        push_absorb::<BF<R>>(&mut ops, coeff_bytes); // degree=2
+        let _ = tr.get_challenge(); // rc
+        tr.absorb_field_element(&BF::<R>::ZERO); // nvars
+        tr.absorb_field_element(&BF::<R>::ZERO); // degree=2
         for _ in 0..nvars_cm {
             for _ in 0..3 {
-                push_absorb::<BF<R>>(&mut ops, ring_bytes);
+                tr.absorb(&R::ZERO);
             }
-            push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field);
-            push_absorb::<BF<R>>(&mut ops, coeff_bytes);
+            let _ = tr.get_challenge();
+            tr.absorb_field_element(&BF::<R>::ZERO);
         }
         // CM eval tables: L instances, with (1+mlen_mats) rows each, each row has 4 ring elems.
         for _ in 0..l_instances {
             for _ in 0..(1 + mlen_mats) {
                 for _ in 0..4 {
-                    push_absorb::<BF<R>>(&mut ops, ring_bytes);
+                    tr.absorb(&R::ZERO);
                 }
             }
         }
     }
 
-    Ok(PoseidonTranscriptTrace {
-        ops,
-        absorbed: Vec::new(),
-        squeezed_field,
-        squeezed_bytes,
-    })
+    Ok(tr.trace().clone())
 }
 
 #[cfg(feature = "we_gate")]
