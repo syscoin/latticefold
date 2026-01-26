@@ -3587,6 +3587,58 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
     ])
     .map_err(|e| format!("merge poseidon+cm+mul_glue failed: {e}"))?;
 
+    // Enforce Fiat–Shamir re-absorb semantics for `get_challenge()`:
+    // whenever a `SqueezeField(len=8)` is immediately followed by `Absorb(len=8)`, we require the
+    // absorbed digits equal the squeezed digits elementwise. (Short-challenge squeezes `len=ring_dim`
+    // are NOT re-absorbed and are therefore excluded.)
+    let mut absorb_idx = 0usize;
+    let mut squeeze_idx = 0usize;
+    for (i, op) in ops.iter().enumerate() {
+        match op {
+            PoseidonTraceOp::Absorb(_) => {
+                absorb_idx += 1;
+            }
+            PoseidonTraceOp::SqueezeField(out) => {
+                let (sq_start, sq_len) = *pose_wiring
+                    .squeeze_field_ranges
+                    .get(squeeze_idx)
+                    .ok_or("poseidon wiring squeeze_field_ranges oob (tiny)")?;
+                squeeze_idx += 1;
+                if sq_len != out.len() {
+                    return Err("poseidon squeeze length mismatch (tiny)".to_string());
+                }
+                // Only enforce for `get_challenge`/coin squeezes (len=8).
+                if out.len() != DIGITS_PER_TRY {
+                    continue;
+                }
+                // Next op must be Absorb(out) for Fiat–Shamir chaining.
+                if let Some(PoseidonTraceOp::Absorb(next)) = ops.get(i + 1) {
+                    if next.len() != DIGITS_PER_TRY {
+                        return Err("poseidon reabsorb length mismatch (tiny)".to_string());
+                    }
+                    let (ab_start, ab_len) = *pose_wiring
+                        .absorb_ranges
+                        .get(absorb_idx)
+                        .ok_or("poseidon wiring absorb_ranges oob after squeeze (tiny)")?;
+                    if ab_len != sq_len {
+                        return Err("poseidon reabsorb length mismatch (tiny)".to_string());
+                    }
+                    for j in 0..sq_len {
+                        let v_sq = pose_wiring.squeeze_field_vars[sq_start + j];
+                        let v_ab = pose_wiring.absorb_vars[ab_start + j];
+                        // (v_ab - v_sq) * 1 = 0
+                        inst.constraints.push(Constraint {
+                            a: vec![(F257::ONE, v_ab), (-F257::ONE, v_sq)],
+                            b: vec![(F257::ONE, 0)],
+                            c: vec![(F257::ZERO, 0)],
+                        });
+                    }
+                }
+            }
+            PoseidonTraceOp::SqueezeBytes { .. } => {}
+        }
+    }
+
     // Add explicit equality constraints between pose vars and their local copies.
     let pose_nvars = inst.nvars - (glue_nvars - 1);
     let glue_offset = pose_nvars - 1;

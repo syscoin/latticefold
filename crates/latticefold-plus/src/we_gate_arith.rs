@@ -137,7 +137,7 @@ where
         .splice(0..0, prefix_u32_squeeze_ops.into_iter());
     wiring_abs.frog_squeeze_ops = Vec::new();
 
-    let (mut inst_pose, asg_pose, _shorts, _u32s, _surfaces_mul, _surfaces_sq, pose_wiring) =
+    let (inst_pose, asg_pose, _shorts, _u32s, _surfaces_mul, _surfaces_sq, _pose_wiring) =
         tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
             None,
             &ops_f257,
@@ -145,10 +145,6 @@ where
             &wiring_abs,
             pairs,
         )?;
-    // Critical for FS soundness: `get_challenge()` is recorded as SqueezeField(len=8) then Absorb(len=8).
-    // The Poseidon arithmetizer does not enforce that the re-absorbed elements equal the squeezed outputs,
-    // so we add those equalities here.
-    enforce_reabsorb_equals_squeeze::<F257>(&mut inst_pose, &pose_wiring, &ops_f257)?;
 
     // Public statement params prefix (arm-time bound).
     let mut b_params = Dr1csBuilder::<F257>::new();
@@ -5360,7 +5356,7 @@ mod tests {
         // Update pairs to point at the first CM u32 block.
         pairs[0].1 = prefix_cnt;
 
-        let (mut inst_pose, asg_pose, _shorts, _u32s, _surfaces_mul, _surfaces_sq, pose_wiring) =
+        let (inst_pose, asg_pose, _shorts, _u32s, _surfaces_mul, _surfaces_sq, _pose_wiring) =
             tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
                 None,
                 &ops_f257,
@@ -5369,8 +5365,6 @@ mod tests {
                 &pairs,
             )
             .expect("build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring");
-        super::enforce_reabsorb_equals_squeeze::<F257>(&mut inst_pose, &pose_wiring, &ops_f257)
-            .expect("enforce_reabsorb_equals_squeeze");
 
         // Params prefix (must be public / statement-bound).
         let mut b_params = Dr1csBuilder::<F257>::new();
@@ -5472,7 +5466,7 @@ mod tests {
             .splice(0..0, prefix_u32_squeeze_ops.into_iter());
         pairs[0].1 = prefix_cnt;
 
-        let (mut inst_pose, asg_pose, _shorts, _u32s, _surfaces_mul, _surfaces_sq, pose_wiring) =
+        let (inst_pose, asg_pose, _shorts, _u32s, _surfaces_mul, _surfaces_sq, _pose_wiring) =
             tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
                 None,
                 &ops_f257,
@@ -5481,8 +5475,6 @@ mod tests {
                 &pairs,
             )
             .expect("build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring");
-        super::enforce_reabsorb_equals_squeeze::<F257>(&mut inst_pose, &pose_wiring, &ops_f257)
-            .expect("enforce_reabsorb_equals_squeeze");
 
         // Params prefix (must be public / statement-bound).
         let mut b_params = Dr1csBuilder::<F257>::new();
