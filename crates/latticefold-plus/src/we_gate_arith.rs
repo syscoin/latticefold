@@ -1408,6 +1408,29 @@ fn toom4_vandermonde_inv<F: PrimeField>() -> ([[F; 7]; 7], [F; 7]) {
     (inv, pts)
 }
 
+#[inline]
+fn toom4_points_distinct<F: PrimeField>() -> bool {
+    // Toom-4 uses points {0, ±1, ±2, ±3}. In small-characteristic prime fields (notably p∈{2,3,5})
+    // these collide (e.g. 3 == -2 mod 5), making the Vandermonde singular.
+    let pts = [
+        F::from(0u64),
+        F::from(1u64),
+        -F::from(1u64),
+        F::from(2u64),
+        -F::from(2u64),
+        F::from(3u64),
+        -F::from(3u64),
+    ];
+    for i in 0..7 {
+        for j in (i + 1)..7 {
+            if pts[i] == pts[j] {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn poly_mul_toom4_lc<F: PrimeField>(
     b: &mut Dr1csBuilder<F>,
     a: &[Lc<F>],
@@ -1530,7 +1553,7 @@ fn ring_mul_negacyclic<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: 
     // Fall back to the signed schoolbook for non-pow2 dimensions.
     if d.is_power_of_two() && d > 1 {
         // For d=64 (FrogRing64), Toom-4 beats Karatsuba without requiring NTT roots.
-        if d == 64 {
+        if d == 64 && toom4_points_distinct::<F>() {
             return ring_mul_negacyclic_toom4::<F>(b, x, y);
         }
         return ring_mul_negacyclic_karatsuba::<F>(b, x, y);
