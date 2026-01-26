@@ -1185,6 +1185,22 @@ fn bounded_u32_from_8_digits_base128(
     (limbs, bytes, bal16_digits, bal16_sq_digits)
 }
 
+#[inline]
+fn res257_from_u64_bytes_le(gb: &mut Dr1csBuilder<F257>, bytes: &[usize; 8]) -> usize {
+    // 256 ≡ -1 (mod 257), so Σ byte[i] * 256^i ≡ Σ (-1)^i * byte[i].
+    let mut acc = F257::ZERO;
+    let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + 8);
+    for i in 0..8 {
+        let sign = if (i & 1) == 0 { F257::ONE } else { -F257::ONE };
+        acc += gb.assignment[bytes[i]] * sign;
+        lc.push((-sign, bytes[i]));
+    }
+    let v = gb.new_var(acc);
+    lc.insert(0, (F257::ONE, v));
+    gb.enforce_lc_times_one_eq_const(lc);
+    v
+}
+
 fn base128_add10<F: PrimeField>(
     b: &mut Dr1csBuilder<F>,
     a: &[usize; LIMBS_U64],
@@ -1760,6 +1776,28 @@ pub struct BoundedU32ChallengeWiring {
     /// This is a common derived scalar in CM (e.g. `beta2 = beta*beta`) and avoids going back to
     /// in-field multiplication for u32-ish values.
     pub bal16_sq_digits: Vec<usize>,
+}
+
+/// Wiring for a Frog-field challenge derived from a `get_challenge()` digit block.
+///
+/// Semantics match the transcript's "byte view" of 8 digits:
+/// - map each digit `d ∈ {0..=256}` to a byte `b ∈ {0..=255}` via `256 -> 0`
+/// - interpret as a little-endian u64
+/// - reduce mod `p_frog` via the single-subtract gadget (since \(2^{64} < 2p\))
+///
+/// We also expose the residue mod 257 for cheap tiny-field “stage 0” CM constraints.
+#[derive(Clone, Debug)]
+pub struct FrogChallengeWiring {
+    /// The 8 digit vars (F257) consumed for this challenge (schedule-only).
+    pub digit_vars: Vec<usize>,
+    /// The 8 byte-view vars (256 -> 0), little-endian.
+    pub byte_vars: [usize; 8],
+    /// Reduction bit `q ∈ {0,1}` such that u64 = z + q*p_frog.
+    pub q_bit: usize,
+    /// Reduced Frog value `z` as base-128 limbs (little-endian).
+    pub limbs: [usize; LIMBS_U64],
+    /// The residue of the u64 byte-view modulo 257 (in F257), i.e. Σ (-1)^i * byte[i].
+    pub res257: usize,
 }
 
 /// Wiring for short challenges `short_challenge(128)` over a ring of dimension `ring_dim`.
@@ -2929,6 +2967,16 @@ pub fn build_poseidon_f257_with_cm_coins_frog_and_digit_mul_sq_surfaces_from_ops
             bal16_sq_digits: w.bal16_sq_digits.into_iter().map(to_glue_global).collect(),
         })
         .collect::<Vec<_>>();
+    let frogs_out = frog_locals
+        .into_iter()
+        .map(|(_idx, w)| FrogChallengeWiring {
+            digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
+            byte_vars: w.byte_vars.map(to_glue_global),
+            q_bit: to_glue_global(w.q_bit),
+            limbs: w.limbs.map(to_glue_global),
+            res257: to_glue_global(w.res257),
+        })
+        .collect::<Vec<_>>();
 
     for coin_idx in 0..n_coins {
         let off = coin_idx * tries * DIGITS_PER_TRY;
@@ -3248,6 +3296,7 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         Vec<F257>,
         Vec<ShortChallengeWiring>,
         Vec<BoundedU32ChallengeWiring>,
+        Vec<FrogChallengeWiring>,
         Vec<usize>, // tcch0 residues per instance (F257 vars)
         Vec<usize>, // tcch1 residues per instance (F257 vars)
         Vec<CmDigitMulSurfaceWiring>,
@@ -3329,6 +3378,9 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
     // Materialize all u32 blocks (both prefix `get_challenge` and CM u32 coins).
     let mut u32_locals: std::collections::BTreeMap<usize, BoundedU32ChallengeWiring> =
         std::collections::BTreeMap::new();
+    // Also materialize the same digit blocks as bounded Frog-field challenges.
+    let mut frog_locals: std::collections::BTreeMap<usize, FrogChallengeWiring> =
+        std::collections::BTreeMap::new();
     for ui in 0..u32_ranges.len() {
         let (u_start, u_len) = u32_ranges[ui];
         if u_len != DIGITS_PER_TRY {
@@ -3343,6 +3395,15 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         }
         let (u_limbs, u_bytes, u_bal16, u_bal16_sq) =
             bounded_u32_from_8_digits_base128(&mut gb, &u_digits_local);
+
+        // Full 8-digit byte-view (256 -> 0), used as u64 little-endian for Frog reduction.
+        let mut u64_bytes = [0usize; 8];
+        u64_bytes[0..4].copy_from_slice(&u_bytes);
+        for i in 4..8 {
+            u64_bytes[i] = digit_to_byte_var::<F257>(&mut gb, u_digits_local[i]);
+        }
+        let (q_bit, frog_limbs) = reduce_u64_mod_frog_from_byte_vars::<F257>(&mut gb, &u64_bytes);
+        let res257 = res257_from_u64_bytes_le(&mut gb, &u64_bytes);
         u32_locals.insert(
             ui,
             BoundedU32ChallengeWiring {
@@ -3351,6 +3412,16 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
                 limbs: u_limbs,
                 bal16_digits: u_bal16,
                 bal16_sq_digits: u_bal16_sq,
+            },
+        );
+        frog_locals.insert(
+            ui,
+            FrogChallengeWiring {
+                digit_vars: u_digits_local.to_vec(),
+                byte_vars: u64_bytes,
+                q_bit,
+                limbs: frog_limbs,
+                res257,
             },
         );
     }
@@ -3491,52 +3562,24 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
                             let kappa = 1usize << lg;
                             let l_instances = n_comh_elems / kappa;
 
-                            // Helper: residue of a 9-digit balanced base-16 u32-ish number.
-                            let mut pow16_9 = [F257::ZERO; 9];
-                            let mut cur = F257::ONE;
-                            let sixteen = F257::from(16u64);
-                            for i in 0..9 {
-                                pow16_9[i] = cur;
-                                cur *= sixteen;
-                            }
-                            #[inline]
-                            fn u32_res(
-                                gb: &mut Dr1csBuilder<F257>,
-                                digits9: &[usize],
-                                pow16_9: &[F257; 9],
-                            ) -> usize {
-                                debug_assert_eq!(digits9.len(), 9);
-                                let mut acc = F257::ZERO;
-                                for i in 0..9 {
-                                    acc += gb.assignment[digits9[i]] * pow16_9[i];
-                                }
-                                let v = gb.new_var(acc);
-                                let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + 9);
-                                lc.push((F257::ONE, v));
-                                for i in 0..9 {
-                                    lc.push((-pow16_9[i], digits9[i]));
-                                }
-                                gb.enforce_lc_times_one_eq_const(lc);
-                                v
-                            }
-
-                            // Build c0/c1 scalar vars in F257 from the first 2*log_kappa CM u32 coins.
+                            // Build c0/c1 scalar vars in F257 from the first 2*log_kappa CM challenge blocks.
+                            // We interpret each block as a u64 byte-view and take its residue mod 257.
                             let c0_start = cm_u32_start;
                             let c1_start = cm_u32_start + lg;
                             if c1_start + lg <= u32_ranges.len() {
                                 let mut c0_vars: Vec<usize> = Vec::with_capacity(lg);
                                 let mut c1_vars: Vec<usize> = Vec::with_capacity(lg);
                                 for i in 0..lg {
-                                    let u = u32_locals
+                                    let f = frog_locals
                                         .get(&(c0_start + i))
-                                        .ok_or("tiny gate: missing u32_locals for c0")?;
-                                    c0_vars.push(u32_res(&mut gb, &u.bal16_digits, &pow16_9));
+                                        .ok_or("tiny gate: missing frog_locals for c0")?;
+                                    c0_vars.push(f.res257);
                                 }
                                 for i in 0..lg {
-                                    let u = u32_locals
+                                    let f = frog_locals
                                         .get(&(c1_start + i))
-                                        .ok_or("tiny gate: missing u32_locals for c1")?;
-                                    c1_vars.push(u32_res(&mut gb, &u.bal16_digits, &pow16_9));
+                                        .ok_or("tiny gate: missing frog_locals for c1")?;
+                                    c1_vars.push(f.res257);
                                 }
 
                                 // Tensor weights in F257: fold tensor_product with [1-c_i, c_i].
@@ -4116,6 +4159,16 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
             bal16_sq_digits: w.bal16_sq_digits.into_iter().map(to_glue_global).collect(),
         })
         .collect::<Vec<_>>();
+    let frogs_out = frog_locals
+        .into_iter()
+        .map(|(_idx, w)| FrogChallengeWiring {
+            digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
+            byte_vars: w.byte_vars.map(to_glue_global),
+            q_bit: to_glue_global(w.q_bit),
+            limbs: w.limbs.map(to_glue_global),
+            res257: to_glue_global(w.res257),
+        })
+        .collect::<Vec<_>>();
     let surfaces_out = surfaces_mul_local
         .into_iter()
         .map(|s| CmDigitMulSurfaceWiring {
@@ -4166,6 +4219,7 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         asg,
         shorts_out,
         u32s_out,
+        frogs_out,
         tcch0_out,
         tcch1_out,
         surfaces_out,

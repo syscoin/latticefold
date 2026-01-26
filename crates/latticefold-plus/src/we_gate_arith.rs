@@ -137,7 +137,7 @@ where
         .splice(0..0, prefix_u32_squeeze_ops.into_iter());
     wiring_abs.frog_squeeze_ops = Vec::new();
 
-    let (inst_pose, asg_pose, _shorts, _u32s, _tcch0, _tcch1, _surfaces_mul, _surfaces_sq, pose_wiring) =
+    let (inst_pose, asg_pose, _shorts, _u32s, _frogs, _tcch0, _tcch1, _surfaces_mul, _surfaces_sq, pose_wiring) =
         tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
             None,
             &ops_f257,
@@ -875,7 +875,7 @@ where
     wiring_abs.frog_squeeze_ops = Vec::new();
 
     // Build Poseidon(F257)+coin surfaces with this concrete trace (assignment carries the real absorbs/squeezes).
-    let (inst_pose, asg_pose, _shorts, _u32s, _tcch0, _tcch1, _surfaces_mul, _surfaces_sq, _pose_wiring) =
+    let (inst_pose, asg_pose, _shorts, _u32s, _frogs, _tcch0, _tcch1, _surfaces_mul, _surfaces_sq, _pose_wiring) =
         tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
             None,
             &ops_f257,
@@ -1567,6 +1567,29 @@ fn ring_mul_negacyclic_toom4<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVar
         out.push(lc_to_var_opt::<F>(b, lc));
     }
     RingVars::new(out)
+}
+
+#[inline]
+fn toom4_points_distinct<F: PrimeField>() -> bool {
+    // Toom-4 uses points {0, ±1, ±2, ±3}. In small-characteristic prime fields (notably p∈{2,3,5})
+    // these collide (e.g. 3 == -2 mod 5), making the Vandermonde singular.
+    let pts = [
+        F::from(0u64),
+        F::from(1u64),
+        -F::from(1u64),
+        F::from(2u64),
+        -F::from(2u64),
+        F::from(3u64),
+        -F::from(3u64),
+    ];
+    for i in 0..7 {
+        for j in (i + 1)..7 {
+            if pts[i] == pts[j] {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn ring_mul_negacyclic<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: &RingVars) -> RingVars {
@@ -5797,7 +5820,7 @@ mod tests {
         // Update pairs to point at the first CM u32 block.
         pairs[0].1 = prefix_cnt;
 
-        let (inst_pose, asg_pose, _shorts, _u32s, _tcch0, _tcch1, _surfaces_mul, _surfaces_sq, _pose_wiring) =
+        let (inst_pose, asg_pose, _shorts, _u32s, _frogs, _tcch0, _tcch1, _surfaces_mul, _surfaces_sq, _pose_wiring) =
             tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
                 None,
                 &ops_f257,
