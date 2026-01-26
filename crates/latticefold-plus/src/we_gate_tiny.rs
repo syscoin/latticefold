@@ -3558,11 +3558,31 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
     // This is a small, shape-fixed step that starts exercising the ConstCoeff0-centered representation
     // with the same balanced-base16 machinery we’ll use for real CM math.
     if bb_centered_locals.is_empty() {
-        return Err("tiny gate: ConstCoeff0 enabled but no absorbed ring elements were detected".to_string());
+        return Err(
+            "tiny gate: ConstCoeff0 enabled but no absorbed ring elements were detected".to_string(),
+        );
     }
     if !u32_ranges.is_empty() {
-        // Use the very first u32 block in the wiring (includes any prefix `get_challenge` coins).
-        let u0 = u32_locals.get(&0).ok_or("tiny gate: expected u32_locals[0]")?;
+        // Use the first **CM** u32 block, not a prefix `get_challenge` coin.
+        // CM schedule: short squeezes (len=ring_dim) happen before CM u32 squeezes (len=8),
+        // so prefix u32 squeezes are exactly those with op-index < first short-squeeze op.
+        let first_short_op = wiring
+            .short_squeeze_ops
+            .iter()
+            .copied()
+            .min()
+            .ok_or("tiny gate: expected at least one short_squeeze_op")?;
+        let cm_u32_start = wiring
+            .u32_squeeze_ops
+            .iter()
+            .filter(|&&idx| idx < first_short_op)
+            .count();
+        if cm_u32_start >= u32_ranges.len() {
+            return Err("tiny gate: CM u32 start index out of range".to_string());
+        }
+        let u0 = u32_locals
+            .get(&cm_u32_start)
+            .ok_or("tiny gate: expected u32_locals[cm_u32_start]")?;
         let x0 = &bb_centered_locals[0];
         debug_assert_eq!(x0.centered_bal16_digits.len(), 9);
         debug_assert_eq!(u0.bal16_digits.len(), 9);
