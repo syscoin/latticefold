@@ -483,14 +483,13 @@ where
     // --------------------------------------------------------------------
     // CmProof::verify transcript schedule (Dcom prefix + CM proper).
     // --------------------------------------------------------------------
-    if n_lin_proofs != 1 {
-        return Err(
-            "poseidon_trace_schedule_for_plus: currently requires n_lin_proofs == 1 (prefix binding assumes L=1)"
-                .to_string(),
-        );
+    //
+    // `l_instances` is the number of “instances” carried by the CM proof (Dcom commitments,
+    // evaluation tables, etc). For the LF+ schedule, this matches the number of Π_lin proofs.
+    if n_lin_proofs == 0 {
+        return Err("poseidon_trace_schedule_for_plus: n_lin_proofs must be >= 1".to_string());
     }
-
-    let l_instances = 1usize;
+    let l_instances = n_lin_proofs;
     let kappa = params.kappa as usize;
     let k_rg = params.k as usize;
     let out_nvars = nvars_lin;
@@ -812,6 +811,94 @@ where
         mlen_mats,
         pairs,
     )
+}
+
+/// Witness-time (assignment) builder for the **tiny-field** (F257) Π_plus WE gate.
+///
+/// This is the canonical “real prover witness” entrypoint for the tiny gate: given a recorded
+/// verifier transcript trace (over `BF<R>` that stores F257 digits) it lifts the op schedule to
+/// Poseidon(F257), derives the CM coin surfaces, and returns a satisfying assignment for the
+/// corresponding arm-time shape produced by `build_we_dr1cs_for_plus_proof_shape_tiny`.
+///
+/// Notes:
+/// - `public_inputs` are WE statement public inputs in `F257` (typically 0/1 bits for an SP1 digest).
+/// - The returned assignment has prefix layout `[ONE] || [10×WeParams] || [public_inputs...]`.
+#[cfg(feature = "we_gate")]
+pub fn build_we_dr1cs_for_plus_proof_witness_tiny<R>(
+    trace: &PoseidonTranscriptTrace<BF<R>>,
+    params: &WeParams,
+    public_inputs: &[F257],
+    _n_lin_proofs: usize,
+    _mlen_mats: usize,
+    pairs: &[(usize, usize)],
+) -> Result<Vec<F257>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + Field + PrimeField,
+{
+    let ring_dim = R::dimension();
+    let k = params.k as usize;
+    let log_kappa = ark_std::log2((params.kappa as usize).next_power_of_two()) as usize;
+    let nvars_cm = params.nvars_cm as usize;
+
+    // Lift the recorded trace ops to F257.
+    let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<R>>(&trace.ops)?;
+
+    // The CM segment begins at the first `SqueezeField(len=ring_dim)` (short challenges).
+    let squeeze_field_op_offset = first_squeeze_field_op_index_of_len(&ops_f257, ring_dim)?;
+    let prefix_u32_squeeze_ops =
+        collect_get_challenge_squeeze_field_indices(&ops_f257, 0, squeeze_field_op_offset);
+
+    let wiring_rel = tiny::infer_cm_coin_op_wiring_from_ops(
+        &ops_f257,
+        ring_dim,
+        k,
+        log_kappa,
+        nvars_cm,
+        squeeze_field_op_offset,
+        0, // frog_need (not used on this path yet)
+    )?;
+    let mut wiring_abs = tiny::TinyCoinOpWiring::default();
+    wiring_abs.short_squeeze_ops = wiring_rel
+        .short_squeeze_ops
+        .into_iter()
+        .map(|i| i + squeeze_field_op_offset)
+        .collect();
+    wiring_abs.u32_squeeze_ops = wiring_rel
+        .u32_squeeze_ops
+        .into_iter()
+        .map(|i| i + squeeze_field_op_offset)
+        .collect();
+    wiring_abs
+        .u32_squeeze_ops
+        .splice(0..0, prefix_u32_squeeze_ops.into_iter());
+    wiring_abs.frog_squeeze_ops = Vec::new();
+
+    // Build Poseidon(F257)+coin surfaces with this concrete trace (assignment carries the real absorbs/squeezes).
+    let (inst_pose, asg_pose, _shorts, _u32s, _surfaces_mul, _surfaces_sq, _pose_wiring) =
+        tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
+            None,
+            &ops_f257,
+            ring_dim,
+            &wiring_abs,
+            pairs,
+        )?;
+
+    // Public statement prefix: [ONE] || [10×WeParams] || [public_inputs...]
+    let mut b_params = Dr1csBuilder::<F257>::new();
+    b_params.enforce_var_eq_const(b_params.one(), F257::from(1u64));
+    for &x in &params.to_field_vec::<F257>() {
+        b_params.new_var(x);
+    }
+    for &pi in public_inputs {
+        b_params.new_var(pi);
+    }
+    let (params_inst, params_asg) = b_params.into_instance();
+
+    // Merge in the same order as the shape builder.
+    let parts = vec![(params_inst, params_asg), (inst_pose, asg_pose)];
+    let (_inst, asg) = merge_sparse_dr1cs_share_one(parts).map_err(|e| e.to_string())?;
+    Ok(asg)
 }
 
 fn lf_ops_to_symphony_ops<F: PrimeField>(ops: &[LfPoseidonTraceOp<F>]) -> Vec<symphony::transcript::PoseidonTraceOp<F>> {
@@ -5478,74 +5565,21 @@ mod tests {
         let public_inputs_len = 0usize;
         let n_lin_proofs = 1usize; // schedule builder currently assumes L=1
         let mlen_mats = 0usize;
-        // Use the first *CM* u32 coin, not a prefix coin.
-        let mut pairs: Vec<(usize, usize)> = vec![(0, 0)];
+        // Mirror the SP1 oneproof path: use the canonical tiny-gate builders.
+        // (For now we keep `public_inputs_len=0`, so this is the minimal end-to-end roundtrip.)
+        let pairs: Vec<(usize, usize)> = vec![(0, 0)];
+        let public_inputs_f257: Vec<F257> = vec![F257::from(0u64); public_inputs_len];
 
-        // Build a satisfiable assignment for the *same* instance shape the armer uses.
-        let trace = super::poseidon_trace_schedule_for_plus::<R>(public_inputs_len, &params, n_lin_proofs, mlen_mats)
-            .expect("poseidon_trace_schedule_for_plus");
-        let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<R>>(&trace.ops)
-            .expect("lift_recording_trace_ops_to_f257");
-
-        let squeeze_field_op_offset =
-            super::first_squeeze_field_op_index_of_len(&ops_f257, <R as PolyRing>::dimension())
-                .expect("first short SqueezeField(len=ring_dim) exists");
-        let k = params.k as usize;
-        let log_kappa = ark_std::log2((params.kappa as usize).next_power_of_two()) as usize;
-        let nvars_cm = params.nvars_cm as usize;
-        let wiring_rel = tiny::infer_cm_coin_op_wiring_from_ops(
-            &ops_f257,
-            <R as PolyRing>::dimension(),
-            k,
-            log_kappa,
-            nvars_cm,
-            squeeze_field_op_offset,
-            0,
+        // Build a concrete trace that is self-consistent (squeeze values are re-absorbed).
+        let trace = super::poseidon_trace_schedule_for_plus::<R>(
+            public_inputs_len,
+            &params,
+            n_lin_proofs,
+            mlen_mats,
         )
-        .expect("infer_cm_coin_op_wiring_from_ops");
-        let mut wiring_abs = tiny::TinyCoinOpWiring::default();
-        wiring_abs.short_squeeze_ops = wiring_rel
-            .short_squeeze_ops
-            .into_iter()
-            .map(|i| i + squeeze_field_op_offset)
-            .collect();
-        wiring_abs.u32_squeeze_ops = wiring_rel
-            .u32_squeeze_ops
-            .into_iter()
-            .map(|i| i + squeeze_field_op_offset)
-            .collect();
-        wiring_abs.frog_squeeze_ops = Vec::new();
-        // Prepend prefix get_challenge u32 squeezes (same as the shape builder).
-        let prefix_u32_squeeze_ops =
-            super::collect_get_challenge_squeeze_field_indices(&ops_f257, 0, squeeze_field_op_offset);
-        let prefix_cnt = prefix_u32_squeeze_ops.len();
-        wiring_abs
-            .u32_squeeze_ops
-            .splice(0..0, prefix_u32_squeeze_ops.into_iter());
-        pairs[0].1 = prefix_cnt;
+        .expect("poseidon_trace_schedule_for_plus");
 
-        let (inst_pose, asg_pose, _shorts, _u32s, _surfaces_mul, _surfaces_sq, _pose_wiring) =
-            tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
-                None,
-                &ops_f257,
-                <R as PolyRing>::dimension(),
-                &wiring_abs,
-                &pairs,
-            )
-            .expect("build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring");
-
-        // Params prefix (must be public / statement-bound).
-        let mut b_params = Dr1csBuilder::<F257>::new();
-        b_params.enforce_var_eq_const(b_params.one(), F257::from(1u64));
-        for &x in &params.to_field_vec::<F257>() {
-            b_params.new_var(x);
-        }
-        let (params_inst, params_asg) = b_params.into_instance();
-
-        let parts = vec![(params_inst, params_asg), (inst_pose, asg_pose)];
-        let (inst, asg) = merge_sparse_dr1cs_share_one(parts).expect("merge parts");
-
-        // Armer builds the shape (should match our satisfiable inst).
+        // Armer builds the shape.
         let t_shape = Instant::now();
         let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
             &params,
@@ -5556,9 +5590,21 @@ mod tests {
         )
         .expect("build_we_dr1cs_for_plus_proof_shape_tiny");
         assert_eq!(shape.public_len, 1 + 10 + public_inputs_len);
-        assert_eq!(shape.inst.nvars, inst.nvars);
-        assert_eq!(shape.inst.constraints.len(), inst.constraints.len());
-        shape.inst.check(&asg).expect("shape should be satisfied by asg");
+
+        // Prover builds a satisfying assignment for *that same shape* from the recorded trace.
+        let asg = build_we_dr1cs_for_plus_proof_witness_tiny::<R>(
+            &trace,
+            &params,
+            &public_inputs_f257,
+            n_lin_proofs,
+            mlen_mats,
+            &pairs,
+        )
+        .expect("build_we_dr1cs_for_plus_proof_witness_tiny");
+        assert_eq!(asg.len(), shape.inst.nvars);
+        shape.inst
+            .check(&asg)
+            .expect("shape should be satisfied by witness assignment");
         eprintln!(
             "[tiny_gate] built shape in {:?}: public_len={} nvars={} constraints={}",
             t_shape.elapsed(),
