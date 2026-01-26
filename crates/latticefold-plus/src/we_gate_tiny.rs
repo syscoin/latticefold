@@ -3491,11 +3491,84 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
     for &(si, ui) in pairs {
         let s = short_locals.get(&si).expect("short local present");
         let u = u32_locals.get(&ui).expect("u32 local present");
+
+        // ------------------------------------------------------------
+        // First “CM math” consumption hook:
+        //
+        // Connect the digit-level multiplication gadget to standard F257 field multiplication
+        // by checking residues mod 257:
+        //   (coeff mod 257) * (u mod 257) == (product mod 257)
+        //
+        // This does not yet implement the full CM verifier math, but it makes the digit backend
+        // *semantically live* in the circuit (i.e., the products are no longer “dead wires”).
+        // ------------------------------------------------------------
+        let pow16: [F257; 13] = {
+            let mut p = [F257::ZERO; 13];
+            let mut cur = F257::ONE;
+            let sixteen = F257::from(16u64);
+            for i in 0..13 {
+                p[i] = cur;
+                cur *= sixteen;
+            }
+            p
+        };
+        let u_res = {
+            debug_assert_eq!(u.bal16_digits.len(), 9);
+            let mut acc = F257::ZERO;
+            for i in 0..9 {
+                acc += gb.assignment[u.bal16_digits[i]] * pow16[i];
+            }
+            let v = gb.new_var(acc);
+            // v - Σ pow16[i]*u_i = 0
+            let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + 9);
+            lc.push((F257::ONE, v));
+            for i in 0..9 {
+                lc.push((-pow16[i], u.bal16_digits[i]));
+            }
+            gb.enforce_lc_times_one_eq_const(lc);
+            v
+        };
+
         let products = scale_short_coeffs_by_u32(&mut gb, &s.coeff_bal16_digits, &u.bal16_digits);
         let products13 = products
             .iter()
             .map(|p12| rebalance_prod12_to_prod13(&mut gb, p12))
             .collect::<Vec<_>>();
+
+        // Residue checks for each coefficient product.
+        debug_assert_eq!(products13.len(), ring_dim);
+        debug_assert_eq!(s.coeff_bal16_digits.len(), ring_dim);
+        for j in 0..ring_dim {
+            let c3 = &s.coeff_bal16_digits[j];
+            // coeff residue: c0 + 16*c1 + 256*c2
+            let coeff_val = gb.assignment[c3[0]]
+                + gb.assignment[c3[1]] * F257::from(16u64)
+                + gb.assignment[c3[2]] * F257::from(256u64);
+            let coeff_res = gb.new_var(coeff_val);
+            gb.enforce_lc_times_one_eq_const(vec![
+                (F257::ONE, coeff_res),
+                (-F257::ONE, c3[0]),
+                (-F257::from(16u64), c3[1]),
+                (-F257::from(256u64), c3[2]),
+            ]);
+
+            let p13 = &products13[j];
+            let mut prod_val = F257::ZERO;
+            for i in 0..13 {
+                prod_val += gb.assignment[p13[i]] * pow16[i];
+            }
+            let prod_res = gb.new_var(prod_val);
+            let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + 13);
+            lc.push((F257::ONE, prod_res));
+            for i in 0..13 {
+                lc.push((-pow16[i], p13[i]));
+            }
+            gb.enforce_lc_times_one_eq_const(lc);
+
+            // coeff_res * u_res == prod_res  (in F257)
+            gb.enforce_mul(coeff_res, u_res, prod_res);
+        }
+
         let sum_digits = sum_product_digits_bal16(&mut gb, &products13, 16);
         surfaces_mul_local.push(CmDigitMulSurfaceWiring {
             short_block_idx: si,
