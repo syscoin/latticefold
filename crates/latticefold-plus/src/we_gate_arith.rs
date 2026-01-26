@@ -756,38 +756,18 @@ fn ring_scale<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, s: usize) ->
     RingVars::new(out)
 }
 
-/// Scale a **const-coeff** ring element by a scalar: only coeff[0] is live.
+/// Scale a ring element by a **constant** scalar (no mul constraints).
 ///
-/// This is the canonical optimization for SP1/R1LF-style base-ring lifts:
-/// when `x = (x0, 0, 0, ...)`, `x*s = (x0*s, 0, 0, ...)` uses **one** multiplication constraint
-/// instead of `d` coefficient-wise muls.
+/// This uses a single linear constraint per coefficient (`scalar_mul_const`), and is safe
+/// whenever the scalar is statement-bound (e.g. powers of `decomp_b`).
 #[inline]
-fn ring_scale_constcoeff0<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, s: usize) -> RingVars {
-    cm_bump(|c| c.ring_scale += 1);
-    let d = x.d();
-    if d == 0 {
-        return RingVars::new(Vec::new());
-    }
-    cm_bump(|c| c.scalar_mul += 1);
-    let v0 = b.new_var(b.assignment[x.coeffs[0]] * b.assignment[s]);
-    b.enforce_mul(x.coeffs[0], s, v0);
-    let mut out = Vec::with_capacity(d);
-    out.push(v0);
-    for _ in 1..d {
-        out.push(const_var::<F>(b, F::ZERO));
+fn ring_scale_const<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, c: F) -> RingVars {
+    cm_bump(|cc| cc.ring_scale += 1);
+    let mut out = Vec::with_capacity(x.d());
+    for i in 0..x.d() {
+        out.push(scalar_mul_const::<F>(b, x.coeffs[i], c));
     }
     RingVars::new(out)
-}
-
-/// Enforce that a ring element is **const-coeff** (only coefficient 0 may be nonzero).
-///
-/// In the SP1-only WE-gate, this is the right way to “assume const-coeff”: make it explicit in the
-/// relation so the prover cannot stuff higher coefficients.
-#[inline]
-fn enforce_const_coeff0_ringvars<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars) {
-    for i in 1..x.d() {
-        b.enforce_var_eq_const(x.coeffs[i], F::ZERO);
-    }
 }
 
 // -------------------------------------------------------------------------
@@ -2109,11 +2089,12 @@ where
         let L = dcom.evals.len();
         let k_rg = dcom.dparams.k;
         let decomp_b = dcom.dparams.b;
-        let mut dppow_vars: Vec<usize> = Vec::with_capacity(k_rg);
+        // Precompute powers of `decomp_b` as statement-bound constants (used in the rgchk checks).
+        let mut dppow_const: Vec<BF<R>> = Vec::with_capacity(k_rg);
         for i in 0..k_rg {
             let base = R::BaseRing::from(decomp_b);
             let p_br = ark_ff::Field::pow(&base, [i as u64]);
-            dppow_vars.push(const_var(&mut b, bf_from_base_ring::<R>(p_br)));
+            dppow_const.push(bf_from_base_ring::<R>(p_br));
         }
 
         let mut eval_a_vars: Vec<Vec<usize>> = Vec::with_capacity(L);
@@ -2172,7 +2153,7 @@ where
                     let mut acc = ring_zero.clone();
                     for i in 0..k_rg {
                         let ui_col = &out_e_vars[ni][base + i][col];
-                        let scaled = ring_scale::<BF<R>>(&mut b, ui_col, dppow_vars[i]);
+                        let scaled = ring_scale_const::<BF<R>>(&mut b, ui_col, dppow_const[i]);
                         acc = ring_add::<BF<R>>(&mut b, &acc, &scaled);
                     }
                     let ct = ct_psi_mul_ring::<R>(&mut b, &acc);
