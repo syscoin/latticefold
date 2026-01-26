@@ -12,8 +12,8 @@ use symphony::transcript::PoseidonTraceOp;
 
 use super::challenges::{
     bounded_u32_from_8_digits_base128, digit_to_byte_var, res257_from_u64_bytes_le,
-    short_challenge_from_digits_128, squeeze_field_ranges_by_op_index, BoundedU32ChallengeWiring,
-    FrogChallengeWiring, ShortChallengeWiring, TinyCoinOpWiring,
+    select_first_ok_u32_try_digits, short_challenge_from_digits_128, squeeze_field_ranges_by_op_index,
+    BoundedU32ChallengeWiring, FrogChallengeWiring, ShortChallengeWiring, TinyCoinOpWiring,
 };
 use super::coins::{sample_frog_coin_unrolled_rejection_8_digits, FrogRejectionCoinWiring};
 use super::digits::{
@@ -96,21 +96,36 @@ fn build_short_blocks(
 fn build_u32_and_frog_blocks(
     glue: &mut GlueCtx,
     pose_wiring: &PoseidonDr1csWiring,
-    u32_ranges: &[(usize, usize)],
+    u32_starts: &[usize],
 ) -> Result<(Vec<BoundedU32ChallengeWiring>, Vec<FrogChallengeWiring>), String> {
-    let mut u32_out: Vec<BoundedU32ChallengeWiring> = Vec::with_capacity(u32_ranges.len());
-    let mut frog_out: Vec<FrogChallengeWiring> = Vec::with_capacity(u32_ranges.len());
-    for (ui, (u_start, u_len)) in u32_ranges.iter().copied().enumerate() {
-        if u_len != DIGITS_PER_TRY {
-            return Err(format!(
-                "u32 block {ui} length mismatch (got {u_len}, expected {DIGITS_PER_TRY})"
-            ));
+    let tries: usize = DEFAULT_REJECTION_TRIES;
+    let mut u32_out: Vec<BoundedU32ChallengeWiring> = Vec::with_capacity(u32_starts.len());
+    let mut frog_out: Vec<FrogChallengeWiring> = Vec::with_capacity(u32_starts.len());
+    for (ui, &u_start_op) in u32_starts.iter().enumerate() {
+        // Copy all try digits locally (but keep wiring compact: store only the selected digits).
+        let mut all_digits_local: Vec<usize> = Vec::with_capacity(tries * DIGITS_PER_TRY);
+        for t in 0..tries {
+            let op_idx = u_start_op + t;
+            let (u_start, u_len) = pose_wiring
+                .squeeze_field_ranges
+                .get(op_idx)
+                .copied()
+                .ok_or_else(|| format!("u32 start op idx {u_start_op} + {t} out of range"))?;
+            if u_len != DIGITS_PER_TRY {
+                return Err(format!(
+                    "u32 try block {ui}.{t} length mismatch (got {u_len}, expected {DIGITS_PER_TRY})"
+                ));
+            }
+            for &gv in &pose_wiring.squeeze_field_vars[u_start..u_start + u_len] {
+                all_digits_local.push(glue.copy_digit(gv));
+            }
         }
-        let u_digits_global = &pose_wiring.squeeze_field_vars[u_start..u_start + u_len];
-        let mut u_digits_local = [0usize; DIGITS_PER_TRY];
-        for i in 0..DIGITS_PER_TRY {
-            u_digits_local[i] = glue.copy_digit(u_digits_global[i]);
-        }
+
+        // Select the first acceptable try (digits[0..4] all != 256), matching `transcript.rs`.
+        let (u_digits_local, found_bit) =
+            select_first_ok_u32_try_digits(&mut glue.gb, &all_digits_local, tries);
+        glue.gb.enforce_var_eq_const(found_bit, F257::ONE);
+
         let (u_limbs, u_bytes, u_bal16, u_bal16_sq) =
             bounded_u32_from_8_digits_base128(&mut glue.gb, &u_digits_local);
 
@@ -935,7 +950,8 @@ pub(super) fn build(
     let mut glue = GlueCtx::new(pose_asg);
 
     let short_locals = build_short_blocks(&mut glue, &pose_wiring, ring_dim, &short_ranges)?;
-    let (u32_locals, frog_locals) = build_u32_and_frog_blocks(&mut glue, &pose_wiring, &u32_ranges)?;
+    let (u32_locals, frog_locals) =
+        build_u32_and_frog_blocks(&mut glue, &pose_wiring, &wiring.u32_squeeze_ops)?;
     let frog_rejection_locals = build_frog_rejection_coins(&mut glue, &pose_wiring, &frog_ranges)?;
     let (tcch0_local, tcch1_local) =
         compute_tcch(&mut glue, ops, &pose_wiring, ring_dim, wiring, &u32_ranges, &frog_locals)?;

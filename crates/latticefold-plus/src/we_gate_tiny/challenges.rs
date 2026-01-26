@@ -7,6 +7,7 @@ use symphony::transcript::PoseidonTraceOp;
 use super::digits::{alloc_bal16_digit, f257_to_i32_bal, mul_u32ish9_to_fixed_bal16, u32_bytes_to_bal16_digits};
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::params::{DIGITS_PER_TRY, LIMB_BITS, LIMBS_U32, LIMBS_U64};
+use crate::transcript::DEFAULT_REJECTION_TRIES;
 
 /// Explicit wiring of which Poseidon `SqueezeField` ops (by **squeeze-field op index**) are used
 /// for each challenge type.
@@ -16,7 +17,10 @@ use super::params::{DIGITS_PER_TRY, LIMB_BITS, LIMBS_U32, LIMBS_U64};
 pub struct TinyCoinOpWiring {
     /// `SqueezeField(len=ring_dim)` op indices for `short_challenge(128)` blocks.
     pub short_squeeze_ops: Vec<usize>,
-    /// `SqueezeField(len=8)` op indices for bounded u32 scalar challenges.
+    /// `SqueezeField(len=8)` **start op indices** for bounded u32 scalar challenges.
+    ///
+    /// Each logical `get_challenge()` performs `DEFAULT_REJECTION_TRIES` consecutive `SqueezeField(len=8)`
+    /// attempts (each followed by an absorb); this vector stores the **first** squeeze-op index of each group.
     pub u32_squeeze_ops: Vec<usize>,
     /// `SqueezeField(len=8)` op indices for Frog rejection candidates (length must be `n_coins*tries`).
     pub frog_squeeze_ops: Vec<usize>,
@@ -64,9 +68,11 @@ pub fn infer_cm_coin_op_wiring_from_ops(
 ) -> Result<TinyCoinOpWiring, String> {
     let short_need = cm_short_challenge_blocks(ring_dim, k);
     let u32_need = cm_bounded_u32_challenges(log_kappa, nvars_cm);
+    let tries = DEFAULT_REJECTION_TRIES;
 
     let mut out = TinyCoinOpWiring::default();
     let mut squeeze_field_op_idx = 0usize;
+    let mut u32_try_blocks_seen = 0usize;
 
     // First pass: count squeeze-field ops, and select indices in the desired order.
     for op in ops {
@@ -75,9 +81,14 @@ pub fn infer_cm_coin_op_wiring_from_ops(
                 if v.len() == ring_dim && out.short_squeeze_ops.len() < short_need {
                     out.short_squeeze_ops
                         .push(squeeze_field_op_idx - squeeze_field_op_offset);
-                } else if v.len() == DIGITS_PER_TRY && out.u32_squeeze_ops.len() < u32_need {
-                    out.u32_squeeze_ops
-                        .push(squeeze_field_op_idx - squeeze_field_op_offset);
+                } else if v.len() == DIGITS_PER_TRY && u32_try_blocks_seen < u32_need * tries {
+                    // One logical u32 challenge corresponds to `tries` consecutive squeeze blocks.
+                    // Record only the first squeeze-op index of each group.
+                    if (u32_try_blocks_seen % tries) == 0 {
+                        out.u32_squeeze_ops
+                            .push(squeeze_field_op_idx - squeeze_field_op_offset);
+                    }
+                    u32_try_blocks_seen += 1;
                 } else if v.len() == DIGITS_PER_TRY && out.frog_squeeze_ops.len() < frog_need {
                     out.frog_squeeze_ops
                         .push(squeeze_field_op_idx - squeeze_field_op_offset);
@@ -103,7 +114,7 @@ pub fn infer_cm_coin_op_wiring_from_ops(
     }
     if out.u32_squeeze_ops.len() != u32_need {
         return Err(format!(
-            "infer_cm_coin_op_wiring: need {} u32 squeezes (len=8), got {}",
+            "infer_cm_coin_op_wiring: need {} u32 challenge starts (len=8), got {}",
             u32_need,
             out.u32_squeeze_ops.len()
         ));
@@ -116,6 +127,142 @@ pub fn infer_cm_coin_op_wiring_from_ops(
         ));
     }
     Ok(out)
+}
+
+/// Select the first acceptable `get_challenge()` try (fixed schedule).
+///
+/// Input `digits_by_try` is a flat array of `tries * DIGITS_PER_TRY` digit vars,
+/// ordered by try then digit index. Acceptance predicate matches `transcript.rs`:
+/// accept iff the first 4 digits are all != 256.
+///
+/// Returns:
+/// - selected digit vars `[d0..d7]` (each equals the corresponding digit of the chosen try)
+/// - `found_bit` indicating that an acceptable try exists (enforced by caller if desired)
+pub(super) fn select_first_ok_u32_try_digits(
+    b: &mut Dr1csBuilder<F257>,
+    digits_by_try: &[usize],
+    tries: usize,
+) -> ([usize; DIGITS_PER_TRY], usize) {
+    assert_eq!(digits_by_try.len(), tries * DIGITS_PER_TRY);
+
+    // Enforce an existing var is boolean: v*(1-v)=0.
+    #[inline]
+    fn enforce_bit_var<F: PrimeField>(b: &mut Dr1csBuilder<F>, v: usize) {
+        b.add_constraint(
+            vec![(F::ONE, v)],
+            vec![(F::ONE, b.one()), (-F::ONE, v)],
+            vec![(F::ZERO, b.one())],
+        );
+    }
+
+    // Boolean witness for (d == 256), with inverse trick constraints.
+    fn digit_is_256_bit(b: &mut Dr1csBuilder<F257>, d: usize) -> usize {
+        let du16 = digit_u16::<F257>(b, d);
+        debug_assert!(du16 < 257);
+        let is256 = alloc_bool::<F257>(b, du16 == 256);
+
+        // diff = d - 256
+        let diff = b.new_var(b.assignment[d] - F257::from(256u64));
+        b.enforce_lc_times_one_eq_const(vec![
+            (F257::ONE, diff),
+            (-F257::ONE, d),
+            (F257::from(256u64), b.one()),
+        ]);
+
+        // inv = 0 if diff==0 else diff^{-1}
+        let inv = b.new_var(if du16 == 256 {
+            F257::ZERO
+        } else {
+            (b.assignment[d] - F257::from(256u64)).inverse().unwrap()
+        });
+        let prod = b.new_var(b.assignment[diff] * b.assignment[inv]);
+        b.enforce_mul(diff, inv, prod);
+        // prod = 1 - is256
+        b.enforce_lc_times_one_eq_const(vec![
+            (F257::ONE, prod),
+            (F257::ONE, is256),
+            (-F257::ONE, b.one()),
+        ]);
+        // diff * is256 = 0
+        let z = b.new_var(F257::ZERO);
+        b.enforce_var_eq_const(z, F257::ZERO);
+        b.enforce_mul(diff, is256, z);
+        is256
+    }
+
+    // found accumulates OR of ok bits; select_t picks first ok.
+    let mut found = b.new_var(F257::ZERO);
+    b.enforce_var_eq_const(found, F257::ZERO);
+    enforce_bit_var::<F257>(b, found);
+
+    let mut selects: Vec<usize> = Vec::with_capacity(tries);
+    for t in 0..tries {
+        let base = t * DIGITS_PER_TRY;
+        let e0 = digit_is_256_bit(b, digits_by_try[base + 0]);
+        let e1 = digit_is_256_bit(b, digits_by_try[base + 1]);
+        let e2 = digit_is_256_bit(b, digits_by_try[base + 2]);
+        let e3 = digit_is_256_bit(b, digits_by_try[base + 3]);
+
+        // o = 1 - e
+        let one_minus = |b: &mut Dr1csBuilder<F257>, e: usize| -> usize {
+            let v = b.new_var(F257::ONE - b.assignment[e]);
+            b.enforce_lc_times_one_eq_const(vec![(F257::ONE, v), (F257::ONE, e), (-F257::ONE, b.one())]);
+            v
+        };
+        let o0 = one_minus(b, e0);
+        let o1 = one_minus(b, e1);
+        let o2 = one_minus(b, e2);
+        let o3 = one_minus(b, e3);
+
+        // ok = o0*o1*o2*o3 (boolean)
+        let ok01 = b.new_var(b.assignment[o0] * b.assignment[o1]);
+        b.enforce_mul(o0, o1, ok01);
+        let ok23 = b.new_var(b.assignment[o2] * b.assignment[o3]);
+        b.enforce_mul(o2, o3, ok23);
+        let ok = b.new_var(b.assignment[ok01] * b.assignment[ok23]);
+        b.enforce_mul(ok01, ok23, ok);
+        enforce_bit_var::<F257>(b, ok);
+
+        let not_found = one_minus(b, found);
+        let sel = b.new_var(b.assignment[ok] * b.assignment[not_found]);
+        b.enforce_mul(ok, not_found, sel);
+        enforce_bit_var::<F257>(b, sel);
+        selects.push(sel);
+
+        // found' = found + sel
+        let found_next = b.new_var(b.assignment[found] + b.assignment[sel]);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F257::ONE, found_next),
+            (-F257::ONE, found),
+            (-F257::ONE, sel),
+        ]);
+        enforce_bit_var::<F257>(b, found_next);
+        found = found_next;
+    }
+
+    // selected digit i = Σ_t sel_t * digit_{t,i}
+    let mut out = [0usize; DIGITS_PER_TRY];
+    for i in 0..DIGITS_PER_TRY {
+        let mut prods: Vec<usize> = Vec::with_capacity(tries);
+        let mut acc = F257::ZERO;
+        for t in 0..tries {
+            let d = digits_by_try[t * DIGITS_PER_TRY + i];
+            let p = b.new_var(b.assignment[selects[t]] * b.assignment[d]);
+            b.enforce_mul(selects[t], d, p);
+            acc += b.assignment[p];
+            prods.push(p);
+        }
+        let v = b.new_var(acc);
+        let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + prods.len());
+        lc.push((F257::ONE, v));
+        for &p in &prods {
+            lc.push((-F257::ONE, p));
+        }
+        b.enforce_lc_times_one_eq_const(lc);
+        out[i] = v;
+    }
+
+    (out, found)
 }
 
 pub(super) fn squeeze_field_ranges_by_op_index(
