@@ -3484,92 +3484,276 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
     }
 
     // --------------------------------------------------------------------
-    // CM math port (stage 0): decode `absorb_comh` ring elements as coefficient bytes and
-    // canonicalize each coefficient as a 64-bit field element mod `FROG_P`.
+    // CM math port (stage 0): compute tcch0/tcch1 *residues* (in F257) from the transcript.
     //
-    // This does NOT implement CM verifier arithmetic yet; it just makes the committed ring
-    // elements *available* in a structured, range-checked form for downstream gadgets.
+    // This reintroduces the CM-aligned `tcch` hook **without** any ConstCoeff0/BabyBear enforcement.
+    // We work purely with residues in F257:
+    // - parse `absorb_comh` ring elements as bytes (already F257 vars in the Poseidon schedule),
+    // - extract a residue for coefficient-0 via the identity 256 ≡ -1 (mod 257):
+    //     u = Σ_{i=0}^{coeff_bytes-1} byte[i] * 256^i  (as an integer)
+    //     u mod 257 = Σ byte[i] * (-1)^i            (in F257)
+    // - build tensor(c0), tensor(c1) from the bounded-u32 coin digits (base16),
+    // - compute per-instance tcch0/tcch1 = Σ_j tensor_c{0,1}[j] * coh_res[j].
+    //
+    // This stays in the tiny field and is cheap enough to keep the e2e tiny test fast.
     // --------------------------------------------------------------------
-    //
-    // Transcript convention (LF+): ring elements are absorbed as fixed-width LE bytes per coeff,
-    // concatenated in coefficient order. For the Frog 64-bit base field, coeff_bytes = 8.
-    //
-    // We locate the `absorb_comh` window purely from the transcript schedule:
-    // - after the last short-challenge SqueezeField(len=ring_dim)
-    // - before the first CM u32 `get_challenge` squeeze (c0[0])
+    let mut tcch0_local: Vec<usize> = Vec::new();
+    let mut tcch1_local: Vec<usize> = Vec::new();
     if ring_dim > 0 && !wiring.short_squeeze_ops.is_empty() && !wiring.u32_squeeze_ops.is_empty() {
-        const COEFF_BYTES: usize = 8; // 64-bit base field element encoding
-        let reb = ring_dim * COEFF_BYTES;
-
-        let last_short_op = *wiring
-            .short_squeeze_ops
-            .iter()
-            .max()
-            .expect("non-empty short_squeeze_ops");
-        let first_short_op = *wiring
-            .short_squeeze_ops
-            .iter()
-            .min()
-            .expect("non-empty short_squeeze_ops");
-
-        // Prefix u32 squeezes happen before the first short squeeze; skip them.
-        let cm_u32_start = wiring
-            .u32_squeeze_ops
-            .iter()
-            .filter(|&&idx| idx < first_short_op)
-            .count();
-        if cm_u32_start < wiring.u32_squeeze_ops.len() {
-            let first_cm_u32_op = wiring.u32_squeeze_ops[cm_u32_start];
-
-            // Collect Absorb ranges in the absorb_comh window.
-            let mut absorb_idx = 0usize;
-            let mut squeeze_field_op_idx = 0usize;
-            let mut after_short = false;
-            let mut comh_absorb_ranges: Vec<(usize, usize)> = Vec::new();
-            for op in ops {
-                match op {
-                    PoseidonTraceOp::Absorb(_v) => {
-                        let (ab_start, ab_len) = *pose_wiring
-                            .absorb_ranges
-                            .get(absorb_idx)
-                            .ok_or("tiny gate: pose_wiring.absorb_ranges oob")?;
-                        absorb_idx += 1;
-                        if after_short && squeeze_field_op_idx <= first_cm_u32_op {
-                            comh_absorb_ranges.push((ab_start, ab_len));
-                        }
-                    }
-                    PoseidonTraceOp::SqueezeField(_v) => {
-                        if squeeze_field_op_idx == last_short_op {
-                            after_short = true;
-                        }
-                        squeeze_field_op_idx += 1;
-                    }
-                    PoseidonTraceOp::SqueezeBytes { .. } => {}
-                }
+        // Infer ring-element absorb byte-length from the schedule.
+        let mut ring_elem_bytes: Option<usize> = None;
+        for &(_st, ln) in &pose_wiring.absorb_ranges {
+            if ln % ring_dim == 0 && ln > ring_dim {
+                ring_elem_bytes = Some(match ring_elem_bytes {
+                    None => ln,
+                    Some(cur) => cur.min(ln),
+                });
             }
+        }
+        if let Some(reb) = ring_elem_bytes {
+            let coeff_bytes = reb / ring_dim;
+            if coeff_bytes > 0 {
+                let last_short_op = *wiring
+                    .short_squeeze_ops
+                    .iter()
+                    .max()
+                    .expect("non-empty short_squeeze_ops");
+                let first_short_op = *wiring
+                    .short_squeeze_ops
+                    .iter()
+                    .min()
+                    .expect("non-empty short_squeeze_ops");
 
-            // Decode each absorbed ring element (possibly multiple per Absorb op).
-            // We do not assume any const-coeff shape: all coefficients are decoded.
-            let mut _comh_coeff_limbs: Vec<[usize; LIMBS_U64]> = Vec::new();
-            for &(ab_start, ab_len) in &comh_absorb_ranges {
-                if ab_len < reb || (ab_len % reb) != 0 {
-                    continue;
-                }
-                let n_blocks = ab_len / reb;
-                for blk in 0..n_blocks {
-                    let blk_start = ab_start + blk * reb;
-                    for coeff in 0..ring_dim {
-                        let off = blk_start + coeff * COEFF_BYTES;
-                        let mut bytes8 = [0usize; 8];
-                        for j in 0..8 {
-                            let gv = pose_wiring.absorb_vars[off + j];
-                            let lv = copy_digit(&mut gb, &pose_asg, &mut local_map, gv);
-                            // Range-check as byte (8-bit).
-                            let _ = decompose_existing_byte_var_to_bits::<F257>(&mut gb, lv);
-                            bytes8[j] = lv;
+                // Prefix u32 squeezes happen before the first short squeeze; skip them.
+                let cm_u32_start = wiring
+                    .u32_squeeze_ops
+                    .iter()
+                    .filter(|&&idx| idx < first_short_op)
+                    .count();
+                if cm_u32_start < wiring.u32_squeeze_ops.len() {
+                    let first_cm_u32_op = wiring.u32_squeeze_ops[cm_u32_start];
+
+                    // Collect Absorb ranges in the absorb_comh window.
+                    let mut absorb_idx = 0usize;
+                    let mut squeeze_field_op_idx = 0usize;
+                    let mut after_short = false;
+                    let mut comh_absorb_ranges: Vec<(usize, usize)> = Vec::new();
+                    for op in ops {
+                        match op {
+                            PoseidonTraceOp::Absorb(_v) => {
+                                let (ab_start, ab_len) = *pose_wiring
+                                    .absorb_ranges
+                                    .get(absorb_idx)
+                                    .ok_or("tiny gate: pose_wiring.absorb_ranges oob")?;
+                                absorb_idx += 1;
+                                if after_short && squeeze_field_op_idx <= first_cm_u32_op {
+                                    comh_absorb_ranges.push((ab_start, ab_len));
+                                }
+                            }
+                            PoseidonTraceOp::SqueezeField(_v) => {
+                                if squeeze_field_op_idx == last_short_op {
+                                    after_short = true;
+                                }
+                                squeeze_field_op_idx += 1;
+                            }
+                            PoseidonTraceOp::SqueezeBytes { .. } => {}
                         }
-                        let (_q, z) = reduce_u64_mod_frog_from_byte_vars::<F257>(&mut gb, &bytes8);
-                        _comh_coeff_limbs.push(z);
+                    }
+
+                    // Collect residues for each absorbed `comh` ring element (coefficient-0 only).
+                    let mut coh0_res: Vec<usize> = Vec::new();
+                    for &(ab_start, ab_len) in &comh_absorb_ranges {
+                        if ab_len < reb || (ab_len % reb) != 0 {
+                            continue;
+                        }
+                        let n_blocks = ab_len / reb;
+                        for blk in 0..n_blocks {
+                            let blk_start = ab_start + blk * reb;
+                            // coeff0 bytes are at the start of the ring element.
+                            let mut acc = F257::ZERO;
+                            let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + coeff_bytes);
+                            // v - Σ (-1)^i * byte[i] == 0
+                            for i in 0..coeff_bytes {
+                                let gv = pose_wiring.absorb_vars[blk_start + i];
+                                let lv = copy_digit(&mut gb, &pose_asg, &mut local_map, gv);
+                                // Ensure it's a byte (8-bit); Poseidon absorbs may include arbitrary F257 elems,
+                                // but ring encoding uses bytes.
+                                let _ = decompose_existing_byte_var_to_bits::<F257>(&mut gb, lv);
+                                let sign = if (i & 1) == 0 { F257::ONE } else { -F257::ONE };
+                                acc += gb.assignment[lv] * sign;
+                                lc.push((-sign, lv));
+                            }
+                            let v = gb.new_var(acc);
+                            lc.insert(0, (F257::ONE, v));
+                            gb.enforce_lc_times_one_eq_const(lc);
+                            coh0_res.push(v);
+                        }
+                    }
+
+                    // Infer (log_kappa, nvars_cm) from the u32 schedule and number of absorbed `comh` elements.
+                    let n_comh_elems = coh0_res.len();
+                    if n_comh_elems > 0 {
+                        let cm_u32_need = wiring.u32_squeeze_ops.len().saturating_sub(cm_u32_start);
+                        let mut log_kappa: Option<usize> = None;
+                        let mut nvars_cm_guess: Option<usize> = None;
+                        for lg in 0usize..=20 {
+                            let kappa = 1usize << lg;
+                            if n_comh_elems % kappa != 0 {
+                                continue;
+                            }
+                            if cm_u32_need < 2 * lg + 2 {
+                                continue;
+                            }
+                            let rem = cm_u32_need - (2 * lg + 2);
+                            if rem % 2 != 0 {
+                                continue;
+                            }
+                            let nv = rem / 2;
+                            if nv == 0 {
+                                continue;
+                            }
+                            log_kappa = Some(lg);
+                            nvars_cm_guess = Some(nv);
+                            break;
+                        }
+                        if let (Some(lg), Some(_nv)) = (log_kappa, nvars_cm_guess) {
+                            let kappa = 1usize << lg;
+                            let l_instances = n_comh_elems / kappa;
+
+                            // Helper: residue of a 9-digit balanced base-16 u32-ish number.
+                            let mut pow16_9 = [F257::ZERO; 9];
+                            let mut cur = F257::ONE;
+                            let sixteen = F257::from(16u64);
+                            for i in 0..9 {
+                                pow16_9[i] = cur;
+                                cur *= sixteen;
+                            }
+                            #[inline]
+                            fn u32_res(
+                                gb: &mut Dr1csBuilder<F257>,
+                                digits9: &[usize],
+                                pow16_9: &[F257; 9],
+                            ) -> usize {
+                                debug_assert_eq!(digits9.len(), 9);
+                                let mut acc = F257::ZERO;
+                                for i in 0..9 {
+                                    acc += gb.assignment[digits9[i]] * pow16_9[i];
+                                }
+                                let v = gb.new_var(acc);
+                                let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + 9);
+                                lc.push((F257::ONE, v));
+                                for i in 0..9 {
+                                    lc.push((-pow16_9[i], digits9[i]));
+                                }
+                                gb.enforce_lc_times_one_eq_const(lc);
+                                v
+                            }
+
+                            // Build c0/c1 scalar vars in F257 from the first 2*log_kappa CM u32 coins.
+                            let c0_start = cm_u32_start;
+                            let c1_start = cm_u32_start + lg;
+                            if c1_start + lg <= u32_ranges.len() {
+                                let mut c0_vars: Vec<usize> = Vec::with_capacity(lg);
+                                let mut c1_vars: Vec<usize> = Vec::with_capacity(lg);
+                                for i in 0..lg {
+                                    let u = u32_locals
+                                        .get(&(c0_start + i))
+                                        .ok_or("tiny gate: missing u32_locals for c0")?;
+                                    c0_vars.push(u32_res(&mut gb, &u.bal16_digits, &pow16_9));
+                                }
+                                for i in 0..lg {
+                                    let u = u32_locals
+                                        .get(&(c1_start + i))
+                                        .ok_or("tiny gate: missing u32_locals for c1")?;
+                                    c1_vars.push(u32_res(&mut gb, &u.bal16_digits, &pow16_9));
+                                }
+
+                                // Tensor weights in F257: fold tensor_product with [1-c_i, c_i].
+                                #[inline]
+                                fn tensor_vars(gb: &mut Dr1csBuilder<F257>, c: &[usize]) -> Vec<usize> {
+                                    let mut acc: Vec<usize> = vec![gb.new_var(F257::ONE)];
+                                    gb.enforce_var_eq_const(acc[0], F257::ONE);
+                                    for &ci in c {
+                                        let one_minus = gb.new_var(F257::ONE - gb.assignment[ci]);
+                                        gb.enforce_lc_times_one_eq_const(vec![
+                                            (F257::ONE, one_minus),
+                                            (F257::ONE, ci),
+                                            (-F257::ONE, gb.one()),
+                                        ]);
+                                        let mut next = Vec::with_capacity(acc.len() * 2);
+                                        for &t in &acc {
+                                            // t*(1-ci)
+                                            let v0 = gb.new_var(gb.assignment[t] * gb.assignment[one_minus]);
+                                            gb.enforce_mul(t, one_minus, v0);
+                                            next.push(v0);
+                                            // t*ci
+                                            let v1 = gb.new_var(gb.assignment[t] * gb.assignment[ci]);
+                                            gb.enforce_mul(t, ci, v1);
+                                            next.push(v1);
+                                        }
+                                        acc = next;
+                                    }
+                                    acc
+                                }
+
+                                let tensor_c0 = tensor_vars(&mut gb, &c0_vars);
+                                let tensor_c1 = tensor_vars(&mut gb, &c1_vars);
+                                debug_assert_eq!(tensor_c0.len(), kappa);
+                                debug_assert_eq!(tensor_c1.len(), kappa);
+
+                                // Compute tcch0/tcch1 per instance as a single LC over products.
+                                tcch0_local.clear();
+                                tcch1_local.clear();
+                                tcch0_local.reserve(l_instances);
+                                tcch1_local.reserve(l_instances);
+                                for l in 0..l_instances {
+                                    let base = l * kappa;
+                                    // Build product vars (mul constraints).
+                                    let mut terms0: Vec<usize> = Vec::with_capacity(kappa);
+                                    let mut terms1: Vec<usize> = Vec::with_capacity(kappa);
+                                    for j in 0..kappa {
+                                        let rj = coh0_res[base + j];
+                                        let m0 = gb.new_var(gb.assignment[tensor_c0[j]] * gb.assignment[rj]);
+                                        gb.enforce_mul(tensor_c0[j], rj, m0);
+                                        let m1 = gb.new_var(gb.assignment[tensor_c1[j]] * gb.assignment[rj]);
+                                        gb.enforce_mul(tensor_c1[j], rj, m1);
+                                        terms0.push(m0);
+                                        terms1.push(m1);
+                                    }
+                                    // Sum via one LC constraint (avoid a scalar-add chain).
+                                    let sum0 = {
+                                        let mut acc = F257::ZERO;
+                                        for &t in &terms0 {
+                                            acc += gb.assignment[t];
+                                        }
+                                        let v = gb.new_var(acc);
+                                        let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + terms0.len());
+                                        lc.push((F257::ONE, v));
+                                        for &t in &terms0 {
+                                            lc.push((-F257::ONE, t));
+                                        }
+                                        gb.enforce_lc_times_one_eq_const(lc);
+                                        v
+                                    };
+                                    let sum1 = {
+                                        let mut acc = F257::ZERO;
+                                        for &t in &terms1 {
+                                            acc += gb.assignment[t];
+                                        }
+                                        let v = gb.new_var(acc);
+                                        let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + terms1.len());
+                                        lc.push((F257::ONE, v));
+                                        for &t in &terms1 {
+                                            lc.push((-F257::ONE, t));
+                                        }
+                                        gb.enforce_lc_times_one_eq_const(lc);
+                                        v
+                                    };
+                                    tcch0_local.push(sum0);
+                                    tcch1_local.push(sum1);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -4104,8 +4288,8 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         .collect::<Vec<_>>();
 
     let bb_centered_out: Vec<BabyBearCenteredWiring> = Vec::new();
-    let tcch0_out: Vec<usize> = Vec::new();
-    let tcch1_out: Vec<usize> = Vec::new();
+    let tcch0_out: Vec<usize> = tcch0_local.into_iter().map(to_glue_global).collect();
+    let tcch1_out: Vec<usize> = tcch1_local.into_iter().map(to_glue_global).collect();
 
     Ok((
         inst,
