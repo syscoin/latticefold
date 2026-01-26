@@ -1511,7 +1511,14 @@ where
     // add an explicit statement-bound mode bit in `WeParams` (preferred), but we avoid that API
     // change here.
     // ---------------------------------------------------------------------
-    let const_coeff0_only = (d == 64) && (params.decomp_b == 12);
+    // SP1/R1LF currently uses either:
+    // - the Frog64 hardcoded safe params: decomp_b=12, or
+    // - the generic boundedness choice: decomp_b=d/2 (=32 when d=64).
+    //
+    // Both correspond to the same *structural* fact we care about here: base-field lifts are
+    // const-coeff ring elements.
+    let const_coeff0_only =
+        (d == 64) && (params.decomp_b == 12 || params.decomp_b == (d as u64 / 2));
     // Hygiene: ensure the proof's embedded dparams agree with statement-bound params.
     if (proof.dcom.dparams.b as u64) != params.decomp_b {
         return Err(format!(
@@ -1521,12 +1528,18 @@ where
         ));
     }
     if std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1") {
+        let reason = if const_coeff0_only {
+            if params.decomp_b == 12 {
+                "inferred_sp1_decomp_b12"
+            } else {
+                "inferred_sp1_decomp_b_d_over_2"
+            }
+        } else {
+            "generic"
+        };
         println!(
             "[we_gate/cm] const_coeff0_only={} (d={}, decomp_b={}, reason={})",
-            const_coeff0_only,
-            d,
-            params.decomp_b,
-            if const_coeff0_only { "inferred_sp1" } else { "generic" }
+            const_coeff0_only, d, params.decomp_b, reason
         );
     }
 
