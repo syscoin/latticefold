@@ -59,6 +59,7 @@ fn collect_get_challenge_squeeze_field_indices(
 ) -> Vec<usize> {
     let mut out = Vec::new();
     let mut sf_idx = 0usize;
+    let mut try_seen = 0usize;
     for (i, op) in ops.iter().enumerate() {
         if let symphony::transcript::PoseidonTraceOp::SqueezeField(v) = op {
             let my_sf = sf_idx;
@@ -72,7 +73,12 @@ fn collect_get_challenge_squeeze_field_indices(
             // get_challenge() immediately re-absorbs the squeezed elements.
             if let Some(symphony::transcript::PoseidonTraceOp::Absorb(a)) = ops.get(i + 1) {
                 if a.len() == CHALLENGE_DIGITS {
-                    out.push(my_sf);
+                    // Fixed-tries rejection: return only the *start* squeeze-op index for each
+                    // logical challenge (one per DEFAULT_REJECTION_TRIES consecutive tries).
+                    if (try_seen % DEFAULT_REJECTION_TRIES) == 0 {
+                        out.push(my_sf);
+                    }
+                    try_seen += 1;
                 }
             }
         }
