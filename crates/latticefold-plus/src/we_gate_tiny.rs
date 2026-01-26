@@ -3633,7 +3633,8 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         // Find a (log_kappa, nvars_cm) that matches the u32 schedule and partitions comh elements.
         let mut log_kappa: Option<usize> = None;
         let mut nvars_cm_guess: Option<usize> = None;
-        for lg in 1usize..=20 {
+        // Allow lg=0 for the tiny test case kappa=1.
+        for lg in 0usize..=20 {
             let kappa = 1usize << lg;
             if n_comh_elems % kappa != 0 {
                 continue;
