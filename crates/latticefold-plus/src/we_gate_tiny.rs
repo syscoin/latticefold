@@ -3413,7 +3413,7 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         lv
     }
 
-    // Determine which short/u32 blocks we need.
+    // Validate requested pairs are in range (but materialize *all* blocks).
     for &(si, ui) in pairs {
         if si >= short_ranges.len() {
             return Err(format!("short_block_idx {si} out of range"));
@@ -3423,13 +3423,10 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         }
     }
 
-    // Materialize required short blocks.
+    // Materialize all short blocks (CM will need them; keep shapes statement-only).
     let mut short_locals: std::collections::BTreeMap<usize, ShortChallengeWiring> =
         std::collections::BTreeMap::new();
-    for &(si, _ui) in pairs {
-        if short_locals.contains_key(&si) {
-            continue;
-        }
+    for si in 0..short_ranges.len() {
         let (s_start, s_len) = short_ranges[si];
         if s_len != ring_dim {
             return Err(format!(
@@ -3455,13 +3452,10 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         );
     }
 
-    // Materialize required u32 blocks.
+    // Materialize all u32 blocks (both prefix `get_challenge` and CM u32 coins).
     let mut u32_locals: std::collections::BTreeMap<usize, BoundedU32ChallengeWiring> =
         std::collections::BTreeMap::new();
-    for &(_si, ui) in pairs {
-        if u32_locals.contains_key(&ui) {
-            continue;
-        }
+    for ui in 0..u32_ranges.len() {
         let (u_start, u_len) = u32_ranges[ui];
         if u_len != DIGITS_PER_TRY {
             return Err(format!(
