@@ -1376,27 +1376,48 @@ fn toom4_vandermonde_inv<F: PrimeField>() -> ([[F; 7]; 7], [F; 7]) {
     (inv, pts)
 }
 
+// -------------------------------------------------------------------------
+// Toom-4 build-time scratch (no math change).
+//
+// We keep per-level evaluation buffers (length m) so repeated Toom-4 calls don't constantly
+// allocate new `Vec<Lc<_>>` and their internal `Vec<(F,usize)>` backing stores.
+// -------------------------------------------------------------------------
+
+struct Toom4Scratch<F: PrimeField> {
+    m: usize,
+    a_eval_buf: Vec<Lc<F>>,
+    c_eval_buf: Vec<Lc<F>>,
+}
+
 #[inline]
-fn toom4_points_distinct<F: PrimeField>() -> bool {
-    // Toom-4 uses points {0, ±1, ±2, ±3}. In small-characteristic prime fields (notably p∈{2,3,5})
-    // these collide (e.g. 3 == -2 mod 5), making the Vandermonde singular.
-    let pts = [
-        F::from(0u64),
-        F::from(1u64),
-        -F::from(1u64),
-        F::from(2u64),
-        -F::from(2u64),
-        F::from(3u64),
-        -F::from(3u64),
-    ];
-    for i in 0..7 {
-        for j in (i + 1)..7 {
-            if pts[i] == pts[j] {
-                return false;
-            }
-        }
+fn toom4_scratch_take<F: PrimeField>(
+    scratch: &mut Vec<Toom4Scratch<F>>,
+    m: usize,
+) -> (usize, Vec<Lc<F>>, Vec<Lc<F>>) {
+    if let Some(pos) = scratch.iter().position(|s| s.m == m) {
+        let a = core::mem::take(&mut scratch[pos].a_eval_buf);
+        let c = core::mem::take(&mut scratch[pos].c_eval_buf);
+        return (pos, a, c);
     }
-    true
+    let a_eval_buf: Vec<Lc<F>> = (0..m).map(|_| Vec::new()).collect();
+    let c_eval_buf: Vec<Lc<F>> = (0..m).map(|_| Vec::new()).collect();
+    scratch.push(Toom4Scratch {
+        m,
+        a_eval_buf: Vec::new(),
+        c_eval_buf: Vec::new(),
+    });
+    (scratch.len() - 1, a_eval_buf, c_eval_buf)
+}
+
+#[inline]
+fn toom4_scratch_put<F: PrimeField>(
+    scratch: &mut Vec<Toom4Scratch<F>>,
+    idx: usize,
+    a_eval_buf: Vec<Lc<F>>,
+    c_eval_buf: Vec<Lc<F>>,
+) {
+    scratch[idx].a_eval_buf = a_eval_buf;
+    scratch[idx].c_eval_buf = c_eval_buf;
 }
 
 fn poly_mul_toom4_lc<F: PrimeField>(
@@ -1405,6 +1426,9 @@ fn poly_mul_toom4_lc<F: PrimeField>(
     c: &[Lc<F>],
     inv_v: &[[F; 7]; 7],
     pts: &[F; 7],
+    pts2: &[F; 7],
+    pts3: &[F; 7],
+    scratch: &mut Vec<Toom4Scratch<F>>,
 ) -> Vec<Lc<F>> {
     assert_eq!(a.len(), c.len());
     let n = a.len();
@@ -1425,64 +1449,84 @@ fn poly_mul_toom4_lc<F: PrimeField>(
     let (c1, rest) = rest.split_at(m);
     let (c2, c3) = rest.split_at(m);
 
-    // Evaluate at points: a(t) = a0 + t a1 + t^2 a2 + t^3 a3, coefficient-wise (each coeff is an LC).
-    let mut a_eval: Vec<Vec<Lc<F>>> = Vec::with_capacity(7);
-    let mut c_eval: Vec<Vec<Lc<F>>> = Vec::with_capacity(7);
-    for &t in pts {
-        let t2 = t * t;
-        let t3 = t2 * t;
-        let mut ae = Vec::with_capacity(m);
-        let mut ce = Vec::with_capacity(m);
-        for i in 0..m {
-            let mut lc_a = Vec::new();
-            lc_add_scaled_into::<F>(&mut lc_a, F::ONE, &a0[i]);
-            lc_add_scaled_into::<F>(&mut lc_a, t, &a1[i]);
-            lc_add_scaled_into::<F>(&mut lc_a, t2, &a2[i]);
-            lc_add_scaled_into::<F>(&mut lc_a, t3, &a3[i]);
-            ae.push(lc_a);
-
-            let mut lc_c = Vec::new();
-            lc_add_scaled_into::<F>(&mut lc_c, F::ONE, &c0[i]);
-            lc_add_scaled_into::<F>(&mut lc_c, t, &c1[i]);
-            lc_add_scaled_into::<F>(&mut lc_c, t2, &c2[i]);
-            lc_add_scaled_into::<F>(&mut lc_c, t3, &c3[i]);
-            ce.push(lc_c);
-        }
-        a_eval.push(ae);
-        c_eval.push(ce);
-    }
-
-    // Pointwise products (recursive): w(t) = a(t) * c(t), each is length (2m-1).
+    // Evaluate at each point and recursively multiply.
+    //
+    // Performance: reuse `a_eval_buf/c_eval_buf` across points (scratch) to avoid heap churn.
+    let (scratch_idx, mut a_eval_buf, mut c_eval_buf) = toom4_scratch_take::<F>(scratch, m);
     let mut w_eval: Vec<Vec<Lc<F>>> = Vec::with_capacity(7);
-    for i in 0..7 {
-        w_eval.push(poly_mul_toom4_lc::<F>(b, &a_eval[i], &c_eval[i], inv_v, pts));
+
+    for p in 0..7 {
+        let t = pts[p];
+        let t2 = pts2[p];
+        let t3 = pts3[p];
+        for i in 0..m {
+            // a(t)[i] = a0[i] + t a1[i] + t^2 a2[i] + t^3 a3[i]
+            let out_a = &mut a_eval_buf[i];
+            out_a.clear();
+            out_a.reserve(a0[i].len() + a1[i].len() + a2[i].len() + a3[i].len());
+            lc_add_scaled_into::<F>(out_a, F::ONE, &a0[i]);
+            lc_add_scaled_into::<F>(out_a, t, &a1[i]);
+            lc_add_scaled_into::<F>(out_a, t2, &a2[i]);
+            lc_add_scaled_into::<F>(out_a, t3, &a3[i]);
+
+            // c(t)[i] = c0[i] + t c1[i] + t^2 c2[i] + t^3 c3[i]
+            let out_c = &mut c_eval_buf[i];
+            out_c.clear();
+            out_c.reserve(c0[i].len() + c1[i].len() + c2[i].len() + c3[i].len());
+            lc_add_scaled_into::<F>(out_c, F::ONE, &c0[i]);
+            lc_add_scaled_into::<F>(out_c, t, &c1[i]);
+            lc_add_scaled_into::<F>(out_c, t2, &c2[i]);
+            lc_add_scaled_into::<F>(out_c, t3, &c3[i]);
+        }
+
+        w_eval.push(poly_mul_toom4_lc::<F>(
+            b,
+            &a_eval_buf,
+            &c_eval_buf,
+            inv_v,
+            pts,
+            pts2,
+            pts3,
+            scratch,
+        ));
     }
+    debug_assert_eq!(w_eval.len(), 7);
     debug_assert_eq!(w_eval[0].len(), 2 * m - 1);
 
-    // Interpolate coefficient blocks c_j (j=0..6), each length (2m-1).
-    let mut blocks: Vec<Vec<Lc<F>>> = (0..7).map(|_| vec![Vec::new(); 2 * m - 1]).collect();
-    for k in 0..(2 * m - 1) {
-        // w_k is values at points (length 7) for this coefficient position.
-        for j in 0..7 {
-            let mut lc: Lc<F> = Vec::new();
-            for i in 0..7 {
-                let coef = inv_v[j][i];
-                if coef.is_zero() {
-                    continue;
-                }
-                lc_add_scaled_into::<F>(&mut lc, coef, &w_eval[i][k]);
-            }
-            blocks[j][k] = lc;
-        }
-    }
+    // Return scratch buffers to the cache (keep capacities).
+    toom4_scratch_put::<F>(scratch, scratch_idx, a_eval_buf, c_eval_buf);
 
-    // Assemble full convolution length 2n-1 = 8m-1 by shifting blocks by j*m.
+    // Interpolate and assemble directly into the full convolution (len 2n-1 = 8m-1),
+    // avoiding an intermediate `blocks[7][2m-1]` allocation.
+    //
+    // Performance:
+    // - Each output coefficient is written exactly once (unique `(j,k) -> idx`), so we can reserve
+    //   capacity up-front and avoid realloc during `lc_extend_scaled`.
+    // - `inv_v` has some structural zeros for these evaluation points; skip them by iterating over
+    //   precomputed nonzero index sets (row-wise).
+    const NZ0: [usize; 1] = [0];
+    const NZ1: [usize; 6] = [1, 2, 3, 4, 5, 6];
+    const NZ2: [usize; 7] = [0, 1, 2, 3, 4, 5, 6];
+    const NZ3: [usize; 6] = [1, 2, 3, 4, 5, 6];
+    const NZ4: [usize; 7] = [0, 1, 2, 3, 4, 5, 6];
+    const NZ5: [usize; 6] = [1, 2, 3, 4, 5, 6];
+    const NZ6: [usize; 7] = [0, 1, 2, 3, 4, 5, 6];
+    const NZ: [&[usize]; 7] = [&NZ0, &NZ1, &NZ2, &NZ3, &NZ4, &NZ5, &NZ6];
+
     let mut res: Vec<Lc<F>> = (0..(2 * n - 1)).map(|_| Vec::new()).collect();
-    for j in 0..7 {
-        let base = j * m;
-        for k in 0..(2 * m - 1) {
-            let idx = base + k;
-            lc_add_scaled_into::<F>(&mut res[idx], F::ONE, &blocks[j][k]);
+    for k in 0..(2 * m - 1) {
+        for j in 0..7 {
+            let idx = j * m + k;
+            let dst = &mut res[idx];
+            // Reserve once: sum of input LC sizes for this interpolation row.
+            let mut cap = 0usize;
+            for &i in NZ[j] {
+                cap += w_eval[i][k].len();
+            }
+            dst.reserve(cap);
+            for &i in NZ[j] {
+                lc_add_scaled_into::<F>(dst, inv_v[j][i], &w_eval[i][k]);
+            }
         }
     }
     res
@@ -1496,9 +1540,21 @@ fn ring_mul_negacyclic_toom4<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVar
     assert!(d % 4 == 0);
 
     let (inv_v, pts) = toom4_vandermonde_inv::<F>();
+    // Precompute point powers once per top-level Toom-4 (no `pow` in hot loops).
+    let pts2 = pts.map(|t| t * t);
+    let pts3 = [
+        pts2[0] * pts[0],
+        pts2[1] * pts[1],
+        pts2[2] * pts[2],
+        pts2[3] * pts[3],
+        pts2[4] * pts[4],
+        pts2[5] * pts[5],
+        pts2[6] * pts[6],
+    ];
     let x_lc: Vec<Lc<F>> = x.coeffs.iter().map(|&v| vec![(F::ONE, v)]).collect();
     let y_lc: Vec<Lc<F>> = y.coeffs.iter().map(|&v| vec![(F::ONE, v)]).collect();
-    let prod_lc = poly_mul_toom4_lc::<F>(b, &x_lc, &y_lc, &inv_v, &pts); // len 2d-1
+    let mut scratch: Vec<Toom4Scratch<F>> = Vec::new();
+    let prod_lc = poly_mul_toom4_lc::<F>(b, &x_lc, &y_lc, &inv_v, &pts, &pts2, &pts3, &mut scratch); // len 2d-1
     debug_assert_eq!(prod_lc.len(), 2 * d - 1);
     let mut out = Vec::with_capacity(d);
     for k in 0..d {
