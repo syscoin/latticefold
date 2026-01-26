@@ -15,7 +15,7 @@
 use ark_ff::{BigInteger, PrimeField};
 use symphony::dpp_sumcheck::Dr1csBuilder;
 
-const FROG_P: u64 = 15912092521325583641u64;
+pub(crate) const FROG_P: u64 = 15912092521325583641u64;
 
 const LIMB_BASE_U64: u64 = 128;
 const LIMB_BITS: usize = 7;

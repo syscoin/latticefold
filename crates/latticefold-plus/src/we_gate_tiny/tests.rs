@@ -1,0 +1,681 @@
+use super::*;
+
+use ark_ff::{BigInteger, Field, PrimeField};
+use latticefold::transcript::poseidon::F257;
+use symphony::dpp_sumcheck::Dr1csBuilder;
+use symphony::transcript::PoseidonTraceOp;
+
+use crate::we_frog_poseidon_f257::FROG_P;
+use crate::we_gate_tiny::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U32, LIMBS_U64};
+
+use super::challenges::bounded_u32_from_8_digits_base128;
+use super::digits::*;
+use super::frog::reduce_u64_mod_frog_from_byte_vars;
+use super::gadgets::alloc_byte;
+
+use latticefold::transcript::Transcript;
+use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as FrogRing;
+
+fn var_to_u8<F: PrimeField>(b: &Dr1csBuilder<F>, v: usize) -> u8 {
+    b.assignment[v]
+        .into_bigint()
+        .to_bytes_le()
+        .get(0)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn limbs_to_u64_base128<F: PrimeField>(b: &Dr1csBuilder<F>, limbs: &[usize; LIMBS_U64]) -> u64 {
+    let mut acc: u64 = 0;
+    for i in (0..LIMBS_U64).rev() {
+        let di = b.assignment[limbs[i]]
+            .into_bigint()
+            .to_bytes_le()
+            .get(0)
+            .copied()
+            .unwrap_or(0) as u64;
+        acc <<= LIMB_BITS;
+        acc |= di & (LIMB_BASE_U64 - 1);
+    }
+    acc
+}
+
+fn limbs_u32_from_base128<F: PrimeField>(b: &Dr1csBuilder<F>, limbs: &[usize; LIMBS_U32]) -> u32 {
+    let mut acc: u64 = 0;
+    for i in (0..LIMBS_U32).rev() {
+        let di = b.assignment[limbs[i]]
+            .into_bigint()
+            .to_bytes_le()
+            .get(0)
+            .copied()
+            .unwrap_or(0) as u64;
+        acc <<= LIMB_BITS;
+        acc |= di & (LIMB_BASE_U64 - 1);
+    }
+    acc as u32
+}
+
+#[test]
+fn test_poseidon_f257_ops_arithmetization_satisfies() {
+    // Record a tiny transcript trace in the **actual sponge field** (F257).
+    //
+    // IMPORTANT: we must not use `crate::recording_transcript::TracePoseidonTranscript`,
+    // which lifts F257 digits into the outer base ring. For a tiny-field gate we want the
+    // transcript ops directly over F257.
+    let mut tr = symphony::transcript::TracePoseidonTranscript::<FrogRing>::empty::<()>();
+    tr.absorb_field_element(&<FrogRing as stark_rings::PolyRing>::BaseRing::from(123u64));
+    let _c = tr.get_challenge(); // SqueezeField(8) + Absorb(8)
+    let _b = tr.squeeze_bytes(17); // SqueezeBytes(17) (no reabsorb)
+
+    let ops: Vec<PoseidonTraceOp<F257>> = tr.trace().ops.clone();
+
+    let (inst, asg, _wiring, _byte_wiring) =
+        poseidon_f257_arithmetize(None, &ops).expect("poseidon_f257_arithmetize");
+    inst.check(&asg).expect("poseidon(F257) dR1CS satisfied");
+}
+
+#[test]
+fn test_reduce_u64_mod_frog_branch_u_lt_p() {
+    let mut b = Dr1csBuilder::<F257>::new();
+    b.enforce_var_eq_const(b.one(), F257::ONE);
+
+    let u = 42u64;
+    let mut u_byte_vars = [0usize; 8];
+    for (i, v) in u.to_le_bytes().into_iter().enumerate() {
+        let bv = alloc_byte::<F257>(&mut b, v);
+        u_byte_vars[i] = bv.byte;
+    }
+    let (q, z) = reduce_u64_mod_frog_from_byte_vars::<F257>(&mut b, &u_byte_vars);
+
+    // q should be 0, z == u.
+    assert_eq!(var_to_u8::<F257>(&b, q), 0);
+    assert_eq!(limbs_to_u64_base128::<F257>(&b, &z), u);
+
+    let (inst, asg) = b.into_instance();
+    inst.check(&asg).expect("branch u<p satisfied");
+}
+
+#[test]
+fn test_reduce_u64_mod_frog_branch_u_ge_p() {
+    let mut b = Dr1csBuilder::<F257>::new();
+    b.enforce_var_eq_const(b.one(), F257::ONE);
+
+    let u = FROG_P + 424242u64;
+    let mut u_byte_vars = [0usize; 8];
+    for (i, v) in u.to_le_bytes().into_iter().enumerate() {
+        let bv = alloc_byte::<F257>(&mut b, v);
+        u_byte_vars[i] = bv.byte;
+    }
+    let (q, z) = reduce_u64_mod_frog_from_byte_vars::<F257>(&mut b, &u_byte_vars);
+
+    // q should be 1, z == u - p.
+    assert_eq!(var_to_u8::<F257>(&b, q), 1);
+    assert_eq!(limbs_to_u64_base128::<F257>(&b, &z), u - FROG_P);
+
+    let (inst, asg) = b.into_instance();
+    inst.check(&asg).expect("branch u>=p satisfied");
+}
+
+#[test]
+fn test_reduce_u64_mod_frog_rejects_wrong_q() {
+    let mut b = Dr1csBuilder::<F257>::new();
+    b.enforce_var_eq_const(b.one(), F257::ONE);
+
+    let u = FROG_P + 7u64;
+    let mut u_byte_vars = [0usize; 8];
+    for (i, v) in u.to_le_bytes().into_iter().enumerate() {
+        let bv = alloc_byte::<F257>(&mut b, v);
+        u_byte_vars[i] = bv.byte;
+    }
+    let (q, _z) = reduce_u64_mod_frog_from_byte_vars::<F257>(&mut b, &u_byte_vars);
+
+    let (inst, mut asg) = b.into_instance();
+    // Flip q (should be 1 -> set to 0) without adjusting anything else.
+    asg[q] = F257::ZERO;
+    assert!(inst.check(&asg).is_err(), "flipped q should break constraints");
+}
+
+#[test]
+fn test_bounded_u32_from_8_digits_base128_matches_byte_view() {
+    let mut b = Dr1csBuilder::<F257>::new();
+    b.enforce_var_eq_const(b.one(), F257::ONE);
+
+    // Build a digit block with a 256 in it to exercise byte view (256 -> 0).
+    let ds: [u16; 8] = [1, 2, 256, 4, 5, 6, 7, 8];
+    let mut dvars = [0usize; 8];
+    for i in 0..8 {
+        dvars[i] = b.new_var(F257::from(ds[i] as u64));
+    }
+
+    let (limbs, bytes, bal16_digits, bal16_sq_digits) =
+        bounded_u32_from_8_digits_base128(&mut b, &dvars);
+
+    // Expected u32 from byte view of first 4 digits.
+    let bv = |x: u16| if x == 256 { 0u8 } else { x as u8 };
+    let exp = u32::from_le_bytes([bv(ds[0]), bv(ds[1]), bv(ds[2]), bv(ds[3])]);
+
+    // Check reconstructed u32 from limbs.
+    assert_eq!(limbs_u32_from_base128::<F257>(&b, &limbs), exp);
+
+    // Also check bytes match.
+    let to_u8 = |v: usize| var_to_u8::<F257>(&b, v);
+    assert_eq!(to_u8(bytes[0]), bv(ds[0]));
+    assert_eq!(to_u8(bytes[1]), bv(ds[1]));
+    assert_eq!(to_u8(bytes[2]), bv(ds[2]));
+    assert_eq!(to_u8(bytes[3]), bv(ds[3]));
+
+    // Check balanced base-16 digits decode to the same u32.
+    let mut acc: i128 = 0;
+    let mut pow: i128 = 1;
+    for &v in &bal16_digits {
+        acc += (f257_to_i32_bal(b.assignment[v]) as i128) * pow;
+        pow *= 16;
+    }
+    assert_eq!(acc as u64, exp as u64);
+
+    // Check square digits decode to exp^2.
+    let mut sq_acc: i128 = 0;
+    let mut pow: i128 = 1;
+    for &v in &bal16_sq_digits {
+        sq_acc += (f257_to_i32_bal(b.assignment[v]) as i128) * pow;
+        pow *= 16;
+    }
+    assert_eq!(sq_acc, (exp as i128) * (exp as i128));
+
+    let (inst, asg) = b.into_instance();
+    inst.check(&asg).expect("bounded u32 gadget satisfied");
+}
+
+#[test]
+fn test_rebalance_prod12_to_prod13_decodes_same() {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x5EED_13u64);
+    let mut b = Dr1csBuilder::<F257>::new();
+    b.enforce_var_eq_const(b.one(), F257::ONE);
+
+    // Random coeff in [-128,127] and random scalar in a u32-ish envelope.
+    let coeff: i128 = rng.gen_range(-128i128..=127i128);
+    let x: i128 = rng.gen_range(-(1i128 << 32)..(1i128 << 32));
+
+    // coeff -> 3 balanced digits
+    let mut cur = coeff;
+    let mut c3 = [0usize; 3];
+    for i in 0..3 {
+        let mut r = ((cur % 16) + 16) % 16;
+        if r >= 8 {
+            r -= 16;
+        }
+        c3[i] = alloc_bal16_digit(&mut b, r as i8);
+        cur = (cur - r) / 16;
+    }
+    debug_assert_eq!(cur, 0);
+
+    // x -> 9 balanced digits
+    let x_digits = {
+        let mut xx = x;
+        let mut out: Vec<usize> = Vec::with_capacity(9);
+        for _ in 0..9 {
+            let mut r = ((xx % 16) + 16) % 16;
+            if r >= 8 {
+                r -= 16;
+            }
+            out.push(alloc_bal16_digit(&mut b, r as i8));
+            xx = (xx - r) / 16;
+        }
+        out
+    };
+
+    let p12 = mul_bal16_3_by_digits9(&mut b, &c3, &x_digits);
+    let p13 = rebalance_prod12_to_prod13(&mut b, &p12);
+
+    let decode = |digits: &[usize]| -> i128 {
+        let mut acc: i128 = 0;
+        let mut pow: i128 = 1;
+        for &dv in digits {
+            acc += (f257_to_i32_bal(b.assignment[dv]) as i128) * pow;
+            pow *= 16;
+        }
+        acc
+    };
+    assert_eq!(decode(&p12), decode(&p13));
+    assert_eq!(decode(&p13), coeff * x);
+
+    let (inst, asg) = b.into_instance();
+    inst.check(&asg).expect("rebalance prod satisfied");
+}
+
+#[test]
+fn test_lift_recording_trace_ops_to_f257_roundtrip_small() {
+    use ark_ff::Field;
+    use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as R;
+    use stark_rings::PolyRing;
+    use stark_rings::Ring;
+
+    // Record a tiny trace in the LF+ recording transcript (base ring is large, but values are digits/bytes).
+    let mut rec = crate::recording_transcript::TracePoseidonTranscript::<R>::empty::<()>();
+    rec.absorb(&R::ONE);
+    let _ = rec.squeeze_bytes(17);
+    let _c = rec.get_challenge();
+    let tr = rec.trace().clone();
+
+    // Lift ops to F257 and ensure lengths line up.
+    type BF = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
+    let ops_f257 =
+        lift_recording_trace_ops_to_f257::<BF>(&tr.ops).expect("lift_recording_trace_ops_to_f257");
+    assert_eq!(ops_f257.len(), tr.ops.len());
+
+    // Check that every absorbed/squeezed element is in 0..=256.
+    for op in ops_f257 {
+        match op {
+            PoseidonTraceOp::Absorb(v) | PoseidonTraceOp::SqueezeField(v) => {
+                for e in v {
+                    let du16 = e.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u16;
+                    assert!(du16 < 257);
+                }
+            }
+            PoseidonTraceOp::SqueezeBytes { .. } => {}
+        }
+    }
+}
+
+#[test]
+fn test_mul_bal16_small_3_by_u32_bal_roundtrip() {
+    // Multiply a 12-bit-ish value (3 base-16 digits) by a balanced u32 (9 digits),
+    // and check the digit decomposition matches native integer multiplication.
+    fn to_bal16_u32(mut x: u32) -> Vec<i8> {
+        // Start from base-16 digits (0..15), then balance with carry so each digit in [-8,7].
+        let mut digs: Vec<i8> = Vec::with_capacity(9);
+        let mut carry: i32 = 0;
+        for _ in 0..8 {
+            let d = (x & 0xF) as i32;
+            x >>= 4;
+            let mut t = d + carry;
+            if t >= 8 {
+                t -= 16;
+                carry = 1;
+            } else {
+                carry = 0;
+            }
+            digs.push(t as i8);
+        }
+        digs.push(carry as i8);
+        digs
+    }
+    fn from_bal16(digs: &[i8]) -> i128 {
+        let mut acc: i128 = 0;
+        let mut pow: i128 = 1;
+        for &d in digs {
+            acc += (d as i128) * pow;
+            pow *= 16;
+        }
+        acc
+    }
+
+    let a_u16: u16 = 0x0777; // all nibbles < 8 => already balanced (3 digits)
+    let b_u32: u32 = 0xffff_fffe;
+    let a_i = a_u16 as i128;
+    let b_bal = to_bal16_u32(b_u32);
+    let b_i = from_bal16(&b_bal);
+    assert_eq!(b_i as u64, b_u32 as u64);
+    let prod_i = a_i * b_i;
+
+    let mut b = Dr1csBuilder::<F257>::new();
+    b.enforce_var_eq_const(b.one(), F257::ONE);
+
+    // a in balanced base-16 (3 digits) from standard nibbles (no balancing needed due to a<2048).
+    let a0 = alloc_bal16_digit(&mut b, (a_u16 & 0xF) as i8);
+    let a1 = alloc_bal16_digit(&mut b, ((a_u16 >> 4) & 0xF) as i8);
+    let a2 = alloc_bal16_digit(&mut b, ((a_u16 >> 8) & 0xF) as i8);
+    let a_digits = vec![a0, a1, a2];
+
+    // b in balanced base-16 (9 digits).
+    let mut b_digits: Vec<usize> = Vec::with_capacity(9);
+    for &d in &b_bal {
+        b_digits.push(alloc_bal16_digit(&mut b, d));
+    }
+
+    let out = mul_bal16_small(&mut b, &a_digits, &b_digits);
+
+    // Check satisfiable.
+    let (inst, asg) = b.into_instance();
+    inst.check(&asg).expect("mul_bal16_small satisfiable");
+
+    // Decode output digits and compare.
+    let out_digits_i32: Vec<i32> = out.iter().map(|&v| f257_to_i32_bal(asg[v])).collect();
+    let mut out_i: i128 = 0;
+    let mut pow: i128 = 1;
+    for &di in &out_digits_i32 {
+        out_i += (di as i128) * pow;
+        pow *= 16;
+    }
+    assert_eq!(out_i, prod_i, "decoded integer mismatch");
+}
+
+#[test]
+fn test_u32_bytes_to_bal16_digits_roundtrip() {
+    let x: u32 = 0xffff_fffe;
+    let mut b = Dr1csBuilder::<F257>::new();
+    b.enforce_var_eq_const(b.one(), F257::ONE);
+
+    // Allocate bytes as ByteVars, then pass just the byte vars.
+    let bytes = x.to_le_bytes();
+    let b0 = alloc_byte::<F257>(&mut b, bytes[0]);
+    let b1 = alloc_byte::<F257>(&mut b, bytes[1]);
+    let b2 = alloc_byte::<F257>(&mut b, bytes[2]);
+    let b3 = alloc_byte::<F257>(&mut b, bytes[3]);
+
+    let digs = u32_bytes_to_bal16_digits(&mut b, [b0.byte, b1.byte, b2.byte, b3.byte]);
+
+    let (inst, asg) = b.into_instance();
+    inst.check(&asg).expect("u32_bytes_to_bal16_digits satisfiable");
+
+    let mut acc: i128 = 0;
+    let mut pow: i128 = 1;
+    for &v in &digs {
+        let di = f257_to_i32_bal(asg[v]) as i128;
+        acc += di * pow;
+        pow *= 16;
+    }
+    assert_eq!(acc as u64, x as u64);
+}
+
+#[test]
+fn test_add_bal16_same_len_roundtrip() {
+    // Check that balanced-base16 addition matches integer addition.
+    fn decode(asg: &[F257], digs: &[usize]) -> i128 {
+        let mut acc: i128 = 0;
+        let mut pow: i128 = 1;
+        for &v in digs {
+            acc += (f257_to_i32_bal(asg[v]) as i128) * pow;
+            pow *= 16;
+        }
+        acc
+    }
+
+    let mut b = Dr1csBuilder::<F257>::new();
+    b.enforce_var_eq_const(b.one(), F257::ONE);
+
+    // a = 0x0777 (3 digits), b = 0x0001 (3 digits)
+    let a = vec![
+        alloc_bal16_digit(&mut b, 0x7),
+        alloc_bal16_digit(&mut b, 0x7),
+        alloc_bal16_digit(&mut b, 0x7),
+    ];
+    let c = vec![alloc_bal16_digit(&mut b, 1), alloc_bal16_digit(&mut b, 0), alloc_bal16_digit(&mut b, 0)];
+
+    let (sum, carry) = add_bal16_same_len(&mut b, &a, &c);
+    let (inst, asg) = b.into_instance();
+    inst.check(&asg).expect("add_bal16_same_len satisfiable");
+
+    let a_i = decode(&asg, &a);
+    let c_i = decode(&asg, &c);
+    let sum_i = decode(&asg, &sum)
+        + (f257_to_i32_bal(asg[carry]) as i128) * 16i128.pow(sum.len() as u32);
+    assert_eq!(sum_i, a_i + c_i);
+}
+
+#[test]
+fn test_neg_and_sub_bal16_roundtrip() {
+    // Check negation and subtraction decode correctly for random small-ish values.
+    use rand::Rng;
+    let mut rng = ark_std::test_rng();
+
+    for _ in 0..200 {
+        let x: i64 = rng.gen_range(-(1i64 << 31)..(1i64 << 31));
+        let y: i64 = rng.gen_range(-(1i64 << 31)..(1i64 << 31));
+
+        // Encode into 9 balanced digits (enough for 32-bit-ish values).
+        fn to_bal16(mut v: i64) -> [i8; 9] {
+            let mut out = [0i8; 9];
+            for i in 0..9 {
+                let mut d = (v % 16) as i32;
+                if d > 7 {
+                    d -= 16;
+                }
+                if d < -8 {
+                    d += 16;
+                }
+                out[i] = d as i8;
+                v = (v - d as i64) / 16;
+            }
+            out
+        }
+        let xd = to_bal16(x);
+        let yd = to_bal16(y);
+
+        let mut b = Dr1csBuilder::<F257>::new();
+        b.enforce_var_eq_const(b.one(), F257::ONE);
+        let xvars: Vec<usize> = xd.iter().map(|&d| alloc_bal16_digit(&mut b, d)).collect();
+        let yvars: Vec<usize> = yd.iter().map(|&d| alloc_bal16_digit(&mut b, d)).collect();
+
+        let (nx, c0) = neg_bal16_digits(&mut b, &xvars);
+        let (diff, c1) = sub_bal16_same_len(&mut b, &xvars, &yvars);
+
+        // For fixed-width 9-digit inputs, enforce no overflow.
+        b.enforce_var_eq_const(c0, F257::ZERO);
+        b.enforce_var_eq_const(c1, F257::ZERO);
+
+        let (inst, asg) = b.into_instance();
+        inst.check(&asg).expect("neg/sub satisfiable");
+
+        let decode = |ds: &[usize]| -> i128 {
+            let mut acc: i128 = 0;
+            let mut pow: i128 = 1;
+            for &v in ds {
+                acc += (f257_to_i32_bal(asg[v]) as i128) * pow;
+                pow *= 16;
+            }
+            acc
+        };
+        assert_eq!(decode(&nx), -(x as i128));
+        assert_eq!(decode(&diff), (x as i128) - (y as i128));
+    }
+}
+
+#[test]
+fn test_mul_bal16_long_by_u32ish9_roundtrip() {
+    // Multiply a moderately-sized integer by a u32-ish integer via chunking.
+    // (Keep decoded values within i128 to avoid overflow in the test.)
+    use rand::Rng;
+    let mut rng = ark_std::test_rng();
+
+    for _ in 0..50 {
+        // Build a random ~48-bit signed integer.
+        let mag: i128 = (rng.gen::<u64>() & ((1u64 << 48) - 1)) as i128;
+        let sign: i128 = if rng.gen::<bool>() { 1 } else { -1 };
+        let a: i128 = sign * mag;
+        let b_u32: u32 = rng.gen();
+        let b_i: i128 = b_u32 as i128;
+
+        // Encode a into balanced base-16 digits (len 16 is enough for ~64 bits).
+        let mut a_tmp = a;
+        let mut a_digs: Vec<i8> = Vec::with_capacity(16);
+        for _ in 0..16 {
+            let mut d = (a_tmp % 16) as i32;
+            if d > 7 {
+                d -= 16;
+            }
+            if d < -8 {
+                d += 16;
+            }
+            a_digs.push(d as i8);
+            a_tmp = (a_tmp - d as i128) / 16;
+        }
+        assert_eq!(a_tmp, 0);
+
+        let mut b = Dr1csBuilder::<F257>::new();
+        b.enforce_var_eq_const(b.one(), F257::ONE);
+        let a_vars: Vec<usize> = a_digs.iter().map(|&d| alloc_bal16_digit(&mut b, d)).collect();
+        let bb = b_u32.to_le_bytes();
+        let b_bytes = [
+            alloc_byte::<F257>(&mut b, bb[0]).byte,
+            alloc_byte::<F257>(&mut b, bb[1]).byte,
+            alloc_byte::<F257>(&mut b, bb[2]).byte,
+            alloc_byte::<F257>(&mut b, bb[3]).byte,
+        ];
+        let b9 = u32_bytes_to_bal16_digits(&mut b, b_bytes);
+        let prod = mul_bal16_long_by_u32ish9(&mut b, &a_vars, &b9);
+
+        let (inst, asg) = b.into_instance();
+        inst.check(&asg).expect("long*u32ish satisfiable");
+
+        let mut acc: i128 = 0;
+        let mut pow: i128 = 1;
+        for (idx, &dv) in prod.iter().enumerate() {
+            acc += (f257_to_i32_bal(asg[dv]) as i128) * pow;
+            if idx + 1 < prod.len() {
+                pow *= 16;
+            }
+        }
+        assert_eq!(acc, a * b_i);
+    }
+}
+
+#[test]
+fn test_mul_bal16_long_by_long_roundtrip_small() {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0xA11CE5EED_u64);
+    let mut b = Dr1csBuilder::<F257>::new();
+    b.enforce_var_eq_const(b.one(), F257::ONE);
+
+    let to_digits = |b: &mut Dr1csBuilder<F257>, mut x: i128, max_len: usize| -> Vec<usize> {
+        let zero = alloc_bal16_digit(b, 0);
+        if x == 0 {
+            return vec![zero];
+        }
+        let mut out: Vec<usize> = Vec::new();
+        for _ in 0..max_len {
+            if x == 0 {
+                break;
+            }
+            // Balanced remainder in [-8,7].
+            let mut r = (x % 16) as i32;
+            if r < 0 {
+                r += 16;
+            }
+            if r >= 8 {
+                r -= 16;
+            }
+            out.push(alloc_bal16_digit(b, r as i8));
+            x = (x - (r as i128)) / 16;
+        }
+        out
+    };
+
+    // Keep sizes modest so native product fits in i128 comfortably.
+    for _ in 0..50 {
+        let a: i128 = rng.gen_range(-(1i128 << 40)..(1i128 << 40));
+        let c: i128 = rng.gen_range(-(1i128 << 40)..(1i128 << 40));
+        let ad = to_digits(&mut b, a, 20);
+        let cd = to_digits(&mut b, c, 20);
+        let prod = mul_bal16_long_by_long(&mut b, &ad, &cd);
+
+        // Decode result.
+        let mut acc: i128 = 0;
+        let mut pow: i128 = 1;
+        for &dv in &prod {
+            acc += (f257_to_i32_bal(b.assignment[dv]) as i128) * pow;
+            pow *= 16;
+        }
+        assert_eq!(acc, a * c);
+    }
+
+    let (inst, asg) = b.into_instance();
+    inst.check(&asg).expect("mul_bal16_long_by_long satisfied");
+}
+
+#[test]
+fn test_mul_bal16_3_by_u32_roundtrip() {
+    fn decode(asg: &[F257], digs: &[usize]) -> i128 {
+        let mut acc: i128 = 0;
+        let mut pow: i128 = 1;
+        for &v in digs {
+            acc += (f257_to_i32_bal(asg[v]) as i128) * pow;
+            pow *= 16;
+        }
+        acc
+    }
+
+    let mut b = Dr1csBuilder::<F257>::new();
+    b.enforce_var_eq_const(b.one(), F257::ONE);
+
+    // coeff = 0x0777 (positive, already balanced in 3 digits)
+    let coeff3 = [
+        alloc_bal16_digit(&mut b, 0x7),
+        alloc_bal16_digit(&mut b, 0x7),
+        alloc_bal16_digit(&mut b, 0x7),
+    ];
+    // u32 = 0xffff_fffe via byte->bal16 gadget.
+    let x: u32 = 0xffff_fffe;
+    let bytes = x.to_le_bytes();
+    let b0 = alloc_byte::<F257>(&mut b, bytes[0]);
+    let b1 = alloc_byte::<F257>(&mut b, bytes[1]);
+    let b2 = alloc_byte::<F257>(&mut b, bytes[2]);
+    let b3 = alloc_byte::<F257>(&mut b, bytes[3]);
+    let u32_bal16 = u32_bytes_to_bal16_digits(&mut b, [b0.byte, b1.byte, b2.byte, b3.byte]);
+    assert_eq!(u32_bal16.len(), 9);
+
+    let out12 = mul_bal16_3_by_digits9(&mut b, &coeff3, &u32_bal16);
+
+    let (inst, asg) = b.into_instance();
+    inst.check(&asg).expect("mul_bal16_3_by_u32 satisfiable");
+
+    let coeff_i = decode(&asg, &coeff3);
+    let u_i = decode(&asg, &u32_bal16);
+    let out_i = decode(&asg, &out12);
+    assert_eq!(out_i, coeff_i * u_i);
+}
+
+#[test]
+fn test_scale_short_coeffs_by_u32_roundtrip_small_vec() {
+    fn decode(asg: &[F257], digs: &[usize]) -> i128 {
+        let mut acc: i128 = 0;
+        let mut pow: i128 = 1;
+        for &v in digs {
+            acc += (f257_to_i32_bal(asg[v]) as i128) * pow;
+            pow *= 16;
+        }
+        acc
+    }
+
+    let mut b = Dr1csBuilder::<F257>::new();
+    b.enforce_var_eq_const(b.one(), F257::ONE);
+
+    // Two short coefficients (simulate small CM coeffs).
+    // c0 = 0x0777, c1 = -5
+    let c0 = [
+        alloc_bal16_digit(&mut b, 0x7),
+        alloc_bal16_digit(&mut b, 0x7),
+        alloc_bal16_digit(&mut b, 0x0),
+    ];
+    let c1 = [
+        alloc_bal16_digit(&mut b, -5),
+        alloc_bal16_digit(&mut b, 0),
+        alloc_bal16_digit(&mut b, 0),
+    ];
+    let coeffs = vec![c0, c1];
+
+    // u32 = 0x04030201 (no 256 byte-view edge case)
+    let x: u32 = 0x04030201;
+    let bytes = x.to_le_bytes();
+    let b0 = alloc_byte::<F257>(&mut b, bytes[0]);
+    let b1 = alloc_byte::<F257>(&mut b, bytes[1]);
+    let b2 = alloc_byte::<F257>(&mut b, bytes[2]);
+    let b3 = alloc_byte::<F257>(&mut b, bytes[3]);
+    let u32_digits = u32_bytes_to_bal16_digits(&mut b, [b0.byte, b1.byte, b2.byte, b3.byte]);
+    assert_eq!(u32_digits.len(), 9);
+
+    let prods = scale_short_coeffs_by_digits9(&mut b, &coeffs, &u32_digits);
+    assert_eq!(prods.len(), 2);
+
+    let (inst, asg) = b.into_instance();
+    inst.check(&asg).expect("scale_short_coeffs_by_u32 satisfiable");
+
+    let u = decode(&asg, &u32_digits);
+    for (i, c3) in coeffs.iter().enumerate() {
+        let c = decode(&asg, c3);
+        let p = decode(&asg, &prods[i]);
+        assert_eq!(p, c * u);
+    }
+}
+

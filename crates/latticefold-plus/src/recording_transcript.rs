@@ -9,6 +9,7 @@ use latticefold::transcript::bytes::{prime_field_to_bytes_le_fixed, ring_to_byte
 use latticefold::transcript::poseidon::{f257_poseidon_config, F257};
 use stark_rings::OverField;
 
+use crate::transcript::{CHALLENGE_DIGITS, DEFAULT_REJECTION_TRIES};
 use crate::transcript::PoseidonTranscriptMetrics;
 
 /// Poseidon sponge transcript operation trace (in the sponge's base prime field).
@@ -39,28 +40,52 @@ impl<BF: PrimeField> PoseidonTranscriptTrace<BF> {
     /// This helper extracts exactly the `SqueezeField` ops whose vector length equals
     /// `digits_per_challenge`, combines them, and returns the first `n` reconstructed challenges.
     pub fn challenge_scalars_base257(&self, digits_per_challenge: usize, n: usize) -> Vec<BF> {
+        // Fixed-tries rejection: each `get_challenge()` contributes `DEFAULT_REJECTION_TRIES`
+        // occurrences of `SqueezeField(len=digits_per_challenge)` in the trace.
+        //
+        // Acceptance predicate matches `crate::transcript::PoseidonTranscript::get_challenge`:
+        // accept first attempt whose first 4 digits are all != 256, then pack those 4 digits
+        // (as bytes) into a u32.
         let mut out = Vec::with_capacity(n);
+        let mut buf: Vec<&[BF]> = Vec::with_capacity(DEFAULT_REJECTION_TRIES);
         for op in &self.ops {
             if let PoseidonTraceOp::SqueezeField(digits) = op {
                 if digits.len() != digits_per_challenge {
                     continue;
                 }
-                // Pack the first 4 digits into a u32 in byte view (256 -> 0).
-                let mut bs = [0u8; 4];
-                for i in 0..4 {
-                    let du16 = digits[i]
-                        .into_bigint()
-                        .to_bytes_le()
-                        .get(0)
-                        .copied()
-                        .unwrap_or(0) as u16;
-                    debug_assert!(du16 < 257u16);
-                    bs[i] = if du16 == 256 { 0u8 } else { du16 as u8 };
-                }
-                let x = u32::from_le_bytes(bs);
-                out.push(BF::from(x as u64));
-                if out.len() == n {
-                    break;
+                buf.push(digits.as_slice());
+                if buf.len() == DEFAULT_REJECTION_TRIES {
+                    let mut chosen = [0u8; 4];
+                    let mut found = false;
+                    'tries: for cand in buf.drain(..) {
+                        let mut bs = [0u8; 4];
+                        for i in 0..4 {
+                            let du16 = cand[i]
+                                .into_bigint()
+                                .to_bytes_le()
+                                .get(0)
+                                .copied()
+                                .unwrap_or(0) as u16;
+                            debug_assert!(du16 < 257u16);
+                            if du16 == 256 {
+                                continue 'tries;
+                            }
+                            bs[i] = du16 as u8;
+                        }
+                        chosen = bs;
+                        found = true;
+                        break;
+                    }
+                    assert!(
+                        found,
+                        "challenge_scalars_base257 exhausted {} rejection tries",
+                        DEFAULT_REJECTION_TRIES
+                    );
+                    let x = u32::from_le_bytes(chosen);
+                    out.push(BF::from(x as u64));
+                    if out.len() == n {
+                        break;
+                    }
                 }
             }
         }
@@ -165,34 +190,50 @@ where
     }
 
     fn get_challenge(&mut self) -> R::BaseRing {
-        // Fixed-length digit schedule (no rejection) to keep a fixed schedule.
-        // See `crate::transcript::PoseidonTranscript::get_challenge` for semantics:
-        // pack the first 4 digits (byte view, 256 -> 0) into a u32.
-        const CHALLENGE_DIGITS: usize = 8;
-        let c = self.sponge.squeeze_field_elements::<F257>(CHALLENGE_DIGITS);
-        self.metrics.squeezed_field_elems += c.len() as u64;
-        let lifted = c
-            .iter()
-            .map(|e| Self::lift_f257_to_base_ring(e))
-            .collect::<Vec<_>>();
-        self.trace.squeezed_field.extend_from_slice(&lifted);
-        self.trace.ops.push(PoseidonTraceOp::SqueezeField(lifted));
+        // Fixed schedule with rejection to avoid bias from the byte view map (256 -> 0).
+        let mut chosen = [0u8; 4];
+        let mut found = false;
+        for _ in 0..DEFAULT_REJECTION_TRIES {
+            let c = self.sponge.squeeze_field_elements::<F257>(CHALLENGE_DIGITS);
+            self.metrics.squeezed_field_elems += c.len() as u64;
+            let lifted = c
+                .iter()
+                .map(|e| Self::lift_f257_to_base_ring(e))
+                .collect::<Vec<_>>();
+            self.trace.squeezed_field.extend_from_slice(&lifted);
+            self.trace.ops.push(PoseidonTraceOp::SqueezeField(lifted));
 
-        // `get_challenge` re-absorbs the squeezed elements to evolve the sponge state.
-        self.absorb_f257_elems_vec(c.clone());
+            // `get_challenge` re-absorbs the squeezed elements to evolve the sponge state.
+            self.absorb_f257_elems_vec(c.clone());
 
-        let mut bs = [0u8; 4];
-        for i in 0..4 {
-            let d = c[i]
-                .into_bigint()
-                .to_bytes_le()
-                .get(0)
-                .copied()
-                .unwrap_or(0) as u16;
-            debug_assert!(d < 257u16);
-            bs[i] = if d == 256 { 0u8 } else { d as u8 };
+            // Accept iff none of the first 4 digits is 256.
+            let mut ok = true;
+            let mut bs = [0u8; 4];
+            for i in 0..4 {
+                let d = c[i]
+                    .into_bigint()
+                    .to_bytes_le()
+                    .get(0)
+                    .copied()
+                    .unwrap_or(0) as u16;
+                debug_assert!(d < 257u16);
+                if d == 256 {
+                    ok = false;
+                    break;
+                }
+                bs[i] = d as u8;
+            }
+            if !found && ok {
+                chosen = bs;
+                found = true;
+            }
         }
-        let x = u32::from_le_bytes(bs);
+        assert!(
+            found,
+            "TracePoseidonTranscript::get_challenge exhausted {} rejection tries",
+            DEFAULT_REJECTION_TRIES
+        );
+        let x = u32::from_le_bytes(chosen);
         R::BaseRing::from(x as u64)
     }
 

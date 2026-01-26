@@ -79,13 +79,8 @@ fn collect_get_challenge_squeeze_field_indices(
     out
 }
 
-/// Build a tiny-field (F257) Poseidon+CM-coin+digit-mul-surface dR1CS for Π_plus schedule.
-///
-/// This is a *WE-arith wiring checkpoint*: it does not implement full CM verifier math yet, but it
-/// ensures that we can (a) lift the Π_plus transcript schedule to F257, (b) derive CM coins, and
-/// (c) materialize digit-mul surfaces for requested `(short_block_idx, u32_idx)` pairs.
 #[cfg(feature = "we_gate")]
-pub fn build_we_dr1cs_for_plus_proof_shape_tiny_cm_coin_mul_surfaces<R>(
+fn build_we_dr1cs_for_plus_proof_shape_tiny<R>(
     params: &WeParams,
     public_inputs_len: usize,
     n_lin_proofs: usize,
@@ -137,8 +132,20 @@ where
         .splice(0..0, prefix_u32_squeeze_ops.into_iter());
     wiring_abs.frog_squeeze_ops = Vec::new();
 
-    let (inst_pose, asg_pose, _shorts, _u32s, _frogs, _tcch0, _tcch1, _surfaces_mul, _surfaces_sq, pose_wiring) =
-        tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
+    let (
+        inst_pose,
+        asg_pose,
+        _shorts,
+        _u32s,
+        _frogs,
+        _frog_rejection,
+        _tcch0,
+        _tcch1,
+        _surfaces_mul,
+        _surfaces_sq,
+        pose_wiring,
+    ) =
+        tiny::we_tiny_f257_build_cm_gate_from_trace_ops(
             None,
             &ops_f257,
             ring_dim,
@@ -783,17 +790,9 @@ where
     )
 }
 
-/// Arm-time (shape-only) builder for the **tiny-field** (F257) WE gate (Π_plus schedule).
-///
-/// This is the current “real” tiny-field entrypoint:
-/// - lifts the Π_plus transcript schedule to Poseidon(F257),
-/// - derives CM-facing coins (short challenges + bounded u32 challenges),
-/// - materializes digit-mul surfaces for requested `(short_block_idx, u32_idx)` pairs.
-///
-/// It is intentionally a *slice* of the full WE gate: it’s the smallest end-to-end artifact that
-/// proves we can bind the Π_plus schedule and start consuming the digit backend for CM math.
+/// Short, canonical name for the tiny Π_plus arm-time shape.
 #[cfg(feature = "we_gate")]
-pub fn build_we_dr1cs_for_plus_proof_shape_tiny<R>(
+pub fn we_plus_tiny_dr1cs_shape<R>(
     params: &WeParams,
     public_inputs_len: usize,
     n_lin_proofs: usize,
@@ -804,13 +803,7 @@ where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + Field + PrimeField,
 {
-    build_we_dr1cs_for_plus_proof_shape_tiny_cm_coin_mul_surfaces::<R>(
-        params,
-        public_inputs_len,
-        n_lin_proofs,
-        mlen_mats,
-        pairs,
-    )
+    build_we_dr1cs_for_plus_proof_shape_tiny::<R>(params, public_inputs_len, n_lin_proofs, mlen_mats, pairs)
 }
 
 /// Witness-time (assignment) builder for the **tiny-field** (F257) Π_plus WE gate.
@@ -875,8 +868,20 @@ where
     wiring_abs.frog_squeeze_ops = Vec::new();
 
     // Build Poseidon(F257)+coin surfaces with this concrete trace (assignment carries the real absorbs/squeezes).
-    let (inst_pose, asg_pose, _shorts, _u32s, _frogs, _tcch0, _tcch1, _surfaces_mul, _surfaces_sq, _pose_wiring) =
-        tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
+    let (
+        inst_pose,
+        asg_pose,
+        _shorts,
+        _u32s,
+        _frogs,
+        _frog_rejection,
+        _tcch0,
+        _tcch1,
+        _surfaces_mul,
+        _surfaces_sq,
+        _pose_wiring,
+    ) =
+        tiny::we_tiny_f257_build_cm_gate_from_trace_ops(
             None,
             &ops_f257,
             ring_dim,
@@ -5820,15 +5825,27 @@ mod tests {
         // Update pairs to point at the first CM u32 block.
         pairs[0].1 = prefix_cnt;
 
-        let (inst_pose, asg_pose, _shorts, _u32s, _frogs, _tcch0, _tcch1, _surfaces_mul, _surfaces_sq, _pose_wiring) =
-            tiny::build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring(
+        let (
+            inst_pose,
+            asg_pose,
+            _shorts,
+            _u32s,
+            _frogs,
+            _frog_rejection,
+            _tcch0,
+            _tcch1,
+            _surfaces_mul,
+            _surfaces_sq,
+            _pose_wiring,
+        ) =
+            tiny::we_tiny_f257_build_cm_gate_from_trace_ops(
                 None,
                 &ops_f257,
                 <R as PolyRing>::dimension(),
                 &wiring_abs,
                 &pairs,
             )
-            .expect("build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wiring");
+            .expect("we_tiny_f257_build_cm_gate_from_trace_ops");
 
         // Params prefix (must be public / statement-bound).
         let mut b_params = Dr1csBuilder::<F257>::new();
@@ -6569,8 +6586,8 @@ mod tests {
                 .expect("poseidon_trace_schedule_for_plus");
         let ops_f257 = crate::we_gate_tiny::lift_recording_trace_ops_to_f257::<BF<RR>>(&trace.ops)
             .expect("lift trace ops to f257");
-        let (inst, asg) =
-            crate::we_gate_tiny::build_poseidon_f257_from_ops(None, &ops_f257).expect("poseidon f257");
+        let (inst, asg, _wiring, _byte_wiring) =
+            crate::we_gate_tiny::poseidon_f257_arithmetize(None, &ops_f257).expect("poseidon f257");
         inst.check(&asg).expect("poseidon f257 schedule satisfiable");
     }
 

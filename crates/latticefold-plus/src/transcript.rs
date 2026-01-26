@@ -9,6 +9,14 @@ use latticefold::transcript::bytes::{prime_field_to_bytes_le_fixed, ring_to_byte
 use latticefold::transcript::poseidon::{f257_poseidon_config, F257};
 use stark_rings::OverField;
 
+/// Number of base-257 digits per rejection attempt.
+pub const CHALLENGE_DIGITS: usize = 8;
+/// Fixed number of rejection attempts per `get_challenge()` to keep a fixed transcript schedule.
+///
+/// With the acceptance predicate used below ("first 4 digits are all != 256"), failure probability is:
+/// \((1 - (256/257)^4)^{TRIES}\), which is negligible for `TRIES=10`.
+pub const DEFAULT_REJECTION_TRIES: usize = 10;
+
 /// Lightweight transcript metrics to estimate Poseidon sponge work.
 ///
 /// Counts are in units of the Poseidon sponge's **F257 elements** (one per byte).
@@ -113,31 +121,49 @@ where
     }
 
     fn get_challenge(&mut self) -> R::BaseRing {
-        // Fixed-length digit schedule (no rejection) to keep a fixed transcript schedule.
+        // Fixed schedule with rejection to avoid bias from the byte view map (256 -> 0):
+        // for each attempt, we squeeze 8 base-257 digits, re-absorb them, and accept the first
+        // attempt whose first 4 digits are all in 0..=255. We always perform a fixed number of
+        // attempts to keep the transcript schedule fixed/arithmetic-gate-friendly.
         //
-        // IMPORTANT (bounded-int CM math):
-        // We interpret the squeezed F257 digits in **byte view** (256 -> 0) and pack the first
-        // 4 bytes into a u32. This keeps scalar challenges < 2^32, which is required for the
-        // "no-wrap" bounded-integer model to remain sound through degree-2/3 polynomial steps.
-        const CHALLENGE_DIGITS: usize = 8; // schedule-only; we pack 4 bytes.
-        let elems = self.sponge.squeeze_field_elements::<F257>(CHALLENGE_DIGITS);
-        self.metrics.squeezed_field_elems += elems.len() as u64;
-        // Re-absorb squeezed elements (Fiat-Shamir)
-        self.metrics.absorbed_elems += elems.len() as u64;
-        self.sponge.absorb(&elems);
+        // Result is a bounded u32 (packed from 4 bytes), preserving the "no-wrap" bounded-int model.
+        let mut chosen = [0u8; 4];
+        let mut found = false;
+        for _ in 0..DEFAULT_REJECTION_TRIES {
+            let elems = self.sponge.squeeze_field_elements::<F257>(CHALLENGE_DIGITS);
+            self.metrics.squeezed_field_elems += elems.len() as u64;
+            // Re-absorb squeezed elements (Fiat–Shamir)
+            self.metrics.absorbed_elems += elems.len() as u64;
+            self.sponge.absorb(&elems);
 
-        let mut bs = [0u8; 4];
-        for i in 0..4 {
-            let d = elems[i]
-                .into_bigint()
-                .to_bytes_le()
-                .get(0)
-                .copied()
-                .unwrap_or(0) as u16;
-            debug_assert!(d < 257u16);
-            bs[i] = if d == 256 { 0u8 } else { d as u8 };
+            // Accept iff none of the first 4 digits is 256.
+            let mut ok = true;
+            let mut bs = [0u8; 4];
+            for i in 0..4 {
+                let d = elems[i]
+                    .into_bigint()
+                    .to_bytes_le()
+                    .get(0)
+                    .copied()
+                    .unwrap_or(0) as u16;
+                debug_assert!(d < 257u16);
+                if d == 256 {
+                    ok = false;
+                    break;
+                }
+                bs[i] = d as u8;
+            }
+            if !found && ok {
+                chosen = bs;
+                found = true;
+            }
         }
-        let x = u32::from_le_bytes(bs);
+        assert!(
+            found,
+            "PoseidonTranscript::get_challenge exhausted {} rejection tries",
+            DEFAULT_REJECTION_TRIES
+        );
+        let x = u32::from_le_bytes(chosen);
         R::BaseRing::from(x as u64)
     }
 

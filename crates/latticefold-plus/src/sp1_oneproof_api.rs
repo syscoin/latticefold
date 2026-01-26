@@ -252,14 +252,14 @@ pub fn run_sp1_oneproof_we_gate_from_files(
     // Tiny-field (F257) WE gate (Theorem 4.3 path)
     // -------------------------------------------------------------------------
     let pairs: Vec<(usize, usize)> = vec![(0, 0)];
-    let shape = crate::we_gate_arith::build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
+    let shape = crate::we_gate_arith::we_plus_tiny_dr1cs_shape::<R>(
         &we_params,
         public_inputs.len(),
         proof.lproof.len(),
         m0.len(),
         &pairs,
     )
-    .map_err(|e| format!("build_we_dr1cs_for_plus_proof_shape_tiny: {e}"))?;
+    .map_err(|e| format!("we_plus_tiny_dr1cs_shape: {e}"))?;
 
     // Map statement public inputs into F257 (expected to be small integers, typically 0/1 bits).
     let public_inputs_f257: Vec<F257> = public_inputs
