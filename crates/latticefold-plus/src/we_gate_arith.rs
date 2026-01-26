@@ -987,6 +987,205 @@ fn ring_mul_negacyclic_naive<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVar
     RingVars::new(out)
 }
 
+// -------------------------------------------------------------------------
+// Toom-4 optimization (NTT-free) for d=64
+//
+// Karatsuba on length-64 costs 3^6 = 729 mul-constraints per ring-mul.
+// A Toom-4 split (n = 4*m) with 7 evaluation points gives ~7^3 = 343 mul-constraints.
+//
+// We implement a generic Toom-4 polynomial multiplication over LCs:
+// - evaluation/interpolation are pure linear combinations (no constraints)
+// - only the recursive pointwise multiplications introduce mul constraints.
+//
+// This is intended for FrogRing64-scale CM math where ring_mul dominates scalar_mul.
+// -------------------------------------------------------------------------
+
+#[inline]
+fn lc_add_scaled_into<F: PrimeField>(dst: &mut Lc<F>, scale: F, src: &Lc<F>) {
+    lc_extend_scaled(dst, scale, src);
+}
+
+fn invert_matrix_7<F: PrimeField>(mut a: [[F; 7]; 7]) -> [[F; 7]; 7] {
+    // Gauss–Jordan inversion over the field.
+    let mut inv = [[F::ZERO; 7]; 7];
+    for i in 0..7 {
+        inv[i][i] = F::ONE;
+    }
+
+    for col in 0..7 {
+        // Find a pivot (should exist for our Vandermonde points).
+        let mut piv = col;
+        while piv < 7 && a[piv][col].is_zero() {
+            piv += 1;
+        }
+        assert!(piv < 7, "invert_matrix_7: singular matrix");
+        if piv != col {
+            a.swap(piv, col);
+            inv.swap(piv, col);
+        }
+
+        let inv_piv = a[col][col].inverse().expect("invert_matrix_7: zero pivot");
+        for j in 0..7 {
+            a[col][j] *= inv_piv;
+            inv[col][j] *= inv_piv;
+        }
+
+        for r in 0..7 {
+            if r == col {
+                continue;
+            }
+            let f = a[r][col];
+            if f.is_zero() {
+                continue;
+            }
+            for j in 0..7 {
+                a[r][j] -= f * a[col][j];
+                inv[r][j] -= f * inv[col][j];
+            }
+        }
+    }
+    inv
+}
+
+fn toom4_vandermonde_inv<F: PrimeField>() -> ([[F; 7]; 7], [F; 7]) {
+    // Points for block-polynomial interpolation: degree <= 6
+    // Use small symmetric integers (avoid 1/2): 0, 1, -1, 2, -2, 3, -3.
+    let pts = [
+        F::from(0u64),
+        F::from(1u64),
+        -F::from(1u64),
+        F::from(2u64),
+        -F::from(2u64),
+        F::from(3u64),
+        -F::from(3u64),
+    ];
+    let mut v = [[F::ZERO; 7]; 7];
+    for (i, &t) in pts.iter().enumerate() {
+        let mut pow = F::ONE;
+        for j in 0..7 {
+            v[i][j] = pow;
+            pow *= t;
+        }
+    }
+    // We want coefficients c0..c6 from values at pts: c = V^{-1} * w
+    let inv = invert_matrix_7::<F>(v);
+    (inv, pts)
+}
+
+fn poly_mul_toom4_lc<F: PrimeField>(
+    b: &mut Dr1csBuilder<F>,
+    a: &[Lc<F>],
+    c: &[Lc<F>],
+    inv_v: &[[F; 7]; 7],
+    pts: &[F; 7],
+) -> Vec<Lc<F>> {
+    assert_eq!(a.len(), c.len());
+    let n = a.len();
+    assert!(n.is_power_of_two(), "toom4_lc requires pow2 length");
+    assert!(n > 0);
+    if n == 1 {
+        let prod = scalar_mul_lc::<F>(b, a[0].clone(), c[0].clone());
+        return vec![vec![(F::ONE, prod)]];
+    }
+    // Require a Toom-4 split.
+    assert!(n % 4 == 0, "toom4_lc requires n divisible by 4");
+    let m = n / 4;
+
+    let (a0, rest) = a.split_at(m);
+    let (a1, rest) = rest.split_at(m);
+    let (a2, a3) = rest.split_at(m);
+    let (c0, rest) = c.split_at(m);
+    let (c1, rest) = rest.split_at(m);
+    let (c2, c3) = rest.split_at(m);
+
+    // Evaluate at points: a(t) = a0 + t a1 + t^2 a2 + t^3 a3, coefficient-wise (each coeff is an LC).
+    let mut a_eval: Vec<Vec<Lc<F>>> = Vec::with_capacity(7);
+    let mut c_eval: Vec<Vec<Lc<F>>> = Vec::with_capacity(7);
+    for &t in pts {
+        let t2 = t * t;
+        let t3 = t2 * t;
+        let mut ae = Vec::with_capacity(m);
+        let mut ce = Vec::with_capacity(m);
+        for i in 0..m {
+            let mut lc_a = Vec::new();
+            lc_add_scaled_into::<F>(&mut lc_a, F::ONE, &a0[i]);
+            lc_add_scaled_into::<F>(&mut lc_a, t, &a1[i]);
+            lc_add_scaled_into::<F>(&mut lc_a, t2, &a2[i]);
+            lc_add_scaled_into::<F>(&mut lc_a, t3, &a3[i]);
+            ae.push(lc_a);
+
+            let mut lc_c = Vec::new();
+            lc_add_scaled_into::<F>(&mut lc_c, F::ONE, &c0[i]);
+            lc_add_scaled_into::<F>(&mut lc_c, t, &c1[i]);
+            lc_add_scaled_into::<F>(&mut lc_c, t2, &c2[i]);
+            lc_add_scaled_into::<F>(&mut lc_c, t3, &c3[i]);
+            ce.push(lc_c);
+        }
+        a_eval.push(ae);
+        c_eval.push(ce);
+    }
+
+    // Pointwise products (recursive): w(t) = a(t) * c(t), each is length (2m-1).
+    let mut w_eval: Vec<Vec<Lc<F>>> = Vec::with_capacity(7);
+    for i in 0..7 {
+        w_eval.push(poly_mul_toom4_lc::<F>(b, &a_eval[i], &c_eval[i], inv_v, pts));
+    }
+    debug_assert_eq!(w_eval[0].len(), 2 * m - 1);
+
+    // Interpolate coefficient blocks c_j (j=0..6), each length (2m-1).
+    let mut blocks: Vec<Vec<Lc<F>>> = (0..7).map(|_| vec![Vec::new(); 2 * m - 1]).collect();
+    for k in 0..(2 * m - 1) {
+        // w_k is values at points (length 7) for this coefficient position.
+        for j in 0..7 {
+            let mut lc: Lc<F> = Vec::new();
+            for i in 0..7 {
+                let coef = inv_v[j][i];
+                if coef.is_zero() {
+                    continue;
+                }
+                lc_add_scaled_into::<F>(&mut lc, coef, &w_eval[i][k]);
+            }
+            blocks[j][k] = lc;
+        }
+    }
+
+    // Assemble full convolution length 2n-1 = 8m-1 by shifting blocks by j*m.
+    let mut res: Vec<Lc<F>> = (0..(2 * n - 1)).map(|_| Vec::new()).collect();
+    for j in 0..7 {
+        let base = j * m;
+        for k in 0..(2 * m - 1) {
+            let idx = base + k;
+            lc_add_scaled_into::<F>(&mut res[idx], F::ONE, &blocks[j][k]);
+        }
+    }
+    res
+}
+
+fn ring_mul_negacyclic_toom4<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: &RingVars) -> RingVars {
+    // Toom-4 convolution (len 2d-1) then fold mod (X^d + 1): c[k] = p[k] - p[k+d].
+    let d = x.d();
+    assert_eq!(d, y.d());
+    assert!(d.is_power_of_two());
+    assert!(d % 4 == 0);
+
+    let (inv_v, pts) = toom4_vandermonde_inv::<F>();
+    let x_lc: Vec<Lc<F>> = x.coeffs.iter().map(|&v| vec![(F::ONE, v)]).collect();
+    let y_lc: Vec<Lc<F>> = y.coeffs.iter().map(|&v| vec![(F::ONE, v)]).collect();
+    let prod_lc = poly_mul_toom4_lc::<F>(b, &x_lc, &y_lc, &inv_v, &pts); // len 2d-1
+    debug_assert_eq!(prod_lc.len(), 2 * d - 1);
+    let mut out = Vec::with_capacity(d);
+    for k in 0..d {
+        let hi = k + d;
+        let mut lc = Vec::new();
+        lc_extend_scaled(&mut lc, F::ONE, &prod_lc[k]);
+        if hi < prod_lc.len() {
+            lc_extend_scaled(&mut lc, -F::ONE, &prod_lc[hi]);
+        }
+        out.push(lc_to_var_opt::<F>(b, lc));
+    }
+    RingVars::new(out)
+}
+
 fn ring_mul_negacyclic<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: &RingVars) -> RingVars {
     cm_bump(|c| c.ring_mul_negacyclic += 1);
     let d = x.d();
@@ -994,6 +1193,11 @@ fn ring_mul_negacyclic<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: 
     // Karatsuba cuts mul count (64^2 -> 3^6 = 729) for d=64 and is algebraically identical.
     // Fall back to the signed schoolbook for non-pow2 dimensions.
     if d.is_power_of_two() && d > 1 {
+        // For d=64 (FrogRing64), Toom-4 beats Karatsuba without requiring NTT roots.
+        // Disable quickly with `LFP_WE_NO_TOOM4=1` if you want to compare.
+        if d == 64 && std::env::var("LFP_WE_NO_TOOM4").is_err() {
+            return ring_mul_negacyclic_toom4::<F>(b, x, y);
+        }
         return ring_mul_negacyclic_karatsuba::<F>(b, x, y);
     }
     ring_mul_negacyclic_naive::<F>(b, x, y)
