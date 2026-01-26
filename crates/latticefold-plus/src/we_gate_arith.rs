@@ -5567,6 +5567,9 @@ mod tests {
         let mlen_mats = 0usize;
         // Mirror the SP1 oneproof path: use the canonical tiny-gate builders.
         // (For now we keep `public_inputs_len=0`, so this is the minimal end-to-end roundtrip.)
+        //
+        // NOTE: `pairs` indices are interpreted over the full `u32_squeeze_ops` wiring, which
+        // includes any prefix `get_challenge()` u32 squeezes.
         let pairs: Vec<(usize, usize)> = vec![(0, 0)];
         let public_inputs_f257: Vec<F257> = vec![F257::from(0u64); public_inputs_len];
 
