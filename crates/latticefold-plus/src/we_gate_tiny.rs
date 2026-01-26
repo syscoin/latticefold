@@ -3375,6 +3375,7 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         Vec<F257>,
         Vec<ShortChallengeWiring>,
         Vec<BoundedU32ChallengeWiring>,
+        Vec<BabyBearCenteredWiring>,
         Vec<CmDigitMulSurfaceWiring>,
         Vec<CmDigitMulSqSurfaceWiring>,
         PoseidonDr1csWiring,
@@ -3498,6 +3499,7 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
     // - within coeff0, bytes[4..coeff_bytes) are 0 and the low 4 bytes form a canonical BabyBear
     //   element (bit31==0 and < p_bb), enabling centered integer arithmetic later.
     // ------------------------------------------------------------
+    let mut bb_centered_locals: Vec<BabyBearCenteredWiring> = Vec::new();
     if ring_dim > 1 {
         let mut ring_elem_bytes: Option<usize> = None;
         for &(_st, ln) in &pose_wiring.absorb_ranges {
@@ -3550,11 +3552,8 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
                             let _ = decompose_existing_byte_var_to_bits::<F257>(&mut gb, lv);
                             bb[i] = lv;
                         }
-                        let _w = babybear31_from_u32_byte_vars_with_modulus(
-                            &mut gb,
-                            bb,
-                            BABYBEAR_P_U32,
-                        );
+                        let w = babybear_centered_from_u32_byte_vars_with_modulus(&mut gb, bb, BABYBEAR_P_U32);
+                        bb_centered_locals.push(w);
                     }
                 }
     }
@@ -4086,7 +4085,29 @@ pub fn build_poseidon_f257_with_cm_coins_and_digit_mul_surfaces_from_ops_with_wi
         })
         .collect::<Vec<_>>();
 
-    Ok((inst, asg, shorts_out, u32s_out, surfaces_out, surfaces_sq_out, pose_wiring))
+    let bb_centered_out = bb_centered_locals
+        .into_iter()
+        .map(|w| BabyBearCenteredWiring {
+            byte_vars: w.byte_vars.map(to_glue_global),
+            is_neg: to_glue_global(w.is_neg),
+            centered_bal16_digits: w
+                .centered_bal16_digits
+                .into_iter()
+                .map(to_glue_global)
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+
+    Ok((
+        inst,
+        asg,
+        shorts_out,
+        u32s_out,
+        bb_centered_out,
+        surfaces_out,
+        surfaces_sq_out,
+        pose_wiring,
+    ))
 }
 /// Build the Poseidon transcript subrelation **over F257** from an op schedule.
 ///
