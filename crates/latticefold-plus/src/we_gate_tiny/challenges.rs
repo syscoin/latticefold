@@ -81,7 +81,10 @@ pub fn infer_cm_coin_op_wiring_from_ops(
                 if v.len() == ring_dim && out.short_squeeze_ops.len() < short_need {
                     out.short_squeeze_ops
                         .push(squeeze_field_op_idx - squeeze_field_op_offset);
-                } else if v.len() == DIGITS_PER_TRY && u32_try_blocks_seen < u32_need * tries {
+                } else if out.short_squeeze_ops.len() == short_need
+                    && v.len() == DIGITS_PER_TRY
+                    && u32_try_blocks_seen < u32_need * tries
+                {
                     // One logical u32 challenge corresponds to `tries` consecutive squeeze blocks.
                     // Record only the first squeeze-op index of each group.
                     if (u32_try_blocks_seen % tries) == 0 {
@@ -89,7 +92,11 @@ pub fn infer_cm_coin_op_wiring_from_ops(
                             .push(squeeze_field_op_idx - squeeze_field_op_offset);
                     }
                     u32_try_blocks_seen += 1;
-                } else if v.len() == DIGITS_PER_TRY && out.frog_squeeze_ops.len() < frog_need {
+                } else if out.short_squeeze_ops.len() == short_need
+                    && out.u32_squeeze_ops.len() == u32_need
+                    && v.len() == DIGITS_PER_TRY
+                    && out.frog_squeeze_ops.len() < frog_need
+                {
                     out.frog_squeeze_ops
                         .push(squeeze_field_op_idx - squeeze_field_op_offset);
                 }
