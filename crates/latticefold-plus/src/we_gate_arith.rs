@@ -1214,8 +1214,7 @@ fn ring_mul_negacyclic<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: 
     // Fall back to the signed schoolbook for non-pow2 dimensions.
     if d.is_power_of_two() && d > 1 {
         // For d=64 (FrogRing64), Toom-4 beats Karatsuba without requiring NTT roots.
-        // Disable quickly with `LFP_WE_NO_TOOM4=1` if you want to compare.
-        if d == 64 && std::env::var("LFP_WE_NO_TOOM4").is_err() {
+        if d == 64 {
             return ring_mul_negacyclic_toom4::<F>(b, x, y);
         }
         return ring_mul_negacyclic_karatsuba::<F>(b, x, y);
@@ -1718,45 +1717,6 @@ where
     let d = R::dimension();
     let l_instances = proof.evals.0.len();
     let ell = proof.dcom.dparams.l;
-    // ---------------------------------------------------------------------
-    // Const-coeff mode detection (SP1/R1LF inference):
-    //
-    // In native SP1/R1LF, matrices and the large trace witness are **base-field** objects that get
-    // lifted into the ring via the canonical const-coeff embedding (only coefficient 0 is nonzero).
-    // That property is not automatically enforced by the verifier unless the arithmetized relation
-    // adds constraints.
-    //
-    // Here we **infer** "SP1 const-coeff mode" from statement-bound params (so the instance shape
-    // stays arm-time deterministic), and when enabled we:
-    // - enforce const-coeff shape in-circuit for soundness
-    // - use cheaper arithmetic gadgets where possible
-    //
-    // NOTE: This is an inference, not a protocol-level flag. If you want this to be future-proof,
-    // add an explicit statement-bound mode bit in `WeParams` (preferred), but we avoid that API
-    // change here.
-    // ---------------------------------------------------------------------
-    // SP1-only gate policy:
-    // This WE gate is intended for the SP1/R1LF case only, where witness/matrices are base-field
-    // lifts into the ring and therefore const-coeff. We therefore *always* enable the const-coeff
-    // fast path, and enforce const-coeff shape in-circuit for soundness.
-    //
-    // If you ever want a generic (non-SP1) WE gate, introduce an explicit statement-bound mode bit
-    // in `WeParams` and branch on that instead.
-    // Hygiene: ensure the proof's embedded dparams agree with statement-bound params.
-    if (proof.dcom.dparams.b as u64) != params.decomp_b {
-        return Err(format!(
-            "CmProof: dcom.dparams.b mismatch with WeParams (dcom={} params={})",
-            proof.dcom.dparams.b,
-            params.decomp_b
-        ));
-    }
-    if std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1") {
-        println!(
-            "[we_gate/cm] const_coeff0_only=false (d={}, decomp_b={}, reason=cm_out_is_not_const_coeff)",
-            d,
-            params.decomp_b
-        );
-    }
 
     if proof.sumcheck_proofs.0.msgs().len() != nvars || proof.sumcheck_proofs.1.msgs().len() != nvars {
         return Err("CmProof: sumcheck proof length mismatch".to_string());
