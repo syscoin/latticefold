@@ -11,6 +11,7 @@ use cyclotomic_rings::rings::{FrogPoseidonConfig as PC, GetPoseidonParams};
 use cyclotomic_rings::rings::FrogRing64 as R;
 use ark_ff::{BigInteger, PrimeField};
 use latticefold::commitment::AjtaiCommitmentScheme;
+use latticefold::transcript::poseidon::F257;
 use latticefold::transcript::Transcript;
 use stark_rings::PolyRing;
 use stark_rings_linalg::SparseMatrix;
@@ -247,25 +248,42 @@ pub fn run_sp1_oneproof_we_gate_from_files(
         .map_err(|e| format!("cm proof verify: {e:?}"))?;
     let trace = rec.trace().clone();
 
-    let shape = crate::we_gate_arith::build_we_dr1cs_for_plus_proof_shape::<R>(
-        &poseidon_cfg,
+    // -------------------------------------------------------------------------
+    // Tiny-field (F257) WE gate (Theorem 4.3 path)
+    // -------------------------------------------------------------------------
+    let pairs: Vec<(usize, usize)> = vec![(0, 0)];
+    let shape = crate::we_gate_arith::build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
         &we_params,
         public_inputs.len(),
         proof.lproof.len(),
         m0.len(),
+        &pairs,
     )
-    .map_err(|e| format!("build_we_dr1cs_for_plus_proof_shape: {e}"))?;
+    .map_err(|e| format!("build_we_dr1cs_for_plus_proof_shape_tiny: {e}"))?;
 
-    let assignment = crate::we_gate_arith::build_we_dr1cs_for_plus_proof_witness::<R>(
-        &poseidon_cfg,
+    // Map statement public inputs into F257 (expected to be small integers, typically 0/1 bits).
+    let public_inputs_f257: Vec<F257> = public_inputs
+        .iter()
+        .map(|x| {
+            let bytes = x.into_bigint().to_bytes_le();
+            let v = (bytes.get(0).copied().unwrap_or(0) as u16)
+                | ((bytes.get(1).copied().unwrap_or(0) as u16) << 8);
+            if v > 256 {
+                return Err(format!("public input out of range for tiny gate: {v}"));
+            }
+            Ok(F257::from(v as u64))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let assignment = crate::we_gate_arith::build_we_dr1cs_for_plus_proof_witness_tiny::<R>(
         &trace,
         &we_params,
-        &public_inputs,
-        &proof,
+        &public_inputs_f257,
+        proof.lproof.len(),
         m0.len(),
-        b_decomp,
+        &pairs,
     )
-    .map_err(|e| format!("build_we_dr1cs_for_plus_proof_witness: {e}"))?;
+    .map_err(|e| format!("build_we_dr1cs_for_plus_proof_witness_tiny: {e}"))?;
 
     // Optional sanity: the witness must satisfy the armed instance.
     // This can be expensive for large gates; enable only when debugging.
