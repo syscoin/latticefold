@@ -231,29 +231,22 @@ pub(crate) fn alloc_carry_pm2(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
 /// then enforce `c = off - 128` as a linear relation in F257.
 pub(crate) fn alloc_carry_pm128(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
     assert!((-128..=127).contains(&c));
-    let off_u8: u8 = (c + 128) as u8;
-    // 8-bit decomposition of off.
-    let mut bits = [0usize; 8];
-    for i in 0..8 {
-        bits[i] = alloc_bool::<F257>(b, ((off_u8 >> i) & 1) == 1);
-    }
-    let off_var = b.new_var(F257::from(off_u8 as u64));
-    // off = Σ 2^i * bits[i]
-    let mut lc = vec![(F257::ONE, off_var)];
-    let mut pow = F257::ONE;
-    for i in 0..8 {
-        lc.push((-pow, bits[i]));
-        pow *= F257::from(2u64);
-    }
-    b.enforce_lc_times_one_eq_const(lc);
-
-    // c = off - 128
+    // In F257, the balanced representative map is unique on [-128,128].
+    // Restricting to [-128,127] is therefore exactly "forbid +128".
+    //
+    // We can enforce this with a single non-equality constraint:
+    //   (c - 128) * inv = 1
+    // which is satisfiable iff c != 128.
     let c_var = b.new_var(i32_to_f257(c));
-    b.enforce_lc_times_one_eq_const(vec![
-        (F257::ONE, c_var),
-        (-F257::ONE, off_var),
-        (F257::from(128u64), b.one()),
-    ]);
+    let diff = b.assignment[c_var] - F257::from(128u64);
+    debug_assert!(diff != F257::ZERO, "alloc_carry_pm128: witness hit forbidden value 128");
+    let inv = b.new_var(diff.inverse().unwrap());
+    // (c - 128) * inv = 1
+    b.add_constraint(
+        vec![(F257::ONE, c_var), (-F257::from(128u64), b.one())],
+        vec![(F257::ONE, inv)],
+        vec![(F257::ONE, b.one())],
+    );
     c_var
 }
 
