@@ -237,38 +237,9 @@ fn alloc_carry_pm128(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
     c_var
 }
 
-/// Allocate a signed carry `c ∈ [-64,63]` as an F257 variable by range-checking an offset.
-///
-/// We represent `off = c + 64` as a 7-bit value in [0,127], then enforce `c = off - 64`.
-fn alloc_carry_pm64(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
-    assert!((-64..=63).contains(&c));
-    let off_u8: u8 = (c + 64) as u8; // in [0,127]
-    debug_assert!(off_u8 < 128);
-
-    // 7-bit decomposition of off.
-    let mut bits = [0usize; 7];
-    for i in 0..7 {
-        bits[i] = alloc_bool::<F257>(b, ((off_u8 >> i) & 1) == 1);
-    }
-    let off_var = b.new_var(F257::from(off_u8 as u64));
-    // off = Σ 2^i * bits[i]
-    let mut lc = vec![(F257::ONE, off_var)];
-    let mut pow = F257::ONE;
-    for i in 0..7 {
-        lc.push((-pow, bits[i]));
-        pow *= F257::from(2u64);
-    }
-    b.enforce_lc_times_one_eq_const(lc);
-
-    // c = off - 64
-    let c_var = b.new_var(i32_to_f257(c));
-    b.enforce_lc_times_one_eq_const(vec![
-        (F257::ONE, c_var),
-        (-F257::ONE, off_var),
-        (F257::from(64u64), b.one()),
-    ]);
-    c_var
-}
+// NOTE: We intentionally do not use a narrower carry range (like pm64) for the streaming
+// convolution multipliers. For 17×17 balanced digits, the worst-case carry magnitude can exceed
+// 63 (e.g. ≈ 68), so pm64 would reject some valid witnesses. pm128 is safe.
 
 /// Allocate a signed carry `c ∈ {-1,0,1}` using two booleans.
 ///
@@ -881,7 +852,7 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
 
         let mut out: Vec<usize> = Vec::with_capacity(la + lb + 4);
         let mut carry_i32: i32 = 0;
-        let mut carry_var = alloc_carry_pm64(b, 0);
+        let mut carry_var = alloc_carry_pm128(b, 0);
 
         for k in 0..(la + lb - 1) {
             let mut sum: i32 = carry_i32;
@@ -913,14 +884,14 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
                 rem += NIBBLE_BASE;
             }
             assert!((-8..=7).contains(&rem));
-            // For la,lb <= 19 and digits in [-8,7], carry stays safely within [-64,63].
+            // For la,lb <= 19 and digits in [-8,7], carry stays safely within [-128,127].
             assert!(
-                (-64..=63).contains(&carry_next),
-                "carry out of range for pm64: {carry_next} from sum {sum}"
+                (-128..=127).contains(&carry_next),
+                "carry out of range for pm128: {carry_next} from sum {sum}"
             );
 
             let digit_var = alloc_bal16_digit(b, rem as i8);
-            let carry_out_var = alloc_carry_pm64(b, carry_next);
+            let carry_out_var = alloc_carry_pm128(b, carry_next);
 
             // carry + Σ prods - digit - 16*carry_out = 0
             let mut lc: Vec<(F257, usize)> = Vec::with_capacity(2 + prods.len());
@@ -952,12 +923,12 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
             }
             assert!((-8..=7).contains(&rem));
             assert!(
-                (-64..=63).contains(&carry_next),
-                "carry out of range for pm64 tail: {carry_next} from sum {sum}"
+                (-128..=127).contains(&carry_next),
+                "carry out of range for pm128 tail: {carry_next} from sum {sum}"
             );
 
             let rem_digit = alloc_bal16_digit(b, rem as i8);
-            let carry_next_var = alloc_carry_pm64(b, carry_next);
+            let carry_next_var = alloc_carry_pm128(b, carry_next);
             // carry = rem + 16*carry_next
             b.enforce_lc_times_one_eq_const(vec![
                 (F257::ONE, carry_var),
@@ -1205,7 +1176,7 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
         let lb = bb_const.len();
         let mut out: Vec<usize> = Vec::with_capacity(la + lb + 4);
         let mut carry_i32: i32 = 0;
-        let mut carry_var = alloc_carry_pm64(b, 0);
+        let mut carry_var = alloc_carry_pm128(b, 0);
 
         let div_floor = |x: i32, d: i32| -> i32 {
             debug_assert!(d > 0);
@@ -1244,14 +1215,14 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
                 rem += NIBBLE_BASE;
             }
             assert!((-8..=7).contains(&rem));
-            // For our intended operand sizes, carry stays well within [-64,63].
+            // For our intended operand sizes, carry stays well within [-128,127].
             assert!(
-                (-64..=63).contains(&carry_next),
-                "carry out of range for pm64: {carry_next} from sum {sum}"
+                (-128..=127).contains(&carry_next),
+                "carry out of range for pm128: {carry_next} from sum {sum}"
             );
 
             let digit_var = alloc_bal16_digit(b, rem as i8);
-            let carry_out_var = alloc_carry_pm64(b, carry_next);
+            let carry_out_var = alloc_carry_pm128(b, carry_next);
 
             lc.push((-F257::ONE, digit_var));
             lc.push((-F257::from(16u64), carry_out_var));
@@ -1279,12 +1250,12 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
             }
             assert!((-8..=7).contains(&rem));
             assert!(
-                (-64..=63).contains(&carry_next),
-                "carry out of range for pm64 tail: {carry_next} from sum {sum}"
+                (-128..=127).contains(&carry_next),
+                "carry out of range for pm128 tail: {carry_next} from sum {sum}"
             );
 
             let rem_digit = alloc_bal16_digit(b, rem as i8);
-            let carry_next_var = alloc_carry_pm64(b, carry_next);
+            let carry_next_var = alloc_carry_pm128(b, carry_next);
             // carry = rem + 16*carry_next
             b.enforce_lc_times_one_eq_const(vec![
                 (F257::ONE, carry_var),
@@ -1351,17 +1322,14 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
 pub(crate) fn u32_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 4]) -> Vec<usize> {
     let _prev = b.profile_enter("digits::u32_bytes_to_bal16_digits");
     struct Nib {
-        d: usize,
         bits: [usize; 4],
         msb: usize,
     }
     let mut nibbles: Vec<Nib> = Vec::with_capacity(8);
     for &bv in &bytes_le {
         let bits8 = decompose_existing_byte_var_to_bits::<F257>(b, bv);
-        let tmp = ByteVar { byte: bv, bits: bits8 };
-        let (lo, hi) = byte_to_nibbles(b, &tmp);
-        nibbles.push(Nib { d: lo, bits: [bits8[0], bits8[1], bits8[2], bits8[3]], msb: bits8[3] });
-        nibbles.push(Nib { d: hi, bits: [bits8[4], bits8[5], bits8[6], bits8[7]], msb: bits8[7] });
+        nibbles.push(Nib { bits: [bits8[0], bits8[1], bits8[2], bits8[3]], msb: bits8[3] });
+        nibbles.push(Nib { bits: [bits8[4], bits8[5], bits8[6], bits8[7]], msb: bits8[7] });
     }
     debug_assert_eq!(nibbles.len(), 8);
 
@@ -1404,12 +1372,11 @@ pub(crate) fn u32_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
         ]);
         // `c_out` is computed as OR(msb, carry_is7) over booleans, so it is boolean.
 
-        let d_i = b.assignment[nib.d]
-            .into_bigint()
-            .to_bytes_le()
-            .get(0)
-            .copied()
-            .unwrap_or(0) as i32;
+        let d_i =
+            (b.assignment[b0].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as i32)
+                + 2 * (b.assignment[b1].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as i32)
+                + 4 * (b.assignment[b2].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as i32)
+                + 8 * (b.assignment[msb].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as i32);
         let carry_i = b.assignment[carry]
             .into_bigint()
             .to_bytes_le()
@@ -1427,8 +1394,11 @@ pub(crate) fn u32_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
         let out_digit = b.new_var(i32_to_f257(v));
         b.enforce_lc_times_one_eq_const(vec![
             (F257::ONE, out_digit),
-            (-F257::ONE, nib.d),
             (-F257::ONE, carry),
+            (-F257::ONE, b0),
+            (-F257::from(2u64), b1),
+            (-F257::from(4u64), b2),
+            (-F257::from(8u64), msb),
             (F257::from(16u64), c_out),
         ]);
 
@@ -1457,17 +1427,14 @@ pub(crate) fn u32_bytes_to_bal16_digits_cached(b: &mut Dr1csBuilder<F257>, bytes
 pub(crate) fn u64_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 8]) -> Vec<usize> {
     let _prev = b.profile_enter("digits::u64_bytes_to_bal16_digits");
     struct Nib {
-        d: usize,
         bits: [usize; 4],
         msb: usize,
     }
     let mut nibbles: Vec<Nib> = Vec::with_capacity(16);
     for &bv in &bytes_le {
         let bits8 = decompose_existing_byte_var_to_bits::<F257>(b, bv);
-        let tmp = ByteVar { byte: bv, bits: bits8 };
-        let (lo, hi) = byte_to_nibbles(b, &tmp);
-        nibbles.push(Nib { d: lo, bits: [bits8[0], bits8[1], bits8[2], bits8[3]], msb: bits8[3] });
-        nibbles.push(Nib { d: hi, bits: [bits8[4], bits8[5], bits8[6], bits8[7]], msb: bits8[7] });
+        nibbles.push(Nib { bits: [bits8[0], bits8[1], bits8[2], bits8[3]], msb: bits8[3] });
+        nibbles.push(Nib { bits: [bits8[4], bits8[5], bits8[6], bits8[7]], msb: bits8[7] });
     }
     debug_assert_eq!(nibbles.len(), 16);
 
@@ -1510,12 +1477,11 @@ pub(crate) fn u64_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
         ]);
         // `c_out` is computed as OR(msb, carry_is7) over booleans, so it is boolean.
 
-        let d_i = b.assignment[nib.d]
-            .into_bigint()
-            .to_bytes_le()
-            .get(0)
-            .copied()
-            .unwrap_or(0) as i32;
+        let d_i =
+            (b.assignment[b0].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as i32)
+                + 2 * (b.assignment[b1].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as i32)
+                + 4 * (b.assignment[b2].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as i32)
+                + 8 * (b.assignment[msb].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as i32);
         let carry_i = b.assignment[carry]
             .into_bigint()
             .to_bytes_le()
@@ -1533,8 +1499,11 @@ pub(crate) fn u64_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
         let out_digit = b.new_var(i32_to_f257(v));
         b.enforce_lc_times_one_eq_const(vec![
             (F257::ONE, out_digit),
-            (-F257::ONE, nib.d),
             (-F257::ONE, carry),
+            (-F257::ONE, b0),
+            (-F257::from(2u64), b1),
+            (-F257::from(4u64), b2),
+            (-F257::from(8u64), msb),
             (F257::from(16u64), c_out),
         ]);
 
