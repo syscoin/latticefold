@@ -54,6 +54,23 @@ fn u64_to_bal16_digits_le_const(mut x: u64) -> [i8; 17] {
     out
 }
 
+/// Allocate a u64 witness value as balanced base-16 digits (len 17) as F257 variables.
+///
+/// The digits follow the same convention as `u64_bytes_to_bal16_digits` / `u64_to_bal16_digits_le_const`:
+/// - digits[0..16] are in [-8,7]
+/// - digits[16] is the final carry in {0,1}
+fn alloc_u64_as_bal16_digits_witness(b: &mut Dr1csBuilder<F257>, x: u64) -> Vec<usize> {
+    let ds = u64_to_bal16_digits_le_const(x);
+    let mut out: Vec<usize> = Vec::with_capacity(17);
+    for i in 0..16 {
+        out.push(alloc_bal16_digit(b, ds[i]));
+    }
+    // Final carry is already in {0,1}. Allocate it as a boolean (cheaper than `alloc_bal16_digit`).
+    let carry = alloc_bool::<F257>(b, ds[16] == 1);
+    out.push(carry);
+    out
+}
+
 /// Boundary-only canonicalization gadget:
 /// given an unconstrained 64-bit integer `u` as 8 little-endian bytes, produce
 /// `(q, z)` such that:
@@ -490,23 +507,21 @@ fn frog_mul_mod_p_from_byte_vars_assume_canonical(
     let q_u: u64 = (prod / (FROG_P as u128)) as u64;
     let r_u: u64 = (prod % (FROG_P as u128)) as u64;
 
-    // Allocate q and r as byte vars.
-    let q_bytes_u8 = q_u.to_le_bytes();
+    // Allocate r as byte vars (output). The quotient `q` is internal; we allocate it directly as
+    // balanced base-16 digits to avoid the expensive byte->digit conversion.
     let r_bytes_u8 = r_u.to_le_bytes();
-    let mut q_bytes = [0usize; 8];
     let mut r_bytes = [0usize; 8];
     for i in 0..8 {
-        q_bytes[i] = alloc_u8_var::<F257>(b, q_bytes_u8[i]);
         r_bytes[i] = alloc_u8_var::<F257>(b, r_bytes_u8[i]);
     }
     // Enforce r is canonical (<p).
     let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &r_bytes);
 
-    // Convert a,b,q,r and p to balanced-base16 digits.
+    // Convert a,b,r and p to balanced-base16 digits.
     let a_d = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
     let b_d = u64_bytes_to_bal16_digits_cached(b, *b_bytes);
-    let q_d = u64_bytes_to_bal16_digits_cached(b, q_bytes);
     let r_d = u64_bytes_to_bal16_digits_cached(b, r_bytes);
+    let q_d = alloc_u64_as_bal16_digits_witness(b, q_u);
 
     // Compute prod_digits = a*b (balanced digits, with headroom/carry already enforced in gadget).
     let prod_d = mul_bal16_long_by_long(b, &a_d, &b_d);
@@ -568,21 +583,19 @@ fn frog_mul_const_mod_p_from_byte_vars_assume_canonical(
     let q_u: u64 = (prod / (FROG_P as u128)) as u64;
     let r_u: u64 = (prod % (FROG_P as u128)) as u64;
 
-    // Allocate q and r as byte vars.
-    let q_bytes_u8 = q_u.to_le_bytes();
+    // Allocate r as byte vars (output). The quotient `q` is internal; we allocate it directly as
+    // balanced base-16 digits to avoid the expensive byte->digit conversion.
     let r_bytes_u8 = r_u.to_le_bytes();
-    let mut q_bytes = [0usize; 8];
     let mut r_bytes = [0usize; 8];
     for i in 0..8 {
-        q_bytes[i] = alloc_u8_var::<F257>(b, q_bytes_u8[i]);
         r_bytes[i] = alloc_u8_var::<F257>(b, r_bytes_u8[i]);
     }
     let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &r_bytes);
 
-    // Convert x,q,r to bal16 digits (vars).
+    // Convert x,r to bal16 digits (vars). `q` is allocated directly as balanced digits.
     let x_d = u64_bytes_to_bal16_digits_cached(b, *x_bytes);
-    let q_d = u64_bytes_to_bal16_digits_cached(b, q_bytes);
     let r_d = u64_bytes_to_bal16_digits_cached(b, r_bytes);
+    let q_d = alloc_u64_as_bal16_digits_witness(b, q_u);
 
     // Constant bal16 digits for c and p, computed directly (no variables/constraints).
     let c_d_const = u64_to_bal16_digits_le_const(c);
