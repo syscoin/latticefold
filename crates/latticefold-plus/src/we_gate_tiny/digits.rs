@@ -291,6 +291,34 @@ pub(crate) fn alloc_carry_pm32(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
     c_var
 }
 
+/// Allocate a signed carry `c ∈ [-256,255]` as an F257 variable by range-checking an offset.
+pub(crate) fn alloc_carry_pm256(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
+    assert!((-256..=255).contains(&c));
+    let off_u16: u16 = (c + 256) as u16; // in [0,511]
+    debug_assert!(off_u16 < 512);
+    // 9-bit decomposition of off.
+    let mut bits = [0usize; 9];
+    for i in 0..9 {
+        bits[i] = alloc_bool::<F257>(b, (((off_u16 >> i) & 1) == 1));
+    }
+    let off_var = b.new_var(F257::from(off_u16 as u64));
+    let mut lc = vec![(F257::ONE, off_var)];
+    let mut pow = F257::ONE;
+    for i in 0..9 {
+        lc.push((-pow, bits[i]));
+        pow *= F257::from(2u64);
+    }
+    b.enforce_lc_times_one_eq_const(lc);
+    // c = off - 256
+    let c_var = b.new_var(i32_to_f257(c));
+    b.enforce_lc_times_one_eq_const(vec![
+        (F257::ONE, c_var),
+        (-F257::ONE, off_var),
+        (F257::from(256u64), b.one()),
+    ]);
+    c_var
+}
+
 /// Allocate a signed carry `c ∈ [-16,15]` as an F257 variable by range-checking an offset.
 pub(crate) fn alloc_carry_pm16(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
     assert!((-16..=15).contains(&c));
@@ -345,7 +373,7 @@ pub(crate) fn alloc_carry_pm8(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
 
 /// Allocate a carry `c` using the smallest pow2-bound ≤ 128 that contains it.
 #[inline]
-fn alloc_carry_pm_dynamic_le128(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
+pub(crate) fn alloc_carry_pm_dynamic_le128(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
     let a = c.abs();
     if a <= 7 {
         alloc_carry_pm8(b, c)
@@ -357,6 +385,27 @@ fn alloc_carry_pm_dynamic_le128(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
         alloc_carry_pm64(b, c)
     } else {
         alloc_carry_pm128(b, c)
+    }
+}
+
+/// Allocate a carry `c` using the smallest pow2-bound ≤ 512 that contains it.
+#[inline]
+pub(crate) fn alloc_carry_pm_dynamic_le512(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
+    let a = c.abs();
+    if a <= 7 {
+        alloc_carry_pm8(b, c)
+    } else if a <= 15 {
+        alloc_carry_pm16(b, c)
+    } else if a <= 31 {
+        alloc_carry_pm32(b, c)
+    } else if a <= 63 {
+        alloc_carry_pm64(b, c)
+    } else if a <= 127 {
+        alloc_carry_pm128(b, c)
+    } else if a <= 255 {
+        alloc_carry_pm256(b, c)
+    } else {
+        alloc_carry_pm512(b, c)
     }
 }
 
