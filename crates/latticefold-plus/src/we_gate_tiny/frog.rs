@@ -867,6 +867,22 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
 
     let zero = frog_zero_bytes(b);
 
+    #[inline]
+    fn mod_i64_to_u64(x: i64, p: u64) -> u64 {
+        let p_i = p as i128;
+        let mut r = (x as i128) % p_i;
+        if r < 0 {
+            r += p_i;
+        }
+        r as u64
+    }
+
+    #[inline]
+    fn modmul_i64_u64(x: i64, y: u64, p: u64) -> u64 {
+        let xm = mod_i64_to_u64(x, p);
+        ((xm as u128) * (y as u128) % (p as u128)) as u64
+    }
+
     // Split into 4 blocks of length 16.
     let a0 = &a[0..16];
     let a1 = &a[16..32];
@@ -916,6 +932,8 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
         debug_assert_eq!(a.len(), 16);
         debug_assert_eq!(c.len(), 16);
         // Base case at n=1 would be frog_mul_mod_p; but for n=16 we do one Toom-4 level (m=4) then base mults at n=4 via schoolbook.
+
+        let zero = frog_zero_bytes(b);
 
         // Helper: schoolbook convolution for small n with frog_mul_mod_p (n<=4).
         fn schoolbook(
@@ -980,17 +998,20 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
         for k in 0..(2 * m - 1) {
             for j in 0..7 {
                 let idx = j * m + k; // unique
-                // Compute Σ_i (NUMS[j][i] * inv720) * w_eval[i][k]
-                let mut acc = frog_zero_bytes(b);
+                // Compute Σ_i (NUMS[j][i]/720) * w_eval[i][k] by fusing constants:
+                // coeff = NUMS[j][i] * inv720 mod p, then term = w_eval[i][k] * coeff mod p.
+                let mut acc = zero;
                 for i in 0..7 {
                     let n = NUMS[j][i];
                     if n == 0 {
                         continue;
                     }
-                    // term = w * (n/720) = (((w * |n|) * inv720) with sign)
-                    // First multiply by |n| via small-int scaling (adds), then by inv720 via const-mul.
-                    let scaled = scale_small(b, &w_eval[i][k], n);
-                    let term = frog_mul_const_mod_p_from_byte_vars_assume_canonical(b, &scaled, inv720);
+                    let coeff = modmul_i64_u64(n, inv720, FROG_P);
+                    if coeff == 0 {
+                        continue;
+                    }
+                    let term =
+                        frog_mul_const_mod_p_from_byte_vars_assume_canonical(b, &w_eval[i][k], coeff);
                     acc = frog_add_mod_p_from_byte_vars_assume_canonical(b, &acc, &term);
                 }
                 // NOTE: idx is NOT unique: blocks of length (2m-1) shifted by m overlap.
@@ -1026,14 +1047,18 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
     for k in 0..31 {
         for j in 0..7 {
             let idx = j * 16 + k;
-            let mut acc = frog_zero_bytes(b);
+            let mut acc = zero;
             for i in 0..7 {
                 let n = NUMS[j][i];
                 if n == 0 {
                     continue;
                 }
-                let scaled = scale_small(b, &w_eval_top[i][k], n);
-                let term = frog_mul_const_mod_p_from_byte_vars_assume_canonical(b, &scaled, inv720);
+                let coeff = modmul_i64_u64(n, inv720, FROG_P);
+                if coeff == 0 {
+                    continue;
+                }
+                let term =
+                    frog_mul_const_mod_p_from_byte_vars_assume_canonical(b, &w_eval_top[i][k], coeff);
                 acc = frog_add_mod_p_from_byte_vars_assume_canonical(b, &acc, &term);
             }
             // NOTE: idx is NOT unique: blocks of length 31 shifted by 16 overlap.
