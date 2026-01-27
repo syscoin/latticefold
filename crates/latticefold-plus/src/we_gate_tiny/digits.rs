@@ -395,7 +395,12 @@ pub(crate) fn alloc_carry_pm8(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
 #[inline]
 pub(crate) fn alloc_carry_pm_dynamic_le128(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
     let a = c.abs();
-    if a <= 7 {
+    // Prefer the smallest gadgets first: pm1/pm2 avoid bit-decomposition entirely.
+    if a <= 1 {
+        alloc_carry_pm1_dynamic(b, c)
+    } else if a <= 2 {
+        alloc_carry_pm2(b, c)
+    } else if a <= 7 {
         alloc_carry_pm8(b, c)
     } else if a <= 15 {
         alloc_carry_pm16(b, c)
@@ -412,7 +417,12 @@ pub(crate) fn alloc_carry_pm_dynamic_le128(b: &mut Dr1csBuilder<F257>, c: i32) -
 #[inline]
 pub(crate) fn alloc_carry_pm_dynamic_le512(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
     let a = c.abs();
-    if a <= 7 {
+    // Prefer the smallest gadgets first: pm1/pm2 avoid bit-decomposition entirely.
+    if a <= 1 {
+        alloc_carry_pm1_dynamic(b, c)
+    } else if a <= 2 {
+        alloc_carry_pm2(b, c)
+    } else if a <= 7 {
         alloc_carry_pm8(b, c)
     } else if a <= 15 {
         alloc_carry_pm16(b, c)
