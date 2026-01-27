@@ -257,6 +257,61 @@ fn alloc_carry_pm128(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
     c_var
 }
 
+/// Allocate a signed carry `c ∈ [-64,63]` as an F257 variable by range-checking an offset.
+///
+/// We represent `off = c + 64` as a 7-bit value in [0,127], then enforce `c = off - 64`.
+fn alloc_carry_pm64(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
+    assert!((-64..=63).contains(&c));
+    let off_u8: u8 = (c + 64) as u8; // in [0,127]
+    debug_assert!(off_u8 < 128);
+
+    // 7-bit decomposition of off.
+    let mut bits = [0usize; 7];
+    for i in 0..7 {
+        bits[i] = alloc_bool::<F257>(b, ((off_u8 >> i) & 1) == 1);
+    }
+    let off_var = b.new_var(F257::from(off_u8 as u64));
+    // off = Σ 2^i * bits[i]
+    let mut lc = vec![(F257::ONE, off_var)];
+    let mut pow = F257::ONE;
+    for i in 0..7 {
+        lc.push((-pow, bits[i]));
+        pow *= F257::from(2u64);
+    }
+    b.enforce_lc_times_one_eq_const(lc);
+
+    // c = off - 64
+    let c_var = b.new_var(i32_to_f257(c));
+    b.enforce_lc_times_one_eq_const(vec![
+        (F257::ONE, c_var),
+        (-F257::ONE, off_var),
+        (F257::from(64u64), b.one()),
+    ]);
+    c_var
+}
+
+/// Allocate a signed carry `c ∈ {-1,0,1}` using two booleans.
+///
+/// Constrain `b_pos * b_neg = 0` and `c = b_pos - b_neg`.
+fn alloc_carry_pm1(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
+    assert!((-1..=1).contains(&c));
+    let b_pos = alloc_bool::<F257>(b, c == 1);
+    let b_neg = alloc_bool::<F257>(b, c == -1);
+    // b_pos * b_neg = 0
+    b.add_constraint(
+        vec![(F257::ONE, b_pos)],
+        vec![(F257::ONE, b_neg)],
+        vec![(F257::ZERO, b.one())],
+    );
+    let c_var = b.new_var(i32_to_f257(c));
+    b.enforce_lc_times_one_eq_const(vec![
+        (F257::ONE, c_var),
+        (-F257::ONE, b_pos),
+        (F257::ONE, b_neg),
+    ]);
+    c_var
+}
+
 /// Allocate a signed carry `c ∈ [-1024,1023]` as an F257 variable by range-checking an offset.
 ///
 /// We represent `off = c + 1024` as an 11-bit value in [0,2047], then enforce
@@ -327,7 +382,7 @@ pub(crate) fn alloc_carry_pm512(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
 
 /// Add two balanced base-16 digit vectors of the same length.
 ///
-/// Assumes each digit is in [-8,7]. Enforces output digits in [-8,7] and carry in [-2,2].
+/// Assumes each digit is in [-8,7]. Enforces output digits in [-8,7] and carry in {-1,0,1}.
 pub(crate) fn add_bal16_same_len(
     b: &mut Dr1csBuilder<F257>,
     a: &[usize],
@@ -356,12 +411,12 @@ pub(crate) fn add_bal16_same_len(
             carry_next -= 1;
             rem += 16;
         }
-        // For inputs in [-8,7], carry stays in [-1,1], but keep [-2,2] margin.
-        assert!((-2..=2).contains(&carry_next));
+        // For inputs in [-8,7], carry is always in {-1,0,1}.
+        assert!((-1..=1).contains(&carry_next));
         assert!((-8..=7).contains(&rem));
 
         let out_digit = alloc_bal16_digit(b, rem as i8);
-        let carry_next_var = alloc_carry_pm2(b, carry_next);
+        let carry_next_var = alloc_carry_pm1(b, carry_next);
 
         // a_i + c_i + carry - out_i - 16*carry_next = 0
         b.enforce_lc_times_one_eq_const(vec![
@@ -468,11 +523,11 @@ pub(crate) fn neg_bal16_digits(
             carry_next -= 1;
             rem += 16;
         }
-        debug_assert!((-2..=2).contains(&carry_next));
+        debug_assert!((-1..=1).contains(&carry_next));
         debug_assert!((-8..=7).contains(&rem));
 
         let out_digit = alloc_bal16_digit(b, rem as i8);
-        let carry_next_var = alloc_carry_pm2(b, carry_next);
+        let carry_next_var = alloc_carry_pm1(b, carry_next);
 
         // carry - x_i - out_i - 16*carry_next = 0
         b.enforce_lc_times_one_eq_const(vec![
@@ -846,7 +901,7 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
 
         let mut out: Vec<usize> = Vec::with_capacity(la + lb + 4);
         let mut carry_i32: i32 = 0;
-        let mut carry_var = alloc_carry_pm128(b, 0);
+        let mut carry_var = alloc_carry_pm64(b, 0);
 
         for k in 0..(la + lb - 1) {
             let mut sum: i32 = carry_i32;
@@ -878,14 +933,14 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
                 rem += NIBBLE_BASE;
             }
             assert!((-8..=7).contains(&rem));
-            // For la,lb <= 19 and digits in [-8,7], carry stays safely within [-128,127].
+            // For la,lb <= 19 and digits in [-8,7], carry stays safely within [-64,63].
             assert!(
-                (-128..=127).contains(&carry_next),
-                "carry out of range for pm128: {carry_next} from sum {sum}"
+                (-64..=63).contains(&carry_next),
+                "carry out of range for pm64: {carry_next} from sum {sum}"
             );
 
             let digit_var = alloc_bal16_digit(b, rem as i8);
-            let carry_out_var = alloc_carry_pm128(b, carry_next);
+            let carry_out_var = alloc_carry_pm64(b, carry_next);
 
             // carry + Σ prods - digit - 16*carry_out = 0
             let mut lc: Vec<(F257, usize)> = Vec::with_capacity(2 + prods.len());
@@ -917,12 +972,12 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
             }
             assert!((-8..=7).contains(&rem));
             assert!(
-                (-128..=127).contains(&carry_next),
-                "carry out of range for pm128 tail: {carry_next} from sum {sum}"
+                (-64..=63).contains(&carry_next),
+                "carry out of range for pm64 tail: {carry_next} from sum {sum}"
             );
 
             let rem_digit = alloc_bal16_digit(b, rem as i8);
-            let carry_next_var = alloc_carry_pm128(b, carry_next);
+            let carry_next_var = alloc_carry_pm64(b, carry_next);
             // carry = rem + 16*carry_next
             b.enforce_lc_times_one_eq_const(vec![
                 (F257::ONE, carry_var),
@@ -1170,7 +1225,7 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
         let lb = bb_const.len();
         let mut out: Vec<usize> = Vec::with_capacity(la + lb + 4);
         let mut carry_i32: i32 = 0;
-        let mut carry_var = alloc_carry_pm128(b, 0);
+        let mut carry_var = alloc_carry_pm64(b, 0);
 
         let div_floor = |x: i32, d: i32| -> i32 {
             debug_assert!(d > 0);
@@ -1209,14 +1264,14 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
                 rem += NIBBLE_BASE;
             }
             assert!((-8..=7).contains(&rem));
-            // For our intended operand sizes, carry stays well within [-128,127].
+            // For our intended operand sizes, carry stays well within [-64,63].
             assert!(
-                (-128..=127).contains(&carry_next),
-                "carry out of range for pm128: {carry_next} from sum {sum}"
+                (-64..=63).contains(&carry_next),
+                "carry out of range for pm64: {carry_next} from sum {sum}"
             );
 
             let digit_var = alloc_bal16_digit(b, rem as i8);
-            let carry_out_var = alloc_carry_pm128(b, carry_next);
+            let carry_out_var = alloc_carry_pm64(b, carry_next);
 
             lc.push((-F257::ONE, digit_var));
             lc.push((-F257::from(16u64), carry_out_var));
@@ -1244,12 +1299,12 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
             }
             assert!((-8..=7).contains(&rem));
             assert!(
-                (-128..=127).contains(&carry_next),
-                "carry out of range for pm128 tail: {carry_next} from sum {sum}"
+                (-64..=63).contains(&carry_next),
+                "carry out of range for pm64 tail: {carry_next} from sum {sum}"
             );
 
             let rem_digit = alloc_bal16_digit(b, rem as i8);
-            let carry_next_var = alloc_carry_pm128(b, carry_next);
+            let carry_next_var = alloc_carry_pm64(b, carry_next);
             // carry = rem + 16*carry_next
             b.enforce_lc_times_one_eq_const(vec![
                 (F257::ONE, carry_var),
