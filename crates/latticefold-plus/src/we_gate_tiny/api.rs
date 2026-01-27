@@ -4,6 +4,8 @@ use latticefold::transcript::poseidon::F257;
 use symphony::dpp_poseidon::{PoseidonDr1csWiring, SparseDr1csInstance};
 use symphony::transcript::PoseidonTraceOp;
 
+use crate::we_statement::WeParams;
+
 use super::builder;
 
 pub use super::coins::FrogRejectionCoinWiring;
@@ -20,6 +22,7 @@ pub fn we_tiny_f257_build_cm_gate_from_trace_ops(
     cfg: Option<&PoseidonConfig<F257>>,
     ops: &[PoseidonTraceOp<F257>],
     ring_dim: usize,
+    params: &WeParams,
     wiring: &TinyCoinOpWiring,
     pairs: &[(usize, usize)],
 ) -> Result<
@@ -38,6 +41,6 @@ pub fn we_tiny_f257_build_cm_gate_from_trace_ops(
     ),
     String,
 > {
-    builder::build(cfg, ops, ring_dim, wiring, pairs)
+    builder::build(cfg, ops, ring_dim, params, wiring, pairs)
 }
 

@@ -191,3 +191,177 @@ pub(super) fn frog_u64_canonical_from_byte_vars<F: PrimeField>(
     z
 }
 
+/// Enforce that a canonical Frog base-field element `u` (encoded as 8 bytes, u < p_frog)
+/// lies in the **centered magnitude** range \(|u| <= bound\), meaning:
+/// - u ∈ [0, bound]  (non-negative)
+/// - OR u ∈ [p_frog - bound, p_frog - 1]  (negative, in centered lift)
+///
+/// Returns base-128 limbs of `u` (same as `frog_u64_canonical_from_byte_vars`).
+pub(super) fn frog_u64_centered_le_bound_from_byte_vars<F: PrimeField>(
+    b: &mut Dr1csBuilder<F>,
+    u_byte_vars: &[usize; 8],
+    bound: u64,
+) -> [usize; LIMBS_U64] {
+    // First, enforce canonical encoding and get base-128 limbs for u.
+    let u_limbs = frog_u64_canonical_from_byte_vars::<F>(b, u_byte_vars);
+
+    // Witness u as u64 for boolean witnesses.
+    let mut u_buf = [0u8; 8];
+    for i in 0..8 {
+        u_buf[i] = b.assignment[u_byte_vars[i]]
+            .into_bigint()
+            .to_bytes_le()
+            .get(0)
+            .copied()
+            .unwrap_or(0);
+    }
+    let u = u64::from_le_bytes(u_buf);
+
+    // Helper: compare u <= c using base-128 borrow chain on (c - u).
+    fn le_const_base128<F: PrimeField>(
+        b: &mut Dr1csBuilder<F>,
+        u_limbs: &[usize; LIMBS_U64],
+        u_wit: u64,
+        c: u64,
+    ) -> usize {
+        let le = alloc_bool::<F>(b, u_wit <= c);
+
+        let mut borrow = b.new_var(F::ZERO);
+        b.enforce_var_eq_const(borrow, F::ZERO);
+        for i in 0..LIMBS_U64 {
+            let ui = ((u_wit >> (LIMB_BITS * i)) & (LIMB_BASE_U64 - 1)) as i16;
+            let ci = ((c >> (LIMB_BITS * i)) & (LIMB_BASE_U64 - 1)) as i16;
+            let bi = if i == 0 {
+                0i16
+            } else {
+                b.assignment[borrow]
+                    .into_bigint()
+                    .to_bytes_le()
+                    .get(0)
+                    .copied()
+                    .unwrap_or(0) as i16
+            };
+            let mut t = ci - ui - bi;
+            let bor_next_u8 = if t < 0 { 1u8 } else { 0u8 };
+            if t < 0 {
+                t += LIMB_BASE_U64 as i16;
+            }
+            let diff_i = b.new_var(F::from((t as u64) & (LIMB_BASE_U64 - 1)));
+            // Range-check diff_i to 7 bits.
+            let mut dbits = [0usize; LIMB_BITS];
+            for k in 0..LIMB_BITS {
+                dbits[k] = alloc_bool::<F>(b, (((t as u8) >> k) & 1) == 1);
+            }
+            let mut lc_diff = vec![(F::ONE, diff_i)];
+            let mut pow = F::ONE;
+            for k in 0..LIMB_BITS {
+                lc_diff.push((-pow, dbits[k]));
+                pow *= F::from(2u64);
+            }
+            b.enforce_lc_times_one_eq_const(lc_diff);
+
+            let bor_next = alloc_bool::<F>(b, bor_next_u8 == 1);
+            // c_i - u_i - bor_i + base*bor_{i+1} - diff_i == 0
+            b.enforce_lc_times_one_eq_const(vec![
+                (F::from(ci as u64), b.one()),
+                (-F::ONE, u_limbs[i]),
+                (-F::ONE, borrow),
+                (F::from(LIMB_BASE_U64), bor_next),
+                (-F::ONE, diff_i),
+            ]);
+            borrow = bor_next;
+        }
+        // le == 1 - final_borrow
+        let one_minus_bor = b.new_var(F::ONE - b.assignment[borrow]);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, one_minus_bor),
+            (F::ONE, borrow),
+            (-F::ONE, b.one()),
+        ]);
+        b.enforce_lc_times_one_eq_const(vec![(F::ONE, le), (-F::ONE, one_minus_bor)]);
+        le
+    }
+
+    // Helper: compare u >= c using base-128 borrow chain on (u - c).
+    fn ge_const_base128<F: PrimeField>(
+        b: &mut Dr1csBuilder<F>,
+        u_limbs: &[usize; LIMBS_U64],
+        u_wit: u64,
+        c: u64,
+    ) -> usize {
+        let ge = alloc_bool::<F>(b, u_wit >= c);
+        let mut borrow = b.new_var(F::ZERO);
+        b.enforce_var_eq_const(borrow, F::ZERO);
+        for i in 0..LIMBS_U64 {
+            let ui = ((u_wit >> (LIMB_BITS * i)) & (LIMB_BASE_U64 - 1)) as i16;
+            let ci = ((c >> (LIMB_BITS * i)) & (LIMB_BASE_U64 - 1)) as i16;
+            let bi = if i == 0 {
+                0i16
+            } else {
+                b.assignment[borrow]
+                    .into_bigint()
+                    .to_bytes_le()
+                    .get(0)
+                    .copied()
+                    .unwrap_or(0) as i16
+            };
+            let mut t = ui - ci - bi;
+            let bor_next_u8 = if t < 0 { 1u8 } else { 0u8 };
+            if t < 0 {
+                t += LIMB_BASE_U64 as i16;
+            }
+            let diff_i = b.new_var(F::from((t as u64) & (LIMB_BASE_U64 - 1)));
+            // Range-check diff_i to 7 bits.
+            let mut dbits = [0usize; LIMB_BITS];
+            for k in 0..LIMB_BITS {
+                dbits[k] = alloc_bool::<F>(b, (((t as u8) >> k) & 1) == 1);
+            }
+            let mut lc_diff = vec![(F::ONE, diff_i)];
+            let mut pow = F::ONE;
+            for k in 0..LIMB_BITS {
+                lc_diff.push((-pow, dbits[k]));
+                pow *= F::from(2u64);
+            }
+            b.enforce_lc_times_one_eq_const(lc_diff);
+
+            let bor_next = alloc_bool::<F>(b, bor_next_u8 == 1);
+            // u_i - c_i - bor_i + base*bor_{i+1} - diff_i == 0
+            b.enforce_lc_times_one_eq_const(vec![
+                (F::ONE, u_limbs[i]),
+                (-F::from(ci as u64), b.one()),
+                (-F::ONE, borrow),
+                (F::from(LIMB_BASE_U64), bor_next),
+                (-F::ONE, diff_i),
+            ]);
+            borrow = bor_next;
+        }
+        // ge == 1 - final_borrow
+        let one_minus_bor = b.new_var(F::ONE - b.assignment[borrow]);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, one_minus_bor),
+            (F::ONE, borrow),
+            (-F::ONE, b.one()),
+        ]);
+        b.enforce_lc_times_one_eq_const(vec![(F::ONE, ge), (-F::ONE, one_minus_bor)]);
+        ge
+    }
+
+    let le_bound = le_const_base128::<F>(b, &u_limbs, u, bound);
+    let p_minus_bound = FROG_P.saturating_sub(bound);
+    let ge_p_minus_bound = ge_const_base128::<F>(b, &u_limbs, u, p_minus_bound);
+
+    // ok = le_bound OR ge_p_minus_bound
+    let and = b.new_var(b.assignment[le_bound] * b.assignment[ge_p_minus_bound]);
+    b.enforce_mul(le_bound, ge_p_minus_bound, and);
+    let ok = b.new_var(b.assignment[le_bound] + b.assignment[ge_p_minus_bound] - b.assignment[and]);
+    b.enforce_lc_times_one_eq_const(vec![
+        (F::ONE, ok),
+        (-F::ONE, le_bound),
+        (-F::ONE, ge_p_minus_bound),
+        (F::ONE, and),
+    ]);
+    b.enforce_var_eq_const(ok, F::ONE);
+
+    u_limbs
+}
+

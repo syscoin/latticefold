@@ -156,6 +156,7 @@ where
             None,
             &ops_f257,
             ring_dim,
+            params,
             &wiring_abs,
             pairs,
         )?;
@@ -892,6 +893,7 @@ where
             None,
             &ops_f257,
             ring_dim,
+            params,
             &wiring_abs,
             pairs,
         )?;
@@ -5995,6 +5997,7 @@ mod tests {
                 None,
                 &ops_f257,
                 <R as PolyRing>::dimension(),
+                &params,
                 &wiring_abs,
                 &pairs,
             )
