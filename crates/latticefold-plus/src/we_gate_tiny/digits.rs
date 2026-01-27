@@ -416,7 +416,7 @@ pub(crate) fn alloc_carry_pm_dynamic_le512(b: &mut Dr1csBuilder<F257>, c: i32) -
 /// Allocate a signed carry `c ∈ {-1,0,1}` using two booleans.
 ///
 /// Constrain `b_pos * b_neg = 0` and `c = b_pos - b_neg`.
-fn alloc_carry_pm1(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
+pub(crate) fn alloc_carry_pm1(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
     assert!((-1..=1).contains(&c));
     let b_pos = alloc_bool::<F257>(b, c == 1);
     let b_neg = alloc_bool::<F257>(b, c == -1);
@@ -433,6 +433,26 @@ fn alloc_carry_pm1(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
         (F257::ONE, b_neg),
     ]);
     c_var
+}
+
+/// Allocate carry in {-1,0,1}, using *zero_var()* when carry == 0.
+#[inline]
+pub(crate) fn alloc_carry_pm1_dynamic(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
+    assert!((-1..=1).contains(&c));
+    if c == 0 { b.zero_var() } else { alloc_carry_pm1(b, c) }
+}
+
+/// Allocate carry in {-2,-1,0,1,2}, using cheaper gadgets when possible.
+#[inline]
+pub(crate) fn alloc_carry_pm2_dynamic(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
+    assert!((-2..=2).contains(&c));
+    if c == 0 {
+        b.zero_var()
+    } else if c.abs() == 1 {
+        alloc_carry_pm1(b, c)
+    } else {
+        alloc_carry_pm2(b, c)
+    }
 }
 
 /// Allocate a signed carry `c ∈ [-1024,1023]` as an F257 variable by range-checking an offset.
@@ -516,8 +536,7 @@ pub(crate) fn add_bal16_same_len(
     let n = a.len();
     let mut out: Vec<usize> = Vec::with_capacity(n);
     let mut carry_i32: i32 = 0;
-    let mut carry = b.new_var(F257::ZERO);
-    b.enforce_var_eq_const(carry, F257::ZERO);
+    let mut carry = b.zero_var();
 
     for i in 0..n {
         let ai = f257_to_i32_bal(b.assignment[a[i]]);
@@ -539,7 +558,7 @@ pub(crate) fn add_bal16_same_len(
         assert!((-8..=7).contains(&rem));
 
         let out_digit = alloc_bal16_digit(b, rem as i8);
-        let carry_next_var = alloc_carry_pm1(b, carry_next);
+        let carry_next_var = alloc_carry_pm1_dynamic(b, carry_next);
 
         // a_i + c_i + carry - out_i - 16*carry_next = 0
         b.enforce_lc_times_one_eq_const(vec![
@@ -575,8 +594,7 @@ pub(crate) fn add3_bal16_same_len(
     let n = a.len();
     let mut out: Vec<usize> = Vec::with_capacity(n);
     let mut carry_i32: i32 = 0;
-    let mut carry = b.new_var(F257::ZERO);
-    b.enforce_var_eq_const(carry, F257::ZERO);
+    let mut carry = b.zero_var();
 
     for i in 0..n {
         let ai = f257_to_i32_bal(b.assignment[a[i]]);
@@ -600,7 +618,7 @@ pub(crate) fn add3_bal16_same_len(
         assert!((-8..=7).contains(&rem));
 
         let out_digit = alloc_bal16_digit(b, rem as i8);
-        let carry_next_var = alloc_carry_pm2(b, carry_next);
+        let carry_next_var = alloc_carry_pm2_dynamic(b, carry_next);
 
         // a_i + c_i + d_i + carry - out_i - 16*carry_next = 0
         b.enforce_lc_times_one_eq_const(vec![
@@ -630,8 +648,7 @@ pub(crate) fn neg_bal16_digits(
     let n = x.len();
     let mut out: Vec<usize> = Vec::with_capacity(n);
     let mut carry_i32: i32 = 0;
-    let mut carry = b.new_var(F257::ZERO);
-    b.enforce_var_eq_const(carry, F257::ZERO);
+    let mut carry = b.zero_var();
 
     for i in 0..n {
         let xi = f257_to_i32_bal(b.assignment[x[i]]);
@@ -650,7 +667,7 @@ pub(crate) fn neg_bal16_digits(
         debug_assert!((-8..=7).contains(&rem));
 
         let out_digit = alloc_bal16_digit(b, rem as i8);
-        let carry_next_var = alloc_carry_pm1(b, carry_next);
+        let carry_next_var = alloc_carry_pm1_dynamic(b, carry_next);
 
         // carry - x_i - out_i - 16*carry_next = 0
         b.enforce_lc_times_one_eq_const(vec![
