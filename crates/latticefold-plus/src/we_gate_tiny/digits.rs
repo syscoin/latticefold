@@ -499,6 +499,9 @@ fn alloc_carry_pm11_dynamic(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
         b.zero_var()
     } else if c.abs() == 1 {
         alloc_carry_pm1(b, c)
+    } else if c.abs() == 2 {
+        // pm2 is now enforced without bit-decomposition.
+        alloc_carry_pm2(b, c)
     } else if (-8..=7).contains(&c) {
         alloc_carry_pm8(b, c)
     } else {
