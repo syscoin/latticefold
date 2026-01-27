@@ -5,6 +5,9 @@ use latticefold::transcript::poseidon::F257;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 use symphony::transcript::PoseidonTraceOp;
 
+use std::cmp::Reverse;
+use std::collections::BTreeMap;
+
 use crate::we_frog_poseidon_f257::FROG_P;
 use crate::we_gate_tiny::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U32, LIMBS_U64};
 
@@ -57,6 +60,90 @@ fn limbs_u32_from_base128<F: PrimeField>(b: &Dr1csBuilder<F>, limbs: &[usize; LI
         acc |= di & (LIMB_BASE_U64 - 1);
     }
     acc as u32
+}
+
+fn should_dump_constraints() -> bool {
+    match std::env::var("LF_DUMP_CONSTRAINTS") {
+        Ok(v) => v != "0",
+        Err(_) => false,
+    }
+}
+
+fn field_to_u64<F: PrimeField>(x: F) -> u64 {
+    let bytes = x.into_bigint().to_bytes_le();
+    let mut buf = [0u8; 8];
+    for (i, b) in bytes.into_iter().take(8).enumerate() {
+        buf[i] = b;
+    }
+    u64::from_le_bytes(buf)
+}
+
+fn fmt_lc<F: PrimeField>(terms: &[(F, usize)]) -> String {
+    if terms.is_empty() {
+        return "0".to_string();
+    }
+    let mut s = String::new();
+    for (i, (c, idx)) in terms.iter().copied().enumerate() {
+        if i > 0 {
+            s.push_str(" + ");
+        }
+        let cu = field_to_u64::<F>(c);
+        s.push_str(&format!("{cu}*v{idx}"));
+    }
+    s
+}
+
+fn dump_dr1cs<F: PrimeField>(b: &Dr1csBuilder<F>, label: &str, max_rows: usize) {
+    eprintln!(
+        "== dR1CS dump: {label} | nvars={} nconstraints={} ==",
+        b.assignment.len(),
+        b.rows.len()
+    );
+
+    let mut hist: BTreeMap<(usize, usize, usize), usize> = BTreeMap::new();
+    let mut max_terms: usize = 0;
+    for row in &b.rows {
+        let shape = (row.a.len(), row.b.len(), row.c.len());
+        *hist.entry(shape).or_insert(0) += 1;
+        max_terms = max_terms.max(shape.0 + shape.1 + shape.2);
+    }
+
+    let mut hist_sorted: Vec<((usize, usize, usize), usize)> = hist.into_iter().collect();
+    hist_sorted.sort_by_key(|(_k, v)| Reverse(*v));
+    eprintln!("shape histogram (|A|,|B|,|C|) -> count (top 20), max_terms={max_terms}:");
+    for (shape, count) in hist_sorted.into_iter().take(20) {
+        eprintln!("  {:?} -> {}", shape, count);
+    }
+
+    let n = b.rows.len();
+    let head = n.min(max_rows);
+    for i in 0..head {
+        let row = &b.rows[i];
+        eprintln!(
+            "row {i}: ({}) * ({}) = ({})",
+            fmt_lc::<F>(&row.a),
+            fmt_lc::<F>(&row.b),
+            fmt_lc::<F>(&row.c),
+        );
+    }
+    if n > head {
+        eprintln!("... omitted {} rows ...", n - head);
+    }
+    if n > 0 {
+        let tail_start = n.saturating_sub(5);
+        if tail_start > 0 && tail_start >= head {
+            eprintln!("tail (last {} rows):", n - tail_start);
+            for i in tail_start..n {
+                let row = &b.rows[i];
+                eprintln!(
+                    "row {i}: ({}) * ({}) = ({})",
+                    fmt_lc::<F>(&row.a),
+                    fmt_lc::<F>(&row.b),
+                    fmt_lc::<F>(&row.c),
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -317,12 +404,23 @@ fn test_ring_mul_negacyclic_toom4_d64_matches_native_one_case() {
     }
 
     let out = ring_mul_negacyclic_toom4_d64(&mut b, &a_bytes, &c_bytes);
+    if should_dump_constraints() {
+        dump_dr1cs::<F257>(&b, "ring_mul_negacyclic_toom4_d64", 40);
+    }
     for k in 0..64 {
         let mut ob = [0u8; 8];
         for j in 0..8 {
             ob[j] = var_to_u8::<F257>(&b, out[k][j]);
         }
-        assert_eq!(u64::from_le_bytes(ob), exp[k]);
+        let got = u64::from_le_bytes(ob);
+        if got != exp[k] {
+            dump_dr1cs::<F257>(&b, "ring_mul_negacyclic_toom4_d64 (mismatch)", 120);
+            eprintln!(
+                "ring mul mismatch at k={k}: got={got} expected={} (seed=4242424242)",
+                exp[k]
+            );
+            panic!("ring mul output mismatch");
+        }
     }
 
     let (inst, asg) = b.into_instance();
