@@ -6,7 +6,7 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 use super::coins::frog_p_base128_digits_le;
 use super::digits::{
     add_bal16_same_len, alloc_bal16_digit, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
-    alloc_carry_pm512, i32_to_f257, u64_bytes_to_bal16_digits_cached,
+    alloc_carry_pm128, alloc_carry_pm512, i32_to_f257, u64_bytes_to_bal16_digits_cached,
 };
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
@@ -615,12 +615,12 @@ fn enforce_prod_eq_qp_plus_r_bal16(
         );
         let carry_next: i32 = sum / 16;
         debug_assert!(
-            (-512..=511).contains(&carry_next),
-            "carry out of pm512 bound: {carry_next} at k={k} (sum={sum})"
+            (-128..=127).contains(&carry_next),
+            "carry out of pm128 bound: {carry_next} at k={k} (sum={sum})"
         );
 
-        // Allocate next carry with range-check.
-        let carry_next_var = alloc_carry_pm512(b, carry_next);
+        // Allocate next carry with range-check (pm128 is sufficient here).
+        let carry_next_var = alloc_carry_pm128(b, carry_next);
 
         // Constrain: carry + prod_k - r_k - Σ(q_i * p_{k-i}) - 16*carry_next = 0
         let mut lc: Vec<(F257, usize)> = Vec::with_capacity(4 + q_d.len());
