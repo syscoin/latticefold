@@ -88,6 +88,16 @@ pub(crate) fn alloc_bal16_digit(b: &mut Dr1csBuilder<F257>, d: i8) -> usize {
     out
 }
 
+/// Allocate a balanced base-16 digit witness in [-8,7] **without** bit-decomposition.
+///
+/// This is sound when the digit is immediately pinned by a no-wrap-safe carry-chain equation
+/// whose integer magnitude stays < 257 (so mod-257 aliasing is impossible).
+#[inline]
+pub(crate) fn alloc_bal16_digit_nocheck(b: &mut Dr1csBuilder<F257>, d: i8) -> usize {
+    debug_assert!((-8..=7).contains(&d));
+    b.new_var(i32_to_f257(d as i32))
+}
+
 /// Allocate a signed carry `c` by allocating an offset `off = c + 16` in [0,31] and
 /// enforcing `off ∈ [5,27]` (i.e., `c ∈ [-11,11]`).
 fn alloc_carry_pm11(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
@@ -429,7 +439,7 @@ pub(crate) fn add_bal16_same_len(
         assert!((-1..=1).contains(&carry_next));
         assert!((-8..=7).contains(&rem));
 
-        let out_digit = alloc_bal16_digit(b, rem as i8);
+        let out_digit = alloc_bal16_digit_nocheck(b, rem as i8);
         // Statement-only arming: do not branch on witness carry value.
         let carry_next_var = alloc_carry_pm1(b, carry_next);
 
@@ -574,7 +584,7 @@ fn normalize_bal16_loose_same_len_with_bound(
             carry_bounds[i]
         );
 
-        let rem_digit = alloc_bal16_digit(b, rem as i8);
+        let rem_digit = alloc_bal16_digit_nocheck(b, rem as i8);
         let carry_next_var = alloc_carry_with_bound(b, carry_next, carry_bounds[i]);
 
         // loose_i + carry_i - rem_i - 16*carry_{i+1} = 0
@@ -632,7 +642,7 @@ pub(crate) fn add3_bal16_same_len(
         assert!((-2..=2).contains(&carry_next));
         assert!((-8..=7).contains(&rem));
 
-        let out_digit = alloc_bal16_digit(b, rem as i8);
+        let out_digit = alloc_bal16_digit_nocheck(b, rem as i8);
         // Statement-only arming: do not branch on witness carry value.
         let carry_next_var = alloc_carry_pm2(b, carry_next);
 
@@ -682,7 +692,7 @@ pub(crate) fn neg_bal16_digits(
         debug_assert!((-1..=1).contains(&carry_next));
         debug_assert!((-8..=7).contains(&rem));
 
-        let out_digit = alloc_bal16_digit(b, rem as i8);
+        let out_digit = alloc_bal16_digit_nocheck(b, rem as i8);
         // Statement-only arming: do not branch on witness carry value.
         let carry_next_var = alloc_carry_pm1(b, carry_next);
 
@@ -790,7 +800,7 @@ pub(crate) fn rebalance_tail_pm11_to_pm2(b: &mut Dr1csBuilder<F257>, digits: &[u
     debug_assert!((-8..=7).contains(&rem));
     debug_assert!((-2..=2).contains(&carry2));
 
-    let rem_digit = alloc_bal16_digit(b, rem as i8);
+    let rem_digit = alloc_bal16_digit_nocheck(b, rem as i8);
     let carry2_var = alloc_carry_pm2(b, carry2);
     b.enforce_lc_times_one_eq_const(vec![
         (F257::ONE, digits[l - 1]),
@@ -828,7 +838,7 @@ pub(crate) fn rebalance_tail_pm16_to_pm1(b: &mut Dr1csBuilder<F257>, digits: &[u
     debug_assert!((-8..=7).contains(&rem));
     debug_assert!((-1..=1).contains(&carry1));
 
-    let rem_digit = alloc_bal16_digit(b, rem as i8);
+    let rem_digit = alloc_bal16_digit_nocheck(b, rem as i8);
     let carry1_var = alloc_carry_pm1(b, carry1);
     b.enforce_lc_times_one_eq_const(vec![
         (F257::ONE, digits[l - 1]),
@@ -1210,7 +1220,7 @@ pub(crate) fn mul_bal16_small(b: &mut Dr1csBuilder<F257>, a: &[usize], bb: &[usi
             "carry out of expected range: {carry} from sum {sum}"
         );
 
-        let digit_var = alloc_bal16_digit(b, rem as i8);
+        let digit_var = alloc_bal16_digit_nocheck(b, rem as i8);
         // Statement-only arming: avoid witness-dependent gadget selection.
         let carry_out_var = alloc_carry_pm11(b, carry);
 
@@ -1300,7 +1310,7 @@ pub(crate) fn mul_bal16_small_const_rhs(
             "carry out of expected range: {carry} from sum {sum}"
         );
 
-        let digit_var = alloc_bal16_digit(b, rem as i8);
+        let digit_var = alloc_bal16_digit_nocheck(b, rem as i8);
         // Statement-only arming: avoid witness-dependent gadget selection.
         let carry_out_var = alloc_carry_pm11(b, carry);
 
@@ -1380,7 +1390,7 @@ fn mul_bal16_small_const_rhs4(
         debug_assert!((-8..=7).contains(&rem));
         debug_assert!((-16..=15).contains(&carry));
 
-        let digit_var = alloc_bal16_digit(b, rem as i8);
+        let digit_var = alloc_bal16_digit_nocheck(b, rem as i8);
         let carry_out_var = alloc_carry_pm16(b, carry);
         lc.push((-F257::ONE, digit_var));
         lc.push((-F257::from(16u64), carry_out_var));

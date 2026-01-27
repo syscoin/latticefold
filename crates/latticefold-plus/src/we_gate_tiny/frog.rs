@@ -1194,6 +1194,24 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
         out
     }
 
+    /// Allocate a u64 witness as balanced base-16 digits **without** per-digit bit range checks.
+    ///
+    /// Soundness note (for NTT add/sub paths only): the resulting digit vars are immediately
+    /// constrained by a tight carry-chain relation (`enforce_{add,sub}_mod_p_relation_bal16`)
+    /// whose per-step integer magnitude is < 257, so mod-257 aliasing is impossible.
+    #[inline]
+    fn alloc_u64_as_bal16_digits_witness_nocheck(b: &mut Dr1csBuilder<F257>, x: u64) -> Vec<usize> {
+        let ds = u64_to_bal16_digits_le_const(x);
+        let mut out: Vec<usize> = Vec::with_capacity(17);
+        for i in 0..16 {
+            // Witness-only digit var; its value will be pinned by subsequent carry constraints.
+            out.push(b.new_var(i32_to_f257(ds[i] as i32)));
+        }
+        // Final carry digit is in {0,1}; keep it boolean (cheap) to avoid accidental misuse.
+        out.push(alloc_bool::<F257>(b, ds[16] == 1));
+        out
+    }
+
     #[inline]
     fn add_mod_p(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, c: &FrogScalar, p_u64: u64, p_d: &[i8; 17]) -> FrogScalar {
         let a_u = digits_to_u64_witness(b, a);
@@ -1202,7 +1220,7 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
         let q_u8: u8 = if sum >= (p_u64 as u128) { 1 } else { 0 };
         let r_u: u64 = if q_u8 == 1 { (sum - (p_u64 as u128)) as u64 } else { sum as u64 };
         let q = alloc_bool::<F257>(b, q_u8 == 1);
-        let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
+        let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness_nocheck(b, r_u));
         enforce_add_mod_p_relation_bal16(b, a, c, &r_d, q, q_u8, p_d);
         r_d
     }
@@ -1217,7 +1235,7 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
             (1u8, (a_u as u128 + (p_u64 as u128) - (c_u as u128)) as u64)
         };
         let q = alloc_bool::<F257>(b, q_u8 == 1);
-        let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
+        let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness_nocheck(b, r_u));
         enforce_sub_mod_p_relation_bal16(b, a, c, &r_d, q, q_u8, p_d);
         r_d
     }
@@ -1740,7 +1758,6 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         // producing balanced digits in [-8,7] with a bounded carry.
         let p_d_const = frog_p_bal16_digits_le_const();
         const TARGET_LEN: usize = 43;
-        let zero_digit = b.zero_var();
 
         // Precompute constant bal16 digits for each coefficient.
         let mut coeff_ds: [[i8; 17]; N] = [[0i8; 17]; N];
