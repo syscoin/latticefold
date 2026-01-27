@@ -68,6 +68,145 @@ fn validate_pairs(pairs: &[(usize, usize)], short_len: usize, u32_len: usize) ->
     Ok(())
 }
 
+fn validate_params_and_short_schedule(
+    ring_dim: usize,
+    params: &WeParams,
+    short_ranges_len: usize,
+) -> Result<(), String> {
+    // Basic parameter consistency: the tiny builder is specialized to the same ring/CM schedule
+    // as LF+ CM verification.
+    if ring_dim != params.ring_dim_d as usize {
+        return Err(format!(
+            "tiny gate: ring_dim mismatch (arg={} params.ring_dim_d={})",
+            ring_dim, params.ring_dim_d
+        ));
+    }
+    if params.degree_cm != 2 {
+        return Err("tiny gate: expected params.degree_cm == 2".to_string());
+    }
+
+    // CM short-challenge schedule: `s` has 3 blocks, and `s_prime` has k*d blocks.
+    let k_decomp = params.k as usize;
+    let expected_short_blocks = 3usize
+        .checked_add(k_decomp.saturating_mul(ring_dim))
+        .ok_or_else(|| "tiny gate: short block count overflow".to_string())?;
+    if short_ranges_len != expected_short_blocks {
+        return Err(format!(
+            "tiny gate: short_squeeze_ops count mismatch (got {}, expected {})",
+            short_ranges_len, expected_short_blocks
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cm_u32_schedule(params: &WeParams, wiring: &TinyCoinOpWiring) -> Result<(), String> {
+    // Deterministic schedule sanity (aligns with `CmProof::verify_with_mlen`):
+    // After the first short squeeze, CM consumes:
+    // - `log_kappa` challenges for c0
+    // - `log_kappa` challenges for c1
+    // - rc0, rc1 (2)
+    // - sumcheck r0/r1 (2*nvars_cm)
+    // Total = 2*log_kappa + 2 + 2*nvars_cm.
+    if wiring.short_squeeze_ops.is_empty() {
+        return Err("tiny gate: expected CM short squeezes (short_squeeze_ops empty)".to_string());
+    }
+    let first_short_op = *wiring
+        .short_squeeze_ops
+        .iter()
+        .min()
+        .expect("non-empty short_squeeze_ops");
+    let cm_u32_start = wiring.u32_squeeze_ops.iter().filter(|&&idx| idx < first_short_op).count();
+    let cm_u32_have = wiring.u32_squeeze_ops.len().saturating_sub(cm_u32_start);
+    let kappa = params.kappa as usize;
+    if kappa == 0 || !kappa.is_power_of_two() {
+        return Err("tiny gate: params.kappa must be a power of two".to_string());
+    }
+    let log_kappa = usize::BITS as usize - 1 - kappa.leading_zeros() as usize;
+    let nvars_cm = params.nvars_cm as usize;
+    let cm_u32_need = 2 * log_kappa + 2 + 2 * nvars_cm;
+    if cm_u32_have < cm_u32_need {
+        return Err(format!(
+            "tiny gate: not enough CM u32 challenges after absorb_comh: have={cm_u32_have} need={cm_u32_need}"
+        ));
+    }
+    Ok(())
+}
+
+fn count_comh_ring_elements(
+    ops: &[PoseidonTraceOp<F257>],
+    pose_wiring: &PoseidonDr1csWiring,
+    ring_dim: usize,
+    wiring: &TinyCoinOpWiring,
+) -> Result<(usize /* n_ring_elems */, usize /* coeff_bytes */), String> {
+    if ring_dim == 0 {
+        return Ok((0, 0));
+    }
+    if wiring.short_squeeze_ops.is_empty() || wiring.u32_squeeze_ops.is_empty() {
+        return Ok((0, 0));
+    }
+
+    // Infer per-ring-element absorb width `reb` from absorb ranges.
+    let mut ring_elem_bytes: Option<usize> = None;
+    for &(_st, ln) in &pose_wiring.absorb_ranges {
+        if ln % ring_dim == 0 && ln > ring_dim {
+            ring_elem_bytes = Some(match ring_elem_bytes {
+                None => ln,
+                Some(cur) => cur.min(ln),
+            });
+        }
+    }
+    let reb = ring_elem_bytes.ok_or_else(|| "tiny gate: could not infer ring_elem_bytes".to_string())?;
+    let coeff_bytes = reb / ring_dim;
+
+    let last_short_op = *wiring
+        .short_squeeze_ops
+        .iter()
+        .max()
+        .expect("non-empty short_squeeze_ops");
+    let first_short_op = *wiring
+        .short_squeeze_ops
+        .iter()
+        .min()
+        .expect("non-empty short_squeeze_ops");
+    let cm_u32_start = wiring.u32_squeeze_ops.iter().filter(|&&idx| idx < first_short_op).count();
+    if cm_u32_start >= wiring.u32_squeeze_ops.len() {
+        return Ok((0, coeff_bytes));
+    }
+    let first_cm_u32_op = wiring.u32_squeeze_ops[cm_u32_start];
+
+    let mut absorb_idx = 0usize;
+    let mut squeeze_field_op_idx = 0usize;
+    let mut after_short = false;
+    let mut count = 0usize;
+    for op in ops {
+        match op {
+            PoseidonTraceOp::Absorb(_v) => {
+                let (_ab_start, ab_len) = *pose_wiring
+                    .absorb_ranges
+                    .get(absorb_idx)
+                    .ok_or("tiny gate: pose_wiring.absorb_ranges oob (comh count)")?;
+                absorb_idx += 1;
+                if after_short && squeeze_field_op_idx <= first_cm_u32_op {
+                    if ab_len != reb {
+                        return Err(format!(
+                            "tiny gate: unexpected absorb len in comh segment (got {ab_len}, expected {reb})"
+                        ));
+                    }
+                    count += 1;
+                }
+            }
+            PoseidonTraceOp::SqueezeField(_v) => {
+                if squeeze_field_op_idx == last_short_op {
+                    after_short = true;
+                }
+                squeeze_field_op_idx += 1;
+            }
+            PoseidonTraceOp::SqueezeBytes { .. } => {}
+        }
+    }
+    Ok((count, coeff_bytes))
+}
+
 fn build_short_blocks(
     glue: &mut GlueCtx,
     pose_wiring: &PoseidonDr1csWiring,
@@ -1080,6 +1219,7 @@ pub(super) fn build(
     let u32_ranges = squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.u32_squeeze_ops)?;
     let frog_ranges = squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.frog_squeeze_ops)?;
     validate_pairs(pairs, short_ranges.len(), u32_ranges.len())?;
+    validate_params_and_short_schedule(ring_dim, params, short_ranges.len())?;
 
     let mut glue = GlueCtx::new(pose_asg);
 
@@ -1087,35 +1227,18 @@ pub(super) fn build(
     // (Skip fiat–shamir reabsorbs, which are F257 digits and may contain 256.)
     enforce_nonreabsorb_absorbs_are_canonical_frog(&mut glue, ops, &pose_wiring)?;
 
-    // Deterministic schedule sanity (aligns with `CmProof::verify_with_mlen`):
-    // After the first short squeeze, CM consumes:
-    // - `log_kappa` challenges for c0
-    // - `log_kappa` challenges for c1
-    // - rc0, rc1 (2)
-    // - sumcheck r0/r1 (2*nvars_cm)
-    // Total = 2*log_kappa + 2 + 2*nvars_cm.
-    if wiring.short_squeeze_ops.is_empty() {
-        return Err("tiny gate: expected CM short squeezes (short_squeeze_ops empty)".to_string());
-    }
-    let first_short_op = *wiring
-        .short_squeeze_ops
-        .iter()
-        .min()
-        .expect("non-empty short_squeeze_ops");
-    let cm_u32_start = wiring.u32_squeeze_ops.iter().filter(|&&idx| idx < first_short_op).count();
-    let cm_u32_have = wiring.u32_squeeze_ops.len().saturating_sub(cm_u32_start);
-    let kappa = params.kappa as usize;
-    if kappa == 0 || !kappa.is_power_of_two() {
-        return Err("tiny gate: params.kappa must be a power of two".to_string());
-    }
-    let log_kappa = usize::BITS as usize - 1 - kappa.leading_zeros() as usize;
-    let nvars_cm = params.nvars_cm as usize;
-    let cm_u32_need = 2 * log_kappa + 2 + 2 * nvars_cm;
-    if cm_u32_have < cm_u32_need {
+    validate_cm_u32_schedule(params, wiring)?;
+    let (n_comh_ring_elems, coeff_bytes) = count_comh_ring_elements(ops, &pose_wiring, ring_dim, wiring)?;
+    if ring_dim > 0 && n_comh_ring_elems > 0 && coeff_bytes != 8 {
         return Err(format!(
-            "tiny gate: not enough CM u32 challenges after absorb_comh: have={cm_u32_have} need={cm_u32_need}"
+            "tiny gate: expected Frog base-field coeff_bytes=8, got {coeff_bytes}"
         ));
     }
+    let kappa = params.kappa as usize;
+    if kappa > 0 && (n_comh_ring_elems % kappa) != 0 {
+        return Err("tiny gate: comh ring element count not divisible by kappa".to_string());
+    }
+    let l_instances_expected = if kappa == 0 { 0 } else { n_comh_ring_elems / kappa };
 
 
     let short_locals = build_short_blocks(&mut glue, &pose_wiring, ring_dim, &short_ranges)?;
@@ -1124,6 +1247,12 @@ pub(super) fn build(
     let frog_rejection_locals = build_frog_rejection_coins(&mut glue, &pose_wiring, &frog_ranges)?;
     let (tcch0_local, tcch1_local) =
         compute_tcch(&mut glue, ops, &pose_wiring, ring_dim, params, wiring, &u32_ranges, &frog_locals)?;
+    if l_instances_expected != 0 && tcch0_local.len() != l_instances_expected {
+        return Err("tiny gate: tcch0 length mismatch with inferred L".to_string());
+    }
+    if l_instances_expected != 0 && tcch1_local.len() != l_instances_expected {
+        return Err("tiny gate: tcch1 length mismatch with inferred L".to_string());
+    }
 
     let (mut surfaces_mul_local, all_sum_digits, all_sum_coeffwise) =
         build_mul_surfaces(&mut glue, ring_dim, pairs, &short_locals, &u32_locals)?;
