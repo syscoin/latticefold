@@ -6,7 +6,8 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 use super::coins::frog_p_base128_digits_le;
 use super::digits::{
     add_bal16_same_len, alloc_bal16_digit, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
-    alloc_carry_pm128, alloc_carry_pm2, alloc_carry_pm512, i32_to_f257, u64_bytes_to_bal16_digits_cached,
+    alloc_carry_pm2, alloc_carry_pm_dynamic_le128, alloc_carry_pm_dynamic_le512, i32_to_f257,
+    u64_bytes_to_bal16_digits_cached,
 };
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
@@ -619,8 +620,8 @@ fn enforce_prod_eq_qp_plus_r_bal16(
             "carry out of pm128 bound: {carry_next} at k={k} (sum={sum})"
         );
 
-        // Allocate next carry with range-check (pm128 is sufficient here).
-        let carry_next_var = alloc_carry_pm128(b, carry_next);
+        // Allocate next carry with the smallest sufficient bound.
+        let carry_next_var = alloc_carry_pm_dynamic_le128(b, carry_next);
 
         // Constrain: carry + prod_k - r_k - Σ(q_i * p_{k-i}) - 16*carry_next = 0
         let mut lc: Vec<(F257, usize)> = Vec::with_capacity(4 + q_d.len());
@@ -1304,7 +1305,8 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
 
         let mut acc_digits: Vec<usize> = Vec::with_capacity(TARGET_LEN);
         let mut carry_i32: i32 = 0;
-        let mut carry_var = alloc_carry_pm512(b, 0);
+        let mut carry_var = b.new_var(F257::ZERO);
+        b.enforce_var_eq_const(carry_var, F257::ZERO);
 
         #[inline]
         fn f257_from_i8(x: i8) -> F257 {
@@ -1353,7 +1355,7 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
             );
 
             let digit_var = alloc_bal16_digit(b, rem as i8);
-            let carry_out_var = alloc_carry_pm512(b, carry_next);
+            let carry_out_var = alloc_carry_pm_dynamic_le512(b, carry_next);
             lc.push((-F257::ONE, digit_var));
             lc.push((-F257::from(16u64), carry_out_var));
             b.enforce_lc_times_one_eq_const(lc);
@@ -1380,7 +1382,7 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
             debug_assert!((-512..=511).contains(&carry_next));
 
             let rem_digit = alloc_bal16_digit(b, rem as i8);
-            let carry_next_var = alloc_carry_pm512(b, carry_next);
+            let carry_next_var = alloc_carry_pm_dynamic_le512(b, carry_next);
             b.enforce_lc_times_one_eq_const(vec![
                 (F257::ONE, carry_var),
                 (-F257::ONE, rem_digit),
