@@ -963,6 +963,7 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
     fn lincomb7_mod_p_from_canonical_evals(
         b: &mut Dr1csBuilder<F257>,
         evals: &[[usize; 8]; 7],
+        evals_d: &[Vec<usize>; 7],
         coeffs: &[u64; 7],
     ) -> [usize; 8] {
         // -----------------------
@@ -1027,7 +1028,7 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
             if coeff == 0 {
                 continue;
             }
-            let e_d = u64_bytes_to_bal16_digits_cached(b, evals[i]);
+            let e_d = &evals_d[i];
             let coeff_d_const = u64_to_bal16_digits_le_const(coeff);
             let prod_d = mul_bal16_long_by_const_rhs(b, &e_d, &coeff_d_const);
             let prod_d = pad_bal16(b, prod_d, TARGET_LEN);
@@ -1171,6 +1172,7 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
                 for i in 0..7 {
                     evals[i] = w_eval[i][k];
                 }
+                let evals_d: [Vec<usize>; 7] = core::array::from_fn(|i| u64_bytes_to_bal16_digits_cached(b, evals[i]));
                 let mut coeffs = [0u64; 7];
                 for i in 0..7 {
                     let n = NUMS[j][i];
@@ -1178,7 +1180,7 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
                         coeffs[i] = modmul_i64_u64(n, inv720, FROG_P);
                     }
                 }
-                let acc = lincomb7_mod_p_from_canonical_evals(b, &evals, &coeffs);
+                let acc = lincomb7_mod_p_from_canonical_evals(b, &evals, &evals_d, &coeffs);
                 // NOTE: idx is NOT unique: blocks of length (2m-1) shifted by m overlap.
                 res[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &res[idx], &acc);
             }
@@ -1216,6 +1218,7 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
             for i in 0..7 {
                 evals[i] = w_eval_top[i][k];
             }
+            let evals_d: [Vec<usize>; 7] = core::array::from_fn(|i| u64_bytes_to_bal16_digits_cached(b, evals[i]));
             let mut coeffs = [0u64; 7];
             for i in 0..7 {
                 let n = NUMS[j][i];
@@ -1223,7 +1226,7 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
                     coeffs[i] = modmul_i64_u64(n, inv720, FROG_P);
                 }
             }
-            let acc = lincomb7_mod_p_from_canonical_evals(b, &evals, &coeffs);
+            let acc = lincomb7_mod_p_from_canonical_evals(b, &evals, &evals_d, &coeffs);
             // NOTE: idx is NOT unique: blocks of length 31 shifted by 16 overlap.
             prod[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &prod[idx], &acc);
         }
