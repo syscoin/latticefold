@@ -763,6 +763,113 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
         b.profile_exit(_prev);
         return out;
     }
+
+    // Fast path for the common WE-gate operand sizes (u64-ish bal16 digits):
+    // perform a streaming convolution with a bounded carry in [-128,127], avoiding the
+    // block+shift accumulator (which is add-heavy).
+    if a.len() <= 19 && bb.len() <= 19 {
+        let la = a.len();
+        let lb = bb.len();
+
+        let div_floor = |x: i32, d: i32| -> i32 {
+            debug_assert!(d > 0);
+            if x >= 0 { x / d } else { -(((-x) + d - 1) / d) }
+        };
+
+        let mut out: Vec<usize> = Vec::with_capacity(la + lb + 4);
+        let mut carry_i32: i32 = 0;
+        let mut carry_var = alloc_carry_pm128(b, 0);
+
+        for k in 0..(la + lb - 1) {
+            let mut sum: i32 = carry_i32;
+            let mut prods: Vec<usize> = Vec::new();
+
+            for i in 0..la {
+                let j = k as i32 - i as i32;
+                if j < 0 || j >= lb as i32 {
+                    continue;
+                }
+                let j = j as usize;
+                let aval = f257_to_i32_bal(b.assignment[a[i]]);
+                let bval = f257_to_i32_bal(b.assignment[bb[j]]);
+                sum += aval * bval;
+
+                let pv = b.new_var(b.assignment[a[i]] * b.assignment[bb[j]]);
+                b.enforce_mul(a[i], bb[j], pv);
+                prods.push(pv);
+            }
+
+            let mut carry_next = div_floor(sum + 8, NIBBLE_BASE);
+            let mut rem = sum - NIBBLE_BASE * carry_next;
+            while rem > 7 {
+                carry_next += 1;
+                rem -= NIBBLE_BASE;
+            }
+            while rem < -8 {
+                carry_next -= 1;
+                rem += NIBBLE_BASE;
+            }
+            assert!((-8..=7).contains(&rem));
+            // For la,lb <= 19 and digits in [-8,7], carry stays safely within [-128,127].
+            assert!(
+                (-128..=127).contains(&carry_next),
+                "carry out of range for pm128: {carry_next} from sum {sum}"
+            );
+
+            let digit_var = alloc_bal16_digit(b, rem as i8);
+            let carry_out_var = alloc_carry_pm128(b, carry_next);
+
+            // carry + Σ prods - digit - 16*carry_out = 0
+            let mut lc: Vec<(F257, usize)> = Vec::with_capacity(2 + prods.len());
+            lc.push((F257::ONE, carry_var));
+            for &p in &prods {
+                lc.push((F257::ONE, p));
+            }
+            lc.push((-F257::ONE, digit_var));
+            lc.push((-F257::from(16u64), carry_out_var));
+            b.enforce_lc_times_one_eq_const(lc);
+
+            out.push(digit_var);
+            carry_i32 = carry_next;
+            carry_var = carry_out_var;
+        }
+
+        // Expand the final carry into balanced base-16 digits until it becomes 0.
+        while carry_i32 != 0 {
+            let sum = carry_i32;
+            let mut carry_next = div_floor(sum + 8, NIBBLE_BASE);
+            let mut rem = sum - NIBBLE_BASE * carry_next;
+            while rem > 7 {
+                carry_next += 1;
+                rem -= NIBBLE_BASE;
+            }
+            while rem < -8 {
+                carry_next -= 1;
+                rem += NIBBLE_BASE;
+            }
+            assert!((-8..=7).contains(&rem));
+            assert!(
+                (-128..=127).contains(&carry_next),
+                "carry out of range for pm128 tail: {carry_next} from sum {sum}"
+            );
+
+            let rem_digit = alloc_bal16_digit(b, rem as i8);
+            let carry_next_var = alloc_carry_pm128(b, carry_next);
+            // carry = rem + 16*carry_next
+            b.enforce_lc_times_one_eq_const(vec![
+                (F257::ONE, carry_var),
+                (-F257::ONE, rem_digit),
+                (-F257::from(16u64), carry_next_var),
+            ]);
+            out.push(rem_digit);
+            carry_i32 = carry_next;
+            carry_var = carry_next_var;
+        }
+        b.enforce_var_eq_const(carry_var, F257::ZERO);
+
+        b.profile_exit(_prev);
+        return out;
+    }
     let (short, long) = if a.len() <= bb.len() { (a, bb) } else { (bb, a) };
 
     let zero = alloc_bal16_digit(b, 0);
