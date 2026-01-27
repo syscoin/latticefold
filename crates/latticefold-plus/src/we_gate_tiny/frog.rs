@@ -839,11 +839,11 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
     c: &[[usize; 8]; 64],
 ) -> [[usize; 8]; 64] {
     let _prev = b.profile_enter("frog::ring_mul_negacyclic_toom4_d64");
-    // Boundary checks: inputs are assumed to be canonical Frog elements.
-    for i in 0..64 {
-        let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &a[i]);
-        let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &c[i]);
-    }
+    // NOTE: We intentionally do NOT canonical-validate all 128 inputs here.
+    //
+    // Canonicality should be enforced at the *true* byte-boundaries (transcript absorb / IO),
+    // not redundantly inside every internal ring multiplication. This function itself reduces
+    // and outputs canonical Frog elements where needed by downstream gadgets.
     // Precomputed inv(Vandermonde(0,±1,±2,±3)) entries as nums/720.
     const NUMS: [[i64; 7]; 7] = [
         [720, 0, 0, 0, 0, 0, 0],
