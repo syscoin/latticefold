@@ -22,7 +22,7 @@ pub(crate) fn f257_to_i32_bal(x: F257) -> i32 {
 }
 
 #[inline]
-fn i32_to_f257(x: i32) -> F257 {
+pub(crate) fn i32_to_f257(x: i32) -> F257 {
     let mut v = x % 257;
     if v < 0 {
         v += 257;
