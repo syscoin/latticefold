@@ -564,6 +564,97 @@ fn frog_p_bytes_le() -> [u8; 8] {
     FROG_P.to_le_bytes()
 }
 
+/// Enforce `prod == q*p + r` in balanced base-16 digits *without* materializing `q*p` or `q*p+r`.
+///
+/// This is a big `alloc_bool` saver in hot paths (mul and mul-by-const), because it avoids
+/// allocating and range-checking intermediate digit vectors that are only used for equality.
+fn enforce_prod_eq_qp_plus_r_bal16(
+    b: &mut Dr1csBuilder<F257>,
+    prod_d: &[usize],
+    q_d: &[usize],
+    p_d_const: &[i8],
+    r_d: &[usize],
+) {
+    let zero = b.zero_var();
+    let max_len = prod_d
+        .len()
+        .max(r_d.len())
+        .max(q_d.len().saturating_add(p_d_const.len()).saturating_sub(1))
+        + 1; // one digit of headroom for the final carry becoming 0
+
+    // Pad prod and r to max_len with 0 digits.
+    let prod_pad = pad_bal16(b, prod_d.to_vec(), max_len);
+    let r_pad = pad_bal16(b, r_d.to_vec(), max_len);
+
+    // carry_0 = 0 (fixed, no range-check needed).
+    let mut carry_var = b.new_var(F257::ZERO);
+    b.enforce_var_eq_const(carry_var, F257::ZERO);
+    let mut carry_i32: i32 = 0;
+
+    for k in 0..max_len {
+        // Witness the exact carry update from the already-witnessed digits.
+        let prod_k = super::digits::f257_to_i32_bal(b.assignment[prod_pad[k]]);
+        let r_k = super::digits::f257_to_i32_bal(b.assignment[r_pad[k]]);
+        let mut sum: i32 = carry_i32 + prod_k - r_k;
+
+        for i in 0..q_d.len() {
+            if i > k {
+                break;
+            }
+            let j = k - i;
+            if j >= p_d_const.len() {
+                continue;
+            }
+            let q_i = super::digits::f257_to_i32_bal(b.assignment[q_d[i]]);
+            sum -= q_i * (p_d_const[j] as i32);
+        }
+
+        debug_assert!(
+            sum % 16 == 0,
+            "base-16 carry check not divisible: sum={sum} at k={k}"
+        );
+        let carry_next: i32 = sum / 16;
+        debug_assert!(
+            (-512..=511).contains(&carry_next),
+            "carry out of pm512 bound: {carry_next} at k={k} (sum={sum})"
+        );
+
+        // Allocate next carry with range-check.
+        let carry_next_var = alloc_carry_pm512(b, carry_next);
+
+        // Constrain: carry + prod_k - r_k - Σ(q_i * p_{k-i}) - 16*carry_next = 0
+        let mut lc: Vec<(F257, usize)> = Vec::with_capacity(4 + q_d.len());
+        lc.push((F257::ONE, carry_var));
+        lc.push((F257::ONE, prod_pad[k]));
+        lc.push((-F257::ONE, r_pad[k]));
+
+        for i in 0..q_d.len() {
+            if i > k {
+                break;
+            }
+            let j = k - i;
+            if j >= p_d_const.len() {
+                continue;
+            }
+            let coeff = i32_to_f257(-(p_d_const[j] as i32)); // subtract q_i*p_j
+            if coeff != F257::ZERO {
+                lc.push((coeff, q_d[i]));
+            }
+        }
+
+        lc.push((-F257::from(16u64), carry_next_var));
+        b.enforce_lc_times_one_eq_const(lc);
+
+        carry_var = carry_next_var;
+        carry_i32 = carry_next;
+    }
+
+    // Final carry must be 0.
+    b.enforce_var_eq_const(carry_var, F257::ZERO);
+    // Also ensure the padded tails we introduced are actually zero digits (soundness belt+braces).
+    b.enforce_var_eq_const(zero, F257::ZERO);
+}
+
 /// General Frog-field multiplication gadget (64-bit prime field) inside the tiny field.
 ///
 /// Inputs are canonical u64 encodings as 8 little-endian byte vars (0..255), representing
@@ -634,20 +725,8 @@ fn frog_mul_mod_p_from_byte_vars_assume_canonical(
 
     // Compute prod_digits = a*b (balanced digits, with headroom/carry already enforced in gadget).
     let prod_d = mul_bal16_long_by_long(b, &a_d, &b_d);
-    // Compute qp_digits = q*p.
     let p_d_const = frog_p_bal16_digits_le_const();
-    let qp_d = mul_bal16_long_by_const_rhs(b, &q_d, &p_d_const);
-
-    // Align lengths and enforce prod == qp + r.
-    let tlen = prod_d.len().max(qp_d.len()).max(r_d.len());
-    let prod_d = pad_bal16(b, prod_d, tlen);
-    let qp_d = pad_bal16(b, qp_d, tlen);
-    let r_d = pad_bal16(b, r_d, tlen);
-
-    // sum = qp + r
-    let (sum_d, carry) = add_bal16_same_len(b, &qp_d, &r_d);
-    b.enforce_var_eq_const(carry, F257::ZERO);
-    enforce_bal16_vec_eq(b, &prod_d, &sum_d);
+    enforce_prod_eq_qp_plus_r_bal16(b, &prod_d, &q_d, &p_d_const, &r_d);
 
     let out = r_bytes;
     b.profile_exit(_prev);
@@ -712,17 +791,7 @@ fn frog_mul_const_mod_p_from_byte_vars_assume_canonical(
 
     // prod_digits = x*c  (const-RHS)
     let prod_d = mul_bal16_long_by_const_rhs(b, &x_d, &c_d_const);
-    // qp_digits = q*p  (const-RHS)
-    let qp_d = mul_bal16_long_by_const_rhs(b, &q_d, &p_d_const);
-
-    // Align lengths and enforce prod == qp + r.
-    let tlen = prod_d.len().max(qp_d.len()).max(r_d.len());
-    let prod_d = pad_bal16(b, prod_d, tlen);
-    let qp_d = pad_bal16(b, qp_d, tlen);
-    let r_d = pad_bal16(b, r_d, tlen);
-    let (sum_d, carry) = add_bal16_same_len(b, &qp_d, &r_d);
-    b.enforce_var_eq_const(carry, F257::ZERO);
-    enforce_bal16_vec_eq(b, &prod_d, &sum_d);
+    enforce_prod_eq_qp_plus_r_bal16(b, &prod_d, &q_d, &p_d_const, &r_d);
 
     let out = r_bytes;
     b.profile_exit(_prev);
