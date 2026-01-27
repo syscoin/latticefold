@@ -6,7 +6,7 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 use super::coins::frog_p_base128_digits_le;
 use super::digits::{
     add_bal16_same_len, alloc_bal16_digit, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
-    i32_to_f257, u64_bytes_to_bal16_digits_cached,
+    alloc_carry_pm1024, i32_to_f257, u64_bytes_to_bal16_digits_cached,
 };
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
@@ -1122,42 +1122,124 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
         let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &r_bytes);
 
         // Constrain Σ (coeff*eval) == q*p + r in bal16 digit space.
+        //
+        // Instead of materializing each product vector and summing them with many long adds,
+        // stream the digit convolution of the whole sum:
+        //   acc = Σ_i (eval_i * coeff_i)  (coeff_i are u64 constants)
+        // producing balanced digits in [-8,7] with a bounded carry.
         let p_d_const = frog_p_bal16_digits_le_const();
         const TARGET_LEN: usize = 43;
         let zero_digit = alloc_bal16_digit(b, 0);
 
-        let mut terms: Vec<Vec<usize>> = Vec::with_capacity(N);
+        // Precompute constant bal16 digits for each coefficient.
+        let mut coeff_ds: [[i8; 17]; N] = [[0i8; 17]; N];
         for i in 0..N {
-            let coeff = coeffs[i];
-            if coeff == 0 {
-                continue;
+            coeff_ds[i] = u64_to_bal16_digits_le_const(coeffs[i]);
+        }
+
+        // Streaming convolution for acc digits (len up to 33), then expand final carry.
+        let la = evals_d[0].len(); // expected 17
+        debug_assert!(la <= 17, "expected canonical u64 digit length");
+        let lb = 17usize;
+        let base_len = la + lb - 1; // <= 33
+
+        let div_floor = |x: i32, d: i32| -> i32 {
+            debug_assert!(d > 0);
+            if x >= 0 { x / d } else { -(((-x) + d - 1) / d) }
+        };
+
+        let mut acc_digits: Vec<usize> = Vec::with_capacity(TARGET_LEN);
+        let mut carry_i32: i32 = 0;
+        let mut carry_var = alloc_carry_pm1024(b, 0);
+
+        #[inline]
+        fn f257_from_i8(x: i8) -> F257 {
+            if x >= 0 { F257::from(x as u64) } else { -F257::from((-x) as u64) }
+        }
+
+        for k in 0..base_len {
+            let mut sum: i32 = carry_i32;
+            let mut lc: Vec<(F257, usize)> = Vec::new();
+            lc.push((F257::ONE, carry_var));
+
+            for i in 0..N {
+                if coeffs[i] == 0 {
+                    continue;
+                }
+                let e_d = &evals_d[i];
+                for j in 0..la {
+                    let t = k as i32 - j as i32;
+                    if t < 0 || t >= lb as i32 {
+                        continue;
+                    }
+                    let cd = coeff_ds[i][t as usize];
+                    if cd == 0 {
+                        continue;
+                    }
+                    let aval = super::digits::f257_to_i32_bal(b.assignment[e_d[j]]);
+                    sum += aval * (cd as i32);
+                    lc.push((f257_from_i8(cd), e_d[j]));
+                }
             }
-            let e_d = &evals_d[i];
-            let coeff_d_const = u64_to_bal16_digits_le_const(coeff);
-            let prod_d = mul_bal16_long_by_const_rhs(b, &e_d, &coeff_d_const);
-            terms.push(pad_bal16(b, prod_d, TARGET_LEN));
-        }
-        if terms.is_empty() {
-            terms.push(vec![zero_digit; TARGET_LEN]);
-        }
-        let mut stack = terms;
-        while stack.len() > 1 {
-            if stack.len() >= 3 {
-                let d = stack.pop().unwrap();
-                let c = stack.pop().unwrap();
-                let a = stack.pop().unwrap();
-                let (sum, carry) = super::digits::add3_bal16_same_len(b, &a, &c, &d);
-                b.enforce_var_eq_const(carry, F257::ZERO);
-                stack.push(sum);
-            } else {
-                let c = stack.pop().unwrap();
-                let a = stack.pop().unwrap();
-                let (sum, carry) = add_bal16_same_len(b, &a, &c);
-                b.enforce_var_eq_const(carry, F257::ZERO);
-                stack.push(sum);
+
+            let mut carry_next = div_floor(sum + 8, 16);
+            let mut rem = sum - 16 * carry_next;
+            while rem > 7 {
+                carry_next += 1;
+                rem -= 16;
             }
+            while rem < -8 {
+                carry_next -= 1;
+                rem += 16;
+            }
+            debug_assert!((-8..=7).contains(&rem));
+            debug_assert!(
+                (-1024..=1023).contains(&carry_next),
+                "carry out of pm1024 bound: {carry_next} from sum {sum}"
+            );
+
+            let digit_var = alloc_bal16_digit(b, rem as i8);
+            let carry_out_var = alloc_carry_pm1024(b, carry_next);
+            lc.push((-F257::ONE, digit_var));
+            lc.push((-F257::from(16u64), carry_out_var));
+            b.enforce_lc_times_one_eq_const(lc);
+
+            acc_digits.push(digit_var);
+            carry_i32 = carry_next;
+            carry_var = carry_out_var;
         }
-        let acc = stack.pop().unwrap();
+
+        // Expand remaining carry into balanced digits.
+        while carry_i32 != 0 {
+            let sum = carry_i32;
+            let mut carry_next = div_floor(sum + 8, 16);
+            let mut rem = sum - 16 * carry_next;
+            while rem > 7 {
+                carry_next += 1;
+                rem -= 16;
+            }
+            while rem < -8 {
+                carry_next -= 1;
+                rem += 16;
+            }
+            debug_assert!((-8..=7).contains(&rem));
+            debug_assert!((-1024..=1023).contains(&carry_next));
+
+            let rem_digit = alloc_bal16_digit(b, rem as i8);
+            let carry_next_var = alloc_carry_pm1024(b, carry_next);
+            b.enforce_lc_times_one_eq_const(vec![
+                (F257::ONE, carry_var),
+                (-F257::ONE, rem_digit),
+                (-F257::from(16u64), carry_next_var),
+            ]);
+            acc_digits.push(rem_digit);
+            carry_i32 = carry_next;
+            carry_var = carry_next_var;
+        }
+        b.enforce_var_eq_const(carry_var, F257::ZERO);
+
+        // Pad acc to TARGET_LEN.
+        let acc = pad_bal16(b, acc_digits, TARGET_LEN);
 
         // q fits within ~log2(N)+64 bits; represent it with 18 nibbles + final carry => 19 digits.
         let q_d = alloc_u128_as_bal16_digits_witness(b, q_u128, 18);

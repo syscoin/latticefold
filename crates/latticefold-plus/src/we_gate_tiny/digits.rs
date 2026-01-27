@@ -257,6 +257,40 @@ fn alloc_carry_pm128(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
     c_var
 }
 
+/// Allocate a signed carry `c ∈ [-1024,1023]` as an F257 variable by range-checking an offset.
+///
+/// We represent `off = c + 1024` as an 11-bit value in [0,2047], then enforce
+/// `c = off - 1024` as a linear relation in F257.
+pub(crate) fn alloc_carry_pm1024(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
+    assert!((-1024..=1023).contains(&c));
+    let off: u16 = (c + 1024) as u16; // in [0,2047]
+    debug_assert!(off < 2048);
+
+    // 11-bit decomposition of off.
+    let mut bits = [0usize; 11];
+    for i in 0..11 {
+        bits[i] = alloc_bool::<F257>(b, (((off >> i) & 1) == 1));
+    }
+    let off_var = b.new_var(F257::from(off as u64));
+    // off = Σ 2^i * bits[i]
+    let mut lc = vec![(F257::ONE, off_var)];
+    let mut pow = F257::ONE;
+    for i in 0..11 {
+        lc.push((-pow, bits[i]));
+        pow *= F257::from(2u64);
+    }
+    b.enforce_lc_times_one_eq_const(lc);
+
+    // c = off - 1024
+    let c_var = b.new_var(i32_to_f257(c));
+    b.enforce_lc_times_one_eq_const(vec![
+        (F257::ONE, c_var),
+        (-F257::ONE, off_var),
+        (F257::from(1024u64), b.one()),
+    ]);
+    c_var
+}
+
 /// Add two balanced base-16 digit vectors of the same length.
 ///
 /// Assumes each digit is in [-8,7]. Enforces output digits in [-8,7] and carry in [-2,2].
