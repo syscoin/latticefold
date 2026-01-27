@@ -433,6 +433,89 @@ fn test_ring_mul_negacyclic_karatsuba_d64_matches_native_one_case() {
 }
 
 #[test]
+fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
+    use rand::{RngCore, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(123456789);
+
+    let p = super::frog::GOLDILOCKS_P;
+
+    let mut a = [0u64; 64];
+    let mut c = [0u64; 64];
+    for i in 0..64 {
+        a[i] = rng.next_u64() % p;
+        c[i] = rng.next_u64() % p;
+    }
+
+    // Native expected.
+    let mut conv = vec![0u64; 127];
+    for i in 0..64 {
+        for j in 0..64 {
+            let idx = i + j;
+            let t = ((a[i] as u128) * (c[j] as u128) + (conv[idx] as u128)) % (p as u128);
+            conv[idx] = t as u64;
+        }
+    }
+    let mut exp = [0u64; 64];
+    for k in 0..64 {
+        let hi = k + 64;
+        let v = if hi < 127 {
+            (conv[k] as i128 - conv[hi] as i128).rem_euclid(p as i128) as u64
+        } else {
+            conv[k]
+        };
+        exp[k] = v;
+    }
+
+    // Circuit: boundary conversion bytes->digits only (stand-in for external IO).
+    let mut b = Dr1csBuilder::<F257>::new();
+    b.enforce_var_eq_const(b.one(), F257::ONE);
+    let mut a_bytes = [[0usize; 8]; 64];
+    let mut c_bytes = [[0usize; 8]; 64];
+    for i in 0..64 {
+        for (j, v) in a[i].to_le_bytes().into_iter().enumerate() {
+            a_bytes[i][j] = alloc_byte::<F257>(&mut b, v).byte;
+        }
+        for (j, v) in c[i].to_le_bytes().into_iter().enumerate() {
+            c_bytes[i][j] = alloc_byte::<F257>(&mut b, v).byte;
+        }
+    }
+
+    let a_d: [super::frog::FrogScalar; 64] = core::array::from_fn(|i| {
+        let v = u64_bytes_to_bal16_digits_cached(&mut b, a_bytes[i]);
+        v.try_into().expect("u64 bytes -> 17 digits")
+    });
+    let c_d: [super::frog::FrogScalar; 64] = core::array::from_fn(|i| {
+        let v = u64_bytes_to_bal16_digits_cached(&mut b, c_bytes[i]);
+        v.try_into().expect("u64 bytes -> 17 digits")
+    });
+
+    let out = super::frog::ring_mul_negacyclic_ntt_goldilocks_d64(&mut b, &a_d, &c_d);
+
+    for k in 0..64 {
+        // Decode digits -> u64 in the host.
+        let mut acc: i128 = 0;
+        let mut pow: i128 = 1;
+        for j in 0..17 {
+            acc += (f257_to_i32_bal(b.assignment[out[k][j]]) as i128) * pow;
+            pow *= 16;
+        }
+        assert_eq!(acc as u64, exp[k]);
+    }
+
+    eprintln!(
+        "== dR1CS dump: ring_mul_negacyclic_ntt_goldilocks_d64 | nvars={} nconstraints={} ==",
+        b.assignment.len(),
+        b.rows.len()
+    );
+    if std::env::var("LF_PROFILE_DR1CS").ok().as_deref() == Some("1") {
+        eprintln!("{}", b.profile_report(40));
+    }
+
+    let (inst, asg) = b.into_instance();
+    inst.check(&asg).expect("ring mul (goldilocks ntt) constraints satisfied");
+}
+
+#[test]
 fn test_bounded_u32_from_8_digits_base128_matches_byte_view() {
     let mut b = Dr1csBuilder::<F257>::new();
     b.enforce_var_eq_const(b.one(), F257::ONE);

@@ -6,11 +6,17 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 use super::coins::frog_p_base128_digits_le;
 use super::digits::{
     add_bal16_same_len, alloc_bal16_digit, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
-    alloc_carry_pm2, alloc_carry_pm128, alloc_carry_pm512, i32_to_f257, u64_bytes_to_bal16_digits_cached,
+    alloc_carry_pm2, alloc_carry_pm32, alloc_carry_pm128, alloc_carry_pm512, i32_to_f257,
+    u64_bytes_to_bal16_digits_cached,
 };
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
 use crate::we_frog_poseidon_f257::FROG_P;
+
+/// Goldilocks prime field modulus: \(2^{64} - 2^{32} + 1\).
+///
+/// This is NTT-friendly (large 2-adicity), unlike the Frog prime used elsewhere in this module.
+pub(crate) const GOLDILOCKS_P: u64 = 0xFFFF_FFFF_0000_0001;
 
 #[inline]
 fn strict_nowrap_enabled() -> bool {
@@ -1108,6 +1114,231 @@ fn frog_add_many_mod_p(b: &mut Dr1csBuilder<F257>, terms: &[[usize; 8]]) -> [usi
 /// - plus a final carry digit in {0,1}
 pub(crate) type FrogScalar = [usize; 17];
 
+/// Negacyclic ring multiplication for `d=64` over **Goldilocks** using an NTT-based method.
+///
+/// This is a “what it looks like” prototype: it stays in digit arithmetic throughout, uses
+/// variable×const twiddle multiplies and only 64 variable×variable multiplications for the
+/// pointwise product.
+///
+/// Returns `c = a*b mod (X^64 + 1)` as 64 canonical u64 digit-encodings (bal16 digits).
+pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
+    b: &mut Dr1csBuilder<F257>,
+    a: &[FrogScalar; 64],
+    c: &[FrogScalar; 64],
+) -> [FrogScalar; 64] {
+    // --- Small host-side helpers for Goldilocks constants.
+    #[inline]
+    fn mul_mod_u64(a: u64, b: u64, p: u64) -> u64 {
+        ((a as u128) * (b as u128) % (p as u128)) as u64
+    }
+    #[inline]
+    fn pow_mod_u64(mut base: u64, mut exp: u64, p: u64) -> u64 {
+        let mut acc: u64 = 1;
+        while exp != 0 {
+            if (exp & 1) == 1 {
+                acc = mul_mod_u64(acc, base, p);
+            }
+            base = mul_mod_u64(base, base, p);
+            exp >>= 1;
+        }
+        acc
+    }
+    #[inline]
+    fn inv_mod_u64(x: u64, p: u64) -> u64 {
+        // Fermat (p is prime).
+        pow_mod_u64(x, p - 2, p)
+    }
+
+    // Twiddle generator: Goldilocks is known to have primitive root 7.
+    // (Used in Plonky2/Polygon labs; kept as a deterministic constant here.)
+    let g: u64 = 7;
+    let p: u64 = GOLDILOCKS_P;
+    debug_assert_eq!(mul_mod_u64(g, 1, p), g);
+
+    // For length-64 NTT we need a primitive 64th root ω, and for negacyclic we also need ψ
+    // a primitive 128th root (ψ^2 = ω).
+    let omega = pow_mod_u64(g, (p - 1) / 64, p);
+    let psi = pow_mod_u64(g, (p - 1) / 128, p);
+    debug_assert_eq!(pow_mod_u64(omega, 64, p), 1);
+    debug_assert_eq!(pow_mod_u64(psi, 128, p), 1);
+    debug_assert_eq!(mul_mod_u64(psi, psi, p), omega);
+    // ω^{32} = -1
+    debug_assert_eq!(pow_mod_u64(omega, 32, p), p - 1);
+
+    let omega_inv = inv_mod_u64(omega, p);
+    let psi_inv = inv_mod_u64(psi, p);
+    let inv_n = inv_mod_u64(64, p);
+
+    let p_d_const = u64_to_bal16_digits_le_const(p);
+
+    // --- Digit-field helpers parameterized by modulus p.
+    #[inline]
+    fn digits_to_u64_witness(b: &Dr1csBuilder<F257>, d: &FrogScalar) -> u64 {
+        let mut acc: i128 = 0;
+        let mut pow: i128 = 1;
+        for i in 0..17 {
+            let di = super::digits::f257_to_i32_bal(b.assignment[d[i]]) as i128;
+            acc += di * pow;
+            pow *= 16;
+        }
+        debug_assert!(acc >= 0);
+        acc as u64
+    }
+    #[inline]
+    fn vec17_to_arr17(v: Vec<usize>) -> FrogScalar {
+        debug_assert_eq!(v.len(), 17);
+        let mut out = [0usize; 17];
+        for i in 0..17 {
+            out[i] = v[i];
+        }
+        out
+    }
+
+    #[inline]
+    fn add_mod_p(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, c: &FrogScalar, p_u64: u64, p_d: &[i8; 17]) -> FrogScalar {
+        let a_u = digits_to_u64_witness(b, a);
+        let c_u = digits_to_u64_witness(b, c);
+        let sum = (a_u as u128) + (c_u as u128);
+        let q_u8: u8 = if sum >= (p_u64 as u128) { 1 } else { 0 };
+        let r_u: u64 = if q_u8 == 1 { (sum - (p_u64 as u128)) as u64 } else { sum as u64 };
+        let q = alloc_bool::<F257>(b, q_u8 == 1);
+        let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
+        enforce_add_mod_p_relation_bal16(b, a, c, &r_d, q, q_u8, p_d);
+        r_d
+    }
+
+    #[inline]
+    fn sub_mod_p(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, c: &FrogScalar, p_u64: u64, p_d: &[i8; 17]) -> FrogScalar {
+        let a_u = digits_to_u64_witness(b, a);
+        let c_u = digits_to_u64_witness(b, c);
+        let (q_u8, r_u) = if a_u >= c_u {
+            (0u8, a_u - c_u)
+        } else {
+            (1u8, (a_u as u128 + (p_u64 as u128) - (c_u as u128)) as u64)
+        };
+        let q = alloc_bool::<F257>(b, q_u8 == 1);
+        let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
+        enforce_sub_mod_p_relation_bal16(b, a, c, &r_d, q, q_u8, p_d);
+        r_d
+    }
+
+    #[inline]
+    fn mul_mod_p(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, c: &FrogScalar, p_u64: u64, p_d: &[i8; 17]) -> FrogScalar {
+        let a_u = digits_to_u64_witness(b, a);
+        let c_u = digits_to_u64_witness(b, c);
+        let prod: u128 = (a_u as u128) * (c_u as u128);
+        let q_u: u64 = (prod / (p_u64 as u128)) as u64;
+        let r_u: u64 = (prod % (p_u64 as u128)) as u64;
+        let q_d = alloc_u64_as_bal16_digits_witness(b, q_u);
+        let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
+        let prod_d = mul_bal16_long_by_long(b, a, c);
+        enforce_prod_eq_qp_plus_r_bal16(b, &prod_d, &q_d, p_d, &r_d);
+        r_d
+    }
+
+    #[inline]
+    fn mul_const_mod_p(b: &mut Dr1csBuilder<F257>, x: &FrogScalar, k: u64, p_u64: u64, p_d: &[i8; 17]) -> FrogScalar {
+        let x_u = digits_to_u64_witness(b, x);
+        let prod: u128 = (x_u as u128) * (k as u128);
+        let q_u: u64 = (prod / (p_u64 as u128)) as u64;
+        let r_u: u64 = (prod % (p_u64 as u128)) as u64;
+        let q_d = alloc_u64_as_bal16_digits_witness(b, q_u);
+        let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
+        let k_d_const = u64_to_bal16_digits_le_const(k);
+        let prod_d = mul_bal16_long_by_const_rhs(b, x, &k_d_const);
+        enforce_prod_eq_qp_plus_r_bal16(b, &prod_d, &q_d, p_d, &r_d);
+        r_d
+    }
+
+    // --- NTT plumbing.
+    #[inline]
+    fn bitreverse6(mut x: usize) -> usize {
+        let mut r = 0usize;
+        for _ in 0..6 {
+            r = (r << 1) | (x & 1);
+            x >>= 1;
+        }
+        r
+    }
+
+    fn ntt_in_place(
+        b: &mut Dr1csBuilder<F257>,
+        a: &mut [FrogScalar; 64],
+        omega: u64,
+        p_u64: u64,
+        p_d: &[i8; 17],
+    ) {
+        // Bit-reversal permutation (purely structural).
+        let mut tmp = *a;
+        for i in 0..64 {
+            tmp[bitreverse6(i)] = a[i];
+        }
+        *a = tmp;
+
+        // Iterative Cooley–Tukey.
+        let mut len = 2usize;
+        while len <= 64 {
+            let half = len / 2;
+            let wlen = pow_mod_u64(omega, (64 / len) as u64, p_u64);
+            for start in (0..64).step_by(len) {
+                let mut w = 1u64;
+                for j in 0..half {
+                    let u = a[start + j];
+                    let v = mul_const_mod_p(b, &a[start + j + half], w, p_u64, p_d);
+                    a[start + j] = add_mod_p(b, &u, &v, p_u64, p_d);
+                    a[start + j + half] = sub_mod_p(b, &u, &v, p_u64, p_d);
+                    w = mul_mod_u64(w, wlen, p_u64);
+                }
+            }
+            len *= 2;
+        }
+    }
+
+    fn intt_in_place(
+        b: &mut Dr1csBuilder<F257>,
+        a: &mut [FrogScalar; 64],
+        omega_inv: u64,
+        inv_n: u64,
+        p_u64: u64,
+        p_d: &[i8; 17],
+    ) {
+        ntt_in_place(b, a, omega_inv, p_u64, p_d);
+        // scale by n^{-1}
+        for i in 0..64 {
+            a[i] = mul_const_mod_p(b, &a[i], inv_n, p_u64, p_d);
+        }
+    }
+
+    // Negacyclic via twist by ψ^i (ψ is primitive 128th root).
+    let mut a_tw = [[b.zero_var(); 17]; 64];
+    let mut c_tw = [[b.zero_var(); 17]; 64];
+    let mut psi_pow: u64 = 1;
+    for i in 0..64 {
+        a_tw[i] = mul_const_mod_p(b, &a[i], psi_pow, p, &p_d_const);
+        c_tw[i] = mul_const_mod_p(b, &c[i], psi_pow, p, &p_d_const);
+        psi_pow = mul_mod_u64(psi_pow, psi, p);
+    }
+
+    ntt_in_place(b, &mut a_tw, omega, p, &p_d_const);
+    ntt_in_place(b, &mut c_tw, omega, p, &p_d_const);
+
+    // Pointwise multiply.
+    for i in 0..64 {
+        a_tw[i] = mul_mod_p(b, &a_tw[i], &c_tw[i], p, &p_d_const);
+    }
+
+    intt_in_place(b, &mut a_tw, omega_inv, inv_n, p, &p_d_const);
+
+    // Untwist by ψ^{-i}.
+    let mut out = [[b.zero_var(); 17]; 64];
+    let mut psi_inv_pow: u64 = 1;
+    for i in 0..64 {
+        out[i] = mul_const_mod_p(b, &a_tw[i], psi_inv_pow, p, &p_d_const);
+        psi_inv_pow = mul_mod_u64(psi_inv_pow, psi_inv, p);
+    }
+    out
+}
+
 /// Negacyclic ring multiplication for `d=64` (FrogRing64), where coefficients are canonical Frog scalars.
 ///
 /// Returns `c = a*b mod (X^64 + 1)` as 64 canonical Frog scalars (bal16 digits).
@@ -1482,7 +1713,7 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         // carry is always within [-512,511] here (pm512). After one step:
         //   |carry_next| <= floor((|carry|+8)/16) <= 32
         // after two: <= 2, after three: = 0. So 3 digits suffice and are witness-independent.
-        for _ in 0..3 {
+        for step in 0..3 {
             let sum = carry_i32;
             let mut carry_next = div_floor(sum + 8, 16);
             let mut rem = sum - 16 * carry_next;
@@ -1498,8 +1729,27 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
             debug_assert!((-512..=511).contains(&carry_next));
 
             let rem_digit = alloc_bal16_digit(b, rem as i8);
-            // Statement-only arming: use a fixed pm512 bound (no witness-dependent gadget selection).
-            let carry_next_var = alloc_carry_pm512(b, carry_next);
+            // Statement-only arming: bound schedule is fixed by analysis above (no witness branching).
+            let carry_next_var = match step {
+                0 => {
+                    // After one step, |carry_next| <= 32.
+                    debug_assert!((-32..=32).contains(&carry_next));
+                    alloc_carry_pm32(b, carry_next)
+                }
+                1 => {
+                    // After two steps, |carry_next| <= 2.
+                    debug_assert!((-2..=2).contains(&carry_next));
+                    alloc_carry_pm2(b, carry_next)
+                }
+                2 => {
+                    // After three steps, carry_next must be 0.
+                    debug_assert_eq!(carry_next, 0);
+                    let z = b.zero_var();
+                    b.enforce_var_eq_const(z, F257::ZERO);
+                    z
+                }
+                _ => unreachable!(),
+            };
             b.enforce_lc_times_one_eq_const(vec![
                 (F257::ONE, carry_var),
                 (-F257::ONE, rem_digit),
