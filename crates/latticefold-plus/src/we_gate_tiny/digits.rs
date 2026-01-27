@@ -996,6 +996,15 @@ pub(crate) fn u32_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
     out
 }
 
+pub(crate) fn u32_bytes_to_bal16_digits_cached(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 4]) -> Vec<usize> {
+    if let Some(v) = b.u32_bal16_cache.get(&bytes_le) {
+        return v.clone();
+    }
+    let v = u32_bytes_to_bal16_digits(b, bytes_le);
+    b.u32_bal16_cache.insert(bytes_le, v.clone());
+    v
+}
+
 /// Convert 8 little-endian byte vars (0..255) into balanced base-16 digits (len 17).
 ///
 /// Output digits are little-endian base-16 with each digit in [-8,7], followed by a final
@@ -1101,5 +1110,14 @@ pub(crate) fn u64_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
 
     out.push(carry);
     out
+}
+
+pub(crate) fn u64_bytes_to_bal16_digits_cached(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 8]) -> Vec<usize> {
+    if let Some(v) = b.u64_bal16_cache.get(&bytes_le) {
+        return v.clone();
+    }
+    let v = u64_bytes_to_bal16_digits(b, bytes_le);
+    b.u64_bal16_cache.insert(bytes_le, v.clone());
+    v
 }
 

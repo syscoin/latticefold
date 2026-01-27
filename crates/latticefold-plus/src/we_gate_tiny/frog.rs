@@ -6,7 +6,7 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 use super::coins::frog_p_base128_digits_le;
 use super::digits::{
     add_bal16_same_len, alloc_bal16_digit, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
-    i32_to_f257, u64_bytes_to_bal16_digits,
+    i32_to_f257, u64_bytes_to_bal16_digits_cached,
 };
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
@@ -502,10 +502,10 @@ fn frog_mul_mod_p_from_byte_vars_assume_canonical(
     let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &r_bytes);
 
     // Convert a,b,q,r and p to balanced-base16 digits.
-    let a_d = u64_bytes_to_bal16_digits(b, *a_bytes);
-    let b_d = u64_bytes_to_bal16_digits(b, *b_bytes);
-    let q_d = u64_bytes_to_bal16_digits(b, q_bytes);
-    let r_d = u64_bytes_to_bal16_digits(b, r_bytes);
+    let a_d = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
+    let b_d = u64_bytes_to_bal16_digits_cached(b, *b_bytes);
+    let q_d = u64_bytes_to_bal16_digits_cached(b, q_bytes);
+    let r_d = u64_bytes_to_bal16_digits_cached(b, r_bytes);
 
     // Compute prod_digits = a*b (balanced digits, with headroom/carry already enforced in gadget).
     let prod_d = mul_bal16_long_by_long(b, &a_d, &b_d);
@@ -576,9 +576,9 @@ fn frog_mul_const_mod_p_from_byte_vars_assume_canonical(
     let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &r_bytes);
 
     // Convert x,q,r to bal16 digits (vars).
-    let x_d = u64_bytes_to_bal16_digits(b, *x_bytes);
-    let q_d = u64_bytes_to_bal16_digits(b, q_bytes);
-    let r_d = u64_bytes_to_bal16_digits(b, r_bytes);
+    let x_d = u64_bytes_to_bal16_digits_cached(b, *x_bytes);
+    let q_d = u64_bytes_to_bal16_digits_cached(b, q_bytes);
+    let r_d = u64_bytes_to_bal16_digits_cached(b, r_bytes);
 
     // Constant bal16 digits for c and p, computed directly (no variables/constraints).
     let c_d_const = u64_to_bal16_digits_le_const(c);
@@ -652,8 +652,8 @@ fn frog_add_mod_p_from_byte_vars_assume_canonical(
     let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &r_bytes);
 
     // Digits: pad to length 18 so the final add carry must be 0.
-    let a_d0 = u64_bytes_to_bal16_digits(b, *a_bytes);
-    let c_d0 = u64_bytes_to_bal16_digits(b, *c_bytes);
+    let a_d0 = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
+    let c_d0 = u64_bytes_to_bal16_digits_cached(b, *c_bytes);
     let a_d = pad_bal16(b, a_d0, 18);
     let c_d = pad_bal16(b, c_d0, 18);
     let (sum_d, carry_sum) = add_bal16_same_len(b, &a_d, &c_d);
@@ -661,7 +661,7 @@ fn frog_add_mod_p_from_byte_vars_assume_canonical(
 
     // p digits as constants (avoid allocating p bytes/digits every call).
     let p_d0_const = frog_p_bal16_digits_le_const();
-    let r_d0 = u64_bytes_to_bal16_digits(b, r_bytes);
+    let r_d0 = u64_bytes_to_bal16_digits_cached(b, r_bytes);
     let r_d = pad_bal16(b, r_d0, 18);
 
     // qp digits = q * p digits (q is boolean, p digits are constants in [-8,7]).
@@ -735,9 +735,9 @@ fn frog_sub_mod_p_from_byte_vars_assume_canonical(
     let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &r_bytes);
 
     // Enforce a + q*p == c + r (as integers) using balanced digits.
-    let a_d0 = u64_bytes_to_bal16_digits(b, *a_bytes);
-    let c_d0 = u64_bytes_to_bal16_digits(b, *c_bytes);
-    let r_d0 = u64_bytes_to_bal16_digits(b, r_bytes);
+    let a_d0 = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
+    let c_d0 = u64_bytes_to_bal16_digits_cached(b, *c_bytes);
+    let r_d0 = u64_bytes_to_bal16_digits_cached(b, r_bytes);
     let a_d = pad_bal16(b, a_d0, 18);
     let c_d = pad_bal16(b, c_d0, 18);
     let r_d = pad_bal16(b, r_d0, 18);

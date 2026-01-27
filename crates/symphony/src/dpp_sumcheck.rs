@@ -24,11 +24,26 @@ pub struct Dr1csBuilder<F: PrimeField> {
     ///
     /// Key: byte variable index. Value: 8 boolean bit variable indices (little-endian).
     pub byte_bits_cache: BTreeMap<usize, [usize; 8]>,
+
+    /// Cache for reusing `u64_bytes_to_bal16_digits` expansions across gadgets.
+    ///
+    /// Key: 8 byte variables (little-endian). Value: balanced-base16 digits (len 17).
+    pub u64_bal16_cache: BTreeMap<[usize; 8], Vec<usize>>,
+    /// Cache for reusing `u32_bytes_to_bal16_digits` expansions across gadgets.
+    ///
+    /// Key: 4 byte variables (little-endian). Value: balanced-base16 digits (len 9).
+    pub u32_bal16_cache: BTreeMap<[usize; 4], Vec<usize>>,
 }
 
 impl<F: PrimeField> Dr1csBuilder<F> {
     pub fn new() -> Self {
-        Self { assignment: vec![F::ONE], rows: Vec::new(), byte_bits_cache: BTreeMap::new() }
+        Self {
+            assignment: vec![F::ONE],
+            rows: Vec::new(),
+            byte_bits_cache: BTreeMap::new(),
+            u64_bal16_cache: BTreeMap::new(),
+            u32_bal16_cache: BTreeMap::new(),
+        }
     }
     pub fn one(&self) -> usize { 0 }
     pub fn new_var(&mut self, value: F) -> usize {
