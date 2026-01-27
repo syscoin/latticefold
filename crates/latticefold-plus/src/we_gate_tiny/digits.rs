@@ -906,6 +906,44 @@ pub(crate) fn rebalance_tail_pm11_to_pm2(b: &mut Dr1csBuilder<F257>, digits: &[u
     out
 }
 
+/// Rebalance the final digit of a `mul_bal16_small_const_rhs4` product.
+///
+/// Input tail is a carry digit in [-16,15]; output is a balanced digit in [-8,7] plus a
+/// final carry in {-1,0,1}.
+pub(crate) fn rebalance_tail_pm16_to_pm1(b: &mut Dr1csBuilder<F257>, digits: &[usize]) -> Vec<usize> {
+    assert!(!digits.is_empty());
+    let l = digits.len();
+    let tail = f257_to_i32_bal(b.assignment[digits[l - 1]]);
+    debug_assert!((-16..=15).contains(&tail));
+
+    let mut carry1 = if tail >= 0 { (tail + 8) / 16 } else { -(((-tail) + 8) / 16) };
+    let mut rem = tail - 16 * carry1;
+    while rem > 7 {
+        carry1 += 1;
+        rem -= 16;
+    }
+    while rem < -8 {
+        carry1 -= 1;
+        rem += 16;
+    }
+    debug_assert!((-8..=7).contains(&rem));
+    debug_assert!((-1..=1).contains(&carry1));
+
+    let rem_digit = alloc_bal16_digit(b, rem as i8);
+    let carry1_var = alloc_carry_pm1(b, carry1);
+    b.enforce_lc_times_one_eq_const(vec![
+        (F257::ONE, digits[l - 1]),
+        (-F257::ONE, rem_digit),
+        (-F257::from(16u64), carry1_var),
+    ]);
+
+    let mut out = Vec::with_capacity(l + 1);
+    out.extend_from_slice(&digits[..l - 1]);
+    out.push(rem_digit);
+    out.push(carry1_var);
+    out
+}
+
 fn shift_pad_bal16(digits: &[usize], shift: usize, target_len: usize, zero_digit: usize) -> Vec<usize> {
     assert!(shift <= target_len);
     assert!(digits.len() + shift <= target_len);
@@ -1541,6 +1579,84 @@ pub(crate) fn mul_bal16_small_const_rhs(
     out
 }
 
+/// Multiply balanced base-16 digits by **constant** balanced digits (little-endian),
+/// specialized for `a.len() <= 4`.
+///
+/// This is a no-wrap-safe variant for strict mode: each output digit equation contains at most
+/// 4 terms of the form `a[i] * const`, so the integer magnitude stays < 257.
+fn mul_bal16_small_const_rhs4(
+    b: &mut Dr1csBuilder<F257>,
+    a: &[usize; 4],
+    a_len: usize,
+    bb_const: &[i8],
+) -> Vec<usize> {
+    debug_assert!(a_len >= 1 && a_len <= 4);
+    let la = a_len;
+    let lb = bb_const.len();
+
+    #[inline]
+    fn f257_from_i8(x: i8) -> F257 {
+        if x >= 0 { F257::from(x as u64) } else { -F257::from((-x) as u64) }
+    }
+
+    let mut out: Vec<usize> = Vec::with_capacity(la + lb);
+    let mut carry_i32: i32 = 0;
+    let mut carry_var = b.zero_var();
+
+    let div_floor = |x: i32, d: i32| -> i32 {
+        debug_assert!(d > 0);
+        if x >= 0 { x / d } else { -(((-x) + d - 1) / d) }
+    };
+
+    for k in 0..(la + lb - 1) {
+        let mut sum: i32 = carry_i32;
+        let mut lc: Vec<(F257, usize)> = Vec::new();
+        lc.push((F257::ONE, carry_var));
+
+        for i in 0..la {
+            let j = k as i32 - i as i32;
+            if j < 0 || j >= lb as i32 {
+                continue;
+            }
+            let j = j as usize;
+            let aval = f257_to_i32_bal(b.assignment[a[i]]);
+            let bval = bb_const[j] as i32;
+            sum += aval * bval;
+            let cf = f257_from_i8(bb_const[j]);
+            if cf != F257::ZERO {
+                lc.push((cf, a[i]));
+            }
+        }
+
+        // With <=4 terms of magnitude <=56 and carry in <=15, |sum| < 257.
+        let mut carry = div_floor(sum + 8, NIBBLE_BASE);
+        let mut rem = sum - NIBBLE_BASE * carry;
+        while rem > 7 {
+            carry += 1;
+            rem -= NIBBLE_BASE;
+        }
+        while rem < -8 {
+            carry -= 1;
+            rem += NIBBLE_BASE;
+        }
+        debug_assert!((-8..=7).contains(&rem));
+        debug_assert!((-16..=15).contains(&carry));
+
+        let digit_var = alloc_bal16_digit(b, rem as i8);
+        let carry_out_var = alloc_carry_pm16(b, carry);
+        lc.push((-F257::ONE, digit_var));
+        lc.push((-F257::from(16u64), carry_out_var));
+        b.enforce_lc_times_one_eq_const(lc);
+
+        out.push(digit_var);
+        carry_i32 = carry;
+        carry_var = carry_out_var;
+    }
+
+    out.push(carry_var);
+    out
+}
+
 /// Multiply a long balanced digit vector by a **constant** long balanced digit vector.
 ///
 /// This is the const-RHS analogue of `mul_bal16_long_by_long`, and avoids any digit×digit
@@ -1721,24 +1837,26 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
     }
 
     let zero = bal16_zero(b);
-    let blocks = (a.len() + 2) / 3;
-    let per_block_len = bb_const.len() + 5;
+    // Use 4-digit blocks (still no-wrap safe), reducing the number of blocks.
+    const BLK: usize = 4;
+    let blocks = (a.len() + (BLK - 1)) / BLK;
+    let per_block_len = bb_const.len() + BLK + 2;
     // Add 1 digit of headroom so that we can enforce carry_out=0 when summing blocks.
-    let target_len = per_block_len + 3 * (blocks - 1) + 3;
+    let target_len = per_block_len + BLK * (blocks - 1) + 3;
 
     // Build all shifted block-products.
     let mut terms: Vec<Vec<usize>> = Vec::with_capacity(blocks);
 
     for blk in 0..blocks {
-        let start = blk * 3;
-        let end = core::cmp::min(start + 3, a.len());
-        let mut coeff3 = [zero; 3];
+        let start = blk * BLK;
+        let end = core::cmp::min(start + BLK, a.len());
+        let mut coeff4 = [zero; 4];
         for j in 0..(end - start) {
-            coeff3[j] = a[start + j];
+            coeff4[j] = a[start + j];
         }
-        let raw = mul_bal16_small_const_rhs(b, &coeff3, bb_const);
-        let reb = rebalance_tail_pm11_to_pm2(b, &raw);
-        let shifted = shift_pad_bal16(&reb, blk * 3, target_len, zero);
+        let raw = mul_bal16_small_const_rhs4(b, &coeff4, end - start, bb_const);
+        let reb = rebalance_tail_pm16_to_pm1(b, &raw);
+        let shifted = shift_pad_bal16(&reb, blk * BLK, target_len, zero);
         terms.push(shifted);
     }
 
