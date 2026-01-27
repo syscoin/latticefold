@@ -1737,11 +1737,8 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         res
     }
 
-    // Top-level multiply (Fox #2): Toom-4 over digit scalars.
-    //
-    // NOTE: `KARATSUBA` top-level split is not yet ported to digit arithmetic; we currently
-    // always use this Toom-4 path regardless of `KARATSUBA`.
-    let prod: Vec<FrogScalar> = {
+    // Top-level multiply: either Toom-4 (existing) or Karatsuba/Toom-2.
+    let prod: Vec<FrogScalar> = if !KARATSUBA {
         // Evaluate at 7 points, multiply (len16), interpolate into convolution len 127, then fold.
         let mut w_eval_top: Vec<Vec<FrogScalar>> = Vec::with_capacity(7);
         for &t in &pts {
@@ -1799,6 +1796,95 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
             }
         }
         prod
+    } else {
+        // Karatsuba/Toom-2 for length 64 using Toom-4 length-16 as the base multiplier.
+        fn poly_add_same_len(
+            b: &mut Dr1csBuilder<F257>,
+            x: &[FrogScalar],
+            y: &[FrogScalar],
+            p_d_const: &[i8; 17],
+        ) -> Vec<FrogScalar> {
+            debug_assert_eq!(x.len(), y.len());
+            x.iter()
+                .zip(y.iter())
+                .map(|(a, c)| add_mod_p(b, a, c, p_d_const))
+                .collect()
+        }
+        fn poly_sub_same_len(
+            b: &mut Dr1csBuilder<F257>,
+            x: &[FrogScalar],
+            y: &[FrogScalar],
+            p_d_const: &[i8; 17],
+        ) -> Vec<FrogScalar> {
+            debug_assert_eq!(x.len(), y.len());
+            x.iter()
+                .zip(y.iter())
+                .map(|(a, c)| sub_mod_p(b, a, c, p_d_const))
+                .collect()
+        }
+
+        fn poly_add_into_shifted(
+            b: &mut Dr1csBuilder<F257>,
+            acc: &mut Vec<FrogScalar>,
+            src: &[FrogScalar],
+            shift: usize,
+            p_d_const: &[i8; 17],
+        ) {
+            for (i, v) in src.iter().enumerate() {
+                let idx = i + shift;
+                acc[idx] = add_mod_p(b, &acc[idx], v, p_d_const);
+            }
+        }
+
+        fn poly_mul_karatsuba_len32(
+            b: &mut Dr1csBuilder<F257>,
+            a32: &[FrogScalar],
+            c32: &[FrogScalar],
+            inv720: u64,
+            zero: FrogScalar,
+            p_d_const: &[i8; 17],
+        ) -> Vec<FrogScalar> {
+            debug_assert_eq!(a32.len(), 32);
+            debug_assert_eq!(c32.len(), 32);
+            let (a0, a1) = a32.split_at(16);
+            let (c0, c1) = c32.split_at(16);
+            let s_a = poly_add_same_len(b, a0, a1, p_d_const);
+            let s_c = poly_add_same_len(b, c0, c1, p_d_const);
+
+            let z0 = poly_mul_toom4_len16(b, &a0.to_vec(), &c0.to_vec(), inv720, p_d_const); // len31
+            let z2 = poly_mul_toom4_len16(b, &a1.to_vec(), &c1.to_vec(), inv720, p_d_const); // len31
+            let z1_full = poly_mul_toom4_len16(b, &s_a, &s_c, inv720, p_d_const); // len31
+
+            let mut z1 = poly_sub_same_len(b, &z1_full, &z0, p_d_const);
+            z1 = poly_sub_same_len(b, &z1, &z2, p_d_const);
+
+            let mut out = vec![zero; 2 * 32 - 1]; // len63
+            poly_add_into_shifted(b, &mut out, &z0, 0, p_d_const);
+            poly_add_into_shifted(b, &mut out, &z1, 16, p_d_const);
+            poly_add_into_shifted(b, &mut out, &z2, 32, p_d_const);
+            out
+        }
+
+        let a_lo: Vec<FrogScalar> = a[0..32].to_vec();
+        let a_hi: Vec<FrogScalar> = a[32..64].to_vec();
+        let c_lo: Vec<FrogScalar> = c[0..32].to_vec();
+        let c_hi: Vec<FrogScalar> = c[32..64].to_vec();
+
+        let s_a = poly_add_same_len(b, &a_lo, &a_hi, &p_d_const);
+        let s_c = poly_add_same_len(b, &c_lo, &c_hi, &p_d_const);
+
+        let z0 = poly_mul_karatsuba_len32(b, &a_lo, &c_lo, inv720, zero, &p_d_const); // len63
+        let z2 = poly_mul_karatsuba_len32(b, &a_hi, &c_hi, inv720, zero, &p_d_const); // len63
+        let z1_full = poly_mul_karatsuba_len32(b, &s_a, &s_c, inv720, zero, &p_d_const); // len63
+
+        let mut z1 = poly_sub_same_len(b, &z1_full, &z0, &p_d_const);
+        z1 = poly_sub_same_len(b, &z1, &z2, &p_d_const);
+
+        let mut conv = vec![zero; 2 * 64 - 1]; // len127
+        poly_add_into_shifted(b, &mut conv, &z0, 0, &p_d_const);
+        poly_add_into_shifted(b, &mut conv, &z1, 32, &p_d_const);
+        poly_add_into_shifted(b, &mut conv, &z2, 64, &p_d_const);
+        conv
     };
 
     // Fold mod X^64+1: out[k] = prod[k] - prod[k+64]
