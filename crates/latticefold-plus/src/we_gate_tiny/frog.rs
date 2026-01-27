@@ -1073,6 +1073,129 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
         r_bytes
     }
 
+    /// Generic linear combination modulo p with one final reduction.
+    ///
+    /// Like `lincomb7_mod_p_from_canonical_evals` but for a fixed arity `N`.
+    fn lincomb_mod_p_from_canonical_evals<const N: usize>(
+        b: &mut Dr1csBuilder<F257>,
+        evals: &[[usize; 8]; N],
+        evals_d: &[Vec<usize>; N],
+        coeffs: &[u64; N],
+    ) -> [usize; 8] {
+        // Witness compute q, r for Σ coeff_i * eval_i.
+        let mut lo: u128 = 0;
+        let mut hi: u64 = 0;
+        for i in 0..N {
+            let coeff = coeffs[i];
+            if coeff == 0 {
+                continue;
+            }
+            let mut eb = [0u8; 8];
+            for j in 0..8 {
+                eb[j] = b.assignment[evals[i][j]]
+                    .into_bigint()
+                    .to_bytes_le()
+                    .get(0)
+                    .copied()
+                    .unwrap_or(0);
+            }
+            let e_u = u64::from_le_bytes(eb);
+            let term = (e_u as u128) * (coeff as u128);
+            let (new_lo, carry) = lo.overflowing_add(term);
+            lo = new_lo;
+            if carry {
+                hi += 1;
+            }
+        }
+        debug_assert!(hi <= (N as u64));
+        let n2 = hi;
+        let n1 = (lo >> 64) as u64;
+        let n0 = (lo & (u64::MAX as u128)) as u64;
+        let (q_u128, r_u64) = div_rem_u192_by_u64(n2, n1, n0, FROG_P);
+
+        // Allocate r as bytes and enforce canonical.
+        let r_bytes_u8 = r_u64.to_le_bytes();
+        let mut r_bytes = [0usize; 8];
+        for j in 0..8 {
+            r_bytes[j] = alloc_u8_var::<F257>(b, r_bytes_u8[j]);
+        }
+        let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &r_bytes);
+
+        // Constrain Σ (coeff*eval) == q*p + r in bal16 digit space.
+        let p_d_const = frog_p_bal16_digits_le_const();
+        const TARGET_LEN: usize = 43;
+        let zero_digit = alloc_bal16_digit(b, 0);
+
+        let mut terms: Vec<Vec<usize>> = Vec::with_capacity(N);
+        for i in 0..N {
+            let coeff = coeffs[i];
+            if coeff == 0 {
+                continue;
+            }
+            let e_d = &evals_d[i];
+            let coeff_d_const = u64_to_bal16_digits_le_const(coeff);
+            let prod_d = mul_bal16_long_by_const_rhs(b, &e_d, &coeff_d_const);
+            terms.push(pad_bal16(b, prod_d, TARGET_LEN));
+        }
+        if terms.is_empty() {
+            terms.push(vec![zero_digit; TARGET_LEN]);
+        }
+        let mut stack = terms;
+        while stack.len() > 1 {
+            if stack.len() >= 3 {
+                let d = stack.pop().unwrap();
+                let c = stack.pop().unwrap();
+                let a = stack.pop().unwrap();
+                let (sum, carry) = super::digits::add3_bal16_same_len(b, &a, &c, &d);
+                b.enforce_var_eq_const(carry, F257::ZERO);
+                stack.push(sum);
+            } else {
+                let c = stack.pop().unwrap();
+                let a = stack.pop().unwrap();
+                let (sum, carry) = add_bal16_same_len(b, &a, &c);
+                b.enforce_var_eq_const(carry, F257::ZERO);
+                stack.push(sum);
+            }
+        }
+        let acc = stack.pop().unwrap();
+
+        // q fits within ~log2(N)+64 bits; represent it with 18 nibbles + final carry => 19 digits.
+        let q_d = alloc_u128_as_bal16_digits_witness(b, q_u128, 18);
+        let qp_d = mul_bal16_long_by_const_rhs(b, &q_d, &p_d_const);
+        let qp_d = pad_bal16(b, qp_d, TARGET_LEN);
+
+        let r_d = u64_bytes_to_bal16_digits_cached(b, r_bytes);
+        let r_d = pad_bal16(b, r_d, TARGET_LEN);
+
+        let (sum_d, carry_sum) = add_bal16_same_len(b, &qp_d, &r_d);
+        b.enforce_var_eq_const(carry_sum, F257::ZERO);
+        enforce_bal16_vec_eq(b, &acc, &sum_d);
+        r_bytes
+    }
+
+    fn eval_deg3_poly_at_t(
+        b: &mut Dr1csBuilder<F257>,
+        a0: &[usize; 8],
+        a1: &[usize; 8],
+        a2: &[usize; 8],
+        a3: &[usize; 8],
+        t: i64,
+    ) -> [usize; 8] {
+        // coeffs = [1, t, t^2, t^3] mod p
+        let t1 = mod_i64_to_u64(t, FROG_P);
+        let t2 = mod_i64_to_u64(t * t, FROG_P);
+        let t3 = mod_i64_to_u64(t * t * t, FROG_P);
+        let coeffs = [1u64, t1, t2, t3];
+        let evals = [*a0, *a1, *a2, *a3];
+        let evals_d: [Vec<usize>; 4] = [
+            u64_bytes_to_bal16_digits_cached(b, *a0),
+            u64_bytes_to_bal16_digits_cached(b, *a1),
+            u64_bytes_to_bal16_digits_cached(b, *a2),
+            u64_bytes_to_bal16_digits_cached(b, *a3),
+        ];
+        lincomb_mod_p_from_canonical_evals::<4>(b, &evals, &evals_d, &coeffs)
+    }
+
     // Split into 4 blocks of length 16.
     let a0 = &a[0..16];
     let a1 = &a[16..32];
@@ -1082,35 +1205,6 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
     let c1 = &c[16..32];
     let c2 = &c[32..48];
     let c3 = &c[48..64];
-
-    // Evaluate at points: A(t) = a0 + t a1 + t^2 a2 + t^3 a3 (each coefficient-wise).
-    // Since t ∈ {0,±1,±2,±3}, we implement t*x via adds (no mul), and t^k similarly.
-    fn scale_small(
-        b: &mut Dr1csBuilder<F257>,
-        x: &[usize; 8],
-        t: i64,
-    ) -> [usize; 8] {
-        if t == 0 {
-            return frog_zero_bytes(b);
-        }
-        let mut acc = frog_zero_bytes(b);
-        let mut k = t.abs();
-        let mut cur = *x;
-        while k > 0 {
-            if (k & 1) == 1 {
-                acc = frog_add_mod_p_from_byte_vars_assume_canonical(b, &acc, &cur);
-            }
-            k >>= 1;
-            if k > 0 {
-                cur = frog_add_mod_p_from_byte_vars_assume_canonical(b, &cur, &cur);
-            }
-        }
-        if t < 0 {
-            let z = frog_zero_bytes(b);
-            return frog_sub_mod_p_from_byte_vars_assume_canonical(b, &z, &acc);
-        }
-        acc
-    }
 
     // Recursive Toom-4 poly mul for length n=16 over Frog scalars (returns len 31).
     fn poly_mul_toom4_len16(
@@ -1153,21 +1247,11 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
         let pts: [i64; 7] = [0, 1, -1, 2, -2, 3, -3];
         let mut w_eval: Vec<Vec<[usize; 8]>> = Vec::with_capacity(7);
         for &t in &pts {
-            let t2 = t * t;
-            let t3 = t2 * t;
             let mut ae: Vec<[usize; 8]> = Vec::with_capacity(m);
             let mut ce: Vec<[usize; 8]> = Vec::with_capacity(m);
             for i in 0..m {
-                let sa1 = scale_small(b, &a1[i], t);
-                let sa2 = scale_small(b, &a2[i], t2);
-                let sa3 = scale_small(b, &a3[i], t3);
-                let s = frog_add_many_mod_p(b, &[a0[i], sa1, sa2, sa3]);
-                ae.push(s);
-                let sc1 = scale_small(b, &c1[i], t);
-                let sc2 = scale_small(b, &c2[i], t2);
-                let sc3 = scale_small(b, &c3[i], t3);
-                let sc = frog_add_many_mod_p(b, &[c0[i], sc1, sc2, sc3]);
-                ce.push(sc);
+                ae.push(eval_deg3_poly_at_t(b, &a0[i], &a1[i], &a2[i], &a3[i], t));
+                ce.push(eval_deg3_poly_at_t(b, &c0[i], &c1[i], &c2[i], &c3[i], t));
             }
             w_eval.push(schoolbook(b, &ae, &ce)); // len 7 (2m-1)
         }
@@ -1215,20 +1299,11 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
     // Evaluate at 7 points, multiply (len16), interpolate into convolution len 127, then fold.
     let mut w_eval_top: Vec<Vec<[usize; 8]>> = Vec::with_capacity(7);
     for &t in &pts {
-        let t2 = t * t;
-        let t3 = t2 * t;
         let mut ae: Vec<[usize; 8]> = Vec::with_capacity(16);
         let mut ce: Vec<[usize; 8]> = Vec::with_capacity(16);
         for i in 0..16 {
-            let sa1 = scale_small(b, &a1[i], t);
-            let sa2 = scale_small(b, &a2[i], t2);
-            let sa3 = scale_small(b, &a3[i], t3);
-            ae.push(frog_add_many_mod_p(b, &[a0[i], sa1, sa2, sa3]));
-
-            let sc1 = scale_small(b, &c1[i], t);
-            let sc2 = scale_small(b, &c2[i], t2);
-            let sc3 = scale_small(b, &c3[i], t3);
-            ce.push(frog_add_many_mod_p(b, &[c0[i], sc1, sc2, sc3]));
+            ae.push(eval_deg3_poly_at_t(b, &a0[i], &a1[i], &a2[i], &a3[i], t));
+            ce.push(eval_deg3_poly_at_t(b, &c0[i], &c1[i], &c2[i], &c3[i], t));
         }
         w_eval_top.push(poly_mul_toom4_len16(b, &ae, &ce, inv720)); // len 31
     }
