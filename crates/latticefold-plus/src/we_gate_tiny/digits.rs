@@ -282,6 +282,68 @@ pub(crate) fn add_bal16_same_len(
     res
 }
 
+/// Add three balanced base-16 digit vectors of the same length.
+///
+/// Assumes each digit is in [-8,7]. Enforces output digits in [-8,7] and carry in [-2,2].
+pub(crate) fn add3_bal16_same_len(
+    b: &mut Dr1csBuilder<F257>,
+    a: &[usize],
+    c: &[usize],
+    d: &[usize],
+) -> (Vec<usize>, usize /* carry_out */) {
+    let _prev = b.profile_enter("digits::add_bal16_same_len");
+    assert_eq!(a.len(), c.len());
+    assert_eq!(a.len(), d.len());
+    let n = a.len();
+    let mut out: Vec<usize> = Vec::with_capacity(n);
+    let mut carry_i32: i32 = 0;
+    let mut carry = b.new_var(F257::ZERO);
+    b.enforce_var_eq_const(carry, F257::ZERO);
+
+    for i in 0..n {
+        let ai = f257_to_i32_bal(b.assignment[a[i]]);
+        let ci = f257_to_i32_bal(b.assignment[c[i]]);
+        let di = f257_to_i32_bal(b.assignment[d[i]]);
+        let sum = ai + ci + di + carry_i32;
+
+        // Choose carry_out so remainder in [-8,7].
+        let mut carry_next = if sum >= 0 { (sum + 8) / 16 } else { -(((-sum) + 8) / 16) };
+        let mut rem = sum - 16 * carry_next;
+        while rem > 7 {
+            carry_next += 1;
+            rem -= 16;
+        }
+        while rem < -8 {
+            carry_next -= 1;
+            rem += 16;
+        }
+        // With 3 inputs in [-8,7], carry stays in [-2,2].
+        assert!((-2..=2).contains(&carry_next));
+        assert!((-8..=7).contains(&rem));
+
+        let out_digit = alloc_bal16_digit(b, rem as i8);
+        let carry_next_var = alloc_carry_pm2(b, carry_next);
+
+        // a_i + c_i + d_i + carry - out_i - 16*carry_next = 0
+        b.enforce_lc_times_one_eq_const(vec![
+            (F257::ONE, a[i]),
+            (F257::ONE, c[i]),
+            (F257::ONE, d[i]),
+            (F257::ONE, carry),
+            (-F257::ONE, out_digit),
+            (-F257::from(16u64), carry_next_var),
+        ]);
+
+        out.push(out_digit);
+        carry_i32 = carry_next;
+        carry = carry_next_var;
+    }
+
+    let res = (out, carry);
+    b.profile_exit(_prev);
+    res
+}
+
 /// Negate a balanced base-16 digit vector (little-endian), producing digits in [-8,7].
 pub(crate) fn neg_bal16_digits(
     b: &mut Dr1csBuilder<F257>,
@@ -884,8 +946,11 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
     let zero = alloc_bal16_digit(b, 0);
     let blocks = (a.len() + 2) / 3;
     let per_block_len = bb_const.len() + 5;
-    let target_len = per_block_len + 3 * (blocks - 1) + 2;
-    let mut acc = vec![zero; target_len];
+    // Add 1 digit of headroom so that we can enforce carry_out=0 when summing blocks.
+    let target_len = per_block_len + 3 * (blocks - 1) + 3;
+
+    // Build all shifted block-products.
+    let mut terms: Vec<Vec<usize>> = Vec::with_capacity(blocks);
 
     for blk in 0..blocks {
         let start = blk * 3;
@@ -897,14 +962,29 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
         let raw = mul_bal16_small_const_rhs(b, &coeff3, bb_const);
         let reb = rebalance_tail_pm11_to_pm2(b, &raw);
         let shifted = shift_pad_bal16(&reb, blk * 3, target_len, zero);
-        let (new_acc, carry) = add_bal16_same_len(b, &acc, &shifted);
-        acc = new_acc;
-        let top = acc[target_len - 1];
-        let (top_sum, top_carry) = add_bal16_same_len(b, &[top], &[carry]);
-        acc[target_len - 1] = top_sum[0];
-        b.enforce_var_eq_const(top_carry, F257::ZERO);
+        terms.push(shifted);
     }
-    let out = acc;
+
+    // Reduce by summing 3-at-a-time (fewer passes than pairwise accumulation).
+    let mut stack = terms;
+    while stack.len() > 1 {
+        if stack.len() >= 3 {
+            let d = stack.pop().unwrap();
+            let c = stack.pop().unwrap();
+            let a = stack.pop().unwrap();
+            let (sum, carry) = add3_bal16_same_len(b, &a, &c, &d);
+            b.enforce_var_eq_const(carry, F257::ZERO);
+            stack.push(sum);
+        } else {
+            let c = stack.pop().unwrap();
+            let a = stack.pop().unwrap();
+            let (sum, carry) = add_bal16_same_len(b, &a, &c);
+            b.enforce_var_eq_const(carry, F257::ZERO);
+            stack.push(sum);
+        }
+    }
+
+    let out = stack.pop().unwrap();
     b.profile_exit(_prev);
     out
 }
