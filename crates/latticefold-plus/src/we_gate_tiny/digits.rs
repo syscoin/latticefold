@@ -5,11 +5,6 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits, ByteVar};
 
-#[inline]
-fn strict_nowrap_enabled() -> bool {
-    std::env::var("LF_STRICT_NOWRAP").ok().as_deref() == Some("1")
-}
-
 // -----------------------------------------------------------------------------
 // Balanced base-16 (nibble) gadgets for *bounded* integer arithmetic in F257.
 // -----------------------------------------------------------------------------
@@ -1188,195 +1183,28 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
         return out;
     }
 
-    // Fast path for the common WE-gate operand sizes (u64-ish bal16 digits):
-    // perform a streaming convolution with a bounded carry, avoiding the block+shift accumulator.
+    // -------------------------------------------------------------------------
+    // Fox #1 (SOUND): Use loose digit accumulation when bounds permit.
     //
-    // IMPORTANT (soundness): This path enforces a large linear relation in F257. If intermediate
-    // integer magnitudes can reach ≥ 257, equality in F257 may not imply the intended integer
-    // relation (wraparound ambiguity). When `LF_STRICT_NOWRAP=1`, we disable this fast path and
-    // fall back to the add-heavy but obviously-safe construction.
-    if !strict_nowrap_enabled() && a.len() <= 19 && bb.len() <= 19 {
-        let la = a.len();
-        let lb = bb.len();
-
-        // ---------------------------------------------------------------------
-        // Statement-only arming: choose carry gadgets by position, not by value.
-        //
-        // We bound the carry magnitude C_k for each output position k using:
-        //   |sum_k| <= 64 * t_k + C_{k-1},  where t_k is the number of products at k,
-        // and since sum_k = rem_k + 16*C_k with rem_k in [-8,7], we have:
-        //   C_k <= floor((|sum_k| + 8)/16).
-        //
-        // This gives a conservative, witness-independent bound schedule.
-        // ---------------------------------------------------------------------
-        #[inline]
-        fn terms_at_pos(k: usize, la: usize, lb: usize) -> i32 {
-            let t0 = (k + 1).min(la);
-            let t1 = lb.min(la + lb - 1 - k);
-            (t0.min(t1)) as i32
-        }
-        #[inline]
-        fn next_carry_bound(prev: i32, terms: i32) -> i32 {
-            // prev >= 0, terms >= 1
-            let max_sum = prev + 64 * terms;
-            (max_sum + 8) / 16
-        }
-        #[inline]
-        fn alloc_carry_with_bound(b: &mut Dr1csBuilder<F257>, c: i32, bound: i32) -> usize {
-            debug_assert!(bound >= 0);
-            if bound <= 1 {
-                alloc_carry_pm1(b, c)
-            } else if bound <= 2 {
-                alloc_carry_pm2(b, c)
-            } else if bound <= 7 {
-                alloc_carry_pm8(b, c)
-            } else if bound <= 15 {
-                alloc_carry_pm16(b, c)
-            } else if bound <= 31 {
-                alloc_carry_pm32(b, c)
-            } else if bound <= 63 {
-                alloc_carry_pm64(b, c)
-            } else {
-                alloc_carry_pm128(b, c)
-            }
-        }
-        let mut carry_bounds: Vec<i32> = Vec::with_capacity(la + lb);
-        let mut cb: i32 = 0;
-        for k in 0..(la + lb - 1) {
-            let t = terms_at_pos(k, la, lb);
-            cb = next_carry_bound(cb, t);
-            carry_bounds.push(cb);
-        }
-        // NOTE: strict-nowarp checking is intentionally not run here anymore because strict mode
-        // disables this entire fast path. (Keeping the check would just be dead code.)
-
-        let div_floor = |x: i32, d: i32| -> i32 {
-            debug_assert!(d > 0);
-            if x >= 0 { x / d } else { -(((-x) + d - 1) / d) }
-        };
-
-        let mut out: Vec<usize> = Vec::with_capacity(la + lb + 4);
-        let mut carry_i32: i32 = 0;
-        let mut carry_var = b.new_var(F257::ZERO);
-        b.enforce_var_eq_const(carry_var, F257::ZERO);
-
-        for k in 0..(la + lb - 1) {
-            let mut sum: i32 = carry_i32;
-            let mut prods: Vec<usize> = Vec::new();
-
-            for i in 0..la {
-                let j = k as i32 - i as i32;
-                if j < 0 || j >= lb as i32 {
-                    continue;
-                }
-                let j = j as usize;
-                let aval = f257_to_i32_bal(b.assignment[a[i]]);
-                let bval = f257_to_i32_bal(b.assignment[bb[j]]);
-                sum += aval * bval;
-
-                let pv = b.new_var(b.assignment[a[i]] * b.assignment[bb[j]]);
-                b.enforce_mul(a[i], bb[j], pv);
-                prods.push(pv);
-            }
-
-            let mut carry_next = div_floor(sum + 8, NIBBLE_BASE);
-            let mut rem = sum - NIBBLE_BASE * carry_next;
-            while rem > 7 {
-                carry_next += 1;
-                rem -= NIBBLE_BASE;
-            }
-            while rem < -8 {
-                carry_next -= 1;
-                rem += NIBBLE_BASE;
-            }
-            // Do not assert on witness-derived values in statement-only arming mode.
-
-            let digit_var = alloc_bal16_digit(b, rem as i8);
-            let carry_out_var = alloc_carry_with_bound(b, carry_next, carry_bounds[k]);
-
-            // carry + Σ prods - digit - 16*carry_out = 0
-            let mut lc: Vec<(F257, usize)> = Vec::with_capacity(2 + prods.len());
-            lc.push((F257::ONE, carry_var));
-            for &p in &prods {
-                lc.push((F257::ONE, p));
-            }
-            lc.push((-F257::ONE, digit_var));
-            lc.push((-F257::from(16u64), carry_out_var));
-            b.enforce_lc_times_one_eq_const(lc);
-
-            out.push(digit_var);
-            carry_i32 = carry_next;
-            carry_var = carry_out_var;
-        }
-
-        // Expand the final carry with a fixed number of digits, chosen from the static bound.
-        // For carry bound C, choose the smallest L such that any value in [-C,C] is representable
-        // as L balanced base-16 digits (with final carry forced to 0).
-        let c_tail = *carry_bounds.last().unwrap_or(&0);
-        let mut max_mag: i64 = c_tail as i64;
-        let mut tail_len: usize = 0;
-        // representable magnitude with L digits is 8*(16^L - 1)/15
-        let mut pow16: i64 = 1;
-        while (8 * (pow16 - 1) / 15) < max_mag {
-            pow16 *= 16;
-            tail_len += 1;
-            if tail_len > 6 {
-                break; // extremely conservative guard; unreachable for la,lb<=19
-            }
-        }
-        if tail_len == 0 {
-            // Still add one digit so the representation stays uniform across instances.
-            tail_len = 1;
-        }
-        let mut cbound = c_tail;
-        for _ in 0..tail_len {
-            // Next carry bound after one digit:
-            let next_bound = (cbound + 8) / 16;
-            let sum = carry_i32;
-            let mut carry_next = div_floor(sum + 8, NIBBLE_BASE);
-            let mut rem = sum - NIBBLE_BASE * carry_next;
-            while rem > 7 {
-                carry_next += 1;
-                rem -= NIBBLE_BASE;
-            }
-            while rem < -8 {
-                carry_next -= 1;
-                rem += NIBBLE_BASE;
-            }
-            let rem_digit = alloc_bal16_digit(b, rem as i8);
-            let carry_next_var = alloc_carry_with_bound(b, carry_next, next_bound);
-            b.enforce_lc_times_one_eq_const(vec![
-                (F257::ONE, carry_var),
-                (-F257::ONE, rem_digit),
-                (-F257::from(16u64), carry_next_var),
-            ]);
-            out.push(rem_digit);
-            carry_i32 = carry_next;
-            carry_var = carry_next_var;
-            cbound = next_bound;
-        }
-        b.enforce_var_eq_const(carry_var, F257::ZERO);
-
-        b.profile_exit(_prev);
-        return out;
-    }
+    // This path is sound because:
+    // 1. mul_bal16_small handles blocks of size 3×n, where sums stay under 257
+    // 2. Loose accumulation uses pure linear constraints (no ambiguity)
+    // 3. Final normalization has bound < 128, ensuring no F257 wrap-around
+    //
+    // We check this FIRST (before the streaming path) because it's provably sound
+    // for all operand sizes where the bound check passes.
+    // -------------------------------------------------------------------------
     let (short, long) = if a.len() <= bb.len() { (a, bb) } else { (bb, a) };
-
     let zero = bal16_zero(b);
     let blocks = (short.len() + 2) / 3;
-
     let per_block_len = long.len() + 5;
     let target_len = per_block_len + 3 * (blocks - 1) + 2;
-    let mut acc = vec![zero; target_len];
 
-    // Fox #1: when dimensions are small (WE-gate typical), sum block-shifted terms as *loose*
-    // digits and normalize once. This avoids repeated carry-normalizations.
-    //
-    // We only enable this when the loose digit bound is provably < 128 (no-wrap).
     if long.len() <= 19 && short.len() <= 19 {
         let per_term_bound: i32 = 10; // conservative: digits in [-8,7] plus small tail carry
         let acc_bound: i32 = (blocks as i32) * per_term_bound;
         if acc_bound < 128 {
+            let mut acc = vec![zero; target_len];
             for blk in 0..blocks {
                 let start = blk * 3;
                 let end = core::cmp::min(start + 3, short.len());
@@ -1397,6 +1225,12 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
     }
 
     // Fallback: original carry-normalizing accumulation.
+    // This path is used when neither Fox #1 nor streaming applies.
+    let zero = bal16_zero(b);
+    let blocks = (short.len() + 2) / 3;
+    let per_block_len = long.len() + 5;
+    let target_len = per_block_len + 3 * (blocks - 1) + 2;
+    let mut acc = vec![zero; target_len];
     for blk in 0..blocks {
         let start = blk * 3;
         let end = core::cmp::min(start + 3, short.len());
@@ -1679,174 +1513,58 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
         return out;
     }
 
-    // Fast path for typical sizes in WE-gate tiny-field arithmetic (streaming convolution).
+    // -------------------------------------------------------------------------
+    // Block multiplication with Fox #1 loose accumulation (SOUND).
     //
-    // IMPORTANT (soundness): same caveat as the long-by-long fast path. Disabled when
-    // `LF_STRICT_NOWRAP=1`.
-    if !strict_nowrap_enabled() && a.len() <= 19 && bb_const.len() <= 17 {
-        #[inline]
-        fn f257_from_i8(x: i8) -> F257 {
-            if x >= 0 {
-                F257::from(x as u64)
-            } else {
-                -F257::from((-x) as u64)
-            }
-        }
-
-        let la = a.len();
-        let lb = bb_const.len();
-        let mut out: Vec<usize> = Vec::with_capacity(la + lb + 4);
-        let mut carry_i32: i32 = 0;
-        let mut carry_var = b.new_var(F257::ZERO);
-        b.enforce_var_eq_const(carry_var, F257::ZERO);
-
-        // Statement-only arming: choose carry gadgets by position, not by value.
-        #[inline]
-        fn terms_at_pos(k: usize, la: usize, lb: usize) -> i32 {
-            let t0 = (k + 1).min(la);
-            let t1 = lb.min(la + lb - 1 - k);
-            (t0.min(t1)) as i32
-        }
-        #[inline]
-        fn next_carry_bound(prev: i32, terms: i32) -> i32 {
-            let max_sum = prev + 64 * terms;
-            (max_sum + 8) / 16
-        }
-        #[inline]
-        fn alloc_carry_with_bound(b: &mut Dr1csBuilder<F257>, c: i32, bound: i32) -> usize {
-            if bound <= 1 {
-                alloc_carry_pm1(b, c)
-            } else if bound <= 2 {
-                alloc_carry_pm2(b, c)
-            } else if bound <= 7 {
-                alloc_carry_pm8(b, c)
-            } else if bound <= 15 {
-                alloc_carry_pm16(b, c)
-            } else if bound <= 31 {
-                alloc_carry_pm32(b, c)
-            } else if bound <= 63 {
-                alloc_carry_pm64(b, c)
-            } else {
-                alloc_carry_pm128(b, c)
-            }
-        }
-        let mut carry_bounds: Vec<i32> = Vec::with_capacity(la + lb);
-        let mut cb: i32 = 0;
-        for k in 0..(la + lb - 1) {
-            let t = terms_at_pos(k, la, lb);
-            cb = next_carry_bound(cb, t);
-            carry_bounds.push(cb);
-        }
-        // NOTE: strict mode disables this path, so no need to run the nowrap checker here.
-
-        let div_floor = |x: i32, d: i32| -> i32 {
-            debug_assert!(d > 0);
-            if x >= 0 { x / d } else { -(((-x) + d - 1) / d) }
-        };
-
-        for k in 0..(la + lb - 1) {
-            let mut sum: i32 = carry_i32;
-            let mut lc: Vec<(F257, usize)> = Vec::new();
-            lc.push((F257::ONE, carry_var));
-
-            // Σ_i a[i] * bb_const[k-i]
-            for i in 0..la {
-                let j = k as i32 - i as i32;
-                if j < 0 || j >= lb as i32 {
-                    continue;
-                }
-                let j = j as usize;
-                let aval = f257_to_i32_bal(b.assignment[a[i]]);
-                let bval = bb_const[j] as i32;
-                sum += aval * bval;
-                let cf = f257_from_i8(bb_const[j]);
-                if cf != F257::ZERO {
-                    lc.push((cf, a[i]));
-                }
-            }
-
-            let mut carry_next = div_floor(sum + 8, NIBBLE_BASE);
-            let mut rem = sum - NIBBLE_BASE * carry_next;
-            while rem > 7 {
-                carry_next += 1;
-                rem -= NIBBLE_BASE;
-            }
-            while rem < -8 {
-                carry_next -= 1;
-                rem += NIBBLE_BASE;
-            }
-            // Do not assert on witness-derived values in statement-only arming mode.
-
-            let digit_var = alloc_bal16_digit(b, rem as i8);
-            let carry_out_var = alloc_carry_with_bound(b, carry_next, carry_bounds[k]);
-
-            lc.push((-F257::ONE, digit_var));
-            lc.push((-F257::from(16u64), carry_out_var));
-            b.enforce_lc_times_one_eq_const(lc);
-
-            out.push(digit_var);
-            carry_i32 = carry_next;
-            carry_var = carry_out_var;
-        }
-
-        // Fixed-length tail expansion (statement-derived).
-        let c_tail = *carry_bounds.last().unwrap_or(&0);
-        let mut max_mag: i64 = c_tail as i64;
-        let mut tail_len: usize = 0;
-        let mut pow16: i64 = 1;
-        while (8 * (pow16 - 1) / 15) < max_mag {
-            pow16 *= 16;
-            tail_len += 1;
-            if tail_len > 6 {
-                break;
-            }
-        }
-        if tail_len == 0 {
-            tail_len = 1;
-        }
-        let mut cbound = c_tail;
-        for _ in 0..tail_len {
-            let next_bound = (cbound + 8) / 16;
-            let sum = carry_i32;
-            let mut carry_next = div_floor(sum + 8, NIBBLE_BASE);
-            let mut rem = sum - NIBBLE_BASE * carry_next;
-            while rem > 7 {
-                carry_next += 1;
-                rem -= NIBBLE_BASE;
-            }
-            while rem < -8 {
-                carry_next -= 1;
-                rem += NIBBLE_BASE;
-            }
-            let rem_digit = alloc_bal16_digit(b, rem as i8);
-            let carry_next_var = alloc_carry_with_bound(b, carry_next, next_bound);
-            b.enforce_lc_times_one_eq_const(vec![
-                (F257::ONE, carry_var),
-                (-F257::ONE, rem_digit),
-                (-F257::from(16u64), carry_next_var),
-            ]);
-            out.push(rem_digit);
-            carry_i32 = carry_next;
-            carry_var = carry_next_var;
-            cbound = next_bound;
-        }
-        b.enforce_var_eq_const(carry_var, F257::ZERO);
-
-        b.profile_exit(_prev);
-        return out;
-    }
-
+    // This path is sound because:
+    // 1. mul_bal16_small_const_rhs4 handles blocks of up to 4 terms, keeping sums < 257
+    // 2. Loose accumulation uses pure linear constraints (no ambiguity)
+    // 3. Final normalization has bound < 128, ensuring no F257 wrap-around
+    //
+    // We check this FIRST (before the streaming path) because it's provably sound
+    // for all operand sizes where the bound check passes.
+    // -------------------------------------------------------------------------
     let zero = bal16_zero(b);
-    // Use 4-digit blocks (still no-wrap safe), reducing the number of blocks.
     const BLK: usize = 4;
     let blocks = (a.len() + (BLK - 1)) / BLK;
     let per_block_len = bb_const.len() + BLK + 2;
-    // Add 1 digit of headroom so that we can enforce carry_out=0 when summing blocks.
     let target_len = per_block_len + BLK * (blocks - 1) + 3;
 
-    // Build all shifted block-products.
-    let mut terms: Vec<Vec<usize>> = Vec::with_capacity(blocks);
+    let per_term_bound: i32 = 10;
+    let acc_bound: i32 = (blocks as i32) * per_term_bound;
 
+    if a.len() <= 19 && bb_const.len() <= 17 && acc_bound < 128 {
+        // Build all shifted block-products using the sound 4-term multiplier.
+        let mut terms: Vec<Vec<usize>> = Vec::with_capacity(blocks);
+        for blk in 0..blocks {
+            let start = blk * BLK;
+            let end = core::cmp::min(start + BLK, a.len());
+            let mut coeff4 = [zero; 4];
+            for j in 0..(end - start) {
+                coeff4[j] = a[start + j];
+            }
+            let raw = mul_bal16_small_const_rhs4(b, &coeff4, end - start, bb_const);
+            let reb = rebalance_tail_pm16_to_pm1(b, &raw);
+            let shifted = shift_pad_bal16(&reb, blk * BLK, target_len, zero);
+            terms.push(shifted);
+        }
+
+        // Fox #1: accumulate as loose digits, normalize once.
+        let mut acc = vec![zero; target_len];
+        for t in &terms {
+            add_bal16_loose_in_place(b, &mut acc, t);
+        }
+        let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc, acc_bound);
+        b.enforce_var_eq_const(carry, F257::ZERO);
+        b.profile_exit(_prev);
+        return norm;
+    }
+
+    // -------------------------------------------------------------------------
+    // Fallback for very large operands (acc_bound >= 128).
+    // Uses 3-at-a-time reduction instead of loose accumulation.
+    // -------------------------------------------------------------------------
+    let mut terms: Vec<Vec<usize>> = Vec::with_capacity(blocks);
     for blk in 0..blocks {
         let start = blk * BLK;
         let end = core::cmp::min(start + BLK, a.len());
@@ -1860,40 +1578,25 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
         terms.push(shifted);
     }
 
-    // Fox #1: sum as loose digits, normalize once (only when bound is < 128).
-    let per_term_bound: i32 = 10; // conservative per shifted block (digits in [-8,7], tail carry small)
-    let acc_bound: i32 = (blocks as i32) * per_term_bound;
-    // Enable loose summation whenever the resulting digit bound is provably < 128 (no-wrap).
-    // This includes the important `q*p` case inside strict reductions where `q` may be ~33 digits.
-    let out = if acc_bound < 128 {
-        let mut acc = vec![zero; target_len];
-        for t in &terms {
-            add_bal16_loose_in_place(b, &mut acc, t);
+    // Reduce by summing 3-at-a-time (fewer passes than pairwise accumulation).
+    let mut stack = terms;
+    while stack.len() > 1 {
+        if stack.len() >= 3 {
+            let d = stack.pop().unwrap();
+            let c = stack.pop().unwrap();
+            let aa = stack.pop().unwrap();
+            let (sum, carry) = add3_bal16_same_len(b, &aa, &c, &d);
+            b.enforce_var_eq_const(carry, F257::ZERO);
+            stack.push(sum);
+        } else {
+            let c = stack.pop().unwrap();
+            let aa = stack.pop().unwrap();
+            let (sum, carry) = add_bal16_same_len(b, &aa, &c);
+            b.enforce_var_eq_const(carry, F257::ZERO);
+            stack.push(sum);
         }
-        let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc, acc_bound);
-        b.enforce_var_eq_const(carry, F257::ZERO);
-        norm
-    } else {
-        // Reduce by summing 3-at-a-time (fewer passes than pairwise accumulation).
-        let mut stack = terms;
-        while stack.len() > 1 {
-            if stack.len() >= 3 {
-                let d = stack.pop().unwrap();
-                let c = stack.pop().unwrap();
-                let a = stack.pop().unwrap();
-                let (sum, carry) = add3_bal16_same_len(b, &a, &c, &d);
-                b.enforce_var_eq_const(carry, F257::ZERO);
-                stack.push(sum);
-            } else {
-                let c = stack.pop().unwrap();
-                let a = stack.pop().unwrap();
-                let (sum, carry) = add_bal16_same_len(b, &a, &c);
-                b.enforce_var_eq_const(carry, F257::ZERO);
-                stack.push(sum);
-            }
-        }
-        stack.pop().unwrap()
-    };
+    }
+    let out = stack.pop().unwrap();
     b.profile_exit(_prev);
     out
 }
