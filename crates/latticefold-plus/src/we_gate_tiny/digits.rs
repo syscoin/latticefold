@@ -225,6 +225,38 @@ fn alloc_carry_pm2(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
     c_var
 }
 
+/// Allocate a signed carry `c ∈ [-128,127]` as an F257 variable by range-checking an offset.
+///
+/// We represent `off = c + 128` as an 8-bit value in [0,255] (so it admits a byte decomposition),
+/// then enforce `c = off - 128` as a linear relation in F257.
+fn alloc_carry_pm128(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
+    assert!((-128..=127).contains(&c));
+    let off_u8: u8 = (c + 128) as u8;
+    // 8-bit decomposition of off.
+    let mut bits = [0usize; 8];
+    for i in 0..8 {
+        bits[i] = alloc_bool::<F257>(b, ((off_u8 >> i) & 1) == 1);
+    }
+    let off_var = b.new_var(F257::from(off_u8 as u64));
+    // off = Σ 2^i * bits[i]
+    let mut lc = vec![(F257::ONE, off_var)];
+    let mut pow = F257::ONE;
+    for i in 0..8 {
+        lc.push((-pow, bits[i]));
+        pow *= F257::from(2u64);
+    }
+    b.enforce_lc_times_one_eq_const(lc);
+
+    // c = off - 128
+    let c_var = b.new_var(i32_to_f257(c));
+    b.enforce_lc_times_one_eq_const(vec![
+        (F257::ONE, c_var),
+        (-F257::ONE, off_var),
+        (F257::from(128u64), b.one()),
+    ]);
+    c_var
+}
+
 /// Add two balanced base-16 digit vectors of the same length.
 ///
 /// Assumes each digit is in [-8,7]. Enforces output digits in [-8,7] and carry in [-2,2].
@@ -939,6 +971,122 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
     if a.len() <= 3 {
         let raw = mul_bal16_small_const_rhs(b, a, bb_const);
         let out = rebalance_tail_pm11_to_pm2(b, &raw);
+        b.profile_exit(_prev);
+        return out;
+    }
+
+    // Fast path for the typical sizes in WE-gate tiny-field arithmetic:
+    // - `a` is a u64-ish bal16 expansion (len 17) or a small extension (<=19 for q),
+    // - `bb_const` is a u64-ish constant bal16 expansion (len 17).
+    //
+    // We can do a single streaming convolution with a bounded carry in [-128,127], avoiding
+    // the block+shift accumulator (which is add-heavy).
+    if a.len() <= 19 && bb_const.len() <= 17 {
+        #[inline]
+        fn f257_from_i8(x: i8) -> F257 {
+            if x >= 0 {
+                F257::from(x as u64)
+            } else {
+                -F257::from((-x) as u64)
+            }
+        }
+
+        let la = a.len();
+        let lb = bb_const.len();
+        let mut out: Vec<usize> = Vec::with_capacity(la + lb + 4);
+        let mut carry_i32: i32 = 0;
+        let mut carry_var = alloc_carry_pm128(b, 0);
+
+        let div_floor = |x: i32, d: i32| -> i32 {
+            debug_assert!(d > 0);
+            if x >= 0 { x / d } else { -(((-x) + d - 1) / d) }
+        };
+
+        for k in 0..(la + lb - 1) {
+            let mut sum: i32 = carry_i32;
+            let mut lc: Vec<(F257, usize)> = Vec::new();
+            lc.push((F257::ONE, carry_var));
+
+            // Σ_i a[i] * bb_const[k-i]
+            for i in 0..la {
+                let j = k as i32 - i as i32;
+                if j < 0 || j >= lb as i32 {
+                    continue;
+                }
+                let j = j as usize;
+                let aval = f257_to_i32_bal(b.assignment[a[i]]);
+                let bval = bb_const[j] as i32;
+                sum += aval * bval;
+                let cf = f257_from_i8(bb_const[j]);
+                if cf != F257::ZERO {
+                    lc.push((cf, a[i]));
+                }
+            }
+
+            let mut carry_next = div_floor(sum + 8, NIBBLE_BASE);
+            let mut rem = sum - NIBBLE_BASE * carry_next;
+            while rem > 7 {
+                carry_next += 1;
+                rem -= NIBBLE_BASE;
+            }
+            while rem < -8 {
+                carry_next -= 1;
+                rem += NIBBLE_BASE;
+            }
+            assert!((-8..=7).contains(&rem));
+            // For our intended operand sizes, carry stays well within [-128,127].
+            assert!(
+                (-128..=127).contains(&carry_next),
+                "carry out of range for pm128: {carry_next} from sum {sum}"
+            );
+
+            let digit_var = alloc_bal16_digit(b, rem as i8);
+            let carry_out_var = alloc_carry_pm128(b, carry_next);
+
+            lc.push((-F257::ONE, digit_var));
+            lc.push((-F257::from(16u64), carry_out_var));
+            b.enforce_lc_times_one_eq_const(lc);
+
+            out.push(digit_var);
+            carry_i32 = carry_next;
+            carry_var = carry_out_var;
+        }
+
+        // Expand the final carry into balanced base-16 digits until it becomes 0.
+        // This yields a pure digit vector with no extra carry output, matching the contract of
+        // the long-by-const gadget.
+        while carry_i32 != 0 {
+            let sum = carry_i32;
+            let mut carry_next = div_floor(sum + 8, NIBBLE_BASE);
+            let mut rem = sum - NIBBLE_BASE * carry_next;
+            while rem > 7 {
+                carry_next += 1;
+                rem -= NIBBLE_BASE;
+            }
+            while rem < -8 {
+                carry_next -= 1;
+                rem += NIBBLE_BASE;
+            }
+            assert!((-8..=7).contains(&rem));
+            assert!(
+                (-128..=127).contains(&carry_next),
+                "carry out of range for pm128 tail: {carry_next} from sum {sum}"
+            );
+
+            let rem_digit = alloc_bal16_digit(b, rem as i8);
+            let carry_next_var = alloc_carry_pm128(b, carry_next);
+            // carry = rem + 16*carry_next
+            b.enforce_lc_times_one_eq_const(vec![
+                (F257::ONE, carry_var),
+                (-F257::ONE, rem_digit),
+                (-F257::from(16u64), carry_next_var),
+            ]);
+            out.push(rem_digit);
+            carry_i32 = carry_next;
+            carry_var = carry_next_var;
+        }
+        b.enforce_var_eq_const(carry_var, F257::ZERO);
+
         b.profile_exit(_prev);
         return out;
     }
