@@ -209,7 +209,7 @@ fn alloc_carry_pm2(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
 ///
 /// We represent `off = c + 128` as an 8-bit value in [0,255] (so it admits a byte decomposition),
 /// then enforce `c = off - 128` as a linear relation in F257.
-fn alloc_carry_pm128(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
+pub(crate) fn alloc_carry_pm128(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
     assert!((-128..=127).contains(&c));
     let off_u8: u8 = (c + 128) as u8;
     // 8-bit decomposition of off.
