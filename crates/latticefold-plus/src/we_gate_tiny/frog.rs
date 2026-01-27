@@ -255,6 +255,111 @@ pub(super) fn frog_u64_canonical_from_byte_vars<F: PrimeField>(
     z
 }
 
+/// Enforce that an 8-byte little-endian integer `u` satisfies `u < p_frog`.
+///
+/// This is a *cheaper* alternative to `frog_u64_canonical_from_byte_vars` when you do not need
+/// the base-128 limbs of `u` (and do not need to compute the reduced value `z`).
+///
+/// Internally this:
+/// - bit-decomposes the bytes (cached)
+/// - packs them into 10 base-128 limbs (7-bit each)
+/// - runs a base-128 borrow chain on (u - p)
+/// - enforces the final borrow is 1 (i.e., u < p)
+pub(super) fn frog_u64_enforce_lt_p_from_byte_vars<F: PrimeField>(
+    b: &mut Dr1csBuilder<F>,
+    u_byte_vars: &[usize; 8],
+) {
+    // Witness u.
+    let mut u_buf = [0u8; 8];
+    for i in 0..8 {
+        u_buf[i] = b.assignment[u_byte_vars[i]]
+            .into_bigint()
+            .to_bytes_le()
+            .get(0)
+            .copied()
+            .unwrap_or(0);
+    }
+    let u = u64::from_le_bytes(u_buf);
+
+    // Decompose bytes into bits (cached per byte var).
+    let mut u_bits: Vec<usize> = Vec::with_capacity(64);
+    for i in 0..8 {
+        let bits = decompose_existing_byte_var_to_bits::<F>(b, u_byte_vars[i]);
+        u_bits.extend_from_slice(&bits);
+    }
+    debug_assert_eq!(u_bits.len(), 64);
+
+    // Pack into base-128 limbs.
+    let mut u_limbs = [0usize; LIMBS_U64];
+    for j in 0..LIMBS_U64 {
+        let limb_val = ((u >> (LIMB_BITS * j)) & (LIMB_BASE_U64 - 1)) as u64;
+        let limb_var = b.new_var(F::from(limb_val));
+        let mut lc = vec![(F::ONE, limb_var)];
+        let mut pow = F::ONE;
+        for k in 0..LIMB_BITS {
+            let bit_idx = LIMB_BITS * j + k;
+            if bit_idx < 64 {
+                lc.push((-pow, u_bits[bit_idx]));
+            }
+            pow *= F::from(2u64);
+        }
+        b.enforce_lc_times_one_eq_const(lc);
+        u_limbs[j] = limb_var;
+    }
+
+    // Borrow chain for u - p. Final borrow == 1 iff u < p.
+    let p_digits = frog_p_base128_digits_le();
+    let mut borrow = b.new_var(F::ZERO);
+    b.enforce_var_eq_const(borrow, F::ZERO);
+    for i in 0..LIMBS_U64 {
+        let ui = ((u >> (LIMB_BITS * i)) & (LIMB_BASE_U64 - 1)) as i16;
+        let pi = p_digits[i] as i16;
+        let bi = if i == 0 {
+            0i16
+        } else {
+            b.assignment[borrow]
+                .into_bigint()
+                .to_bytes_le()
+                .get(0)
+                .copied()
+                .unwrap_or(0) as i16
+        };
+        debug_assert!(bi == 0 || bi == 1);
+        let mut t = ui - pi - bi;
+        let borrow_next_u8 = if t < 0 { 1u8 } else { 0u8 };
+        if t < 0 {
+            t += LIMB_BASE_U64 as i16;
+        }
+        let diff_i = b.new_var(F::from((t as u64) & (LIMB_BASE_U64 - 1)));
+        // Range-check diff_i to 7 bits.
+        let mut dbits = [0usize; LIMB_BITS];
+        for k in 0..LIMB_BITS {
+            dbits[k] = alloc_bool::<F>(b, (((t as u8) >> k) & 1) == 1);
+        }
+        let mut lc_diff = vec![(F::ONE, diff_i)];
+        let mut pow = F::ONE;
+        for k in 0..LIMB_BITS {
+            lc_diff.push((-pow, dbits[k]));
+            pow *= F::from(2u64);
+        }
+        b.enforce_lc_times_one_eq_const(lc_diff);
+
+        let borrow_next = alloc_bool::<F>(b, borrow_next_u8 == 1);
+        // u_i - p_i - borrow_i + base*borrow_{i+1} - diff_i == 0
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, u_limbs[i]),
+            (-F::from(p_digits[i] as u64), b.one()),
+            (-F::ONE, borrow),
+            (F::from(LIMB_BASE_U64), borrow_next),
+            (-F::ONE, diff_i),
+        ]);
+        borrow = borrow_next;
+    }
+
+    // Enforce u < p: final borrow must be 1.
+    b.enforce_var_eq_const(borrow, F::ONE);
+}
+
 /// Enforce that a canonical Frog base-field element `u` (encoded as 8 bytes, u < p_frog)
 /// lies in the **centered magnitude** range \(|u| <= bound\), meaning:
 /// - u ∈ [0, bound]  (non-negative)
@@ -471,8 +576,8 @@ pub(super) fn frog_mul_mod_p_from_byte_vars(
     b_bytes: &[usize; 8],
 ) -> [usize; 8] {
     // Ensure inputs are canonical (<p).
-    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, a_bytes);
-    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, b_bytes);
+    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, a_bytes);
+    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, b_bytes);
     frog_mul_mod_p_from_byte_vars_assume_canonical(b, a_bytes, b_bytes)
 }
 
@@ -515,7 +620,7 @@ fn frog_mul_mod_p_from_byte_vars_assume_canonical(
         r_bytes[i] = alloc_u8_var::<F257>(b, r_bytes_u8[i]);
     }
     // Enforce r is canonical (<p).
-    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &r_bytes);
+    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
 
     // Convert a,b,r and p to balanced-base16 digits.
     let a_d = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
@@ -556,7 +661,7 @@ pub(super) fn frog_mul_const_mod_p_from_byte_vars(
     c: u64,
 ) -> [usize; 8] {
     assert!(c < FROG_P, "frog_mul_const_mod_p_from_byte_vars requires c < p");
-    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, x_bytes);
+    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, x_bytes);
     frog_mul_const_mod_p_from_byte_vars_assume_canonical(b, x_bytes, c)
 }
 
@@ -590,7 +695,7 @@ fn frog_mul_const_mod_p_from_byte_vars_assume_canonical(
     for i in 0..8 {
         r_bytes[i] = alloc_u8_var::<F257>(b, r_bytes_u8[i]);
     }
-    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &r_bytes);
+    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
 
     // Convert x,r to bal16 digits (vars). `q` is allocated directly as balanced digits.
     let x_d = u64_bytes_to_bal16_digits_cached(b, *x_bytes);
@@ -628,8 +733,8 @@ pub(super) fn frog_add_mod_p_from_byte_vars(
     a_bytes: &[usize; 8],
     c_bytes: &[usize; 8],
 ) -> [usize; 8] {
-    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, a_bytes);
-    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, c_bytes);
+    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, a_bytes);
+    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, c_bytes);
     frog_add_mod_p_from_byte_vars_assume_canonical(b, a_bytes, c_bytes)
 }
 
@@ -669,7 +774,7 @@ fn frog_add_mod_p_from_byte_vars_assume_canonical(
     for i in 0..8 {
         r_bytes[i] = alloc_u8_var::<F257>(b, r_bytes_u8[i]);
     }
-    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &r_bytes);
+    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
 
     // Digits: pad to length 18 so the final add carry must be 0.
     let a_d0 = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
@@ -714,8 +819,8 @@ pub(super) fn frog_sub_mod_p_from_byte_vars(
     a_bytes: &[usize; 8],
     c_bytes: &[usize; 8],
 ) -> [usize; 8] {
-    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, a_bytes);
-    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, c_bytes);
+    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, a_bytes);
+    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, c_bytes);
     frog_sub_mod_p_from_byte_vars_assume_canonical(b, a_bytes, c_bytes)
 }
 
@@ -757,7 +862,7 @@ fn frog_sub_mod_p_from_byte_vars_assume_canonical(
     for i in 0..8 {
         r_bytes[i] = alloc_u8_var::<F257>(b, r_bytes_u8[i]);
     }
-    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &r_bytes);
+    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
 
     // Enforce a + q*p == c + r (as integers) using balanced digits.
     let a_d0 = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
@@ -814,7 +919,7 @@ fn frog_from_u64_const_bytes(b: &mut Dr1csBuilder<F257>, c: u64) -> [usize; 8] {
     for i in 0..8 {
         out[i] = alloc_u8_var::<F257>(b, cb[i]);
     }
-    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &out);
+    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, &out);
     out
 }
 
@@ -1026,7 +1131,7 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         for j in 0..8 {
             r_bytes[j] = alloc_u8_var::<F257>(b, r_bytes_u8[j]);
         }
-        let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &r_bytes);
+        frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
 
         // -----------------------
         // Constrain: Σ (coeff*eval) == q*p + r as integers via bal16 digits.
@@ -1139,7 +1244,7 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         for j in 0..8 {
             r_bytes[j] = alloc_u8_var::<F257>(b, r_bytes_u8[j]);
         }
-        let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &r_bytes);
+        frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
 
         // Constrain Σ (coeff*eval) == q*p + r in bal16 digit space.
         //
