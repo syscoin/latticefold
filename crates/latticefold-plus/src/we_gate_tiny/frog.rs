@@ -5,9 +5,8 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 
 use super::coins::frog_p_base128_digits_le;
 use super::digits::{
-    add_bal16_same_len, alloc_bal16_digit, alloc_bal16_digit_const, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
-    alloc_carry_pm2_dynamic, alloc_carry_pm_dynamic_le128,
-    alloc_carry_pm_dynamic_le512, i32_to_f257, u64_bytes_to_bal16_digits_cached,
+    add_bal16_same_len, alloc_bal16_digit, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
+    alloc_carry_pm2, alloc_carry_pm128, alloc_carry_pm512, i32_to_f257, u64_bytes_to_bal16_digits_cached,
 };
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
@@ -64,12 +63,12 @@ fn alloc_u64_as_bal16_digits_witness(b: &mut Dr1csBuilder<F257>, x: u64) -> Vec<
     let ds = u64_to_bal16_digits_le_const(x);
     let mut out: Vec<usize> = Vec::with_capacity(17);
     for i in 0..16 {
-        // These digits are known at build time; allocate them as cached constants to avoid
-        // per-digit bit decomposition.
-        out.push(alloc_bal16_digit_const(b, ds[i]));
+        // NOTE: This function allocates *witness digits* (for q in mul/lincomb reductions).
+        // For statement-only arming, do NOT hard-code witness-derived digits as constants.
+        out.push(alloc_bal16_digit(b, ds[i]));
     }
-    // Final carry is in {0,1}; use cached constants.
-    out.push(if ds[16] == 1 { b.one() } else { b.zero_var() });
+    // Final carry is already in {0,1}.
+    out.push(alloc_bool::<F257>(b, ds[16] == 1));
     out
 }
 
@@ -622,7 +621,8 @@ fn enforce_prod_eq_qp_plus_r_bal16(
         );
 
         // Allocate next carry with the smallest sufficient bound.
-        let carry_next_var = alloc_carry_pm_dynamic_le128(b, carry_next);
+        // Statement-only arming: use a fixed pm128 bound (no witness-dependent gadget selection).
+        let carry_next_var = alloc_carry_pm128(b, carry_next);
 
         // Constrain: carry + prod_k - r_k - Σ(q_i * p_{k-i}) - 16*carry_next = 0
         let mut lc: Vec<(F257, usize)> = Vec::with_capacity(4 + q_d.len());
@@ -688,7 +688,7 @@ fn enforce_add_mod_p_relation_bal16(
             (-2..=2).contains(&carry_next),
             "add_mod_p carry out of pm2: {carry_next} (sum={sum}) at k={k}"
         );
-        let carry_next_var = alloc_carry_pm2_dynamic(b, carry_next);
+        let carry_next_var = alloc_carry_pm2(b, carry_next);
 
         let mut lc: Vec<(F257, usize)> = Vec::with_capacity(6);
         lc.push((F257::ONE, carry_var));
@@ -738,7 +738,7 @@ fn enforce_sub_mod_p_relation_bal16(
             (-2..=2).contains(&carry_next),
             "sub_mod_p carry out of pm2: {carry_next} (sum={sum}) at k={k}"
         );
-        let carry_next_var = alloc_carry_pm2_dynamic(b, carry_next);
+        let carry_next_var = alloc_carry_pm2(b, carry_next);
 
         let mut lc: Vec<(F257, usize)> = Vec::with_capacity(6);
         lc.push((F257::ONE, carry_var));
@@ -1206,10 +1206,11 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         let ds = u128_to_bal16_digits_le_const(x, n_nibbles);
         let mut out: Vec<usize> = Vec::with_capacity(n_nibbles + 1);
         for i in 0..n_nibbles {
-            out.push(alloc_bal16_digit_const(b, ds[i]));
+            // Statement-only arming: do NOT hard-code witness-derived digits as constants.
+            out.push(alloc_bal16_digit(b, ds[i]));
         }
         // Final carry in {0,1}.
-        out.push(if ds[n_nibbles] == 1 { b.one() } else { b.zero_var() });
+        out.push(alloc_bool::<F257>(b, ds[n_nibbles] == 1));
         out
     }
 
@@ -1356,7 +1357,8 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
             );
 
             let digit_var = alloc_bal16_digit(b, rem as i8);
-            let carry_out_var = alloc_carry_pm_dynamic_le512(b, carry_next);
+            // Statement-only arming: use a fixed pm512 bound (no witness-dependent gadget selection).
+            let carry_out_var = alloc_carry_pm512(b, carry_next);
             lc.push((-F257::ONE, digit_var));
             lc.push((-F257::from(16u64), carry_out_var));
             b.enforce_lc_times_one_eq_const(lc);
@@ -1366,8 +1368,12 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
             carry_var = carry_out_var;
         }
 
-        // Expand remaining carry into balanced digits.
-        while carry_i32 != 0 {
+        // Expand remaining carry into balanced digits with a fixed schedule (statement-only arming).
+        //
+        // carry is always within [-512,511] here (pm512). After one step:
+        //   |carry_next| <= floor((|carry|+8)/16) <= 32
+        // after two: <= 2, after three: = 0. So 3 digits suffice and are witness-independent.
+        for _ in 0..3 {
             let sum = carry_i32;
             let mut carry_next = div_floor(sum + 8, 16);
             let mut rem = sum - 16 * carry_next;
@@ -1383,7 +1389,8 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
             debug_assert!((-512..=511).contains(&carry_next));
 
             let rem_digit = alloc_bal16_digit(b, rem as i8);
-            let carry_next_var = alloc_carry_pm_dynamic_le512(b, carry_next);
+            // Statement-only arming: use a fixed pm512 bound (no witness-dependent gadget selection).
+            let carry_next_var = alloc_carry_pm512(b, carry_next);
             b.enforce_lc_times_one_eq_const(vec![
                 (F257::ONE, carry_var),
                 (-F257::ONE, rem_digit),

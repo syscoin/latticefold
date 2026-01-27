@@ -46,14 +46,6 @@ pub struct Dr1csBuilder<F: PrimeField> {
     /// decompositions for constant-zero digits/limbs.
     pub zero_var_cache: Option<usize>,
 
-    /// Cache for small constant variables constrained to a field element `F::from(c)`.
-    ///
-    /// This is useful for reusing frequently occurring small constants (e.g. digits/limbs)
-    /// without repeatedly allocating range/bit gadgets.
-    ///
-    /// Key: the u64 constant `c` (interpreted as `F::from(c)`).
-    pub small_const_cache: BTreeMap<u64, usize>,
-
     // -------------------------------------------------------------------------
     // Optional profiling (enabled by env var; low overhead when disabled).
     // -------------------------------------------------------------------------
@@ -75,7 +67,6 @@ impl<F: PrimeField> Dr1csBuilder<F> {
             u64_bal16_cache: BTreeMap::new(),
             u32_bal16_cache: BTreeMap::new(),
             zero_var_cache: None,
-            small_const_cache: BTreeMap::new(),
             profile_enabled,
             profile_current: None,
             profile: BTreeMap::new(),
@@ -116,26 +107,6 @@ impl<F: PrimeField> Dr1csBuilder<F> {
         let v = self.new_var(F::ZERO);
         self.enforce_var_eq_const(v, F::ZERO);
         self.zero_var_cache = Some(v);
-        v
-    }
-
-    /// Return a reusable variable constrained to the small constant `F::from(c)`.
-    ///
-    /// - For `c == 0`, this returns `zero_var()`.
-    /// - For `c == 1`, this returns `one()` (variable 0).
-    pub fn const_u64(&mut self, c: u64) -> usize {
-        if c == 0 {
-            return self.zero_var();
-        }
-        if c == 1 {
-            return self.one();
-        }
-        if let Some(&v) = self.small_const_cache.get(&c) {
-            return v;
-        }
-        let v = self.new_var(F::from(c));
-        self.enforce_var_eq_const(v, F::from(c));
-        self.small_const_cache.insert(c, v);
         v
     }
     pub fn into_instance(self) -> (SparseDr1csInstance<F>, Vec<F>) {
