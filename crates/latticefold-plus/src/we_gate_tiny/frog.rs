@@ -669,7 +669,9 @@ fn frog_add_mod_p_from_byte_vars_assume_canonical(
     for i in 0..18 {
         let pd_i: i8 = if i < 17 { p_d0_const[i] } else { 0 };
         let want: i8 = if q_u8 == 1 { pd_i } else { 0 };
-        let out = alloc_bal16_digit(b, want);
+        // `out` is fully determined by the linear constraint below and the booleanity of `q`,
+        // so we do not need to pay for `alloc_bal16_digit`'s internal bit-decomposition.
+        let out = b.new_var(i32_to_f257(want as i32));
         // out = pd_i * q  (linear, since pd_i is constant and q ∈ {0,1})
         b.enforce_lc_times_one_eq_const(vec![(F257::ONE, out), (-i32_to_f257(pd_i as i32), q)]);
         qp_d.push(out);
@@ -748,7 +750,7 @@ fn frog_sub_mod_p_from_byte_vars_assume_canonical(
     for i in 0..18 {
         let pd_i: i8 = if i < 17 { p_d0_const[i] } else { 0 };
         let want: i8 = if q_u8 == 1 { pd_i } else { 0 };
-        let out = alloc_bal16_digit(b, want);
+        let out = b.new_var(i32_to_f257(want as i32));
         b.enforce_lc_times_one_eq_const(vec![(F257::ONE, out), (-i32_to_f257(pd_i as i32), q)]);
         qp_d.push(out);
     }
