@@ -16,6 +16,12 @@ use std::collections::BTreeMap;
 
 use crate::dpp_poseidon::{Constraint, SparseDr1csInstance};
 
+#[derive(Clone, Debug, Default)]
+pub struct Dr1csProfileCounts {
+    pub vars: u64,
+    pub constraints: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Dr1csBuilder<F: PrimeField> {
     pub assignment: Vec<F>,
@@ -33,26 +39,48 @@ pub struct Dr1csBuilder<F: PrimeField> {
     ///
     /// Key: 4 byte variables (little-endian). Value: balanced-base16 digits (len 9).
     pub u32_bal16_cache: BTreeMap<[usize; 4], Vec<usize>>,
+
+    // -------------------------------------------------------------------------
+    // Optional profiling (enabled by env var; low overhead when disabled).
+    // -------------------------------------------------------------------------
+    pub profile_enabled: bool,
+    pub profile_current: Option<&'static str>,
+    pub profile: BTreeMap<&'static str, Dr1csProfileCounts>,
 }
 
 impl<F: PrimeField> Dr1csBuilder<F> {
     pub fn new() -> Self {
+        let profile_enabled = match std::env::var("LF_PROFILE_DR1CS") {
+            Ok(v) => v != "0",
+            Err(_) => false,
+        };
         Self {
             assignment: vec![F::ONE],
             rows: Vec::new(),
             byte_bits_cache: BTreeMap::new(),
             u64_bal16_cache: BTreeMap::new(),
             u32_bal16_cache: BTreeMap::new(),
+            profile_enabled,
+            profile_current: None,
+            profile: BTreeMap::new(),
         }
     }
     pub fn one(&self) -> usize { 0 }
     pub fn new_var(&mut self, value: F) -> usize {
         let idx = self.assignment.len();
         self.assignment.push(value);
+        if self.profile_enabled {
+            let key = self.profile_current.unwrap_or("unlabeled");
+            self.profile.entry(key).or_default().vars += 1;
+        }
         idx
     }
     pub fn add_constraint(&mut self, a: Vec<(F, usize)>, b: Vec<(F, usize)>, c: Vec<(F, usize)>) {
         self.rows.push(Constraint { a, b, c });
+        if self.profile_enabled {
+            let key = self.profile_current.unwrap_or("unlabeled");
+            self.profile.entry(key).or_default().constraints += 1;
+        }
     }
     pub fn enforce_lc_times_one_eq_const(&mut self, lc: Vec<(F, usize)>) {
         self.add_constraint(lc, vec![(F::ONE, self.one())], vec![(F::ZERO, self.one())]);
@@ -66,6 +94,69 @@ impl<F: PrimeField> Dr1csBuilder<F> {
     pub fn into_instance(self) -> (SparseDr1csInstance<F>, Vec<F>) {
         let inst = SparseDr1csInstance { nvars: self.assignment.len(), constraints: self.rows };
         (inst, self.assignment)
+    }
+
+    #[inline]
+    pub fn profile_scope<'a>(&'a mut self, label: &'static str) -> Dr1csProfileGuard<'a, F> {
+        if !self.profile_enabled {
+            return Dr1csProfileGuard { b: self, prev: None };
+        }
+        let prev = self.profile_current.replace(label);
+        Dr1csProfileGuard { b: self, prev: Some(prev) }
+    }
+
+    pub fn profile_report(&self, top_n: usize) -> String {
+        if !self.profile_enabled {
+            return "LF_PROFILE_DR1CS disabled".to_string();
+        }
+        let mut total_vars: u64 = 0;
+        let mut total_constraints: u64 = 0;
+        for v in self.profile.values() {
+            total_vars += v.vars;
+            total_constraints += v.constraints;
+        }
+        let mut rows: Vec<(&'static str, Dr1csProfileCounts)> = self
+            .profile
+            .iter()
+            .map(|(&k, v)| (k, v.clone()))
+            .collect();
+        rows.sort_by_key(|(_k, v)| std::cmp::Reverse(v.constraints));
+
+        let mut out = String::new();
+        out.push_str(&format!(
+            "== dR1CS profile (LF_PROFILE_DR1CS=1): total vars={} total constraints={} ==\n",
+            total_vars, total_constraints
+        ));
+        out.push_str("top scopes by constraints:\n");
+        for (i, (k, v)) in rows.into_iter().take(top_n).enumerate() {
+            let pct = if total_constraints == 0 {
+                0.0
+            } else {
+                (v.constraints as f64) * 100.0 / (total_constraints as f64)
+            };
+            out.push_str(&format!(
+                "  {:>2}. {:<40}  constraints={:<12} vars={:<12} ({:>5.1}%)\n",
+                i + 1,
+                k,
+                v.constraints,
+                v.vars,
+                pct
+            ));
+        }
+        out
+    }
+}
+
+pub struct Dr1csProfileGuard<'a, F: PrimeField> {
+    b: &'a mut Dr1csBuilder<F>,
+    prev: Option<Option<&'static str>>,
+}
+
+impl<'a, F: PrimeField> Drop for Dr1csProfileGuard<'a, F> {
+    fn drop(&mut self) {
+        if let Some(prev) = self.prev.take() {
+            self.b.profile_current = prev;
+        }
     }
 }
 

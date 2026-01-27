@@ -233,6 +233,7 @@ pub(crate) fn add_bal16_same_len(
     a: &[usize],
     c: &[usize],
 ) -> (Vec<usize>, usize /* carry_out */) {
+    let _p = b.profile_scope("digits::add_bal16_same_len");
     assert_eq!(a.len(), c.len());
     let n = a.len();
     let mut out: Vec<usize> = Vec::with_capacity(n);
@@ -654,6 +655,7 @@ pub(crate) fn mul_bal16_long_by_u32ish9(b: &mut Dr1csBuilder<F257>, a: &[usize],
 }
 
 pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb: &[usize]) -> Vec<usize> {
+    let _p = b.profile_scope("digits::mul_bal16_long_by_long");
     if a.is_empty() || bb.is_empty() {
         return vec![alloc_bal16_digit(b, 0)];
     }
@@ -858,6 +860,7 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
     a: &[usize],
     bb_const: &[i8],
 ) -> Vec<usize> {
+    let _p = b.profile_scope("digits::mul_bal16_long_by_const_rhs");
     if a.is_empty() || bb_const.is_empty() {
         return vec![alloc_bal16_digit(b, 0)];
     }
@@ -894,6 +897,7 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
 
 /// Convert 4 little-endian byte vars (0..255) into balanced base-16 digits (len 9).
 pub(crate) fn u32_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 4]) -> Vec<usize> {
+    let _p = b.profile_scope("digits::u32_bytes_to_bal16_digits");
     struct Nib {
         d: usize,
         bits: [usize; 4],
@@ -1010,6 +1014,7 @@ pub(crate) fn u32_bytes_to_bal16_digits_cached(b: &mut Dr1csBuilder<F257>, bytes
 /// Output digits are little-endian base-16 with each digit in [-8,7], followed by a final
 /// carry digit (also in {0,1} for a canonical u64 byte encoding).
 pub(crate) fn u64_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 8]) -> Vec<usize> {
+    let _p = b.profile_scope("digits::u64_bytes_to_bal16_digits");
     struct Nib {
         d: usize,
         bits: [usize; 4],
