@@ -777,20 +777,21 @@ fn frog_sub_mod_p_from_byte_vars_assume_canonical(
 }
 
 fn frog_zero_bytes(b: &mut Dr1csBuilder<F257>) -> [usize; 8] {
-    let mut z = [0usize; 8];
-    for i in 0..8 {
-        z[i] = b.new_var(F257::ZERO);
-        b.enforce_var_eq_const(z[i], F257::ZERO);
-        let _ = decompose_existing_byte_var_to_bits::<F257>(b, z[i]);
-    }
-    z
+    // Allocate a single shared 0-byte variable and reuse it for all 8 limbs.
+    //
+    // Important: we intentionally do NOT eagerly bit-decompose this byte. If/when a downstream
+    // gadget truly needs bits (e.g. digit conversion), `decompose_existing_byte_var_to_bits`
+    // will do it once and cache it by variable index. Eager decomposition here is pure overhead
+    // because `0` is already fixed by a constant constraint.
+    let z0 = b.new_var(F257::ZERO);
+    b.enforce_var_eq_const(z0, F257::ZERO);
+    [z0; 8]
 }
 
 fn frog_one_bytes(b: &mut Dr1csBuilder<F257>) -> [usize; 8] {
     let mut o = frog_zero_bytes(b);
     o[0] = b.new_var(F257::ONE);
     b.enforce_var_eq_const(o[0], F257::ONE);
-    let _ = decompose_existing_byte_var_to_bits::<F257>(b, o[0]);
     o
 }
 
