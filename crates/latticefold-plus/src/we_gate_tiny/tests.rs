@@ -10,7 +10,7 @@ use crate::we_gate_tiny::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U32, LIMBS_U64
 
 use super::challenges::bounded_u32_from_8_digits_base128;
 use super::digits::*;
-use super::frog::reduce_u64_mod_frog_from_byte_vars;
+use super::frog::{frog_u64_canonical_from_byte_vars, reduce_u64_mod_frog_from_byte_vars};
 use super::gadgets::alloc_byte;
 
 use latticefold::transcript::Transcript;
@@ -133,6 +133,34 @@ fn test_reduce_u64_mod_frog_rejects_wrong_q() {
     // Flip q (should be 1 -> set to 0) without adjusting anything else.
     asg[q] = F257::ZERO;
     assert!(inst.check(&asg).is_err(), "flipped q should break constraints");
+}
+
+#[test]
+fn test_frog_u64_canonical_from_bytes_accepts_lt_p_and_rejects_ge_p() {
+    // For transcript-absorbed base-field elements we expect canonical encoding u < p_frog.
+    let mut b = Dr1csBuilder::<F257>::new();
+    b.enforce_var_eq_const(b.one(), F257::ONE);
+
+    // u < p should satisfy q=0.
+    let u_good = (FROG_P / 2) + 7u64;
+    let mut u_byte_vars = [0usize; 8];
+    for (i, v) in u_good.to_le_bytes().into_iter().enumerate() {
+        let bv = alloc_byte::<F257>(&mut b, v);
+        u_byte_vars[i] = bv.byte;
+    }
+    let _z = frog_u64_canonical_from_byte_vars::<F257>(&mut b, &u_byte_vars);
+
+    // u >= p should fail due to enforced q==0.
+    let u_bad = FROG_P + 9u64;
+    let mut v_byte_vars = [0usize; 8];
+    for (i, v) in u_bad.to_le_bytes().into_iter().enumerate() {
+        let bv = alloc_byte::<F257>(&mut b, v);
+        v_byte_vars[i] = bv.byte;
+    }
+    let _z2 = frog_u64_canonical_from_byte_vars::<F257>(&mut b, &v_byte_vars);
+
+    let (inst, asg) = b.into_instance();
+    assert!(inst.check(&asg).is_err(), "u>=p should violate canonical constraint");
 }
 
 #[test]

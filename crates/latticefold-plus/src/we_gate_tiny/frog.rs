@@ -16,7 +16,6 @@ use crate::we_frog_poseidon_f257::FROG_P;
 ///
 /// This is the "single subtract" reduction justified by \(2^{64} < 2p\).
 /// Takes raw byte variables that are already constrained to be 8-bit.
-#[allow(dead_code)]
 pub(super) fn reduce_u64_mod_frog_from_byte_vars<F: PrimeField>(
     b: &mut Dr1csBuilder<F>,
     u_byte_vars: &[usize; 8],
@@ -173,5 +172,22 @@ pub(super) fn reduce_u64_mod_frog_from_byte_vars<F: PrimeField>(
     b.enforce_var_eq_const(borrow2, F::ZERO);
 
     (q, z_limbs)
+}
+
+/// Interpret 8 little-endian byte vars (0..255) as a **canonical** Frog base-field element.
+///
+/// This enforces that the represented integer `u` satisfies `u < p_frog` (no reduction),
+/// and returns `u` as base-128 limbs.
+///
+/// Use this for transcript-absorbed base-field elements, which are already encoded canonically
+/// by `prime_field_to_bytes_le_fixed` in the transcript.
+pub(super) fn frog_u64_canonical_from_byte_vars<F: PrimeField>(
+    b: &mut Dr1csBuilder<F>,
+    u_byte_vars: &[usize; 8],
+) -> [usize; LIMBS_U64] {
+    let (q, z) = reduce_u64_mod_frog_from_byte_vars::<F>(b, u_byte_vars);
+    // Canonical encoding requires no subtraction (u < p), so q == 0.
+    b.enforce_var_eq_const(q, F::ZERO);
+    z
 }
 

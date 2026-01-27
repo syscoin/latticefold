@@ -21,7 +21,7 @@ use super::digits::{
     scale_short_coeffs_by_digits9, sum_bal16_vectors_fixed_len, sum_product_digits_bal16,
     sum_product_digits_bal16_22, sum_products13_coeffwise_fixed_len, sum_products22_coeffwise_fixed_len,
 };
-use super::frog::reduce_u64_mod_frog_from_byte_vars;
+use super::frog::{frog_u64_canonical_from_byte_vars, reduce_u64_mod_frog_from_byte_vars};
 use super::gadgets::{decompose_existing_byte_var_to_bits, enforce_var_eq};
 use super::params::DIGITS_PER_TRY;
 use super::poseidon::poseidon_f257_arithmetize;
@@ -275,6 +275,19 @@ fn compute_tcch(
                         let n_blocks = ab_len / reb;
                         for blk in 0..n_blocks {
                             let blk_start = ab_start + blk * reb;
+                            // The first coefficient of the ring element is encoded as `coeff_bytes` bytes.
+                            // Enforce canonical Frog base-field encoding on that 8-byte chunk (no reduction).
+                            if coeff_bytes == 8 {
+                                let mut coeff0_bytes = [0usize; 8];
+                                for i in 0..8 {
+                                    let gv = pose_wiring.absorb_vars[blk_start + i];
+                                    let lv = glue.copy_digit(gv);
+                                    let _ = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, lv);
+                                    coeff0_bytes[i] = lv;
+                                }
+                                let _coeff0_limbs =
+                                    frog_u64_canonical_from_byte_vars::<F257>(&mut glue.gb, &coeff0_bytes);
+                            }
                             let mut acc = F257::ZERO;
                             let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + coeff_bytes);
                             for i in 0..coeff_bytes {

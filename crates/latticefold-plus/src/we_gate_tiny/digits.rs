@@ -868,3 +868,110 @@ pub(crate) fn u32_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
     out
 }
 
+/// Convert 8 little-endian byte vars (0..255) into balanced base-16 digits (len 17).
+///
+/// Output digits are little-endian base-16 with each digit in [-8,7], followed by a final
+/// carry digit (also in {0,1} for a canonical u64 byte encoding).
+pub(crate) fn u64_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 8]) -> Vec<usize> {
+    struct Nib {
+        d: usize,
+        bits: [usize; 4],
+        msb: usize,
+    }
+    let mut nibbles: Vec<Nib> = Vec::with_capacity(16);
+    for &bv in &bytes_le {
+        let bits8 = decompose_existing_byte_var_to_bits::<F257>(b, bv);
+        let tmp = ByteVar { byte: bv, bits: bits8 };
+        let (lo, hi) = byte_to_nibbles(b, &tmp);
+        nibbles.push(Nib { d: lo, bits: [bits8[0], bits8[1], bits8[2], bits8[3]], msb: bits8[3] });
+        nibbles.push(Nib { d: hi, bits: [bits8[4], bits8[5], bits8[6], bits8[7]], msb: bits8[7] });
+    }
+    debug_assert_eq!(nibbles.len(), 16);
+
+    let mut out: Vec<usize> = Vec::with_capacity(17);
+    let mut carry = b.new_var(F257::ZERO);
+    b.enforce_var_eq_const(carry, F257::ZERO);
+    b.add_constraint(
+        vec![(F257::ONE, carry)],
+        vec![(F257::ONE, b.one()), (-F257::ONE, carry)],
+        vec![(F257::ZERO, b.one())],
+    );
+
+    for nib in &nibbles {
+        let b0 = nib.bits[0];
+        let b1 = nib.bits[1];
+        let b2 = nib.bits[2];
+        let msb = nib.msb;
+        let not_msb = b.new_var(F257::ONE - b.assignment[msb]);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F257::ONE, not_msb),
+            (F257::ONE, msb),
+            (-F257::ONE, b.one()),
+        ]);
+
+        let t01 = b.new_var(b.assignment[b0] * b.assignment[b1]);
+        b.enforce_mul(b0, b1, t01);
+        let t012 = b.new_var(b.assignment[t01] * b.assignment[b2]);
+        b.enforce_mul(t01, b2, t012);
+        let is7 = b.new_var(b.assignment[t012] * b.assignment[not_msb]);
+        b.enforce_mul(t012, not_msb, is7);
+        b.add_constraint(
+            vec![(F257::ONE, is7)],
+            vec![(F257::ONE, b.one()), (-F257::ONE, is7)],
+            vec![(F257::ZERO, b.one())],
+        );
+
+        let carry_is7 = b.new_var(b.assignment[carry] * b.assignment[is7]);
+        b.enforce_mul(carry, is7, carry_is7);
+
+        let msb_and = b.new_var(b.assignment[msb] * b.assignment[carry_is7]);
+        b.enforce_mul(msb, carry_is7, msb_and);
+        let c_out = b.new_var(b.assignment[msb] + b.assignment[carry_is7] - b.assignment[msb_and]);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F257::ONE, c_out),
+            (-F257::ONE, msb),
+            (-F257::ONE, carry_is7),
+            (F257::ONE, msb_and),
+        ]);
+        b.add_constraint(
+            vec![(F257::ONE, c_out)],
+            vec![(F257::ONE, b.one()), (-F257::ONE, c_out)],
+            vec![(F257::ZERO, b.one())],
+        );
+
+        let d_i = b.assignment[nib.d]
+            .into_bigint()
+            .to_bytes_le()
+            .get(0)
+            .copied()
+            .unwrap_or(0) as i32;
+        let carry_i = b.assignment[carry]
+            .into_bigint()
+            .to_bytes_le()
+            .get(0)
+            .copied()
+            .unwrap_or(0) as i32;
+        let c_i = b.assignment[c_out]
+            .into_bigint()
+            .to_bytes_le()
+            .get(0)
+            .copied()
+            .unwrap_or(0) as i32;
+        let v = d_i + carry_i - 16 * c_i;
+        debug_assert!((-8..=7).contains(&v));
+        let out_digit = b.new_var(i32_to_f257(v));
+        b.enforce_lc_times_one_eq_const(vec![
+            (F257::ONE, out_digit),
+            (-F257::ONE, nib.d),
+            (-F257::ONE, carry),
+            (F257::from(16u64), c_out),
+        ]);
+
+        out.push(out_digit);
+        carry = c_out;
+    }
+
+    out.push(carry);
+    out
+}
+
