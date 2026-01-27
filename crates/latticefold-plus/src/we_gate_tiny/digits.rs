@@ -455,6 +455,21 @@ pub(crate) fn alloc_carry_pm2_dynamic(b: &mut Dr1csBuilder<F257>, c: i32) -> usi
     }
 }
 
+/// Allocate carry in [-11,11], using cheaper gadgets when possible.
+#[inline]
+fn alloc_carry_pm11_dynamic(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
+    assert!((-11..=11).contains(&c));
+    if c == 0 {
+        b.zero_var()
+    } else if c.abs() == 1 {
+        alloc_carry_pm1(b, c)
+    } else if (-8..=7).contains(&c) {
+        alloc_carry_pm8(b, c)
+    } else {
+        alloc_carry_pm11(b, c)
+    }
+}
+
 /// Allocate a signed carry `c ∈ [-1024,1023]` as an F257 variable by range-checking an offset.
 ///
 /// We represent `off = c + 1024` as an 11-bit value in [0,2047], then enforce
@@ -1179,8 +1194,7 @@ pub(crate) fn mul_bal16_small(b: &mut Dr1csBuilder<F257>, a: &[usize], bb: &[usi
 
     let mut out: Vec<usize> = Vec::with_capacity(la + lb);
     let mut carry_i32: i32 = 0;
-    let mut carry_var = b.new_var(F257::ZERO);
-    b.enforce_var_eq_const(carry_var, F257::ZERO);
+    let mut carry_var = b.zero_var();
 
     for k in 0..(la + lb - 1) {
         let mut sum: i32 = carry_i32;
@@ -1224,7 +1238,7 @@ pub(crate) fn mul_bal16_small(b: &mut Dr1csBuilder<F257>, a: &[usize], bb: &[usi
         );
 
         let digit_var = alloc_bal16_digit(b, rem as i8);
-        let carry_out_var = alloc_carry_pm11(b, carry);
+        let carry_out_var = alloc_carry_pm11_dynamic(b, carry);
 
         let mut lc: Vec<(F257, usize)> = Vec::new();
         lc.push((F257::ONE, carry_var));
@@ -1270,8 +1284,7 @@ pub(crate) fn mul_bal16_small_const_rhs(
 
     let mut out: Vec<usize> = Vec::with_capacity(la + lb);
     let mut carry_i32: i32 = 0;
-    let mut carry_var = b.new_var(F257::ZERO);
-    b.enforce_var_eq_const(carry_var, F257::ZERO);
+    let mut carry_var = b.zero_var();
 
     for k in 0..(la + lb - 1) {
         let mut sum: i32 = carry_i32;
@@ -1314,7 +1327,7 @@ pub(crate) fn mul_bal16_small_const_rhs(
         );
 
         let digit_var = alloc_bal16_digit(b, rem as i8);
-        let carry_out_var = alloc_carry_pm11(b, carry);
+        let carry_out_var = alloc_carry_pm11_dynamic(b, carry);
 
         lc.push((-F257::ONE, digit_var));
         lc.push((-F257::from(16u64), carry_out_var));
