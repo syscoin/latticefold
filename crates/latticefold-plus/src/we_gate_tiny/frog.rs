@@ -1370,10 +1370,14 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
             [-20, 15, 15, -6, -6, 1, 1],
         ];
 
-        let mut res: Vec<[usize; 8]> = vec![frog_zero_bytes(b); 2 * 16 - 1];
+        // Compute block contributions block[j][k] (7×7), then batch overlaps.
+        //
+        // Here m=4 and block length is (2m-1)=7. Shifts by m cause an overlap of length 3:
+        // for each j>=1 and k in 0..2, index (j*m+k) receives contributions from
+        // block[j][k] and block[j-1][k+m].
+        let mut block: Vec<Vec<[usize; 8]>> = vec![vec![zero; 2 * m - 1]; 7];
         for k in 0..(2 * m - 1) {
             // For fixed k, the 7 evaluation values are reused across all 7 j-blocks.
-            // Hoist digit conversions out of the inner j-loop.
             let mut evals = [zero; 7];
             for i in 0..7 {
                 evals[i] = w_eval[i][k];
@@ -1382,7 +1386,6 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
                 core::array::from_fn(|i| u64_bytes_to_bal16_digits_cached(b, evals[i]));
 
             for j in 0..7 {
-                let idx = j * m + k; // unique
                 let mut coeffs = [0u64; 7];
                 for i in 0..7 {
                     let n = NUMS[j][i];
@@ -1390,9 +1393,27 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
                         coeffs[i] = modmul_i64_u64(n, inv720, FROG_P);
                     }
                 }
-                let acc = lincomb7_mod_p_from_canonical_evals(b, &evals, &evals_d, &coeffs);
-                // NOTE: idx is NOT unique: blocks of length (2m-1) shifted by m overlap.
-                res[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &res[idx], &acc);
+                block[j][k] = lincomb7_mod_p_from_canonical_evals(b, &evals, &evals_d, &coeffs);
+            }
+        }
+
+        let mut res: Vec<[usize; 8]> = vec![zero; 2 * 16 - 1]; // len 31
+        // j=0 has no left-overlap.
+        for k in 0..(2 * m - 1) {
+            res[k] = block[0][k];
+        }
+        for j in 1..7 {
+            // Overlap k=0..2: sum of current block and previous block's tail.
+            for k in 0..(2 * m - 1 - m) {
+                let idx = j * m + k;
+                res[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &block[j][k], &block[j - 1][k + m]);
+            }
+            // Non-overlap k=3..6: direct assignment.
+            for k in (2 * m - 1 - m)..(2 * m - 1) {
+                let idx = j * m + k;
+                if idx < res.len() {
+                    res[idx] = block[j][k];
+                }
             }
         }
         res
@@ -1413,7 +1434,11 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         }
 
         // Interpolate into blocks j=0..6, each len 31, giving conv len 127.
-        let mut prod: Vec<[usize; 8]> = vec![zero; 2 * 64 - 1];
+        //
+        // With block length 31 and shift 16, overlaps are of length 15:
+        // for each j>=1 and k in 0..14, index (16j+k) receives contributions from
+        // block[j][k] and block[j-1][k+16].
+        let mut block: Vec<Vec<[usize; 8]>> = vec![vec![zero; 31]; 7];
         for k in 0..31 {
             // For fixed k, the 7 evaluation values are reused across all 7 j-blocks.
             let mut evals = [zero; 7];
@@ -1424,7 +1449,6 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
                 core::array::from_fn(|i| u64_bytes_to_bal16_digits_cached(b, evals[i]));
 
             for j in 0..7 {
-                let idx = j * 16 + k;
                 let mut coeffs = [0u64; 7];
                 for i in 0..7 {
                     let n = NUMS[j][i];
@@ -1432,9 +1456,27 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
                         coeffs[i] = modmul_i64_u64(n, inv720, FROG_P);
                     }
                 }
-                let acc = lincomb7_mod_p_from_canonical_evals(b, &evals, &evals_d, &coeffs);
-                // NOTE: idx is NOT unique: blocks of length 31 shifted by 16 overlap.
-                prod[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &prod[idx], &acc);
+                block[j][k] = lincomb7_mod_p_from_canonical_evals(b, &evals, &evals_d, &coeffs);
+            }
+        }
+
+        let mut prod: Vec<[usize; 8]> = vec![zero; 2 * 64 - 1]; // len 127
+        // j=0 has no left-overlap.
+        for k in 0..31 {
+            prod[k] = block[0][k];
+        }
+        for j in 1..7 {
+            // Overlap k=0..14: sum of current block and previous block's tail.
+            for k in 0..15 {
+                let idx = j * 16 + k;
+                prod[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &block[j][k], &block[j - 1][k + 16]);
+            }
+            // Non-overlap k=15..30: direct assignment.
+            for k in 15..31 {
+                let idx = j * 16 + k;
+                if idx < prod.len() {
+                    prod[idx] = block[j][k];
+                }
             }
         }
         prod
