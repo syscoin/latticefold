@@ -764,6 +764,134 @@ pub(crate) fn mul_bal16_small(b: &mut Dr1csBuilder<F257>, a: &[usize], bb: &[usi
     out
 }
 
+/// Multiply balanced base-16 digits by **constant** balanced digits (little-endian),
+/// specialized for `a.len() <= 3` (or `bb_const.len() <= 3` by swapping yourself).
+///
+/// This avoids any `enforce_mul`: each digit product is a constant scaling inside a linear
+/// combination, so the whole step is enforced by a single linear constraint per output digit.
+pub(crate) fn mul_bal16_small_const_rhs(
+    b: &mut Dr1csBuilder<F257>,
+    a: &[usize],
+    bb_const: &[i8],
+) -> Vec<usize> {
+    let la = a.len();
+    let lb = bb_const.len();
+    assert!(la > 0 && lb > 0);
+    assert!(la <= 3, "mul_bal16_small_const_rhs requires a.len() <= 3");
+
+    #[inline]
+    fn f257_from_i8(x: i8) -> F257 {
+        if x >= 0 {
+            F257::from(x as u64)
+        } else {
+            -F257::from((-x) as u64)
+        }
+    }
+
+    let mut out: Vec<usize> = Vec::with_capacity(la + lb);
+    let mut carry_i32: i32 = 0;
+    let mut carry_var = b.new_var(F257::ZERO);
+    b.enforce_var_eq_const(carry_var, F257::ZERO);
+
+    for k in 0..(la + lb - 1) {
+        let mut sum: i32 = carry_i32;
+        let mut lc: Vec<(F257, usize)> = Vec::new();
+        lc.push((F257::ONE, carry_var));
+
+        for i in 0..la {
+            let j = k as i32 - i as i32;
+            if j < 0 || j >= lb as i32 {
+                continue;
+            }
+            let j = j as usize;
+            let aval = f257_to_i32_bal(b.assignment[a[i]]);
+            let bval = bb_const[j] as i32;
+            sum += aval * bval;
+            let cf = f257_from_i8(bb_const[j]);
+            if cf != F257::ZERO {
+                lc.push((cf, a[i]));
+            }
+        }
+
+        let div_floor = |x: i32, d: i32| -> i32 {
+            debug_assert!(d > 0);
+            if x >= 0 { x / d } else { -(((-x) + d - 1) / d) }
+        };
+        let mut carry = div_floor(sum + 8, NIBBLE_BASE);
+        let mut rem = sum - NIBBLE_BASE * carry;
+        while rem > 7 {
+            carry += 1;
+            rem -= NIBBLE_BASE;
+        }
+        while rem < -8 {
+            carry -= 1;
+            rem += NIBBLE_BASE;
+        }
+        assert!((-8..=7).contains(&rem));
+        assert!(
+            (-11..=11).contains(&carry),
+            "carry out of expected range: {carry} from sum {sum}"
+        );
+
+        let digit_var = alloc_bal16_digit(b, rem as i8);
+        let carry_out_var = alloc_carry_pm11(b, carry);
+
+        lc.push((-F257::ONE, digit_var));
+        lc.push((-F257::from(16u64), carry_out_var));
+        b.enforce_lc_times_one_eq_const(lc);
+
+        out.push(digit_var);
+        carry_i32 = carry;
+        carry_var = carry_out_var;
+    }
+
+    out.push(carry_var);
+    out
+}
+
+/// Multiply a long balanced digit vector by a **constant** long balanced digit vector.
+///
+/// This is the const-RHS analogue of `mul_bal16_long_by_long`, and avoids any digit×digit
+/// multiplications by keeping all RHS digits as constants inside linear constraints.
+pub(crate) fn mul_bal16_long_by_const_rhs(
+    b: &mut Dr1csBuilder<F257>,
+    a: &[usize],
+    bb_const: &[i8],
+) -> Vec<usize> {
+    if a.is_empty() || bb_const.is_empty() {
+        return vec![alloc_bal16_digit(b, 0)];
+    }
+    if a.len() <= 3 {
+        let raw = mul_bal16_small_const_rhs(b, a, bb_const);
+        return rebalance_tail_pm11_to_pm2(b, &raw);
+    }
+
+    let zero = alloc_bal16_digit(b, 0);
+    let blocks = (a.len() + 2) / 3;
+    let per_block_len = bb_const.len() + 5;
+    let target_len = per_block_len + 3 * (blocks - 1) + 2;
+    let mut acc = vec![zero; target_len];
+
+    for blk in 0..blocks {
+        let start = blk * 3;
+        let end = core::cmp::min(start + 3, a.len());
+        let mut coeff3 = [zero; 3];
+        for j in 0..(end - start) {
+            coeff3[j] = a[start + j];
+        }
+        let raw = mul_bal16_small_const_rhs(b, &coeff3, bb_const);
+        let reb = rebalance_tail_pm11_to_pm2(b, &raw);
+        let shifted = shift_pad_bal16(&reb, blk * 3, target_len, zero);
+        let (new_acc, carry) = add_bal16_same_len(b, &acc, &shifted);
+        acc = new_acc;
+        let top = acc[target_len - 1];
+        let (top_sum, top_carry) = add_bal16_same_len(b, &[top], &[carry]);
+        acc[target_len - 1] = top_sum[0];
+        b.enforce_var_eq_const(top_carry, F257::ZERO);
+    }
+    acc
+}
+
 /// Convert 4 little-endian byte vars (0..255) into balanced base-16 digits (len 9).
 pub(crate) fn u32_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 4]) -> Vec<usize> {
     struct Nib {

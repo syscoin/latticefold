@@ -4,7 +4,10 @@ use latticefold::transcript::poseidon::F257;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 
 use super::coins::frog_p_base128_digits_le;
-use super::digits::{add_bal16_same_len, alloc_bal16_digit, mul_bal16_long_by_long, u64_bytes_to_bal16_digits};
+use super::digits::{
+    add_bal16_same_len, alloc_bal16_digit, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
+    u64_bytes_to_bal16_digits,
+};
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
 use crate::we_frog_poseidon_f257::FROG_P;
@@ -479,6 +482,90 @@ pub(super) fn frog_mul_mod_p_from_byte_vars(
     r_bytes
 }
 
+/// Multiply a canonical Frog scalar `x` by a **known constant** `c` (as u64 in `[0,p)`),
+/// returning a canonical Frog scalar (8-byte little-endian) for `x*c mod p`.
+///
+/// This is substantially cheaper than `frog_mul_mod_p_from_byte_vars` because it avoids all
+/// digit×digit multiplications in the 64-bit integer product checks.
+pub(super) fn frog_mul_const_mod_p_from_byte_vars(
+    b: &mut Dr1csBuilder<F257>,
+    x_bytes: &[usize; 8],
+    c: u64,
+) -> [usize; 8] {
+    assert!(c < FROG_P, "frog_mul_const_mod_p_from_byte_vars requires c < p");
+    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, x_bytes);
+
+    // Witness compute.
+    let mut xb = [0u8; 8];
+    for i in 0..8 {
+        xb[i] = b.assignment[x_bytes[i]]
+            .into_bigint()
+            .to_bytes_le()
+            .get(0)
+            .copied()
+            .unwrap_or(0);
+    }
+    let x_u = u64::from_le_bytes(xb);
+    let prod: u128 = (x_u as u128) * (c as u128);
+    let q_u: u64 = (prod / (FROG_P as u128)) as u64;
+    let r_u: u64 = (prod % (FROG_P as u128)) as u64;
+
+    // Allocate q and r as byte vars.
+    let q_bytes_u8 = q_u.to_le_bytes();
+    let r_bytes_u8 = r_u.to_le_bytes();
+    let mut q_bytes = [0usize; 8];
+    let mut r_bytes = [0usize; 8];
+    for i in 0..8 {
+        q_bytes[i] = alloc_u8_var::<F257>(b, q_bytes_u8[i]);
+        r_bytes[i] = alloc_u8_var::<F257>(b, r_bytes_u8[i]);
+    }
+    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &r_bytes);
+
+    // Convert x,q,r to bal16 digits (vars).
+    let x_d = u64_bytes_to_bal16_digits(b, *x_bytes);
+    let q_d = u64_bytes_to_bal16_digits(b, q_bytes);
+    let r_d = u64_bytes_to_bal16_digits(b, r_bytes);
+
+    // Constant bal16 digits for c and p.
+    let c_bytes = c.to_le_bytes();
+    let mut c_const_vars = [0usize; 8];
+    for i in 0..8 {
+        c_const_vars[i] = alloc_u8_var::<F257>(b, c_bytes[i]);
+    }
+    let c_d_vars = u64_bytes_to_bal16_digits(b, c_const_vars);
+    let mut c_d_const: Vec<i8> = Vec::with_capacity(c_d_vars.len());
+    for &dv in &c_d_vars {
+        c_d_const.push(super::digits::f257_to_i32_bal(b.assignment[dv]) as i8);
+    }
+
+    let p_bytes = frog_p_bytes_le();
+    let mut p_const_vars = [0usize; 8];
+    for i in 0..8 {
+        p_const_vars[i] = alloc_u8_var::<F257>(b, p_bytes[i]);
+    }
+    let p_d_vars = u64_bytes_to_bal16_digits(b, p_const_vars);
+    let mut p_d_const: Vec<i8> = Vec::with_capacity(p_d_vars.len());
+    for &dv in &p_d_vars {
+        p_d_const.push(super::digits::f257_to_i32_bal(b.assignment[dv]) as i8);
+    }
+
+    // prod_digits = x*c  (const-RHS)
+    let prod_d = mul_bal16_long_by_const_rhs(b, &x_d, &c_d_const);
+    // qp_digits = q*p  (const-RHS)
+    let qp_d = mul_bal16_long_by_const_rhs(b, &q_d, &p_d_const);
+
+    // Align lengths and enforce prod == qp + r.
+    let tlen = prod_d.len().max(qp_d.len()).max(r_d.len());
+    let prod_d = pad_bal16(b, prod_d, tlen);
+    let qp_d = pad_bal16(b, qp_d, tlen);
+    let r_d = pad_bal16(b, r_d, tlen);
+    let (sum_d, carry) = add_bal16_same_len(b, &qp_d, &r_d);
+    b.enforce_var_eq_const(carry, F257::ZERO);
+    enforce_bal16_vec_eq(b, &prod_d, &sum_d);
+
+    r_bytes
+}
+
 /// General Frog-field addition gadget inside F257.
 ///
 /// Enforces `r = (a + c) mod p` for canonical `a,c < p`, returning canonical `r` as 8 bytes.
@@ -629,5 +716,275 @@ pub(super) fn frog_sub_mod_p_from_byte_vars(
     enforce_bal16_vec_eq(b, &lhs_d, &rhs_d);
 
     r_bytes
+}
+
+fn frog_zero_bytes(b: &mut Dr1csBuilder<F257>) -> [usize; 8] {
+    let mut z = [0usize; 8];
+    for i in 0..8 {
+        z[i] = b.new_var(F257::ZERO);
+        b.enforce_var_eq_const(z[i], F257::ZERO);
+        let _ = decompose_existing_byte_var_to_bits::<F257>(b, z[i]);
+    }
+    z
+}
+
+fn frog_one_bytes(b: &mut Dr1csBuilder<F257>) -> [usize; 8] {
+    let mut o = frog_zero_bytes(b);
+    o[0] = b.new_var(F257::ONE);
+    b.enforce_var_eq_const(o[0], F257::ONE);
+    let _ = decompose_existing_byte_var_to_bits::<F257>(b, o[0]);
+    o
+}
+
+fn frog_from_u64_const_bytes(b: &mut Dr1csBuilder<F257>, c: u64) -> [usize; 8] {
+    let cb = c.to_le_bytes();
+    let mut out = [0usize; 8];
+    for i in 0..8 {
+        out[i] = alloc_u8_var::<F257>(b, cb[i]);
+    }
+    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &out);
+    out
+}
+
+fn frog_add_many_mod_p(b: &mut Dr1csBuilder<F257>, terms: &[[usize; 8]]) -> [usize; 8] {
+    let mut acc = frog_zero_bytes(b);
+    for t in terms {
+        acc = frog_add_mod_p_from_byte_vars(b, &acc, t);
+    }
+    acc
+}
+
+/// Negacyclic ring multiplication for `d=64` (FrogRing64), where coefficients are canonical Frog scalars.
+///
+/// Returns `c = a*b mod (X^64 + 1)` as 64 canonical Frog scalars (each 8 bytes).
+///
+/// This uses the same **Toom-4** block structure as the native WE gate (`we_gate_arith.rs`),
+/// but implemented over our byte-based Frog-field gadgets. The critical requirement is that
+/// interpolation uses `frog_mul_const_mod_p_from_byte_vars` (cheap const-mul), not full mul.
+pub(super) fn ring_mul_negacyclic_toom4_d64(
+    b: &mut Dr1csBuilder<F257>,
+    a: &[[usize; 8]; 64],
+    c: &[[usize; 8]; 64],
+) -> [[usize; 8]; 64] {
+    // Precomputed inv(Vandermonde(0,±1,±2,±3)) entries as nums/720.
+    const NUMS: [[i64; 7]; 7] = [
+        [720, 0, 0, 0, 0, 0, 0],
+        [0, 540, -540, -108, 108, 12, -12],
+        [-980, 540, 540, -54, -54, 4, 4],
+        [0, -195, 195, 120, -120, -15, 15],
+        [280, -195, -195, 60, 60, -5, -5],
+        [0, 15, -15, -12, 12, 3, -3],
+        [-20, 15, 15, -6, -6, 1, 1],
+    ];
+    // inv720 mod p, precomputed in host below (witness-time), but fixed as a constant operand.
+    let inv720 = {
+        // Compute inv720 in the host field (u64) using extended Euclid on integers.
+        fn inv_mod_u64(a: u64, p: u64) -> u64 {
+            let mut t0: i128 = 0;
+            let mut t1: i128 = 1;
+            let mut r0: i128 = p as i128;
+            let mut r1: i128 = a as i128;
+            while r1 != 0 {
+                let q = r0 / r1;
+                (t0, t1) = (t1, t0 - q * t1);
+                (r0, r1) = (r1, r0 - q * r1);
+            }
+            debug_assert!(r0 == 1 || r0 == -1);
+            let mut t = t0;
+            if t < 0 {
+                t += p as i128;
+            }
+            (t as u128 % (p as u128)) as u64
+        }
+        inv_mod_u64(720u64, FROG_P)
+    };
+
+    let pts: [i64; 7] = [0, 1, -1, 2, -2, 3, -3];
+
+    let zero = frog_zero_bytes(b);
+
+    // Split into 4 blocks of length 16.
+    let a0 = &a[0..16];
+    let a1 = &a[16..32];
+    let a2 = &a[32..48];
+    let a3 = &a[48..64];
+    let c0 = &c[0..16];
+    let c1 = &c[16..32];
+    let c2 = &c[32..48];
+    let c3 = &c[48..64];
+
+    // Evaluate at points: A(t) = a0 + t a1 + t^2 a2 + t^3 a3 (each coefficient-wise).
+    // Since t ∈ {0,±1,±2,±3}, we implement t*x via adds (no mul), and t^k similarly.
+    fn scale_small(
+        b: &mut Dr1csBuilder<F257>,
+        x: &[usize; 8],
+        t: i64,
+    ) -> [usize; 8] {
+        if t == 0 {
+            return frog_zero_bytes(b);
+        }
+        let mut acc = frog_zero_bytes(b);
+        let mut k = t.abs();
+        let mut cur = *x;
+        while k > 0 {
+            if (k & 1) == 1 {
+                acc = frog_add_mod_p_from_byte_vars(b, &acc, &cur);
+            }
+            k >>= 1;
+            if k > 0 {
+                cur = frog_add_mod_p_from_byte_vars(b, &cur, &cur);
+            }
+        }
+        if t < 0 {
+            let z = frog_zero_bytes(b);
+            return frog_sub_mod_p_from_byte_vars(b, &z, &acc);
+        }
+        acc
+    }
+
+    // Recursive Toom-4 poly mul for length n=16 over Frog scalars (returns len 31).
+    fn poly_mul_toom4_len16(
+        b: &mut Dr1csBuilder<F257>,
+        a: &Vec<[usize; 8]>,
+        c: &Vec<[usize; 8]>,
+        inv720: u64,
+    ) -> Vec<[usize; 8]> {
+        debug_assert_eq!(a.len(), 16);
+        debug_assert_eq!(c.len(), 16);
+        // Base case at n=1 would be frog_mul_mod_p; but for n=16 we do one Toom-4 level (m=4) then base mults at n=4 via schoolbook.
+
+        // Helper: schoolbook convolution for small n with frog_mul_mod_p (n<=4).
+        fn schoolbook(
+            b: &mut Dr1csBuilder<F257>,
+            a: &[[usize; 8]],
+            c: &[[usize; 8]],
+        ) -> Vec<[usize; 8]> {
+            let n = a.len();
+            let mut out: Vec<[usize; 8]> = vec![frog_zero_bytes(b); 2 * n - 1];
+            for i in 0..n {
+                for j in 0..n {
+                    let m = frog_mul_mod_p_from_byte_vars(b, &a[i], &c[j]);
+                    out[i + j] = frog_add_mod_p_from_byte_vars(b, &out[i + j], &m);
+                }
+            }
+            out
+        }
+
+        let m = 4;
+        let (a0, rest) = a.split_at(m);
+        let (a1, rest) = rest.split_at(m);
+        let (a2, a3) = rest.split_at(m);
+        let (c0, rest) = c.split_at(m);
+        let (c1, rest) = rest.split_at(m);
+        let (c2, c3) = rest.split_at(m);
+
+        let pts: [i64; 7] = [0, 1, -1, 2, -2, 3, -3];
+        let mut w_eval: Vec<Vec<[usize; 8]>> = Vec::with_capacity(7);
+        for &t in &pts {
+            let t2 = t * t;
+            let t3 = t2 * t;
+            let mut ae: Vec<[usize; 8]> = Vec::with_capacity(m);
+            let mut ce: Vec<[usize; 8]> = Vec::with_capacity(m);
+            for i in 0..m {
+                let sa1 = scale_small(b, &a1[i], t);
+                let sa2 = scale_small(b, &a2[i], t2);
+                let sa3 = scale_small(b, &a3[i], t3);
+                let s = frog_add_many_mod_p(b, &[a0[i], sa1, sa2, sa3]);
+                ae.push(s);
+                let sc1 = scale_small(b, &c1[i], t);
+                let sc2 = scale_small(b, &c2[i], t2);
+                let sc3 = scale_small(b, &c3[i], t3);
+                let sc = frog_add_many_mod_p(b, &[c0[i], sc1, sc2, sc3]);
+                ce.push(sc);
+            }
+            w_eval.push(schoolbook(b, &ae, &ce)); // len 7 (2m-1)
+        }
+
+        // Interpolate (degree<=6) into blocks j=0..6, each length 2m-1=7:
+        // block[j][k] = Σ_i inv_v[j][i] * w_eval[i][k], with inv_v = NUMS/720.
+        const NUMS: [[i64; 7]; 7] = [
+            [720, 0, 0, 0, 0, 0, 0],
+            [0, 540, -540, -108, 108, 12, -12],
+            [-980, 540, 540, -54, -54, 4, 4],
+            [0, -195, 195, 120, -120, -15, 15],
+            [280, -195, -195, 60, 60, -5, -5],
+            [0, 15, -15, -12, 12, 3, -3],
+            [-20, 15, 15, -6, -6, 1, 1],
+        ];
+
+        let mut res: Vec<[usize; 8]> = vec![frog_zero_bytes(b); 2 * 16 - 1];
+        for k in 0..(2 * m - 1) {
+            for j in 0..7 {
+                let idx = j * m + k; // unique
+                // Compute Σ_i (NUMS[j][i] * inv720) * w_eval[i][k]
+                let mut acc = frog_zero_bytes(b);
+                for i in 0..7 {
+                    let n = NUMS[j][i];
+                    if n == 0 {
+                        continue;
+                    }
+                    // term = w * (n/720) = (((w * |n|) * inv720) with sign)
+                    // First multiply by |n| via small-int scaling (adds), then by inv720 via const-mul.
+                    let scaled = scale_small(b, &w_eval[i][k], n);
+                    let term = frog_mul_const_mod_p_from_byte_vars(b, &scaled, inv720);
+                    acc = frog_add_mod_p_from_byte_vars(b, &acc, &term);
+                }
+                res[idx] = acc;
+            }
+        }
+        res
+    }
+
+    // Evaluate at 7 points, multiply (len16), interpolate into convolution len 127, then fold.
+    let mut w_eval_top: Vec<Vec<[usize; 8]>> = Vec::with_capacity(7);
+    for &t in &pts {
+        let t2 = t * t;
+        let t3 = t2 * t;
+        let mut ae: Vec<[usize; 8]> = Vec::with_capacity(16);
+        let mut ce: Vec<[usize; 8]> = Vec::with_capacity(16);
+        for i in 0..16 {
+            let sa1 = scale_small(b, &a1[i], t);
+            let sa2 = scale_small(b, &a2[i], t2);
+            let sa3 = scale_small(b, &a3[i], t3);
+            ae.push(frog_add_many_mod_p(b, &[a0[i], sa1, sa2, sa3]));
+
+            let sc1 = scale_small(b, &c1[i], t);
+            let sc2 = scale_small(b, &c2[i], t2);
+            let sc3 = scale_small(b, &c3[i], t3);
+            ce.push(frog_add_many_mod_p(b, &[c0[i], sc1, sc2, sc3]));
+        }
+        w_eval_top.push(poly_mul_toom4_len16(b, &ae, &ce, inv720)); // len 31
+    }
+
+    // Interpolate into blocks j=0..6, each len 31, giving conv len 127.
+    let mut prod: Vec<[usize; 8]> = vec![zero; 2 * 64 - 1];
+    for k in 0..31 {
+        for j in 0..7 {
+            let idx = j * 16 + k;
+            let mut acc = frog_zero_bytes(b);
+            for i in 0..7 {
+                let n = NUMS[j][i];
+                if n == 0 {
+                    continue;
+                }
+                let scaled = scale_small(b, &w_eval_top[i][k], n);
+                let term = frog_mul_const_mod_p_from_byte_vars(b, &scaled, inv720);
+                acc = frog_add_mod_p_from_byte_vars(b, &acc, &term);
+            }
+            prod[idx] = acc;
+        }
+    }
+
+    // Fold mod X^64+1: out[k] = prod[k] - prod[k+64]
+    let mut out = [[0usize; 8]; 64];
+    for k in 0..64 {
+        let hi = k + 64;
+        if hi < prod.len() {
+            out[k] = frog_sub_mod_p_from_byte_vars(b, &prod[k], &prod[hi]);
+        } else {
+            out[k] = prod[k];
+        }
+    }
+    out
 }
 

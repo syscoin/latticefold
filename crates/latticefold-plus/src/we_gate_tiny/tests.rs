@@ -12,7 +12,8 @@ use super::challenges::bounded_u32_from_8_digits_base128;
 use super::digits::*;
 use super::frog::{
     frog_add_mod_p_from_byte_vars, frog_mul_mod_p_from_byte_vars, frog_sub_mod_p_from_byte_vars,
-    frog_u64_canonical_from_byte_vars, reduce_u64_mod_frog_from_byte_vars,
+    frog_mul_const_mod_p_from_byte_vars, frog_u64_canonical_from_byte_vars, reduce_u64_mod_frog_from_byte_vars,
+    ring_mul_negacyclic_toom4_d64,
 };
 use super::gadgets::alloc_byte;
 
@@ -238,6 +239,94 @@ fn test_frog_add_sub_mod_p_from_bytes_matches_native() {
         let (inst, asg) = b.into_instance();
         inst.check(&asg).expect("add/sub mod p constraints satisfied");
     }
+}
+
+#[test]
+fn test_frog_mul_const_mod_p_from_bytes_matches_native() {
+    use rand::{RngCore, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(999888777);
+
+    for _ in 0..20 {
+        let x = rng.next_u64() % FROG_P;
+        let c = rng.next_u64() % FROG_P;
+        let exp = ((x as u128) * (c as u128) % (FROG_P as u128)) as u64;
+
+        let mut b = Dr1csBuilder::<F257>::new();
+        b.enforce_var_eq_const(b.one(), F257::ONE);
+        let mut x_bytes = [0usize; 8];
+        for (i, v) in x.to_le_bytes().into_iter().enumerate() {
+            x_bytes[i] = alloc_byte::<F257>(&mut b, v).byte;
+        }
+
+        let r_bytes = frog_mul_const_mod_p_from_byte_vars(&mut b, &x_bytes, c);
+        let mut out = [0u8; 8];
+        for i in 0..8 {
+            out[i] = var_to_u8::<F257>(&b, r_bytes[i]);
+        }
+        assert_eq!(u64::from_le_bytes(out), exp);
+
+        let (inst, asg) = b.into_instance();
+        inst.check(&asg).expect("mul const constraints satisfied");
+    }
+}
+
+#[test]
+fn test_ring_mul_negacyclic_toom4_d64_matches_native_one_case() {
+    use rand::{RngCore, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(4242424242);
+
+    let mut a = [0u64; 64];
+    let mut c = [0u64; 64];
+    for i in 0..64 {
+        a[i] = rng.next_u64() % FROG_P;
+        c[i] = rng.next_u64() % FROG_P;
+    }
+
+    // Native expected.
+    let mut conv = vec![0u64; 127];
+    for i in 0..64 {
+        for j in 0..64 {
+            let idx = i + j;
+            let t = ((a[i] as u128) * (c[j] as u128) + (conv[idx] as u128)) % (FROG_P as u128);
+            conv[idx] = t as u64;
+        }
+    }
+    let mut exp = [0u64; 64];
+    for k in 0..64 {
+        let hi = k + 64;
+        let v = if hi < 127 {
+            (conv[k] as i128 - conv[hi] as i128).rem_euclid(FROG_P as i128) as u64
+        } else {
+            conv[k]
+        };
+        exp[k] = v;
+    }
+
+    // Circuit.
+    let mut b = Dr1csBuilder::<F257>::new();
+    b.enforce_var_eq_const(b.one(), F257::ONE);
+    let mut a_bytes = [[0usize; 8]; 64];
+    let mut c_bytes = [[0usize; 8]; 64];
+    for i in 0..64 {
+        for (j, v) in a[i].to_le_bytes().into_iter().enumerate() {
+            a_bytes[i][j] = alloc_byte::<F257>(&mut b, v).byte;
+        }
+        for (j, v) in c[i].to_le_bytes().into_iter().enumerate() {
+            c_bytes[i][j] = alloc_byte::<F257>(&mut b, v).byte;
+        }
+    }
+
+    let out = ring_mul_negacyclic_toom4_d64(&mut b, &a_bytes, &c_bytes);
+    for k in 0..64 {
+        let mut ob = [0u8; 8];
+        for j in 0..8 {
+            ob[j] = var_to_u8::<F257>(&b, out[k][j]);
+        }
+        assert_eq!(u64::from_le_bytes(ob), exp[k]);
+    }
+
+    let (inst, asg) = b.into_instance();
+    inst.check(&asg).expect("ring mul constraints satisfied");
 }
 
 #[test]
