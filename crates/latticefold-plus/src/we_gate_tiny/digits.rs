@@ -1009,9 +1009,13 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
     }
 
     // Fast path for the common WE-gate operand sizes (u64-ish bal16 digits):
-    // perform a streaming convolution with a bounded carry in [-128,127], avoiding the
-    // block+shift accumulator (which is add-heavy).
-    if a.len() <= 19 && bb.len() <= 19 {
+    // perform a streaming convolution with a bounded carry, avoiding the block+shift accumulator.
+    //
+    // IMPORTANT (soundness): This path enforces a large linear relation in F257. If intermediate
+    // integer magnitudes can reach ≥ 257, equality in F257 may not imply the intended integer
+    // relation (wraparound ambiguity). When `LF_STRICT_NOWRAP=1`, we disable this fast path and
+    // fall back to the add-heavy but obviously-safe construction.
+    if !strict_nowrap_enabled() && a.len() <= 19 && bb.len() <= 19 {
         let la = a.len();
         let lb = bb.len();
 
@@ -1063,30 +1067,8 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
             cb = next_carry_bound(cb, t);
             carry_bounds.push(cb);
         }
-        if strict_nowrap_enabled() {
-            // Check whether the per-step carry constraint could wrap mod 257.
-            //
-            // Constraint shape (in F257):
-            //   carry + Σ (a_i*b_j) - digit - 16*carry_out == 0
-            //
-            // With |a_i*b_j| <= 64, |digit| <= 8, and carry/carry_out bounded by carry_bounds,
-            // a sufficient (very conservative) no-wrap condition is:
-            //   max_abs(carry + Σprods - digit - 16*carry_out) < 257
-            //
-            // If this fails, the constraint enforces only a mod-257 relation and may admit
-            // non-integer-consistent witnesses.
-            let mut prev = 0i32;
-            for k in 0..(la + lb - 1) {
-                let t = terms_at_pos(k, la, lb);
-                let ck = carry_bounds[k];
-                let max_abs = prev + 64 * t + 8 + 16 * ck;
-                debug_assert!(
-                    max_abs < 257,
-                    "LF_STRICT_NOWRAP failed (mul_bal16_long_by_long): la={la} lb={lb} k={k} terms={t} prev_bound={prev} carry_bound={ck} => max_abs_LHS={max_abs} >= 257"
-                );
-                prev = ck;
-            }
-        }
+        // NOTE: strict-nowarp checking is intentionally not run here anymore because strict mode
+        // disables this entire fast path. (Keeping the check would just be dead code.)
 
         let div_floor = |x: i32, d: i32| -> i32 {
             debug_assert!(d > 0);
@@ -1410,13 +1392,11 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
         return out;
     }
 
-    // Fast path for the typical sizes in WE-gate tiny-field arithmetic:
-    // - `a` is a u64-ish bal16 expansion (len 17) or a small extension (<=19 for q),
-    // - `bb_const` is a u64-ish constant bal16 expansion (len 17).
+    // Fast path for typical sizes in WE-gate tiny-field arithmetic (streaming convolution).
     //
-    // We can do a single streaming convolution with a bounded carry in [-128,127], avoiding
-    // the block+shift accumulator (which is add-heavy).
-    if a.len() <= 19 && bb_const.len() <= 17 {
+    // IMPORTANT (soundness): same caveat as the long-by-long fast path. Disabled when
+    // `LF_STRICT_NOWRAP=1`.
+    if !strict_nowrap_enabled() && a.len() <= 19 && bb_const.len() <= 17 {
         #[inline]
         fn f257_from_i8(x: i8) -> F257 {
             if x >= 0 {
@@ -1470,20 +1450,7 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
             cb = next_carry_bound(cb, t);
             carry_bounds.push(cb);
         }
-        if strict_nowrap_enabled() {
-            // Same check as mul_bal16_long_by_long, but RHS digits are constants; |a_i*const| <= 64.
-            let mut prev = 0i32;
-            for k in 0..(la + lb - 1) {
-                let t = terms_at_pos(k, la, lb);
-                let ck = carry_bounds[k];
-                let max_abs = prev + 64 * t + 8 + 16 * ck;
-                debug_assert!(
-                    max_abs < 257,
-                    "LF_STRICT_NOWRAP failed (mul_bal16_long_by_const_rhs): la={la} lb={lb} k={k} terms={t} prev_bound={prev} carry_bound={ck} => max_abs_LHS={max_abs} >= 257"
-                );
-                prev = ck;
-            }
-        }
+        // NOTE: strict mode disables this path, so no need to run the nowrap checker here.
 
         let div_floor = |x: i32, d: i32| -> i32 {
             debug_assert!(d > 0);
