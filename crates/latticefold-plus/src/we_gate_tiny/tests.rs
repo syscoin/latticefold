@@ -13,7 +13,7 @@ use super::digits::*;
 use super::frog::{
     frog_add_mod_p_from_byte_vars, frog_mul_mod_p_from_byte_vars, frog_sub_mod_p_from_byte_vars,
     frog_mul_const_mod_p_from_byte_vars, frog_u64_canonical_from_byte_vars, reduce_u64_mod_frog_from_byte_vars,
-    ring_mul_negacyclic_toom4_d64,
+    ring_mul_negacyclic_karatsuba_d64, ring_mul_negacyclic_toom4_d64,
 };
 use super::gadgets::alloc_byte;
 
@@ -338,6 +338,74 @@ fn test_ring_mul_negacyclic_toom4_d64_matches_native_one_case() {
 
     let (inst, asg) = b.into_instance();
     inst.check(&asg).expect("ring mul constraints satisfied");
+}
+
+#[test]
+fn test_ring_mul_negacyclic_karatsuba_d64_matches_native_one_case() {
+    use rand::{RngCore, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(4242424242);
+
+    let mut a = [0u64; 64];
+    let mut c = [0u64; 64];
+    for i in 0..64 {
+        a[i] = rng.next_u64() % FROG_P;
+        c[i] = rng.next_u64() % FROG_P;
+    }
+
+    // Native expected.
+    let mut conv = vec![0u64; 127];
+    for i in 0..64 {
+        for j in 0..64 {
+            let idx = i + j;
+            let t = ((a[i] as u128) * (c[j] as u128) + (conv[idx] as u128)) % (FROG_P as u128);
+            conv[idx] = t as u64;
+        }
+    }
+    let mut exp = [0u64; 64];
+    for k in 0..64 {
+        let hi = k + 64;
+        let v = if hi < 127 {
+            (conv[k] as i128 - conv[hi] as i128).rem_euclid(FROG_P as i128) as u64
+        } else {
+            conv[k]
+        };
+        exp[k] = v;
+    }
+
+    // Circuit.
+    let mut b = Dr1csBuilder::<F257>::new();
+    b.enforce_var_eq_const(b.one(), F257::ONE);
+    let mut a_bytes = [[0usize; 8]; 64];
+    let mut c_bytes = [[0usize; 8]; 64];
+    for i in 0..64 {
+        for (j, v) in a[i].to_le_bytes().into_iter().enumerate() {
+            a_bytes[i][j] = alloc_byte::<F257>(&mut b, v).byte;
+        }
+        for (j, v) in c[i].to_le_bytes().into_iter().enumerate() {
+            c_bytes[i][j] = alloc_byte::<F257>(&mut b, v).byte;
+        }
+    }
+
+    let out = ring_mul_negacyclic_karatsuba_d64(&mut b, &a_bytes, &c_bytes);
+    for k in 0..64 {
+        let mut ob = [0u8; 8];
+        for j in 0..8 {
+            ob[j] = var_to_u8::<F257>(&b, out[k][j]);
+        }
+        assert_eq!(u64::from_le_bytes(ob), exp[k]);
+    }
+
+    eprintln!(
+        "== dR1CS dump: ring_mul_negacyclic_karatsuba_d64 | nvars={} nconstraints={} ==",
+        b.assignment.len(),
+        b.rows.len()
+    );
+    if std::env::var("LF_PROFILE_DR1CS").ok().as_deref() == Some("1") {
+        eprintln!("{}", b.profile_report(40));
+    }
+
+    let (inst, asg) = b.into_instance();
+    inst.check(&asg).expect("ring mul (karatsuba) constraints satisfied");
 }
 
 #[test]

@@ -838,6 +838,26 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
     a: &[[usize; 8]; 64],
     c: &[[usize; 8]; 64],
 ) -> [[usize; 8]; 64] {
+    ring_mul_negacyclic_d64_impl::<false>(b, a, c)
+}
+
+/// Negacyclic ring multiplication for `d=64` using a Karatsuba/Toom-2 top-level split.
+///
+/// This is typically more circuit-friendly than Toom-4 because it uses fewer evaluation points
+/// and much simpler interpolation (mostly ±1 coefficients).
+pub(super) fn ring_mul_negacyclic_karatsuba_d64(
+    b: &mut Dr1csBuilder<F257>,
+    a: &[[usize; 8]; 64],
+    c: &[[usize; 8]; 64],
+) -> [[usize; 8]; 64] {
+    ring_mul_negacyclic_d64_impl::<true>(b, a, c)
+}
+
+fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
+    b: &mut Dr1csBuilder<F257>,
+    a: &[[usize; 8]; 64],
+    c: &[[usize; 8]; 64],
+) -> [[usize; 8]; 64] {
     let _prev = b.profile_enter("frog::ring_mul_negacyclic_toom4_d64");
     // NOTE: We intentionally do NOT canonical-validate all 128 inputs here.
     //
@@ -1378,42 +1398,134 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
         res
     }
 
-    // Evaluate at 7 points, multiply (len16), interpolate into convolution len 127, then fold.
-    let mut w_eval_top: Vec<Vec<[usize; 8]>> = Vec::with_capacity(7);
-    for &t in &pts {
-        let mut ae: Vec<[usize; 8]> = Vec::with_capacity(16);
-        let mut ce: Vec<[usize; 8]> = Vec::with_capacity(16);
-        for i in 0..16 {
-            ae.push(eval_deg3_poly_at_t(b, &a0[i], &a1[i], &a2[i], &a3[i], t));
-            ce.push(eval_deg3_poly_at_t(b, &c0[i], &c1[i], &c2[i], &c3[i], t));
-        }
-        w_eval_top.push(poly_mul_toom4_len16(b, &ae, &ce, inv720)); // len 31
-    }
-
-    // Interpolate into blocks j=0..6, each len 31, giving conv len 127.
-    let mut prod: Vec<[usize; 8]> = vec![zero; 2 * 64 - 1];
-    for k in 0..31 {
-        // For fixed k, the 7 evaluation values are reused across all 7 j-blocks.
-        let mut evals = [zero; 7];
-        for i in 0..7 {
-            evals[i] = w_eval_top[i][k];
-        }
-        let evals_d: [Vec<usize>; 7] = core::array::from_fn(|i| u64_bytes_to_bal16_digits_cached(b, evals[i]));
-
-        for j in 0..7 {
-            let idx = j * 16 + k;
-            let mut coeffs = [0u64; 7];
-            for i in 0..7 {
-                let n = NUMS[j][i];
-                if n != 0 {
-                    coeffs[i] = modmul_i64_u64(n, inv720, FROG_P);
-                }
+    // Top-level multiply: either Toom-4 (existing) or Karatsuba/Toom-2.
+    let prod: Vec<[usize; 8]> = if !KARATSUBA {
+        // Evaluate at 7 points, multiply (len16), interpolate into convolution len 127, then fold.
+        let mut w_eval_top: Vec<Vec<[usize; 8]>> = Vec::with_capacity(7);
+        for &t in &pts {
+            let mut ae: Vec<[usize; 8]> = Vec::with_capacity(16);
+            let mut ce: Vec<[usize; 8]> = Vec::with_capacity(16);
+            for i in 0..16 {
+                ae.push(eval_deg3_poly_at_t(b, &a0[i], &a1[i], &a2[i], &a3[i], t));
+                ce.push(eval_deg3_poly_at_t(b, &c0[i], &c1[i], &c2[i], &c3[i], t));
             }
-            let acc = lincomb7_mod_p_from_canonical_evals(b, &evals, &evals_d, &coeffs);
-            // NOTE: idx is NOT unique: blocks of length 31 shifted by 16 overlap.
-            prod[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &prod[idx], &acc);
+            w_eval_top.push(poly_mul_toom4_len16(b, &ae, &ce, inv720)); // len 31
         }
-    }
+
+        // Interpolate into blocks j=0..6, each len 31, giving conv len 127.
+        let mut prod: Vec<[usize; 8]> = vec![zero; 2 * 64 - 1];
+        for k in 0..31 {
+            // For fixed k, the 7 evaluation values are reused across all 7 j-blocks.
+            let mut evals = [zero; 7];
+            for i in 0..7 {
+                evals[i] = w_eval_top[i][k];
+            }
+            let evals_d: [Vec<usize>; 7] =
+                core::array::from_fn(|i| u64_bytes_to_bal16_digits_cached(b, evals[i]));
+
+            for j in 0..7 {
+                let idx = j * 16 + k;
+                let mut coeffs = [0u64; 7];
+                for i in 0..7 {
+                    let n = NUMS[j][i];
+                    if n != 0 {
+                        coeffs[i] = modmul_i64_u64(n, inv720, FROG_P);
+                    }
+                }
+                let acc = lincomb7_mod_p_from_canonical_evals(b, &evals, &evals_d, &coeffs);
+                // NOTE: idx is NOT unique: blocks of length 31 shifted by 16 overlap.
+                prod[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &prod[idx], &acc);
+            }
+        }
+        prod
+    } else {
+        // Karatsuba/Toom-2 for length 64 using Toom-4 length-16 as the base multiplier.
+        fn poly_add_same_len(
+            b: &mut Dr1csBuilder<F257>,
+            x: &[[usize; 8]],
+            y: &[[usize; 8]],
+        ) -> Vec<[usize; 8]> {
+            debug_assert_eq!(x.len(), y.len());
+            x.iter()
+                .zip(y.iter())
+                .map(|(a, c)| frog_add_mod_p_from_byte_vars_assume_canonical(b, a, c))
+                .collect()
+        }
+        fn poly_sub_same_len(
+            b: &mut Dr1csBuilder<F257>,
+            x: &[[usize; 8]],
+            y: &[[usize; 8]],
+        ) -> Vec<[usize; 8]> {
+            debug_assert_eq!(x.len(), y.len());
+            x.iter()
+                .zip(y.iter())
+                .map(|(a, c)| frog_sub_mod_p_from_byte_vars_assume_canonical(b, a, c))
+                .collect()
+        }
+
+        fn poly_add_into_shifted(
+            b: &mut Dr1csBuilder<F257>,
+            acc: &mut Vec<[usize; 8]>,
+            src: &Vec<[usize; 8]>,
+            shift: usize,
+        ) {
+            for (i, v) in src.iter().enumerate() {
+                let idx = i + shift;
+                acc[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &acc[idx], v);
+            }
+        }
+
+        fn poly_mul_karatsuba_len32(
+            b: &mut Dr1csBuilder<F257>,
+            a32: &Vec<[usize; 8]>,
+            c32: &Vec<[usize; 8]>,
+            inv720: u64,
+            zero: [usize; 8],
+        ) -> Vec<[usize; 8]> {
+            debug_assert_eq!(a32.len(), 32);
+            debug_assert_eq!(c32.len(), 32);
+            let (a0, a1) = a32.split_at(16);
+            let (c0, c1) = c32.split_at(16);
+            let s_a = poly_add_same_len(b, a0, a1);
+            let s_c = poly_add_same_len(b, c0, c1);
+
+            let z0 = poly_mul_toom4_len16(b, &a0.to_vec(), &c0.to_vec(), inv720); // len31
+            let z2 = poly_mul_toom4_len16(b, &a1.to_vec(), &c1.to_vec(), inv720); // len31
+            let z1_full = poly_mul_toom4_len16(b, &s_a, &s_c, inv720); // len31
+
+            let z0_pad = z0;
+            let z2_pad = z2;
+            let mut z1 = poly_sub_same_len(b, &z1_full, &z0_pad);
+            z1 = poly_sub_same_len(b, &z1, &z2_pad);
+
+            let mut out = vec![zero; 2 * 32 - 1]; // len63
+            poly_add_into_shifted(b, &mut out, &z0_pad, 0);
+            poly_add_into_shifted(b, &mut out, &z1, 16);
+            poly_add_into_shifted(b, &mut out, &z2_pad, 32);
+            out
+        }
+
+        let a_lo: Vec<[usize; 8]> = a[0..32].to_vec();
+        let a_hi: Vec<[usize; 8]> = a[32..64].to_vec();
+        let c_lo: Vec<[usize; 8]> = c[0..32].to_vec();
+        let c_hi: Vec<[usize; 8]> = c[32..64].to_vec();
+
+        let s_a = poly_add_same_len(b, &a_lo, &a_hi);
+        let s_c = poly_add_same_len(b, &c_lo, &c_hi);
+
+        let z0 = poly_mul_karatsuba_len32(b, &a_lo, &c_lo, inv720, zero); // len63
+        let z2 = poly_mul_karatsuba_len32(b, &a_hi, &c_hi, inv720, zero); // len63
+        let z1_full = poly_mul_karatsuba_len32(b, &s_a, &s_c, inv720, zero); // len63
+
+        let mut z1 = poly_sub_same_len(b, &z1_full, &z0);
+        z1 = poly_sub_same_len(b, &z1, &z2);
+
+        let mut conv = vec![zero; 2 * 64 - 1]; // len127
+        poly_add_into_shifted(b, &mut conv, &z0, 0);
+        poly_add_into_shifted(b, &mut conv, &z1, 32);
+        poly_add_into_shifted(b, &mut conv, &z2, 64);
+        conv
+    };
 
     // Fold mod X^64+1: out[k] = prod[k] - prod[k+64]
     let mut out = [[0usize; 8]; 64];
