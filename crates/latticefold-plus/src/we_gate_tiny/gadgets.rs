@@ -71,8 +71,9 @@ pub(super) fn decompose_existing_byte_var_to_bits<F: PrimeField>(
 ) -> [usize; 8] {
     let _prev = b.profile_enter("gadgets::decompose_byte_to_bits");
     if let Some(bits) = b.byte_bits_cache.get(&byte_var) {
+        let bits = *bits;
         b.profile_exit(_prev);
-        return *bits;
+        return bits;
     }
     // Constrain: byte_var = Σ 2^i * bit_i, with bit_i boolean.
     let mut bits = [0usize; 8];
