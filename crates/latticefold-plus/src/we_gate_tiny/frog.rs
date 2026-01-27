@@ -34,6 +34,26 @@ fn frog_p_bal16_digits_le_const() -> [i8; 17] {
     out
 }
 
+fn u64_to_bal16_digits_le_const(mut x: u64) -> [i8; 17] {
+    // Match `u64_bytes_to_bal16_digits`: balanced digits in [-8,7] with carry in {0,1}.
+    let mut out = [0i8; 17];
+    let mut carry: i16 = 0;
+    for i in 0..16 {
+        let nib = (x & 0xF) as i16;
+        x >>= 4;
+        let v = nib + carry;
+        if v >= 8 {
+            out[i] = (v - 16) as i8;
+            carry = 1;
+        } else {
+            out[i] = v as i8;
+            carry = 0;
+        }
+    }
+    out[16] = carry as i8;
+    out
+}
+
 /// Boundary-only canonicalization gadget:
 /// given an unconstrained 64-bit integer `u` as 8 little-endian bytes, produce
 /// `(q, z)` such that:
@@ -487,17 +507,11 @@ fn frog_mul_mod_p_from_byte_vars_assume_canonical(
     let q_d = u64_bytes_to_bal16_digits(b, q_bytes);
     let r_d = u64_bytes_to_bal16_digits(b, r_bytes);
 
-    let p_bytes = frog_p_bytes_le();
-    let mut p_byte_vars = [0usize; 8];
-    for i in 0..8 {
-        p_byte_vars[i] = alloc_u8_var::<F257>(b, p_bytes[i]);
-    }
-    let p_d = u64_bytes_to_bal16_digits(b, p_byte_vars);
-
     // Compute prod_digits = a*b (balanced digits, with headroom/carry already enforced in gadget).
     let prod_d = mul_bal16_long_by_long(b, &a_d, &b_d);
     // Compute qp_digits = q*p.
-    let qp_d = mul_bal16_long_by_long(b, &q_d, &p_d);
+    let p_d_const = frog_p_bal16_digits_le_const();
+    let qp_d = mul_bal16_long_by_const_rhs(b, &q_d, &p_d_const);
 
     // Align lengths and enforce prod == qp + r.
     let tlen = prod_d.len().max(qp_d.len()).max(r_d.len());
@@ -566,28 +580,9 @@ fn frog_mul_const_mod_p_from_byte_vars_assume_canonical(
     let q_d = u64_bytes_to_bal16_digits(b, q_bytes);
     let r_d = u64_bytes_to_bal16_digits(b, r_bytes);
 
-    // Constant bal16 digits for c and p.
-    let c_bytes = c.to_le_bytes();
-    let mut c_const_vars = [0usize; 8];
-    for i in 0..8 {
-        c_const_vars[i] = alloc_u8_var::<F257>(b, c_bytes[i]);
-    }
-    let c_d_vars = u64_bytes_to_bal16_digits(b, c_const_vars);
-    let mut c_d_const: Vec<i8> = Vec::with_capacity(c_d_vars.len());
-    for &dv in &c_d_vars {
-        c_d_const.push(super::digits::f257_to_i32_bal(b.assignment[dv]) as i8);
-    }
-
-    let p_bytes = frog_p_bytes_le();
-    let mut p_const_vars = [0usize; 8];
-    for i in 0..8 {
-        p_const_vars[i] = alloc_u8_var::<F257>(b, p_bytes[i]);
-    }
-    let p_d_vars = u64_bytes_to_bal16_digits(b, p_const_vars);
-    let mut p_d_const: Vec<i8> = Vec::with_capacity(p_d_vars.len());
-    for &dv in &p_d_vars {
-        p_d_const.push(super::digits::f257_to_i32_bal(b.assignment[dv]) as i8);
-    }
+    // Constant bal16 digits for c and p, computed directly (no variables/constraints).
+    let c_d_const = u64_to_bal16_digits_le_const(c);
+    let p_d_const = frog_p_bal16_digits_le_const();
 
     // prod_digits = x*c  (const-RHS)
     let prod_d = mul_bal16_long_by_const_rhs(b, &x_d, &c_d_const);
