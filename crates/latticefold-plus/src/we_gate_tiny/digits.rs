@@ -30,6 +30,21 @@ pub(crate) fn i32_to_f257(x: i32) -> F257 {
     F257::from(v as u64)
 }
 
+/// Allocate (and cache) a small constant in F257 as a constrained variable.
+#[inline]
+pub(crate) fn alloc_const_f257(b: &mut Dr1csBuilder<F257>, x: F257) -> usize {
+    let u = x.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u64;
+    debug_assert!(u <= 256);
+    b.const_u64(u)
+}
+
+/// Allocate (and cache) a constant balanced base-16 digit in [-8,7].
+#[inline]
+pub(crate) fn alloc_bal16_digit_const(b: &mut Dr1csBuilder<F257>, d: i8) -> usize {
+    assert!((-8..=7).contains(&d));
+    alloc_const_f257(b, i32_to_f257(d as i32))
+}
+
 fn nibble_from_bits(b: &mut Dr1csBuilder<F257>, bits: [usize; 4], v: u8) -> usize {
     debug_assert!(v < 16);
     let out = b.new_var(F257::from(v as u64));

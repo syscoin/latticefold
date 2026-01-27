@@ -5,7 +5,7 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 
 use super::coins::frog_p_base128_digits_le;
 use super::digits::{
-    add_bal16_same_len, alloc_bal16_digit, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
+    add_bal16_same_len, alloc_bal16_digit, alloc_bal16_digit_const, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
     alloc_carry_pm2_dynamic, alloc_carry_pm_dynamic_le128,
     alloc_carry_pm_dynamic_le512, i32_to_f257, u64_bytes_to_bal16_digits_cached,
 };
@@ -64,11 +64,12 @@ fn alloc_u64_as_bal16_digits_witness(b: &mut Dr1csBuilder<F257>, x: u64) -> Vec<
     let ds = u64_to_bal16_digits_le_const(x);
     let mut out: Vec<usize> = Vec::with_capacity(17);
     for i in 0..16 {
-        out.push(alloc_bal16_digit(b, ds[i]));
+        // These digits are known at build time; allocate them as cached constants to avoid
+        // per-digit bit decomposition.
+        out.push(alloc_bal16_digit_const(b, ds[i]));
     }
-    // Final carry is already in {0,1}. Allocate it as a boolean (cheaper than `alloc_bal16_digit`).
-    let carry = alloc_bool::<F257>(b, ds[16] == 1);
-    out.push(carry);
+    // Final carry is in {0,1}; use cached constants.
+    out.push(if ds[16] == 1 { b.one() } else { b.zero_var() });
     out
 }
 
@@ -1203,10 +1204,10 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         let ds = u128_to_bal16_digits_le_const(x, n_nibbles);
         let mut out: Vec<usize> = Vec::with_capacity(n_nibbles + 1);
         for i in 0..n_nibbles {
-            out.push(alloc_bal16_digit(b, ds[i]));
+            out.push(alloc_bal16_digit_const(b, ds[i]));
         }
         // Final carry in {0,1}.
-        out.push(alloc_bool::<F257>(b, ds[n_nibbles] == 1));
+        out.push(if ds[n_nibbles] == 1 { b.one() } else { b.zero_var() });
         out
     }
 
