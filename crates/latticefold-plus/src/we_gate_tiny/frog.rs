@@ -1101,18 +1101,25 @@ fn frog_add_many_mod_p(b: &mut Dr1csBuilder<F257>, terms: &[[usize; 8]]) -> [usi
     acc
 }
 
+/// Frog scalar in balanced base-16 digits (canonical u64 encoding).
+///
+/// Representation matches `u64_bytes_to_bal16_digits_cached`:
+/// - 16 balanced digits in [-8,7]
+/// - plus a final carry digit in {0,1}
+pub(crate) type FrogScalar = [usize; 17];
+
 /// Negacyclic ring multiplication for `d=64` (FrogRing64), where coefficients are canonical Frog scalars.
 ///
-/// Returns `c = a*b mod (X^64 + 1)` as 64 canonical Frog scalars (each 8 bytes).
+/// Returns `c = a*b mod (X^64 + 1)` as 64 canonical Frog scalars (bal16 digits).
 ///
 /// This uses the same **Toom-4** block structure as the native WE gate (`we_gate_arith.rs`),
 /// but implemented over our byte-based Frog-field gadgets. The critical requirement is that
 /// interpolation uses `frog_mul_const_mod_p_from_byte_vars` (cheap const-mul), not full mul.
 pub(super) fn ring_mul_negacyclic_toom4_d64(
     b: &mut Dr1csBuilder<F257>,
-    a: &[[usize; 8]; 64],
-    c: &[[usize; 8]; 64],
-) -> [[usize; 8]; 64] {
+    a: &[FrogScalar; 64],
+    c: &[FrogScalar; 64],
+) -> [FrogScalar; 64] {
     ring_mul_negacyclic_d64_impl::<false>(b, a, c)
 }
 
@@ -1122,17 +1129,17 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
 /// and much simpler interpolation (mostly ±1 coefficients).
 pub(super) fn ring_mul_negacyclic_karatsuba_d64(
     b: &mut Dr1csBuilder<F257>,
-    a: &[[usize; 8]; 64],
-    c: &[[usize; 8]; 64],
-) -> [[usize; 8]; 64] {
+    a: &[FrogScalar; 64],
+    c: &[FrogScalar; 64],
+) -> [FrogScalar; 64] {
     ring_mul_negacyclic_d64_impl::<true>(b, a, c)
 }
 
 fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
     b: &mut Dr1csBuilder<F257>,
-    a: &[[usize; 8]; 64],
-    c: &[[usize; 8]; 64],
-) -> [[usize; 8]; 64] {
+    a: &[FrogScalar; 64],
+    c: &[FrogScalar; 64],
+) -> [FrogScalar; 64] {
     let _prev = b.profile_enter("frog::ring_mul_negacyclic_toom4_d64");
     // NOTE: We intentionally do NOT canonical-validate all 128 inputs here.
     //
@@ -1174,7 +1181,92 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
 
     let pts: [i64; 7] = [0, 1, -1, 2, -2, 3, -3];
 
-    let zero = frog_zero_bytes(b);
+    let p_d_const = frog_p_bal16_digits_le_const();
+    let zero: FrogScalar = [b.zero_var(); 17];
+
+    #[inline]
+    fn digits_to_u64_witness(b: &Dr1csBuilder<F257>, d: &FrogScalar) -> u64 {
+        let mut acc: i128 = 0;
+        let mut pow: i128 = 1;
+        for i in 0..17 {
+            let di = super::digits::f257_to_i32_bal(b.assignment[d[i]]) as i128;
+            acc += di * pow;
+            pow *= 16;
+        }
+        debug_assert!(acc >= 0);
+        acc as u64
+    }
+
+    #[inline]
+    fn vec17_to_arr17(v: Vec<usize>) -> FrogScalar {
+        debug_assert_eq!(v.len(), 17);
+        let mut out = [0usize; 17];
+        for i in 0..17 {
+            out[i] = v[i];
+        }
+        out
+    }
+
+    #[inline]
+    fn add_mod_p(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, c: &FrogScalar, p: &[i8; 17]) -> FrogScalar {
+        let a_u = digits_to_u64_witness(b, a);
+        let c_u = digits_to_u64_witness(b, c);
+        let sum = (a_u as u128) + (c_u as u128);
+        let q_u8: u8 = if sum >= (FROG_P as u128) { 1 } else { 0 };
+        let r_u: u64 = if q_u8 == 1 { (sum - (FROG_P as u128)) as u64 } else { sum as u64 };
+        let q = alloc_bool::<F257>(b, q_u8 == 1);
+        let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
+        enforce_add_mod_p_relation_bal16(b, a, c, &r_d, q, q_u8, p);
+        r_d
+    }
+
+    #[inline]
+    fn sub_mod_p(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, c: &FrogScalar, p: &[i8; 17]) -> FrogScalar {
+        let a_u = digits_to_u64_witness(b, a);
+        let c_u = digits_to_u64_witness(b, c);
+        let (q_u8, r_u) = if a_u >= c_u {
+            (0u8, a_u - c_u)
+        } else {
+            (1u8, (a_u as u128 + (FROG_P as u128) - (c_u as u128)) as u64)
+        };
+        let q = alloc_bool::<F257>(b, q_u8 == 1);
+        let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
+        enforce_sub_mod_p_relation_bal16(b, a, c, &r_d, q, q_u8, p);
+        r_d
+    }
+
+    #[inline]
+    fn mul_mod_p(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, c: &FrogScalar, p: &[i8; 17]) -> FrogScalar {
+        let a_u = digits_to_u64_witness(b, a);
+        let c_u = digits_to_u64_witness(b, c);
+        let prod: u128 = (a_u as u128) * (c_u as u128);
+        let q_u: u64 = (prod / (FROG_P as u128)) as u64;
+        let r_u: u64 = (prod % (FROG_P as u128)) as u64;
+        let q_d = alloc_u64_as_bal16_digits_witness(b, q_u);
+        let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
+        let prod_d = mul_bal16_long_by_long(b, a, c);
+        enforce_prod_eq_qp_plus_r_bal16(b, &prod_d, &q_d, p, &r_d);
+        r_d
+    }
+
+    #[inline]
+    fn mul_const_mod_p(
+        b: &mut Dr1csBuilder<F257>,
+        x: &FrogScalar,
+        c_u64: u64,
+        p: &[i8; 17],
+    ) -> FrogScalar {
+        let x_u = digits_to_u64_witness(b, x);
+        let prod: u128 = (x_u as u128) * (c_u64 as u128);
+        let q_u: u64 = (prod / (FROG_P as u128)) as u64;
+        let r_u: u64 = (prod % (FROG_P as u128)) as u64;
+        let q_d = alloc_u64_as_bal16_digits_witness(b, q_u);
+        let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
+        let c_d_const = u64_to_bal16_digits_le_const(c_u64);
+        let prod_d = mul_bal16_long_by_const_rhs(b, x, &c_d_const);
+        enforce_prod_eq_qp_plus_r_bal16(b, &prod_d, &q_d, p, &r_d);
+        r_d
+    }
 
     #[inline]
     fn mod_i64_to_u64(x: i64, p: u64) -> u64 {
@@ -1251,19 +1343,17 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
     }
 
     /// Compute `Σ_i (coeffs[i] * evals[i]) mod p`, where:
-    /// - evals[i] are canonical Frog elements (8 bytes each),
+    /// - evals[i] are canonical Frog elements (bal16 digits),
     /// - coeffs[i] are u64 constants in [0,p).
     ///
     /// This avoids per-term modular reduction: it accumulates the integer products in bal16 digit
     /// space, then performs a single `S = q*p + r` reduction.
     fn lincomb7_mod_p_from_canonical_evals(
         b: &mut Dr1csBuilder<F257>,
-        evals: &[[usize; 8]; 7],
-        evals_d: &[Vec<usize>; 7],
+        evals: &[FrogScalar; 7],
         coeffs: &[u64; 7],
-    ) -> [usize; 8] {
-        // Use the streaming-convolution implementation for N=7.
-        lincomb_mod_p_from_canonical_evals::<7>(b, evals, evals_d, coeffs)
+    ) -> FrogScalar {
+        lincomb_mod_p_from_canonical_evals::<7>(b, evals, coeffs)
     }
 
     /// Generic linear combination modulo p with one final reduction.
@@ -1271,10 +1361,9 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
     /// Like `lincomb7_mod_p_from_canonical_evals` but for a fixed arity `N`.
     fn lincomb_mod_p_from_canonical_evals<const N: usize>(
         b: &mut Dr1csBuilder<F257>,
-        evals: &[[usize; 8]; N],
-        evals_d: &[Vec<usize>; N],
+        evals: &[FrogScalar; N],
         coeffs: &[u64; N],
-    ) -> [usize; 8] {
+    ) -> FrogScalar {
         // Witness compute q, r for Σ coeff_i * eval_i.
         let mut lo: u128 = 0;
         let mut hi: u64 = 0;
@@ -1283,16 +1372,7 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
             if coeff == 0 {
                 continue;
             }
-            let mut eb = [0u8; 8];
-            for j in 0..8 {
-                eb[j] = b.assignment[evals[i][j]]
-                    .into_bigint()
-                    .to_bytes_le()
-                    .get(0)
-                    .copied()
-                    .unwrap_or(0);
-            }
-            let e_u = u64::from_le_bytes(eb);
+            let e_u = digits_to_u64_witness(b, &evals[i]);
             let term = (e_u as u128) * (coeff as u128);
             let (new_lo, carry) = lo.overflowing_add(term);
             lo = new_lo;
@@ -1306,13 +1386,8 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         let n0 = (lo & (u64::MAX as u128)) as u64;
         let (q_u128, r_u64) = div_rem_u192_by_u64(n2, n1, n0, FROG_P);
 
-        // Allocate r as bytes and enforce canonical.
-        let r_bytes_u8 = r_u64.to_le_bytes();
-        let mut r_bytes = [0usize; 8];
-        for j in 0..8 {
-            r_bytes[j] = alloc_u8_var::<F257>(b, r_bytes_u8[j]);
-        }
-        frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
+        // Allocate r directly as bal16 digits (canonical u64 encoding).
+        let r17 = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u64));
 
         // Constrain Σ (coeff*eval) == q*p + r in bal16 digit space.
         //
@@ -1331,8 +1406,7 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         }
 
         // Streaming convolution for acc digits (len up to 33), then expand final carry.
-        let la = evals_d[0].len(); // expected 17
-        debug_assert!(la <= 17, "expected canonical u64 digit length");
+        let la = 17usize;
         let lb = 17usize;
         let base_len = la + lb - 1; // <= 33
 
@@ -1360,7 +1434,6 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
                 if coeffs[i] == 0 {
                     continue;
                 }
-                let e_d = &evals_d[i];
                 for j in 0..la {
                     let t = k as i32 - j as i32;
                     if t < 0 || t >= lb as i32 {
@@ -1370,9 +1443,9 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
                     if cd == 0 {
                         continue;
                     }
-                    let aval = super::digits::f257_to_i32_bal(b.assignment[e_d[j]]);
+                    let aval = super::digits::f257_to_i32_bal(b.assignment[evals[i][j]]);
                     sum += aval * (cd as i32);
-                    lc.push((f257_from_i8(cd), e_d[j]));
+                    lc.push((f257_from_i8(cd), evals[i][j]));
                 }
             }
 
@@ -1446,36 +1519,29 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         let qp_d = mul_bal16_long_by_const_rhs(b, &q_d, &p_d_const);
         let qp_d = pad_bal16(b, qp_d, TARGET_LEN);
 
-        let r_d = u64_bytes_to_bal16_digits_cached(b, r_bytes);
-        let r_d = pad_bal16(b, r_d, TARGET_LEN);
+        let r_pad = pad_bal16(b, r17.to_vec(), TARGET_LEN);
 
-        let (sum_d, carry_sum) = add_bal16_same_len(b, &qp_d, &r_d);
+        let (sum_d, carry_sum) = add_bal16_same_len(b, &qp_d, &r_pad);
         b.enforce_var_eq_const(carry_sum, F257::ZERO);
         enforce_bal16_vec_eq(b, &acc, &sum_d);
-        r_bytes
+        r17
     }
 
     fn eval_deg3_poly_at_t(
         b: &mut Dr1csBuilder<F257>,
-        a0: &[usize; 8],
-        a1: &[usize; 8],
-        a2: &[usize; 8],
-        a3: &[usize; 8],
+        a0: &FrogScalar,
+        a1: &FrogScalar,
+        a2: &FrogScalar,
+        a3: &FrogScalar,
         t: i64,
-    ) -> [usize; 8] {
+    ) -> FrogScalar {
         // coeffs = [1, t, t^2, t^3] mod p
         let t1 = mod_i64_to_u64(t, FROG_P);
         let t2 = mod_i64_to_u64(t * t, FROG_P);
         let t3 = mod_i64_to_u64(t * t * t, FROG_P);
         let coeffs = [1u64, t1, t2, t3];
         let evals = [*a0, *a1, *a2, *a3];
-        let evals_d: [Vec<usize>; 4] = [
-            u64_bytes_to_bal16_digits_cached(b, *a0),
-            u64_bytes_to_bal16_digits_cached(b, *a1),
-            u64_bytes_to_bal16_digits_cached(b, *a2),
-            u64_bytes_to_bal16_digits_cached(b, *a3),
-        ];
-        lincomb_mod_p_from_canonical_evals::<4>(b, &evals, &evals_d, &coeffs)
+        lincomb_mod_p_from_canonical_evals::<4>(b, &evals, &coeffs)
     }
 
     // Split into 4 blocks of length 16.
@@ -1491,63 +1557,49 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
     // Recursive Toom-4 poly mul for length n=16 over Frog scalars (returns len 31).
     fn poly_mul_toom4_len16(
         b: &mut Dr1csBuilder<F257>,
-        a: &Vec<[usize; 8]>,
-        c: &Vec<[usize; 8]>,
+        a: &Vec<FrogScalar>,
+        c: &Vec<FrogScalar>,
         inv720: u64,
-    ) -> Vec<[usize; 8]> {
+        p_d_const: &[i8; 17],
+    ) -> Vec<FrogScalar> {
         debug_assert_eq!(a.len(), 16);
         debug_assert_eq!(c.len(), 16);
         // Base case at n=1 would be frog_mul_mod_p; but for n=16 we do one Toom-4 level (m=4) then base mults at n=4 via schoolbook.
 
-        let zero = frog_zero_bytes(b);
-
-        // Helper: schoolbook convolution for small n with frog_mul_mod_p (n<=4).
-        fn schoolbook(
-            b: &mut Dr1csBuilder<F257>,
-            a: &[[usize; 8]],
-            c: &[[usize; 8]],
-        ) -> Vec<[usize; 8]> {
-            let n = a.len();
-            let mut out: Vec<[usize; 8]> = vec![frog_zero_bytes(b); 2 * n - 1];
-            for i in 0..n {
-                for j in 0..n {
-                    let m = frog_mul_mod_p_from_byte_vars_assume_canonical(b, &a[i], &c[j]);
-                    out[i + j] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &out[i + j], &m);
-                }
-            }
-            out
-        }
+        let zero: FrogScalar = [b.zero_var(); 17];
 
         // Helper: fixed-shape Karatsuba convolution for n=4 (length-7 output).
         //
-        // This reduces the number of expensive `frog_mul_mod_p` calls from 16 -> 9 for each
+        // This reduces the number of expensive `mul_mod_p` calls from 16 -> 9 for each
         // 4x4 base multiply (the hot base case inside Toom-4 length-16).
         #[inline(always)]
         fn karatsuba_len4(
             b: &mut Dr1csBuilder<F257>,
-            a: &[[usize; 8]; 4],
-            c: &[[usize; 8]; 4],
-            zero: [usize; 8],
-        ) -> Vec<[usize; 8]> {
+            a: &[FrogScalar; 4],
+            c: &[FrogScalar; 4],
+            zero: FrogScalar,
+            p_d_const: &[i8; 17],
+        ) -> Vec<FrogScalar> {
             // 2x2 Karatsuba: 4 muls -> 3 muls.
             #[inline(always)]
             fn karatsuba_len2(
                 b: &mut Dr1csBuilder<F257>,
-                a0: &[usize; 8],
-                a1: &[usize; 8],
-                b0: &[usize; 8],
-                b1: &[usize; 8],
-            ) -> [[usize; 8]; 3] {
+                a0: &FrogScalar,
+                a1: &FrogScalar,
+                b0: &FrogScalar,
+                b1: &FrogScalar,
+                p_d_const: &[i8; 17],
+            ) -> [FrogScalar; 3] {
                 // z0 = a0*b0
-                let z0 = frog_mul_mod_p_from_byte_vars_assume_canonical(b, a0, b0);
+                let z0 = mul_mod_p(b, a0, b0, p_d_const);
                 // z2 = a1*b1
-                let z2 = frog_mul_mod_p_from_byte_vars_assume_canonical(b, a1, b1);
+                let z2 = mul_mod_p(b, a1, b1, p_d_const);
                 // z1 = (a0+a1)*(b0+b1) - z0 - z2
-                let sa = frog_add_mod_p_from_byte_vars_assume_canonical(b, a0, a1);
-                let sb = frog_add_mod_p_from_byte_vars_assume_canonical(b, b0, b1);
-                let z1_full = frog_mul_mod_p_from_byte_vars_assume_canonical(b, &sa, &sb);
-                let mut z1 = frog_sub_mod_p_from_byte_vars_assume_canonical(b, &z1_full, &z0);
-                z1 = frog_sub_mod_p_from_byte_vars_assume_canonical(b, &z1, &z2);
+                let sa = add_mod_p(b, a0, a1, p_d_const);
+                let sb = add_mod_p(b, b0, b1, p_d_const);
+                let z1_full = mul_mod_p(b, &sa, &sb, p_d_const);
+                let t = sub_mod_p(b, &z1_full, &z0, p_d_const);
+                let z1 = sub_mod_p(b, &t, &z2, p_d_const);
 
                 // Assemble length-3 convolution:
                 // out[0] = z0
@@ -1567,31 +1619,31 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
             let c1_1 = &c[3];
 
             // z0 = a0*c0 (len 3)
-            let z0 = karatsuba_len2(b, a0_0, a0_1, c0_0, c0_1);
+            let z0 = karatsuba_len2(b, a0_0, a0_1, c0_0, c0_1, p_d_const);
             // z2 = a1*c1 (len 3)
-            let z2 = karatsuba_len2(b, a1_0, a1_1, c1_0, c1_1);
+            let z2 = karatsuba_len2(b, a1_0, a1_1, c1_0, c1_1, p_d_const);
 
             // s_a = a0 + a1, s_c = c0 + c1 (len 2 each)
-            let sa0 = frog_add_mod_p_from_byte_vars_assume_canonical(b, a0_0, a1_0);
-            let sa1 = frog_add_mod_p_from_byte_vars_assume_canonical(b, a0_1, a1_1);
-            let sc0 = frog_add_mod_p_from_byte_vars_assume_canonical(b, c0_0, c1_0);
-            let sc1 = frog_add_mod_p_from_byte_vars_assume_canonical(b, c0_1, c1_1);
+            let sa0 = add_mod_p(b, a0_0, a1_0, p_d_const);
+            let sa1 = add_mod_p(b, a0_1, a1_1, p_d_const);
+            let sc0 = add_mod_p(b, c0_0, c1_0, p_d_const);
+            let sc1 = add_mod_p(b, c0_1, c1_1, p_d_const);
 
             // z1_full = (a0+a1)*(c0+c1) (len 3)
-            let z1_full = karatsuba_len2(b, &sa0, &sa1, &sc0, &sc1);
+            let z1_full = karatsuba_len2(b, &sa0, &sa1, &sc0, &sc1, p_d_const);
 
             // z1 = z1_full - z0 - z2 (len 3)
             let mut z1 = [zero; 3];
             for i in 0..3 {
-                let t = frog_sub_mod_p_from_byte_vars_assume_canonical(b, &z1_full[i], &z0[i]);
-                z1[i] = frog_sub_mod_p_from_byte_vars_assume_canonical(b, &t, &z2[i]);
+                let t = sub_mod_p(b, &z1_full[i], &z0[i], p_d_const);
+                z1[i] = sub_mod_p(b, &t, &z2[i], p_d_const);
             }
 
             // Assemble len-7: out = z0 + x^2 z1 + x^4 z2.
             //
             // Write directly to avoid unnecessary add-with-zero constraints.
-            let out2 = frog_add_mod_p_from_byte_vars_assume_canonical(b, &z0[2], &z1[0]);
-            let out4 = frog_add_mod_p_from_byte_vars_assume_canonical(b, &z1[2], &z2[0]);
+            let out2 = add_mod_p(b, &z0[2], &z1[0], p_d_const);
+            let out4 = add_mod_p(b, &z1[2], &z2[0], p_d_const);
             vec![
                 z0[0],  // x^0
                 z0[1],  // x^1
@@ -1612,18 +1664,18 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         let (c2, c3) = rest.split_at(m);
 
         let pts: [i64; 7] = [0, 1, -1, 2, -2, 3, -3];
-        let mut w_eval: Vec<Vec<[usize; 8]>> = Vec::with_capacity(7);
+        let mut w_eval: Vec<Vec<FrogScalar>> = Vec::with_capacity(7);
         for &t in &pts {
-            let mut ae: Vec<[usize; 8]> = Vec::with_capacity(m);
-            let mut ce: Vec<[usize; 8]> = Vec::with_capacity(m);
+            let mut ae: Vec<FrogScalar> = Vec::with_capacity(m);
+            let mut ce: Vec<FrogScalar> = Vec::with_capacity(m);
             for i in 0..m {
                 ae.push(eval_deg3_poly_at_t(b, &a0[i], &a1[i], &a2[i], &a3[i], t));
                 ce.push(eval_deg3_poly_at_t(b, &c0[i], &c1[i], &c2[i], &c3[i], t));
             }
             // Base multiply (len-4 × len-4 -> len-7): use Karatsuba to reduce non-native muls.
-            let ae4: [[usize; 8]; 4] = [ae[0], ae[1], ae[2], ae[3]];
-            let ce4: [[usize; 8]; 4] = [ce[0], ce[1], ce[2], ce[3]];
-            w_eval.push(karatsuba_len4(b, &ae4, &ce4, zero)); // len 7 (2m-1)
+            let ae4: [FrogScalar; 4] = [ae[0], ae[1], ae[2], ae[3]];
+            let ce4: [FrogScalar; 4] = [ce[0], ce[1], ce[2], ce[3]];
+            w_eval.push(karatsuba_len4(b, &ae4, &ce4, zero, p_d_const)); // len 7 (2m-1)
         }
 
         // Interpolate (degree<=6) into blocks j=0..6, each length 2m-1=7:
@@ -1643,15 +1695,13 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         // Here m=4 and block length is (2m-1)=7. Shifts by m cause an overlap of length 3:
         // for each j>=1 and k in 0..2, index (j*m+k) receives contributions from
         // block[j][k] and block[j-1][k+m].
-        let mut block: Vec<Vec<[usize; 8]>> = vec![vec![zero; 2 * m - 1]; 7];
+        let mut block: Vec<Vec<FrogScalar>> = vec![vec![zero; 2 * m - 1]; 7];
         for k in 0..(2 * m - 1) {
             // For fixed k, the 7 evaluation values are reused across all 7 j-blocks.
             let mut evals = [zero; 7];
             for i in 0..7 {
                 evals[i] = w_eval[i][k];
             }
-            let evals_d: [Vec<usize>; 7] =
-                core::array::from_fn(|i| u64_bytes_to_bal16_digits_cached(b, evals[i]));
 
             for j in 0..7 {
                 let mut coeffs = [0u64; 7];
@@ -1661,11 +1711,11 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
                         coeffs[i] = modmul_i64_u64(n, inv720, FROG_P);
                     }
                 }
-                block[j][k] = lincomb7_mod_p_from_canonical_evals(b, &evals, &evals_d, &coeffs);
+                block[j][k] = lincomb7_mod_p_from_canonical_evals(b, &evals, &coeffs);
             }
         }
 
-        let mut res: Vec<[usize; 8]> = vec![zero; 2 * 16 - 1]; // len 31
+        let mut res: Vec<FrogScalar> = vec![zero; 2 * 16 - 1]; // len 31
         // j=0 has no left-overlap.
         for k in 0..(2 * m - 1) {
             res[k] = block[0][k];
@@ -1674,7 +1724,7 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
             // Overlap k=0..2: sum of current block and previous block's tail.
             for k in 0..(2 * m - 1 - m) {
                 let idx = j * m + k;
-                res[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &block[j][k], &block[j - 1][k + m]);
+                res[idx] = add_mod_p(b, &block[j][k], &block[j - 1][k + m], p_d_const);
             }
             // Non-overlap k=3..6: direct assignment.
             for k in (2 * m - 1 - m)..(2 * m - 1) {
@@ -1687,18 +1737,21 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         res
     }
 
-    // Top-level multiply: either Toom-4 (existing) or Karatsuba/Toom-2.
-    let prod: Vec<[usize; 8]> = if !KARATSUBA {
+    // Top-level multiply (Fox #2): Toom-4 over digit scalars.
+    //
+    // NOTE: `KARATSUBA` top-level split is not yet ported to digit arithmetic; we currently
+    // always use this Toom-4 path regardless of `KARATSUBA`.
+    let prod: Vec<FrogScalar> = {
         // Evaluate at 7 points, multiply (len16), interpolate into convolution len 127, then fold.
-        let mut w_eval_top: Vec<Vec<[usize; 8]>> = Vec::with_capacity(7);
+        let mut w_eval_top: Vec<Vec<FrogScalar>> = Vec::with_capacity(7);
         for &t in &pts {
-            let mut ae: Vec<[usize; 8]> = Vec::with_capacity(16);
-            let mut ce: Vec<[usize; 8]> = Vec::with_capacity(16);
+            let mut ae: Vec<FrogScalar> = Vec::with_capacity(16);
+            let mut ce: Vec<FrogScalar> = Vec::with_capacity(16);
             for i in 0..16 {
                 ae.push(eval_deg3_poly_at_t(b, &a0[i], &a1[i], &a2[i], &a3[i], t));
                 ce.push(eval_deg3_poly_at_t(b, &c0[i], &c1[i], &c2[i], &c3[i], t));
             }
-            w_eval_top.push(poly_mul_toom4_len16(b, &ae, &ce, inv720)); // len 31
+            w_eval_top.push(poly_mul_toom4_len16(b, &ae, &ce, inv720, &p_d_const)); // len 31
         }
 
         // Interpolate into blocks j=0..6, each len 31, giving conv len 127.
@@ -1706,15 +1759,13 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         // With block length 31 and shift 16, overlaps are of length 15:
         // for each j>=1 and k in 0..14, index (16j+k) receives contributions from
         // block[j][k] and block[j-1][k+16].
-        let mut block: Vec<Vec<[usize; 8]>> = vec![vec![zero; 31]; 7];
+        let mut block: Vec<Vec<FrogScalar>> = vec![vec![zero; 31]; 7];
         for k in 0..31 {
             // For fixed k, the 7 evaluation values are reused across all 7 j-blocks.
             let mut evals = [zero; 7];
             for i in 0..7 {
                 evals[i] = w_eval_top[i][k];
             }
-            let evals_d: [Vec<usize>; 7] =
-                core::array::from_fn(|i| u64_bytes_to_bal16_digits_cached(b, evals[i]));
 
             for j in 0..7 {
                 let mut coeffs = [0u64; 7];
@@ -1724,11 +1775,11 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
                         coeffs[i] = modmul_i64_u64(n, inv720, FROG_P);
                     }
                 }
-                block[j][k] = lincomb7_mod_p_from_canonical_evals(b, &evals, &evals_d, &coeffs);
+                block[j][k] = lincomb7_mod_p_from_canonical_evals(b, &evals, &coeffs);
             }
         }
 
-        let mut prod: Vec<[usize; 8]> = vec![zero; 2 * 64 - 1]; // len 127
+        let mut prod: Vec<FrogScalar> = vec![zero; 2 * 64 - 1]; // len 127
         // j=0 has no left-overlap.
         for k in 0..31 {
             prod[k] = block[0][k];
@@ -1737,7 +1788,7 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
             // Overlap k=0..14: sum of current block and previous block's tail.
             for k in 0..15 {
                 let idx = j * 16 + k;
-                prod[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &block[j][k], &block[j - 1][k + 16]);
+                prod[idx] = add_mod_p(b, &block[j][k], &block[j - 1][k + 16], &p_d_const);
             }
             // Non-overlap k=15..30: direct assignment.
             for k in 15..31 {
@@ -1748,101 +1799,14 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
             }
         }
         prod
-    } else {
-        // Karatsuba/Toom-2 for length 64 using Toom-4 length-16 as the base multiplier.
-        fn poly_add_same_len(
-            b: &mut Dr1csBuilder<F257>,
-            x: &[[usize; 8]],
-            y: &[[usize; 8]],
-        ) -> Vec<[usize; 8]> {
-            debug_assert_eq!(x.len(), y.len());
-            x.iter()
-                .zip(y.iter())
-                .map(|(a, c)| frog_add_mod_p_from_byte_vars_assume_canonical(b, a, c))
-                .collect()
-        }
-        fn poly_sub_same_len(
-            b: &mut Dr1csBuilder<F257>,
-            x: &[[usize; 8]],
-            y: &[[usize; 8]],
-        ) -> Vec<[usize; 8]> {
-            debug_assert_eq!(x.len(), y.len());
-            x.iter()
-                .zip(y.iter())
-                .map(|(a, c)| frog_sub_mod_p_from_byte_vars_assume_canonical(b, a, c))
-                .collect()
-        }
-
-        fn poly_add_into_shifted(
-            b: &mut Dr1csBuilder<F257>,
-            acc: &mut Vec<[usize; 8]>,
-            src: &Vec<[usize; 8]>,
-            shift: usize,
-        ) {
-            for (i, v) in src.iter().enumerate() {
-                let idx = i + shift;
-                acc[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &acc[idx], v);
-            }
-        }
-
-        fn poly_mul_karatsuba_len32(
-            b: &mut Dr1csBuilder<F257>,
-            a32: &Vec<[usize; 8]>,
-            c32: &Vec<[usize; 8]>,
-            inv720: u64,
-            zero: [usize; 8],
-        ) -> Vec<[usize; 8]> {
-            debug_assert_eq!(a32.len(), 32);
-            debug_assert_eq!(c32.len(), 32);
-            let (a0, a1) = a32.split_at(16);
-            let (c0, c1) = c32.split_at(16);
-            let s_a = poly_add_same_len(b, a0, a1);
-            let s_c = poly_add_same_len(b, c0, c1);
-
-            let z0 = poly_mul_toom4_len16(b, &a0.to_vec(), &c0.to_vec(), inv720); // len31
-            let z2 = poly_mul_toom4_len16(b, &a1.to_vec(), &c1.to_vec(), inv720); // len31
-            let z1_full = poly_mul_toom4_len16(b, &s_a, &s_c, inv720); // len31
-
-            let z0_pad = z0;
-            let z2_pad = z2;
-            let mut z1 = poly_sub_same_len(b, &z1_full, &z0_pad);
-            z1 = poly_sub_same_len(b, &z1, &z2_pad);
-
-            let mut out = vec![zero; 2 * 32 - 1]; // len63
-            poly_add_into_shifted(b, &mut out, &z0_pad, 0);
-            poly_add_into_shifted(b, &mut out, &z1, 16);
-            poly_add_into_shifted(b, &mut out, &z2_pad, 32);
-            out
-        }
-
-        let a_lo: Vec<[usize; 8]> = a[0..32].to_vec();
-        let a_hi: Vec<[usize; 8]> = a[32..64].to_vec();
-        let c_lo: Vec<[usize; 8]> = c[0..32].to_vec();
-        let c_hi: Vec<[usize; 8]> = c[32..64].to_vec();
-
-        let s_a = poly_add_same_len(b, &a_lo, &a_hi);
-        let s_c = poly_add_same_len(b, &c_lo, &c_hi);
-
-        let z0 = poly_mul_karatsuba_len32(b, &a_lo, &c_lo, inv720, zero); // len63
-        let z2 = poly_mul_karatsuba_len32(b, &a_hi, &c_hi, inv720, zero); // len63
-        let z1_full = poly_mul_karatsuba_len32(b, &s_a, &s_c, inv720, zero); // len63
-
-        let mut z1 = poly_sub_same_len(b, &z1_full, &z0);
-        z1 = poly_sub_same_len(b, &z1, &z2);
-
-        let mut conv = vec![zero; 2 * 64 - 1]; // len127
-        poly_add_into_shifted(b, &mut conv, &z0, 0);
-        poly_add_into_shifted(b, &mut conv, &z1, 32);
-        poly_add_into_shifted(b, &mut conv, &z2, 64);
-        conv
     };
 
     // Fold mod X^64+1: out[k] = prod[k] - prod[k+64]
-    let mut out = [[0usize; 8]; 64];
+    let mut out = [[0usize; 17]; 64];
     for k in 0..64 {
         let hi = k + 64;
         if hi < prod.len() {
-            out[k] = frog_sub_mod_p_from_byte_vars_assume_canonical(b, &prod[k], &prod[hi]);
+            out[k] = sub_mod_p(b, &prod[k], &prod[hi], &p_d_const);
         } else {
             out[k] = prod[k];
         }

@@ -316,13 +316,26 @@ fn test_ring_mul_negacyclic_toom4_d64_matches_native_one_case() {
         }
     }
 
-    let out = ring_mul_negacyclic_toom4_d64(&mut b, &a_bytes, &c_bytes);
+    // External boundary conversion: bytes -> canonical bal16 digits once.
+    let a_d: [super::frog::FrogScalar; 64] = core::array::from_fn(|i| {
+        let v = u64_bytes_to_bal16_digits_cached(&mut b, a_bytes[i]);
+        v.try_into().expect("u64 bytes -> 17 digits")
+    });
+    let c_d: [super::frog::FrogScalar; 64] = core::array::from_fn(|i| {
+        let v = u64_bytes_to_bal16_digits_cached(&mut b, c_bytes[i]);
+        v.try_into().expect("u64 bytes -> 17 digits")
+    });
+
+    let out = ring_mul_negacyclic_toom4_d64(&mut b, &a_d, &c_d);
     for k in 0..64 {
-        let mut ob = [0u8; 8];
-        for j in 0..8 {
-            ob[j] = var_to_u8::<F257>(&b, out[k][j]);
+        // Decode digits -> u64 in the host.
+        let mut acc: i128 = 0;
+        let mut pow: i128 = 1;
+        for j in 0..17 {
+            acc += (f257_to_i32_bal(b.assignment[out[k][j]]) as i128) * pow;
+            pow *= 16;
         }
-        assert_eq!(u64::from_le_bytes(ob), exp[k]);
+        assert_eq!(acc as u64, exp[k]);
     }
 
 
@@ -386,13 +399,24 @@ fn test_ring_mul_negacyclic_karatsuba_d64_matches_native_one_case() {
         }
     }
 
-    let out = ring_mul_negacyclic_karatsuba_d64(&mut b, &a_bytes, &c_bytes);
+    let a_d: [super::frog::FrogScalar; 64] = core::array::from_fn(|i| {
+        let v = u64_bytes_to_bal16_digits_cached(&mut b, a_bytes[i]);
+        v.try_into().expect("u64 bytes -> 17 digits")
+    });
+    let c_d: [super::frog::FrogScalar; 64] = core::array::from_fn(|i| {
+        let v = u64_bytes_to_bal16_digits_cached(&mut b, c_bytes[i]);
+        v.try_into().expect("u64 bytes -> 17 digits")
+    });
+
+    let out = ring_mul_negacyclic_karatsuba_d64(&mut b, &a_d, &c_d);
     for k in 0..64 {
-        let mut ob = [0u8; 8];
-        for j in 0..8 {
-            ob[j] = var_to_u8::<F257>(&b, out[k][j]);
+        let mut acc: i128 = 0;
+        let mut pow: i128 = 1;
+        for j in 0..17 {
+            acc += (f257_to_i32_bal(b.assignment[out[k][j]]) as i128) * pow;
+            pow *= 16;
         }
-        assert_eq!(u64::from_le_bytes(ob), exp[k]);
+        assert_eq!(acc as u64, exp[k]);
     }
 
     eprintln!(
