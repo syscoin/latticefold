@@ -436,6 +436,15 @@ pub(super) fn frog_mul_mod_p_from_byte_vars(
     // Ensure inputs are canonical (<p).
     let _ = frog_u64_canonical_from_byte_vars::<F257>(b, a_bytes);
     let _ = frog_u64_canonical_from_byte_vars::<F257>(b, b_bytes);
+    frog_mul_mod_p_from_byte_vars_assume_canonical(b, a_bytes, b_bytes)
+}
+
+#[inline]
+fn frog_mul_mod_p_from_byte_vars_assume_canonical(
+    b: &mut Dr1csBuilder<F257>,
+    a_bytes: &[usize; 8],
+    b_bytes: &[usize; 8],
+) -> [usize; 8] {
 
     // Witness compute.
     let mut ab = [0u8; 8];
@@ -516,6 +525,15 @@ pub(super) fn frog_mul_const_mod_p_from_byte_vars(
 ) -> [usize; 8] {
     assert!(c < FROG_P, "frog_mul_const_mod_p_from_byte_vars requires c < p");
     let _ = frog_u64_canonical_from_byte_vars::<F257>(b, x_bytes);
+    frog_mul_const_mod_p_from_byte_vars_assume_canonical(b, x_bytes, c)
+}
+
+#[inline]
+fn frog_mul_const_mod_p_from_byte_vars_assume_canonical(
+    b: &mut Dr1csBuilder<F257>,
+    x_bytes: &[usize; 8],
+    c: u64,
+) -> [usize; 8] {
 
     // Witness compute.
     let mut xb = [0u8; 8];
@@ -598,6 +616,15 @@ pub(super) fn frog_add_mod_p_from_byte_vars(
 ) -> [usize; 8] {
     let _ = frog_u64_canonical_from_byte_vars::<F257>(b, a_bytes);
     let _ = frog_u64_canonical_from_byte_vars::<F257>(b, c_bytes);
+    frog_add_mod_p_from_byte_vars_assume_canonical(b, a_bytes, c_bytes)
+}
+
+#[inline]
+fn frog_add_mod_p_from_byte_vars_assume_canonical(
+    b: &mut Dr1csBuilder<F257>,
+    a_bytes: &[usize; 8],
+    c_bytes: &[usize; 8],
+) -> [usize; 8] {
 
     let mut ab = [0u8; 8];
     let mut cb = [0u8; 8];
@@ -670,6 +697,15 @@ pub(super) fn frog_sub_mod_p_from_byte_vars(
 ) -> [usize; 8] {
     let _ = frog_u64_canonical_from_byte_vars::<F257>(b, a_bytes);
     let _ = frog_u64_canonical_from_byte_vars::<F257>(b, c_bytes);
+    frog_sub_mod_p_from_byte_vars_assume_canonical(b, a_bytes, c_bytes)
+}
+
+#[inline]
+fn frog_sub_mod_p_from_byte_vars_assume_canonical(
+    b: &mut Dr1csBuilder<F257>,
+    a_bytes: &[usize; 8],
+    c_bytes: &[usize; 8],
+) -> [usize; 8] {
 
     let mut ab = [0u8; 8];
     let mut cb = [0u8; 8];
@@ -762,7 +798,7 @@ fn frog_from_u64_const_bytes(b: &mut Dr1csBuilder<F257>, c: u64) -> [usize; 8] {
 fn frog_add_many_mod_p(b: &mut Dr1csBuilder<F257>, terms: &[[usize; 8]]) -> [usize; 8] {
     let mut acc = frog_zero_bytes(b);
     for t in terms {
-        acc = frog_add_mod_p_from_byte_vars(b, &acc, t);
+        acc = frog_add_mod_p_from_byte_vars_assume_canonical(b, &acc, t);
     }
     acc
 }
@@ -779,6 +815,11 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
     a: &[[usize; 8]; 64],
     c: &[[usize; 8]; 64],
 ) -> [[usize; 8]; 64] {
+    // Boundary checks: inputs are assumed to be canonical Frog elements.
+    for i in 0..64 {
+        let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &a[i]);
+        let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &c[i]);
+    }
     // Precomputed inv(Vandermonde(0,±1,±2,±3)) entries as nums/720.
     const NUMS: [[i64; 7]; 7] = [
         [720, 0, 0, 0, 0, 0, 0],
@@ -841,16 +882,16 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
         let mut cur = *x;
         while k > 0 {
             if (k & 1) == 1 {
-                acc = frog_add_mod_p_from_byte_vars(b, &acc, &cur);
+                acc = frog_add_mod_p_from_byte_vars_assume_canonical(b, &acc, &cur);
             }
             k >>= 1;
             if k > 0 {
-                cur = frog_add_mod_p_from_byte_vars(b, &cur, &cur);
+                cur = frog_add_mod_p_from_byte_vars_assume_canonical(b, &cur, &cur);
             }
         }
         if t < 0 {
             let z = frog_zero_bytes(b);
-            return frog_sub_mod_p_from_byte_vars(b, &z, &acc);
+            return frog_sub_mod_p_from_byte_vars_assume_canonical(b, &z, &acc);
         }
         acc
     }
@@ -876,8 +917,8 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
             let mut out: Vec<[usize; 8]> = vec![frog_zero_bytes(b); 2 * n - 1];
             for i in 0..n {
                 for j in 0..n {
-                    let m = frog_mul_mod_p_from_byte_vars(b, &a[i], &c[j]);
-                    out[i + j] = frog_add_mod_p_from_byte_vars(b, &out[i + j], &m);
+                    let m = frog_mul_mod_p_from_byte_vars_assume_canonical(b, &a[i], &c[j]);
+                    out[i + j] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &out[i + j], &m);
                 }
             }
             out
@@ -939,11 +980,11 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
                     // term = w * (n/720) = (((w * |n|) * inv720) with sign)
                     // First multiply by |n| via small-int scaling (adds), then by inv720 via const-mul.
                     let scaled = scale_small(b, &w_eval[i][k], n);
-                    let term = frog_mul_const_mod_p_from_byte_vars(b, &scaled, inv720);
-                    acc = frog_add_mod_p_from_byte_vars(b, &acc, &term);
+                    let term = frog_mul_const_mod_p_from_byte_vars_assume_canonical(b, &scaled, inv720);
+                    acc = frog_add_mod_p_from_byte_vars_assume_canonical(b, &acc, &term);
                 }
                 // NOTE: idx is NOT unique: blocks of length (2m-1) shifted by m overlap.
-                res[idx] = frog_add_mod_p_from_byte_vars(b, &res[idx], &acc);
+                res[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &res[idx], &acc);
             }
         }
         res
@@ -982,11 +1023,11 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
                     continue;
                 }
                 let scaled = scale_small(b, &w_eval_top[i][k], n);
-                let term = frog_mul_const_mod_p_from_byte_vars(b, &scaled, inv720);
-                acc = frog_add_mod_p_from_byte_vars(b, &acc, &term);
+                let term = frog_mul_const_mod_p_from_byte_vars_assume_canonical(b, &scaled, inv720);
+                acc = frog_add_mod_p_from_byte_vars_assume_canonical(b, &acc, &term);
             }
             // NOTE: idx is NOT unique: blocks of length 31 shifted by 16 overlap.
-            prod[idx] = frog_add_mod_p_from_byte_vars(b, &prod[idx], &acc);
+            prod[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &prod[idx], &acc);
         }
     }
 
@@ -995,7 +1036,7 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
     for k in 0..64 {
         let hi = k + 64;
         if hi < prod.len() {
-            out[k] = frog_sub_mod_p_from_byte_vars(b, &prod[k], &prod[hi]);
+            out[k] = frog_sub_mod_p_from_byte_vars_assume_canonical(b, &prod[k], &prod[hi]);
         } else {
             out[k] = prod[k];
         }
