@@ -6,7 +6,7 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 use super::coins::frog_p_base128_digits_le;
 use super::digits::{
     add_bal16_same_len, alloc_bal16_digit, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
-    u64_bytes_to_bal16_digits,
+    i32_to_f257, u64_bytes_to_bal16_digits,
 };
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
