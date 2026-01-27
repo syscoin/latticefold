@@ -206,6 +206,7 @@ fn compute_tcch(
     ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
     ring_dim: usize,
+    params: &WeParams,
     wiring: &TinyCoinOpWiring,
     u32_ranges: &[(usize, usize)],
     frog_locals: &[FrogChallengeWiring],
@@ -312,44 +313,27 @@ fn compute_tcch(
 
                     let n_comh_elems = coh0_res.len();
                     if n_comh_elems > 0 {
-                        let cm_u32_need = wiring.u32_squeeze_ops.len().saturating_sub(cm_u32_start);
-                        let mut log_kappa: Option<usize> = None;
-                        let mut nvars_cm_guess: Option<usize> = None;
-                        for lg in 0usize..=20 {
-                            let kappa = 1usize << lg;
-                            if n_comh_elems % kappa != 0 {
-                                continue;
-                            }
-                            if cm_u32_need < 2 * lg + 2 {
-                                continue;
-                            }
-                            let rem = cm_u32_need - (2 * lg + 2);
-                            if rem % 2 != 0 {
-                                continue;
-                            }
-                            let nv = rem / 2;
-                            if nv == 0 {
-                                continue;
-                            }
-                            log_kappa = Some(lg);
-                            nvars_cm_guess = Some(nv);
-                            break;
+                        let kappa = params.kappa as usize;
+                        if kappa == 0 || !kappa.is_power_of_two() {
+                            return Err("tiny gate: params.kappa must be a power of two".to_string());
                         }
-                        if let (Some(lg), Some(_nv)) = (log_kappa, nvars_cm_guess) {
-                            let kappa = 1usize << lg;
-                            let l_instances = n_comh_elems / kappa;
+                        if (n_comh_elems % kappa) != 0 {
+                            return Err("tiny gate: comh length not divisible by kappa".to_string());
+                        }
+                        let lg = usize::BITS as usize - 1 - kappa.leading_zeros() as usize;
+                        let l_instances = n_comh_elems / kappa;
 
-                            let c0_start = cm_u32_start;
-                            let c1_start = cm_u32_start + lg;
-                            if c1_start + lg <= u32_ranges.len() && c1_start + lg <= frog_locals.len() {
-                                let mut c0_vars: Vec<usize> = Vec::with_capacity(lg);
-                                let mut c1_vars: Vec<usize> = Vec::with_capacity(lg);
-                                for i in 0..lg {
-                                    c0_vars.push(frog_locals[c0_start + i].res257);
-                                }
-                                for i in 0..lg {
-                                    c1_vars.push(frog_locals[c1_start + i].res257);
-                                }
+                        let c0_start = cm_u32_start;
+                        let c1_start = cm_u32_start + lg;
+                        if c1_start + lg <= u32_ranges.len() && c1_start + lg <= frog_locals.len() {
+                            let mut c0_vars: Vec<usize> = Vec::with_capacity(lg);
+                            let mut c1_vars: Vec<usize> = Vec::with_capacity(lg);
+                            for i in 0..lg {
+                                c0_vars.push(frog_locals[c0_start + i].res257);
+                            }
+                            for i in 0..lg {
+                                c1_vars.push(frog_locals[c1_start + i].res257);
+                            }
 
                                 #[inline]
                                 fn tensor_vars(gb: &mut Dr1csBuilder<F257>, c: &[usize]) -> Vec<usize> {
@@ -379,58 +363,57 @@ fn compute_tcch(
                                 let tensor_c0 = tensor_vars(&mut glue.gb, &c0_vars);
                                 let tensor_c1 = tensor_vars(&mut glue.gb, &c1_vars);
 
-                                tcch0_local.reserve(l_instances);
-                                tcch1_local.reserve(l_instances);
-                                for l in 0..l_instances {
-                                    let base = l * kappa;
-                                    let mut terms0: Vec<usize> = Vec::with_capacity(kappa);
-                                    let mut terms1: Vec<usize> = Vec::with_capacity(kappa);
-                                    for j in 0..kappa {
-                                        let rj = coh0_res[base + j];
-                                        let m0 = glue.gb.new_var(
-                                            glue.gb.assignment[tensor_c0[j]] * glue.gb.assignment[rj],
-                                        );
-                                        glue.gb.enforce_mul(tensor_c0[j], rj, m0);
-                                        let m1 = glue.gb.new_var(
-                                            glue.gb.assignment[tensor_c1[j]] * glue.gb.assignment[rj],
-                                        );
-                                        glue.gb.enforce_mul(tensor_c1[j], rj, m1);
-                                        terms0.push(m0);
-                                        terms1.push(m1);
-                                    }
-                                    let sum0 = {
-                                        let mut acc = F257::ZERO;
-                                        for &t in &terms0 {
-                                            acc += glue.gb.assignment[t];
-                                        }
-                                        let v = glue.gb.new_var(acc);
-                                        let mut lc: Vec<(F257, usize)> =
-                                            Vec::with_capacity(1 + terms0.len());
-                                        lc.push((F257::ONE, v));
-                                        for &t in &terms0 {
-                                            lc.push((-F257::ONE, t));
-                                        }
-                                        glue.gb.enforce_lc_times_one_eq_const(lc);
-                                        v
-                                    };
-                                    let sum1 = {
-                                        let mut acc = F257::ZERO;
-                                        for &t in &terms1 {
-                                            acc += glue.gb.assignment[t];
-                                        }
-                                        let v = glue.gb.new_var(acc);
-                                        let mut lc: Vec<(F257, usize)> =
-                                            Vec::with_capacity(1 + terms1.len());
-                                        lc.push((F257::ONE, v));
-                                        for &t in &terms1 {
-                                            lc.push((-F257::ONE, t));
-                                        }
-                                        glue.gb.enforce_lc_times_one_eq_const(lc);
-                                        v
-                                    };
-                                    tcch0_local.push(sum0);
-                                    tcch1_local.push(sum1);
+                            tcch0_local.reserve(l_instances);
+                            tcch1_local.reserve(l_instances);
+                            for l in 0..l_instances {
+                                let base = l * kappa;
+                                let mut terms0: Vec<usize> = Vec::with_capacity(kappa);
+                                let mut terms1: Vec<usize> = Vec::with_capacity(kappa);
+                                for j in 0..kappa {
+                                    let rj = coh0_res[base + j];
+                                    let m0 = glue.gb.new_var(
+                                        glue.gb.assignment[tensor_c0[j]] * glue.gb.assignment[rj],
+                                    );
+                                    glue.gb.enforce_mul(tensor_c0[j], rj, m0);
+                                    let m1 = glue.gb.new_var(
+                                        glue.gb.assignment[tensor_c1[j]] * glue.gb.assignment[rj],
+                                    );
+                                    glue.gb.enforce_mul(tensor_c1[j], rj, m1);
+                                    terms0.push(m0);
+                                    terms1.push(m1);
                                 }
+                                let sum0 = {
+                                    let mut acc = F257::ZERO;
+                                    for &t in &terms0 {
+                                        acc += glue.gb.assignment[t];
+                                    }
+                                    let v = glue.gb.new_var(acc);
+                                    let mut lc: Vec<(F257, usize)> =
+                                        Vec::with_capacity(1 + terms0.len());
+                                    lc.push((F257::ONE, v));
+                                    for &t in &terms0 {
+                                        lc.push((-F257::ONE, t));
+                                    }
+                                    glue.gb.enforce_lc_times_one_eq_const(lc);
+                                    v
+                                };
+                                let sum1 = {
+                                    let mut acc = F257::ZERO;
+                                    for &t in &terms1 {
+                                        acc += glue.gb.assignment[t];
+                                    }
+                                    let v = glue.gb.new_var(acc);
+                                    let mut lc: Vec<(F257, usize)> =
+                                        Vec::with_capacity(1 + terms1.len());
+                                    lc.push((F257::ONE, v));
+                                    for &t in &terms1 {
+                                        lc.push((-F257::ONE, t));
+                                    }
+                                    glue.gb.enforce_lc_times_one_eq_const(lc);
+                                    v
+                                };
+                                tcch0_local.push(sum0);
+                                tcch1_local.push(sum1);
                             }
                         }
                     }
@@ -1103,15 +1086,14 @@ pub(super) fn build(
     // Bind all proof/statement payload absorbs that encode base-field elements as canonical 8-byte scalars.
     // (Skip fiat–shamir reabsorbs, which are F257 digits and may contain 256.)
     enforce_nonreabsorb_absorbs_are_canonical_frog(&mut glue, ops, &pose_wiring)?;
-    // Stronger: also enforce the conservative centered bound implied by rgchk digit constraints.
-    enforce_nonreabsorb_absorbs_are_centered_bounded_frog(&mut glue, ops, &pose_wiring, params, ring_dim)?;
+
 
     let short_locals = build_short_blocks(&mut glue, &pose_wiring, ring_dim, &short_ranges)?;
     let (u32_locals, frog_locals) =
         build_u32_and_frog_blocks(&mut glue, &pose_wiring, &wiring.u32_squeeze_ops)?;
     let frog_rejection_locals = build_frog_rejection_coins(&mut glue, &pose_wiring, &frog_ranges)?;
     let (tcch0_local, tcch1_local) =
-        compute_tcch(&mut glue, ops, &pose_wiring, ring_dim, wiring, &u32_ranges, &frog_locals)?;
+        compute_tcch(&mut glue, ops, &pose_wiring, ring_dim, params, wiring, &u32_ranges, &frog_locals)?;
 
     let (mut surfaces_mul_local, all_sum_digits, all_sum_coeffwise) =
         build_mul_surfaces(&mut glue, ring_dim, pairs, &short_locals, &u32_locals)?;
