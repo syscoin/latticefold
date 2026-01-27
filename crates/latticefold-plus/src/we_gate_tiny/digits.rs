@@ -180,7 +180,7 @@ fn alloc_carry_pm11(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
 }
 
 /// Allocate a signed carry `c ∈ [-2,2]` as an F257 variable, with a tight boolean decomposition.
-fn alloc_carry_pm2(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
+pub(crate) fn alloc_carry_pm2(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
     assert!((-2..=2).contains(&c));
     // Represent as off = c + 2 in [0,4].
     let off = (c + 2) as u8;
