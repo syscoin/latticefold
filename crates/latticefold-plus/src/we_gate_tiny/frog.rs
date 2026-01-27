@@ -125,58 +125,47 @@ pub(super) fn reduce_u64_mod_frog_from_byte_vars<F: PrimeField>(
         u_limbs[j] = limb_var;
     }
 
-    // Enforce q matches u >= p by comparing u_limbs (base-128) against p.
-    // Comparator: run a base-128 borrow chain on (u - p) with witnessed borrows.
-    let p_digits = frog_p_base128_digits_le();
-    let mut bor = b.new_var(F::ZERO);
-    b.enforce_var_eq_const(bor, F::ZERO);
-    for i in 0..LIMBS_U64 {
-        let ui = ((u >> (LIMB_BITS * i)) & (LIMB_BASE_U64 - 1)) as i16;
-        let pi = p_digits[i] as i16;
-        let bi = if i == 0 {
-            0i16
+    // Enforce q matches (u >= p) via a bitwise lexicographic comparator against constant p.
+    //
+    // This avoids allocating fresh boolean variables beyond the cached byte-bit decomposition.
+    let mut eq = b.one();
+    let mut gt = b.new_var(F::ZERO);
+    b.enforce_var_eq_const(gt, F::ZERO);
+    for bit_idx in (0..64).rev() {
+        let u_i = u_bits[bit_idx];
+        let p_i = ((FROG_P >> bit_idx) & 1) as u8;
+        let prod = b.new_var(b.assignment[eq] * b.assignment[u_i]);
+        b.enforce_mul(eq, u_i, prod);
+        if p_i == 1 {
+            eq = prod;
         } else {
-            b.assignment[bor]
-                .into_bigint()
-                .to_bytes_le()
-                .get(0)
-                .copied()
-                .unwrap_or(0) as i16
-        };
-        let mut t = ui - pi - bi;
-        let bor_next_u8 = if t < 0 { 1u8 } else { 0u8 };
-        if t < 0 {
-            t += LIMB_BASE_U64 as i16;
-        }
-        let diff_i = b.new_var(F::from((t as u64) & (LIMB_BASE_U64 - 1)));
-        // Range-check diff_i to 7 bits by allocating 7 bools.
-        let mut dbits = [0usize; LIMB_BITS];
-        for k in 0..LIMB_BITS {
-            dbits[k] = alloc_bool::<F>(b, (((t as u8) >> k) & 1) == 1);
-        }
-        let mut lc_diff = vec![(F::ONE, diff_i)];
-        let mut pow = F::ONE;
-        for k in 0..LIMB_BITS {
-            lc_diff.push((-pow, dbits[k]));
-            pow *= F::from(2u64);
-        }
-        b.enforce_lc_times_one_eq_const(lc_diff);
+            let eq_next = b.new_var(b.assignment[eq] - b.assignment[prod]);
+            b.enforce_lc_times_one_eq_const(vec![(F::ONE, eq_next), (-F::ONE, eq), (F::ONE, prod)]);
+            eq = eq_next;
 
-        let bor_next = alloc_bool::<F>(b, bor_next_u8 == 1);
-        // u_i - p_i - bor_i + base*bor_{i+1} - diff_i == 0
-        b.enforce_lc_times_one_eq_const(vec![
-            (F::ONE, u_limbs[i]),
-            (-F::from(p_digits[i] as u64), b.one()),
-            (-F::ONE, bor),
-            (F::from(LIMB_BASE_U64), bor_next),
-            (-F::ONE, diff_i),
-        ]);
-        bor = bor_next;
+            let gt_prod = b.new_var(b.assignment[gt] * b.assignment[prod]);
+            b.enforce_mul(gt, prod, gt_prod);
+            let gt_next = b.new_var(b.assignment[gt] + b.assignment[prod] - b.assignment[gt_prod]);
+            b.enforce_lc_times_one_eq_const(vec![
+                (F::ONE, gt_next),
+                (-F::ONE, gt),
+                (-F::ONE, prod),
+                (F::ONE, gt_prod),
+            ]);
+            gt = gt_next;
+        }
     }
-    // is_ge = 1 - final_borrow
-    let is_ge = b.new_var(F::ONE - b.assignment[bor]);
-    b.enforce_lc_times_one_eq_const(vec![(F::ONE, is_ge), (F::ONE, bor), (-F::ONE, b.one())]);
-    b.enforce_lc_times_one_eq_const(vec![(F::ONE, q), (-F::ONE, is_ge)]);
+    // ge = gt OR eq
+    let gt_eq = b.new_var(b.assignment[gt] * b.assignment[eq]);
+    b.enforce_mul(gt, eq, gt_eq);
+    let ge = b.new_var(b.assignment[gt] + b.assignment[eq] - b.assignment[gt_eq]);
+    b.enforce_lc_times_one_eq_const(vec![
+        (F::ONE, ge),
+        (-F::ONE, gt),
+        (-F::ONE, eq),
+        (F::ONE, gt_eq),
+    ]);
+    b.enforce_lc_times_one_eq_const(vec![(F::ONE, q), (-F::ONE, ge)]);
 
     // Now compute z limbs as witness and enforce u = z + q*p + base*borrow chain.
     let z_u64 = if q_u8 == 1 { u - FROG_P } else { u };
@@ -199,8 +188,12 @@ pub(super) fn reduce_u64_mod_frog_from_byte_vars<F: PrimeField>(
     }
 
     // Base-128 borrow constraints for u - q*p - z = 0, with final borrow=0.
-    let mut borrow2 = b.new_var(F::ZERO);
-    b.enforce_var_eq_const(borrow2, F::ZERO);
+    //
+    // We use `z_limbs` directly as the per-limb "difference", so we do not need an extra `diff_i`
+    // variable (and its 7-bit range-check) per limb.
+    let p_digits = frog_p_base128_digits_le();
+    let mut borrow = b.new_var(F::ZERO);
+    b.enforce_var_eq_const(borrow, F::ZERO);
     for i in 0..LIMBS_U64 {
         let ui = ((u >> (LIMB_BITS * i)) & (LIMB_BASE_U64 - 1)) as i16;
         let zi = ((z_u64 >> (LIMB_BITS * i)) & (LIMB_BASE_U64 - 1)) as i16;
@@ -208,7 +201,7 @@ pub(super) fn reduce_u64_mod_frog_from_byte_vars<F: PrimeField>(
         let bi = if i == 0 {
             0i16
         } else {
-            b.assignment[borrow2]
+            b.assignment[borrow]
                 .into_bigint()
                 .to_bytes_le()
                 .get(0)
@@ -216,24 +209,24 @@ pub(super) fn reduce_u64_mod_frog_from_byte_vars<F: PrimeField>(
                 .unwrap_or(0) as i16
         };
         let rhs = ui - (q_u8 as i16) * pi - bi - zi;
-        let bor_next_u8 = if rhs < 0 { 1u8 } else { 0u8 };
-        let bor_next = if i == LIMBS_U64 - 1 {
+        let borrow_next_u8 = if rhs < 0 { 1u8 } else { 0u8 };
+        let borrow_next = if i == LIMBS_U64 - 1 {
             let v = b.new_var(F::ZERO);
             b.enforce_var_eq_const(v, F::ZERO);
             v
         } else {
-            alloc_bool::<F>(b, bor_next_u8 == 1)
+            alloc_bool::<F>(b, borrow_next_u8 == 1)
         };
         b.enforce_lc_times_one_eq_const(vec![
             (F::ONE, u_limbs[i]),
             (-F::from(p_digits[i] as u64), q),
-            (-F::ONE, borrow2),
-            (F::from(LIMB_BASE_U64), bor_next),
+            (-F::ONE, borrow),
+            (F::from(LIMB_BASE_U64), borrow_next),
             (-F::ONE, z_limbs[i]),
         ]);
-        borrow2 = bor_next;
+        borrow = borrow_next;
     }
-    b.enforce_var_eq_const(borrow2, F::ZERO);
+    b.enforce_var_eq_const(borrow, F::ZERO);
 
     (q, z_limbs)
 }
