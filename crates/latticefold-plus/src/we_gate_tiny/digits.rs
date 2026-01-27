@@ -1265,11 +1265,7 @@ pub(crate) fn u32_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
     let mut out: Vec<usize> = Vec::with_capacity(9);
     let mut carry = b.new_var(F257::ZERO);
     b.enforce_var_eq_const(carry, F257::ZERO);
-    b.add_constraint(
-        vec![(F257::ONE, carry)],
-        vec![(F257::ONE, b.one()), (-F257::ONE, carry)],
-        vec![(F257::ZERO, b.one())],
-    );
+    // `carry` is fixed to 0, so booleanity is implied; no need for an extra boolean constraint.
 
     for nib in &nibbles {
         let b0 = nib.bits[0];
@@ -1289,11 +1285,7 @@ pub(crate) fn u32_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
         b.enforce_mul(t01, b2, t012);
         let is7 = b.new_var(b.assignment[t012] * b.assignment[not_msb]);
         b.enforce_mul(t012, not_msb, is7);
-        b.add_constraint(
-            vec![(F257::ONE, is7)],
-            vec![(F257::ONE, b.one()), (-F257::ONE, is7)],
-            vec![(F257::ZERO, b.one())],
-        );
+        // `is7` is a product of booleans, so it is already boolean; no extra constraint needed.
 
         let carry_is7 = b.new_var(b.assignment[carry] * b.assignment[is7]);
         b.enforce_mul(carry, is7, carry_is7);
@@ -1307,11 +1299,7 @@ pub(crate) fn u32_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
             (-F257::ONE, carry_is7),
             (F257::ONE, msb_and),
         ]);
-        b.add_constraint(
-            vec![(F257::ONE, c_out)],
-            vec![(F257::ONE, b.one()), (-F257::ONE, c_out)],
-            vec![(F257::ZERO, b.one())],
-        );
+        // `c_out` is computed as OR(msb, carry_is7) over booleans, so it is boolean.
 
         let d_i = b.assignment[nib.d]
             .into_bigint()
@@ -1383,11 +1371,7 @@ pub(crate) fn u64_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
     let mut out: Vec<usize> = Vec::with_capacity(17);
     let mut carry = b.new_var(F257::ZERO);
     b.enforce_var_eq_const(carry, F257::ZERO);
-    b.add_constraint(
-        vec![(F257::ONE, carry)],
-        vec![(F257::ONE, b.one()), (-F257::ONE, carry)],
-        vec![(F257::ZERO, b.one())],
-    );
+    // `carry` is fixed to 0, so booleanity is implied; no need for an extra boolean constraint.
 
     for nib in &nibbles {
         let b0 = nib.bits[0];
@@ -1407,11 +1391,7 @@ pub(crate) fn u64_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
         b.enforce_mul(t01, b2, t012);
         let is7 = b.new_var(b.assignment[t012] * b.assignment[not_msb]);
         b.enforce_mul(t012, not_msb, is7);
-        b.add_constraint(
-            vec![(F257::ONE, is7)],
-            vec![(F257::ONE, b.one()), (-F257::ONE, is7)],
-            vec![(F257::ZERO, b.one())],
-        );
+        // `is7` is a product of booleans, so it is already boolean; no extra constraint needed.
 
         let carry_is7 = b.new_var(b.assignment[carry] * b.assignment[is7]);
         b.enforce_mul(carry, is7, carry_is7);
@@ -1425,11 +1405,7 @@ pub(crate) fn u64_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
             (-F257::ONE, carry_is7),
             (F257::ONE, msb_and),
         ]);
-        b.add_constraint(
-            vec![(F257::ONE, c_out)],
-            vec![(F257::ONE, b.one()), (-F257::ONE, c_out)],
-            vec![(F257::ZERO, b.one())],
-        );
+        // `c_out` is computed as OR(msb, carry_is7) over booleans, so it is boolean.
 
         let d_i = b.assignment[nib.d]
             .into_bigint()
