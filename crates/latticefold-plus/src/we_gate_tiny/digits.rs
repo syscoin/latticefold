@@ -33,7 +33,11 @@ pub(crate) fn i32_to_f257(x: i32) -> F257 {
 /// Allocate (and cache) a small constant in F257 as a constrained variable.
 #[inline]
 pub(crate) fn alloc_const_f257(b: &mut Dr1csBuilder<F257>, x: F257) -> usize {
-    let u = x.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u64;
+    // F257 elements are in 0..=256; read up to 2 bytes.
+    let bytes = x.into_bigint().to_bytes_le();
+    let lo = bytes.get(0).copied().unwrap_or(0) as u16;
+    let hi = bytes.get(1).copied().unwrap_or(0) as u16;
+    let u = (lo | (hi << 8)) as u64;
     debug_assert!(u <= 256);
     b.const_u64(u)
 }
