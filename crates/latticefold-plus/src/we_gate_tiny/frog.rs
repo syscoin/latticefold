@@ -465,7 +465,7 @@ fn frog_mul_mod_p_from_byte_vars_assume_canonical(
     a_bytes: &[usize; 8],
     b_bytes: &[usize; 8],
 ) -> [usize; 8] {
-    let _p = b.profile_scope("frog::mul_mod_p");
+    let _prev = b.profile_enter("frog::mul_mod_p");
 
     // Witness compute.
     let mut ab = [0u8; 8];
@@ -525,7 +525,9 @@ fn frog_mul_mod_p_from_byte_vars_assume_canonical(
     b.enforce_var_eq_const(carry, F257::ZERO);
     enforce_bal16_vec_eq(b, &prod_d, &sum_d);
 
-    r_bytes
+    let out = r_bytes;
+    b.profile_exit(_prev);
+    out
 }
 
 /// Multiply a canonical Frog scalar `x` by a **known constant** `c` (as u64 in `[0,p)`),
@@ -549,7 +551,7 @@ fn frog_mul_const_mod_p_from_byte_vars_assume_canonical(
     x_bytes: &[usize; 8],
     c: u64,
 ) -> [usize; 8] {
-    let _p = b.profile_scope("frog::mul_const_mod_p");
+    let _prev = b.profile_enter("frog::mul_const_mod_p");
 
     // Witness compute.
     let mut xb = [0u8; 8];
@@ -600,7 +602,9 @@ fn frog_mul_const_mod_p_from_byte_vars_assume_canonical(
     b.enforce_var_eq_const(carry, F257::ZERO);
     enforce_bal16_vec_eq(b, &prod_d, &sum_d);
 
-    r_bytes
+    let out = r_bytes;
+    b.profile_exit(_prev);
+    out
 }
 
 /// General Frog-field addition gadget inside F257.
@@ -622,7 +626,7 @@ fn frog_add_mod_p_from_byte_vars_assume_canonical(
     a_bytes: &[usize; 8],
     c_bytes: &[usize; 8],
 ) -> [usize; 8] {
-    let _p = b.profile_scope("frog::add_mod_p");
+    let _prev = b.profile_enter("frog::add_mod_p");
 
     let mut ab = [0u8; 8];
     let mut cb = [0u8; 8];
@@ -684,7 +688,9 @@ fn frog_add_mod_p_from_byte_vars_assume_canonical(
     b.enforce_var_eq_const(carry_rhs, F257::ZERO);
     enforce_bal16_vec_eq(b, &sum_d, &rhs_d);
 
-    r_bytes
+    let out = r_bytes;
+    b.profile_exit(_prev);
+    out
 }
 
 /// General Frog-field subtraction gadget inside F257.
@@ -706,7 +712,7 @@ fn frog_sub_mod_p_from_byte_vars_assume_canonical(
     a_bytes: &[usize; 8],
     c_bytes: &[usize; 8],
 ) -> [usize; 8] {
-    let _p = b.profile_scope("frog::sub_mod_p");
+    let _prev = b.profile_enter("frog::sub_mod_p");
 
     let mut ab = [0u8; 8];
     let mut cb = [0u8; 8];
@@ -765,7 +771,9 @@ fn frog_sub_mod_p_from_byte_vars_assume_canonical(
     b.enforce_var_eq_const(carry_rhs, F257::ZERO);
     enforce_bal16_vec_eq(b, &lhs_d, &rhs_d);
 
-    r_bytes
+    let out = r_bytes;
+    b.profile_exit(_prev);
+    out
 }
 
 fn frog_zero_bytes(b: &mut Dr1csBuilder<F257>) -> [usize; 8] {
@@ -816,7 +824,7 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
     a: &[[usize; 8]; 64],
     c: &[[usize; 8]; 64],
 ) -> [[usize; 8]; 64] {
-    let _p = b.profile_scope("frog::ring_mul_negacyclic_toom4_d64");
+    let _prev = b.profile_enter("frog::ring_mul_negacyclic_toom4_d64");
     // Boundary checks: inputs are assumed to be canonical Frog elements.
     for i in 0..64 {
         let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &a[i]);
@@ -1043,6 +1051,8 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
             out[k] = prod[k];
         }
     }
-    out
+    let res = out;
+    b.profile_exit(_prev);
+    res
 }
 

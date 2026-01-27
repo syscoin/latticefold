@@ -325,14 +325,19 @@ fn test_ring_mul_negacyclic_toom4_d64_matches_native_one_case() {
         assert_eq!(u64::from_le_bytes(ob), exp[k]);
     }
 
-    let (inst, asg) = b.into_instance();
-    inst.check(&asg).expect("ring mul constraints satisfied");
+
     eprintln!(
-        "== dR1CS dump: {label} | nvars={} nconstraints={} ==",
+        "== dR1CS dump: ring_mul_negacyclic_toom4_d64 | nvars={} nconstraints={} ==",
         b.assignment.len(),
         b.rows.len()
     );
+    if std::env::var("LF_PROFILE_DR1CS").ok().as_deref() == Some("1") {
+        eprintln!("{}", b.profile_report(40));
+    }
+    
 
+    let (inst, asg) = b.into_instance();
+    inst.check(&asg).expect("ring mul constraints satisfied");
 }
 
 #[test]

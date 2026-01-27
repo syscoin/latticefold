@@ -96,13 +96,25 @@ impl<F: PrimeField> Dr1csBuilder<F> {
         (inst, self.assignment)
     }
 
+    /// Enter a profiling scope; returns the previous scope label.
+    ///
+    /// Use `profile_exit(prev)` to restore.
     #[inline]
-    pub fn profile_scope<'a>(&'a mut self, label: &'static str) -> Dr1csProfileGuard<'a, F> {
+    pub fn profile_enter(&mut self, label: &'static str) -> Option<&'static str> {
         if !self.profile_enabled {
-            return Dr1csProfileGuard { b: self, prev: None };
+            return None;
         }
-        let prev = self.profile_current.replace(label);
-        Dr1csProfileGuard { b: self, prev: Some(prev) }
+        let prev = self.profile_current;
+        self.profile_current = Some(label);
+        prev
+    }
+
+    #[inline]
+    pub fn profile_exit(&mut self, prev: Option<&'static str>) {
+        if !self.profile_enabled {
+            return;
+        }
+        self.profile_current = prev;
     }
 
     pub fn profile_report(&self, top_n: usize) -> String {
@@ -144,19 +156,6 @@ impl<F: PrimeField> Dr1csBuilder<F> {
             ));
         }
         out
-    }
-}
-
-pub struct Dr1csProfileGuard<'a, F: PrimeField> {
-    b: &'a mut Dr1csBuilder<F>,
-    prev: Option<Option<&'static str>>,
-}
-
-impl<'a, F: PrimeField> Drop for Dr1csProfileGuard<'a, F> {
-    fn drop(&mut self) {
-        if let Some(prev) = self.prev.take() {
-            self.b.profile_current = prev;
-        }
     }
 }
 

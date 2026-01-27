@@ -233,7 +233,7 @@ pub(crate) fn add_bal16_same_len(
     a: &[usize],
     c: &[usize],
 ) -> (Vec<usize>, usize /* carry_out */) {
-    let _p = b.profile_scope("digits::add_bal16_same_len");
+    let _prev = b.profile_enter("digits::add_bal16_same_len");
     assert_eq!(a.len(), c.len());
     let n = a.len();
     let mut out: Vec<usize> = Vec::with_capacity(n);
@@ -277,7 +277,9 @@ pub(crate) fn add_bal16_same_len(
         carry = carry_next_var;
     }
 
-    (out, carry)
+    let res = (out, carry);
+    b.profile_exit(_prev);
+    res
 }
 
 /// Negate a balanced base-16 digit vector (little-endian), producing digits in [-8,7].
@@ -655,13 +657,17 @@ pub(crate) fn mul_bal16_long_by_u32ish9(b: &mut Dr1csBuilder<F257>, a: &[usize],
 }
 
 pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb: &[usize]) -> Vec<usize> {
-    let _p = b.profile_scope("digits::mul_bal16_long_by_long");
+    let _prev = b.profile_enter("digits::mul_bal16_long_by_long");
     if a.is_empty() || bb.is_empty() {
-        return vec![alloc_bal16_digit(b, 0)];
+        let out = vec![alloc_bal16_digit(b, 0)];
+        b.profile_exit(_prev);
+        return out;
     }
     if a.len().min(bb.len()) <= 3 {
         let raw = mul_bal16_small(b, a, bb);
-        return rebalance_tail_pm11_to_pm2(b, &raw);
+        let out = rebalance_tail_pm11_to_pm2(b, &raw);
+        b.profile_exit(_prev);
+        return out;
     }
     let (short, long) = if a.len() <= bb.len() { (a, bb) } else { (bb, a) };
 
@@ -689,7 +695,9 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
         acc[target_len - 1] = top_sum[0];
         b.enforce_var_eq_const(top_carry, F257::ZERO);
     }
-    acc
+    let out = acc;
+    b.profile_exit(_prev);
+    out
 }
 
 /// Multiply two balanced base-16 digit vectors (little-endian), specialized for min(len)<=3.
@@ -860,13 +868,17 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
     a: &[usize],
     bb_const: &[i8],
 ) -> Vec<usize> {
-    let _p = b.profile_scope("digits::mul_bal16_long_by_const_rhs");
+    let _prev = b.profile_enter("digits::mul_bal16_long_by_const_rhs");
     if a.is_empty() || bb_const.is_empty() {
-        return vec![alloc_bal16_digit(b, 0)];
+        let out = vec![alloc_bal16_digit(b, 0)];
+        b.profile_exit(_prev);
+        return out;
     }
     if a.len() <= 3 {
         let raw = mul_bal16_small_const_rhs(b, a, bb_const);
-        return rebalance_tail_pm11_to_pm2(b, &raw);
+        let out = rebalance_tail_pm11_to_pm2(b, &raw);
+        b.profile_exit(_prev);
+        return out;
     }
 
     let zero = alloc_bal16_digit(b, 0);
@@ -892,12 +904,14 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
         acc[target_len - 1] = top_sum[0];
         b.enforce_var_eq_const(top_carry, F257::ZERO);
     }
-    acc
+    let out = acc;
+    b.profile_exit(_prev);
+    out
 }
 
 /// Convert 4 little-endian byte vars (0..255) into balanced base-16 digits (len 9).
 pub(crate) fn u32_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 4]) -> Vec<usize> {
-    let _p = b.profile_scope("digits::u32_bytes_to_bal16_digits");
+    let _prev = b.profile_enter("digits::u32_bytes_to_bal16_digits");
     struct Nib {
         d: usize,
         bits: [usize; 4],
@@ -997,6 +1011,7 @@ pub(crate) fn u32_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
     }
 
     out.push(carry);
+    b.profile_exit(_prev);
     out
 }
 
@@ -1014,7 +1029,7 @@ pub(crate) fn u32_bytes_to_bal16_digits_cached(b: &mut Dr1csBuilder<F257>, bytes
 /// Output digits are little-endian base-16 with each digit in [-8,7], followed by a final
 /// carry digit (also in {0,1} for a canonical u64 byte encoding).
 pub(crate) fn u64_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 8]) -> Vec<usize> {
-    let _p = b.profile_scope("digits::u64_bytes_to_bal16_digits");
+    let _prev = b.profile_enter("digits::u64_bytes_to_bal16_digits");
     struct Nib {
         d: usize,
         bits: [usize; 4],
@@ -1114,6 +1129,7 @@ pub(crate) fn u64_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
     }
 
     out.push(carry);
+    b.profile_exit(_prev);
     out
 }
 

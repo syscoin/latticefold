@@ -14,7 +14,7 @@ pub(super) struct ByteVar {
 }
 
 pub(super) fn alloc_bool<F: PrimeField>(b: &mut Dr1csBuilder<F>, bit: bool) -> usize {
-    let _p = b.profile_scope("gadgets::alloc_bool");
+    let _prev = b.profile_enter("gadgets::alloc_bool");
     let v = b.new_var(if bit { F::ONE } else { F::ZERO });
     // v*(1-v)=0
     b.add_constraint(
@@ -22,11 +22,12 @@ pub(super) fn alloc_bool<F: PrimeField>(b: &mut Dr1csBuilder<F>, bit: bool) -> u
         vec![(F::ONE, b.one()), (-F::ONE, v)],
         vec![(F::ZERO, b.one())],
     );
+    b.profile_exit(_prev);
     v
 }
 
 pub(super) fn alloc_byte<F: PrimeField>(b: &mut Dr1csBuilder<F>, v8: u8) -> ByteVar {
-    let _p = b.profile_scope("gadgets::alloc_byte");
+    let _prev = b.profile_enter("gadgets::alloc_byte");
     let mut bits = [0usize; 8];
     for i in 0..8 {
         bits[i] = alloc_bool::<F>(b, ((v8 >> i) & 1) == 1);
@@ -45,6 +46,7 @@ pub(super) fn alloc_byte<F: PrimeField>(b: &mut Dr1csBuilder<F>, v8: u8) -> Byte
     // Cache bit decomposition so downstream gadgets can reuse it.
     b.byte_bits_cache.insert(v, bits);
 
+    b.profile_exit(_prev);
     ByteVar { byte: v, bits }
 }
 
@@ -67,8 +69,9 @@ pub(super) fn decompose_existing_byte_var_to_bits<F: PrimeField>(
     b: &mut Dr1csBuilder<F>,
     byte_var: usize,
 ) -> [usize; 8] {
-    let _p = b.profile_scope("gadgets::decompose_byte_to_bits");
+    let _prev = b.profile_enter("gadgets::decompose_byte_to_bits");
     if let Some(bits) = b.byte_bits_cache.get(&byte_var) {
+        b.profile_exit(_prev);
         return *bits;
     }
     // Constrain: byte_var = Σ 2^i * bit_i, with bit_i boolean.
@@ -91,6 +94,7 @@ pub(super) fn decompose_existing_byte_var_to_bits<F: PrimeField>(
     }
     b.enforce_lc_times_one_eq_const(lc);
     b.byte_bits_cache.insert(byte_var, bits);
+    b.profile_exit(_prev);
     bits
 }
 
