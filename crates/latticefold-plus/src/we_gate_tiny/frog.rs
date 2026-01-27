@@ -897,6 +897,156 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
         ((xm as u128) * (y as u128) % (p as u128)) as u64
     }
 
+    #[inline]
+    fn div_rem_u192_by_u64(n2: u64, n1: u64, n0: u64, d: u64) -> (u128, u64) {
+        debug_assert!(d != 0);
+        // Long division in base 2^64 for a 3-limb numerator.
+        let mut rem: u128 = 0;
+        let limbs = [n2, n1, n0];
+        let mut q = [0u64; 3];
+        for (i, &limb) in limbs.iter().enumerate() {
+            let cur = (rem << 64) | (limb as u128);
+            let qi = cur / (d as u128);
+            let ri = cur % (d as u128);
+            debug_assert!(qi <= (u64::MAX as u128));
+            q[i] = qi as u64;
+            rem = ri;
+        }
+        // For our use-cases, the quotient fits in 128 bits (indeed < 2^67).
+        debug_assert_eq!(q[0], 0, "quotient unexpectedly needs >128 bits");
+        let q_u128 = ((q[1] as u128) << 64) | (q[2] as u128);
+        (q_u128, rem as u64)
+    }
+
+    fn u128_to_bal16_digits_le_const(mut x: u128, n_nibbles: usize) -> Vec<i8> {
+        // Balanced digits in [-8,7], plus a final carry digit in {0,1}.
+        let mut out: Vec<i8> = vec![0i8; n_nibbles + 1];
+        let mut carry: i16 = 0;
+        for i in 0..n_nibbles {
+            let nib = (x & 0xF) as i16;
+            x >>= 4;
+            let v = nib + carry;
+            if v >= 8 {
+                out[i] = (v - 16) as i8;
+                carry = 1;
+            } else {
+                out[i] = v as i8;
+                carry = 0;
+            }
+        }
+        debug_assert!(x == 0, "value does not fit in requested nibble length");
+        out[n_nibbles] = carry as i8;
+        out
+    }
+
+    fn alloc_u128_as_bal16_digits_witness(
+        b: &mut Dr1csBuilder<F257>,
+        x: u128,
+        n_nibbles: usize,
+    ) -> Vec<usize> {
+        let ds = u128_to_bal16_digits_le_const(x, n_nibbles);
+        let mut out: Vec<usize> = Vec::with_capacity(n_nibbles + 1);
+        for i in 0..n_nibbles {
+            out.push(alloc_bal16_digit(b, ds[i]));
+        }
+        // Final carry in {0,1}.
+        out.push(alloc_bool::<F257>(b, ds[n_nibbles] == 1));
+        out
+    }
+
+    /// Compute `Σ_i (coeffs[i] * evals[i]) mod p`, where:
+    /// - evals[i] are canonical Frog elements (8 bytes each),
+    /// - coeffs[i] are u64 constants in [0,p).
+    ///
+    /// This avoids per-term modular reduction: it accumulates the integer products in bal16 digit
+    /// space, then performs a single `S = q*p + r` reduction.
+    fn lincomb7_mod_p_from_canonical_evals(
+        b: &mut Dr1csBuilder<F257>,
+        evals: &[[usize; 8]; 7],
+        coeffs: &[u64; 7],
+    ) -> [usize; 8] {
+        // -----------------------
+        // Witness compute q, r.
+        // -----------------------
+        let mut lo: u128 = 0;
+        let mut hi: u64 = 0;
+        for i in 0..7 {
+            let coeff = coeffs[i];
+            if coeff == 0 {
+                continue;
+            }
+            let mut eb = [0u8; 8];
+            for j in 0..8 {
+                eb[j] = b.assignment[evals[i][j]]
+                    .into_bigint()
+                    .to_bytes_le()
+                    .get(0)
+                    .copied()
+                    .unwrap_or(0);
+            }
+            let e_u = u64::from_le_bytes(eb);
+            let term = (e_u as u128) * (coeff as u128);
+            let (new_lo, carry) = lo.overflowing_add(term);
+            lo = new_lo;
+            if carry {
+                hi += 1;
+            }
+        }
+        // N = hi*2^128 + lo, with hi <= 6 for 7 terms.
+        debug_assert!(hi <= 7);
+        let n2 = hi; // top limb fits in u64 (really <=7)
+        let n1 = (lo >> 64) as u64;
+        let n0 = (lo & (u64::MAX as u128)) as u64;
+        let (q_u128, r_u64) = div_rem_u192_by_u64(n2, n1, n0, FROG_P);
+
+        // Allocate r as bytes (output) and enforce canonical.
+        let r_bytes_u8 = r_u64.to_le_bytes();
+        let mut r_bytes = [0usize; 8];
+        for j in 0..8 {
+            r_bytes[j] = alloc_u8_var::<F257>(b, r_bytes_u8[j]);
+        }
+        let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &r_bytes);
+
+        // -----------------------
+        // Constrain: Σ (coeff*eval) == q*p + r as integers via bal16 digits.
+        // -----------------------
+        let p_d_const = frog_p_bal16_digits_le_const();
+
+        // Each product uses 17-digit eval * 17-digit coeff => mul gadget yields len ~39.
+        // We pick a slightly larger target len to guarantee no overflow in summation.
+        const TARGET_LEN: usize = 42;
+        let zero_digit = alloc_bal16_digit(b, 0);
+
+        let mut acc: Vec<usize> = vec![zero_digit; TARGET_LEN];
+        for i in 0..7 {
+            let coeff = coeffs[i];
+            if coeff == 0 {
+                continue;
+            }
+            let e_d = u64_bytes_to_bal16_digits_cached(b, evals[i]);
+            let coeff_d_const = u64_to_bal16_digits_le_const(coeff);
+            let prod_d = mul_bal16_long_by_const_rhs(b, &e_d, &coeff_d_const);
+            let prod_d = pad_bal16(b, prod_d, TARGET_LEN);
+            let (new_acc, carry) = add_bal16_same_len(b, &acc, &prod_d);
+            acc = new_acc;
+            b.enforce_var_eq_const(carry, F257::ZERO);
+        }
+
+        // q fits within 67 bits; represent it with 18 nibbles + final carry => 19 digits.
+        let q_d = alloc_u128_as_bal16_digits_witness(b, q_u128, 18);
+        let qp_d = mul_bal16_long_by_const_rhs(b, &q_d, &p_d_const);
+        let qp_d = pad_bal16(b, qp_d, TARGET_LEN);
+
+        let r_d = u64_bytes_to_bal16_digits_cached(b, r_bytes);
+        let r_d = pad_bal16(b, r_d, TARGET_LEN);
+
+        let (sum_d, carry_sum) = add_bal16_same_len(b, &qp_d, &r_d);
+        b.enforce_var_eq_const(carry_sum, F257::ZERO);
+
+        enforce_bal16_vec_eq(b, &acc, &sum_d);
+        r_bytes
+    }
+
     // Split into 4 blocks of length 16.
     let a0 = &a[0..16];
     let a1 = &a[16..32];
@@ -1012,22 +1162,19 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
         for k in 0..(2 * m - 1) {
             for j in 0..7 {
                 let idx = j * m + k; // unique
-                // Compute Σ_i (NUMS[j][i]/720) * w_eval[i][k] by fusing constants:
-                // coeff = NUMS[j][i] * inv720 mod p, then term = w_eval[i][k] * coeff mod p.
-                let mut acc = zero;
+                // Compute Σ_i (NUMS[j][i]/720) * w_eval[i][k] with one final reduction.
+                let mut evals = [zero; 7];
+                for i in 0..7 {
+                    evals[i] = w_eval[i][k];
+                }
+                let mut coeffs = [0u64; 7];
                 for i in 0..7 {
                     let n = NUMS[j][i];
-                    if n == 0 {
-                        continue;
+                    if n != 0 {
+                        coeffs[i] = modmul_i64_u64(n, inv720, FROG_P);
                     }
-                    let coeff = modmul_i64_u64(n, inv720, FROG_P);
-                    if coeff == 0 {
-                        continue;
-                    }
-                    let term =
-                        frog_mul_const_mod_p_from_byte_vars_assume_canonical(b, &w_eval[i][k], coeff);
-                    acc = frog_add_mod_p_from_byte_vars_assume_canonical(b, &acc, &term);
                 }
+                let acc = lincomb7_mod_p_from_canonical_evals(b, &evals, &coeffs);
                 // NOTE: idx is NOT unique: blocks of length (2m-1) shifted by m overlap.
                 res[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &res[idx], &acc);
             }
@@ -1061,20 +1208,18 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
     for k in 0..31 {
         for j in 0..7 {
             let idx = j * 16 + k;
-            let mut acc = zero;
+            let mut evals = [zero; 7];
+            for i in 0..7 {
+                evals[i] = w_eval_top[i][k];
+            }
+            let mut coeffs = [0u64; 7];
             for i in 0..7 {
                 let n = NUMS[j][i];
-                if n == 0 {
-                    continue;
+                if n != 0 {
+                    coeffs[i] = modmul_i64_u64(n, inv720, FROG_P);
                 }
-                let coeff = modmul_i64_u64(n, inv720, FROG_P);
-                if coeff == 0 {
-                    continue;
-                }
-                let term =
-                    frog_mul_const_mod_p_from_byte_vars_assume_canonical(b, &w_eval_top[i][k], coeff);
-                acc = frog_add_mod_p_from_byte_vars_assume_canonical(b, &acc, &term);
             }
+            let acc = lincomb7_mod_p_from_canonical_evals(b, &evals, &coeffs);
             // NOTE: idx is NOT unique: blocks of length 31 shifted by 16 overlap.
             prod[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &prod[idx], &acc);
         }
