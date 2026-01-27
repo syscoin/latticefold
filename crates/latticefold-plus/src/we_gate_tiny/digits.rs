@@ -182,26 +182,46 @@ fn alloc_carry_pm11(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
 /// Allocate a signed carry `c ∈ [-2,2]` as an F257 variable, with a tight boolean decomposition.
 pub(crate) fn alloc_carry_pm2(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
     assert!((-2..=2).contains(&c));
-    // Represent as off = c + 2 in [0,4].
-    let off = (c + 2) as u8;
-    let b0 = alloc_bool::<F257>(b, (off & 1) == 1);
-    let b1 = alloc_bool::<F257>(b, (off & 2) == 2);
-    let b2 = alloc_bool::<F257>(b, (off & 4) == 4);
-    let off_var = b.new_var(F257::from(off as u64));
-    // off = b0 + 2*b1 + 4*b2
-    b.enforce_lc_times_one_eq_const(vec![
-        (F257::ONE, off_var),
-        (-F257::ONE, b0),
-        (-F257::from(2u64), b1),
-        (-F257::from(4u64), b2),
-    ]);
-    // c = off - 2
+    // Avoid boolean decomposition: enforce membership with the vanishing polynomial
+    //   (c-2)(c-1)c(c+1)(c+2) = 0
+    // over F257, which has exactly the intended roots since 257 is prime > 5.
     let c_var = b.new_var(i32_to_f257(c));
-    b.enforce_lc_times_one_eq_const(vec![
-        (F257::ONE, c_var),
-        (-F257::ONE, off_var),
-        (F257::from(2u64), b.one()),
-    ]);
+
+    // t1 = (c-2)(c-1)
+    let cv = b.assignment[c_var];
+    let t1_val = (cv - F257::from(2u64)) * (cv - F257::ONE);
+    let t1 = b.new_var(t1_val);
+    b.add_constraint(
+        vec![(F257::ONE, c_var), (-F257::from(2u64), b.one())],
+        vec![(F257::ONE, c_var), (-F257::ONE, b.one())],
+        vec![(F257::ONE, t1)],
+    );
+
+    // t2 = t1 * c
+    let t2_val = t1_val * cv;
+    let t2 = b.new_var(t2_val);
+    b.add_constraint(
+        vec![(F257::ONE, t1)],
+        vec![(F257::ONE, c_var)],
+        vec![(F257::ONE, t2)],
+    );
+
+    // t3 = t2 * (c+1)
+    let t3_val = t2_val * (cv + F257::ONE);
+    let t3 = b.new_var(t3_val);
+    b.add_constraint(
+        vec![(F257::ONE, t2)],
+        vec![(F257::ONE, c_var), (F257::ONE, b.one())],
+        vec![(F257::ONE, t3)],
+    );
+
+    // t3 * (c+2) = 0
+    b.add_constraint(
+        vec![(F257::ONE, t3)],
+        vec![(F257::ONE, c_var), (F257::from(2u64), b.one())],
+        vec![(F257::ZERO, b.one())],
+    );
+
     c_var
 }
 
@@ -418,20 +438,26 @@ pub(crate) fn alloc_carry_pm_dynamic_le512(b: &mut Dr1csBuilder<F257>, c: i32) -
 /// Constrain `b_pos * b_neg = 0` and `c = b_pos - b_neg`.
 pub(crate) fn alloc_carry_pm1(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
     assert!((-1..=1).contains(&c));
-    let b_pos = alloc_bool::<F257>(b, c == 1);
-    let b_neg = alloc_bool::<F257>(b, c == -1);
-    // b_pos * b_neg = 0
+    // Avoid boolean decomposition: enforce membership with the vanishing polynomial
+    //   (c-1)c(c+1) = 0
+    // over F257, which has exactly the intended roots since 257 is prime > 3.
+    let c_var = b.new_var(i32_to_f257(c));
+    let cv = b.assignment[c_var];
+
+    // t = (c-1)*c
+    let t_val = (cv - F257::ONE) * cv;
+    let t = b.new_var(t_val);
     b.add_constraint(
-        vec![(F257::ONE, b_pos)],
-        vec![(F257::ONE, b_neg)],
+        vec![(F257::ONE, c_var), (-F257::ONE, b.one())],
+        vec![(F257::ONE, c_var)],
+        vec![(F257::ONE, t)],
+    );
+    // t*(c+1) = 0
+    b.add_constraint(
+        vec![(F257::ONE, t)],
+        vec![(F257::ONE, c_var), (F257::ONE, b.one())],
         vec![(F257::ZERO, b.one())],
     );
-    let c_var = b.new_var(i32_to_f257(c));
-    b.enforce_lc_times_one_eq_const(vec![
-        (F257::ONE, c_var),
-        (-F257::ONE, b_pos),
-        (F257::ONE, b_neg),
-    ]);
     c_var
 }
 
