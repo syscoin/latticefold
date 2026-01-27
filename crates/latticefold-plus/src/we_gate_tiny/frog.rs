@@ -943,7 +943,8 @@ fn frog_add_mod_p_from_byte_vars_assume_canonical(
     let q_u8: u8 = if sum >= (FROG_P as u128) { 1 } else { 0 };
     let r_u: u64 = if q_u8 == 1 { (sum - (FROG_P as u128)) as u64 } else { sum as u64 };
 
-    let q = alloc_bool::<F257>(b, q_u8 == 1);
+    // `q_u8` is a witness-known 0/1 selector; use cached constants instead of allocating a boolean.
+    let q = if q_u8 == 1 { b.one() } else { b.zero_var() };
     let r_bytes_u8 = r_u.to_le_bytes();
     let mut r_bytes = [0usize; 8];
     for i in 0..8 {
@@ -1007,7 +1008,8 @@ fn frog_sub_mod_p_from_byte_vars_assume_canonical(
         (1u8, (a_u as u128 + (FROG_P as u128) - (c_u as u128)) as u64)
     };
 
-    let q = alloc_bool::<F257>(b, q_u8 == 1);
+    // `q_u8` is a witness-known 0/1 selector; use cached constants instead of allocating a boolean.
+    let q = if q_u8 == 1 { b.one() } else { b.zero_var() };
     let r_bytes_u8 = r_u.to_le_bytes();
     let mut r_bytes = [0usize; 8];
     for i in 0..8 {
