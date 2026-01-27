@@ -65,35 +65,6 @@ fn byte_to_nibbles(b: &mut Dr1csBuilder<F257>, byte: &ByteVar) -> (usize, usize)
     (lo, hi)
 }
 
-/// Convert a 4-bit nibble (0..15) into a balanced digit in [-8,7] using the top bit as the sign.
-///
-/// digit = nibble - 16 * msb, where msb is the 8's bit (boolean).
-fn balanced_digit_from_nibble(b: &mut Dr1csBuilder<F257>, nibble: usize, msb: usize) -> usize {
-    // Witness digit value using assignment of nibble/msb.
-    let n = b.assignment[nibble]
-        .into_bigint()
-        .to_bytes_le()
-        .get(0)
-        .copied()
-        .unwrap_or(0) as i32;
-    let s = b.assignment[msb]
-        .into_bigint()
-        .to_bytes_le()
-        .get(0)
-        .copied()
-        .unwrap_or(0) as i32;
-    debug_assert!(n < 16);
-    debug_assert!(s == 0 || s == 1);
-    let d = n - 16 * s; // in [-8,7]
-    let out = b.new_var(F257::from(((d % 257 + 257) % 257) as u64));
-    b.enforce_lc_times_one_eq_const(vec![
-        (F257::ONE, out),
-        (-F257::ONE, nibble),
-        (F257::from(16u64), msb),
-    ]);
-    out
-}
-
 /// Allocate a balanced base-16 digit variable in [-8,7] from witness `d`.
 pub(crate) fn alloc_bal16_digit(b: &mut Dr1csBuilder<F257>, d: i8) -> usize {
     assert!((-8..=7).contains(&d));
@@ -103,9 +74,18 @@ pub(crate) fn alloc_bal16_digit(b: &mut Dr1csBuilder<F257>, d: i8) -> usize {
     for i in 0..4 {
         bits4[i] = alloc_bool::<F257>(b, ((nib >> i) & 1) == 1);
     }
-    let nib_var = nibble_from_bits(b, bits4, nib);
-    let msb = bits4[3];
-    balanced_digit_from_nibble(b, nib_var, msb)
+    // Balanced digit can be expressed directly as:
+    //   d = b0 + 2*b1 + 4*b2 - 8*b3
+    // where bits represent the nibble in [0..15] and b3 is the sign bit.
+    let out = b.new_var(i32_to_f257(d as i32));
+    b.enforce_lc_times_one_eq_const(vec![
+        (F257::ONE, out),
+        (-F257::ONE, bits4[0]),
+        (-F257::from(2u64), bits4[1]),
+        (-F257::from(4u64), bits4[2]),
+        (F257::from(8u64), bits4[3]),
+    ]);
+    out
 }
 
 /// Allocate a signed carry `c` by allocating an offset `off = c + 16` in [0,31] and
