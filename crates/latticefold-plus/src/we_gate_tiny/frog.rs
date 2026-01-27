@@ -1511,6 +1511,95 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
             out
         }
 
+        // Helper: fixed-shape Karatsuba convolution for n=4 (length-7 output).
+        //
+        // This reduces the number of expensive `frog_mul_mod_p` calls from 16 -> 9 for each
+        // 4x4 base multiply (the hot base case inside Toom-4 length-16).
+        #[inline(always)]
+        fn karatsuba_len4(
+            b: &mut Dr1csBuilder<F257>,
+            a: &[[usize; 8]; 4],
+            c: &[[usize; 8]; 4],
+            zero: [usize; 8],
+        ) -> Vec<[usize; 8]> {
+            // 2x2 Karatsuba: 4 muls -> 3 muls.
+            #[inline(always)]
+            fn karatsuba_len2(
+                b: &mut Dr1csBuilder<F257>,
+                a0: &[usize; 8],
+                a1: &[usize; 8],
+                b0: &[usize; 8],
+                b1: &[usize; 8],
+                zero: [usize; 8],
+            ) -> [[usize; 8]; 3] {
+                // z0 = a0*b0
+                let z0 = frog_mul_mod_p_from_byte_vars_assume_canonical(b, a0, b0);
+                // z2 = a1*b1
+                let z2 = frog_mul_mod_p_from_byte_vars_assume_canonical(b, a1, b1);
+                // z1 = (a0+a1)*(b0+b1) - z0 - z2
+                let sa = frog_add_mod_p_from_byte_vars_assume_canonical(b, a0, a1);
+                let sb = frog_add_mod_p_from_byte_vars_assume_canonical(b, b0, b1);
+                let z1_full = frog_mul_mod_p_from_byte_vars_assume_canonical(b, &sa, &sb);
+                let mut z1 = frog_sub_mod_p_from_byte_vars_assume_canonical(b, &z1_full, &z0);
+                z1 = frog_sub_mod_p_from_byte_vars_assume_canonical(b, &z1, &z2);
+
+                // Assemble length-3 convolution:
+                // out[0] = z0
+                // out[1] = z1
+                // out[2] = z2
+                [z0, z1, z2]
+            }
+
+            // Split a = a0 + x^2 a1, c = c0 + x^2 c1, where each part is len-2.
+            let a0_0 = &a[0];
+            let a0_1 = &a[1];
+            let a1_0 = &a[2];
+            let a1_1 = &a[3];
+            let c0_0 = &c[0];
+            let c0_1 = &c[1];
+            let c1_0 = &c[2];
+            let c1_1 = &c[3];
+
+            // z0 = a0*c0 (len 3)
+            let z0 = karatsuba_len2(b, a0_0, a0_1, c0_0, c0_1, zero);
+            // z2 = a1*c1 (len 3)
+            let z2 = karatsuba_len2(b, a1_0, a1_1, c1_0, c1_1, zero);
+
+            // s_a = a0 + a1, s_c = c0 + c1 (len 2 each)
+            let sa0 = frog_add_mod_p_from_byte_vars_assume_canonical(b, a0_0, a1_0);
+            let sa1 = frog_add_mod_p_from_byte_vars_assume_canonical(b, a0_1, a1_1);
+            let sc0 = frog_add_mod_p_from_byte_vars_assume_canonical(b, c0_0, c1_0);
+            let sc1 = frog_add_mod_p_from_byte_vars_assume_canonical(b, c0_1, c1_1);
+
+            // z1_full = (a0+a1)*(c0+c1) (len 3)
+            let z1_full = karatsuba_len2(b, &sa0, &sa1, &sc0, &sc1, zero);
+
+            // z1 = z1_full - z0 - z2 (len 3)
+            let mut z1 = [zero; 3];
+            for i in 0..3 {
+                let t = frog_sub_mod_p_from_byte_vars_assume_canonical(b, &z1_full[i], &z0[i]);
+                z1[i] = frog_sub_mod_p_from_byte_vars_assume_canonical(b, &t, &z2[i]);
+            }
+
+            // Assemble len-7: out = z0 + x^2 z1 + x^4 z2.
+            let mut out = vec![zero; 7];
+            // z0 at shift 0
+            for i in 0..3 {
+                out[i] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &out[i], &z0[i]);
+            }
+            // z1 at shift 2
+            for i in 0..3 {
+                let idx = 2 + i;
+                out[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &out[idx], &z1[i]);
+            }
+            // z2 at shift 4
+            for i in 0..3 {
+                let idx = 4 + i;
+                out[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &out[idx], &z2[i]);
+            }
+            out
+        }
+
         let m = 4;
         let (a0, rest) = a.split_at(m);
         let (a1, rest) = rest.split_at(m);
@@ -1528,7 +1617,10 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
                 ae.push(eval_deg3_poly_at_t(b, &a0[i], &a1[i], &a2[i], &a3[i], t));
                 ce.push(eval_deg3_poly_at_t(b, &c0[i], &c1[i], &c2[i], &c3[i], t));
             }
-            w_eval.push(schoolbook(b, &ae, &ce)); // len 7 (2m-1)
+            // Base multiply (len-4 × len-4 -> len-7): use Karatsuba to reduce non-native muls.
+            let ae4: [[usize; 8]; 4] = [ae[0], ae[1], ae[2], ae[3]];
+            let ce4: [[usize; 8]; 4] = [ce[0], ce[1], ce[2], ce[3]];
+            w_eval.push(karatsuba_len4(b, &ae4, &ce4, zero)); // len 7 (2m-1)
         }
 
         // Interpolate (degree<=6) into blocks j=0..6, each length 2m-1=7:
