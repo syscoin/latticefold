@@ -1022,7 +1022,8 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
         const TARGET_LEN: usize = 43;
         let zero_digit = alloc_bal16_digit(b, 0);
 
-        let mut acc: Vec<usize> = vec![zero_digit; TARGET_LEN];
+        // Build (padded) product terms, then reduce with a small adder tree.
+        let mut terms: Vec<Vec<usize>> = Vec::with_capacity(7);
         for i in 0..7 {
             let coeff = coeffs[i];
             if coeff == 0 {
@@ -1032,10 +1033,30 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
             let coeff_d_const = u64_to_bal16_digits_le_const(coeff);
             let prod_d = mul_bal16_long_by_const_rhs(b, &e_d, &coeff_d_const);
             let prod_d = pad_bal16(b, prod_d, TARGET_LEN);
-            let (new_acc, carry) = add_bal16_same_len(b, &acc, &prod_d);
-            acc = new_acc;
-            b.enforce_var_eq_const(carry, F257::ZERO);
+            terms.push(prod_d);
         }
+        // If all coeffs were 0, the sum is 0.
+        if terms.is_empty() {
+            terms.push(vec![zero_digit; TARGET_LEN]);
+        }
+        let mut stack = terms;
+        while stack.len() > 1 {
+            if stack.len() >= 3 {
+                let d = stack.pop().unwrap();
+                let c = stack.pop().unwrap();
+                let a = stack.pop().unwrap();
+                let (sum, carry) = super::digits::add3_bal16_same_len(b, &a, &c, &d);
+                b.enforce_var_eq_const(carry, F257::ZERO);
+                stack.push(sum);
+            } else {
+                let c = stack.pop().unwrap();
+                let a = stack.pop().unwrap();
+                let (sum, carry) = add_bal16_same_len(b, &a, &c);
+                b.enforce_var_eq_const(carry, F257::ZERO);
+                stack.push(sum);
+            }
+        }
+        let acc = stack.pop().unwrap();
 
         // q fits within 67 bits; represent it with 18 nibbles + final carry => 19 digits.
         let q_d = alloc_u128_as_bal16_digits_witness(b, q_u128, 18);
@@ -1165,14 +1186,17 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
 
         let mut res: Vec<[usize; 8]> = vec![frog_zero_bytes(b); 2 * 16 - 1];
         for k in 0..(2 * m - 1) {
+            // For fixed k, the 7 evaluation values are reused across all 7 j-blocks.
+            // Hoist digit conversions out of the inner j-loop.
+            let mut evals = [zero; 7];
+            for i in 0..7 {
+                evals[i] = w_eval[i][k];
+            }
+            let evals_d: [Vec<usize>; 7] =
+                core::array::from_fn(|i| u64_bytes_to_bal16_digits_cached(b, evals[i]));
+
             for j in 0..7 {
                 let idx = j * m + k; // unique
-                // Compute Σ_i (NUMS[j][i]/720) * w_eval[i][k] with one final reduction.
-                let mut evals = [zero; 7];
-                for i in 0..7 {
-                    evals[i] = w_eval[i][k];
-                }
-                let evals_d: [Vec<usize>; 7] = core::array::from_fn(|i| u64_bytes_to_bal16_digits_cached(b, evals[i]));
                 let mut coeffs = [0u64; 7];
                 for i in 0..7 {
                     let n = NUMS[j][i];
@@ -1212,13 +1236,15 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
     // Interpolate into blocks j=0..6, each len 31, giving conv len 127.
     let mut prod: Vec<[usize; 8]> = vec![zero; 2 * 64 - 1];
     for k in 0..31 {
+        // For fixed k, the 7 evaluation values are reused across all 7 j-blocks.
+        let mut evals = [zero; 7];
+        for i in 0..7 {
+            evals[i] = w_eval_top[i][k];
+        }
+        let evals_d: [Vec<usize>; 7] = core::array::from_fn(|i| u64_bytes_to_bal16_digits_cached(b, evals[i]));
+
         for j in 0..7 {
             let idx = j * 16 + k;
-            let mut evals = [zero; 7];
-            for i in 0..7 {
-                evals[i] = w_eval_top[i][k];
-            }
-            let evals_d: [Vec<usize>; 7] = core::array::from_fn(|i| u64_bytes_to_bal16_digits_cached(b, evals[i]));
             let mut coeffs = [0u64; 7];
             for i in 0..7 {
                 let n = NUMS[j][i];
