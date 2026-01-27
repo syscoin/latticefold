@@ -6,7 +6,7 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 use super::coins::frog_p_base128_digits_le;
 use super::digits::{
     add_bal16_same_len, alloc_bal16_digit, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
-    alloc_carry_pm2_dynamic, alloc_carry_pm64, alloc_carry_pm_dynamic_le128,
+    alloc_carry_pm2_dynamic, alloc_carry_pm_dynamic_le128,
     alloc_carry_pm_dynamic_le512, i32_to_f257, u64_bytes_to_bal16_digits_cached,
 };
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
@@ -756,51 +756,6 @@ fn enforce_sub_mod_p_relation_bal16(
     b.enforce_var_eq_const(carry_var, F257::ZERO);
 }
 
-/// Pack 8 little-endian byte vars into base-128 (7-bit) limbs.
-///
-/// This is "unchecked": it enforces only that each limb equals the corresponding 7 bits of the
-/// 64-bit integer encoded by the bytes. It does *not* enforce `< p_frog`.
-fn bytes_to_base128_limbs_unchecked(b: &mut Dr1csBuilder<F257>, bytes_le: &[usize; 8]) -> [usize; LIMBS_U64] {
-    // Witness u for limb values.
-    let mut buf = [0u8; 8];
-    for i in 0..8 {
-        buf[i] = b.assignment[bytes_le[i]]
-            .into_bigint()
-            .to_bytes_le()
-            .get(0)
-            .copied()
-            .unwrap_or(0);
-    }
-    let u = u64::from_le_bytes(buf);
-
-    // Get cached bits for each byte.
-    let mut bits: Vec<usize> = Vec::with_capacity(64);
-    for i in 0..8 {
-        let b8 = decompose_existing_byte_var_to_bits::<F257>(b, bytes_le[i]);
-        bits.extend_from_slice(&b8);
-    }
-    debug_assert_eq!(bits.len(), 64);
-
-    // Pack into 7-bit limbs.
-    let mut limbs = [0usize; LIMBS_U64];
-    for j in 0..LIMBS_U64 {
-        let limb_val = ((u >> (LIMB_BITS * j)) & (LIMB_BASE_U64 - 1)) as u64; // 0..127
-        let limb_var = b.new_var(F257::from(limb_val));
-        let mut lc = vec![(F257::ONE, limb_var)];
-        let mut pow = F257::ONE;
-        for k in 0..LIMB_BITS {
-            let bit_idx = LIMB_BITS * j + k;
-            if bit_idx < 64 {
-                lc.push((-pow, bits[bit_idx]));
-            }
-            pow *= F257::from(2u64);
-        }
-        b.enforce_lc_times_one_eq_const(lc);
-        limbs[j] = limb_var;
-    }
-    limbs
-}
-
 /// General Frog-field multiplication gadget (64-bit prime field) inside the tiny field.
 ///
 /// Inputs are canonical u64 encodings as 8 little-endian byte vars (0..255), representing
@@ -1462,110 +1417,19 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         a3: &[usize; 8],
         t: i64,
     ) -> [usize; 8] {
-        // Limb-native Toom evaluation with *small signed* coefficients.
-        //
-        // We compute (as integers):
-        //   s = a0 + t*a1 + t^2*a2 + t^3*a3
-        // then Euclidean-divide by p:
-        //   s = q*p + r, 0 <= r < p
-        // and enforce this in base-128 limbs with a bounded carry chain.
-
-        // Witness compute a_i and (q,r).
-        let mut b0 = [0u8; 8];
-        let mut b1 = [0u8; 8];
-        let mut b2 = [0u8; 8];
-        let mut b3 = [0u8; 8];
-        for i in 0..8 {
-            b0[i] = b.assignment[a0[i]].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0);
-            b1[i] = b.assignment[a1[i]].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0);
-            b2[i] = b.assignment[a2[i]].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0);
-            b3[i] = b.assignment[a3[i]].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0);
-        }
-        let a0_u = u64::from_le_bytes(b0) as i128;
-        let a1_u = u64::from_le_bytes(b1) as i128;
-        let a2_u = u64::from_le_bytes(b2) as i128;
-        let a3_u = u64::from_le_bytes(b3) as i128;
-
-        let t1: i128 = t as i128;
-        let t2: i128 = (t * t) as i128;
-        let t3: i128 = (t * t * t) as i128;
-        let s: i128 = a0_u + t1 * a1_u + t2 * a2_u + t3 * a3_u;
-        let p_i: i128 = FROG_P as i128;
-        let q_i: i128 = s.div_euclid(p_i);
-        let r_i: i128 = s.rem_euclid(p_i); // 0..p-1
-        debug_assert!((-64..=63).contains(&(q_i as i32)), "eval quotient out of pm64: q={q_i}");
-        let r_u64 = r_i as u64;
-
-        // Allocate r as bytes (output), and enforce canonical encoding.
-        let r_bytes_u8 = r_u64.to_le_bytes();
-        let mut r_bytes = [0usize; 8];
-        for i in 0..8 {
-            r_bytes[i] = alloc_u8_var::<F257>(b, r_bytes_u8[i]);
-        }
-        frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
-
-        // Pack operands and r into base-128 limbs (no extra booleans; uses cached byte bits).
-        let a0_l = bytes_to_base128_limbs_unchecked(b, a0);
-        let a1_l = bytes_to_base128_limbs_unchecked(b, a1);
-        let a2_l = bytes_to_base128_limbs_unchecked(b, a2);
-        let a3_l = bytes_to_base128_limbs_unchecked(b, a3);
-        let r_l = bytes_to_base128_limbs_unchecked(b, &r_bytes);
-
-        // q is small (|q| <= 40 for our t set), so represent it as a signed pm64 carry var.
-        let q_var = alloc_carry_pm64(b, q_i as i32);
-        let p_digits = frog_p_base128_digits_le();
-
-        // Enforce s = q*p + r in base-128 with a bounded carry chain.
-        let mut carry_var = b.zero_var();
-        let mut carry_i32: i32 = 0;
-        for j in 0..LIMBS_U64 {
-            let a0j = ((a0_u as u128 >> (LIMB_BITS * j)) & ((LIMB_BASE_U64 - 1) as u128)) as i32;
-            let a1j = ((a1_u as u128 >> (LIMB_BITS * j)) & ((LIMB_BASE_U64 - 1) as u128)) as i32;
-            let a2j = ((a2_u as u128 >> (LIMB_BITS * j)) & ((LIMB_BASE_U64 - 1) as u128)) as i32;
-            let a3j = ((a3_u as u128 >> (LIMB_BITS * j)) & ((LIMB_BASE_U64 - 1) as u128)) as i32;
-            let rj = ((r_u64 >> (LIMB_BITS * j)) & (LIMB_BASE_U64 - 1)) as i32;
-            let pj = p_digits[j] as i32;
-
-            let rhs = (carry_i32 as i128)
-                + (a0j as i128)
-                + t1 * (a1j as i128)
-                + t2 * (a2j as i128)
-                + t3 * (a3j as i128)
-                - q_i * (pj as i128)
-                - (rj as i128);
-            debug_assert_eq!(rhs.rem_euclid(LIMB_BASE_U64 as i128), 0);
-            let carry_next = (rhs / (LIMB_BASE_U64 as i128)) as i32;
-            debug_assert!(
-                (-128..=127).contains(&carry_next),
-                "eval carry out of pm128: {carry_next} at limb {j} (rhs={rhs})"
-            );
-            let carry_next_var = alloc_carry_pm_dynamic_le128(b, carry_next);
-
-            let mut lc: Vec<(F257, usize)> = Vec::with_capacity(8);
-            lc.push((F257::ONE, carry_var));
-            lc.push((F257::ONE, a0_l[j]));
-            if t1 != 0 {
-                lc.push((i32_to_f257(t1 as i32), a1_l[j]));
-            }
-            if t2 != 0 {
-                lc.push((i32_to_f257(t2 as i32), a2_l[j]));
-            }
-            if t3 != 0 {
-                lc.push((i32_to_f257(t3 as i32), a3_l[j]));
-            }
-            if pj != 0 {
-                lc.push((-i32_to_f257(pj), q_var));
-            }
-            lc.push((-F257::ONE, r_l[j]));
-            lc.push((-F257::from(LIMB_BASE_U64), carry_next_var));
-            b.enforce_lc_times_one_eq_const(lc);
-
-            carry_i32 = carry_next;
-            carry_var = carry_next_var;
-        }
-        b.enforce_var_eq_const(carry_var, F257::ZERO);
-
-        r_bytes
+        // coeffs = [1, t, t^2, t^3] mod p
+        let t1 = mod_i64_to_u64(t, FROG_P);
+        let t2 = mod_i64_to_u64(t * t, FROG_P);
+        let t3 = mod_i64_to_u64(t * t * t, FROG_P);
+        let coeffs = [1u64, t1, t2, t3];
+        let evals = [*a0, *a1, *a2, *a3];
+        let evals_d: [Vec<usize>; 4] = [
+            u64_bytes_to_bal16_digits_cached(b, *a0),
+            u64_bytes_to_bal16_digits_cached(b, *a1),
+            u64_bytes_to_bal16_digits_cached(b, *a2),
+            u64_bytes_to_bal16_digits_cached(b, *a3),
+        ];
+        lincomb_mod_p_from_canonical_evals::<4>(b, &evals, &evals_d, &coeffs)
     }
 
     // Split into 4 blocks of length 16.
