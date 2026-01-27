@@ -1,8 +1,10 @@
-use ark_ff::{BigInteger, PrimeField};
+use ark_ff::{BigInteger, Field, PrimeField};
 
+use latticefold::transcript::poseidon::F257;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 
 use super::coins::frog_p_base128_digits_le;
+use super::digits::{add_bal16_same_len, alloc_bal16_digit, mul_bal16_long_by_long, u64_bytes_to_bal16_digits};
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
 use crate::we_frog_poseidon_f257::FROG_P;
@@ -363,5 +365,269 @@ pub(super) fn frog_u64_centered_le_bound_from_byte_vars<F: PrimeField>(
     b.enforce_var_eq_const(ok, F::ONE);
 
     u_limbs
+}
+
+fn alloc_u8_var<F: PrimeField>(b: &mut Dr1csBuilder<F>, v: u8) -> usize {
+    let x = b.new_var(F::from(v as u64));
+    let _ = decompose_existing_byte_var_to_bits::<F>(b, x);
+    x
+}
+
+fn pad_bal16(b: &mut Dr1csBuilder<F257>, mut v: Vec<usize>, target_len: usize) -> Vec<usize> {
+    if v.len() >= target_len {
+        return v;
+    }
+    let z = alloc_bal16_digit(b, 0);
+    v.extend(std::iter::repeat(z).take(target_len - v.len()));
+    v
+}
+
+fn enforce_bal16_vec_eq(b: &mut Dr1csBuilder<F257>, a: &[usize], c: &[usize]) {
+    debug_assert_eq!(a.len(), c.len());
+    for (&ai, &ci) in a.iter().zip(c.iter()) {
+        b.enforce_lc_times_one_eq_const(vec![(F257::ONE, ai), (-F257::ONE, ci)]);
+    }
+}
+
+fn frog_p_bytes_le() -> [u8; 8] {
+    FROG_P.to_le_bytes()
+}
+
+/// General Frog-field multiplication gadget (64-bit prime field) inside the tiny field.
+///
+/// Inputs are canonical u64 encodings as 8 little-endian byte vars (0..255), representing
+/// field elements in \([0, p)\).
+///
+/// This enforces:
+/// \[
+///   a \cdot b = q \cdot p + r,\quad 0 \le r < p
+/// \]
+/// using balanced-base16 digit arithmetic (sound in F257), and returns `r` as 8 byte vars.
+pub(super) fn frog_mul_mod_p_from_byte_vars(
+    b: &mut Dr1csBuilder<F257>,
+    a_bytes: &[usize; 8],
+    b_bytes: &[usize; 8],
+) -> [usize; 8] {
+    // Ensure inputs are canonical (<p).
+    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, a_bytes);
+    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, b_bytes);
+
+    // Witness compute.
+    let mut ab = [0u8; 8];
+    let mut bb = [0u8; 8];
+    for i in 0..8 {
+        ab[i] = b.assignment[a_bytes[i]]
+            .into_bigint()
+            .to_bytes_le()
+            .get(0)
+            .copied()
+            .unwrap_or(0);
+        bb[i] = b.assignment[b_bytes[i]]
+            .into_bigint()
+            .to_bytes_le()
+            .get(0)
+            .copied()
+            .unwrap_or(0);
+    }
+    let a_u = u64::from_le_bytes(ab);
+    let b_u = u64::from_le_bytes(bb);
+    let prod: u128 = (a_u as u128) * (b_u as u128);
+    let q_u: u64 = (prod / (FROG_P as u128)) as u64;
+    let r_u: u64 = (prod % (FROG_P as u128)) as u64;
+
+    // Allocate q and r as byte vars.
+    let q_bytes_u8 = q_u.to_le_bytes();
+    let r_bytes_u8 = r_u.to_le_bytes();
+    let mut q_bytes = [0usize; 8];
+    let mut r_bytes = [0usize; 8];
+    for i in 0..8 {
+        q_bytes[i] = alloc_u8_var::<F257>(b, q_bytes_u8[i]);
+        r_bytes[i] = alloc_u8_var::<F257>(b, r_bytes_u8[i]);
+    }
+    // Enforce r is canonical (<p).
+    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &r_bytes);
+
+    // Convert a,b,q,r and p to balanced-base16 digits.
+    let a_d = u64_bytes_to_bal16_digits(b, *a_bytes);
+    let b_d = u64_bytes_to_bal16_digits(b, *b_bytes);
+    let q_d = u64_bytes_to_bal16_digits(b, q_bytes);
+    let r_d = u64_bytes_to_bal16_digits(b, r_bytes);
+
+    let p_bytes = frog_p_bytes_le();
+    let mut p_byte_vars = [0usize; 8];
+    for i in 0..8 {
+        p_byte_vars[i] = alloc_u8_var::<F257>(b, p_bytes[i]);
+    }
+    let p_d = u64_bytes_to_bal16_digits(b, p_byte_vars);
+
+    // Compute prod_digits = a*b (balanced digits, with headroom/carry already enforced in gadget).
+    let prod_d = mul_bal16_long_by_long(b, &a_d, &b_d);
+    // Compute qp_digits = q*p.
+    let qp_d = mul_bal16_long_by_long(b, &q_d, &p_d);
+
+    // Align lengths and enforce prod == qp + r.
+    let tlen = prod_d.len().max(qp_d.len()).max(r_d.len());
+    let prod_d = pad_bal16(b, prod_d, tlen);
+    let qp_d = pad_bal16(b, qp_d, tlen);
+    let r_d = pad_bal16(b, r_d, tlen);
+
+    // sum = qp + r
+    let (sum_d, carry) = add_bal16_same_len(b, &qp_d, &r_d);
+    b.enforce_var_eq_const(carry, F257::ZERO);
+    enforce_bal16_vec_eq(b, &prod_d, &sum_d);
+
+    r_bytes
+}
+
+/// General Frog-field addition gadget inside F257.
+///
+/// Enforces `r = (a + c) mod p` for canonical `a,c < p`, returning canonical `r` as 8 bytes.
+pub(super) fn frog_add_mod_p_from_byte_vars(
+    b: &mut Dr1csBuilder<F257>,
+    a_bytes: &[usize; 8],
+    c_bytes: &[usize; 8],
+) -> [usize; 8] {
+    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, a_bytes);
+    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, c_bytes);
+
+    let mut ab = [0u8; 8];
+    let mut cb = [0u8; 8];
+    for i in 0..8 {
+        ab[i] = b.assignment[a_bytes[i]]
+            .into_bigint()
+            .to_bytes_le()
+            .get(0)
+            .copied()
+            .unwrap_or(0);
+        cb[i] = b.assignment[c_bytes[i]]
+            .into_bigint()
+            .to_bytes_le()
+            .get(0)
+            .copied()
+            .unwrap_or(0);
+    }
+    let a_u = u64::from_le_bytes(ab);
+    let c_u = u64::from_le_bytes(cb);
+    let sum = (a_u as u128) + (c_u as u128);
+    let q_u8: u8 = if sum >= (FROG_P as u128) { 1 } else { 0 };
+    let r_u: u64 = if q_u8 == 1 { (sum - (FROG_P as u128)) as u64 } else { sum as u64 };
+
+    let q = alloc_bool::<F257>(b, q_u8 == 1);
+    let r_bytes_u8 = r_u.to_le_bytes();
+    let mut r_bytes = [0usize; 8];
+    for i in 0..8 {
+        r_bytes[i] = alloc_u8_var::<F257>(b, r_bytes_u8[i]);
+    }
+    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &r_bytes);
+
+    // Digits: pad to length 18 so the final add carry must be 0.
+    let a_d0 = u64_bytes_to_bal16_digits(b, *a_bytes);
+    let c_d0 = u64_bytes_to_bal16_digits(b, *c_bytes);
+    let a_d = pad_bal16(b, a_d0, 18);
+    let c_d = pad_bal16(b, c_d0, 18);
+    let (sum_d, carry_sum) = add_bal16_same_len(b, &a_d, &c_d);
+    b.enforce_var_eq_const(carry_sum, F257::ZERO);
+
+    let p_bytes = frog_p_bytes_le();
+    let mut p_byte_vars = [0usize; 8];
+    for i in 0..8 {
+        p_byte_vars[i] = alloc_u8_var::<F257>(b, p_bytes[i]);
+    }
+    let p_d0 = u64_bytes_to_bal16_digits(b, p_byte_vars);
+    let r_d0 = u64_bytes_to_bal16_digits(b, r_bytes);
+    let p_d = pad_bal16(b, p_d0, 18);
+    let r_d = pad_bal16(b, r_d0, 18);
+
+    // qp digits = q * p digits (q is boolean, p digits are in [-8,7]).
+    let mut qp_d: Vec<usize> = Vec::with_capacity(18);
+    for &pd in &p_d {
+        let pd_i = super::digits::f257_to_i32_bal(b.assignment[pd]);
+        let want = if q_u8 == 1 { pd_i } else { 0 };
+        let out = alloc_bal16_digit(b, want as i8);
+        b.enforce_mul(q, pd, out);
+        qp_d.push(out);
+    }
+
+    let (rhs_d, carry_rhs) = add_bal16_same_len(b, &qp_d, &r_d);
+    b.enforce_var_eq_const(carry_rhs, F257::ZERO);
+    enforce_bal16_vec_eq(b, &sum_d, &rhs_d);
+
+    r_bytes
+}
+
+/// General Frog-field subtraction gadget inside F257.
+///
+/// Enforces `r = (a - c) mod p` for canonical `a,c < p`, returning canonical `r` as 8 bytes.
+pub(super) fn frog_sub_mod_p_from_byte_vars(
+    b: &mut Dr1csBuilder<F257>,
+    a_bytes: &[usize; 8],
+    c_bytes: &[usize; 8],
+) -> [usize; 8] {
+    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, a_bytes);
+    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, c_bytes);
+
+    let mut ab = [0u8; 8];
+    let mut cb = [0u8; 8];
+    for i in 0..8 {
+        ab[i] = b.assignment[a_bytes[i]]
+            .into_bigint()
+            .to_bytes_le()
+            .get(0)
+            .copied()
+            .unwrap_or(0);
+        cb[i] = b.assignment[c_bytes[i]]
+            .into_bigint()
+            .to_bytes_le()
+            .get(0)
+            .copied()
+            .unwrap_or(0);
+    }
+    let a_u = u64::from_le_bytes(ab);
+    let c_u = u64::from_le_bytes(cb);
+    let (q_u8, r_u) = if a_u >= c_u {
+        (0u8, a_u - c_u)
+    } else {
+        (1u8, (a_u as u128 + (FROG_P as u128) - (c_u as u128)) as u64)
+    };
+
+    let q = alloc_bool::<F257>(b, q_u8 == 1);
+    let r_bytes_u8 = r_u.to_le_bytes();
+    let mut r_bytes = [0usize; 8];
+    for i in 0..8 {
+        r_bytes[i] = alloc_u8_var::<F257>(b, r_bytes_u8[i]);
+    }
+    let _ = frog_u64_canonical_from_byte_vars::<F257>(b, &r_bytes);
+
+    // Enforce a + q*p == c + r (as integers) using balanced digits.
+    let a_d0 = u64_bytes_to_bal16_digits(b, *a_bytes);
+    let c_d0 = u64_bytes_to_bal16_digits(b, *c_bytes);
+    let r_d0 = u64_bytes_to_bal16_digits(b, r_bytes);
+    let a_d = pad_bal16(b, a_d0, 18);
+    let c_d = pad_bal16(b, c_d0, 18);
+    let r_d = pad_bal16(b, r_d0, 18);
+
+    let p_bytes = frog_p_bytes_le();
+    let mut p_byte_vars = [0usize; 8];
+    for i in 0..8 {
+        p_byte_vars[i] = alloc_u8_var::<F257>(b, p_bytes[i]);
+    }
+    let p_d0 = u64_bytes_to_bal16_digits(b, p_byte_vars);
+    let p_d = pad_bal16(b, p_d0, 18);
+    let mut qp_d: Vec<usize> = Vec::with_capacity(18);
+    for &pd in &p_d {
+        let pd_i = super::digits::f257_to_i32_bal(b.assignment[pd]);
+        let want = if q_u8 == 1 { pd_i } else { 0 };
+        let out = alloc_bal16_digit(b, want as i8);
+        b.enforce_mul(q, pd, out);
+        qp_d.push(out);
+    }
+
+    let (lhs_d, carry_lhs) = add_bal16_same_len(b, &a_d, &qp_d);
+    b.enforce_var_eq_const(carry_lhs, F257::ZERO);
+    let (rhs_d, carry_rhs) = add_bal16_same_len(b, &c_d, &r_d);
+    b.enforce_var_eq_const(carry_rhs, F257::ZERO);
+    enforce_bal16_vec_eq(b, &lhs_d, &rhs_d);
+
+    r_bytes
 }
 

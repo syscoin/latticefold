@@ -33,8 +33,8 @@ pub fn we_tiny_f257_build_cm_gate_from_trace_ops(
         Vec<BoundedU32ChallengeWiring>,
         Vec<FrogChallengeWiring>,
         Vec<FrogRejectionCoinWiring>,
-        Vec<usize>, // tcch0 residues per instance (F257 vars)
-        Vec<usize>, // tcch1 residues per instance (F257 vars)
+        Vec<[usize; 8]>, // tcch0 (Frog base-field, 8 LE bytes) per instance
+        Vec<[usize; 8]>, // tcch1 (Frog base-field, 8 LE bytes) per instance
         Vec<CmDigitMulSurfaceWiring>,
         Vec<CmDigitMulSqSurfaceWiring>,
         PoseidonDr1csWiring,

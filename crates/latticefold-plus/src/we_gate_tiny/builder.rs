@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::transcript::DEFAULT_REJECTION_TRIES;
 
-use ark_ff::Field;
+use ark_ff::{BigInteger, Field, PrimeField};
 use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
 use latticefold::transcript::poseidon::F257;
 use symphony::dpp_poseidon::{merge_sparse_dr1cs_share_one, Constraint, PoseidonDr1csWiring, SparseDr1csInstance};
@@ -24,6 +24,7 @@ use super::digits::{
     sum_product_digits_bal16_22, sum_products13_coeffwise_fixed_len, sum_products22_coeffwise_fixed_len,
 };
 use super::frog::{
+    frog_add_mod_p_from_byte_vars, frog_mul_mod_p_from_byte_vars, frog_sub_mod_p_from_byte_vars,
     frog_u64_canonical_from_byte_vars, frog_u64_centered_le_bound_from_byte_vars,
     reduce_u64_mod_frog_from_byte_vars,
 };
@@ -349,10 +350,10 @@ fn compute_tcch(
     wiring: &TinyCoinOpWiring,
     u32_ranges: &[(usize, usize)],
     frog_locals: &[FrogChallengeWiring],
-) -> Result<(Vec<usize>, Vec<usize>), String> {
+) -> Result<(Vec<[usize; 8]>, Vec<[usize; 8]>), String> {
     // Preserves exact existing behavior; only moved out for readability/audit.
-    let mut tcch0_local: Vec<usize> = Vec::new();
-    let mut tcch1_local: Vec<usize> = Vec::new();
+    let mut tcch0_local: Vec<[usize; 8]> = Vec::new();
+    let mut tcch1_local: Vec<[usize; 8]> = Vec::new();
 
     if ring_dim > 0 && !wiring.short_squeeze_ops.is_empty() && !wiring.u32_squeeze_ops.is_empty() {
         let mut ring_elem_bytes: Option<usize> = None;
@@ -412,7 +413,7 @@ fn compute_tcch(
                         }
                     }
 
-                    let mut coh0_res: Vec<usize> = Vec::new();
+                    let mut coh0_bytes: Vec<[usize; 8]> = Vec::new();
                     for &(ab_start, ab_len) in &comh_absorb_ranges {
                         if ab_len < reb || (ab_len % reb) != 0 {
                             continue;
@@ -432,25 +433,12 @@ fn compute_tcch(
                                 }
                                 let _coeff0_limbs =
                                     frog_u64_canonical_from_byte_vars::<F257>(&mut glue.gb, &coeff0_bytes);
+                                coh0_bytes.push(coeff0_bytes);
                             }
-                            let mut acc = F257::ZERO;
-                            let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + coeff_bytes);
-                            for i in 0..coeff_bytes {
-                                let gv = pose_wiring.absorb_vars[blk_start + i];
-                                let lv = glue.copy_digit(gv);
-                                let _ = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, lv);
-                                let sign = if (i & 1) == 0 { F257::ONE } else { -F257::ONE };
-                                acc += glue.gb.assignment[lv] * sign;
-                                lc.push((-sign, lv));
-                            }
-                            let v = glue.gb.new_var(acc);
-                            lc.insert(0, (F257::ONE, v));
-                            glue.gb.enforce_lc_times_one_eq_const(lc);
-                            coh0_res.push(v);
                         }
                     }
 
-                    let n_comh_elems = coh0_res.len();
+                    let n_comh_elems = coh0_bytes.len();
                     if n_comh_elems > 0 {
                         let kappa = params.kappa as usize;
                         if kappa == 0 || !kappa.is_power_of_two() {
@@ -465,92 +453,101 @@ fn compute_tcch(
                         let c0_start = cm_u32_start;
                         let c1_start = cm_u32_start + lg;
                         if c1_start + lg <= u32_ranges.len() && c1_start + lg <= frog_locals.len() {
-                            let mut c0_vars: Vec<usize> = Vec::with_capacity(lg);
-                            let mut c1_vars: Vec<usize> = Vec::with_capacity(lg);
+                            // Lift reduced Frog challenges to canonical byte encodings (z < p),
+                            // so we can do Frog-field arithmetic in the tiny gate.
+                            fn canonical_frog_bytes_from_limbs(
+                                gb: &mut Dr1csBuilder<F257>,
+                                limbs: &[usize; super::params::LIMBS_U64],
+                            ) -> [usize; 8] {
+                                let mut z_u64: u64 = 0;
+                                for i in (0..super::params::LIMBS_U64).rev() {
+                                    let di = gb.assignment[limbs[i]]
+                                        .into_bigint()
+                                        .to_bytes_le()
+                                        .get(0)
+                                        .copied()
+                                        .unwrap_or(0) as u64;
+                                    z_u64 <<= super::params::LIMB_BITS;
+                                    z_u64 |= di & (super::params::LIMB_BASE_U64 - 1);
+                                }
+                                let zb = z_u64.to_le_bytes();
+                                let mut z_bytes = [0usize; 8];
+                                for i in 0..8 {
+                                    let v = gb.new_var(F257::from(zb[i] as u64));
+                                    let _ = decompose_existing_byte_var_to_bits::<F257>(gb, v);
+                                    z_bytes[i] = v;
+                                }
+                                let z_limbs = frog_u64_canonical_from_byte_vars::<F257>(gb, &z_bytes);
+                                for i in 0..super::params::LIMBS_U64 {
+                                    gb.enforce_lc_times_one_eq_const(vec![
+                                        (F257::ONE, z_limbs[i]),
+                                        (-F257::ONE, limbs[i]),
+                                    ]);
+                                }
+                                z_bytes
+                            }
+
+                            let mut c0_bytes: Vec<[usize; 8]> = Vec::with_capacity(lg);
+                            let mut c1_bytes: Vec<[usize; 8]> = Vec::with_capacity(lg);
                             for i in 0..lg {
-                                c0_vars.push(frog_locals[c0_start + i].res257);
+                                c0_bytes.push(canonical_frog_bytes_from_limbs(
+                                    &mut glue.gb,
+                                    &frog_locals[c0_start + i].limbs,
+                                ));
                             }
                             for i in 0..lg {
-                                c1_vars.push(frog_locals[c1_start + i].res257);
+                                c1_bytes.push(canonical_frog_bytes_from_limbs(
+                                    &mut glue.gb,
+                                    &frog_locals[c1_start + i].limbs,
+                                ));
                             }
 
                                 #[inline]
-                                fn tensor_vars(gb: &mut Dr1csBuilder<F257>, c: &[usize]) -> Vec<usize> {
-                                    let mut acc: Vec<usize> = vec![gb.new_var(F257::ONE)];
-                                    gb.enforce_var_eq_const(acc[0], F257::ONE);
-                                    for &ci in c {
-                                        let one_minus = gb.new_var(F257::ONE - gb.assignment[ci]);
-                                        gb.enforce_lc_times_one_eq_const(vec![
-                                            (F257::ONE, one_minus),
-                                            (F257::ONE, ci),
-                                            (-F257::ONE, gb.one()),
-                                        ]);
-                                        let mut next = Vec::with_capacity(acc.len() * 2);
-                                        for &t in &acc {
-                                            let v0 = gb.new_var(gb.assignment[t] * gb.assignment[one_minus]);
-                                            gb.enforce_mul(t, one_minus, v0);
-                                            next.push(v0);
-                                            let v1 = gb.new_var(gb.assignment[t] * gb.assignment[ci]);
-                                            gb.enforce_mul(t, ci, v1);
-                                            next.push(v1);
+                                fn tensor_frog_bytes(gb: &mut Dr1csBuilder<F257>, c: &[[usize; 8]]) -> Vec<[usize; 8]> {
+                                    let mut one = [0usize; 8];
+                                    one[0] = gb.new_var(F257::ONE);
+                                    gb.enforce_var_eq_const(one[0], F257::ONE);
+                                    let _ = decompose_existing_byte_var_to_bits::<F257>(gb, one[0]);
+                                    for i in 1..8 {
+                                        one[i] = gb.new_var(F257::ZERO);
+                                        gb.enforce_var_eq_const(one[i], F257::ZERO);
+                                        let _ = decompose_existing_byte_var_to_bits::<F257>(gb, one[i]);
+                                    }
+                                    let mut acc: Vec<[usize; 8]> = vec![one];
+                                    for ci in c {
+                                        let one_minus = frog_sub_mod_p_from_byte_vars(gb, &one, ci);
+                                        let mut next: Vec<[usize; 8]> = Vec::with_capacity(acc.len() * 2);
+                                        for t in &acc {
+                                            next.push(frog_mul_mod_p_from_byte_vars(gb, t, &one_minus));
+                                            next.push(frog_mul_mod_p_from_byte_vars(gb, t, ci));
                                         }
                                         acc = next;
                                     }
                                     acc
                                 }
 
-                                let tensor_c0 = tensor_vars(&mut glue.gb, &c0_vars);
-                                let tensor_c1 = tensor_vars(&mut glue.gb, &c1_vars);
+                                let tensor_c0 = tensor_frog_bytes(&mut glue.gb, &c0_bytes);
+                                let tensor_c1 = tensor_frog_bytes(&mut glue.gb, &c1_bytes);
 
                             tcch0_local.reserve(l_instances);
                             tcch1_local.reserve(l_instances);
                             for l in 0..l_instances {
                                 let base = l * kappa;
-                                let mut terms0: Vec<usize> = Vec::with_capacity(kappa);
-                                let mut terms1: Vec<usize> = Vec::with_capacity(kappa);
-                                for j in 0..kappa {
-                                    let rj = coh0_res[base + j];
-                                    let m0 = glue.gb.new_var(
-                                        glue.gb.assignment[tensor_c0[j]] * glue.gb.assignment[rj],
-                                    );
-                                    glue.gb.enforce_mul(tensor_c0[j], rj, m0);
-                                    let m1 = glue.gb.new_var(
-                                        glue.gb.assignment[tensor_c1[j]] * glue.gb.assignment[rj],
-                                    );
-                                    glue.gb.enforce_mul(tensor_c1[j], rj, m1);
-                                    terms0.push(m0);
-                                    terms1.push(m1);
+                                let mut zero = [0usize; 8];
+                                for i in 0..8 {
+                                    zero[i] = glue.gb.new_var(F257::ZERO);
+                                    glue.gb.enforce_var_eq_const(zero[i], F257::ZERO);
+                                    let _ = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, zero[i]);
                                 }
-                                let sum0 = {
-                                    let mut acc = F257::ZERO;
-                                    for &t in &terms0 {
-                                        acc += glue.gb.assignment[t];
-                                    }
-                                    let v = glue.gb.new_var(acc);
-                                    let mut lc: Vec<(F257, usize)> =
-                                        Vec::with_capacity(1 + terms0.len());
-                                    lc.push((F257::ONE, v));
-                                    for &t in &terms0 {
-                                        lc.push((-F257::ONE, t));
-                                    }
-                                    glue.gb.enforce_lc_times_one_eq_const(lc);
-                                    v
-                                };
-                                let sum1 = {
-                                    let mut acc = F257::ZERO;
-                                    for &t in &terms1 {
-                                        acc += glue.gb.assignment[t];
-                                    }
-                                    let v = glue.gb.new_var(acc);
-                                    let mut lc: Vec<(F257, usize)> =
-                                        Vec::with_capacity(1 + terms1.len());
-                                    lc.push((F257::ONE, v));
-                                    for &t in &terms1 {
-                                        lc.push((-F257::ONE, t));
-                                    }
-                                    glue.gb.enforce_lc_times_one_eq_const(lc);
-                                    v
-                                };
+                                let mut sum0 = zero;
+                                let mut sum1 = zero;
+                                for j in 0..kappa {
+                                    let rj = &coh0_bytes[base + j];
+                                    let m0 = frog_mul_mod_p_from_byte_vars(&mut glue.gb, &tensor_c0[j], rj);
+                                    let m1 = frog_mul_mod_p_from_byte_vars(&mut glue.gb, &tensor_c1[j], rj);
+                                    sum0 = frog_add_mod_p_from_byte_vars(&mut glue.gb, &sum0, &m0);
+                                    sum1 = frog_add_mod_p_from_byte_vars(&mut glue.gb, &sum1, &m1);
+                                }
                                 tcch0_local.push(sum0);
                                 tcch1_local.push(sum1);
                             }
@@ -1039,8 +1036,8 @@ fn finalize(
     u32_locals: Vec<BoundedU32ChallengeWiring>,
     frog_locals: Vec<FrogChallengeWiring>,
     frog_rejection_locals: Vec<FrogRejectionCoinWiring>,
-    tcch0_local: Vec<usize>,
-    tcch1_local: Vec<usize>,
+    tcch0_local: Vec<[usize; 8]>,
+    tcch1_local: Vec<[usize; 8]>,
     surfaces_mul_local: Vec<CmDigitMulSurfaceWiring>,
     surfaces_sq_local: Vec<CmDigitMulSqSurfaceWiring>,
     all_sum_digits: Arc<Vec<usize>>,
@@ -1055,8 +1052,8 @@ fn finalize(
         Vec<BoundedU32ChallengeWiring>,
         Vec<FrogChallengeWiring>,
         Vec<FrogRejectionCoinWiring>,
-        Vec<usize>,
-        Vec<usize>,
+        Vec<[usize; 8]>,
+        Vec<[usize; 8]>,
         Vec<CmDigitMulSurfaceWiring>,
         Vec<CmDigitMulSqSurfaceWiring>,
         PoseidonDr1csWiring,
@@ -1182,8 +1179,26 @@ fn finalize(
         u32s_out,
         frogs_out,
         frog_rejection_out,
-        tcch0_local.into_iter().map(to_glue_global).collect(),
-        tcch1_local.into_iter().map(to_glue_global).collect(),
+        tcch0_local
+            .into_iter()
+            .map(|arr| {
+                let mut out = [0usize; 8];
+                for i in 0..8 {
+                    out[i] = to_glue_global(arr[i]);
+                }
+                out
+            })
+            .collect(),
+        tcch1_local
+            .into_iter()
+            .map(|arr| {
+                let mut out = [0usize; 8];
+                for i in 0..8 {
+                    out[i] = to_glue_global(arr[i]);
+                }
+                out
+            })
+            .collect(),
         surfaces_out,
         surfaces_sq_out,
         pose_wiring,
@@ -1205,8 +1220,8 @@ pub(super) fn build(
         Vec<BoundedU32ChallengeWiring>,
         Vec<FrogChallengeWiring>,
         Vec<FrogRejectionCoinWiring>,
-        Vec<usize>,
-        Vec<usize>,
+        Vec<[usize; 8]>,
+        Vec<[usize; 8]>,
         Vec<CmDigitMulSurfaceWiring>,
         Vec<CmDigitMulSqSurfaceWiring>,
         PoseidonDr1csWiring,

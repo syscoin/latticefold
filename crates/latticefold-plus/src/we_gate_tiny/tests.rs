@@ -10,7 +10,10 @@ use crate::we_gate_tiny::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U32, LIMBS_U64
 
 use super::challenges::bounded_u32_from_8_digits_base128;
 use super::digits::*;
-use super::frog::{frog_u64_canonical_from_byte_vars, reduce_u64_mod_frog_from_byte_vars};
+use super::frog::{
+    frog_add_mod_p_from_byte_vars, frog_mul_mod_p_from_byte_vars, frog_sub_mod_p_from_byte_vars,
+    frog_u64_canonical_from_byte_vars, reduce_u64_mod_frog_from_byte_vars,
+};
 use super::gadgets::alloc_byte;
 
 use latticefold::transcript::Transcript;
@@ -161,6 +164,80 @@ fn test_frog_u64_canonical_from_bytes_accepts_lt_p_and_rejects_ge_p() {
 
     let (inst, asg) = b.into_instance();
     assert!(inst.check(&asg).is_err(), "u>=p should violate canonical constraint");
+}
+
+#[test]
+fn test_frog_mul_mod_p_from_bytes_matches_native() {
+    use rand::{RngCore, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(1234567);
+
+    for _ in 0..20 {
+        // Sample canonical a,b < p.
+        let a = (rng.next_u64() % FROG_P);
+        let b_u = (rng.next_u64() % FROG_P);
+        let exp = ((a as u128) * (b_u as u128) % (FROG_P as u128)) as u64;
+
+        let mut b = Dr1csBuilder::<F257>::new();
+        b.enforce_var_eq_const(b.one(), F257::ONE);
+        let mut a_bytes = [0usize; 8];
+        let mut b_bytes = [0usize; 8];
+        for (i, v) in a.to_le_bytes().into_iter().enumerate() {
+            a_bytes[i] = alloc_byte::<F257>(&mut b, v).byte;
+        }
+        for (i, v) in b_u.to_le_bytes().into_iter().enumerate() {
+            b_bytes[i] = alloc_byte::<F257>(&mut b, v).byte;
+        }
+
+        let r_bytes = frog_mul_mod_p_from_byte_vars(&mut b, &a_bytes, &b_bytes);
+        let mut out = [0u8; 8];
+        for i in 0..8 {
+            out[i] = var_to_u8::<F257>(&b, r_bytes[i]);
+        }
+        let got = u64::from_le_bytes(out);
+        assert_eq!(got, exp);
+
+        let (inst, asg) = b.into_instance();
+        inst.check(&asg).expect("mul mod p constraints satisfied");
+    }
+}
+
+#[test]
+fn test_frog_add_sub_mod_p_from_bytes_matches_native() {
+    use rand::{RngCore, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(222333444);
+
+    for _ in 0..20 {
+        let a = rng.next_u64() % FROG_P;
+        let c = rng.next_u64() % FROG_P;
+        let add_exp = ((a as u128 + c as u128) % (FROG_P as u128)) as u64;
+        let sub_exp = ((a as i128 - c as i128).rem_euclid(FROG_P as i128)) as u64;
+
+        let mut b = Dr1csBuilder::<F257>::new();
+        b.enforce_var_eq_const(b.one(), F257::ONE);
+        let mut a_bytes = [0usize; 8];
+        let mut c_bytes = [0usize; 8];
+        for (i, v) in a.to_le_bytes().into_iter().enumerate() {
+            a_bytes[i] = alloc_byte::<F257>(&mut b, v).byte;
+        }
+        for (i, v) in c.to_le_bytes().into_iter().enumerate() {
+            c_bytes[i] = alloc_byte::<F257>(&mut b, v).byte;
+        }
+
+        let add_r = frog_add_mod_p_from_byte_vars(&mut b, &a_bytes, &c_bytes);
+        let sub_r = frog_sub_mod_p_from_byte_vars(&mut b, &a_bytes, &c_bytes);
+
+        let mut out_add = [0u8; 8];
+        let mut out_sub = [0u8; 8];
+        for i in 0..8 {
+            out_add[i] = var_to_u8::<F257>(&b, add_r[i]);
+            out_sub[i] = var_to_u8::<F257>(&b, sub_r[i]);
+        }
+        assert_eq!(u64::from_le_bytes(out_add), add_exp);
+        assert_eq!(u64::from_le_bytes(out_sub), sub_exp);
+
+        let (inst, asg) = b.into_instance();
+        inst.check(&asg).expect("add/sub mod p constraints satisfied");
+    }
 }
 
 #[test]
