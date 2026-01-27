@@ -6,7 +6,7 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 use super::coins::frog_p_base128_digits_le;
 use super::digits::{
     add_bal16_same_len, alloc_bal16_digit, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
-    alloc_carry_pm128, alloc_carry_pm512, i32_to_f257, u64_bytes_to_bal16_digits_cached,
+    alloc_carry_pm128, alloc_carry_pm2, alloc_carry_pm512, i32_to_f257, u64_bytes_to_bal16_digits_cached,
 };
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
@@ -655,6 +655,108 @@ fn enforce_prod_eq_qp_plus_r_bal16(
     b.enforce_var_eq_const(zero, F257::ZERO);
 }
 
+/// Enforce `a + c = q*p + r` over balanced base-16 digits with a tight carry bound.
+fn enforce_add_mod_p_relation_bal16(
+    b: &mut Dr1csBuilder<F257>,
+    a_d: &[usize],
+    c_d: &[usize],
+    r_d: &[usize],
+    q: usize,
+    q_u8: u8,
+    p_d_const: &[i8; 17],
+) {
+    debug_assert!(q_u8 == 0 || q_u8 == 1);
+    let a = pad_bal16(b, a_d.to_vec(), 18);
+    let c = pad_bal16(b, c_d.to_vec(), 18);
+    let r = pad_bal16(b, r_d.to_vec(), 18);
+
+    let mut carry_var = b.new_var(F257::ZERO);
+    b.enforce_var_eq_const(carry_var, F257::ZERO);
+    let mut carry_i32: i32 = 0;
+
+    for k in 0..18 {
+        let ak = super::digits::f257_to_i32_bal(b.assignment[a[k]]);
+        let ck = super::digits::f257_to_i32_bal(b.assignment[c[k]]);
+        let rk = super::digits::f257_to_i32_bal(b.assignment[r[k]]);
+        let pk = if k < 17 { p_d_const[k] as i32 } else { 0 };
+
+        let sum = carry_i32 + ak + ck - rk - (q_u8 as i32) * pk;
+        debug_assert!(sum % 16 == 0, "add_mod_p carry not divisible: sum={sum} k={k}");
+        let carry_next = sum / 16;
+        debug_assert!(
+            (-2..=2).contains(&carry_next),
+            "add_mod_p carry out of pm2: {carry_next} (sum={sum}) at k={k}"
+        );
+        let carry_next_var = alloc_carry_pm2(b, carry_next);
+
+        let mut lc: Vec<(F257, usize)> = Vec::with_capacity(6);
+        lc.push((F257::ONE, carry_var));
+        lc.push((F257::ONE, a[k]));
+        lc.push((F257::ONE, c[k]));
+        lc.push((-F257::ONE, r[k]));
+        if k < 17 && p_d_const[k] != 0 {
+            lc.push((-i32_to_f257(p_d_const[k] as i32), q));
+        }
+        lc.push((-F257::from(16u64), carry_next_var));
+        b.enforce_lc_times_one_eq_const(lc);
+
+        carry_var = carry_next_var;
+        carry_i32 = carry_next;
+    }
+    b.enforce_var_eq_const(carry_var, F257::ZERO);
+}
+
+/// Enforce `a + q*p = c + r` over balanced base-16 digits with a tight carry bound.
+fn enforce_sub_mod_p_relation_bal16(
+    b: &mut Dr1csBuilder<F257>,
+    a_d: &[usize],
+    c_d: &[usize],
+    r_d: &[usize],
+    q: usize,
+    q_u8: u8,
+    p_d_const: &[i8; 17],
+) {
+    debug_assert!(q_u8 == 0 || q_u8 == 1);
+    let a = pad_bal16(b, a_d.to_vec(), 18);
+    let c = pad_bal16(b, c_d.to_vec(), 18);
+    let r = pad_bal16(b, r_d.to_vec(), 18);
+
+    let mut carry_var = b.new_var(F257::ZERO);
+    b.enforce_var_eq_const(carry_var, F257::ZERO);
+    let mut carry_i32: i32 = 0;
+
+    for k in 0..18 {
+        let ak = super::digits::f257_to_i32_bal(b.assignment[a[k]]);
+        let ck = super::digits::f257_to_i32_bal(b.assignment[c[k]]);
+        let rk = super::digits::f257_to_i32_bal(b.assignment[r[k]]);
+        let pk = if k < 17 { p_d_const[k] as i32 } else { 0 };
+
+        let sum = carry_i32 + ak + (q_u8 as i32) * pk - ck - rk;
+        debug_assert!(sum % 16 == 0, "sub_mod_p carry not divisible: sum={sum} k={k}");
+        let carry_next = sum / 16;
+        debug_assert!(
+            (-2..=2).contains(&carry_next),
+            "sub_mod_p carry out of pm2: {carry_next} (sum={sum}) at k={k}"
+        );
+        let carry_next_var = alloc_carry_pm2(b, carry_next);
+
+        let mut lc: Vec<(F257, usize)> = Vec::with_capacity(6);
+        lc.push((F257::ONE, carry_var));
+        lc.push((F257::ONE, a[k]));
+        lc.push((-F257::ONE, c[k]));
+        lc.push((-F257::ONE, r[k]));
+        if k < 17 && p_d_const[k] != 0 {
+            lc.push((i32_to_f257(p_d_const[k] as i32), q));
+        }
+        lc.push((-F257::from(16u64), carry_next_var));
+        b.enforce_lc_times_one_eq_const(lc);
+
+        carry_var = carry_next_var;
+        carry_i32 = carry_next;
+    }
+    b.enforce_var_eq_const(carry_var, F257::ZERO);
+}
+
 /// General Frog-field multiplication gadget (64-bit prime field) inside the tiny field.
 ///
 /// Inputs are canonical u64 encodings as 8 little-endian byte vars (0..255), representing
@@ -849,35 +951,11 @@ fn frog_add_mod_p_from_byte_vars_assume_canonical(
     }
     frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
 
-    // Digits: pad to length 18 so the final add carry must be 0.
+    let p_d0_const = frog_p_bal16_digits_le_const();
     let a_d0 = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
     let c_d0 = u64_bytes_to_bal16_digits_cached(b, *c_bytes);
-    let a_d = pad_bal16(b, a_d0, 18);
-    let c_d = pad_bal16(b, c_d0, 18);
-    let (sum_d, carry_sum) = add_bal16_same_len(b, &a_d, &c_d);
-    b.enforce_var_eq_const(carry_sum, F257::ZERO);
-
-    // p digits as constants (avoid allocating p bytes/digits every call).
-    let p_d0_const = frog_p_bal16_digits_le_const();
     let r_d0 = u64_bytes_to_bal16_digits_cached(b, r_bytes);
-    let r_d = pad_bal16(b, r_d0, 18);
-
-    // qp digits = q * p digits (q is boolean, p digits are constants in [-8,7]).
-    let mut qp_d: Vec<usize> = Vec::with_capacity(18);
-    for i in 0..18 {
-        let pd_i: i8 = if i < 17 { p_d0_const[i] } else { 0 };
-        let want: i8 = if q_u8 == 1 { pd_i } else { 0 };
-        // `out` is fully determined by the linear constraint below and the booleanity of `q`,
-        // so we do not need to pay for `alloc_bal16_digit`'s internal bit-decomposition.
-        let out = b.new_var(i32_to_f257(want as i32));
-        // out = pd_i * q  (linear, since pd_i is constant and q ∈ {0,1})
-        b.enforce_lc_times_one_eq_const(vec![(F257::ONE, out), (-i32_to_f257(pd_i as i32), q)]);
-        qp_d.push(out);
-    }
-
-    let (rhs_d, carry_rhs) = add_bal16_same_len(b, &qp_d, &r_d);
-    b.enforce_var_eq_const(carry_rhs, F257::ZERO);
-    enforce_bal16_vec_eq(b, &sum_d, &rhs_d);
+    enforce_add_mod_p_relation_bal16(b, &a_d0, &c_d0, &r_d0, q, q_u8, &p_d0_const);
 
     let out = r_bytes;
     b.profile_exit(_prev);
@@ -937,30 +1015,11 @@ fn frog_sub_mod_p_from_byte_vars_assume_canonical(
     }
     frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
 
-    // Enforce a + q*p == c + r (as integers) using balanced digits.
     let a_d0 = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
     let c_d0 = u64_bytes_to_bal16_digits_cached(b, *c_bytes);
     let r_d0 = u64_bytes_to_bal16_digits_cached(b, r_bytes);
-    let a_d = pad_bal16(b, a_d0, 18);
-    let c_d = pad_bal16(b, c_d0, 18);
-    let r_d = pad_bal16(b, r_d0, 18);
-
-    // p digits as constants (avoid allocating p bytes/digits every call).
     let p_d0_const = frog_p_bal16_digits_le_const();
-    let mut qp_d: Vec<usize> = Vec::with_capacity(18);
-    for i in 0..18 {
-        let pd_i: i8 = if i < 17 { p_d0_const[i] } else { 0 };
-        let want: i8 = if q_u8 == 1 { pd_i } else { 0 };
-        let out = b.new_var(i32_to_f257(want as i32));
-        b.enforce_lc_times_one_eq_const(vec![(F257::ONE, out), (-i32_to_f257(pd_i as i32), q)]);
-        qp_d.push(out);
-    }
-
-    let (lhs_d, carry_lhs) = add_bal16_same_len(b, &a_d, &qp_d);
-    b.enforce_var_eq_const(carry_lhs, F257::ZERO);
-    let (rhs_d, carry_rhs) = add_bal16_same_len(b, &c_d, &r_d);
-    b.enforce_var_eq_const(carry_rhs, F257::ZERO);
-    enforce_bal16_vec_eq(b, &lhs_d, &rhs_d);
+    enforce_sub_mod_p_relation_bal16(b, &a_d0, &c_d0, &r_d0, q, q_u8, &p_d0_const);
 
     let out = r_bytes;
     b.profile_exit(_prev);
