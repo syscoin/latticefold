@@ -40,6 +40,12 @@ pub struct Dr1csBuilder<F: PrimeField> {
     /// Key: 4 byte variables (little-endian). Value: balanced-base16 digits (len 9).
     pub u32_bal16_cache: BTreeMap<[usize; 4], Vec<usize>>,
 
+    /// Cache for a single variable constrained to 0.
+    ///
+    /// Many gadgets need a reusable 0 variable; allocating it once avoids repeated boolean
+    /// decompositions for constant-zero digits/limbs.
+    pub zero_var_cache: Option<usize>,
+
     // -------------------------------------------------------------------------
     // Optional profiling (enabled by env var; low overhead when disabled).
     // -------------------------------------------------------------------------
@@ -60,6 +66,7 @@ impl<F: PrimeField> Dr1csBuilder<F> {
             byte_bits_cache: BTreeMap::new(),
             u64_bal16_cache: BTreeMap::new(),
             u32_bal16_cache: BTreeMap::new(),
+            zero_var_cache: None,
             profile_enabled,
             profile_current: None,
             profile: BTreeMap::new(),
@@ -90,6 +97,17 @@ impl<F: PrimeField> Dr1csBuilder<F> {
     }
     pub fn enforce_mul(&mut self, x: usize, y: usize, out: usize) {
         self.add_constraint(vec![(F::ONE, x)], vec![(F::ONE, y)], vec![(F::ONE, out)]);
+    }
+
+    /// Return a reusable variable constrained to 0.
+    pub fn zero_var(&mut self) -> usize {
+        if let Some(v) = self.zero_var_cache {
+            return v;
+        }
+        let v = self.new_var(F::ZERO);
+        self.enforce_var_eq_const(v, F::ZERO);
+        self.zero_var_cache = Some(v);
+        v
     }
     pub fn into_instance(self) -> (SparseDr1csInstance<F>, Vec<F>) {
         let inst = SparseDr1csInstance { nvars: self.assignment.len(), constraints: self.rows };

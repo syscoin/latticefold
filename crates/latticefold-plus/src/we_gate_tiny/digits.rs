@@ -609,13 +609,18 @@ fn shift_pad_bal16(digits: &[usize], shift: usize, target_len: usize, zero_digit
     out
 }
 
+#[inline]
+fn bal16_zero(b: &mut Dr1csBuilder<F257>) -> usize {
+    b.zero_var()
+}
+
 pub(crate) fn sum_product_digits_bal16(
     b: &mut Dr1csBuilder<F257>,
     products13: &[[usize; 13]],
     target_len: usize,
 ) -> Vec<usize> {
     assert!(target_len >= 13);
-    let zero = alloc_bal16_digit(b, 0);
+    let zero = bal16_zero(b);
 
     let mut acc = vec![zero; target_len];
     for p13 in products13 {
@@ -633,7 +638,7 @@ pub(crate) fn sum_product_digits_bal16_22(
     target_len: usize,
 ) -> Vec<usize> {
     assert!(target_len >= 22);
-    let zero = alloc_bal16_digit(b, 0);
+    let zero = bal16_zero(b);
     let mut acc = vec![zero; target_len];
     for p22 in products22 {
         let padded = shift_pad_bal16(p22, 0, target_len, zero);
@@ -649,7 +654,7 @@ pub(crate) fn sum_bal16_vectors_fixed_len(
     vecs: &[&[usize]],
     len: usize,
 ) -> Vec<usize> {
-    let zero = alloc_bal16_digit(b, 0);
+    let zero = bal16_zero(b);
     let mut acc = vec![zero; len];
     for v in vecs {
         assert_eq!(v.len(), len);
@@ -666,7 +671,7 @@ pub(crate) fn sum_products13_coeffwise_fixed_len(
     ring_dim: usize,
     out_len: usize,
 ) -> Vec<Vec<usize>> {
-    let zero = alloc_bal16_digit(b, 0);
+    let zero = bal16_zero(b);
     let mut out: Vec<Vec<usize>> = Vec::with_capacity(ring_dim);
     for coeff_idx in 0..ring_dim {
         let mut acc = vec![zero; out_len];
@@ -688,7 +693,7 @@ pub(crate) fn sum_products22_coeffwise_fixed_len(
     ring_dim: usize,
     out_len: usize,
 ) -> Vec<Vec<usize>> {
-    let zero = alloc_bal16_digit(b, 0);
+    let zero = bal16_zero(b);
     let mut out: Vec<Vec<usize>> = Vec::with_capacity(ring_dim);
     for coeff_idx in 0..ring_dim {
         let mut acc = vec![zero; out_len];
@@ -738,7 +743,7 @@ fn mul_bal16_9_by_9_u32ish(b: &mut Dr1csBuilder<F257>, a9: &[usize], b9: &[usize
     assert_eq!(a9.len(), 9);
     assert_eq!(b9.len(), 9);
 
-    let zero_digit = alloc_bal16_digit(b, 0);
+    let zero_digit = bal16_zero(b);
 
     let a0: [usize; 3] = [a9[0], a9[1], a9[2]];
     let a1: [usize; 3] = [a9[3], a9[4], a9[5]];
@@ -780,7 +785,7 @@ pub(crate) fn mul_u32ish9_to_fixed_bal16(
     assert_eq!(b9.len(), 9);
     assert!(out_len >= 16, "u32*u32 fits in 16 nibbles; use >=16 for headroom");
 
-    let zero = alloc_bal16_digit(b, 0);
+    let zero = bal16_zero(b);
     let raw = mul_bal16_9_by_9_u32ish(b, a9, b9);
     if raw.len() <= out_len {
         let mut out = raw;
@@ -797,9 +802,9 @@ pub(crate) fn mul_u32ish9_to_fixed_bal16(
 pub(crate) fn mul_bal16_long_by_u32ish9(b: &mut Dr1csBuilder<F257>, a: &[usize], b9: &[usize]) -> Vec<usize> {
     assert_eq!(b9.len(), 9);
     if a.is_empty() {
-        return vec![alloc_bal16_digit(b, 0)];
+        return vec![bal16_zero(b)];
     }
-    let zero = alloc_bal16_digit(b, 0);
+    let zero = bal16_zero(b);
     let blocks = (a.len() + 2) / 3;
     let target_len = 3 * blocks + 13 + 1;
     let mut acc = vec![zero; target_len];
@@ -827,7 +832,7 @@ pub(crate) fn mul_bal16_long_by_u32ish9(b: &mut Dr1csBuilder<F257>, a: &[usize],
 pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb: &[usize]) -> Vec<usize> {
     let _prev = b.profile_enter("digits::mul_bal16_long_by_long");
     if a.is_empty() || bb.is_empty() {
-        let out = vec![alloc_bal16_digit(b, 0)];
+        let out = vec![bal16_zero(b)];
         b.profile_exit(_prev);
         return out;
     }
@@ -946,7 +951,7 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
     }
     let (short, long) = if a.len() <= bb.len() { (a, bb) } else { (bb, a) };
 
-    let zero = alloc_bal16_digit(b, 0);
+    let zero = bal16_zero(b);
     let blocks = (short.len() + 2) / 3;
 
     let per_block_len = long.len() + 5;
@@ -1145,7 +1150,7 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
 ) -> Vec<usize> {
     let _prev = b.profile_enter("digits::mul_bal16_long_by_const_rhs");
     if a.is_empty() || bb_const.is_empty() {
-        let out = vec![alloc_bal16_digit(b, 0)];
+        let out = vec![bal16_zero(b)];
         b.profile_exit(_prev);
         return out;
     }
@@ -1272,7 +1277,7 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
         return out;
     }
 
-    let zero = alloc_bal16_digit(b, 0);
+    let zero = bal16_zero(b);
     let blocks = (a.len() + 2) / 3;
     let per_block_len = bb_const.len() + 5;
     // Add 1 digit of headroom so that we can enforce carry_out=0 when summing blocks.
