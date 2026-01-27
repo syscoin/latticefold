@@ -581,6 +581,30 @@ fn enforce_prod_eq_qp_plus_r_bal16(
     p_d_const: &[i8],
     r_d: &[usize],
 ) {
+    // Strict soundness mode: avoid the fused pm128 carry-chain relation, which can wrap mod 257.
+    //
+    // Instead, materialize `qp = q*p` in bal16 digits (using the safe mul-by-const gadget),
+    // add `r`, and enforce equality to `prod` using the bal16 add gadget (pm1 carries).
+    if strict_nowrap_enabled() {
+        let max_len = prod_d
+            .len()
+            .max(r_d.len())
+            .max(q_d.len().saturating_add(p_d_const.len()).saturating_sub(1))
+            + 1; // headroom digit
+
+        let prod_pad = pad_bal16(b, prod_d.to_vec(), max_len);
+        let r_pad = pad_bal16(b, r_d.to_vec(), max_len);
+
+        let qp = mul_bal16_long_by_const_rhs(b, q_d, p_d_const);
+        let qp_pad = pad_bal16(b, qp, max_len);
+
+        let (sum, carry) = add_bal16_same_len(b, &qp_pad, &r_pad);
+        b.enforce_var_eq_const(carry, F257::ZERO);
+
+        enforce_bal16_vec_eq(b, &prod_pad, &sum);
+        return;
+    }
+
     let zero = b.zero_var();
     let max_len = prod_d
         .len()
@@ -596,36 +620,6 @@ fn enforce_prod_eq_qp_plus_r_bal16(
     let mut carry_var = b.new_var(F257::ZERO);
     b.enforce_var_eq_const(carry_var, F257::ZERO);
     let mut carry_i32: i32 = 0;
-
-    if strict_nowrap_enabled() {
-        // Conservative no-wrap check for the per-digit constraint:
-        //
-        //   carry + prod_k - r_k - Σ_i (q_i * p_{k-i}) - 16*carry_next == 0   (in F257)
-        //
-        // Bounds:
-        // - carry, carry_next ∈ [-128,127]
-        // - prod_k, r_k ∈ [-8,7]
-        // - q_i ∈ [-8,7], p_j ∈ [-8,7]  =>  |q_i*p_j| ≤ 64
-        //
-        // With up to T_k terms in the Σ, a sufficient condition to avoid wrap is:
-        //   max_abs_LHS < 257.
-        //
-        // This is intentionally conservative; if it fails, the constraint may only enforce a
-        // mod-257 relation (potential soundness hazard).
-        let mut prev = 0i32;
-        let ql = q_d.len();
-        let pl = p_d_const.len();
-        for k in 0..max_len {
-            let t = ((k + 1).min(ql)).min(pl) as i32;
-            let ck = 128i32; // carry_next is pm128 here
-            let max_abs = prev + 8 + 8 + 64 * t + 16 * ck;
-            debug_assert!(
-                max_abs < 257,
-                "LF_STRICT_NOWRAP failed (enforce_prod_eq_qp_plus_r_bal16): k={k} terms={t} prev_bound={prev} carry_next_bound={ck} => max_abs_LHS={max_abs} >= 257"
-            );
-            prev = ck;
-        }
-    }
 
     for k in 0..max_len {
         // Witness the exact carry update from the already-witnessed digits.
