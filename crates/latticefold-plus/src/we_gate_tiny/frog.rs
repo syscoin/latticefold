@@ -1012,9 +1012,13 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
         // -----------------------
         let p_d_const = frog_p_bal16_digits_le_const();
 
-        // Each product uses 17-digit eval * 17-digit coeff => mul gadget yields len ~39.
-        // We pick a slightly larger target len to guarantee no overflow in summation.
-        const TARGET_LEN: usize = 42;
+        // Each product uses 17-digit eval * 17-digit coeff. Our digit multiplication gadgets
+        // intentionally include headroom in their output length; with the current implementation
+        // of `mul_bal16_long_by_const_rhs`, this lands at length 43 for 17×17 and also for q*p.
+        //
+        // Important: this must be >= the lengths produced by `mul_bal16_long_by_const_rhs` below;
+        // otherwise we'll end up adding mismatched-length vectors (and, worse, could truncate).
+        const TARGET_LEN: usize = 43;
         let zero_digit = alloc_bal16_digit(b, 0);
 
         let mut acc: Vec<usize> = vec![zero_digit; TARGET_LEN];
