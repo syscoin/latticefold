@@ -5,6 +5,11 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits, ByteVar};
 
+#[inline]
+fn strict_nowrap_enabled() -> bool {
+    std::env::var("LF_STRICT_NOWRAP").ok().as_deref() == Some("1")
+}
+
 // -----------------------------------------------------------------------------
 // Balanced base-16 (nibble) gadgets for *bounded* integer arithmetic in F257.
 // -----------------------------------------------------------------------------
@@ -1058,6 +1063,30 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
             cb = next_carry_bound(cb, t);
             carry_bounds.push(cb);
         }
+        if strict_nowrap_enabled() {
+            // Check whether the per-step carry constraint could wrap mod 257.
+            //
+            // Constraint shape (in F257):
+            //   carry + Σ (a_i*b_j) - digit - 16*carry_out == 0
+            //
+            // With |a_i*b_j| <= 64, |digit| <= 8, and carry/carry_out bounded by carry_bounds,
+            // a sufficient (very conservative) no-wrap condition is:
+            //   max_abs(carry + Σprods - digit - 16*carry_out) < 257
+            //
+            // If this fails, the constraint enforces only a mod-257 relation and may admit
+            // non-integer-consistent witnesses.
+            let mut prev = 0i32;
+            for k in 0..(la + lb - 1) {
+                let t = terms_at_pos(k, la, lb);
+                let ck = carry_bounds[k];
+                let max_abs = prev + 64 * t + 8 + 16 * ck;
+                debug_assert!(
+                    max_abs < 257,
+                    "LF_STRICT_NOWRAP failed (mul_bal16_long_by_long): la={la} lb={lb} k={k} terms={t} prev_bound={prev} carry_bound={ck} => max_abs_LHS={max_abs} >= 257"
+                );
+                prev = ck;
+            }
+        }
 
         let div_floor = |x: i32, d: i32| -> i32 {
             debug_assert!(d > 0);
@@ -1440,6 +1469,20 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
             let t = terms_at_pos(k, la, lb);
             cb = next_carry_bound(cb, t);
             carry_bounds.push(cb);
+        }
+        if strict_nowrap_enabled() {
+            // Same check as mul_bal16_long_by_long, but RHS digits are constants; |a_i*const| <= 64.
+            let mut prev = 0i32;
+            for k in 0..(la + lb - 1) {
+                let t = terms_at_pos(k, la, lb);
+                let ck = carry_bounds[k];
+                let max_abs = prev + 64 * t + 8 + 16 * ck;
+                debug_assert!(
+                    max_abs < 257,
+                    "LF_STRICT_NOWRAP failed (mul_bal16_long_by_const_rhs): la={la} lb={lb} k={k} terms={t} prev_bound={prev} carry_bound={ck} => max_abs_LHS={max_abs} >= 257"
+                );
+                prev = ck;
+            }
         }
 
         let div_floor = |x: i32, d: i32| -> i32 {

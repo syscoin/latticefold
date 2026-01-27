@@ -12,6 +12,11 @@ use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
 use crate::we_frog_poseidon_f257::FROG_P;
 
+#[inline]
+fn strict_nowrap_enabled() -> bool {
+    std::env::var("LF_STRICT_NOWRAP").ok().as_deref() == Some("1")
+}
+
 fn frog_p_bal16_digits_le_const() -> [i8; 17] {
     // Match the balancing convention used by `u64_bytes_to_bal16_digits`:
     // carry_{i+1} = (nibble_i + carry_i >= 8), out_i = nibble_i + carry_i - 16*carry_{i+1}.
@@ -591,6 +596,36 @@ fn enforce_prod_eq_qp_plus_r_bal16(
     let mut carry_var = b.new_var(F257::ZERO);
     b.enforce_var_eq_const(carry_var, F257::ZERO);
     let mut carry_i32: i32 = 0;
+
+    if strict_nowrap_enabled() {
+        // Conservative no-wrap check for the per-digit constraint:
+        //
+        //   carry + prod_k - r_k - Σ_i (q_i * p_{k-i}) - 16*carry_next == 0   (in F257)
+        //
+        // Bounds:
+        // - carry, carry_next ∈ [-128,127]
+        // - prod_k, r_k ∈ [-8,7]
+        // - q_i ∈ [-8,7], p_j ∈ [-8,7]  =>  |q_i*p_j| ≤ 64
+        //
+        // With up to T_k terms in the Σ, a sufficient condition to avoid wrap is:
+        //   max_abs_LHS < 257.
+        //
+        // This is intentionally conservative; if it fails, the constraint may only enforce a
+        // mod-257 relation (potential soundness hazard).
+        let mut prev = 0i32;
+        let ql = q_d.len();
+        let pl = p_d_const.len();
+        for k in 0..max_len {
+            let t = ((k + 1).min(ql)).min(pl) as i32;
+            let ck = 128i32; // carry_next is pm128 here
+            let max_abs = prev + 8 + 8 + 64 * t + 16 * ck;
+            debug_assert!(
+                max_abs < 257,
+                "LF_STRICT_NOWRAP failed (enforce_prod_eq_qp_plus_r_bal16): k={k} terms={t} prev_bound={prev} carry_next_bound={ck} => max_abs_LHS={max_abs} >= 257"
+            );
+            prev = ck;
+        }
+    }
 
     for k in 0..max_len {
         // Witness the exact carry update from the already-witnessed digits.
