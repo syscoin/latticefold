@@ -1530,7 +1530,6 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
                 a1: &[usize; 8],
                 b0: &[usize; 8],
                 b1: &[usize; 8],
-                zero: [usize; 8],
             ) -> [[usize; 8]; 3] {
                 // z0 = a0*b0
                 let z0 = frog_mul_mod_p_from_byte_vars_assume_canonical(b, a0, b0);
@@ -1561,9 +1560,9 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
             let c1_1 = &c[3];
 
             // z0 = a0*c0 (len 3)
-            let z0 = karatsuba_len2(b, a0_0, a0_1, c0_0, c0_1, zero);
+            let z0 = karatsuba_len2(b, a0_0, a0_1, c0_0, c0_1);
             // z2 = a1*c1 (len 3)
-            let z2 = karatsuba_len2(b, a1_0, a1_1, c1_0, c1_1, zero);
+            let z2 = karatsuba_len2(b, a1_0, a1_1, c1_0, c1_1);
 
             // s_a = a0 + a1, s_c = c0 + c1 (len 2 each)
             let sa0 = frog_add_mod_p_from_byte_vars_assume_canonical(b, a0_0, a1_0);
@@ -1572,7 +1571,7 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
             let sc1 = frog_add_mod_p_from_byte_vars_assume_canonical(b, c0_1, c1_1);
 
             // z1_full = (a0+a1)*(c0+c1) (len 3)
-            let z1_full = karatsuba_len2(b, &sa0, &sa1, &sc0, &sc1, zero);
+            let z1_full = karatsuba_len2(b, &sa0, &sa1, &sc0, &sc1);
 
             // z1 = z1_full - z0 - z2 (len 3)
             let mut z1 = [zero; 3];
@@ -1582,22 +1581,19 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
             }
 
             // Assemble len-7: out = z0 + x^2 z1 + x^4 z2.
-            let mut out = vec![zero; 7];
-            // z0 at shift 0
-            for i in 0..3 {
-                out[i] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &out[i], &z0[i]);
-            }
-            // z1 at shift 2
-            for i in 0..3 {
-                let idx = 2 + i;
-                out[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &out[idx], &z1[i]);
-            }
-            // z2 at shift 4
-            for i in 0..3 {
-                let idx = 4 + i;
-                out[idx] = frog_add_mod_p_from_byte_vars_assume_canonical(b, &out[idx], &z2[i]);
-            }
-            out
+            //
+            // Write directly to avoid unnecessary add-with-zero constraints.
+            let out2 = frog_add_mod_p_from_byte_vars_assume_canonical(b, &z0[2], &z1[0]);
+            let out4 = frog_add_mod_p_from_byte_vars_assume_canonical(b, &z1[2], &z2[0]);
+            vec![
+                z0[0],  // x^0
+                z0[1],  // x^1
+                out2,   // x^2
+                z1[1],  // x^3
+                out4,   // x^4
+                z2[1],  // x^5
+                z2[2],  // x^6
+            ]
         }
 
         let m = 4;
