@@ -1087,6 +1087,36 @@ pub(super) fn build(
     // (Skip fiat–shamir reabsorbs, which are F257 digits and may contain 256.)
     enforce_nonreabsorb_absorbs_are_canonical_frog(&mut glue, ops, &pose_wiring)?;
 
+    // Deterministic schedule sanity (aligns with `CmProof::verify_with_mlen`):
+    // After the first short squeeze, CM consumes:
+    // - `log_kappa` challenges for c0
+    // - `log_kappa` challenges for c1
+    // - rc0, rc1 (2)
+    // - sumcheck r0/r1 (2*nvars_cm)
+    // Total = 2*log_kappa + 2 + 2*nvars_cm.
+    if wiring.short_squeeze_ops.is_empty() {
+        return Err("tiny gate: expected CM short squeezes (short_squeeze_ops empty)".to_string());
+    }
+    let first_short_op = *wiring
+        .short_squeeze_ops
+        .iter()
+        .min()
+        .expect("non-empty short_squeeze_ops");
+    let cm_u32_start = wiring.u32_squeeze_ops.iter().filter(|&&idx| idx < first_short_op).count();
+    let cm_u32_have = wiring.u32_squeeze_ops.len().saturating_sub(cm_u32_start);
+    let kappa = params.kappa as usize;
+    if kappa == 0 || !kappa.is_power_of_two() {
+        return Err("tiny gate: params.kappa must be a power of two".to_string());
+    }
+    let log_kappa = usize::BITS as usize - 1 - kappa.leading_zeros() as usize;
+    let nvars_cm = params.nvars_cm as usize;
+    let cm_u32_need = 2 * log_kappa + 2 + 2 * nvars_cm;
+    if cm_u32_have < cm_u32_need {
+        return Err(format!(
+            "tiny gate: not enough CM u32 challenges after absorb_comh: have={cm_u32_have} need={cm_u32_need}"
+        ));
+    }
+
 
     let short_locals = build_short_blocks(&mut glue, &pose_wiring, ring_dim, &short_ranges)?;
     let (u32_locals, frog_locals) =
