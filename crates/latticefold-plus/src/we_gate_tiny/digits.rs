@@ -1743,9 +1743,11 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
     }
 
     // Fox #1: sum as loose digits, normalize once (only when bound is < 128).
-    let per_term_bound: i32 = 10; // conservative
+    let per_term_bound: i32 = 10; // conservative per shifted block (digits in [-8,7], tail carry small)
     let acc_bound: i32 = (blocks as i32) * per_term_bound;
-    let out = if a.len() <= 19 && bb_const.len() <= 17 && acc_bound < 128 {
+    // Enable loose summation whenever the resulting digit bound is provably < 128 (no-wrap).
+    // This includes the important `q*p` case inside strict reductions where `q` may be ~33 digits.
+    let out = if acc_bound < 128 {
         let mut acc = vec![zero; target_len];
         for t in &terms {
             add_bal16_loose_in_place(b, &mut acc, t);
