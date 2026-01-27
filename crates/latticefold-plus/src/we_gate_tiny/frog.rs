@@ -6,7 +6,7 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 use super::coins::frog_p_base128_digits_le;
 use super::digits::{
     add_bal16_same_len, alloc_bal16_digit, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
-    alloc_carry_pm2, alloc_carry_pm_dynamic_le128, alloc_carry_pm_dynamic_le512, i32_to_f257,
+    alloc_carry_pm2_dynamic, alloc_carry_pm_dynamic_le128, alloc_carry_pm_dynamic_le512, i32_to_f257,
     u64_bytes_to_bal16_digits_cached,
 };
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
@@ -671,8 +671,7 @@ fn enforce_add_mod_p_relation_bal16(
     let c = pad_bal16(b, c_d.to_vec(), 18);
     let r = pad_bal16(b, r_d.to_vec(), 18);
 
-    let mut carry_var = b.new_var(F257::ZERO);
-    b.enforce_var_eq_const(carry_var, F257::ZERO);
+    let mut carry_var = b.zero_var();
     let mut carry_i32: i32 = 0;
 
     for k in 0..18 {
@@ -688,7 +687,7 @@ fn enforce_add_mod_p_relation_bal16(
             (-2..=2).contains(&carry_next),
             "add_mod_p carry out of pm2: {carry_next} (sum={sum}) at k={k}"
         );
-        let carry_next_var = alloc_carry_pm2(b, carry_next);
+        let carry_next_var = alloc_carry_pm2_dynamic(b, carry_next);
 
         let mut lc: Vec<(F257, usize)> = Vec::with_capacity(6);
         lc.push((F257::ONE, carry_var));
@@ -722,8 +721,7 @@ fn enforce_sub_mod_p_relation_bal16(
     let c = pad_bal16(b, c_d.to_vec(), 18);
     let r = pad_bal16(b, r_d.to_vec(), 18);
 
-    let mut carry_var = b.new_var(F257::ZERO);
-    b.enforce_var_eq_const(carry_var, F257::ZERO);
+    let mut carry_var = b.zero_var();
     let mut carry_i32: i32 = 0;
 
     for k in 0..18 {
@@ -739,7 +737,7 @@ fn enforce_sub_mod_p_relation_bal16(
             (-2..=2).contains(&carry_next),
             "sub_mod_p carry out of pm2: {carry_next} (sum={sum}) at k={k}"
         );
-        let carry_next_var = alloc_carry_pm2(b, carry_next);
+        let carry_next_var = alloc_carry_pm2_dynamic(b, carry_next);
 
         let mut lc: Vec<(F257, usize)> = Vec::with_capacity(6);
         lc.push((F257::ONE, carry_var));
