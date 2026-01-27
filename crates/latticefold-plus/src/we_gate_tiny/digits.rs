@@ -553,6 +553,148 @@ pub(crate) fn add_bal16_same_len(
     res
 }
 
+// -----------------------------------------------------------------------------
+// Fox #1 (sound variant): loose digits + boundary normalization.
+// -----------------------------------------------------------------------------
+//
+// We often need to sum many base-16 digit vectors. Doing a full carry-propagating
+// normalization (`add_bal16_same_len`) after every partial sum is expensive because it
+// allocates fresh balanced digits (and carries).
+//
+// A cheaper approach is:
+// 1) keep a *redundant* representation where each digit can be outside [-8,7]
+//    (still interpreted as Σ digit[i]*16^i), and update it with digitwise additions
+//    (no carries), enforced by a single linear constraint per digit;
+// 2) normalize once at the boundary into balanced digits [-8,7] with a carry chain.
+//
+// Soundness requirement:
+// All linear relations used to build the loose digits must be *no-wrap* over F257,
+// i.e. each digit value stays in (-128,128) so that equality mod 257 implies equality
+// over the integers. We enforce this by only enabling the loose path when the caller
+// provides a conservative, statement-derived bound < 128.
+
+/// Add `src` into `acc` digitwise (no carry propagation).
+///
+/// This preserves the integer value \(\sum_i digit[i]·16^i\) but allows digits to grow
+/// outside [-8,7]. The caller must keep a conservative bound on digit magnitudes < 128.
+#[inline]
+fn add_bal16_loose_in_place(b: &mut Dr1csBuilder<F257>, acc: &mut [usize], src: &[usize]) {
+    debug_assert_eq!(acc.len(), src.len());
+    for i in 0..acc.len() {
+        let v = b.new_var(b.assignment[acc[i]] + b.assignment[src[i]]);
+        // v = acc[i] + src[i]
+        b.enforce_lc_times_one_eq_const(vec![
+            (F257::ONE, v),
+            (-F257::ONE, acc[i]),
+            (-F257::ONE, src[i]),
+        ]);
+        acc[i] = v;
+    }
+}
+
+/// Normalize a loose base-16 digit vector (little-endian) into balanced digits in [-8,7].
+///
+/// Returns `(out_digits, carry_out)`, where `out_digits.len() == loose.len()`.
+/// The caller typically enforces `carry_out == 0` (i.e. the value fits).
+fn normalize_bal16_loose_same_len_with_bound(
+    b: &mut Dr1csBuilder<F257>,
+    loose: &[usize],
+    digit_abs_bound: i32,
+) -> (Vec<usize>, usize) {
+    let _prev = b.profile_enter("digits::normalize_bal16_loose");
+    debug_assert!(digit_abs_bound >= 0);
+    // Critical for no-wrap soundness when interpreting F257 as integers.
+    debug_assert!(digit_abs_bound < 128);
+
+    #[inline]
+    fn alloc_carry_with_bound(b: &mut Dr1csBuilder<F257>, c: i32, bound: i32) -> usize {
+        debug_assert!(bound >= 0);
+        if bound <= 1 {
+            alloc_carry_pm1(b, c)
+        } else if bound <= 2 {
+            alloc_carry_pm2(b, c)
+        } else if bound <= 7 {
+            alloc_carry_pm8(b, c)
+        } else if bound <= 15 {
+            alloc_carry_pm16(b, c)
+        } else if bound <= 31 {
+            alloc_carry_pm32(b, c)
+        } else if bound <= 63 {
+            alloc_carry_pm64(b, c)
+        } else {
+            alloc_carry_pm128(b, c)
+        }
+    }
+
+    // Compute a conservative, statement-derived carry bound schedule from `digit_abs_bound`.
+    //
+    // If |d_i| <= B and |carry_i| <= C, then |d_i + carry_i| <= B + C, so
+    // |carry_{i+1}| <= floor((B + C + 8)/16) + 1.
+    let mut carry_bound: i32 = 0;
+    let mut carry_bounds: Vec<i32> = Vec::with_capacity(loose.len());
+    for _ in 0..loose.len() {
+        let max_sum = digit_abs_bound + carry_bound;
+        carry_bound = ((max_sum + 8) / 16) + 1;
+        carry_bounds.push(carry_bound);
+        debug_assert!(carry_bound < 128);
+    }
+
+    let mut out: Vec<usize> = Vec::with_capacity(loose.len());
+    let mut carry_i32: i32 = 0;
+    let mut carry_var = b.zero_var();
+
+    // div_floor(x/16) for possibly-negative x.
+    let div_floor = |x: i32, d: i32| -> i32 {
+        debug_assert!(d > 0);
+        if x >= 0 { x / d } else { -(((-x) + d - 1) / d) }
+    };
+
+    for (i, &dv) in loose.iter().enumerate() {
+        let di = f257_to_i32_bal(b.assignment[dv]);
+        debug_assert!(
+            (-digit_abs_bound..=digit_abs_bound).contains(&di),
+            "normalize_bal16_loose: digit out of assumed bound (|d|<={}): got {di}",
+            digit_abs_bound
+        );
+        let sum = di + carry_i32;
+
+        let mut carry_next = div_floor(sum + 8, NIBBLE_BASE);
+        let mut rem = sum - NIBBLE_BASE * carry_next;
+        while rem > 7 {
+            carry_next += 1;
+            rem -= NIBBLE_BASE;
+        }
+        while rem < -8 {
+            carry_next -= 1;
+            rem += NIBBLE_BASE;
+        }
+        debug_assert!((-8..=7).contains(&rem));
+        debug_assert!(
+            (-carry_bounds[i]..=carry_bounds[i]).contains(&carry_next),
+            "normalize_bal16_loose: carry out of bound at i={i}: {carry_next} (bound={})",
+            carry_bounds[i]
+        );
+
+        let rem_digit = alloc_bal16_digit(b, rem as i8);
+        let carry_next_var = alloc_carry_with_bound(b, carry_next, carry_bounds[i]);
+
+        // loose_i + carry_i - rem_i - 16*carry_{i+1} = 0
+        b.enforce_lc_times_one_eq_const(vec![
+            (F257::ONE, dv),
+            (F257::ONE, carry_var),
+            (-F257::ONE, rem_digit),
+            (-F257::from(16u64), carry_next_var),
+        ]);
+
+        out.push(rem_digit);
+        carry_i32 = carry_next;
+        carry_var = carry_next_var;
+    }
+
+    b.profile_exit(_prev);
+    (out, carry_var)
+}
+
 /// Add three balanced base-16 digit vectors of the same length.
 ///
 /// Assumes each digit is in [-8,7]. Enforces output digits in [-8,7] and carry in [-2,2].
@@ -1189,6 +1331,34 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
     let target_len = per_block_len + 3 * (blocks - 1) + 2;
     let mut acc = vec![zero; target_len];
 
+    // Fox #1: when dimensions are small (WE-gate typical), sum block-shifted terms as *loose*
+    // digits and normalize once. This avoids repeated carry-normalizations.
+    //
+    // We only enable this when the loose digit bound is provably < 128 (no-wrap).
+    if long.len() <= 19 && short.len() <= 19 {
+        let per_term_bound: i32 = 10; // conservative: digits in [-8,7] plus small tail carry
+        let acc_bound: i32 = (blocks as i32) * per_term_bound;
+        if acc_bound < 128 {
+            for blk in 0..blocks {
+                let start = blk * 3;
+                let end = core::cmp::min(start + 3, short.len());
+                let mut coeff3 = [zero; 3];
+                for j in 0..(end - start) {
+                    coeff3[j] = short[start + j];
+                }
+                let raw = mul_bal16_small(b, &coeff3, long);
+                let reb = rebalance_tail_pm11_to_pm2(b, &raw);
+                let shifted = shift_pad_bal16(&reb, blk * 3, target_len, zero);
+                add_bal16_loose_in_place(b, &mut acc, &shifted);
+            }
+            let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc, acc_bound);
+            b.enforce_var_eq_const(carry, F257::ZERO);
+            b.profile_exit(_prev);
+            return norm;
+        }
+    }
+
+    // Fallback: original carry-normalizing accumulation.
     for blk in 0..blocks {
         let start = blk * 3;
         let end = core::cmp::min(start + 3, short.len());
@@ -1206,6 +1376,7 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
         acc[target_len - 1] = top_sum[0];
         b.enforce_var_eq_const(top_carry, F257::ZERO);
     }
+
     let out = acc;
     b.profile_exit(_prev);
     out
@@ -1571,26 +1742,38 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
         terms.push(shifted);
     }
 
-    // Reduce by summing 3-at-a-time (fewer passes than pairwise accumulation).
-    let mut stack = terms;
-    while stack.len() > 1 {
-        if stack.len() >= 3 {
-            let d = stack.pop().unwrap();
-            let c = stack.pop().unwrap();
-            let a = stack.pop().unwrap();
-            let (sum, carry) = add3_bal16_same_len(b, &a, &c, &d);
-            b.enforce_var_eq_const(carry, F257::ZERO);
-            stack.push(sum);
-        } else {
-            let c = stack.pop().unwrap();
-            let a = stack.pop().unwrap();
-            let (sum, carry) = add_bal16_same_len(b, &a, &c);
-            b.enforce_var_eq_const(carry, F257::ZERO);
-            stack.push(sum);
+    // Fox #1: sum as loose digits, normalize once (only when bound is < 128).
+    let per_term_bound: i32 = 10; // conservative
+    let acc_bound: i32 = (blocks as i32) * per_term_bound;
+    let out = if a.len() <= 19 && bb_const.len() <= 17 && acc_bound < 128 {
+        let mut acc = vec![zero; target_len];
+        for t in &terms {
+            add_bal16_loose_in_place(b, &mut acc, t);
         }
-    }
-
-    let out = stack.pop().unwrap();
+        let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc, acc_bound);
+        b.enforce_var_eq_const(carry, F257::ZERO);
+        norm
+    } else {
+        // Reduce by summing 3-at-a-time (fewer passes than pairwise accumulation).
+        let mut stack = terms;
+        while stack.len() > 1 {
+            if stack.len() >= 3 {
+                let d = stack.pop().unwrap();
+                let c = stack.pop().unwrap();
+                let a = stack.pop().unwrap();
+                let (sum, carry) = add3_bal16_same_len(b, &a, &c, &d);
+                b.enforce_var_eq_const(carry, F257::ZERO);
+                stack.push(sum);
+            } else {
+                let c = stack.pop().unwrap();
+                let a = stack.pop().unwrap();
+                let (sum, carry) = add_bal16_same_len(b, &a, &c);
+                b.enforce_var_eq_const(carry, F257::ZERO);
+                stack.push(sum);
+            }
+        }
+        stack.pop().unwrap()
+    };
     b.profile_exit(_prev);
     out
 }
