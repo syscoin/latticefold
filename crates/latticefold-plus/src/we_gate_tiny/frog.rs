@@ -6,7 +6,7 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 use super::coins::frog_p_base128_digits_le;
 use super::digits::{
     add_bal16_same_len, alloc_bal16_digit, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
-    alloc_carry_pm1024, i32_to_f257, u64_bytes_to_bal16_digits_cached,
+    alloc_carry_pm512, i32_to_f257, u64_bytes_to_bal16_digits_cached,
 };
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
@@ -1150,7 +1150,7 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
 
         let mut acc_digits: Vec<usize> = Vec::with_capacity(TARGET_LEN);
         let mut carry_i32: i32 = 0;
-        let mut carry_var = alloc_carry_pm1024(b, 0);
+        let mut carry_var = alloc_carry_pm512(b, 0);
 
         #[inline]
         fn f257_from_i8(x: i8) -> F257 {
@@ -1194,12 +1194,12 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
             }
             debug_assert!((-8..=7).contains(&rem));
             debug_assert!(
-                (-1024..=1023).contains(&carry_next),
-                "carry out of pm1024 bound: {carry_next} from sum {sum}"
+                (-512..=511).contains(&carry_next),
+                "carry out of pm512 bound: {carry_next} from sum {sum}"
             );
 
             let digit_var = alloc_bal16_digit(b, rem as i8);
-            let carry_out_var = alloc_carry_pm1024(b, carry_next);
+            let carry_out_var = alloc_carry_pm512(b, carry_next);
             lc.push((-F257::ONE, digit_var));
             lc.push((-F257::from(16u64), carry_out_var));
             b.enforce_lc_times_one_eq_const(lc);
@@ -1223,10 +1223,10 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
                 rem += 16;
             }
             debug_assert!((-8..=7).contains(&rem));
-            debug_assert!((-1024..=1023).contains(&carry_next));
+            debug_assert!((-512..=511).contains(&carry_next));
 
             let rem_digit = alloc_bal16_digit(b, rem as i8);
-            let carry_next_var = alloc_carry_pm1024(b, carry_next);
+            let carry_next_var = alloc_carry_pm512(b, carry_next);
             b.enforce_lc_times_one_eq_const(vec![
                 (F257::ONE, carry_var),
                 (-F257::ONE, rem_digit),
