@@ -12,6 +12,28 @@ use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
 use crate::we_frog_poseidon_f257::FROG_P;
 
+fn frog_p_bal16_digits_le_const() -> [i8; 17] {
+    // Match the balancing convention used by `u64_bytes_to_bal16_digits`:
+    // carry_{i+1} = (nibble_i + carry_i >= 8), out_i = nibble_i + carry_i - 16*carry_{i+1}.
+    let mut out = [0i8; 17];
+    let mut carry: i16 = 0;
+    let mut x = FROG_P;
+    for i in 0..16 {
+        let nib = (x & 0xF) as i16;
+        x >>= 4;
+        let v = nib + carry;
+        if v >= 8 {
+            out[i] = (v - 16) as i8;
+            carry = 1;
+        } else {
+            out[i] = v as i8;
+            carry = 0;
+        }
+    }
+    out[16] = carry as i8;
+    out
+}
+
 /// Boundary-only canonicalization gadget:
 /// given an unconstrained 64-bit integer `u` as 8 little-endian bytes, produce
 /// `(q, z)` such that:
@@ -615,23 +637,19 @@ pub(super) fn frog_add_mod_p_from_byte_vars(
     let (sum_d, carry_sum) = add_bal16_same_len(b, &a_d, &c_d);
     b.enforce_var_eq_const(carry_sum, F257::ZERO);
 
-    let p_bytes = frog_p_bytes_le();
-    let mut p_byte_vars = [0usize; 8];
-    for i in 0..8 {
-        p_byte_vars[i] = alloc_u8_var::<F257>(b, p_bytes[i]);
-    }
-    let p_d0 = u64_bytes_to_bal16_digits(b, p_byte_vars);
+    // p digits as constants (avoid allocating p bytes/digits every call).
+    let p_d0_const = frog_p_bal16_digits_le_const();
     let r_d0 = u64_bytes_to_bal16_digits(b, r_bytes);
-    let p_d = pad_bal16(b, p_d0, 18);
     let r_d = pad_bal16(b, r_d0, 18);
 
-    // qp digits = q * p digits (q is boolean, p digits are in [-8,7]).
+    // qp digits = q * p digits (q is boolean, p digits are constants in [-8,7]).
     let mut qp_d: Vec<usize> = Vec::with_capacity(18);
-    for &pd in &p_d {
-        let pd_i = super::digits::f257_to_i32_bal(b.assignment[pd]);
-        let want = if q_u8 == 1 { pd_i } else { 0 };
-        let out = alloc_bal16_digit(b, want as i8);
-        b.enforce_mul(q, pd, out);
+    for i in 0..18 {
+        let pd_i: i8 = if i < 17 { p_d0_const[i] } else { 0 };
+        let want: i8 = if q_u8 == 1 { pd_i } else { 0 };
+        let out = alloc_bal16_digit(b, want);
+        // out = pd_i * q  (linear, since pd_i is constant and q ∈ {0,1})
+        b.enforce_lc_times_one_eq_const(vec![(F257::ONE, out), (-i32_to_f257(pd_i as i32), q)]);
         qp_d.push(out);
     }
 
@@ -693,19 +711,14 @@ pub(super) fn frog_sub_mod_p_from_byte_vars(
     let c_d = pad_bal16(b, c_d0, 18);
     let r_d = pad_bal16(b, r_d0, 18);
 
-    let p_bytes = frog_p_bytes_le();
-    let mut p_byte_vars = [0usize; 8];
-    for i in 0..8 {
-        p_byte_vars[i] = alloc_u8_var::<F257>(b, p_bytes[i]);
-    }
-    let p_d0 = u64_bytes_to_bal16_digits(b, p_byte_vars);
-    let p_d = pad_bal16(b, p_d0, 18);
+    // p digits as constants (avoid allocating p bytes/digits every call).
+    let p_d0_const = frog_p_bal16_digits_le_const();
     let mut qp_d: Vec<usize> = Vec::with_capacity(18);
-    for &pd in &p_d {
-        let pd_i = super::digits::f257_to_i32_bal(b.assignment[pd]);
-        let want = if q_u8 == 1 { pd_i } else { 0 };
-        let out = alloc_bal16_digit(b, want as i8);
-        b.enforce_mul(q, pd, out);
+    for i in 0..18 {
+        let pd_i: i8 = if i < 17 { p_d0_const[i] } else { 0 };
+        let want: i8 = if q_u8 == 1 { pd_i } else { 0 };
+        let out = alloc_bal16_digit(b, want);
+        b.enforce_lc_times_one_eq_const(vec![(F257::ONE, out), (-i32_to_f257(pd_i as i32), q)]);
         qp_d.push(out);
     }
 
@@ -929,7 +942,8 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
                     let term = frog_mul_const_mod_p_from_byte_vars(b, &scaled, inv720);
                     acc = frog_add_mod_p_from_byte_vars(b, &acc, &term);
                 }
-                res[idx] = acc;
+                // NOTE: idx is NOT unique: blocks of length (2m-1) shifted by m overlap.
+                res[idx] = frog_add_mod_p_from_byte_vars(b, &res[idx], &acc);
             }
         }
         res
@@ -971,7 +985,8 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
                 let term = frog_mul_const_mod_p_from_byte_vars(b, &scaled, inv720);
                 acc = frog_add_mod_p_from_byte_vars(b, &acc, &term);
             }
-            prod[idx] = acc;
+            // NOTE: idx is NOT unique: blocks of length 31 shifted by 16 overlap.
+            prod[idx] = frog_add_mod_p_from_byte_vars(b, &prod[idx], &acc);
         }
     }
 
