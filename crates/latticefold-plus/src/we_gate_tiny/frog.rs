@@ -1803,14 +1803,17 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
                 rem += 16;
             }
             debug_assert!((-8..=7).contains(&rem));
+            // We only need carries to be in the small-lift range for soundness in F257.
+            // The [-512,511] bound is a conservative worst-case; in our actual usage here,
+            // `carry_next` should stay within [-128,127] (i.e. all field elements except +128).
             debug_assert!(
-                (-512..=511).contains(&carry_next),
-                "carry out of pm512 bound: {carry_next} from sum {sum}"
+                (-128..=127).contains(&carry_next),
+                "carry out of pm128 bound (expected): {carry_next} from sum {sum}"
             );
 
             let digit_var = alloc_bal16_digit(b, rem as i8);
-            // Statement-only arming: use a fixed pm512 bound (no witness-dependent gadget selection).
-            let carry_out_var = alloc_carry_pm512(b, carry_next);
+            // Statement-only arming: use a fixed pm128 bound (no witness-dependent gadget selection).
+            let carry_out_var = alloc_carry_pm128(b, carry_next);
             lc.push((-F257::ONE, digit_var));
             lc.push((-F257::from(16u64), carry_out_var));
             b.enforce_lc_times_one_eq_const(lc);
