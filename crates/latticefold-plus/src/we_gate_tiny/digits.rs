@@ -237,6 +237,129 @@ pub(crate) fn alloc_carry_pm128(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
     c_var
 }
 
+/// Allocate a signed carry `c ∈ [-64,63]` as an F257 variable by range-checking an offset.
+pub(crate) fn alloc_carry_pm64(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
+    assert!((-64..=63).contains(&c));
+    let off_u8: u8 = (c + 64) as u8; // in [0,127]
+    // 7-bit decomposition of off.
+    let mut bits = [0usize; 7];
+    for i in 0..7 {
+        bits[i] = alloc_bool::<F257>(b, ((off_u8 >> i) & 1) == 1);
+    }
+    let off_var = b.new_var(F257::from(off_u8 as u64));
+    // off = Σ 2^i * bits[i]
+    let mut lc = vec![(F257::ONE, off_var)];
+    let mut pow = F257::ONE;
+    for i in 0..7 {
+        lc.push((-pow, bits[i]));
+        pow *= F257::from(2u64);
+    }
+    b.enforce_lc_times_one_eq_const(lc);
+    // c = off - 64
+    let c_var = b.new_var(i32_to_f257(c));
+    b.enforce_lc_times_one_eq_const(vec![
+        (F257::ONE, c_var),
+        (-F257::ONE, off_var),
+        (F257::from(64u64), b.one()),
+    ]);
+    c_var
+}
+
+/// Allocate a signed carry `c ∈ [-32,31]` as an F257 variable by range-checking an offset.
+pub(crate) fn alloc_carry_pm32(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
+    assert!((-32..=31).contains(&c));
+    let off_u8: u8 = (c + 32) as u8; // in [0,63]
+    // 6-bit decomposition of off.
+    let mut bits = [0usize; 6];
+    for i in 0..6 {
+        bits[i] = alloc_bool::<F257>(b, ((off_u8 >> i) & 1) == 1);
+    }
+    let off_var = b.new_var(F257::from(off_u8 as u64));
+    let mut lc = vec![(F257::ONE, off_var)];
+    let mut pow = F257::ONE;
+    for i in 0..6 {
+        lc.push((-pow, bits[i]));
+        pow *= F257::from(2u64);
+    }
+    b.enforce_lc_times_one_eq_const(lc);
+    let c_var = b.new_var(i32_to_f257(c));
+    b.enforce_lc_times_one_eq_const(vec![
+        (F257::ONE, c_var),
+        (-F257::ONE, off_var),
+        (F257::from(32u64), b.one()),
+    ]);
+    c_var
+}
+
+/// Allocate a signed carry `c ∈ [-16,15]` as an F257 variable by range-checking an offset.
+pub(crate) fn alloc_carry_pm16(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
+    assert!((-16..=15).contains(&c));
+    let off_u8: u8 = (c + 16) as u8; // in [0,31]
+    // 5-bit decomposition of off.
+    let mut bits = [0usize; 5];
+    for i in 0..5 {
+        bits[i] = alloc_bool::<F257>(b, ((off_u8 >> i) & 1) == 1);
+    }
+    let off_var = b.new_var(F257::from(off_u8 as u64));
+    let mut lc = vec![(F257::ONE, off_var)];
+    let mut pow = F257::ONE;
+    for i in 0..5 {
+        lc.push((-pow, bits[i]));
+        pow *= F257::from(2u64);
+    }
+    b.enforce_lc_times_one_eq_const(lc);
+    let c_var = b.new_var(i32_to_f257(c));
+    b.enforce_lc_times_one_eq_const(vec![
+        (F257::ONE, c_var),
+        (-F257::ONE, off_var),
+        (F257::from(16u64), b.one()),
+    ]);
+    c_var
+}
+
+/// Allocate a signed carry `c ∈ [-8,7]` as an F257 variable by range-checking an offset.
+pub(crate) fn alloc_carry_pm8(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
+    assert!((-8..=7).contains(&c));
+    let off_u8: u8 = (c + 8) as u8; // in [0,15]
+    // 4-bit decomposition of off.
+    let mut bits = [0usize; 4];
+    for i in 0..4 {
+        bits[i] = alloc_bool::<F257>(b, ((off_u8 >> i) & 1) == 1);
+    }
+    let off_var = b.new_var(F257::from(off_u8 as u64));
+    b.enforce_lc_times_one_eq_const(vec![
+        (F257::ONE, off_var),
+        (-F257::ONE, bits[0]),
+        (-F257::from(2u64), bits[1]),
+        (-F257::from(4u64), bits[2]),
+        (-F257::from(8u64), bits[3]),
+    ]);
+    let c_var = b.new_var(i32_to_f257(c));
+    b.enforce_lc_times_one_eq_const(vec![
+        (F257::ONE, c_var),
+        (-F257::ONE, off_var),
+        (F257::from(8u64), b.one()),
+    ]);
+    c_var
+}
+
+/// Allocate a carry `c` using the smallest pow2-bound ≤ 128 that contains it.
+#[inline]
+fn alloc_carry_pm_dynamic_le128(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
+    let a = c.abs();
+    if a <= 7 {
+        alloc_carry_pm8(b, c)
+    } else if a <= 15 {
+        alloc_carry_pm16(b, c)
+    } else if a <= 31 {
+        alloc_carry_pm32(b, c)
+    } else if a <= 63 {
+        alloc_carry_pm64(b, c)
+    } else {
+        alloc_carry_pm128(b, c)
+    }
+}
+
 // NOTE: We intentionally do not use a narrower carry range (like pm64) for the streaming
 // convolution multipliers. For 17×17 balanced digits, the worst-case carry magnitude can exceed
 // 63 (e.g. ≈ 68), so pm64 would reject some valid witnesses. pm128 is safe.
@@ -857,7 +980,8 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
 
         let mut out: Vec<usize> = Vec::with_capacity(la + lb + 4);
         let mut carry_i32: i32 = 0;
-        let mut carry_var = alloc_carry_pm128(b, 0);
+        let mut carry_var = b.new_var(F257::ZERO);
+        b.enforce_var_eq_const(carry_var, F257::ZERO);
 
         for k in 0..(la + lb - 1) {
             let mut sum: i32 = carry_i32;
@@ -896,7 +1020,7 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
             );
 
             let digit_var = alloc_bal16_digit(b, rem as i8);
-            let carry_out_var = alloc_carry_pm128(b, carry_next);
+            let carry_out_var = alloc_carry_pm_dynamic_le128(b, carry_next);
 
             // carry + Σ prods - digit - 16*carry_out = 0
             let mut lc: Vec<(F257, usize)> = Vec::with_capacity(2 + prods.len());
@@ -933,7 +1057,7 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
             );
 
             let rem_digit = alloc_bal16_digit(b, rem as i8);
-            let carry_next_var = alloc_carry_pm128(b, carry_next);
+            let carry_next_var = alloc_carry_pm_dynamic_le128(b, carry_next);
             // carry = rem + 16*carry_next
             b.enforce_lc_times_one_eq_const(vec![
                 (F257::ONE, carry_var),
@@ -1181,7 +1305,8 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
         let lb = bb_const.len();
         let mut out: Vec<usize> = Vec::with_capacity(la + lb + 4);
         let mut carry_i32: i32 = 0;
-        let mut carry_var = alloc_carry_pm128(b, 0);
+        let mut carry_var = b.new_var(F257::ZERO);
+        b.enforce_var_eq_const(carry_var, F257::ZERO);
 
         let div_floor = |x: i32, d: i32| -> i32 {
             debug_assert!(d > 0);
@@ -1227,7 +1352,7 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
             );
 
             let digit_var = alloc_bal16_digit(b, rem as i8);
-            let carry_out_var = alloc_carry_pm128(b, carry_next);
+            let carry_out_var = alloc_carry_pm_dynamic_le128(b, carry_next);
 
             lc.push((-F257::ONE, digit_var));
             lc.push((-F257::from(16u64), carry_out_var));
@@ -1260,7 +1385,7 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
             );
 
             let rem_digit = alloc_bal16_digit(b, rem as i8);
-            let carry_next_var = alloc_carry_pm128(b, carry_next);
+            let carry_next_var = alloc_carry_pm_dynamic_le128(b, carry_next);
             // carry = rem + 16*carry_next
             b.enforce_lc_times_one_eq_const(vec![
                 (F257::ONE, carry_var),
