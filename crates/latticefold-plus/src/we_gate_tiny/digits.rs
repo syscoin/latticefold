@@ -1348,34 +1348,31 @@ pub(crate) fn u32_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
         let b1 = nib.bits[1];
         let b2 = nib.bits[2];
         let msb = nib.msb;
-        let not_msb = b.new_var(F257::ONE - b.assignment[msb]);
-        b.enforce_lc_times_one_eq_const(vec![
-            (F257::ONE, not_msb),
-            (F257::ONE, msb),
-            (-F257::ONE, b.one()),
-        ]);
 
         let t01 = b.new_var(b.assignment[b0] * b.assignment[b1]);
         b.enforce_mul(b0, b1, t01);
         let t012 = b.new_var(b.assignment[t01] * b.assignment[b2]);
         b.enforce_mul(t01, b2, t012);
-        let is7 = b.new_var(b.assignment[t012] * b.assignment[not_msb]);
-        b.enforce_mul(t012, not_msb, is7);
-        // `is7` is a product of booleans, so it is already boolean; no extra constraint needed.
-
-        let carry_is7 = b.new_var(b.assignment[carry] * b.assignment[is7]);
-        b.enforce_mul(carry, is7, carry_is7);
-
-        let msb_and = b.new_var(b.assignment[msb] * b.assignment[carry_is7]);
-        b.enforce_mul(msb, carry_is7, msb_and);
-        let c_out = b.new_var(b.assignment[msb] + b.assignment[carry_is7] - b.assignment[msb_and]);
+        // Carry-out rule for balanced digits:
+        // carry_out = msb OR (carry_in AND (b0&b1&b2) AND !msb)
+        //
+        // Implement as:
+        //   carry_t      = carry_in * (b0&b1&b2)
+        //   carry_t_msb  = carry_t * msb
+        //   carry_out    = msb + carry_t - carry_t_msb
+        // This avoids building explicit NOT/AND/OR helper vars.
+        let carry_t = b.new_var(b.assignment[carry] * b.assignment[t012]);
+        b.enforce_mul(carry, t012, carry_t);
+        let carry_t_msb = b.new_var(b.assignment[carry_t] * b.assignment[msb]);
+        b.enforce_mul(carry_t, msb, carry_t_msb);
+        let c_out = b.new_var(b.assignment[msb] + b.assignment[carry_t] - b.assignment[carry_t_msb]);
         b.enforce_lc_times_one_eq_const(vec![
             (F257::ONE, c_out),
             (-F257::ONE, msb),
-            (-F257::ONE, carry_is7),
-            (F257::ONE, msb_and),
+            (-F257::ONE, carry_t),
+            (F257::ONE, carry_t_msb),
         ]);
-        // `c_out` is computed as OR(msb, carry_is7) over booleans, so it is boolean.
+        // `c_out` is a boolean expression over booleans, so it is boolean.
 
         let d_i =
             (b.assignment[b0].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as i32)
@@ -1453,34 +1450,25 @@ pub(crate) fn u64_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
         let b1 = nib.bits[1];
         let b2 = nib.bits[2];
         let msb = nib.msb;
-        let not_msb = b.new_var(F257::ONE - b.assignment[msb]);
-        b.enforce_lc_times_one_eq_const(vec![
-            (F257::ONE, not_msb),
-            (F257::ONE, msb),
-            (-F257::ONE, b.one()),
-        ]);
 
         let t01 = b.new_var(b.assignment[b0] * b.assignment[b1]);
         b.enforce_mul(b0, b1, t01);
         let t012 = b.new_var(b.assignment[t01] * b.assignment[b2]);
         b.enforce_mul(t01, b2, t012);
-        let is7 = b.new_var(b.assignment[t012] * b.assignment[not_msb]);
-        b.enforce_mul(t012, not_msb, is7);
-        // `is7` is a product of booleans, so it is already boolean; no extra constraint needed.
-
-        let carry_is7 = b.new_var(b.assignment[carry] * b.assignment[is7]);
-        b.enforce_mul(carry, is7, carry_is7);
-
-        let msb_and = b.new_var(b.assignment[msb] * b.assignment[carry_is7]);
-        b.enforce_mul(msb, carry_is7, msb_and);
-        let c_out = b.new_var(b.assignment[msb] + b.assignment[carry_is7] - b.assignment[msb_and]);
+        // Carry-out rule for balanced digits (same as u32 path):
+        // carry_out = msb OR (carry_in AND (b0&b1&b2) AND !msb)
+        let carry_t = b.new_var(b.assignment[carry] * b.assignment[t012]);
+        b.enforce_mul(carry, t012, carry_t);
+        let carry_t_msb = b.new_var(b.assignment[carry_t] * b.assignment[msb]);
+        b.enforce_mul(carry_t, msb, carry_t_msb);
+        let c_out = b.new_var(b.assignment[msb] + b.assignment[carry_t] - b.assignment[carry_t_msb]);
         b.enforce_lc_times_one_eq_const(vec![
             (F257::ONE, c_out),
             (-F257::ONE, msb),
-            (-F257::ONE, carry_is7),
-            (F257::ONE, msb_and),
+            (-F257::ONE, carry_t),
+            (F257::ONE, carry_t_msb),
         ]);
-        // `c_out` is computed as OR(msb, carry_is7) over booleans, so it is boolean.
+        // `c_out` is a boolean expression over booleans, so it is boolean.
 
         let d_i =
             (b.assignment[b0].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as i32)
