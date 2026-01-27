@@ -40,6 +40,9 @@ pub(super) fn alloc_byte<F: PrimeField>(b: &mut Dr1csBuilder<F>, v8: u8) -> Byte
     }
     b.enforce_lc_times_one_eq_const(lc);
 
+    // Cache bit decomposition so downstream gadgets can reuse it.
+    b.byte_bits_cache.insert(v, bits);
+
     ByteVar { byte: v, bits }
 }
 
@@ -62,6 +65,9 @@ pub(super) fn decompose_existing_byte_var_to_bits<F: PrimeField>(
     b: &mut Dr1csBuilder<F>,
     byte_var: usize,
 ) -> [usize; 8] {
+    if let Some(bits) = b.byte_bits_cache.get(&byte_var) {
+        return *bits;
+    }
     // Constrain: byte_var = Σ 2^i * bit_i, with bit_i boolean.
     let mut bits = [0usize; 8];
     let v8 = b.assignment[byte_var]
@@ -81,6 +87,7 @@ pub(super) fn decompose_existing_byte_var_to_bits<F: PrimeField>(
         pow *= F::from(2u64);
     }
     b.enforce_lc_times_one_eq_const(lc);
+    b.byte_bits_cache.insert(byte_var, bits);
     bits
 }
 

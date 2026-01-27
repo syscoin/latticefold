@@ -12,17 +12,23 @@
 
 use ark_ff::PrimeField;
 
+use std::collections::BTreeMap;
+
 use crate::dpp_poseidon::{Constraint, SparseDr1csInstance};
 
 #[derive(Clone, Debug)]
 pub struct Dr1csBuilder<F: PrimeField> {
     pub assignment: Vec<F>,
     pub rows: Vec<Constraint<F>>,
+    /// Cache for reusing a byte var's bit-decomposition across gadgets.
+    ///
+    /// Key: byte variable index. Value: 8 boolean bit variable indices (little-endian).
+    pub byte_bits_cache: BTreeMap<usize, [usize; 8]>,
 }
 
 impl<F: PrimeField> Dr1csBuilder<F> {
     pub fn new() -> Self {
-        Self { assignment: vec![F::ONE], rows: Vec::new() }
+        Self { assignment: vec![F::ONE], rows: Vec::new(), byte_bits_cache: BTreeMap::new() }
     }
     pub fn one(&self) -> usize { 0 }
     pub fn new_var(&mut self, value: F) -> usize {
