@@ -439,7 +439,7 @@ fn pad_bal16(b: &mut Dr1csBuilder<F257>, mut v: Vec<usize>, target_len: usize) -
     if v.len() >= target_len {
         return v;
     }
-    let z = alloc_bal16_digit(b, 0);
+    let z = b.zero_var();
     v.extend(std::iter::repeat(z).take(target_len - v.len()));
     v
 }
@@ -1040,7 +1040,7 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         // Important: this must be >= the lengths produced by `mul_bal16_long_by_const_rhs` below;
         // otherwise we'll end up adding mismatched-length vectors (and, worse, could truncate).
         const TARGET_LEN: usize = 43;
-        let zero_digit = alloc_bal16_digit(b, 0);
+        let zero_digit = b.zero_var();
 
         // Build (padded) product terms, then reduce with a small adder tree.
         let mut terms: Vec<Vec<usize>> = Vec::with_capacity(7);
@@ -1149,7 +1149,7 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         // producing balanced digits in [-8,7] with a bounded carry.
         let p_d_const = frog_p_bal16_digits_le_const();
         const TARGET_LEN: usize = 43;
-        let zero_digit = alloc_bal16_digit(b, 0);
+        let zero_digit = b.zero_var();
 
         // Precompute constant bal16 digits for each coefficient.
         let mut coeff_ds: [[i8; 17]; N] = [[0i8; 17]; N];
