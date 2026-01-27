@@ -551,11 +551,18 @@ fn alloc_u8_var<F: PrimeField>(b: &mut Dr1csBuilder<F>, v: u8) -> usize {
 }
 
 fn pad_bal16(b: &mut Dr1csBuilder<F257>, mut v: Vec<usize>, target_len: usize) -> Vec<usize> {
-    if v.len() >= target_len {
+    if v.len() > target_len {
+        // Enforce truncated tail digits are zero, then truncate.
+        for &dv in &v[target_len..] {
+            b.enforce_var_eq_const(dv, F257::ZERO);
+        }
+        v.truncate(target_len);
         return v;
     }
-    let z = b.zero_var();
-    v.extend(std::iter::repeat(z).take(target_len - v.len()));
+    if v.len() < target_len {
+        let z = b.zero_var();
+        v.extend(std::iter::repeat(z).take(target_len - v.len()));
+    }
     v
 }
 
