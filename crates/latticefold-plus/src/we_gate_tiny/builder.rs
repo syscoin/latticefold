@@ -770,6 +770,57 @@ fn enforce_fiat_shamir_reabsorb_semantics(
     Ok(())
 }
 
+/// Enforce that every **non-reabsorb** Absorb chunk of length multiple of 8 consists of
+/// canonical Frog base-field encodings (u64 < p_frog), interpreted as 8-byte little-endian scalars.
+///
+/// This is a byte/limb-only binding step: it does not perform any modular arithmetic beyond
+/// the single-subtract canonicality check.
+fn enforce_nonreabsorb_absorbs_are_canonical_frog(
+    glue: &mut GlueCtx,
+    ops: &[PoseidonTraceOp<F257>],
+    pose_wiring: &PoseidonDr1csWiring,
+) -> Result<(), String> {
+    let mut absorb_idx = 0usize;
+    let mut expect_reabsorb = false;
+    for op in ops {
+        match op {
+            PoseidonTraceOp::SqueezeField(v) => {
+                // Only get_challenge() does a fiat–shamir reabsorb, and it always squeezes 8 digits.
+                expect_reabsorb = v.len() == DIGITS_PER_TRY;
+            }
+            PoseidonTraceOp::Absorb(_v) => {
+                let (ab_start, ab_len) = *pose_wiring
+                    .absorb_ranges
+                    .get(absorb_idx)
+                    .ok_or("pose_wiring.absorb_ranges oob (canonical frog)")?;
+                absorb_idx += 1;
+                let is_reabsorb = expect_reabsorb;
+                expect_reabsorb = false;
+                if is_reabsorb {
+                    // Skip: these are F257 digits (can include 256), not base-field bytes.
+                    continue;
+                }
+                if (ab_len % 8) != 0 {
+                    continue;
+                }
+                let n_elems = ab_len / 8;
+                for e in 0..n_elems {
+                    let mut bytes = [0usize; 8];
+                    for j in 0..8 {
+                        let gv = pose_wiring.absorb_vars[ab_start + e * 8 + j];
+                        let lv = glue.copy_digit(gv);
+                        let _ = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, lv);
+                        bytes[j] = lv;
+                    }
+                    let _limbs = frog_u64_canonical_from_byte_vars::<F257>(&mut glue.gb, &bytes);
+                }
+            }
+            PoseidonTraceOp::SqueezeBytes { .. } => {}
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize(
     pose_inst: SparseDr1csInstance<F257>,
@@ -961,6 +1012,10 @@ pub(super) fn build(
     validate_pairs(pairs, short_ranges.len(), u32_ranges.len())?;
 
     let mut glue = GlueCtx::new(pose_asg);
+
+    // Bind all proof/statement payload absorbs that encode base-field elements as canonical 8-byte scalars.
+    // (Skip fiat–shamir reabsorbs, which are F257 digits and may contain 256.)
+    enforce_nonreabsorb_absorbs_are_canonical_frog(&mut glue, ops, &pose_wiring)?;
 
     let short_locals = build_short_blocks(&mut glue, &pose_wiring, ring_dim, &short_ranges)?;
     let (u32_locals, frog_locals) =
