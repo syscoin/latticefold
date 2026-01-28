@@ -9,6 +9,7 @@ use stark_rings::{OverField, PolyRing, Ring};
 use std::sync::OnceLock;
 
 use super::SuitableRing;
+use super::goldilocks_ntt64 as ntt64;
 use crate::{
     ark_base::*,
     challenge_set::{error, LatticefoldChallengeSet},
@@ -133,7 +134,6 @@ impl core::ops::Mul for GoldilocksRing64 {
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
         const N: usize = 64;
-        const LOG_N: u32 = 6;
 
         #[derive(Clone)]
         struct Precomp {
@@ -156,99 +156,44 @@ impl core::ops::Mul for GoldilocksRing64 {
             iw64: [Fq; 32],
         }
 
-        #[inline(always)]
-        fn pow_u64(mut base: Fq, mut exp: u64) -> Fq {
-            let mut acc = <Fq as Field>::ONE;
-            while exp != 0 {
-                if (exp & 1) == 1 {
-                    acc *= base;
-                }
-                base *= base;
-                exp >>= 1;
-            }
-            acc
-        }
-
-        #[inline(always)]
-        fn bitrev6(i: usize) -> usize {
-            ((i as u32).reverse_bits() >> (32 - LOG_N)) as usize
-        }
-
         fn precomp() -> &'static Precomp {
             static PRE: OnceLock<Precomp> = OnceLock::new();
             PRE.get_or_init(|| {
-                // Goldilocks base field modulus p as u64.
+                // Sanity: modulus matches the shared schedule.
                 let p: u64 = <Fq as PrimeField>::MODULUS.0[0];
-                debug_assert_eq!(p, 0xFFFF_FFFF_0000_0001u64);
+                debug_assert_eq!(p, ntt64::GOLDILOCKS_P_U64);
 
-                // Generator is 7 in the stark-rings Goldilocks field config.
-                let g = Fq::from(7u64);
-                let psi = pow_u64(g, (p - 1) / 128);
-                let omega = psi * psi; // primitive 64th root
-                let omega_inv = omega.inverse().expect("omega inverse");
-                let psi_inv = psi.inverse().expect("psi inverse");
+                #[inline(always)]
+                fn fq_arr<const M: usize>(xs: &[u64; M]) -> [Fq; M] {
+                    core::array::from_fn(|i| Fq::from(xs[i]))
+                }
 
-                let inv_n = Fq::from(N as u64).inverse().expect("inv_n");
+                let inv_n = Fq::from(ntt64::INV_N_U64);
 
                 // Bitrev table.
-                let bitrev = core::array::from_fn(|i| bitrev6(i));
+                let bitrev = ntt64::BITREV_64;
 
                 // psi^i and psi^{-i}
-                let mut psi_pows = [<Fq as Field>::ZERO; N];
-                let mut psi_inv_pows = [<Fq as Field>::ZERO; N];
-                let mut p0 = <Fq as Field>::ONE;
-                let mut p1 = <Fq as Field>::ONE;
-                for i in 0..N {
-                    psi_pows[i] = p0;
-                    psi_inv_pows[i] = p1;
-                    p0 *= psi;
-                    p1 *= psi_inv;
-                }
-
-                // Stage roots: wlen(len)=omega^(N/len). Since N=64, these are omega^(32), omega^(16),...,omega^1.
-                // Compute by repeated squaring.
-                let w64 = omega;            // omega^(1)
-                let w32 = w64 * w64;        // omega^(2)
-                let w16 = w32 * w32;        // omega^(4)
-                let w8 = w16 * w16;         // omega^(8)
-                let w4 = w8 * w8;           // omega^(16)
-                let w2 = w4 * w4;           // omega^(32) = -1
-
-                let iw64 = omega_inv;
-                let iw32 = iw64 * iw64;
-                let iw16 = iw32 * iw32;
-                let iw8 = iw16 * iw16;
-                let iw4 = iw8 * iw8;
-                let iw2 = iw4 * iw4;
-
-                // Precompute all powers for each stage.
-                fn fill<const M: usize>(wlen: Fq) -> [Fq; M] {
-                    let mut out = [<Fq as Field>::ZERO; M];
-                    let mut w = <Fq as Field>::ONE;
-                    for i in 0..M {
-                        out[i] = w;
-                        w *= wlen;
-                    }
-                    out
-                }
+                let psi_pows = fq_arr::<64>(&ntt64::PSI_POWS_64);
+                let psi_inv_pows = fq_arr::<64>(&ntt64::PSI_INV_POWS_64);
 
                 Precomp {
                     bitrev,
                     psi_pows,
                     psi_inv_pows,
                     inv_n,
-                    w2: fill::<1>(w2),
-                    w4: fill::<2>(w4),
-                    w8: fill::<4>(w8),
-                    w16: fill::<8>(w16),
-                    w32: fill::<16>(w32),
-                    w64: fill::<32>(w64),
-                    iw2: fill::<1>(iw2),
-                    iw4: fill::<2>(iw4),
-                    iw8: fill::<4>(iw8),
-                    iw16: fill::<8>(iw16),
-                    iw32: fill::<16>(iw32),
-                    iw64: fill::<32>(iw64),
+                    w2: fq_arr::<1>(&ntt64::W_POWS_LEN_2),
+                    w4: fq_arr::<2>(&ntt64::W_POWS_LEN_4),
+                    w8: fq_arr::<4>(&ntt64::W_POWS_LEN_8),
+                    w16: fq_arr::<8>(&ntt64::W_POWS_LEN_16),
+                    w32: fq_arr::<16>(&ntt64::W_POWS_LEN_32),
+                    w64: fq_arr::<32>(&ntt64::W_POWS_LEN_64),
+                    iw2: fq_arr::<1>(&ntt64::IW_POWS_LEN_2),
+                    iw4: fq_arr::<2>(&ntt64::IW_POWS_LEN_4),
+                    iw8: fq_arr::<4>(&ntt64::IW_POWS_LEN_8),
+                    iw16: fq_arr::<8>(&ntt64::IW_POWS_LEN_16),
+                    iw32: fq_arr::<16>(&ntt64::IW_POWS_LEN_32),
+                    iw64: fq_arr::<32>(&ntt64::IW_POWS_LEN_64),
                 }
             })
         }

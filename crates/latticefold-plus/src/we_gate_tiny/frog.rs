@@ -14,6 +14,7 @@ use super::digits::{
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
 use crate::we_frog_poseidon_f257::FROG_P;
+use cyclotomic_rings::rings::goldilocks_ntt64 as gl_ntt64;
 
 /// Goldilocks prime field modulus: \(2^{64} - 2^{32} + 1\).
 ///
@@ -1122,48 +1123,20 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
     a: &[FrogScalar; 64],
     c: &[FrogScalar; 64],
 ) -> [FrogScalar; 64] {
+    // Shared schedule constants from `cyclotomic-rings` (keeps host + gate in sync).
+    let p: u64 = gl_ntt64::GOLDILOCKS_P_U64;
+    let omega: u64 = gl_ntt64::OMEGA_U64;
+    let omega_inv: u64 = gl_ntt64::OMEGA_INV_U64;
+    let psi: u64 = gl_ntt64::PSI_U64;
+    let inv_n: u64 = gl_ntt64::INV_N_U64;
+
     // --- Small host-side helpers for Goldilocks constants.
     #[inline]
     fn mul_mod_u64(a: u64, b: u64, p: u64) -> u64 {
         ((a as u128) * (b as u128) % (p as u128)) as u64
     }
-    #[inline]
-    fn pow_mod_u64(mut base: u64, mut exp: u64, p: u64) -> u64 {
-        let mut acc: u64 = 1;
-        while exp != 0 {
-            if (exp & 1) == 1 {
-                acc = mul_mod_u64(acc, base, p);
-            }
-            base = mul_mod_u64(base, base, p);
-            exp >>= 1;
-        }
-        acc
-    }
-    #[inline]
-    fn inv_mod_u64(x: u64, p: u64) -> u64 {
-        // Fermat (p is prime).
-        pow_mod_u64(x, p - 2, p)
-    }
-
-    // Twiddle generator: Goldilocks is known to have primitive root 7.
-    // (Used in Plonky2/Polygon labs; kept as a deterministic constant here.)
-    let g: u64 = 7;
-    let p: u64 = GOLDILOCKS_P;
-    debug_assert_eq!(mul_mod_u64(g, 1, p), g);
-
-    // For length-64 NTT we need a primitive 64th root ω, and for negacyclic we also need ψ
-    // a primitive 128th root (ψ^2 = ω).
-    let omega = pow_mod_u64(g, (p - 1) / 64, p);
-    let psi = pow_mod_u64(g, (p - 1) / 128, p);
-    debug_assert_eq!(pow_mod_u64(omega, 64, p), 1);
-    debug_assert_eq!(pow_mod_u64(psi, 128, p), 1);
+    debug_assert_eq!(p, GOLDILOCKS_P);
     debug_assert_eq!(mul_mod_u64(psi, psi, p), omega);
-    // ω^{32} = -1
-    debug_assert_eq!(pow_mod_u64(omega, 32, p), p - 1);
-
-    let omega_inv = inv_mod_u64(omega, p);
-    let psi_inv = inv_mod_u64(psi, p);
-    let inv_n = inv_mod_u64(64, p);
 
     let p_d_const = u64_to_bal16_digits_le_const(p);
 
@@ -1341,17 +1314,7 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
         r_d
     }
 
-    // --- NTT plumbing.
-    #[inline]
-    fn bitreverse6(mut x: usize) -> usize {
-        let mut r = 0usize;
-        for _ in 0..6 {
-            r = (r << 1) | (x & 1);
-            x >>= 1;
-        }
-        r
-    }
-
+    // --- NTT plumbing (use shared twiddle tables).
     fn ntt_in_place(
         b: &mut Dr1csBuilder<F257>,
         a: &mut [FrogScalar; 64],
@@ -1363,7 +1326,7 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
         // Bit-reversal permutation (purely structural).
         let mut tmp = *a;
         for i in 0..64 {
-            tmp[bitreverse6(i)] = a[i];
+            tmp[gl_ntt64::BITREV_64[i]] = a[i];
         }
         *a = tmp;
 
@@ -1371,10 +1334,30 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
         let mut len = 2usize;
         while len <= 64 {
             let half = len / 2;
-            let wlen = pow_mod_u64(omega, (64 / len) as u64, p_u64);
             for start in (0..64).step_by(len) {
-                let mut w = 1u64;
                 for j in 0..half {
+                    let w: u64 = if omega == gl_ntt64::OMEGA_U64 {
+                        match len {
+                            2 => gl_ntt64::W_POWS_LEN_2[j],
+                            4 => gl_ntt64::W_POWS_LEN_4[j],
+                            8 => gl_ntt64::W_POWS_LEN_8[j],
+                            16 => gl_ntt64::W_POWS_LEN_16[j],
+                            32 => gl_ntt64::W_POWS_LEN_32[j],
+                            64 => gl_ntt64::W_POWS_LEN_64[j],
+                            _ => unreachable!(),
+                        }
+                    } else {
+                        debug_assert_eq!(omega, gl_ntt64::OMEGA_INV_U64);
+                        match len {
+                            2 => gl_ntt64::IW_POWS_LEN_2[j],
+                            4 => gl_ntt64::IW_POWS_LEN_4[j],
+                            8 => gl_ntt64::IW_POWS_LEN_8[j],
+                            16 => gl_ntt64::IW_POWS_LEN_16[j],
+                            32 => gl_ntt64::IW_POWS_LEN_32[j],
+                            64 => gl_ntt64::IW_POWS_LEN_64[j],
+                            _ => unreachable!(),
+                        }
+                    };
                     let u = a[start + j];
                     let v = if w == 1 {
                         a[start + j + half]
@@ -1386,7 +1369,6 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
                     };
                     a[start + j] = add_mod_p(b, &u, &v, p_u64, p_d);
                     a[start + j + half] = sub_mod_p(b, &u, &v, p_u64, p_d);
-                    w = mul_mod_u64(w, wlen, p_u64);
                 }
             }
             len *= 2;
@@ -1411,8 +1393,8 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
     // Negacyclic via twist by ψ^i (ψ is primitive 128th root).
     let mut a_tw = [[b.zero_var(); 17]; 64];
     let mut c_tw = [[b.zero_var(); 17]; 64];
-    let mut psi_pow: u64 = 1;
     for i in 0..64 {
+        let psi_pow: u64 = gl_ntt64::PSI_POWS_64[i];
         if psi_pow == 1 {
             a_tw[i] = a[i];
             c_tw[i] = c[i];
@@ -1420,7 +1402,6 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
             a_tw[i] = mul_const_mod_p(b, &a[i], psi_pow, p, &p_d_const);
             c_tw[i] = mul_const_mod_p(b, &c[i], psi_pow, p, &p_d_const);
         }
-        psi_pow = mul_mod_u64(psi_pow, psi, p);
     }
 
     ntt_in_place(b, &mut a_tw, omega, p, &p_d_const);
@@ -1435,14 +1416,13 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
 
     // Untwist by ψ^{-i}.
     let mut out = [[b.zero_var(); 17]; 64];
-    let mut psi_inv_pow: u64 = 1;
     for i in 0..64 {
+        let psi_inv_pow: u64 = gl_ntt64::PSI_INV_POWS_64[i];
         out[i] = if psi_inv_pow == 1 {
             a_tw[i]
         } else {
             mul_const_mod_p(b, &a_tw[i], psi_inv_pow, p, &p_d_const)
         };
-        psi_inv_pow = mul_mod_u64(psi_inv_pow, psi_inv, p);
     }
     out
 }

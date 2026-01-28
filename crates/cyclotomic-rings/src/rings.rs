@@ -16,6 +16,7 @@ mod babybear;
 mod frog;
 mod goldilocks;
 mod goldilocks64;
+pub mod goldilocks_ntt64;
 mod poseidon;
 mod stark;
 
