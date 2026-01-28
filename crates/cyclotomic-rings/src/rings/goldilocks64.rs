@@ -6,6 +6,7 @@ use stark_rings::cyclotomic_ring::Flatten;
 use stark_rings::traits::FromRandomBytes;
 use stark_rings::traits::MulUnchecked;
 use stark_rings::{OverField, PolyRing, Ring};
+use std::sync::OnceLock;
 
 use super::SuitableRing;
 use crate::{
@@ -134,6 +135,27 @@ impl core::ops::Mul for GoldilocksRing64 {
         const N: usize = 64;
         const LOG_N: u32 = 6;
 
+        #[derive(Clone)]
+        struct Precomp {
+            bitrev: [usize; N],
+            psi_pows: [Fq; N],
+            psi_inv_pows: [Fq; N],
+            inv_n: Fq,
+            // stage twiddles for len = 2,4,8,16,32,64 (only prefix used per stage)
+            w2: [Fq; 1],
+            w4: [Fq; 2],
+            w8: [Fq; 4],
+            w16: [Fq; 8],
+            w32: [Fq; 16],
+            w64: [Fq; 32],
+            iw2: [Fq; 1],
+            iw4: [Fq; 2],
+            iw8: [Fq; 4],
+            iw16: [Fq; 8],
+            iw32: [Fq; 16],
+            iw64: [Fq; 32],
+        }
+
         #[inline(always)]
         fn pow_u64(mut base: Fq, mut exp: u64) -> Fq {
             let mut acc = <Fq as Field>::ONE;
@@ -149,105 +171,164 @@ impl core::ops::Mul for GoldilocksRing64 {
 
         #[inline(always)]
         fn bitrev6(i: usize) -> usize {
-            // Reverse 6 bits of i.
             ((i as u32).reverse_bits() >> (32 - LOG_N)) as usize
         }
 
-        #[inline]
-        fn ntt_in_place(a: &mut [Fq; N], omega: Fq) {
-            // Bit-reversal permutation.
-            for i in 0..N {
-                let j = bitrev6(i);
-                if i < j {
-                    a.swap(i, j);
-                }
-            }
+        fn precomp() -> &'static Precomp {
+            static PRE: OnceLock<Precomp> = OnceLock::new();
+            PRE.get_or_init(|| {
+                // Goldilocks base field modulus p as u64.
+                let p: u64 = <Fq as PrimeField>::MODULUS.0[0];
+                debug_assert_eq!(p, 0xFFFF_FFFF_0000_0001u64);
 
-            let mut len = 2usize;
-            while len <= N {
-                // wlen = omega^(N/len)
-                let wlen = pow_u64(omega, (N / len) as u64);
-                for i in (0..N).step_by(len) {
+                // Generator is 7 in the stark-rings Goldilocks field config.
+                let g = Fq::from(7u64);
+                let psi = pow_u64(g, (p - 1) / 128);
+                let omega = psi * psi; // primitive 64th root
+                let omega_inv = omega.inverse().expect("omega inverse");
+                let psi_inv = psi.inverse().expect("psi inverse");
+
+                let inv_n = Fq::from(N as u64).inverse().expect("inv_n");
+
+                // Bitrev table.
+                let bitrev = core::array::from_fn(|i| bitrev6(i));
+
+                // psi^i and psi^{-i}
+                let mut psi_pows = [<Fq as Field>::ZERO; N];
+                let mut psi_inv_pows = [<Fq as Field>::ZERO; N];
+                let mut p0 = <Fq as Field>::ONE;
+                let mut p1 = <Fq as Field>::ONE;
+                for i in 0..N {
+                    psi_pows[i] = p0;
+                    psi_inv_pows[i] = p1;
+                    p0 *= psi;
+                    p1 *= psi_inv;
+                }
+
+                // Stage roots: wlen(len)=omega^(N/len). Since N=64, these are omega^(32), omega^(16),...,omega^1.
+                // Compute by repeated squaring.
+                let w64 = omega;            // omega^(1)
+                let w32 = w64 * w64;        // omega^(2)
+                let w16 = w32 * w32;        // omega^(4)
+                let w8 = w16 * w16;         // omega^(8)
+                let w4 = w8 * w8;           // omega^(16)
+                let w2 = w4 * w4;           // omega^(32) = -1
+
+                let iw64 = omega_inv;
+                let iw32 = iw64 * iw64;
+                let iw16 = iw32 * iw32;
+                let iw8 = iw16 * iw16;
+                let iw4 = iw8 * iw8;
+                let iw2 = iw4 * iw4;
+
+                // Precompute all powers for each stage.
+                fn fill<const M: usize>(wlen: Fq) -> [Fq; M] {
+                    let mut out = [<Fq as Field>::ZERO; M];
                     let mut w = <Fq as Field>::ONE;
-                    for j in 0..(len / 2) {
-                        let u = a[i + j];
-                        let v = a[i + j + len / 2] * w;
-                        a[i + j] = u + v;
-                        a[i + j + len / 2] = u - v;
+                    for i in 0..M {
+                        out[i] = w;
                         w *= wlen;
                     }
+                    out
                 }
-                len <<= 1;
+
+                Precomp {
+                    bitrev,
+                    psi_pows,
+                    psi_inv_pows,
+                    inv_n,
+                    w2: fill::<1>(w2),
+                    w4: fill::<2>(w4),
+                    w8: fill::<4>(w8),
+                    w16: fill::<8>(w16),
+                    w32: fill::<16>(w32),
+                    w64: fill::<32>(w64),
+                    iw2: fill::<1>(iw2),
+                    iw4: fill::<2>(iw4),
+                    iw8: fill::<4>(iw8),
+                    iw16: fill::<8>(iw16),
+                    iw32: fill::<16>(iw32),
+                    iw64: fill::<32>(iw64),
+                }
+            })
+        }
+
+        #[inline(always)]
+        fn bitrev_permute(dst: &mut [Fq; N], src: &[Fq; N], bitrev: &[usize; N]) {
+            // dst[bitrev(i)] = src[i]
+            for i in 0..N {
+                dst[bitrev[i]] = src[i];
             }
         }
 
-        #[inline]
-        fn intt_in_place(a: &mut [Fq; N], omega_inv: Fq) {
-            // Bit-reversal permutation.
-            for i in 0..N {
-                let j = bitrev6(i);
-                if i < j {
-                    a.swap(i, j);
+        #[inline(always)]
+        fn stage<const HALF: usize>(a: &mut [Fq; N], len: usize, w: &[Fq; HALF]) {
+            // len = 2*HALF
+            debug_assert_eq!(len, 2 * HALF);
+            for i in (0..N).step_by(len) {
+                for j in 0..HALF {
+                    let u = a[i + j];
+                    let v = a[i + j + HALF] * w[j];
+                    a[i + j] = u + v;
+                    a[i + j + HALF] = u - v;
                 }
-            }
-
-            let mut len = 2usize;
-            while len <= N {
-                let wlen = pow_u64(omega_inv, (N / len) as u64);
-                for i in (0..N).step_by(len) {
-                    let mut w = <Fq as Field>::ONE;
-                    for j in 0..(len / 2) {
-                        let u = a[i + j];
-                        let v = a[i + j + len / 2] * w;
-                        a[i + j] = u + v;
-                        a[i + j + len / 2] = u - v;
-                        w *= wlen;
-                    }
-                }
-                len <<= 1;
             }
         }
-
-        // Goldilocks base field modulus p as u64.
-        let p: u64 = <Fq as PrimeField>::MODULUS.0[0];
-        debug_assert_eq!(p, 0xFFFF_FFFF_0000_0001u64);
-
-        // Generator is 7 in the stark-rings Goldilocks field config.
-        let g = Fq::from(7u64);
-        let psi = pow_u64(g, (p - 1) / 128);
-        let omega = psi * psi; // primitive 64th root
-        let omega_inv = omega.inverse().expect("omega inverse");
-        let psi_inv = psi.inverse().expect("psi inverse");
-        let inv_n = Fq::from(N as u64).inverse().expect("inv_n");
 
         let mut a = [<Fq as Field>::ZERO; N];
         let mut b = [<Fq as Field>::ZERO; N];
-        a.copy_from_slice(self.coeffs());
-        b.copy_from_slice(rhs.coeffs());
+        let mut a0 = [<Fq as Field>::ZERO; N];
+        let mut b0 = [<Fq as Field>::ZERO; N];
+        a0.copy_from_slice(self.coeffs());
+        b0.copy_from_slice(rhs.coeffs());
 
-        // Twist by psi^i.
-        let mut psi_pow = <Fq as Field>::ONE;
+        let pc = precomp();
+
+        // Twist (mul by psi^i) and bitrev permute into working buffers.
         for i in 0..N {
-            a[i] *= psi_pow;
-            b[i] *= psi_pow;
-            psi_pow *= psi;
+            a0[i] *= pc.psi_pows[i];
+            b0[i] *= pc.psi_pows[i];
         }
+        bitrev_permute(&mut a, &a0, &pc.bitrev);
+        bitrev_permute(&mut b, &b0, &pc.bitrev);
 
-        ntt_in_place(&mut a, omega);
-        ntt_in_place(&mut b, omega);
+        // Forward NTT (fixed stages).
+        stage::<1>(&mut a, 2, &pc.w2);
+        stage::<2>(&mut a, 4, &pc.w4);
+        stage::<4>(&mut a, 8, &pc.w8);
+        stage::<8>(&mut a, 16, &pc.w16);
+        stage::<16>(&mut a, 32, &pc.w32);
+        stage::<32>(&mut a, 64, &pc.w64);
+
+        stage::<1>(&mut b, 2, &pc.w2);
+        stage::<2>(&mut b, 4, &pc.w4);
+        stage::<4>(&mut b, 8, &pc.w8);
+        stage::<8>(&mut b, 16, &pc.w16);
+        stage::<16>(&mut b, 32, &pc.w32);
+        stage::<32>(&mut b, 64, &pc.w64);
 
         for i in 0..N {
             a[i] *= b[i];
         }
 
-        intt_in_place(&mut a, omega_inv);
+        // Inverse NTT: bitrev permute then same stage structure with inverse roots.
+        // We already have bitrev order (output of forward). For inverse with this DIT layout,
+        // we can run the same butterfly structure with inverse roots on the bitrev-permuted data.
+        let mut a_inv_in = [<Fq as Field>::ZERO; N];
+        a_inv_in.copy_from_slice(&a);
+        bitrev_permute(&mut a, &a_inv_in, &pc.bitrev);
+
+        stage::<1>(&mut a, 2, &pc.iw2);
+        stage::<2>(&mut a, 4, &pc.iw4);
+        stage::<4>(&mut a, 8, &pc.iw8);
+        stage::<8>(&mut a, 16, &pc.iw16);
+        stage::<16>(&mut a, 32, &pc.iw32);
+        stage::<32>(&mut a, 64, &pc.iw64);
 
         // Scale by 1/N and untwist by psi^{-i}.
-        let mut psi_inv_pow = <Fq as Field>::ONE;
         for i in 0..N {
-            a[i] *= inv_n;
-            a[i] *= psi_inv_pow;
-            psi_inv_pow *= psi_inv;
+            a[i] *= pc.inv_n;
+            a[i] *= pc.psi_inv_pows[i];
         }
 
         GoldilocksRing64::from(a.to_vec())
