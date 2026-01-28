@@ -581,6 +581,187 @@ fn compute_tcch(
     Ok((tcch0_local, tcch1_local))
 }
 
+/// Parse (and lightly constrain) the CM segment that occurs after short-challenge squeezes.
+///
+/// This is a *schedule* parser: it follows the transcript op ordering implied by
+/// `poseidon_trace_schedule_for_plus` / `CmProof::verify_with_mlen` and returns the absorb ranges
+/// for:
+/// - `comh` ring elements (L × κ)
+/// - both CM sumcheck proof message ring elements (2 × nvars_cm rounds × 3 ring elems)
+/// - both eval tables (2 × L × (1+mlen_mats) × 4 ring elems)
+///
+/// It also enforces that the sumcheck header absorbs match statement-bound constants:
+/// - absorbed `nvars_cm`
+/// - absorbed `degree_cm == 2`
+/// and that the per-round "marker" scalar absorbs are zero (as in the schedule generator).
+fn parse_and_enforce_cm_after_short(
+    glue: &mut GlueCtx,
+    ops: &[PoseidonTraceOp<F257>],
+    pose_wiring: &PoseidonDr1csWiring,
+    ring_dim: usize,
+    params: &WeParams,
+    wiring: &TinyCoinOpWiring,
+    l_instances: usize,
+) -> Result<
+    (
+        Vec<(usize, usize)>, // comh ring absorbs (start,len)
+        Vec<Vec<(usize, usize)>>, // sumcheck msgs absorbs: [which][absorb_idx]
+        Vec<Vec<(usize, usize)>>, // eval table absorbs: [which][absorb_idx]
+    ),
+    String,
+> {
+    if wiring.short_squeeze_ops.is_empty() {
+        return Ok((Vec::new(), vec![Vec::new(), Vec::new()], vec![Vec::new(), Vec::new()]));
+    }
+    let kappa = params.kappa as usize;
+    let nvars_cm = params.nvars_cm as usize;
+    let mlen_mats = params.mlen as usize;
+    let last_short_op = *wiring
+        .short_squeeze_ops
+        .iter()
+        .max()
+        .expect("non-empty short_squeeze_ops");
+
+    // Collect all non-reabsorb Absorb ops after the last short squeeze.
+    let mut absorb_idx = 0usize;
+    let mut squeeze_field_op_idx = 0usize;
+    let mut after_short = false;
+    let mut prev_was_squeeze_field = false;
+    let mut payload_after_short: Vec<(usize, usize)> = Vec::new();
+    for op in ops {
+        match op {
+            PoseidonTraceOp::SqueezeField(v) => {
+                if squeeze_field_op_idx == last_short_op {
+                    after_short = true;
+                }
+                squeeze_field_op_idx += 1;
+                // `get_challenge()` reabsorbs the squeezed digits; skip that absorb.
+                prev_was_squeeze_field = !v.is_empty();
+            }
+            PoseidonTraceOp::Absorb(_v) => {
+                let (ab_start, ab_len) = *pose_wiring
+                    .absorb_ranges
+                    .get(absorb_idx)
+                    .ok_or("tiny gate: pose_wiring.absorb_ranges oob (cm-after-short)")?;
+                absorb_idx += 1;
+                let is_reabsorb = prev_was_squeeze_field;
+                prev_was_squeeze_field = false;
+                if after_short && !is_reabsorb {
+                    payload_after_short.push((ab_start, ab_len));
+                }
+            }
+            PoseidonTraceOp::SqueezeBytes { .. } => {
+                // Legacy; does not affect absorb parsing.
+                prev_was_squeeze_field = false;
+            }
+        }
+    }
+
+    // Now parse payload_after_short sequentially according to the CM schedule.
+    let ring_elem_bytes = ring_dim
+        .checked_mul(8)
+        .ok_or_else(|| "tiny gate: ring_dim*8 overflow".to_string())?;
+    let mut cur = 0usize;
+
+    // coh: L*kappa ring elements
+    let mut comh_absorbs: Vec<(usize, usize)> = Vec::with_capacity(l_instances * kappa);
+    for _ in 0..(l_instances * kappa) {
+        let (st, ln) = *payload_after_short
+            .get(cur)
+            .ok_or("tiny gate: payload_after_short too short (comh)")?;
+        cur += 1;
+        if ln != ring_elem_bytes {
+            return Err("tiny gate: unexpected absorb len while parsing comh".to_string());
+        }
+        comh_absorbs.push((st, ln));
+    }
+
+    // Two CM sumchecks:
+    let mut sc_msg_absorbs: Vec<Vec<(usize, usize)>> = vec![Vec::new(), Vec::new()];
+    let mut eval_absorbs: Vec<Vec<(usize, usize)>> = vec![Vec::new(), Vec::new()];
+
+    // Helper: enforce an absorbed 8-byte scalar equals a u64 constant.
+    #[inline]
+    fn enforce_absorbed_u64_const(
+        glue: &mut GlueCtx,
+        pose_wiring: &PoseidonDr1csWiring,
+        ab_start: usize,
+        val: u64,
+    ) {
+        let bs = val.to_le_bytes();
+        for i in 0..8 {
+            let gv = pose_wiring.absorb_vars[ab_start + i];
+            let lv = glue.copy_digit(gv);
+            glue.gb.enforce_var_eq_const(lv, F257::from(bs[i] as u64));
+        }
+    }
+
+    for which in 0..2 {
+        // Sumcheck header: absorb nvars, absorb degree (both as base-field scalars -> 8 bytes)
+        {
+            let (st, ln) = *payload_after_short
+                .get(cur)
+                .ok_or("tiny gate: payload_after_short too short (sc header nvars)")?;
+            cur += 1;
+            if ln != 8 {
+                return Err("tiny gate: expected 8-byte absorb for sumcheck nvars".to_string());
+            }
+            enforce_absorbed_u64_const(glue, pose_wiring, st, nvars_cm as u64);
+        }
+        {
+            let (st, ln) = *payload_after_short
+                .get(cur)
+                .ok_or("tiny gate: payload_after_short too short (sc header degree)")?;
+            cur += 1;
+            if ln != 8 {
+                return Err("tiny gate: expected 8-byte absorb for sumcheck degree".to_string());
+            }
+            enforce_absorbed_u64_const(glue, pose_wiring, st, 2u64);
+        }
+
+        // Rounds: 3 ring absorbs (msg evals), then one 8-byte scalar marker absorb.
+        for _round in 0..nvars_cm {
+            for _m in 0..3 {
+                let (st, ln) = *payload_after_short
+                    .get(cur)
+                    .ok_or("tiny gate: payload_after_short too short (sc msg)")?;
+                cur += 1;
+                if ln != ring_elem_bytes {
+                    return Err("tiny gate: expected ring-elem absorb for sumcheck msg".to_string());
+                }
+                sc_msg_absorbs[which].push((st, ln));
+            }
+            // Marker absorb (schedule generator uses 0).
+            let (st, ln) = *payload_after_short
+                .get(cur)
+                .ok_or("tiny gate: payload_after_short too short (sc marker)")?;
+            cur += 1;
+            if ln != 8 {
+                return Err("tiny gate: expected 8-byte absorb for sumcheck marker".to_string());
+            }
+            enforce_absorbed_u64_const(glue, pose_wiring, st, 0u64);
+        }
+
+        // Eval tables: L × (1+mlen_mats) rows × 4 ring elements.
+        for _l in 0..l_instances {
+            for _row in 0..(1 + mlen_mats) {
+                for _t in 0..4 {
+                    let (st, ln) = *payload_after_short
+                        .get(cur)
+                        .ok_or("tiny gate: payload_after_short too short (evals)")?;
+                    cur += 1;
+                    if ln != ring_elem_bytes {
+                        return Err("tiny gate: expected ring-elem absorb for eval table".to_string());
+                    }
+                    eval_absorbs[which].push((st, ln));
+                }
+            }
+        }
+    }
+
+    Ok((comh_absorbs, sc_msg_absorbs, eval_absorbs))
+}
+
 struct SurfaceLocal<const RAW: usize, const NORM: usize> {
     short_block_idx: usize,
     u32_idx: usize,
@@ -1288,6 +1469,18 @@ pub(super) fn build(
     if l_instances_expected != 0 && tcch1_local.len() != l_instances_expected {
         return Err("tiny gate: tcch1 length mismatch with inferred L".to_string());
     }
+
+    // Parse and constrain the CM segment after short challenges (sumcheck headers, etc.).
+    // (This is preparatory wiring for the full CM verifier arithmetic.)
+    let _ = parse_and_enforce_cm_after_short(
+        &mut glue,
+        ops,
+        &pose_wiring,
+        ring_dim,
+        params,
+        wiring,
+        l_instances_expected,
+    )?;
 
     let (mut surfaces_mul_local, all_sum_digits, all_sum_coeffwise) =
         build_mul_surfaces(&mut glue, ring_dim, pairs, &short_locals, &u32_locals)?;
