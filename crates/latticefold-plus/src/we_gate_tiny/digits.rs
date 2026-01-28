@@ -806,6 +806,74 @@ pub(crate) fn rebalance_tail_pm11_to_pm2(b: &mut Dr1csBuilder<F257>, digits: &[u
     out
 }
 
+/// Allocate a signed carry `c ∈ [-14,14]` by allocating an offset `off = c + 16` and
+/// enforcing `off ∈ [2,30]`.
+///
+/// Rationale: `mul_bal16_small` can produce carries outside `[-11,11]` when digits may take
+/// the value `-8` (since `(-8)*(-8)=64`), even when `min(len)<=3`.
+fn alloc_carry_pm14(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
+    assert!((-14..=14).contains(&c));
+    let off = (c + 16) as u8; // in [2,30]
+
+    // 5-bit decomposition of off.
+    let mut bits = [0usize; 5];
+    for i in 0..5 {
+        bits[i] = alloc_bool::<F257>(b, ((off >> i) & 1) == 1);
+    }
+    let off_var = b.new_var(F257::from(off as u64));
+    // off = Σ 2^i * bits[i]
+    b.enforce_lc_times_one_eq_const(vec![
+        (F257::ONE, off_var),
+        (-F257::ONE, bits[0]),
+        (-F257::from(2u64), bits[1]),
+        (-F257::from(4u64), bits[2]),
+        (-F257::from(8u64), bits[3]),
+        (-F257::from(16u64), bits[4]),
+    ]);
+
+    // Enforce off <= 30  <=> off != 31  <=> NOT(all 5 bits are 1).
+    let t01 = b.new_var(b.assignment[bits[0]] * b.assignment[bits[1]]);
+    b.enforce_mul(bits[0], bits[1], t01);
+    let t012 = b.new_var(b.assignment[t01] * b.assignment[bits[2]]);
+    b.enforce_mul(t01, bits[2], t012);
+    let t0123 = b.new_var(b.assignment[t012] * b.assignment[bits[3]]);
+    b.enforce_mul(t012, bits[3], t0123);
+    let all1 = b.new_var(b.assignment[t0123] * b.assignment[bits[4]]);
+    b.enforce_mul(t0123, bits[4], all1);
+    b.enforce_var_eq_const(all1, F257::ZERO);
+
+    // Enforce off >= 2  <=> (b1 OR b2 OR b3 OR b4) == 1.
+    // or = 1 - Π (1-bi) for i=1..4
+    let one_minus = |b: &mut Dr1csBuilder<F257>, x: usize| -> usize {
+        let v = b.new_var(F257::ONE - b.assignment[x]);
+        b.enforce_lc_times_one_eq_const(vec![(F257::ONE, v), (F257::ONE, x), (-F257::ONE, b.one())]);
+        v
+    };
+    let om1 = one_minus(b, bits[1]);
+    let om2 = one_minus(b, bits[2]);
+    let om3 = one_minus(b, bits[3]);
+    let om4 = one_minus(b, bits[4]);
+    let p12 = b.new_var(b.assignment[om1] * b.assignment[om2]);
+    b.enforce_mul(om1, om2, p12);
+    let p123 = b.new_var(b.assignment[p12] * b.assignment[om3]);
+    b.enforce_mul(p12, om3, p123);
+    let p1234 = b.new_var(b.assignment[p123] * b.assignment[om4]);
+    b.enforce_mul(p123, om4, p1234);
+    // or = 1 - p1234
+    let or = b.new_var(F257::ONE - b.assignment[p1234]);
+    b.enforce_lc_times_one_eq_const(vec![(F257::ONE, or), (F257::ONE, p1234), (-F257::ONE, b.one())]);
+    b.enforce_var_eq_const(or, F257::ONE);
+
+    // Return carry var: c = off - 16
+    let carry_var = b.new_var(F257::from(off as u64) - F257::from(16u64));
+    b.enforce_lc_times_one_eq_const(vec![
+        (F257::ONE, carry_var),
+        (-F257::ONE, off_var),
+        (F257::from(16u64), b.one()),
+    ]);
+    carry_var
+}
+
 /// Rebalance the final digit of a `mul_bal16_small_const_rhs4` product.
 ///
 /// Input tail is a carry digit in [-16,15]; output is a balanced digit in [-8,7] plus a
@@ -1207,13 +1275,13 @@ pub(crate) fn mul_bal16_small(b: &mut Dr1csBuilder<F257>, a: &[usize], bb: &[usi
         }
         assert!((-8..=7).contains(&rem));
         assert!(
-            (-11..=11).contains(&carry),
+            (-14..=14).contains(&carry),
             "carry out of expected range: {carry} from sum {sum}"
         );
 
         let digit_var = alloc_bal16_digit(b, rem as i8);
         // Statement-only arming: avoid witness-dependent gadget selection.
-        let carry_out_var = alloc_carry_pm11(b, carry);
+        let carry_out_var = alloc_carry_pm14(b, carry);
 
         let mut lc: Vec<(F257, usize)> = Vec::new();
         lc.push((F257::ONE, carry_var));
@@ -1297,13 +1365,13 @@ pub(crate) fn mul_bal16_small_const_rhs(
         }
         assert!((-8..=7).contains(&rem));
         assert!(
-            (-11..=11).contains(&carry),
+            (-14..=14).contains(&carry),
             "carry out of expected range: {carry} from sum {sum}"
         );
 
         let digit_var = alloc_bal16_digit(b, rem as i8);
         // Statement-only arming: avoid witness-dependent gadget selection.
-        let carry_out_var = alloc_carry_pm11(b, carry);
+        let carry_out_var = alloc_carry_pm14(b, carry);
 
         lc.push((-F257::ONE, digit_var));
         lc.push((-F257::from(16u64), carry_out_var));
