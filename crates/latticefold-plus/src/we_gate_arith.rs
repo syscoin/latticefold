@@ -6058,9 +6058,14 @@ mod tests {
         let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<RR>>(&trace.ops)
             .expect("lift_recording_trace_ops_to_f257");
 
+        // The CM segment begins at the first `SqueezeField(len=ring_dim)` (short challenges).
+        // To mirror the real Π_plus verifier schedule, we must also include the *prefix*
+        // `get_challenge()` u32 squeezes that occur before the CM short challenges.
         let squeeze_field_op_offset =
             super::first_squeeze_field_op_index_of_len(&ops_f257, <RR as PolyRing>::dimension())
                 .expect("first short SqueezeField(len=ring_dim) exists");
+        let prefix_u32_squeeze_ops =
+            super::collect_get_challenge_squeeze_field_indices(&ops_f257, 0, squeeze_field_op_offset);
         let k = params.k as usize;
         let log_kappa = ark_std::log2((params.kappa as usize).next_power_of_two()) as usize;
         let nvars_cm = params.nvars_cm as usize;
@@ -6086,6 +6091,9 @@ mod tests {
             .into_iter()
             .map(|i| i + squeeze_field_op_offset)
             .collect();
+        wiring_abs
+            .u32_squeeze_ops
+            .splice(0..0, prefix_u32_squeeze_ops.into_iter());
         wiring_abs.frog_squeeze_ops = Vec::new();
 
         let (inst, asg, _shorts, _u32s, _frogs, _frog_rejection, _tcch0, _tcch1, _sm, _ssq, _w) =
