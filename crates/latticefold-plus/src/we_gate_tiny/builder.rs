@@ -26,7 +26,7 @@ use super::digits::{
 use super::frog::{
     frog_add_mod_p_from_byte_vars_assume_canonical, frog_mul_mod_p_from_byte_vars_assume_canonical,
     frog_sub_mod_p_from_byte_vars_assume_canonical,
-    frog_u64_canonical_from_byte_vars, frog_u64_centered_le_bound_from_byte_vars,
+    frog_u64_centered_le_bound_from_byte_vars, frog_u64_enforce_lt_p_from_byte_vars,
     reduce_u64_mod_frog_from_byte_vars,
     FrogScalar,
 };
@@ -696,7 +696,7 @@ fn compute_tcch(
         for i in 0..8 {
             out[i] = alloc_const_byte(gb, bs[i]);
         }
-        let _limbs = frog_u64_canonical_from_byte_vars::<F257>(gb, &out);
+        frog_u64_enforce_lt_p_from_byte_vars::<F257>(gb, &out);
         out
     }
 
@@ -707,7 +707,7 @@ fn compute_tcch(
         for i in 4..8 {
             out[i] = alloc_const_byte(gb, 0u8);
         }
-        let _limbs = frog_u64_canonical_from_byte_vars::<F257>(gb, &out);
+        frog_u64_enforce_lt_p_from_byte_vars::<F257>(gb, &out);
         out
     }
 
@@ -795,8 +795,7 @@ fn compute_tcch(
                                     let _ = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, lv);
                                     coeffs[coeff][i] = lv;
                                 }
-                                let _limbs =
-                                    frog_u64_canonical_from_byte_vars::<F257>(&mut glue.gb, &coeffs[coeff]);
+                                frog_u64_enforce_lt_p_from_byte_vars::<F257>(&mut glue.gb, &coeffs[coeff]);
                             }
                             coh0_bytes.push(coeffs[0]);
                             comh_all_coeff_bytes.push(coeffs);
@@ -1538,7 +1537,7 @@ fn enforce_nonreabsorb_absorbs_are_canonical_frog(
                         let _ = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, lv);
                         bytes[j] = lv;
                     }
-                    let _limbs = frog_u64_canonical_from_byte_vars::<F257>(&mut glue.gb, &bytes);
+                    frog_u64_enforce_lt_p_from_byte_vars::<F257>(&mut glue.gb, &bytes);
                 }
             }
             PoseidonTraceOp::SqueezeBytes { .. } => {}

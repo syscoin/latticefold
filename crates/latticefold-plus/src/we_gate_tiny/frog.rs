@@ -255,27 +255,9 @@ pub(super) fn reduce_u64_mod_frog_from_byte_vars<F: PrimeField>(
     (q, z_limbs)
 }
 
-/// Interpret 8 little-endian byte vars (0..255) as a **canonical** Frog base-field element.
-///
-/// This enforces that the represented integer `u` satisfies `u < p_frog` (no reduction),
-/// and returns `u` as base-128 limbs.
-///
-/// Use this for transcript-absorbed base-field elements, which are already encoded canonically
-/// by `prime_field_to_bytes_le_fixed` in the transcript.
-pub(super) fn frog_u64_canonical_from_byte_vars<F: PrimeField>(
-    b: &mut Dr1csBuilder<F>,
-    u_byte_vars: &[usize; 8],
-) -> [usize; LIMBS_U64] {
-    let (q, z) = reduce_u64_mod_frog_from_byte_vars::<F>(b, u_byte_vars);
-    // Canonical encoding requires no subtraction (u < p), so q == 0.
-    b.enforce_var_eq_const(q, F::ZERO);
-    z
-}
-
 /// Enforce that an 8-byte little-endian integer `u` satisfies `u < p_frog`.
 ///
-/// This is a *cheaper* alternative to `frog_u64_canonical_from_byte_vars` when you do not need
-/// the base-128 limbs of `u` (and do not need to compute the reduced value `z`).
+/// This is the preferred "IO boundary" check for transcript-absorbed base-field elements.
 ///
 /// Internally this:
 /// - bit-decomposes the bytes (cached)
@@ -286,6 +268,17 @@ pub(super) fn frog_u64_enforce_lt_p_from_byte_vars<F: PrimeField>(
     b: &mut Dr1csBuilder<F>,
     u_byte_vars: &[usize; 8],
 ) {
+    let _ = frog_u64_enforce_lt_p_from_byte_vars_and_limbs::<F>(b, u_byte_vars);
+}
+
+/// Enforce `u < p_frog` and return `u` packed as base-128 limbs.
+///
+/// This is the "lt_p only" variant that avoids computing `u mod p` while still materializing the
+/// limb view needed by some downstream bounded gadgets.
+pub(super) fn frog_u64_enforce_lt_p_from_byte_vars_and_limbs<F: PrimeField>(
+    b: &mut Dr1csBuilder<F>,
+    u_byte_vars: &[usize; 8],
+) -> [usize; LIMBS_U64] {
     // Witness u.
     let mut u_buf = [0u8; 8];
     for i in 0..8 {
@@ -375,6 +368,7 @@ pub(super) fn frog_u64_enforce_lt_p_from_byte_vars<F: PrimeField>(
 
     // Enforce u < p: final borrow must be 1.
     b.enforce_var_eq_const(borrow, F::ONE);
+    u_limbs
 }
 
 /// Enforce that a canonical Frog base-field element `u` (encoded as 8 bytes, u < p_frog)
@@ -382,14 +376,17 @@ pub(super) fn frog_u64_enforce_lt_p_from_byte_vars<F: PrimeField>(
 /// - u ∈ [0, bound]  (non-negative)
 /// - OR u ∈ [p_frog - bound, p_frog - 1]  (negative, in centered lift)
 ///
-/// Returns base-128 limbs of `u` (same as `frog_u64_canonical_from_byte_vars`).
+/// Returns base-128 limbs of `u`.
 pub(super) fn frog_u64_centered_le_bound_from_byte_vars<F: PrimeField>(
     b: &mut Dr1csBuilder<F>,
     u_byte_vars: &[usize; 8],
     bound: u64,
 ) -> [usize; LIMBS_U64] {
-    // First, enforce canonical encoding and get base-128 limbs for u.
-    let u_limbs = frog_u64_canonical_from_byte_vars::<F>(b, u_byte_vars);
+    // First, enforce canonical encoding (u < p) and get base-128 limbs for u.
+    //
+    // We intentionally avoid the heavier "reduce-then-assert-q=0" style gadget here;
+    // for centered-bound checks we only need the limb view + the guarantee `u < p`.
+    let u_limbs = frog_u64_enforce_lt_p_from_byte_vars_and_limbs::<F>(b, u_byte_vars);
 
     // Witness u as u64 for boolean witnesses.
     let mut u_buf = [0u8; 8];

@@ -12,7 +12,8 @@ use super::challenges::bounded_u32_from_8_digits_base128;
 use super::digits::*;
 use super::frog::{
     frog_add_mod_p_from_byte_vars, frog_mul_mod_p_from_byte_vars, frog_sub_mod_p_from_byte_vars,
-    frog_mul_const_mod_p_from_byte_vars, frog_u64_canonical_from_byte_vars, reduce_u64_mod_frog_from_byte_vars,
+    frog_mul_const_mod_p_from_byte_vars, frog_u64_enforce_lt_p_from_byte_vars_and_limbs,
+    reduce_u64_mod_frog_from_byte_vars,
     ring_mul_negacyclic_karatsuba_d64, ring_mul_negacyclic_toom4_d64,
 };
 use super::gadgets::alloc_byte;
@@ -152,7 +153,7 @@ fn test_frog_u64_canonical_from_bytes_accepts_lt_p_and_rejects_ge_p() {
         let bv = alloc_byte::<F257>(&mut b, v);
         u_byte_vars[i] = bv.byte;
     }
-    let _z = frog_u64_canonical_from_byte_vars::<F257>(&mut b, &u_byte_vars);
+    let _z = frog_u64_enforce_lt_p_from_byte_vars_and_limbs::<F257>(&mut b, &u_byte_vars);
 
     // u >= p should fail due to enforced q==0.
     let u_bad = FROG_P + 9u64;
@@ -161,7 +162,7 @@ fn test_frog_u64_canonical_from_bytes_accepts_lt_p_and_rejects_ge_p() {
         let bv = alloc_byte::<F257>(&mut b, v);
         v_byte_vars[i] = bv.byte;
     }
-    let _z2 = frog_u64_canonical_from_byte_vars::<F257>(&mut b, &v_byte_vars);
+    let _z2 = frog_u64_enforce_lt_p_from_byte_vars_and_limbs::<F257>(&mut b, &v_byte_vars);
 
     let (inst, asg) = b.into_instance();
     assert!(inst.check(&asg).is_err(), "u>=p should violate canonical constraint");
