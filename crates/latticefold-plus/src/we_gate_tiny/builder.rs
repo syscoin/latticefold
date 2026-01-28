@@ -2132,29 +2132,13 @@ pub(super) fn build(
                 sumcheck_verify_degree2_ring_bytes(&mut glue.gb, claimed0, &msgs, &rs)?;
             lf_stage_log("cm_sumcheck_constraints_done", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
-            // Parse this sumcheck's eval table absorbs (ring elements) and (if in the pow2 regime)
-            // enforce the standard recombination equality `subclaim_eval == eval_acc`.
-            let evals_rows = {
-                let abs = &eval_absorbs[which];
-                let rows = l_instances_expected * (1 + params.mlen as usize);
-                if abs.len() != rows * 4 {
-                    return Err("tiny gate: eval absorb count mismatch".to_string());
-                }
-                let mut out: Vec<[RingBytes; 4]> = Vec::with_capacity(rows);
-                for row in 0..rows {
-                    let (s0, l0) = abs[row * 4 + 0];
-                    let (s1, l1) = abs[row * 4 + 1];
-                    let (s2, l2) = abs[row * 4 + 2];
-                    let (s3, l3) = abs[row * 4 + 3];
-                    out.push([
-                        parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s0, l0)?,
-                        parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s1, l1)?,
-                        parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s2, l2)?,
-                        parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s3, l3)?,
-                    ]);
-                }
-                out
-            };
+            // Eval table absorbs: we will stream these row-by-row in recombination to avoid
+            // holding a giant `Vec` of ring elements in host memory.
+            let abs_evals = &eval_absorbs[which];
+            let rows_total = l_instances_expected * (1 + params.mlen as usize);
+            if abs_evals.len() != rows_total * 4 {
+                return Err("tiny gate: eval absorb count mismatch".to_string());
+            }
             lf_stage_log("cm_eval_table_parsed", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
             // Recombination check (requires the pow2 regime + recovered setchk r-point).
@@ -2186,48 +2170,52 @@ pub(super) fn build(
                 let t0 = eval_t_z_optimized_ring_digits(&mut glue.gb, tc0_ring, sp_ring, dpp, xp, &rs_digits)?;
                 let t1 = eval_t_z_optimized_ring_digits(&mut glue.gb, tc1_ring, sp_ring, dpp, xp, &rs_digits)?;
 
-                // Reshape eval rows into evals[l][row][t].
-                let rows_per_l = 1 + params.mlen as usize;
-                let mut evals_by_l: Vec<Vec<[RingDigits; 4]>> = Vec::with_capacity(l_instances_expected);
-                for l in 0..l_instances_expected {
-                    let mut rows_l: Vec<[RingDigits; 4]> = Vec::with_capacity(rows_per_l);
-                    for row in 0..rows_per_l {
-                        let flat = l * rows_per_l + row;
-                        let r0 = ring_bytes_to_digits(&mut glue.gb, &evals_rows[flat][0]);
-                        let r1d = ring_bytes_to_digits(&mut glue.gb, &evals_rows[flat][1]);
-                        let r2d = ring_bytes_to_digits(&mut glue.gb, &evals_rows[flat][2]);
-                        let r3d = ring_bytes_to_digits(&mut glue.gb, &evals_rows[flat][3]);
-                        rows_l.push([r0, r1d, r2d, r3d]);
-                    }
-                    evals_by_l.push(rows_l);
-                }
-                lf_stage_log("cm_recomb_evals_to_digits", Some(&pose_inst), Some(&glue), &mut mem_prev);
-
+                // Stream recombination:
                 // eval_acc = Σ_l eq*inner_l + (t0*e00)*rc^z + (t1*e00)*rc^{z+1}
+                let rows_per_l = 1 + params.mlen as usize;
                 let mut eval_acc = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
                 for l in 0..l_instances_expected {
                     let l_idx = l * (4 + 4 * (params.mlen as usize));
                     let mut inner = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
-                    // First row is evals[l][0] = [tau, m_tau, f, h]
+                    let mut e00_opt: Option<RingDigits> = None;
+
+                    // First row (tau, m_tau, f, h)
+                    let flat0 = l * rows_per_l + 0;
                     for j in 0..4 {
-                        let t = ring_scale_digits(&mut glue.gb, &evals_by_l[l][0][j], &rc_pows[l_idx + j]);
+                        let (st, ln) = abs_evals[flat0 * 4 + j];
+                        let rb = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, st, ln)?;
+                        let rd = ring_bytes_to_digits(&mut glue.gb, &rb);
+                        if j == 0 {
+                            e00_opt = Some(rd.clone());
+                        }
+                        let t = ring_scale_digits(&mut glue.gb, &rd, &rc_pows[l_idx + j]);
                         inner = ring_add_digits(&mut glue.gb, &inner, &t);
                     }
-                    // M chunks
+
+                    // M rows
                     for i in 0..(params.mlen as usize) {
+                        let flat = l * rows_per_l + 1 + i;
                         let idx = l_idx + 4 + i * 4;
                         for j in 0..4 {
-                            let t = ring_scale_digits(&mut glue.gb, &evals_by_l[l][1 + i][j], &rc_pows[idx + j]);
+                            let (st, ln) = abs_evals[flat * 4 + j];
+                            let rb = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, st, ln)?;
+                            let rd = ring_bytes_to_digits(&mut glue.gb, &rb);
+                            let t = ring_scale_digits(&mut glue.gb, &rd, &rc_pows[idx + j]);
                             inner = ring_add_digits(&mut glue.gb, &inner, &t);
                         }
                     }
+                    if l == 0 {
+                        // Mark the first completion of digit-conversion for the eval table.
+                        lf_stage_log("cm_recomb_evals_to_digits", Some(&pose_inst), Some(&glue), &mut mem_prev);
+                    }
+
                     let eq_inner = ring_scale_digits(&mut glue.gb, &inner, &eq);
                     eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &eq_inner);
 
-                    // t(z) terms (use e00 == evals[l][0][0])
-                    let e00 = &evals_by_l[l][0][0];
-                    let t0e = ring_mul_negacyclic_digits_d64(&mut glue.gb, &t0, e00)?;
-                    let t1e = ring_mul_negacyclic_digits_d64(&mut glue.gb, &t1, e00)?;
+                    // t(z) terms (use e00 from this l)
+                    let e00 = e00_opt.ok_or_else(|| "tiny gate: missing e00 in recombination".to_string())?;
+                    let t0e = ring_mul_negacyclic_digits_d64(&mut glue.gb, &t0, &e00)?;
+                    let t1e = ring_mul_negacyclic_digits_d64(&mut glue.gb, &t1, &e00)?;
                     let t0e_s = ring_scale_digits(&mut glue.gb, &t0e, &rc_pows[z_idx]);
                     let t1e_s = ring_scale_digits(&mut glue.gb, &t1e, &rc_pows[z_idx + 1]);
                     eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &t0e_s);
