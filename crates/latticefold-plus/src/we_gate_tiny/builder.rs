@@ -443,7 +443,7 @@ fn compute_tcch(
                     }
 
                     let mut coh0_bytes: Vec<[usize; 8]> = Vec::new();
-                    let mut comh_all_coeff_bytes: Vec<[[usize; 8]; 64]> = Vec::new();
+                    let mut comh_all_coeff_bytes: Vec<Vec<[usize; 8]>> = Vec::new();
                     for &(ab_start, ab_len) in &comh_absorb_ranges {
                         if ab_len < reb || (ab_len % reb) != 0 {
                             continue;
@@ -453,14 +453,15 @@ fn compute_tcch(
                             let blk_start = ab_start + blk * reb;
                             // Each ring element is encoded as `ring_dim` coefficients, each coefficient as
                             // `coeff_bytes` bytes (little-endian, canonical for Frog base field).
-                            if coeff_bytes != 8 || ring_dim != 64 {
-                                // Current tiny gate specialization: FrogRing64 with 8-byte coeff encoding.
-                                return Err("tiny gate: expected ring_dim=64 and coeff_bytes=8 for CM verifier".to_string());
+                            if coeff_bytes != 8 {
+                                return Err(format!(
+                                    "tiny gate: expected Frog base-field coeff_bytes=8 for CM verifier, got {coeff_bytes}"
+                                ));
                             }
 
-                            let mut coeffs = [[0usize; 8]; 64];
-                            for coeff in 0..64 {
-                                let coeff_start = blk_start + coeff * 8;
+                            let mut coeffs: Vec<[usize; 8]> = vec![[0usize; 8]; ring_dim];
+                            for coeff in 0..ring_dim {
+                                let coeff_start = blk_start + coeff * coeff_bytes;
                                 for i in 0..8 {
                                     let gv = pose_wiring.absorb_vars[coeff_start + i];
                                     let lv = glue.copy_digit(gv);
