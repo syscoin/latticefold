@@ -2165,10 +2165,12 @@ pub(super) fn build(
 
                 // eq(r, ro) where r is the transcript-derived SetChk point (recovered above).
                 let eq = eq_eval_frog_digits(&mut glue.gb, rpt, &rs_digits)?;
+                lf_stage_log("cm_recomb_eq_done", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
                 // Evaluate t0(ro), t1(ro).
                 let t0 = eval_t_z_optimized_ring_digits(&mut glue.gb, tc0_ring, sp_ring, dpp, xp, &rs_digits)?;
                 let t1 = eval_t_z_optimized_ring_digits(&mut glue.gb, tc1_ring, sp_ring, dpp, xp, &rs_digits)?;
+                lf_stage_log("cm_recomb_t0t1_done", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
                 // Stream recombination:
                 // eval_acc = Σ_l eq*inner_l + (t0*e00)*rc^z + (t1*e00)*rc^{z+1}
