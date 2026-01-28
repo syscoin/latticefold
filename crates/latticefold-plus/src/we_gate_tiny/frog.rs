@@ -736,7 +736,7 @@ pub(super) fn frog_mul_mod_p_from_byte_vars(
 }
 
 #[inline]
-fn frog_mul_mod_p_from_byte_vars_assume_canonical(
+pub(super) fn frog_mul_mod_p_from_byte_vars_assume_canonical(
     b: &mut Dr1csBuilder<F257>,
     a_bytes: &[usize; 8],
     b_bytes: &[usize; 8],
@@ -808,7 +808,7 @@ pub(super) fn frog_mul_const_mod_p_from_byte_vars(
 }
 
 #[inline]
-fn frog_mul_const_mod_p_from_byte_vars_assume_canonical(
+pub(super) fn frog_mul_const_mod_p_from_byte_vars_assume_canonical(
     b: &mut Dr1csBuilder<F257>,
     x_bytes: &[usize; 8],
     c: u64,
@@ -871,7 +871,7 @@ pub(super) fn frog_add_mod_p_from_byte_vars(
 }
 
 #[inline]
-fn frog_add_mod_p_from_byte_vars_assume_canonical(
+pub(super) fn frog_add_mod_p_from_byte_vars_assume_canonical(
     b: &mut Dr1csBuilder<F257>,
     a_bytes: &[usize; 8],
     c_bytes: &[usize; 8],
@@ -934,7 +934,7 @@ pub(super) fn frog_sub_mod_p_from_byte_vars(
 }
 
 #[inline]
-fn frog_sub_mod_p_from_byte_vars_assume_canonical(
+pub(super) fn frog_sub_mod_p_from_byte_vars_assume_canonical(
     b: &mut Dr1csBuilder<F257>,
     a_bytes: &[usize; 8],
     c_bytes: &[usize; 8],

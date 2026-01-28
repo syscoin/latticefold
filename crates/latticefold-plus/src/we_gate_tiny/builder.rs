@@ -24,7 +24,8 @@ use super::digits::{
     sum_product_digits_bal16_22, sum_products13_coeffwise_fixed_len, sum_products22_coeffwise_fixed_len,
 };
 use super::frog::{
-    frog_add_mod_p_from_byte_vars, frog_mul_mod_p_from_byte_vars, frog_sub_mod_p_from_byte_vars,
+    frog_add_mod_p_from_byte_vars_assume_canonical, frog_mul_mod_p_from_byte_vars_assume_canonical,
+    frog_sub_mod_p_from_byte_vars_assume_canonical,
     frog_u64_canonical_from_byte_vars, frog_u64_centered_le_bound_from_byte_vars,
     reduce_u64_mod_frog_from_byte_vars,
 };
@@ -514,11 +515,11 @@ fn compute_tcch(
                                 let one = alloc_const_frog_u64(gb, 1u64);
                                 let mut acc: Vec<[usize; 8]> = vec![one];
                                 for ci in c {
-                                    let one_minus = frog_sub_mod_p_from_byte_vars(gb, &one, ci);
+                                    let one_minus = frog_sub_mod_p_from_byte_vars_assume_canonical(gb, &one, ci);
                                     let mut next: Vec<[usize; 8]> = Vec::with_capacity(acc.len() * 2);
                                     for t in &acc {
-                                        next.push(frog_mul_mod_p_from_byte_vars(gb, t, &one_minus));
-                                        next.push(frog_mul_mod_p_from_byte_vars(gb, t, ci));
+                                        next.push(frog_mul_mod_p_from_byte_vars_assume_canonical(gb, t, &one_minus));
+                                        next.push(frog_mul_mod_p_from_byte_vars_assume_canonical(gb, t, ci));
                                     }
                                     acc = next;
                                 }
@@ -543,20 +544,20 @@ fn compute_tcch(
                                 for j in 0..kappa {
                                     let ch = &comh_all_coeff_bytes[base + j];
                                     for coeff in 0..ring_dim {
-                                        let m0 = frog_mul_mod_p_from_byte_vars(
+                                        let m0 = frog_mul_mod_p_from_byte_vars_assume_canonical(
                                             &mut glue.gb,
                                             &tensor_c0[j],
                                             &ch[coeff],
                                         );
-                                        let m1 = frog_mul_mod_p_from_byte_vars(
+                                        let m1 = frog_mul_mod_p_from_byte_vars_assume_canonical(
                                             &mut glue.gb,
                                             &tensor_c1[j],
                                             &ch[coeff],
                                         );
                                         acc0[coeff] =
-                                            frog_add_mod_p_from_byte_vars(&mut glue.gb, &acc0[coeff], &m0);
+                                            frog_add_mod_p_from_byte_vars_assume_canonical(&mut glue.gb, &acc0[coeff], &m0);
                                         acc1[coeff] =
-                                            frog_add_mod_p_from_byte_vars(&mut glue.gb, &acc1[coeff], &m1);
+                                            frog_add_mod_p_from_byte_vars_assume_canonical(&mut glue.gb, &acc1[coeff], &m1);
                                     }
                                 }
                                 tcch0_ring.push(acc0);
