@@ -18,10 +18,9 @@ use crate::we_frog_poseidon_f257::FROG_P;
 /// This is NTT-friendly (large 2-adicity), unlike the Frog prime used elsewhere in this module.
 pub(crate) const GOLDILOCKS_P: u64 = 0xFFFF_FFFF_0000_0001;
 
-#[inline]
-fn strict_nowrap_enabled() -> bool {
-    std::env::var("LF_STRICT_NOWRAP").ok().as_deref() == Some("1")
-}
+// NOTE: We intentionally do not provide a "fast but potentially wrapping" mode here.
+// The pm128 fused carry-chain style relations are not injective over the integers in F257
+// (see tests in `we_gate_tiny/tests.rs` demonstrating the 257 = 16^2 + 1 bubble).
 
 fn frog_p_bal16_digits_le_const() -> [i8; 17] {
     // Match the balancing convention used by `u64_bytes_to_bal16_digits`:
@@ -594,109 +593,25 @@ fn enforce_prod_eq_qp_plus_r_bal16(
     p_d_const: &[i8],
     r_d: &[usize],
 ) {
-    // Strict soundness mode: avoid the fused pm128 carry-chain relation, which can wrap mod 257.
-    //
-    // Instead, materialize `qp = q*p` in bal16 digits (using the safe mul-by-const gadget),
+    // Sound no-wrap enforcement:
+    // materialize `qp = q*p` in bal16 digits (using the safe mul-by-const gadget),
     // add `r`, and enforce equality to `prod` using the bal16 add gadget (pm1 carries).
-    if strict_nowrap_enabled() {
-        let max_len = prod_d
-            .len()
-            .max(r_d.len())
-            .max(q_d.len().saturating_add(p_d_const.len()).saturating_sub(1))
-            + 1; // headroom digit
-
-        let prod_pad = pad_bal16(b, prod_d.to_vec(), max_len);
-        let r_pad = pad_bal16(b, r_d.to_vec(), max_len);
-
-        let qp = mul_bal16_long_by_const_rhs(b, q_d, p_d_const);
-        let qp_pad = pad_bal16(b, qp, max_len);
-
-        let (sum, carry) = add_bal16_same_len(b, &qp_pad, &r_pad);
-        b.enforce_var_eq_const(carry, F257::ZERO);
-
-        enforce_bal16_vec_eq(b, &prod_pad, &sum);
-        return;
-    }
-
-    let zero = b.zero_var();
     let max_len = prod_d
         .len()
         .max(r_d.len())
         .max(q_d.len().saturating_add(p_d_const.len()).saturating_sub(1))
-        + 1; // one digit of headroom for the final carry becoming 0
+        + 1; // headroom digit
 
-    // Pad prod and r to max_len with 0 digits.
     let prod_pad = pad_bal16(b, prod_d.to_vec(), max_len);
     let r_pad = pad_bal16(b, r_d.to_vec(), max_len);
 
-    // carry_0 = 0 (fixed, no range-check needed).
-    let mut carry_var = b.new_var(F257::ZERO);
-    b.enforce_var_eq_const(carry_var, F257::ZERO);
-    let mut carry_i32: i32 = 0;
+    let qp = mul_bal16_long_by_const_rhs(b, q_d, p_d_const);
+    let qp_pad = pad_bal16(b, qp, max_len);
 
-    for k in 0..max_len {
-        // Witness the exact carry update from the already-witnessed digits.
-        let prod_k = super::digits::f257_to_i32_bal(b.assignment[prod_pad[k]]);
-        let r_k = super::digits::f257_to_i32_bal(b.assignment[r_pad[k]]);
-        let mut sum: i32 = carry_i32 + prod_k - r_k;
+    let (sum, carry) = add_bal16_same_len(b, &qp_pad, &r_pad);
+    b.enforce_var_eq_const(carry, F257::ZERO);
 
-        for i in 0..q_d.len() {
-            if i > k {
-                break;
-            }
-            let j = k - i;
-            if j >= p_d_const.len() {
-                continue;
-            }
-            let q_i = super::digits::f257_to_i32_bal(b.assignment[q_d[i]]);
-            sum -= q_i * (p_d_const[j] as i32);
-        }
-
-        debug_assert!(
-            sum % 16 == 0,
-            "base-16 carry check not divisible: sum={sum} at k={k}"
-        );
-        let carry_next: i32 = sum / 16;
-        debug_assert!(
-            (-128..=127).contains(&carry_next),
-            "carry out of pm128 bound: {carry_next} at k={k} (sum={sum})"
-        );
-
-        // Allocate next carry with the smallest sufficient bound.
-        // Statement-only arming: use a fixed pm128 bound (no witness-dependent gadget selection).
-        let carry_next_var = alloc_carry_pm128(b, carry_next);
-
-        // Constrain: carry + prod_k - r_k - Σ(q_i * p_{k-i}) - 16*carry_next = 0
-        let mut lc: Vec<(F257, usize)> = Vec::with_capacity(4 + q_d.len());
-        lc.push((F257::ONE, carry_var));
-        lc.push((F257::ONE, prod_pad[k]));
-        lc.push((-F257::ONE, r_pad[k]));
-
-        for i in 0..q_d.len() {
-            if i > k {
-                break;
-            }
-            let j = k - i;
-            if j >= p_d_const.len() {
-                continue;
-            }
-            let coeff = i32_to_f257(-(p_d_const[j] as i32)); // subtract q_i*p_j
-            if coeff != F257::ZERO {
-                lc.push((coeff, q_d[i]));
-            }
-        }
-
-        lc.push((-F257::from(16u64), carry_next_var));
-        b.enforce_lc_times_one_eq_const(lc);
-
-        carry_var = carry_next_var;
-        carry_i32 = carry_next;
-    }
-
-    // Final carry must be 0.
-    b.enforce_var_eq_const(carry_var, F257::ZERO);
-    // Also ensure the padded tails we introduced are actually zero digits (soundness belt+braces).
-    b.enforce_var_eq_const(zero, F257::ZERO);
+    enforce_bal16_vec_eq(b, &prod_pad, &sum);
 }
 
 /// Enforce `a + c = q*p + r` over balanced base-16 digits with a tight carry bound.
