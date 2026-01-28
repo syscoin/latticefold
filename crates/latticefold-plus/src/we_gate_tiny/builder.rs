@@ -1569,7 +1569,19 @@ pub(super) fn build(
     // verifier challenges `r_sc` (derived from transcript u32 coins).
     //
     // Claimed sums and recombination will be wired once Dcom prefix verifier math is integrated.
+
+
+    
+
     if ring_dim > 0 && l_instances_expected > 0 && !comh_absorbs.is_empty() {
+        eprintln!(
+            "[tiny_gate/cm] ring_dim={} kappa={} n_comh_ring_elems={} L_expected={} comh_absorbs_len={}",
+            ring_dim,
+            kappa,
+            n_comh_ring_elems,
+            l_instances_expected,
+            comh_absorbs.len()
+        );
         let cm_u32_start = cm_u32_start_idx(wiring);
         let kappa = params.kappa as usize;
         let log_kappa = ark_std::log2(kappa.next_power_of_two()) as usize;
