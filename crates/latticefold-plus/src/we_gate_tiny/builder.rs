@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::transcript::DEFAULT_REJECTION_TRIES;
 
-use ark_ff::{BigInteger, Field, PrimeField};
+use ark_ff::Field;
 use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
 use latticefold::transcript::poseidon::F257;
 use symphony::dpp_poseidon::{merge_sparse_dr1cs_share_one, Constraint, PoseidonDr1csWiring, SparseDr1csInstance};
@@ -528,24 +528,47 @@ fn compute_tcch(
                             let tensor_c0 = tensor_frog_bytes(&mut glue.gb, &c0_bytes);
                             let tensor_c1 = tensor_frog_bytes(&mut glue.gb, &c1_bytes);
 
-                            // Compute full-ring tcch0/tcch1, but return only coefficient-0 bytes for API.
-                            tcch0_local.reserve(l_instances);
-                            tcch1_local.reserve(l_instances);
+                            // Compute full-ring tcch0/tcch1 (as in `CmProof::verify_with_mlen`):
+                            //
+                            //   tcch{0,1}[l] = Σ_j tensor_c{0,1}[j] * comh[l][j]
+                            //
+                            // Multiplying a ring element by a base-field scalar is coefficient-wise scaling.
                             let zero = alloc_const_frog_u64(&mut glue.gb, 0u64);
+                            let mut tcch0_ring: Vec<Vec<[usize; 8]>> = Vec::with_capacity(l_instances);
+                            let mut tcch1_ring: Vec<Vec<[usize; 8]>> = Vec::with_capacity(l_instances);
                             for l in 0..l_instances {
                                 let base = l * kappa;
-                                // coeff 0
-                                let mut sum0 = zero;
-                                let mut sum1 = zero;
+                                let mut acc0: Vec<[usize; 8]> = vec![zero; ring_dim];
+                                let mut acc1: Vec<[usize; 8]> = vec![zero; ring_dim];
                                 for j in 0..kappa {
-                                    let rj0 = &comh_all_coeff_bytes[base + j][0];
-                                    let m0 = frog_mul_mod_p_from_byte_vars(&mut glue.gb, &tensor_c0[j], rj0);
-                                    let m1 = frog_mul_mod_p_from_byte_vars(&mut glue.gb, &tensor_c1[j], rj0);
-                                    sum0 = frog_add_mod_p_from_byte_vars(&mut glue.gb, &sum0, &m0);
-                                    sum1 = frog_add_mod_p_from_byte_vars(&mut glue.gb, &sum1, &m1);
+                                    let ch = &comh_all_coeff_bytes[base + j];
+                                    for coeff in 0..ring_dim {
+                                        let m0 = frog_mul_mod_p_from_byte_vars(
+                                            &mut glue.gb,
+                                            &tensor_c0[j],
+                                            &ch[coeff],
+                                        );
+                                        let m1 = frog_mul_mod_p_from_byte_vars(
+                                            &mut glue.gb,
+                                            &tensor_c1[j],
+                                            &ch[coeff],
+                                        );
+                                        acc0[coeff] =
+                                            frog_add_mod_p_from_byte_vars(&mut glue.gb, &acc0[coeff], &m0);
+                                        acc1[coeff] =
+                                            frog_add_mod_p_from_byte_vars(&mut glue.gb, &acc1[coeff], &m1);
+                                    }
                                 }
-                                tcch0_local.push(sum0);
-                                tcch1_local.push(sum1);
+                                tcch0_ring.push(acc0);
+                                tcch1_ring.push(acc1);
+                            }
+
+                            // Current API exports only coefficient-0 (base-field) as 8 LE bytes per instance.
+                            tcch0_local.reserve(l_instances);
+                            tcch1_local.reserve(l_instances);
+                            for l in 0..l_instances {
+                                tcch0_local.push(tcch0_ring[l][0]);
+                                tcch1_local.push(tcch1_ring[l][0]);
                             }
                         }
                     }
