@@ -28,12 +28,19 @@ use super::frog::{
     frog_sub_mod_p_from_byte_vars_assume_canonical,
     frog_u64_canonical_from_byte_vars, frog_u64_centered_le_bound_from_byte_vars,
     reduce_u64_mod_frog_from_byte_vars,
+    FrogScalar,
 };
 use super::gadgets::{decompose_existing_byte_var_to_bits, enforce_var_eq};
 use super::params::DIGITS_PER_TRY;
 use super::poseidon::poseidon_f257_arithmetize;
 use super::surfaces::{CmDigitMulSqSurfaceWiring, CmDigitMulSurfaceWiring};
-use super::cm_math::{ring_add_bytes, ring_zero_bytes, sumcheck_verify_degree2_ring_bytes, RingBytes};
+
+use super::cm_math::{
+    eq_eval_frog_digits, eval_t_z_optimized_ring_digits, frog_bytes_to_digits, frog_pow_table_digits,
+    ring_add_bytes, ring_add_digits, ring_bytes_to_digits, ring_eq_digits, ring_mul_negacyclic_digits_d64,
+    ring_scale_digits, ring_unit_monomial_digits, ring_zero_bytes, sumcheck_verify_degree2_ring_bytes,
+    tensor_frog_ringconst_digits, tensor_frog_scalars_digits, RingBytes, RingDigits,
+};
 
 struct GlueCtx {
     gb: Dr1csBuilder<F257>,
@@ -1547,7 +1554,7 @@ pub(super) fn build(
     }
 
     // Parse and constrain the CM segment after short challenges (sumcheck headers, etc.).
-    let (comh_absorbs, sc_msg_absorbs, _eval_absorbs) = parse_and_enforce_cm_after_short(
+    let (comh_absorbs, sc_msg_absorbs, eval_absorbs) = parse_and_enforce_cm_after_short(
         &mut glue,
         ops,
         &pose_wiring,
@@ -1567,12 +1574,138 @@ pub(super) fn build(
         let kappa = params.kappa as usize;
         let log_kappa = ark_std::log2(kappa.next_power_of_two()) as usize;
         let nvars_cm = params.nvars_cm as usize;
+        let k_decomp = params.k as usize;
+        let ell = params.l as usize;
 
-        // Sumcheck challenges after absorb_comh: c0/c1, then for each sumcheck: rc, r_sc[0..nvars_cm]
+        // CM challenges after absorb_comh: c0/c1, then for each sumcheck: rc, r_sc[0..nvars_cm]
+        let c0_u32 = &u32_locals[cm_u32_start..cm_u32_start + log_kappa];
+        let c1_u32 = &u32_locals[cm_u32_start + log_kappa..cm_u32_start + 2 * log_kappa];
+
+        // Precompute (once) the ring-constant tables needed for t(z) evaluation.
+        //
+        // NOTE: This mirrors `CmProof::verify_with_mlen` / `tensor_eval::eval_t_z_optimized`.
+        // We only build these when the factor sizes are powers of two (the regime used by WE).
+        let mut tensor_c0_ring: Option<Vec<RingDigits>> = None;
+        let mut tensor_c1_ring: Option<Vec<RingDigits>> = None;
+        let mut s_prime_flat_ring: Option<Vec<RingDigits>> = None;
+        let mut dpp_ring: Option<Vec<RingDigits>> = None;
+        let mut x_powers_ring: Option<Vec<RingDigits>> = None;
+        let mut r_point_digits: Option<Vec<FrogScalar>> = None;
+        if ring_dim == 64
+            && kappa.is_power_of_two()
+            && (k_decomp * ring_dim).is_power_of_two()
+            && ell.is_power_of_two()
+        {
+            // c0/c1 as Frog scalars (digit encoding), then tensor-expand.
+            let c0_digits: Vec<_> = c0_u32
+                .iter()
+                .map(|u| {
+                    let bytes = frog_bytes_from_u32_le_bytes(&mut glue.gb, &u.byte_vars);
+                    frog_bytes_to_digits(&mut glue.gb, bytes)
+                })
+                .collect();
+            let c1_digits: Vec<_> = c1_u32
+                .iter()
+                .map(|u| {
+                    let bytes = frog_bytes_from_u32_le_bytes(&mut glue.gb, &u.byte_vars);
+                    frog_bytes_to_digits(&mut glue.gb, bytes)
+                })
+                .collect();
+            let t0 = tensor_frog_scalars_digits(&mut glue.gb, &c0_digits);
+            let t1 = tensor_frog_scalars_digits(&mut glue.gb, &c1_digits);
+            tensor_c0_ring = Some(tensor_frog_ringconst_digits(&mut glue.gb, &t0, ring_dim));
+            tensor_c1_ring = Some(tensor_frog_ringconst_digits(&mut glue.gb, &t1, ring_dim));
+
+            // dpp: dp^i as constant-coeff ring elements.
+            let dp = (ring_dim / 2) as u64;
+            let p = crate::we_frog_poseidon_f257::FROG_P;
+            let mut acc: u64 = 1;
+            let mut dpp: Vec<RingDigits> = Vec::with_capacity(ell);
+            for _ in 0..ell {
+                let s_bytes = super::cm_math::alloc_const_frog_u64(&mut glue.gb, acc);
+                let s = frog_bytes_to_digits(&mut glue.gb, s_bytes);
+                dpp.push(super::cm_math::ring_const_coeff_digits(&mut glue.gb, &s, ring_dim));
+                acc = ((acc as u128) * (dp as u128) % (p as u128)) as u64;
+            }
+            dpp_ring = Some(dpp);
+
+            // x_powers: unit monomials.
+            let mut xp: Vec<RingDigits> = Vec::with_capacity(ring_dim);
+            for i in 0..ring_dim {
+                xp.push(ring_unit_monomial_digits(&mut glue.gb, i, ring_dim));
+            }
+            x_powers_ring = Some(xp);
+
+            // s_prime_flat: k*d short challenges, each is a ring element with centered coeff bytes.
+            let need_sprime = k_decomp
+                .checked_mul(ring_dim)
+                .ok_or_else(|| "tiny gate: k*ring_dim overflow (s_prime_flat)".to_string())?;
+            if short_locals.len() < 3 + need_sprime {
+                return Err("tiny gate: short_locals too short for s_prime_flat".to_string());
+            }
+            let z = glue.gb.new_var(F257::ZERO);
+            glue.gb.enforce_var_eq_const(z, F257::ZERO);
+            let c128 = super::cm_math::alloc_const_frog_u64(&mut glue.gb, 128u64);
+            let mut sflat: Vec<RingDigits> = Vec::with_capacity(need_sprime);
+            for blk in 0..need_sprime {
+                let sb = &short_locals[3 + blk];
+                // Each block provides `ring_dim` bytes (byte-view).
+                if sb.byte_vars.len() != ring_dim {
+                    return Err("tiny gate: short byte_vars len mismatch (s_prime_flat)".to_string());
+                }
+                let mut re: RingDigits = Vec::with_capacity(ring_dim);
+                for &bv in &sb.byte_vars {
+                    let mut bbytes = [0usize; 8];
+                    bbytes[0] = bv;
+                    for i in 1..8 {
+                        bbytes[i] = z;
+                    }
+                    // Centered coefficient = (byte - 128) mod p (canonical).
+                    let centered = frog_sub_mod_p_from_byte_vars_assume_canonical(&mut glue.gb, &bbytes, &c128);
+                    re.push(frog_bytes_to_digits(&mut glue.gb, centered));
+                }
+                sflat.push(re);
+            }
+            s_prime_flat_ring = Some(sflat);
+
+            // Recover the SetChk verifier point `r` used in eq(r, ro).
+            //
+            // In the LF+ schedule (`poseidon_trace_schedule_for_plus`), this is sampled by `Out::verify`
+            // *before* the CM short challenges. We locate it in the `u32_locals` challenge stream by
+            // counting `get_challenge()` calls in the prefix schedule.
+            let nvars_lin = params.nvars_setchk as usize;
+            let n_lin_proofs = l_instances_expected; // LF+ schedule uses L == n_lin_proofs
+            let lin_chals = n_lin_proofs
+                .checked_mul(2usize.saturating_mul(nvars_lin))
+                .ok_or_else(|| "tiny gate: lin_chals overflow".to_string())?;
+            let nclaims = k_decomp
+                .checked_add(1)
+                .ok_or_else(|| "tiny gate: nclaims overflow".to_string())?;
+            let out_coin_total = nclaims
+                .checked_mul(nvars_lin + 2)
+                .and_then(|x| x.checked_add(if k_decomp > 1 { 1 } else { 0 }))
+                .ok_or_else(|| "tiny gate: out_coin_total overflow".to_string())?;
+            let r_start = lin_chals
+                .checked_add(out_coin_total)
+                .ok_or_else(|| "tiny gate: r_start overflow".to_string())?;
+            let r_end = r_start
+                .checked_add(nvars_lin)
+                .ok_or_else(|| "tiny gate: r_end overflow".to_string())?;
+            if u32_locals.len() < r_end {
+                return Err("tiny gate: not enough u32 challenges to recover setchk r-point".to_string());
+            }
+            let mut rdig: Vec<FrogScalar> = Vec::with_capacity(nvars_lin);
+            for u in &u32_locals[r_start..r_end] {
+                let bytes = frog_bytes_from_u32_le_bytes(&mut glue.gb, &u.byte_vars);
+                rdig.push(frog_bytes_to_digits(&mut glue.gb, bytes));
+            }
+            r_point_digits = Some(rdig);
+        }
+
         let mut u32_idx = cm_u32_start + 2 * log_kappa;
         for which in 0..2 {
             // rc (currently unused here, but we must consume it to align indices)
-            let _rc_bytes = frog_bytes_from_u32_le_bytes(&mut glue.gb, &u32_locals[u32_idx].byte_vars);
+            let rc_bytes = frog_bytes_from_u32_le_bytes(&mut glue.gb, &u32_locals[u32_idx].byte_vars);
             u32_idx += 1;
             let mut rs: Vec<[usize; 8]> = Vec::with_capacity(nvars_cm);
             for _ in 0..nvars_cm {
@@ -1605,7 +1738,110 @@ pub(super) fn build(
             } else {
                 ring_add_bytes(&mut glue.gb, &msgs[0][0], &msgs[0][1])
             };
-            let _final_claim = sumcheck_verify_degree2_ring_bytes(&mut glue.gb, claimed0, &msgs, &rs)?;
+            let final_claim_bytes =
+                sumcheck_verify_degree2_ring_bytes(&mut glue.gb, claimed0, &msgs, &rs)?;
+
+            // Parse this sumcheck's eval table absorbs (ring elements) and (if in the pow2 regime)
+            // enforce the standard recombination equality `subclaim_eval == eval_acc`.
+            let evals_rows = {
+                let abs = &eval_absorbs[which];
+                let rows = l_instances_expected * (1 + params.mlen as usize);
+                if abs.len() != rows * 4 {
+                    return Err("tiny gate: eval absorb count mismatch".to_string());
+                }
+                let mut out: Vec<[RingBytes; 4]> = Vec::with_capacity(rows);
+                for row in 0..rows {
+                    let (s0, l0) = abs[row * 4 + 0];
+                    let (s1, l1) = abs[row * 4 + 1];
+                    let (s2, l2) = abs[row * 4 + 2];
+                    let (s3, l3) = abs[row * 4 + 3];
+                    out.push([
+                        parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s0, l0)?,
+                        parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s1, l1)?,
+                        parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s2, l2)?,
+                        parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s3, l3)?,
+                    ]);
+                }
+                out
+            };
+
+            // Recombination check (requires the pow2 regime + recovered setchk r-point).
+            if let (Some(tc0_ring), Some(tc1_ring), Some(sp_ring), Some(dpp), Some(xp), Some(rpt)) = (
+                tensor_c0_ring.as_ref(),
+                tensor_c1_ring.as_ref(),
+                s_prime_flat_ring.as_ref(),
+                dpp_ring.as_ref(),
+                x_powers_ring.as_ref(),
+                r_point_digits.as_ref(),
+            ) {
+                // Convert r_sc to digit encoding.
+                let rs_digits: Vec<FrogScalar> = rs.iter().copied().map(|b| frog_bytes_to_digits(&mut glue.gb, b)).collect();
+
+                // subclaim_eval (ring) in digit encoding (cheap: only 64 coeff conversions).
+                let subclaim_eval = ring_bytes_to_digits(&mut glue.gb, &final_claim_bytes);
+
+                // rc powers (need up to z_idx+1).
+                let z_idx = l_instances_expected * (4 + 4 * (params.mlen as usize));
+                let max_pow = z_idx + 1;
+                let rc_d = frog_bytes_to_digits(&mut glue.gb, rc_bytes);
+                let rc_pows = frog_pow_table_digits(&mut glue.gb, &rc_d, max_pow);
+
+                // eq(r, ro) where r is the transcript-derived SetChk point (recovered above).
+                let eq = eq_eval_frog_digits(&mut glue.gb, rpt, &rs_digits)?;
+
+                // Evaluate t0(ro), t1(ro).
+                let t0 = eval_t_z_optimized_ring_digits(&mut glue.gb, tc0_ring, sp_ring, dpp, xp, &rs_digits)?;
+                let t1 = eval_t_z_optimized_ring_digits(&mut glue.gb, tc1_ring, sp_ring, dpp, xp, &rs_digits)?;
+
+                // Reshape eval rows into evals[l][row][t].
+                let rows_per_l = 1 + params.mlen as usize;
+                let mut evals_by_l: Vec<Vec<[RingDigits; 4]>> = Vec::with_capacity(l_instances_expected);
+                for l in 0..l_instances_expected {
+                    let mut rows_l: Vec<[RingDigits; 4]> = Vec::with_capacity(rows_per_l);
+                    for row in 0..rows_per_l {
+                        let flat = l * rows_per_l + row;
+                        let r0 = ring_bytes_to_digits(&mut glue.gb, &evals_rows[flat][0]);
+                        let r1d = ring_bytes_to_digits(&mut glue.gb, &evals_rows[flat][1]);
+                        let r2d = ring_bytes_to_digits(&mut glue.gb, &evals_rows[flat][2]);
+                        let r3d = ring_bytes_to_digits(&mut glue.gb, &evals_rows[flat][3]);
+                        rows_l.push([r0, r1d, r2d, r3d]);
+                    }
+                    evals_by_l.push(rows_l);
+                }
+
+                // eval_acc = Σ_l eq*inner_l + (t0*e00)*rc^z + (t1*e00)*rc^{z+1}
+                let mut eval_acc = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+                for l in 0..l_instances_expected {
+                    let l_idx = l * (4 + 4 * (params.mlen as usize));
+                    let mut inner = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+                    // First row is evals[l][0] = [tau, m_tau, f, h]
+                    for j in 0..4 {
+                        let t = ring_scale_digits(&mut glue.gb, &evals_by_l[l][0][j], &rc_pows[l_idx + j]);
+                        inner = ring_add_digits(&mut glue.gb, &inner, &t);
+                    }
+                    // M chunks
+                    for i in 0..(params.mlen as usize) {
+                        let idx = l_idx + 4 + i * 4;
+                        for j in 0..4 {
+                            let t = ring_scale_digits(&mut glue.gb, &evals_by_l[l][1 + i][j], &rc_pows[idx + j]);
+                            inner = ring_add_digits(&mut glue.gb, &inner, &t);
+                        }
+                    }
+                    let eq_inner = ring_scale_digits(&mut glue.gb, &inner, &eq);
+                    eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &eq_inner);
+
+                    // t(z) terms (use e00 == evals[l][0][0])
+                    let e00 = &evals_by_l[l][0][0];
+                    let t0e = ring_mul_negacyclic_digits_d64(&mut glue.gb, &t0, e00)?;
+                    let t1e = ring_mul_negacyclic_digits_d64(&mut glue.gb, &t1, e00)?;
+                    let t0e_s = ring_scale_digits(&mut glue.gb, &t0e, &rc_pows[z_idx]);
+                    let t1e_s = ring_scale_digits(&mut glue.gb, &t1e, &rc_pows[z_idx + 1]);
+                    eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &t0e_s);
+                    eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &t1e_s);
+                }
+
+                ring_eq_digits(&mut glue.gb, &subclaim_eval, &eval_acc);
+            }
         }
     }
 
