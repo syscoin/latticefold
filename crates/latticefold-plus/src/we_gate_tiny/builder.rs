@@ -725,12 +725,7 @@ fn parse_and_enforce_cm_after_short(
             if ln != 8 {
                 return Err("tiny gate: expected 8-byte absorb for sumcheck nvars".to_string());
             }
-            // NOTE: In the current tiny-gate schedule generator (`poseidon_trace_schedule_for_plus`),
-            // these are absorbed as zeros (shape-only trace). We therefore enforce 0 here.
-            //
-            // Once we arithmetize the *real* verifier transcript values for these parameters, this
-            // can be switched to enforce `nvars_cm` statement-bound.
-            enforce_absorbed_u64_const(glue, pose_wiring, st, 0u64);
+            enforce_absorbed_u64_const(glue, pose_wiring, st, nvars_cm as u64);
         }
         {
             let (st, ln) = *payload_after_short
@@ -740,8 +735,7 @@ fn parse_and_enforce_cm_after_short(
             if ln != 8 {
                 return Err("tiny gate: expected 8-byte absorb for sumcheck degree".to_string());
             }
-            // Same note as above: schedule generator absorbs 0 here.
-            enforce_absorbed_u64_const(glue, pose_wiring, st, 0u64);
+            enforce_absorbed_u64_const(glue, pose_wiring, st, 2u64);
         }
 
         // Rounds: 3 ring absorbs (msg evals), then one 8-byte scalar marker absorb.

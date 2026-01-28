@@ -588,8 +588,8 @@ where
     let nvars_cm = params.nvars_cm as usize;
     for _ in 0..2 {
         let _ = tr.get_challenge(); // rc
-        tr.absorb_field_element(&BF::<R>::ZERO); // nvars
-        tr.absorb_field_element(&BF::<R>::ZERO); // degree=2
+        tr.absorb_field_element(&BF::<R>::from(nvars_cm as u64)); // nvars
+        tr.absorb_field_element(&BF::<R>::from(2u64)); // degree=2
         for _ in 0..nvars_cm {
             for _ in 0..3 {
                 tr.absorb(&R::ZERO);
