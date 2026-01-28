@@ -2,6 +2,7 @@ use ark_ff::Field;
 use latticefold::transcript::poseidon::F257;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 
+use super::op_counts::tiny_cm_bump;
 use super::frog::{
     frog_add_mod_p_from_byte_vars_assume_canonical, frog_mul_mod_p_from_byte_vars_assume_canonical,
     frog_sub_mod_p_from_byte_vars_assume_canonical,
@@ -46,6 +47,7 @@ pub(crate) fn ring_zero_bytes(gb: &mut Dr1csBuilder<F257>, d: usize) -> RingByte
 
 #[inline]
 pub(crate) fn ring_eq_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, b: &RingBytes) {
+    tiny_cm_bump(|c| c.ring_eq += 1);
     debug_assert_eq!(a.len(), b.len());
     for (ai, bi) in a.iter().zip(b.iter()) {
         for j in 0..8 {
@@ -56,6 +58,7 @@ pub(crate) fn ring_eq_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, b: &Ring
 
 #[inline]
 pub(crate) fn ring_add_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, b: &RingBytes) -> RingBytes {
+    tiny_cm_bump(|c| c.ring_add += 1);
     debug_assert_eq!(a.len(), b.len());
     let mut out = Vec::with_capacity(a.len());
     for i in 0..a.len() {
@@ -66,6 +69,7 @@ pub(crate) fn ring_add_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, b: &Rin
 
 #[inline]
 pub(crate) fn ring_sub_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, b: &RingBytes) -> RingBytes {
+    tiny_cm_bump(|c| c.ring_sub += 1);
     debug_assert_eq!(a.len(), b.len());
     let mut out = Vec::with_capacity(a.len());
     for i in 0..a.len() {
@@ -79,6 +83,7 @@ pub(crate) fn ring_sub_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, b: &Rin
 /// Since the scalar is in the base field, this is per-coefficient multiplication.
 #[inline]
 pub(crate) fn ring_scale_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, s: &[usize; 8]) -> RingBytes {
+    tiny_cm_bump(|c| c.ring_scale += 1);
     let mut out = Vec::with_capacity(a.len());
     for i in 0..a.len() {
         out.push(frog_mul_mod_p_from_byte_vars_assume_canonical(gb, &a[i], s));
@@ -97,6 +102,9 @@ pub(crate) fn lagrange_degree2_frog(
     one: &[usize; 8],
     two: &[usize; 8],
 ) -> ([usize; 8], [usize; 8], [usize; 8]) {
+    // 2 subs, 4 muls, plus one "mul by const" semantic (inv2) in the big-gate accounting.
+    // Here we count the higher-level helper call once.
+    tiny_cm_bump(|c| c.scalar_sub_const += 0);
     // t1 = r - 1, t2 = r - 2
     let t1 = frog_sub_mod_p_from_byte_vars_assume_canonical(gb, r, one);
     let t2 = frog_sub_mod_p_from_byte_vars_assume_canonical(gb, r, two);
@@ -173,6 +181,7 @@ pub(crate) fn frog_bytes_to_digits(gb: &mut Dr1csBuilder<F257>, bytes_le: [usize
 
 #[inline]
 pub(crate) fn ring_bytes_to_digits(gb: &mut Dr1csBuilder<F257>, a: &RingBytes) -> RingDigits {
+    tiny_cm_bump(|c| c.lc_to_var += 1);
     a.iter().copied().map(|x| frog_bytes_to_digits(gb, x)).collect()
 }
 
@@ -185,6 +194,7 @@ pub(crate) fn ring_zero_digits(gb: &mut Dr1csBuilder<F257>, d: usize) -> RingDig
 
 #[inline]
 pub(crate) fn ring_eq_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &RingDigits) {
+    tiny_cm_bump(|c| c.ring_eq += 1);
     debug_assert_eq!(a.len(), b.len());
     for (ai, bi) in a.iter().zip(b.iter()) {
         for j in 0..17 {
@@ -195,18 +205,21 @@ pub(crate) fn ring_eq_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &Ri
 
 #[inline]
 pub(crate) fn ring_add_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &RingDigits) -> RingDigits {
+    tiny_cm_bump(|c| c.ring_add += 1);
     debug_assert_eq!(a.len(), b.len());
     a.iter().zip(b.iter()).map(|(ai, bi)| frog_add_mod_p_digits(gb, ai, bi)).collect()
 }
 
 #[inline]
 pub(crate) fn ring_sub_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &RingDigits) -> RingDigits {
+    tiny_cm_bump(|c| c.ring_sub += 1);
     debug_assert_eq!(a.len(), b.len());
     a.iter().zip(b.iter()).map(|(ai, bi)| frog_sub_mod_p_digits(gb, ai, bi)).collect()
 }
 
 #[inline]
 pub(crate) fn ring_scale_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, s: &FrogScalar) -> RingDigits {
+    tiny_cm_bump(|c| c.ring_scale += 1);
     a.iter().map(|ai| frog_mul_mod_p_digits(gb, ai, s)).collect()
 }
 
@@ -216,6 +229,7 @@ pub(crate) fn ring_mul_negacyclic_digits_d64(
     a: &RingDigits,
     b: &RingDigits,
 ) -> Result<RingDigits, String> {
+    tiny_cm_bump(|c| c.ring_mul_negacyclic += 1);
     if a.len() != 64 || b.len() != 64 {
         return Err("ring_mul_negacyclic_digits_d64: expected ring_dim=64".to_string());
     }
@@ -346,6 +360,7 @@ pub(crate) fn frog_pow_table_digits(
     x: &FrogScalar,
     n: usize,
 ) -> Vec<FrogScalar> {
+    tiny_cm_bump(|c| c.scalar_pow_table += 1);
     let mut out: Vec<FrogScalar> = Vec::with_capacity(n + 1);
     let mut acc = frog_const_u64_digits(gb, 1u64);
     out.push(acc);
@@ -368,6 +383,7 @@ pub(crate) fn eq_eval_frog_digits(
     if c.len() != r.len() {
         return Err("eq_eval_frog_digits: length mismatch".to_string());
     }
+    tiny_cm_bump(|cc| cc.eq_eval_vars += c.len() as u64);
     let mut acc = frog_const_u64_digits(gb, 1u64);
     for (ci, ri) in c.iter().zip(r.iter()) {
         let one_minus_ci = frog_one_minus_digits(gb, ci);

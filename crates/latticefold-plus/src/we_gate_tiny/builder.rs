@@ -41,6 +41,7 @@ use super::cm_math::{
     ring_scale_digits, ring_unit_monomial_digits, ring_zero_bytes, sumcheck_verify_degree2_ring_bytes,
     tensor_frog_ringconst_digits, tensor_frog_scalars_digits, RingBytes, RingDigits,
 };
+use super::op_counts::{tiny_cm_counts_reset, tiny_cm_counts_take};
 
 #[inline]
 fn tiny_opmix_on() -> bool {
@@ -109,7 +110,7 @@ struct LfStageCounts {
 }
 
 fn lf_stage_log(
-    stage: &'static str,
+    stage: &str,
     pose_inst: Option<&SparseDr1csInstance<F257>>,
     glue: Option<&GlueCtx>,
     prev: &mut Option<LfStageCounts>,
@@ -276,6 +277,25 @@ fn maybe_print_tiny_opmix(
         "  poseidon constraints(no_bytes)={} delta_squeeze_bytes={}",
         c_pose_no_bytes,
         c_pose.saturating_sub(c_pose_no_bytes)
+    );
+    let cm_counts = tiny_cm_counts_take();
+    eprintln!(
+        "  cm_math op counts: ring_add={} ring_sub={} ring_scale={} ring_mul={} ring_eq={} lc_to_var={} scalar_add={} scalar_sub={} scalar_mul={} scalar_mul_const={} scalar_sub_const={} scalar_pow_table={} eq_eval_vars={} short_chal_from_bytes={} ct_psi_mul_ring={}",
+        cm_counts.ring_add,
+        cm_counts.ring_sub,
+        cm_counts.ring_scale,
+        cm_counts.ring_mul_negacyclic,
+        cm_counts.ring_eq,
+        cm_counts.lc_to_var,
+        cm_counts.scalar_add,
+        cm_counts.scalar_sub,
+        cm_counts.scalar_mul,
+        cm_counts.scalar_mul_const,
+        cm_counts.scalar_sub_const,
+        cm_counts.scalar_pow_table,
+        cm_counts.eq_eval_vars,
+        cm_counts.short_challenge_from_bytes,
+        cm_counts.ct_psi_mul_ring
     );
     eprintln!(
         "  absorb(non-reabsorb) breakdown: cm(comh_ops={} comh_bytes={} sc_msgs_ops=[{},{}] sc_msgs_bytes=[{},{}] eval_ops=[{},{}] eval_bytes=[{},{}])",
@@ -1810,7 +1830,13 @@ pub(super) fn build(
     ),
     String,
 > {
+    let mut mem_prev: Option<LfStageCounts> = None;
+    if tiny_opmix_on() {
+        tiny_cm_counts_reset();
+    }
+
     let (pose_inst, pose_asg, pose_wiring, _byte_wiring) = poseidon_f257_arithmetize(cfg, ops)?;
+    lf_stage_log("poseidon_f257_arithmetize", Some(&pose_inst), None, &mut mem_prev);
 
     let short_ranges = squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.short_squeeze_ops)?;
     let u32_ranges = squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.u32_squeeze_ops)?;
@@ -1819,10 +1845,17 @@ pub(super) fn build(
     validate_params_and_short_schedule(ring_dim, params, short_ranges.len())?;
 
     let mut glue = GlueCtx::new(pose_asg);
+    lf_stage_log("glue_init", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
     // Bind all proof/statement payload absorbs that encode base-field elements as canonical 8-byte scalars.
     // (Skip fiat–shamir reabsorbs, which are F257 digits and may contain 256.)
     enforce_nonreabsorb_absorbs_are_canonical_frog(&mut glue, ops, &pose_wiring)?;
+    lf_stage_log(
+        "enforce_nonreabsorb_absorbs_are_canonical_frog",
+        Some(&pose_inst),
+        Some(&glue),
+        &mut mem_prev,
+    );
 
     validate_cm_u32_schedule(params, wiring)?;
     let (n_comh_ring_elems, coeff_bytes) = count_comh_ring_elements(ops, &pose_wiring, ring_dim, wiring)?;
@@ -1837,13 +1870,16 @@ pub(super) fn build(
     }
     let l_instances_expected = if kappa == 0 { 0 } else { n_comh_ring_elems / kappa };
 
-
     let short_locals = build_short_blocks(&mut glue, &pose_wiring, ring_dim, &short_ranges)?;
+    lf_stage_log("build_short_blocks", Some(&pose_inst), Some(&glue), &mut mem_prev);
     let (u32_locals, frog_locals) =
         build_u32_and_frog_blocks(&mut glue, &pose_wiring, &wiring.u32_squeeze_ops)?;
+    lf_stage_log("build_u32_and_frog_blocks", Some(&pose_inst), Some(&glue), &mut mem_prev);
     let frog_rejection_locals = build_frog_rejection_coins(&mut glue, &pose_wiring, &frog_ranges)?;
+    lf_stage_log("build_frog_rejection_coins", Some(&pose_inst), Some(&glue), &mut mem_prev);
     let (tcch0_local, tcch1_local) =
         compute_tcch(&mut glue, ops, &pose_wiring, ring_dim, params, wiring, &u32_locals)?;
+    lf_stage_log("compute_tcch", Some(&pose_inst), Some(&glue), &mut mem_prev);
     if l_instances_expected != 0 && tcch0_local.len() != l_instances_expected {
         return Err("tiny gate: tcch0 length mismatch with inferred L".to_string());
     }
@@ -1861,6 +1897,7 @@ pub(super) fn build(
         wiring,
         l_instances_expected,
     )?;
+    lf_stage_log("parse_and_enforce_cm_after_short", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
     // Capture a lightweight absorb breakdown summary for optional op-mix reporting.
     let absorb_counts = TinyAbsorbBreakdownCounts {
@@ -1886,6 +1923,7 @@ pub(super) fn build(
     
 
     if ring_dim > 0 && l_instances_expected > 0 && !comh_absorbs.is_empty() {
+        lf_stage_log("cm_block_enter", Some(&pose_inst), Some(&glue), &mut mem_prev);
         eprintln!(
             "[tiny_gate/cm] ring_dim={} kappa={} n_comh_ring_elems={} L_expected={} comh_absorbs_len={}",
             ring_dim,
@@ -2025,9 +2063,14 @@ pub(super) fn build(
             }
             r_point_digits = Some(rdig);
         }
+        lf_stage_log("cm_precompute_done", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
         let mut u32_idx = cm_u32_start + 2 * log_kappa;
         for which in 0..2 {
+            if lf_mem_on() {
+                lf_stage_log("cm_sumcheck_enter", Some(&pose_inst), Some(&glue), &mut mem_prev);
+                eprintln!("[LF_MEM]   cm_sumcheck_enter which={which}");
+            }
             // rc (currently unused here, but we must consume it to align indices)
             let rc_bytes = frog_bytes_from_u32_le_bytes(&mut glue.gb, &u32_locals[u32_idx].byte_vars);
             u32_idx += 1;
@@ -2052,6 +2095,7 @@ pub(super) fn build(
                 let e2 = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s2, l2)?;
                 msgs.push([e0, e1, e2]);
             }
+            lf_stage_log("cm_sumcheck_msgs_parsed", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
             // Initial claim: in the full verifier this is a structured linear combination of Dcom evals,
             // u-combinations, and tcch terms. For now, bind it to the transcript by setting it equal to
@@ -2064,6 +2108,7 @@ pub(super) fn build(
             };
             let final_claim_bytes =
                 sumcheck_verify_degree2_ring_bytes(&mut glue.gb, claimed0, &msgs, &rs)?;
+            lf_stage_log("cm_sumcheck_constraints_done", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
             // Parse this sumcheck's eval table absorbs (ring elements) and (if in the pow2 regime)
             // enforce the standard recombination equality `subclaim_eval == eval_acc`.
@@ -2088,6 +2133,7 @@ pub(super) fn build(
                 }
                 out
             };
+            lf_stage_log("cm_eval_table_parsed", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
             // Recombination check (requires the pow2 regime + recovered setchk r-point).
             if let (Some(tc0_ring), Some(tc1_ring), Some(sp_ring), Some(dpp), Some(xp), Some(rpt)) = (
@@ -2109,6 +2155,7 @@ pub(super) fn build(
                 let max_pow = z_idx + 1;
                 let rc_d = frog_bytes_to_digits(&mut glue.gb, rc_bytes);
                 let rc_pows = frog_pow_table_digits(&mut glue.gb, &rc_d, max_pow);
+                lf_stage_log("cm_recomb_rc_pows", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
                 // eq(r, ro) where r is the transcript-derived SetChk point (recovered above).
                 let eq = eq_eval_frog_digits(&mut glue.gb, rpt, &rs_digits)?;
@@ -2132,6 +2179,7 @@ pub(super) fn build(
                     }
                     evals_by_l.push(rows_l);
                 }
+                lf_stage_log("cm_recomb_evals_to_digits", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
                 // eval_acc = Σ_l eq*inner_l + (t0*e00)*rc^z + (t1*e00)*rc^{z+1}
                 let mut eval_acc = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
@@ -2163,6 +2211,7 @@ pub(super) fn build(
                     eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &t0e_s);
                     eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &t1e_s);
                 }
+                lf_stage_log("cm_recomb_eval_acc_done", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
                 ring_eq_digits(&mut glue.gb, &subclaim_eval, &eval_acc);
             }
@@ -2171,8 +2220,10 @@ pub(super) fn build(
 
     let (mut surfaces_mul_local, all_sum_digits, all_sum_coeffwise) =
         build_mul_surfaces(&mut glue, ring_dim, pairs, &short_locals, &u32_locals)?;
+    lf_stage_log("build_mul_surfaces", Some(&pose_inst), Some(&glue), &mut mem_prev);
     let (mut surfaces_sq_local, all_sq_sum_digits, all_sq_sum_coeffwise) =
         build_sq_surfaces(&mut glue, ring_dim, pairs, &short_locals, &u32_locals)?;
+    lf_stage_log("build_sq_surfaces", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
     let all_sum_digits = Arc::new(all_sum_digits);
     let all_sum_coeffwise = Arc::new(all_sum_coeffwise);
@@ -2186,6 +2237,7 @@ pub(super) fn build(
         s.sum_all_pairs_digits = all_sq_sum_digits.clone();
         s.sum_all_pairs_coeffwise = all_sq_sum_coeffwise.clone();
     }
+    lf_stage_log("surfaces_arc_share", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
     // Optional: print an op-mix breakdown for tiny-field porting estimates.
     //

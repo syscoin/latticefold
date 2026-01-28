@@ -4,6 +4,8 @@ use latticefold::transcript::poseidon::F257;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 use symphony::transcript::PoseidonTraceOp;
 
+use super::op_counts::tiny_cm_bump;
+
 use super::digits::{
     alloc_bal16_digit, f257_to_i32_bal, mul_u32ish9_to_fixed_bal16, u32_bytes_to_bal16_digits_cached,
 };
@@ -524,6 +526,7 @@ pub(super) fn short_challenge_from_bytes<F: PrimeField>(
     lambda: usize,
     ring_dim: usize,
 ) -> Vec<usize> {
+    tiny_cm_bump(|c| c.short_challenge_from_bytes += 1);
     // Same parameterization as LF+/WE: u = 2^(lambda / d).
     debug_assert_eq!(bytes.len(), ring_dim);
     let exp = (lambda / ring_dim) as u32;

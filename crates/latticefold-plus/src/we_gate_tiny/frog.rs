@@ -3,6 +3,8 @@ use ark_ff::{BigInteger, Field, PrimeField};
 use latticefold::transcript::poseidon::F257;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 
+use super::op_counts::tiny_cm_bump;
+
 use super::coins::frog_p_base128_digits_le;
 use super::digits::{
     add_bal16_same_len, alloc_bal16_digit, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
@@ -1061,6 +1063,7 @@ pub(crate) fn frogscalar_from_u64_bytes_le_digits(b: &mut Dr1csBuilder<F257>, by
 /// Digit-domain Frog addition: `r = a + c (mod p)`.
 #[inline]
 pub(crate) fn frog_add_mod_p_digits(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, c: &FrogScalar) -> FrogScalar {
+    tiny_cm_bump(|cc| cc.scalar_add += 1);
     let p_d = frog_p_bal16_digits_le_const();
     let a_u = digits_to_u64_witness(b, a);
     let c_u = digits_to_u64_witness(b, c);
@@ -1076,6 +1079,7 @@ pub(crate) fn frog_add_mod_p_digits(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, 
 /// Digit-domain Frog subtraction: `r = a - c (mod p)`.
 #[inline]
 pub(crate) fn frog_sub_mod_p_digits(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, c: &FrogScalar) -> FrogScalar {
+    tiny_cm_bump(|cc| cc.scalar_sub += 1);
     let p_d = frog_p_bal16_digits_le_const();
     let a_u = digits_to_u64_witness(b, a);
     let c_u = digits_to_u64_witness(b, c);
@@ -1093,6 +1097,7 @@ pub(crate) fn frog_sub_mod_p_digits(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, 
 /// Digit-domain Frog multiplication: `r = a * c (mod p)`.
 #[inline]
 pub(crate) fn frog_mul_mod_p_digits(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, c: &FrogScalar) -> FrogScalar {
+    tiny_cm_bump(|cc| cc.scalar_mul += 1);
     let p_d = frog_p_bal16_digits_le_const();
     let a_u = digits_to_u64_witness(b, a);
     let c_u = digits_to_u64_witness(b, c);

@@ -12,6 +12,7 @@ mod poseidon;
 mod builder;
 mod lift;
 mod api;
+mod op_counts;
 
 pub use api::*;
 
