@@ -513,22 +513,6 @@ where
     let dcom_evals_len = 1usize;
     let dcom_eval_vec_len = 1 + mlen_mats;
 
-    // Tiny-gate digit transcript mode (opt-in):
-    // If enabled, we represent *CM sumcheck messages and CM eval tables* as balanced base-16 digits
-    // (17 digits per coefficient) rather than 8-byte little-endian scalars.
-    //
-    // This keeps each transcript element in [0..=256], so `lift_recording_trace_ops_to_f257` remains valid.
-    let tiny_digit_transcript_on = std::env::var("LFP_TINY_DIGIT_TRANSCRIPT").ok().as_deref() == Some("1");
-    let mut absorb_ring_digits17 = |tr: &mut TracePoseidonTranscript<R>, ring_dim: usize| {
-        // For schedule/shape generation, the absorbed ring element is `ZERO`, so each coefficient is 0.
-        // Canonical balanced-digit encoding of 0 is 17 zeros.
-        for _coeff in 0..ring_dim {
-            for _dig in 0..17 {
-                tr.absorb_field_element(&BF::<R>::ZERO);
-            }
-        }
-    };
-
     // Dcom::verify: absorb witness commitments (cm_f, C_Mf, cm_mtau), each ring elem.
     for _ in 0..l_instances {
         for _ in 0..kappa {
@@ -608,11 +592,7 @@ where
         tr.absorb_field_element(&BF::<R>::from(2u64)); // degree=2
         for _ in 0..nvars_cm {
             for _ in 0..3 {
-                if tiny_digit_transcript_on {
-                    absorb_ring_digits17(&mut tr, d);
-                } else {
-                    tr.absorb(&R::ZERO);
-                }
+                tr.absorb(&R::ZERO);
             }
             let _ = tr.get_challenge();
             tr.absorb_field_element(&BF::<R>::ZERO);
@@ -621,11 +601,7 @@ where
         for _ in 0..l_instances {
             for _ in 0..(1 + mlen_mats) {
                 for _ in 0..4 {
-                    if tiny_digit_transcript_on {
-                        absorb_ring_digits17(&mut tr, d);
-                    } else {
-                        tr.absorb(&R::ZERO);
-                    }
+                    tr.absorb(&R::ZERO);
                 }
             }
         }

@@ -88,52 +88,6 @@ pub(crate) fn alloc_bal16_digit(b: &mut Dr1csBuilder<F257>, d: i8) -> usize {
     out
 }
 
-/// Constrain an **existing** F257 variable to be a balanced base-16 digit in `[-8,7]`.
-///
-/// Encoding matches `alloc_bal16_digit` / `u64_bytes_to_bal16_digits`:
-/// \(d = b0 + 2*b1 + 4*b2 - 8*b3\), with boolean \(b_i\).
-pub(crate) fn enforce_existing_bal16_digit_var(b: &mut Dr1csBuilder<F257>, d: usize) {
-    let raw = b.assignment[d]
-        .into_bigint()
-        .to_bytes_le()
-        .get(0)
-        .copied()
-        .unwrap_or(0) as i16;
-    let signed = if raw <= 7 {
-        raw
-    } else if raw >= 249 {
-        raw - 257
-    } else {
-        // Out of range; still allocate something, constraints will fail.
-        0
-    };
-    let (mag, sign) = if signed < 0 {
-        ((signed + 8) as u8, true)
-    } else {
-        (signed as u8, false)
-    };
-    let b0 = alloc_bool::<F257>(b, (mag & 1) != 0);
-    let b1 = alloc_bool::<F257>(b, (mag & 2) != 0);
-    let b2 = alloc_bool::<F257>(b, (mag & 4) != 0);
-    let b3 = alloc_bool::<F257>(b, sign);
-    b.enforce_lc_times_one_eq_const(vec![
-        (F257::ONE, d),
-        (-F257::ONE, b0),
-        (-F257::from(2u64), b1),
-        (-F257::from(4u64), b2),
-        (F257::from(8u64), b3),
-    ]);
-}
-
-/// Constrain an **existing** variable to be boolean: `v*(1-v)=0`.
-pub(crate) fn enforce_existing_bool_var(b: &mut Dr1csBuilder<F257>, v: usize) {
-    b.add_constraint(
-        vec![(F257::ONE, v)],
-        vec![(F257::ONE, b.one()), (-F257::ONE, v)],
-        vec![(F257::ZERO, b.one())],
-    );
-}
-
 
 /// Allocate a signed carry `c` by allocating an offset `off = c + 16` in [0,31] and
 /// enforcing `off ∈ [5,27]` (i.e., `c ∈ [-11,11]`).
