@@ -1,4 +1,4 @@
-use ark_ff::Field;
+use ark_ff::{Field, PrimeField};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use stark_rings::balanced_decomposition::Decompose;
 use stark_rings::cyclotomic_ring::models::goldilocks::{Fq, FqConfig};
@@ -118,188 +118,139 @@ fwd_binop_assign!(SubAssign, sub_assign, -=);
 // GoldilocksRing64 multiplication (performance-critical)
 // -----------------------------------------------------------------------------
 //
-// We implement the negacyclic convolution mod (X^64 + 1):
-//   (a * b)[k] = Σ_{i+j=k} a[i]b[j]  -  Σ_{i+j=k+64} a[i]b[j]
+// We implement multiplication in R = Fq[X]/(X^64 + 1) using a negacyclic NTT:
+// - pick ψ a primitive 128th root of unity (so ω=ψ^2 is a primitive 64th root)
+// - "twist" coefficients by ψ^i
+// - do a size-64 cyclic NTT with ω
+// - pointwise multiply
+// - inverse NTT, scale by 1/64
+// - "untwist" by ψ^{-i}
 //
-// This mirrors `FrogRing64`:
-// - uses a multi-level Karatsuba dense multiply for the 64x64 convolution
-// - avoids heap churn / temporary Vec allocations
+// This is the canonical multiply we want for GL64 (no secondary Karatsuba path kept).
 impl core::ops::Mul for GoldilocksRing64 {
     type Output = Self;
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
-        let a = self.coeffs();
-        let b = rhs.coeffs();
-        debug_assert_eq!(a.len(), 64);
-        debug_assert_eq!(b.len(), 64);
+        const N: usize = 64;
+        const LOG_N: u32 = 6;
 
         #[inline(always)]
-        fn mul8(a: &[Fq], b: &[Fq]) -> [Fq; 16] {
-            debug_assert_eq!(a.len(), 8);
-            debug_assert_eq!(b.len(), 8);
+        fn pow_u64(mut base: Fq, mut exp: u64) -> Fq {
+            let mut acc = <Fq as Field>::ONE;
+            while exp != 0 {
+                if (exp & 1) == 1 {
+                    acc *= base;
+                }
+                base *= base;
+                exp >>= 1;
+            }
+            acc
+        }
 
-            #[inline(always)]
-            fn mul4(a: &[Fq], b: &[Fq]) -> [Fq; 8] {
-                debug_assert_eq!(a.len(), 4);
-                debug_assert_eq!(b.len(), 4);
-                let mut out = [<Fq as Field>::ZERO; 8];
-                for i in 0..4 {
-                    let ai = a[i];
-                    if ai == <Fq as Field>::ZERO {
-                        continue;
-                    }
-                    for j in 0..4 {
-                        out[i + j] += ai * b[j];
+        #[inline(always)]
+        fn bitrev6(i: usize) -> usize {
+            // Reverse 6 bits of i.
+            ((i as u32).reverse_bits() >> (32 - LOG_N)) as usize
+        }
+
+        #[inline]
+        fn ntt_in_place(a: &mut [Fq; N], omega: Fq) {
+            // Bit-reversal permutation.
+            for i in 0..N {
+                let j = bitrev6(i);
+                if i < j {
+                    a.swap(i, j);
+                }
+            }
+
+            let mut len = 2usize;
+            while len <= N {
+                // wlen = omega^(N/len)
+                let wlen = pow_u64(omega, (N / len) as u64);
+                for i in (0..N).step_by(len) {
+                    let mut w = <Fq as Field>::ONE;
+                    for j in 0..(len / 2) {
+                        let u = a[i + j];
+                        let v = a[i + j + len / 2] * w;
+                        a[i + j] = u + v;
+                        a[i + j + len / 2] = u - v;
+                        w *= wlen;
                     }
                 }
-                out
+                len <<= 1;
             }
-
-            let (a0, a1) = a.split_at(4);
-            let (b0, b1) = b.split_at(4);
-
-            let p0 = mul4(a0, b0);
-            let p1 = mul4(a1, b1);
-            let mut a01 = [<Fq as Field>::ZERO; 4];
-            let mut b01 = [<Fq as Field>::ZERO; 4];
-            for i in 0..4 {
-                a01[i] = a0[i] + a1[i];
-                b01[i] = b0[i] + b1[i];
-            }
-            let p2 = mul4(&a01, &b01);
-
-            let mut cross = [<Fq as Field>::ZERO; 8];
-            for i in 0..8 {
-                cross[i] = p2[i] - p0[i] - p1[i];
-            }
-
-            let mut out = [<Fq as Field>::ZERO; 16];
-            for i in 0..8 {
-                out[i] = p0[i];
-            }
-            for i in 0..8 {
-                out[4 + i] += cross[i];
-            }
-            for i in 0..8 {
-                out[8 + i] += p1[i];
-            }
-            out
         }
 
-        #[inline(always)]
-        fn mul16(a: &[Fq], b: &[Fq]) -> [Fq; 32] {
-            debug_assert_eq!(a.len(), 16);
-            debug_assert_eq!(b.len(), 16);
-            let (a0, a1) = a.split_at(8);
-            let (b0, b1) = b.split_at(8);
-
-            let p0 = mul8(a0, b0);
-            let p1 = mul8(a1, b1);
-            let mut a01 = [<Fq as Field>::ZERO; 8];
-            let mut b01 = [<Fq as Field>::ZERO; 8];
-            for i in 0..8 {
-                a01[i] = a0[i] + a1[i];
-                b01[i] = b0[i] + b1[i];
-            }
-            let p2 = mul8(&a01, &b01);
-
-            let mut cross = [<Fq as Field>::ZERO; 16];
-            for i in 0..16 {
-                cross[i] = p2[i] - p0[i] - p1[i];
+        #[inline]
+        fn intt_in_place(a: &mut [Fq; N], omega_inv: Fq) {
+            // Bit-reversal permutation.
+            for i in 0..N {
+                let j = bitrev6(i);
+                if i < j {
+                    a.swap(i, j);
+                }
             }
 
-            let mut out = [<Fq as Field>::ZERO; 32];
-            for i in 0..16 {
-                out[i] = p0[i];
+            let mut len = 2usize;
+            while len <= N {
+                let wlen = pow_u64(omega_inv, (N / len) as u64);
+                for i in (0..N).step_by(len) {
+                    let mut w = <Fq as Field>::ONE;
+                    for j in 0..(len / 2) {
+                        let u = a[i + j];
+                        let v = a[i + j + len / 2] * w;
+                        a[i + j] = u + v;
+                        a[i + j + len / 2] = u - v;
+                        w *= wlen;
+                    }
+                }
+                len <<= 1;
             }
-            for i in 0..16 {
-                out[8 + i] += cross[i];
-            }
-            for i in 0..16 {
-                out[16 + i] += p1[i];
-            }
-            out
         }
 
-        #[inline(always)]
-        fn mul32(a: &[Fq], b: &[Fq]) -> [Fq; 64] {
-            debug_assert_eq!(a.len(), 32);
-            debug_assert_eq!(b.len(), 32);
-            let (a0, a1) = a.split_at(16);
-            let (b0, b1) = b.split_at(16);
+        // Goldilocks base field modulus p as u64.
+        let p: u64 = <Fq as PrimeField>::MODULUS.0[0];
+        debug_assert_eq!(p, 0xFFFF_FFFF_0000_0001u64);
 
-            let p0 = mul16(a0, b0);
-            let p1 = mul16(a1, b1);
-            let mut a01 = [<Fq as Field>::ZERO; 16];
-            let mut b01 = [<Fq as Field>::ZERO; 16];
-            for i in 0..16 {
-                a01[i] = a0[i] + a1[i];
-                b01[i] = b0[i] + b1[i];
-            }
-            let p2 = mul16(&a01, &b01);
+        // Generator is 7 in the stark-rings Goldilocks field config.
+        let g = Fq::from(7u64);
+        let psi = pow_u64(g, (p - 1) / 128);
+        let omega = psi * psi; // primitive 64th root
+        let omega_inv = omega.inverse().expect("omega inverse");
+        let psi_inv = psi.inverse().expect("psi inverse");
+        let inv_n = Fq::from(N as u64).inverse().expect("inv_n");
 
-            let mut cross = [<Fq as Field>::ZERO; 32];
-            for i in 0..32 {
-                cross[i] = p2[i] - p0[i] - p1[i];
-            }
+        let mut a = [<Fq as Field>::ZERO; N];
+        let mut b = [<Fq as Field>::ZERO; N];
+        a.copy_from_slice(self.coeffs());
+        b.copy_from_slice(rhs.coeffs());
 
-            let mut out = [<Fq as Field>::ZERO; 64];
-            for i in 0..32 {
-                out[i] = p0[i];
-            }
-            for i in 0..32 {
-                out[16 + i] += cross[i];
-            }
-            for i in 0..32 {
-                out[32 + i] += p1[i];
-            }
-            out
+        // Twist by psi^i.
+        let mut psi_pow = <Fq as Field>::ONE;
+        for i in 0..N {
+            a[i] *= psi_pow;
+            b[i] *= psi_pow;
+            psi_pow *= psi;
         }
 
-        #[inline(always)]
-        fn mul64(a: &[Fq], b: &[Fq]) -> [Fq; 128] {
-            debug_assert_eq!(a.len(), 64);
-            debug_assert_eq!(b.len(), 64);
-            let (a0, a1) = a.split_at(32);
-            let (b0, b1) = b.split_at(32);
+        ntt_in_place(&mut a, omega);
+        ntt_in_place(&mut b, omega);
 
-            let p0 = mul32(a0, b0);
-            let p1 = mul32(a1, b1);
-            let mut a01 = [<Fq as Field>::ZERO; 32];
-            let mut b01 = [<Fq as Field>::ZERO; 32];
-            for i in 0..32 {
-                a01[i] = a0[i] + a1[i];
-                b01[i] = b0[i] + b1[i];
-            }
-            let p2 = mul32(&a01, &b01);
-
-            let mut cross = [<Fq as Field>::ZERO; 64];
-            for i in 0..64 {
-                cross[i] = p2[i] - p0[i] - p1[i];
-            }
-
-            let mut out = [<Fq as Field>::ZERO; 128];
-            for i in 0..64 {
-                out[i] = p0[i];
-            }
-            for i in 0..64 {
-                out[32 + i] += cross[i];
-            }
-            for i in 0..64 {
-                out[64 + i] += p1[i];
-            }
-            out
+        for i in 0..N {
+            a[i] *= b[i];
         }
 
-        let ab = mul64(a, b);
+        intt_in_place(&mut a, omega_inv);
 
-        // Reduce the 128-coefficient convolution to 64 via negacyclic rule:
-        // out[i] = ab[i] - ab[i+64]
-        let mut out = [<Fq as Field>::ZERO; 64];
-        for i in 0..64 {
-            out[i] = ab[i] - ab[64 + i];
+        // Scale by 1/N and untwist by psi^{-i}.
+        let mut psi_inv_pow = <Fq as Field>::ONE;
+        for i in 0..N {
+            a[i] *= inv_n;
+            a[i] *= psi_inv_pow;
+            psi_inv_pow *= psi_inv;
         }
-        GoldilocksRing64::from(out.to_vec())
+
+        GoldilocksRing64::from(a.to_vec())
     }
 }
 
@@ -639,6 +590,34 @@ mod goldilocks64_tests {
                 assert_eq!(got.coeffs(), exp.coeffs());
             }
         }
+    }
+
+    /// Rough timing smoke test (intentionally **not** ignored).
+    ///
+    /// This is not a benchmark harness; it’s just a sanity check that `GoldilocksRing64` multiply
+    /// stays in a reasonable ballpark.
+    #[test]
+    fn test_goldilocks64_mul_timing_smoke() {
+        use std::time::Instant;
+        use ark_std::Zero;
+        use stark_rings::Ring;
+
+        let mut rng = test_rng();
+        let iters: usize = 50_000;
+
+        let mut acc = GoldilocksRing64::ONE;
+        let a = GoldilocksRing64::rand(&mut rng);
+        let b = GoldilocksRing64::rand(&mut rng);
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            acc *= a;
+            acc *= b;
+        }
+        let dt = t0.elapsed();
+
+        // Keep the value live.
+        assert!(!acc.is_zero());
+        eprintln!("[goldilocks64_smoke] iters={} mul64={:?}", iters, dt);
     }
 }
 

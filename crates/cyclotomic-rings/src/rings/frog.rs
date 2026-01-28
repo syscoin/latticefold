@@ -801,7 +801,6 @@ mod frog64_tests {
     /// This is not a benchmark harness; it’s just a sanity check that `FrogRing64` isn't
     /// catastrophically slower than `FrogRingPoly` for multiplication.
     #[test]
-    #[ignore]
     fn test_frog64_mul_timing_smoke() {
         use std::time::Instant;
 
