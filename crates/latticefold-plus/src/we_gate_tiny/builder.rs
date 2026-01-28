@@ -658,9 +658,20 @@ fn parse_and_enforce_cm_after_short(
     }
 
     // Now parse payload_after_short sequentially according to the CM schedule.
-    let ring_elem_bytes = ring_dim
-        .checked_mul(8)
-        .ok_or_else(|| "tiny gate: ring_dim*8 overflow".to_string())?;
+    // Infer the ring-element absorb width from the wiring (matches `compute_tcch` logic).
+    // This avoids hard-coding `coeff_bytes=8` here; the caller already separately enforces that
+    // absorbed non-reabsorb payloads are canonical Frog bytes at IO boundaries.
+    let mut ring_elem_bytes: Option<usize> = None;
+    for &(_st, ln) in &pose_wiring.absorb_ranges {
+        if ln % ring_dim == 0 && ln > ring_dim {
+            ring_elem_bytes = Some(match ring_elem_bytes {
+                None => ln,
+                Some(cur) => cur.min(ln),
+            });
+        }
+    }
+    let ring_elem_bytes =
+        ring_elem_bytes.ok_or_else(|| "tiny gate: could not infer ring_elem_bytes (cm-after-short)".to_string())?;
     let mut cur = 0usize;
 
     // coh: L*kappa ring elements
@@ -671,7 +682,9 @@ fn parse_and_enforce_cm_after_short(
             .ok_or("tiny gate: payload_after_short too short (comh)")?;
         cur += 1;
         if ln != ring_elem_bytes {
-            return Err("tiny gate: unexpected absorb len while parsing comh".to_string());
+            return Err(format!(
+                "tiny gate: unexpected absorb len while parsing comh (got {ln}, expected {ring_elem_bytes})"
+            ));
         }
         comh_absorbs.push((st, ln));
     }
