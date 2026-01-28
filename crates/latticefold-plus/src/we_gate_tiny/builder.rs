@@ -38,7 +38,7 @@ use super::surfaces::{CmDigitMulSqSurfaceWiring, CmDigitMulSurfaceWiring};
 use super::cm_math::{
     eq_eval_frog_digits, eval_t_z_optimized_ring_digits, frog_bytes_to_digits, frog_pow_table_digits,
     ring_add_bytes, ring_add_digits, ring_bytes_to_digits, ring_eq_digits, ring_mul_negacyclic_digits_d64,
-    ring_scale_digits, ring_unit_monomial_digits, ring_zero_bytes, sumcheck_verify_degree2_ring_bytes,
+    ring_scale_digits, ring_zero_bytes, sumcheck_verify_degree2_ring_bytes,
     tensor_frog_ringconst_digits, tensor_frog_scalars_digits, RingBytes, RingDigits,
 };
 use super::op_counts::{tiny_cm_counts_reset, tiny_cm_counts_take};
@@ -1973,7 +1973,6 @@ pub(super) fn build(
         let mut tensor_c1_ring: Option<Vec<RingDigits>> = None;
         let mut s_prime_flat_ring: Option<Vec<RingDigits>> = None;
         let mut dpp_ring: Option<Vec<RingDigits>> = None;
-        let mut x_powers_ring: Option<Vec<RingDigits>> = None;
         let mut r_point_digits: Option<Vec<FrogScalar>> = None;
         if ring_dim == 64
             && kappa.is_power_of_two()
@@ -2012,13 +2011,6 @@ pub(super) fn build(
                 acc = ((acc as u128) * (dp as u128) % (p as u128)) as u64;
             }
             dpp_ring = Some(dpp);
-
-            // x_powers: unit monomials.
-            let mut xp: Vec<RingDigits> = Vec::with_capacity(ring_dim);
-            for i in 0..ring_dim {
-                xp.push(ring_unit_monomial_digits(&mut glue.gb, i, ring_dim));
-            }
-            x_powers_ring = Some(xp);
 
             // s_prime_flat: k*d short challenges, each is a ring element with centered coeff bytes.
             let need_sprime = k_decomp
@@ -2142,12 +2134,11 @@ pub(super) fn build(
             lf_stage_log("cm_eval_table_parsed", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
             // Recombination check (requires the pow2 regime + recovered setchk r-point).
-            if let (Some(tc0_ring), Some(tc1_ring), Some(sp_ring), Some(dpp), Some(xp), Some(rpt)) = (
+            if let (Some(tc0_ring), Some(tc1_ring), Some(sp_ring), Some(dpp), Some(rpt)) = (
                 tensor_c0_ring.as_ref(),
                 tensor_c1_ring.as_ref(),
                 s_prime_flat_ring.as_ref(),
                 dpp_ring.as_ref(),
-                x_powers_ring.as_ref(),
                 r_point_digits.as_ref(),
             ) {
                 // Convert r_sc to digit encoding.
@@ -2168,8 +2159,12 @@ pub(super) fn build(
                 lf_stage_log("cm_recomb_eq_done", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
                 // Evaluate t0(ro), t1(ro).
-                let t0 = eval_t_z_optimized_ring_digits(&mut glue.gb, tc0_ring, sp_ring, dpp, xp, &rs_digits)?;
-                let t1 = eval_t_z_optimized_ring_digits(&mut glue.gb, tc1_ring, sp_ring, dpp, xp, &rs_digits)?;
+                // `eval_t_z_optimized_ring_digits` only needs `x_powers.len()` (we use the specialized
+                // basis evaluator in digit domain), so we pass a lightweight length-only table.
+                let xp_len = ring_dim;
+                let xp: Vec<RingDigits> = vec![Vec::new(); xp_len];
+                let t0 = eval_t_z_optimized_ring_digits(&mut glue.gb, tc0_ring, sp_ring, dpp, &xp, &rs_digits)?;
+                let t1 = eval_t_z_optimized_ring_digits(&mut glue.gb, tc1_ring, sp_ring, dpp, &xp, &rs_digits)?;
                 lf_stage_log("cm_recomb_t0t1_done", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
                 // Stream recombination:

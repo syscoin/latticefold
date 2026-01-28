@@ -354,6 +354,32 @@ pub(crate) fn tensor_frog_ringconst_digits(
         .collect()
 }
 
+/// Evaluate the `x_powers` basis table (unit monomials) at point `r4` and return the resulting ring element.
+///
+/// If `x_powers[i] = x^i` (unit monomial), then the multilinear evaluation produces coefficients that are
+/// exactly the tensor weights:
+/// \[
+///   w = \bigotimes_j [1-r_j, r_j]
+/// \]
+/// and the evaluated ring element is \(\sum_i w_i x^i\), i.e. coefficient `i` equals `w_i`.
+pub(crate) fn eval_x_powers_basis_mle_ring_digits(
+    gb: &mut Dr1csBuilder<F257>,
+    r4: &[FrogScalar],
+    ring_dim: usize,
+) -> Result<RingDigits, String> {
+    if ring_dim == 0 || !ring_dim.is_power_of_two() {
+        return Err("eval_x_powers_basis_mle_ring_digits: ring_dim must be power of two".to_string());
+    }
+    if (1usize << r4.len()) != ring_dim {
+        return Err("eval_x_powers_basis_mle_ring_digits: r4 length mismatch".to_string());
+    }
+    // weights length = ring_dim; each weight is a Frog scalar in digit encoding.
+    let weights = tensor_frog_scalars_digits(gb, r4);
+    debug_assert_eq!(weights.len(), ring_dim);
+    // Interpret weights as the ring coefficients.
+    Ok(weights)
+}
+
 /// Compute powers \([1, x, x^2, ..., x^n]\) in Frog scalar digit encoding.
 pub(crate) fn frog_pow_table_digits(
     gb: &mut Dr1csBuilder<F257>,
@@ -486,7 +512,9 @@ pub(crate) fn eval_t_z_optimized_ring_digits(
     let v1 = eval_small_mle_ring_digits(gb, tensor_c_ring, r1);
     let v2 = eval_small_mle_ring_digits(gb, s_prime_flat, r2);
     let v3 = eval_small_mle_ring_digits(gb, dpp, r3);
-    let v4 = eval_small_mle_ring_digits(gb, x_powers, r4);
+    // IMPORTANT: `x_powers` is expected to be the unit-monomial basis table. Use a specialized
+    // evaluator to avoid O(d log d) ring-scalar multiplications.
+    let v4 = eval_x_powers_basis_mle_ring_digits(gb, r4, x_powers.len())?;
 
     let mut res = ring_mul_negacyclic_digits_d64(gb, &v1, &v2)?;
     res = ring_mul_negacyclic_digits_d64(gb, &res, &v3)?;
