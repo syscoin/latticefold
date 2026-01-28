@@ -107,6 +107,10 @@ name = "lin"
 harness = false
 
 [[bench]]
+name = "ring64_mul"
+harness = false
+
+[[bench]]
 name = "we_dpp"
 harness = false
 required-features = ["we_gate"]

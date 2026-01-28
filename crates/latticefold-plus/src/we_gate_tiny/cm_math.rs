@@ -7,7 +7,7 @@ use super::frog::{
     frog_add_mod_p_from_byte_vars_assume_canonical, frog_mul_mod_p_from_byte_vars_assume_canonical,
     frog_sub_mod_p_from_byte_vars_assume_canonical,
     frog_add_mod_p_digits, frog_mul_mod_p_digits, frog_sub_mod_p_digits, frogscalar_from_u64_bytes_le_digits,
-    ring_mul_negacyclic_toom4_d64, FrogScalar,
+    ring_mul_negacyclic_ntt_goldilocks_d64, FrogScalar,
 };
 
 /// A ring element whose coefficients are Frog base-field scalars encoded as canonical 8-byte little-endian limbs.
@@ -235,7 +235,7 @@ pub(crate) fn ring_mul_negacyclic_digits_d64(
     }
     let aa: [FrogScalar; 64] = core::array::from_fn(|i| a[i]);
     let bb: [FrogScalar; 64] = core::array::from_fn(|i| b[i]);
-    let cc = ring_mul_negacyclic_toom4_d64(gb, &aa, &bb);
+    let cc = ring_mul_negacyclic_ntt_goldilocks_d64(gb, &aa, &bb);
     Ok(cc.into_iter().collect())
 }
 

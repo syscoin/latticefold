@@ -6030,15 +6030,15 @@ mod tests {
         assert_eq!(shape.inst.constraints.len(), inst.constraints.len());
     }
     #[test]
-    #[ignore = "slow: builds Poseidon(F257) dR1CS schedule + checks all constraints (FrogRing64)"]
+    #[ignore = "slow: builds Poseidon(F257) dR1CS schedule + checks all constraints (GoldilocksRing64)"]
     fn test_tiny_gate_shape_builds_and_constraints_check_frog64() {
-        use cyclotomic_rings::rings::FrogRing64 as RR;
+        use cyclotomic_rings::rings::GoldilocksRing64 as RR;
 
         // Minimal-but-valid params to keep the schedule small.
         let ring_dim = <RR as PolyRing>::dimension() as u64;
         // IMPORTANT: CM verifier math (t(z) tensor evaluation) requires `nvars_cm` to be at least
         // the number of tensor variables: log2(d) + log2(ell) + log2(k*d) + log2(kappa).
-        // For our minimal FrogRing64 regime with kappa=1, k=1, ell=1, this is 6 + 0 + 6 + 0 = 12.
+        // For our minimal GoldilocksRing64 regime with kappa=1, k=1, ell=1, this is 6 + 0 + 6 + 0 = 12.
         let nvars = 12u64;
         let params = WeParams {
             nvars_setchk: nvars,
