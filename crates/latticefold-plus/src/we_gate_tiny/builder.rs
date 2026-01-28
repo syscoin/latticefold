@@ -228,19 +228,34 @@ fn maybe_print_tiny_opmix(
     let mut sq_field_elems = 0usize;
     let mut n_sq_bytes = 0usize;
     let mut sq_bytes = 0usize;
+    let mut absorb_by_len: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut squeeze_field_by_len: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut squeeze_bytes_by_len: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut n_get_challenge_reabsorbs = 0usize;
     for op in ops {
         match op {
             PoseidonTraceOp::Absorb(v) => {
                 n_absorb += 1;
                 absorb_elems += v.len();
+                *absorb_by_len.entry(v.len()).or_insert(0) += 1;
             }
             PoseidonTraceOp::SqueezeField(v) => {
                 n_sq_field += 1;
                 sq_field_elems += v.len();
+                *squeeze_field_by_len.entry(v.len()).or_insert(0) += 1;
             }
             PoseidonTraceOp::SqueezeBytes { n, .. } => {
                 n_sq_bytes += 1;
                 sq_bytes += *n;
+                *squeeze_bytes_by_len.entry(*n).or_insert(0) += 1;
+            }
+        }
+    }
+    // Count `get_challenge()` reabsorbs: SqueezeField(8) immediately followed by Absorb(8).
+    for win in ops.windows(2) {
+        if let [PoseidonTraceOp::SqueezeField(v), PoseidonTraceOp::Absorb(w)] = win {
+            if v.len() == DIGITS_PER_TRY && w.len() == DIGITS_PER_TRY {
+                n_get_challenge_reabsorbs += 1;
             }
         }
     }
@@ -271,6 +286,13 @@ fn maybe_print_tiny_opmix(
     eprintln!(
         "  poseidon permutes split: before_cm={} after_cm={}",
         pose_permutes_before_cm, pose_permutes_after_cm
+    );
+    eprintln!(
+        "  poseidon op lens: absorb_by_len={:?} squeeze_field_by_len={:?} squeeze_bytes_by_len={:?} get_challenge_reabsorbs={}",
+        absorb_by_len,
+        squeeze_field_by_len,
+        squeeze_bytes_by_len,
+        n_get_challenge_reabsorbs
     );
     eprintln!("  dr1cs constraints by part: poseidon={} glue={}", c_pose, c_glue);
     eprintln!(
