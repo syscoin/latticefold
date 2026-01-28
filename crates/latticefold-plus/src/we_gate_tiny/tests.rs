@@ -14,7 +14,6 @@ use super::goldilocks::{
     goldilocks_add_mod_p_from_byte_vars, goldilocks_mul_mod_p_from_byte_vars, goldilocks_sub_mod_p_from_byte_vars,
     goldilocks_mul_const_mod_p_from_byte_vars, goldilocks_u64_enforce_lt_p_from_byte_vars_and_limbs,
     reduce_u64_mod_goldilocks_from_byte_vars,
-    ring_mul_negacyclic_ntt_goldilocks_d64,
 };
 use super::gadgets::alloc_byte;
 
@@ -175,8 +174,8 @@ fn test_goldilocks_mul_mod_p_from_bytes_matches_native() {
 
     for _ in 0..20 {
         // Sample canonical a,b < p.
-        let a = (rng.next_u64() % GOLDILOCKS_P);
-        let b_u = (rng.next_u64() % GOLDILOCKS_P);
+        let a = rng.next_u64() % GOLDILOCKS_P;
+        let b_u = rng.next_u64() % GOLDILOCKS_P;
         let exp = ((a as u128) * (b_u as u128) % (GOLDILOCKS_P as u128)) as u64;
 
         let mut b = Dr1csBuilder::<F257>::new();
