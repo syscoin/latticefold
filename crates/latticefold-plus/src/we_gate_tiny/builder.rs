@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::transcript::DEFAULT_REJECTION_TRIES;
 
 use rayon::join;
+use rayon::prelude::*;
 
 use ark_ff::Field;
 use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
@@ -366,13 +367,16 @@ struct GlueCtx {
     gb: Dr1csBuilder<F257>,
     pose_asg: Arc<Vec<F257>>,
     local_map: BTreeMap<usize, usize>,
+    // Extra "glue" equalities between this module's vars and the *base glue* module's vars.
+    // Each entry is (base_var, local_var) in their respective local index spaces.
+    base_eqs: Vec<(usize, usize)>,
 }
 
 impl GlueCtx {
     fn new(pose_asg: Arc<Vec<F257>>) -> Self {
         let mut gb = Dr1csBuilder::<F257>::new();
         gb.enforce_var_eq_const(gb.one(), F257::ONE);
-        Self { gb, pose_asg, local_map: BTreeMap::new() }
+        Self { gb, pose_asg, local_map: BTreeMap::new(), base_eqs: Vec::new() }
     }
 
     #[inline]
@@ -382,6 +386,16 @@ impl GlueCtx {
         }
         let lv = self.gb.new_var(self.pose_asg[gv]);
         self.local_map.insert(gv, lv);
+        lv
+    }
+
+    #[inline]
+    fn import_base_var(&mut self, base_asg: &[F257], base_var: usize) -> usize {
+        if base_var == 0 {
+            return 0;
+        }
+        let lv = self.gb.new_var(base_asg[base_var]);
+        self.base_eqs.push((base_var, lv));
         lv
     }
 }
@@ -1497,25 +1511,17 @@ fn enforce_fiat_shamir_reabsorb_semantics(
     Ok(())
 }
 
-/// Enforce that every **non-reabsorb** Absorb chunk of length multiple of 8 consists of
-/// canonical Goldilocks base-field encodings (u64 < p_goldilocks), interpreted as 8-byte little-endian scalars.
-///
-/// This is a byte/limb-only binding step: it does not perform any modular arithmetic beyond
-/// the single-subtract canonicality check.
-fn enforce_nonreabsorb_absorbs_are_canonical_goldilocks(
-    glue: &mut GlueCtx,
+
+fn collect_nonreabsorb_absorb_ranges(
     ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
-) -> Result<(), String> {
+) -> Result<Vec<(usize, usize)>, String> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
     let mut absorb_idx = 0usize;
     let mut expect_reabsorb = false;
     for (op_i, op) in ops.iter().enumerate() {
         match op {
             PoseidonTraceOp::SqueezeField(v) => {
-                // Only `get_challenge()` does a fiat–shamir reabsorb. In the trace that is
-                // exactly: SqueezeField(len=8) immediately followed by Absorb(len=8).
-                //
-                // Be strict here so we don't accidentally treat other squeezes as reabsorbs.
                 expect_reabsorb = v.len() == DIGITS_PER_TRY
                     && matches!(ops.get(op_i + 1), Some(PoseidonTraceOp::Absorb(a)) if a.len() == DIGITS_PER_TRY);
             }
@@ -1523,35 +1529,46 @@ fn enforce_nonreabsorb_absorbs_are_canonical_goldilocks(
                 let (ab_start, ab_len) = *pose_wiring
                     .absorb_ranges
                     .get(absorb_idx)
-                    .ok_or("pose_wiring.absorb_ranges oob (canonical goldilocks)")?;
+                    .ok_or("pose_wiring.absorb_ranges oob (collect canonical goldilocks)")?;
                 absorb_idx += 1;
                 let is_reabsorb = expect_reabsorb;
                 expect_reabsorb = false;
                 if is_reabsorb {
-                    // Skip: these are F257 digits (can include 256), not base-field bytes.
                     continue;
                 }
                 if (ab_len % 8) != 0 {
                     continue;
                 }
-                let n_elems = ab_len / 8;
-                for e in 0..n_elems {
-                    let mut bytes = [0usize; 8];
-                    for j in 0..8 {
-                        let gv = pose_wiring.absorb_vars[ab_start + e * 8 + j];
-                        let lv = glue.copy_digit(gv);
-                        let _ = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, lv);
-                        bytes[j] = lv;
-                    }
-                    goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(&mut glue.gb, &bytes);
-                }
+                out.push((ab_start, ab_len));
             }
             PoseidonTraceOp::SqueezeBytes { .. } => {
                 expect_reabsorb = false;
             }
         }
     }
-    Ok(())
+    Ok(out)
+}
+
+fn build_canonical_goldilocks_glue_for_ranges(
+    pose_asg: Arc<Vec<F257>>,
+    pose_wiring: &PoseidonDr1csWiring,
+    ranges: &[(usize, usize)],
+) -> Result<GlueCtx, String> {
+    let mut glue = GlueCtx::new(pose_asg);
+    for &(ab_start, ab_len) in ranges {
+        let n_elems = ab_len / 8;
+        for e in 0..n_elems {
+            let mut bytes = [0usize; 8];
+            for j in 0..8 {
+                let gv = pose_wiring.absorb_vars[ab_start + e * 8 + j];
+                let lv = glue.copy_digit(gv);
+                let _ = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, lv);
+                bytes[j] = lv;
+            }
+            goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(&mut glue.gb, &bytes);
+        }
+    }
+    Ok(glue)
 }
 
 fn sp1_centered_bound_u64(params: &WeParams, ring_dim: usize) -> Result<u64, String> {
@@ -1674,16 +1691,19 @@ fn finalize(
     String,
 > {
     // Convert glue builders to instances; keep per-part local maps so we can add explicit equality constraints.
-    let GlueCtx { gb, pose_asg, local_map: base_local_map } = glue;
+    let GlueCtx { gb, pose_asg, local_map: base_local_map, base_eqs: base_base_eqs } = glue;
     let (base_inst, base_asg) = gb.into_instance();
+    debug_assert!(base_base_eqs.is_empty(), "base glue should not contain base_eqs");
 
     let mut extra_insts: Vec<(SparseDr1csInstance<F257>, Vec<F257>)> = Vec::with_capacity(extra_glues.len());
     let mut extra_maps: Vec<BTreeMap<usize, usize>> = Vec::with_capacity(extra_glues.len());
+    let mut extra_base_eqs: Vec<Vec<(usize, usize)>> = Vec::with_capacity(extra_glues.len());
     for g in extra_glues {
-        let GlueCtx { gb, pose_asg: _pa, local_map } = g;
+        let GlueCtx { gb, pose_asg: _pa, local_map, base_eqs } = g;
         let (inst, asg) = gb.into_instance();
         extra_insts.push((inst, asg));
         extra_maps.push(local_map);
+        extra_base_eqs.push(base_eqs);
     }
 
     // Recover the owned pose assignment (avoid cloning).
@@ -1699,6 +1719,9 @@ fn finalize(
     let mut glue_eq_constraints = base_local_map.len();
     for m in &extra_maps {
         glue_eq_constraints = glue_eq_constraints.saturating_add(m.len());
+    }
+    for v in &extra_base_eqs {
+        glue_eq_constraints = glue_eq_constraints.saturating_add(v.len());
     }
 
     // Compute part offsets in merged space (excluding var0).
@@ -1740,6 +1763,14 @@ fn finalize(
             let gp = remap(0, gv, &offsets);
             let gg = remap(part, lv, &offsets);
             enforce_var_eq::<F257>(&mut inst, gp, gg);
+        }
+    }
+    for (i, v) in extra_base_eqs.iter().enumerate() {
+        let part = 2 + i;
+        for &(base_var, local_var) in v {
+            let gb = remap(1, base_var, &offsets);
+            let gl = remap(part, local_var, &offsets);
+            enforce_var_eq::<F257>(&mut inst, gb, gl);
         }
     }
     let c_after_glue_eq = inst.constraints.len();
@@ -1885,7 +1916,7 @@ fn finalize(
 }
 
 fn build_cm_glue_for_which(
-    cfg: Option<&PoseidonConfig<F257>>,
+    _cfg: Option<&PoseidonConfig<F257>>,
     _ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
     ring_dim: usize,
@@ -1896,17 +1927,14 @@ fn build_cm_glue_for_which(
     eval_absorbs: &[(usize, usize)],
     which: usize,
     pose_asg: Arc<Vec<F257>>,
+    base_asg: &[F257],
+    short_locals: &[ShortChallengeWiring],
+    u32_locals: &[BoundedU32ChallengeWiring],
 ) -> Result<GlueCtx, String> {
     let mut glue = GlueCtx::new(pose_asg);
     if ring_dim == 0 || l_instances_expected == 0 {
         return Ok(glue);
     }
-
-    // Rebuild the short/u32 blocks in this module (so the CM verifier math is self-contained).
-    let short_ranges = squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.short_squeeze_ops)?;
-    let short_locals = build_short_blocks(&mut glue, pose_wiring, ring_dim, &short_ranges)?;
-    let (u32_locals, _goldilocks_locals) =
-        build_u32_and_goldilocks_blocks(&mut glue, pose_wiring, &wiring.u32_squeeze_ops)?;
 
     // The CM segment begins at the last short squeeze, but the absorb ranges were already parsed
     // by the base glue module (and statement-bound there). Here we just consume the ranges.
@@ -1936,14 +1964,22 @@ fn build_cm_glue_for_which(
         let c0_digits: Vec<_> = c0_u32
             .iter()
             .map(|u| {
-                let bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &u.byte_vars);
+                let b0 = glue.import_base_var(base_asg, u.byte_vars[0]);
+                let b1 = glue.import_base_var(base_asg, u.byte_vars[1]);
+                let b2 = glue.import_base_var(base_asg, u.byte_vars[2]);
+                let b3 = glue.import_base_var(base_asg, u.byte_vars[3]);
+                let bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &[b0, b1, b2, b3]);
                 goldilocks_bytes_to_digits(&mut glue.gb, bytes)
             })
             .collect();
         let c1_digits: Vec<_> = c1_u32
             .iter()
             .map(|u| {
-                let bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &u.byte_vars);
+                let b0 = glue.import_base_var(base_asg, u.byte_vars[0]);
+                let b1 = glue.import_base_var(base_asg, u.byte_vars[1]);
+                let b2 = glue.import_base_var(base_asg, u.byte_vars[2]);
+                let b3 = glue.import_base_var(base_asg, u.byte_vars[3]);
+                let bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &[b0, b1, b2, b3]);
                 goldilocks_bytes_to_digits(&mut glue.gb, bytes)
             })
             .collect();
@@ -1983,8 +2019,9 @@ fn build_cm_glue_for_which(
             }
             let mut re: RingDigits = Vec::with_capacity(ring_dim);
             for &bv in &sb.byte_vars {
+                let bv_local = glue.import_base_var(base_asg, bv);
                 let mut bbytes = [0usize; 8];
-                bbytes[0] = bv;
+                bbytes[0] = bv_local;
                 for i in 1..8 {
                     bbytes[i] = z;
                 }
@@ -2021,7 +2058,11 @@ fn build_cm_glue_for_which(
         }
         let mut rdig: Vec<GoldilocksScalar> = Vec::with_capacity(nvars_lin);
         for u in &u32_locals[r_start..r_end] {
-            let bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &u.byte_vars);
+            let b0 = glue.import_base_var(base_asg, u.byte_vars[0]);
+            let b1 = glue.import_base_var(base_asg, u.byte_vars[1]);
+            let b2 = glue.import_base_var(base_asg, u.byte_vars[2]);
+            let b3 = glue.import_base_var(base_asg, u.byte_vars[3]);
+            let bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &[b0, b1, b2, b3]);
             rdig.push(goldilocks_bytes_to_digits(&mut glue.gb, bytes));
         }
         r_point_digits = Some(rdig);
@@ -2029,11 +2070,21 @@ fn build_cm_glue_for_which(
 
     // Select the u32 window for this sumcheck.
     let mut u32_idx = cm_u32_start + 2 * log_kappa + which * (1 + nvars_cm);
-    let rc_bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &u32_locals[u32_idx].byte_vars);
+    let u = &u32_locals[u32_idx];
+    let b0 = glue.import_base_var(base_asg, u.byte_vars[0]);
+    let b1 = glue.import_base_var(base_asg, u.byte_vars[1]);
+    let b2 = glue.import_base_var(base_asg, u.byte_vars[2]);
+    let b3 = glue.import_base_var(base_asg, u.byte_vars[3]);
+    let rc_bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &[b0, b1, b2, b3]);
     u32_idx += 1;
     let mut rs: Vec<[usize; 8]> = Vec::with_capacity(nvars_cm);
     for _ in 0..nvars_cm {
-        rs.push(goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &u32_locals[u32_idx].byte_vars));
+        let u = &u32_locals[u32_idx];
+        let b0 = glue.import_base_var(base_asg, u.byte_vars[0]);
+        let b1 = glue.import_base_var(base_asg, u.byte_vars[1]);
+        let b2 = glue.import_base_var(base_asg, u.byte_vars[2]);
+        let b3 = glue.import_base_var(base_asg, u.byte_vars[3]);
+        rs.push(goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &[b0, b1, b2, b3]));
         u32_idx += 1;
     }
 
@@ -2148,8 +2199,6 @@ fn build_cm_glue_for_which(
         ring_eq_digits(&mut glue.gb, &subclaim_eval, &eval_acc);
     }
 
-    // Keep compiler from warning about unused cfg (we intentionally accept it for consistency with the caller).
-    let _ = cfg;
     Ok(glue)
 }
 
@@ -2196,9 +2245,41 @@ pub(super) fn build(
 
     // Bind all proof/statement payload absorbs that encode base-field elements as canonical 8-byte scalars.
     // (Skip fiat–shamir reabsorbs, which are F257 digits and may contain 256.)
-    enforce_nonreabsorb_absorbs_are_canonical_goldilocks(&mut glue, ops, &pose_wiring)?;
+    //
+    // This is a huge independent workload; build it as many glue modules in parallel and merge.
+    let canonical_ranges = collect_nonreabsorb_absorb_ranges(ops, &pose_wiring)?;
+    let n_threads = rayon::current_num_threads().max(1);
+    // Over-decompose to improve load-balance; avoid too many tiny tasks / too many merge parts.
+    // Override with `LFP_TINY_CANON_CHUNKS`.
+    let n_chunks = std::env::var("LFP_TINY_CANON_CHUNKS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| (n_threads * 2).min(256).max(1))
+        .min(canonical_ranges.len().max(1));
+    let chunk_size = (canonical_ranges.len() + n_chunks - 1) / n_chunks;
+    if lf_mem_on() || tiny_opmix_on() {
+        eprintln!(
+            "[tiny_gate/par] canonical_goldilocks ranges={} threads={} chunks={} chunk_size={}",
+            canonical_ranges.len(),
+            n_threads,
+            n_chunks,
+            chunk_size.max(1)
+        );
+    }
+    let canonical_glues: Vec<GlueCtx> = if canonical_ranges.is_empty() {
+        Vec::new()
+    } else {
+        canonical_ranges
+            .chunks(chunk_size.max(1))
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|chunk| build_canonical_goldilocks_glue_for_ranges(pose_asg.clone(), &pose_wiring, chunk))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    // `lf_stage_log` expects a single glue ctx; log the base ctx here and rely on merge stats for totals.
     lf_stage_log(
-        "enforce_nonreabsorb_absorbs_are_canonical_goldilocks",
+        "enforce_nonreabsorb_absorbs_are_canonical_goldilocks(par)",
         Some(&pose_inst),
         Some(&glue),
         &mut mem_prev,
@@ -2280,6 +2361,7 @@ pub(super) fn build(
                 comh_absorbs.len()
             );
             let pose_asg = glue.pose_asg.clone();
+            let base_asg = glue.gb.assignment.as_slice();
             let (g0, g1) = join(
                 || {
                     build_cm_glue_for_which(
@@ -2294,6 +2376,9 @@ pub(super) fn build(
                         &eval_absorbs[0],
                         0,
                         pose_asg.clone(),
+                        base_asg,
+                        &short_locals,
+                        &u32_locals,
                     )
                 },
                 || {
@@ -2309,6 +2394,9 @@ pub(super) fn build(
                         &eval_absorbs[1],
                         1,
                         pose_asg.clone(),
+                        base_asg,
+                        &short_locals,
+                        &u32_locals,
                     )
                 },
             );
@@ -2365,7 +2453,11 @@ pub(super) fn build(
         pose_wiring,
         ops,
         glue,
-        cm_extra_glues,
+        {
+            let mut extra = canonical_glues;
+            extra.extend(cm_extra_glues);
+            extra
+        },
         short_locals,
         u32_locals,
         goldilocks_locals,
