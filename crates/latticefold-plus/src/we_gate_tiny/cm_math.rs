@@ -431,13 +431,18 @@ pub(crate) fn eval_small_mle_ring_digits(
 
     let mut cur: Vec<RingDigits> = table.to_vec();
     for ri in r.iter() {
-        let one_minus = frog_one_minus_digits(gb, ri);
         let mut next: Vec<RingDigits> = Vec::with_capacity(cur.len() / 2);
         for j in 0..(cur.len() / 2) {
-            // out = cur[2j]*(1-ri) + cur[2j+1]*ri
-            let a = ring_scale_digits(gb, &cur[2 * j], &one_minus);
-            let b = ring_scale_digits(gb, &cur[2 * j + 1], ri);
-            next.push(ring_add_digits(gb, &a, &b));
+            // Standard multilinear combine:
+            // out = a*(1-ri) + b*ri
+            //
+            // Optimize to use ONE scalar multiplication instead of two:
+            // out = a + (b - a) * ri
+            let a = &cur[2 * j];
+            let b = &cur[2 * j + 1];
+            let diff = ring_sub_digits(gb, b, a);
+            let t = ring_scale_digits(gb, &diff, ri);
+            next.push(ring_add_digits(gb, a, &t));
         }
         cur = next;
     }
