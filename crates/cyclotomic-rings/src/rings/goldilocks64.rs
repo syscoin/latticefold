@@ -589,6 +589,7 @@ impl LatticefoldChallengeSet<GoldilocksRing64> for Goldilocks64ChallengeSet {
 mod goldilocks64_tests {
     use super::*;
     use ark_std::{test_rng, UniformRand};
+    use rand::RngCore;
 
     type Inner =
         stark_rings::cyclotomic_ring::CyclotomicPolyRingGeneral<Goldilocks64Config, 1, 64>;
