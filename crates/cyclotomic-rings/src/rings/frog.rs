@@ -1,17 +1,7 @@
-use ark_ff::Field;
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use stark_rings::balanced_decomposition::Decompose;
-use stark_rings::cyclotomic_ring::models::frog_ring::{Fq, FqConfig, RqNTT, RqPoly};
-use stark_rings::cyclotomic_ring::Flatten;
-use stark_rings::traits::FromRandomBytes;
-use stark_rings::traits::MulUnchecked;
-use stark_rings::{OverField, PolyRing, Ring};
+use stark_rings::cyclotomic_ring::models::frog_ring::{Fq, RqNTT, RqPoly};
 
 use super::SuitableRing;
-use crate::{
-    ark_base::*,
-    challenge_set::{error, LatticefoldChallengeSet},
-};
+use crate::challenge_set::{error, LatticefoldChallengeSet};
 
 /// Frog ring in the NTT form.
 ///
