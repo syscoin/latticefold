@@ -22,6 +22,7 @@ use super::digits::{
     rebalance_prod12_to_prod13, rebalance_prod21_to_prod22, scale_short_coeffs_by_digits18,
     scale_short_coeffs_by_digits9, sum_bal16_vectors_fixed_len, sum_product_digits_bal16,
     sum_product_digits_bal16_22, sum_products13_coeffwise_fixed_len, sum_products22_coeffwise_fixed_len,
+    enforce_existing_bal16_digit_var, enforce_existing_bool_var,
 };
 use super::frog::{
     frog_add_mod_p_from_byte_vars_assume_canonical, frog_mul_mod_p_from_byte_vars_assume_canonical,
@@ -38,7 +39,8 @@ use super::surfaces::{CmDigitMulSqSurfaceWiring, CmDigitMulSurfaceWiring};
 use super::cm_math::{
     eq_eval_frog_digits, eval_t_z_optimized_ring_digits_pair, frog_bytes_to_digits, frog_pow_table_digits,
     ring_add_bytes, ring_add_digits, ring_bytes_to_digits, ring_eq_digits, ring_mul_negacyclic_digits_d64,
-    ring_scale_digits, ring_zero_bytes, sumcheck_verify_degree2_ring_bytes,
+    ring_scale_digits, ring_zero_bytes, ring_zero_digits, sumcheck_verify_degree2_ring_bytes,
+    sumcheck_verify_degree2_ring_digits,
     tensor_frog_ringconst_digits, tensor_frog_scalars_digits, RingBytes, RingDigits,
 };
 use super::op_counts::{tiny_cm_counts_reset, tiny_cm_counts_take};
@@ -939,6 +941,9 @@ fn parse_and_enforce_cm_after_short(
     if wiring.short_squeeze_ops.is_empty() {
         return Ok((Vec::new(), vec![Vec::new(), Vec::new()], vec![Vec::new(), Vec::new()]));
     }
+    if ring_dim == 0 {
+        return Ok((Vec::new(), vec![Vec::new(), Vec::new()], vec![Vec::new(), Vec::new()]));
+    }
     let kappa = params.kappa as usize;
     let nvars_cm = params.nvars_cm as usize;
     let mlen_mats = params.mlen as usize;
@@ -1004,6 +1009,9 @@ fn parse_and_enforce_cm_after_short(
     }
     let ring_elem_bytes =
         ring_elem_bytes.ok_or_else(|| "tiny gate: could not infer ring_elem_bytes (cm-after-short)".to_string())?;
+    let ring_elem_digits17 = ring_dim
+        .checked_mul(17)
+        .ok_or_else(|| "tiny gate: ring_dim*17 overflow".to_string())?;
     let mut cur = 0usize;
 
     // coh: L*kappa ring elements
@@ -1042,6 +1050,30 @@ fn parse_and_enforce_cm_after_short(
     }
 
     for which in 0..2 {
+        // CM ring payloads (sumcheck msgs + eval tables) may be encoded either as:
+        // - canonical 8-byte little-endian scalars per coefficient (len = ring_elem_bytes)
+        // - balanced base-16 digits per coefficient (17 elems; len = ring_elem_digits17)
+        let mut ring_elem_payload_len: Option<usize> = None;
+        let mut check_ring_payload_len = |ln: usize| -> Result<(), String> {
+            if ln != ring_elem_bytes && ln != ring_elem_digits17 {
+                return Err(format!(
+                    "tiny gate: unexpected ring-elem absorb len (got {ln}, expected {ring_elem_bytes} or {ring_elem_digits17})"
+                ));
+            }
+            match ring_elem_payload_len {
+                None => {
+                    ring_elem_payload_len = Some(ln);
+                    Ok(())
+                }
+                Some(cur_ln) => {
+                    if ln != cur_ln {
+                        return Err("tiny gate: mixed ring-elem encodings within CM payload segment".to_string());
+                    }
+                    Ok(())
+                }
+            }
+        };
+
         // Sumcheck header: absorb nvars, absorb degree (both as base-field scalars -> 8 bytes)
         {
             let (st, ln) = *payload_after_short
@@ -1071,9 +1103,7 @@ fn parse_and_enforce_cm_after_short(
                     .get(cur)
                     .ok_or("tiny gate: payload_after_short too short (sc msg)")?;
                 cur += 1;
-                if ln != ring_elem_bytes {
-                    return Err("tiny gate: expected ring-elem absorb for sumcheck msg".to_string());
-                }
+                check_ring_payload_len(ln)?;
                 sc_msg_absorbs[which].push((st, ln));
             }
             // Marker absorb (schedule generator uses 0).
@@ -1095,9 +1125,7 @@ fn parse_and_enforce_cm_after_short(
                         .get(cur)
                         .ok_or("tiny gate: payload_after_short too short (evals)")?;
                     cur += 1;
-                    if ln != ring_elem_bytes {
-                        return Err("tiny gate: expected ring-elem absorb for eval table".to_string());
-                    }
+                    check_ring_payload_len(ln)?;
                     eval_absorbs[which].push((st, ln));
                 }
             }
@@ -1159,6 +1187,44 @@ fn parse_ring_elem_absorb_as_ringbytes(
             cbytes[i] = glue.copy_digit(gv);
         }
         out.push(cbytes);
+    }
+    Ok(out)
+}
+
+fn parse_ring_elem_absorb_as_ringdigits17(
+    glue: &mut GlueCtx,
+    pose_wiring: &PoseidonDr1csWiring,
+    ring_dim: usize,
+    ab_start: usize,
+    ab_len: usize,
+) -> Result<RingDigits, String> {
+    if ring_dim == 0 {
+        return Ok(Vec::new());
+    }
+    if ab_len % ring_dim != 0 {
+        return Err("tiny gate: ring absorb len not divisible by ring_dim".to_string());
+    }
+    let coeff_elems = ab_len / ring_dim;
+    if coeff_elems != 17 {
+        return Err(format!(
+            "tiny gate: expected 17-digit coeff encoding for RingDigits, got {coeff_elems}"
+        ));
+    }
+    let mut out: RingDigits = Vec::with_capacity(ring_dim);
+    for coeff in 0..ring_dim {
+        let mut digs = [0usize; 17];
+        let off = ab_start + coeff * 17;
+        for i in 0..17 {
+            let gv = pose_wiring.absorb_vars[off + i];
+            let lv = glue.copy_digit(gv);
+            if i < 16 {
+                enforce_existing_bal16_digit_var(&mut glue.gb, lv);
+            } else {
+                enforce_existing_bool_var(&mut glue.gb, lv);
+            }
+            digs[i] = lv;
+        }
+        out.push(digs);
     }
     Ok(out)
 }
@@ -1505,7 +1571,9 @@ fn enforce_nonreabsorb_absorbs_are_canonical_frog(
     glue: &mut GlueCtx,
     ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
+    ring_dim: usize,
 ) -> Result<(), String> {
+    let tiny_digit_transcript_on = std::env::var("LFP_TINY_DIGIT_TRANSCRIPT").ok().as_deref() == Some("1");
     let mut absorb_idx = 0usize;
     let mut expect_reabsorb = false;
     for op in ops {
@@ -1527,6 +1595,15 @@ fn enforce_nonreabsorb_absorbs_are_canonical_frog(
                     continue;
                 }
                 if (ab_len % 8) != 0 {
+                    continue;
+                }
+                if tiny_digit_transcript_on
+                    && ring_dim > 0
+                    && (ab_len % ring_dim) == 0
+                    && (ab_len / ring_dim) == 17
+                {
+                    // Digit transcript payloads are not 8-byte canonical scalars; they are constrained
+                    // at the parse site as balanced digits.
                     continue;
                 }
                 let n_elems = ab_len / 8;
@@ -1871,7 +1948,7 @@ pub(super) fn build(
 
     // Bind all proof/statement payload absorbs that encode base-field elements as canonical 8-byte scalars.
     // (Skip fiat–shamir reabsorbs, which are F257 digits and may contain 256.)
-    enforce_nonreabsorb_absorbs_are_canonical_frog(&mut glue, ops, &pose_wiring)?;
+    enforce_nonreabsorb_absorbs_are_canonical_frog(&mut glue, ops, &pose_wiring, ring_dim)?;
     lf_stage_log(
         "enforce_nonreabsorb_absorbs_are_canonical_frog",
         Some(&pose_inst),
@@ -2094,34 +2171,62 @@ pub(super) fn build(
                 u32_idx += 1;
             }
 
-            // Parse sumcheck msg absorbs into ring bytes: each round has 3 ring elements.
-            let mut msgs: Vec<[RingBytes; 3]> = Vec::with_capacity(nvars_cm);
             let abs = &sc_msg_absorbs[which];
             if abs.len() != nvars_cm * 3 {
                 return Err("tiny gate: sumcheck msg absorb count mismatch".to_string());
             }
-            for round in 0..nvars_cm {
-                let (s0, l0) = abs[round * 3 + 0];
-                let (s1, l1) = abs[round * 3 + 1];
-                let (s2, l2) = abs[round * 3 + 2];
-                let e0 = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s0, l0)?;
-                let e1 = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s1, l1)?;
-                let e2 = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s2, l2)?;
-                msgs.push([e0, e1, e2]);
-            }
-            lf_stage_log("cm_sumcheck_msgs_parsed", Some(&pose_inst), Some(&glue), &mut mem_prev);
+            let digit_payload = ring_dim > 0 && abs.first().map(|&(_s, ln)| ln == ring_dim * 17).unwrap_or(false);
+            let final_claim_digits = if digit_payload {
+                // Parse sumcheck msg absorbs into ring digits (balanced base-16): each round has 3 ring elements.
+                let mut msgs: Vec<[RingDigits; 3]> = Vec::with_capacity(nvars_cm);
+                for round in 0..nvars_cm {
+                    let (s0, l0) = abs[round * 3 + 0];
+                    let (s1, l1) = abs[round * 3 + 1];
+                    let (s2, l2) = abs[round * 3 + 2];
+                    let e0 = parse_ring_elem_absorb_as_ringdigits17(&mut glue, &pose_wiring, ring_dim, s0, l0)?;
+                    let e1 = parse_ring_elem_absorb_as_ringdigits17(&mut glue, &pose_wiring, ring_dim, s1, l1)?;
+                    let e2 = parse_ring_elem_absorb_as_ringdigits17(&mut glue, &pose_wiring, ring_dim, s2, l2)?;
+                    msgs.push([e0, e1, e2]);
+                }
+                lf_stage_log("cm_sumcheck_msgs_parsed", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
-            // Initial claim: in the full verifier this is a structured linear combination of Dcom evals,
-            // u-combinations, and tcch terms. For now, bind it to the transcript by setting it equal to
-            // the first-round consistency relation g(0)+g(1), so the sumcheck constraints remain satisfiable
-            // under existing proofs while we wire the full claimed-sum computation.
-            let claimed0 = if nvars_cm == 0 {
-                ring_zero_bytes(&mut glue.gb, ring_dim)
+                // Convert r_sc to digit encoding.
+                let rs_digits: Vec<FrogScalar> =
+                    rs.iter().copied().map(|b| frog_bytes_to_digits(&mut glue.gb, b)).collect();
+
+                let claimed0 = if nvars_cm == 0 {
+                    ring_zero_digits(&mut glue.gb, ring_dim)
+                } else {
+                    ring_add_digits(&mut glue.gb, &msgs[0][0], &msgs[0][1])
+                };
+                sumcheck_verify_degree2_ring_digits(&mut glue.gb, claimed0, &msgs, &rs_digits)?
             } else {
-                ring_add_bytes(&mut glue.gb, &msgs[0][0], &msgs[0][1])
+                // Legacy: ring elements absorbed as 8-byte canonical scalars per coefficient.
+                let mut msgs: Vec<[RingBytes; 3]> = Vec::with_capacity(nvars_cm);
+                for round in 0..nvars_cm {
+                    let (s0, l0) = abs[round * 3 + 0];
+                    let (s1, l1) = abs[round * 3 + 1];
+                    let (s2, l2) = abs[round * 3 + 2];
+                    let e0 = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s0, l0)?;
+                    let e1 = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s1, l1)?;
+                    let e2 = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s2, l2)?;
+                    msgs.push([e0, e1, e2]);
+                }
+                lf_stage_log("cm_sumcheck_msgs_parsed", Some(&pose_inst), Some(&glue), &mut mem_prev);
+
+                // Initial claim: in the full verifier this is a structured linear combination of Dcom evals,
+                // u-combinations, and tcch terms. For now, bind it to the transcript by setting it equal to
+                // the first-round consistency relation g(0)+g(1), so the sumcheck constraints remain satisfiable
+                // under existing proofs while we wire the full claimed-sum computation.
+                let claimed0 = if nvars_cm == 0 {
+                    ring_zero_bytes(&mut glue.gb, ring_dim)
+                } else {
+                    ring_add_bytes(&mut glue.gb, &msgs[0][0], &msgs[0][1])
+                };
+                let final_claim_bytes =
+                    sumcheck_verify_degree2_ring_bytes(&mut glue.gb, claimed0, &msgs, &rs)?;
+                ring_bytes_to_digits(&mut glue.gb, &final_claim_bytes)
             };
-            let final_claim_bytes =
-                sumcheck_verify_degree2_ring_bytes(&mut glue.gb, claimed0, &msgs, &rs)?;
             lf_stage_log("cm_sumcheck_constraints_done", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
             // Eval table absorbs: we will stream these row-by-row in recombination to avoid
@@ -2144,8 +2249,8 @@ pub(super) fn build(
                 // Convert r_sc to digit encoding.
                 let rs_digits: Vec<FrogScalar> = rs.iter().copied().map(|b| frog_bytes_to_digits(&mut glue.gb, b)).collect();
 
-                // subclaim_eval (ring) in digit encoding (cheap: only 64 coeff conversions).
-                let subclaim_eval = ring_bytes_to_digits(&mut glue.gb, &final_claim_bytes);
+                // subclaim_eval (ring) in digit encoding.
+                let subclaim_eval = final_claim_digits.clone();
 
                 // rc powers (need up to z_idx+1).
                 let z_idx = l_instances_expected * (4 + 4 * (params.mlen as usize));
@@ -2176,6 +2281,14 @@ pub(super) fn build(
                 // eval_acc = Σ_l eq*inner_l + (t0*e00)*rc^z + (t1*e00)*rc^{z+1}
                 let rows_per_l = 1 + params.mlen as usize;
                 let mut eval_acc = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+                let mut parse_eval_ring = |glue: &mut GlueCtx, st: usize, ln: usize| -> Result<RingDigits, String> {
+                    if digit_payload {
+                        parse_ring_elem_absorb_as_ringdigits17(glue, &pose_wiring, ring_dim, st, ln)
+                    } else {
+                        let rb = parse_ring_elem_absorb_as_ringbytes(glue, &pose_wiring, ring_dim, st, ln)?;
+                        Ok(ring_bytes_to_digits(&mut glue.gb, &rb))
+                    }
+                };
                 for l in 0..l_instances_expected {
                     let l_idx = l * (4 + 4 * (params.mlen as usize));
                     let mut inner = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
@@ -2185,8 +2298,7 @@ pub(super) fn build(
                     let flat0 = l * rows_per_l + 0;
                     for j in 0..4 {
                         let (st, ln) = abs_evals[flat0 * 4 + j];
-                        let rb = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, st, ln)?;
-                        let rd = ring_bytes_to_digits(&mut glue.gb, &rb);
+                        let rd = parse_eval_ring(&mut glue, st, ln)?;
                         if j == 0 {
                             e00_opt = Some(rd.clone());
                         }
@@ -2200,8 +2312,7 @@ pub(super) fn build(
                         let idx = l_idx + 4 + i * 4;
                         for j in 0..4 {
                             let (st, ln) = abs_evals[flat * 4 + j];
-                            let rb = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, st, ln)?;
-                            let rd = ring_bytes_to_digits(&mut glue.gb, &rb);
+                            let rd = parse_eval_ring(&mut glue, st, ln)?;
                             let t = ring_scale_digits(&mut glue.gb, &rd, &rc_pows[idx + j]);
                             inner = ring_add_digits(&mut glue.gb, &inner, &t);
                         }
