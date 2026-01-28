@@ -348,12 +348,41 @@ fn compute_tcch(
     ring_dim: usize,
     params: &WeParams,
     wiring: &TinyCoinOpWiring,
-    u32_ranges: &[(usize, usize)],
-    frog_locals: &[FrogChallengeWiring],
+    u32_locals: &[BoundedU32ChallengeWiring],
 ) -> Result<(Vec<[usize; 8]>, Vec<[usize; 8]>), String> {
     // Preserves exact existing behavior; only moved out for readability/audit.
     let mut tcch0_local: Vec<[usize; 8]> = Vec::new();
     let mut tcch1_local: Vec<[usize; 8]> = Vec::new();
+
+    #[inline]
+    fn alloc_const_byte(gb: &mut Dr1csBuilder<F257>, v: u8) -> usize {
+        let x = gb.new_var(F257::from(v as u64));
+        gb.enforce_var_eq_const(x, F257::from(v as u64));
+        let _ = decompose_existing_byte_var_to_bits::<F257>(gb, x);
+        x
+    }
+
+    #[inline]
+    fn alloc_const_frog_u64(gb: &mut Dr1csBuilder<F257>, v: u64) -> [usize; 8] {
+        let bs = v.to_le_bytes();
+        let mut out = [0usize; 8];
+        for i in 0..8 {
+            out[i] = alloc_const_byte(gb, bs[i]);
+        }
+        let _limbs = frog_u64_canonical_from_byte_vars::<F257>(gb, &out);
+        out
+    }
+
+    #[inline]
+    fn frog_bytes_from_u32_le_bytes(gb: &mut Dr1csBuilder<F257>, u32_le: &[usize; 4]) -> [usize; 8] {
+        let mut out = [0usize; 8];
+        out[0..4].copy_from_slice(u32_le);
+        for i in 4..8 {
+            out[i] = alloc_const_byte(gb, 0u8);
+        }
+        let _limbs = frog_u64_canonical_from_byte_vars::<F257>(gb, &out);
+        out
+    }
 
     if ring_dim > 0 && !wiring.short_squeeze_ops.is_empty() && !wiring.u32_squeeze_ops.is_empty() {
         let mut ring_elem_bytes: Option<usize> = None;
@@ -414,6 +443,7 @@ fn compute_tcch(
                     }
 
                     let mut coh0_bytes: Vec<[usize; 8]> = Vec::new();
+                    let mut comh_all_coeff_bytes: Vec<[[usize; 8]; 64]> = Vec::new();
                     for &(ab_start, ab_len) in &comh_absorb_ranges {
                         if ab_len < reb || (ab_len % reb) != 0 {
                             continue;
@@ -421,20 +451,27 @@ fn compute_tcch(
                         let n_blocks = ab_len / reb;
                         for blk in 0..n_blocks {
                             let blk_start = ab_start + blk * reb;
-                            // The first coefficient of the ring element is encoded as `coeff_bytes` bytes.
-                            // Enforce canonical Frog base-field encoding on that 8-byte chunk (no reduction).
-                            if coeff_bytes == 8 {
-                                let mut coeff0_bytes = [0usize; 8];
+                            // Each ring element is encoded as `ring_dim` coefficients, each coefficient as
+                            // `coeff_bytes` bytes (little-endian, canonical for Frog base field).
+                            if coeff_bytes != 8 || ring_dim != 64 {
+                                // Current tiny gate specialization: FrogRing64 with 8-byte coeff encoding.
+                                return Err("tiny gate: expected ring_dim=64 and coeff_bytes=8 for CM verifier".to_string());
+                            }
+
+                            let mut coeffs = [[0usize; 8]; 64];
+                            for coeff in 0..64 {
+                                let coeff_start = blk_start + coeff * 8;
                                 for i in 0..8 {
-                                    let gv = pose_wiring.absorb_vars[blk_start + i];
+                                    let gv = pose_wiring.absorb_vars[coeff_start + i];
                                     let lv = glue.copy_digit(gv);
                                     let _ = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, lv);
-                                    coeff0_bytes[i] = lv;
+                                    coeffs[coeff][i] = lv;
                                 }
-                                let _coeff0_limbs =
-                                    frog_u64_canonical_from_byte_vars::<F257>(&mut glue.gb, &coeff0_bytes);
-                                coh0_bytes.push(coeff0_bytes);
+                                let _limbs =
+                                    frog_u64_canonical_from_byte_vars::<F257>(&mut glue.gb, &coeffs[coeff]);
                             }
+                            coh0_bytes.push(coeffs[0]);
+                            comh_all_coeff_bytes.push(coeffs);
                         }
                     }
 
@@ -452,99 +489,57 @@ fn compute_tcch(
 
                         let c0_start = cm_u32_start;
                         let c1_start = cm_u32_start + lg;
-                        if c1_start + lg <= u32_ranges.len() && c1_start + lg <= frog_locals.len() {
-                            // Lift reduced Frog challenges to canonical byte encodings (z < p),
-                            // so we can do Frog-field arithmetic in the tiny gate.
-                            fn canonical_frog_bytes_from_limbs(
-                                gb: &mut Dr1csBuilder<F257>,
-                                limbs: &[usize; super::params::LIMBS_U64],
-                            ) -> [usize; 8] {
-                                let mut z_u64: u64 = 0;
-                                for i in (0..super::params::LIMBS_U64).rev() {
-                                    let di = gb.assignment[limbs[i]]
-                                        .into_bigint()
-                                        .to_bytes_le()
-                                        .get(0)
-                                        .copied()
-                                        .unwrap_or(0) as u64;
-                                    z_u64 <<= super::params::LIMB_BITS;
-                                    z_u64 |= di & (super::params::LIMB_BASE_U64 - 1);
-                                }
-                                let zb = z_u64.to_le_bytes();
-                                let mut z_bytes = [0usize; 8];
-                                for i in 0..8 {
-                                    let v = gb.new_var(F257::from(zb[i] as u64));
-                                    let _ = decompose_existing_byte_var_to_bits::<F257>(gb, v);
-                                    z_bytes[i] = v;
-                                }
-                                let z_limbs = frog_u64_canonical_from_byte_vars::<F257>(gb, &z_bytes);
-                                for i in 0..super::params::LIMBS_U64 {
-                                    gb.enforce_lc_times_one_eq_const(vec![
-                                        (F257::ONE, z_limbs[i]),
-                                        (-F257::ONE, limbs[i]),
-                                    ]);
-                                }
-                                z_bytes
-                            }
-
+                        if c1_start + lg <= u32_locals.len() {
+                            // Challenges c0/c1 are transcript `get_challenge()` outputs: bounded u32 embedded
+                            // into the Frog base field. Represent them as canonical Frog bytes by padding the
+                            // 4-byte u32 with 4 zero bytes (so value < 2^32 < p).
                             let mut c0_bytes: Vec<[usize; 8]> = Vec::with_capacity(lg);
                             let mut c1_bytes: Vec<[usize; 8]> = Vec::with_capacity(lg);
                             for i in 0..lg {
-                                c0_bytes.push(canonical_frog_bytes_from_limbs(
+                                c0_bytes.push(frog_bytes_from_u32_le_bytes(
                                     &mut glue.gb,
-                                    &frog_locals[c0_start + i].limbs,
+                                    &u32_locals[c0_start + i].byte_vars,
                                 ));
                             }
                             for i in 0..lg {
-                                c1_bytes.push(canonical_frog_bytes_from_limbs(
+                                c1_bytes.push(frog_bytes_from_u32_le_bytes(
                                     &mut glue.gb,
-                                    &frog_locals[c1_start + i].limbs,
+                                    &u32_locals[c1_start + i].byte_vars,
                                 ));
                             }
 
-                                #[inline]
-                                fn tensor_frog_bytes(gb: &mut Dr1csBuilder<F257>, c: &[[usize; 8]]) -> Vec<[usize; 8]> {
-                                    let mut one = [0usize; 8];
-                                    one[0] = gb.new_var(F257::ONE);
-                                    gb.enforce_var_eq_const(one[0], F257::ONE);
-                                    let _ = decompose_existing_byte_var_to_bits::<F257>(gb, one[0]);
-                                    for i in 1..8 {
-                                        one[i] = gb.new_var(F257::ZERO);
-                                        gb.enforce_var_eq_const(one[i], F257::ZERO);
-                                        let _ = decompose_existing_byte_var_to_bits::<F257>(gb, one[i]);
+                            #[inline]
+                            fn tensor_frog_bytes(gb: &mut Dr1csBuilder<F257>, c: &[[usize; 8]]) -> Vec<[usize; 8]> {
+                                let one = alloc_const_frog_u64(gb, 1u64);
+                                let mut acc: Vec<[usize; 8]> = vec![one];
+                                for ci in c {
+                                    let one_minus = frog_sub_mod_p_from_byte_vars(gb, &one, ci);
+                                    let mut next: Vec<[usize; 8]> = Vec::with_capacity(acc.len() * 2);
+                                    for t in &acc {
+                                        next.push(frog_mul_mod_p_from_byte_vars(gb, t, &one_minus));
+                                        next.push(frog_mul_mod_p_from_byte_vars(gb, t, ci));
                                     }
-                                    let mut acc: Vec<[usize; 8]> = vec![one];
-                                    for ci in c {
-                                        let one_minus = frog_sub_mod_p_from_byte_vars(gb, &one, ci);
-                                        let mut next: Vec<[usize; 8]> = Vec::with_capacity(acc.len() * 2);
-                                        for t in &acc {
-                                            next.push(frog_mul_mod_p_from_byte_vars(gb, t, &one_minus));
-                                            next.push(frog_mul_mod_p_from_byte_vars(gb, t, ci));
-                                        }
-                                        acc = next;
-                                    }
-                                    acc
+                                    acc = next;
                                 }
+                                acc
+                            }
 
-                                let tensor_c0 = tensor_frog_bytes(&mut glue.gb, &c0_bytes);
-                                let tensor_c1 = tensor_frog_bytes(&mut glue.gb, &c1_bytes);
+                            let tensor_c0 = tensor_frog_bytes(&mut glue.gb, &c0_bytes);
+                            let tensor_c1 = tensor_frog_bytes(&mut glue.gb, &c1_bytes);
 
+                            // Compute full-ring tcch0/tcch1, but return only coefficient-0 bytes for API.
                             tcch0_local.reserve(l_instances);
                             tcch1_local.reserve(l_instances);
+                            let zero = alloc_const_frog_u64(&mut glue.gb, 0u64);
                             for l in 0..l_instances {
                                 let base = l * kappa;
-                                let mut zero = [0usize; 8];
-                                for i in 0..8 {
-                                    zero[i] = glue.gb.new_var(F257::ZERO);
-                                    glue.gb.enforce_var_eq_const(zero[i], F257::ZERO);
-                                    let _ = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, zero[i]);
-                                }
+                                // coeff 0
                                 let mut sum0 = zero;
                                 let mut sum1 = zero;
                                 for j in 0..kappa {
-                                    let rj = &coh0_bytes[base + j];
-                                    let m0 = frog_mul_mod_p_from_byte_vars(&mut glue.gb, &tensor_c0[j], rj);
-                                    let m1 = frog_mul_mod_p_from_byte_vars(&mut glue.gb, &tensor_c1[j], rj);
+                                    let rj0 = &comh_all_coeff_bytes[base + j][0];
+                                    let m0 = frog_mul_mod_p_from_byte_vars(&mut glue.gb, &tensor_c0[j], rj0);
+                                    let m1 = frog_mul_mod_p_from_byte_vars(&mut glue.gb, &tensor_c1[j], rj0);
                                     sum0 = frog_add_mod_p_from_byte_vars(&mut glue.gb, &sum0, &m0);
                                     sum1 = frog_add_mod_p_from_byte_vars(&mut glue.gb, &sum1, &m1);
                                 }
@@ -1261,7 +1256,7 @@ pub(super) fn build(
         build_u32_and_frog_blocks(&mut glue, &pose_wiring, &wiring.u32_squeeze_ops)?;
     let frog_rejection_locals = build_frog_rejection_coins(&mut glue, &pose_wiring, &frog_ranges)?;
     let (tcch0_local, tcch1_local) =
-        compute_tcch(&mut glue, ops, &pose_wiring, ring_dim, params, wiring, &u32_ranges, &frog_locals)?;
+        compute_tcch(&mut glue, ops, &pose_wiring, ring_dim, params, wiring, &u32_locals)?;
     if l_instances_expected != 0 && tcch0_local.len() != l_instances_expected {
         return Err("tiny gate: tcch0 length mismatch with inferred L".to_string());
     }
