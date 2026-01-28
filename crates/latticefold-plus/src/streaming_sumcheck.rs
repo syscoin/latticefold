@@ -25,7 +25,7 @@ use core::mem::MaybeUninit;
 //
 // IMPORTANT (d-scaling):
 // `vals` stores full ring elements, so its footprint scales linearly with `R::dimension()`.
-// We size it to target ~4 MiB/thread for the *values* across different rings (e.g. Frog d=16 vs d=64)
+// We size it to target ~4 MiB/thread for the *values* across different rings (e.g. Goldilocks d=16 vs d=64)
 // to avoid a 4x memory jump when switching to d=64.
 const CM_HFROM_TARGET_VAL_BYTES: usize = 4 * 1024 * 1024;
 
@@ -2373,7 +2373,7 @@ impl StreamingSumcheck {
             // CM optimization: cache one fused mat-vec row scan for the "even" and "odd" indices
             // within the current hypercube vertex pair.
             // NOTE: store cached `[R;4]` on the heap to avoid huge per-thread stack frames when
-            // `R` is large (e.g. `FrogRing64`). Rayon's worker stack is limited and can overflow.
+            // `R` is large (e.g. `GoldilocksRing64`). Rayon's worker stack is limited and can overflow.
             cm_cache_even: Option<(usize, usize, Box<[Rr; 4]>)>, // (shared_id, row, vals)
             cm_cache_odd: Option<(usize, usize, Box<[Rr; 4]>)>,
             // CM optimization (LazyFixed): cache the *lazy-combined* value for a fused mat-vec
@@ -2640,7 +2640,7 @@ impl StreamingSumcheck {
             vals0: Vec<Rr>,
             vals1: Vec<Rr>,
             hfrom_cache: Option<HFromIndexCache<Rr>>,
-            // Heap-cached `[R;4]` to avoid large stack frames for big rings (e.g. `FrogRing64`).
+            // Heap-cached `[R;4]` to avoid large stack frames for big rings (e.g. `GoldilocksRing64`).
             cm_cache_even: Option<(usize, usize, Box<[Rr; 4]>)>,
             cm_cache_odd: Option<(usize, usize, Box<[Rr; 4]>)>,
             cm_lazy_cache_even: Option<(usize, usize, usize, Box<[Rr; 4]>)>,
@@ -3204,7 +3204,7 @@ impl StreamingSumcheck {
 mod tests {
     use super::*;
     use rand::RngCore;
-    use cyclotomic_rings::rings::FrogRing64 as R;
+    use cyclotomic_rings::rings::GoldilocksRing64 as R;
     use stark_rings::PolyRing;
     use stark_rings_linalg::SparseMatrix;
     use std::sync::Arc;

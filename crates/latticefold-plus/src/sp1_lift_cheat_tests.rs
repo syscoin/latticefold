@@ -1,11 +1,11 @@
-//! Cheat / soundness regression tests for the SP1 BabyBear→Frog lift.
+//! Cheat / soundness regression tests for the SP1 BabyBear→Goldilocks lift.
 //!
 //! Goal: exercise the exact failure mode:
 //! - If lift vars (`t_i` = carry/quotient) are *not* bounded, the lifted constraint is vacuous:
-//!     t := (A*B - C) * p_bb^{-1}  (mod q_frog)
+//!     t := (A*B - C) * p_bb^{-1}  (mod q_goldilocks)
 //!   always satisfies in the host field.
 //! - With LF+ boundedness enforced via **base-12 digits with k=8** under the conservative
-//!   per-digit bound \(|digit|\le 31\) (Frog64 unit monomial exponent range),
+//!   per-digit bound \(|digit|\le 31\) (Goldilocks64 unit monomial exponent range),
 //!   that cheating `t`
 //!   is (overwhelmingly) out of range and cannot be decomposed -> rejected.
 
@@ -13,14 +13,14 @@
 
 use ark_ff::Field;
 use stark_rings::{
-    cyclotomic_ring::models::frog_ring::Fq,
+    cyclotomic_ring::models::goldilocks::Fq,
     Zq,
 };
 
 const P_BB: u64 = 2013265921;
 const BOUND_BASE: i128 = 12;
 const BOUND_K: usize = 8;
-const DIGIT_MAX: i128 = 31; // Frog64 unit-monomial exponent range
+const DIGIT_MAX: i128 = 31; // Goldilocks64 unit-monomial exponent range
 
 fn centered_i64(x: Fq) -> i64 {
     let mag = x
@@ -31,7 +31,7 @@ fn centered_i64(x: Fq) -> i64 {
     if neg { -mag } else { mag }
 }
 
-fn decompose_fits_sp1_frog64_bound(x: Fq) -> bool {
+fn decompose_fits_sp1_goldilocks64_bound(x: Fq) -> bool {
     // Model the actual boundedness envelope used in the current verifier argument:
     // represent x as sum_{i<k} d_i * B^i with each digit d_i in [-DIGIT_MAX, DIGIT_MAX].
     //
@@ -95,15 +95,15 @@ fn decompose_fits_sp1_frog64_bound(x: Fq) -> bool {
 
 #[test]
 fn test_lift_vacuity_exists_but_boundedness_rejects_random() {
-    // Show: for random a,b,c in [0,p_bb), we can always solve t in Frog field so that
-    //   a*b = c + p_bb*t (mod q_frog)
+    // Show: for random a,b,c in [0,p_bb), we can always solve t in Goldilocks field so that
+    //   a*b = c + p_bb*t (mod q_goldilocks)
     // but that t is (almost always) not representable under b=2^16,k=2 boundedness.
     use rand::Rng;
 
     let mut rng = ark_std::test_rng();
     let inv_p = Fq::from(P_BB).inverse().unwrap();
 
-    // Find a sample where the computed t does NOT fit in the SP1/Frog64 boundedness regime.
+    // Find a sample where the computed t does NOT fit in the SP1/Goldilocks64 boundedness regime.
     for _ in 0..10_000 {
         let a_u: u64 = rng.gen_range(0..P_BB);
         let b_u: u64 = rng.gen_range(0..P_BB);
@@ -113,7 +113,7 @@ fn test_lift_vacuity_exists_but_boundedness_rejects_random() {
         let c = Fq::from(c_u);
 
         // Cheating choice of t in the host field:
-        //   t := (a*b - c) / p_bb  (mod q_frog)
+        //   t := (a*b - c) / p_bb  (mod q_goldilocks)
         let t = (a * b - c) * inv_p;
 
         // This ALWAYS satisfies in the host field.
@@ -122,7 +122,7 @@ fn test_lift_vacuity_exists_but_boundedness_rejects_random() {
         assert_eq!(lhs, rhs);
 
         // Under boundedness (base=14,k=8,digit_max=31), this t should almost never fit.
-        if !decompose_fits_sp1_frog64_bound(t) {
+        if !decompose_fits_sp1_goldilocks64_bound(t) {
             // Nice to sanity-print magnitude if needed while debugging.
             let _mag = centered_i64(t);
             return;
@@ -147,7 +147,7 @@ fn test_lift_nonvacuous_accepts_small_valid_case() {
     let t = Fq::ZERO; // quotient/carry is 0
 
     assert_eq!(a * b, c + Fq::from(P_BB) * t);
-    assert!(decompose_fits_sp1_frog64_bound(t));
+    assert!(decompose_fits_sp1_goldilocks64_bound(t));
 }
 
 #[test]
@@ -167,7 +167,7 @@ fn test_lift_add_carry_example_is_bounded() {
 
     // Model linear constraint as (A=1, B = a+b, C = c + p*carry) or equivalently just check integer equality:
     assert_eq!(a + b, c + Fq::from(P_BB) * carry);
-    assert!(decompose_fits_sp1_frog64_bound(carry));
+    assert!(decompose_fits_sp1_goldilocks64_bound(carry));
 }
 
 #[test]
@@ -175,8 +175,8 @@ fn test_lift_mul_cheat_t_is_rejected_by_boundedness() {
     // Construct a single lifted mul constraint:
     //   a*b = c + p*t
     // where a,b,c are in [0,p_bb). Choose random values and set
-    //   t := (a*b - c)/p  (mod q_frog)
-    // which always satisfies in Frog, but almost never fits b=2^16,k=2 boundedness.
+    //   t := (a*b - c)/p  (mod q_goldilocks)
+    // which always satisfies in Goldilocks, but almost never fits b=2^16,k=2 boundedness.
     use rand::Rng;
 
     let mut rng = ark_std::test_rng();
@@ -190,7 +190,7 @@ fn test_lift_mul_cheat_t_is_rejected_by_boundedness() {
         let c = Fq::from(c_u);
         let t = (a * b - c) * inv_p;
         assert_eq!(a * b, c + Fq::from(P_BB) * t);
-        if !decompose_fits_sp1_frog64_bound(t) {
+        if !decompose_fits_sp1_goldilocks64_bound(t) {
             return;
         }
     }

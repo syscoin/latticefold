@@ -3,24 +3,24 @@ use latticefold::transcript::poseidon::F257;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 
 use super::op_counts::tiny_cm_bump;
-use super::frog::{
-    frog_add_mod_p_from_byte_vars_assume_canonical, frog_mul_mod_p_from_byte_vars_assume_canonical,
-    frog_sub_mod_p_from_byte_vars_assume_canonical,
-    frog_add_mod_p_digits, frog_mul_mod_p_digits, frog_sub_mod_p_digits, frogscalar_from_u64_bytes_le_digits,
-    ring_mul_negacyclic_ntt_goldilocks_d64, FrogScalar,
+use super::goldilocks::{
+    goldilocks_add_mod_p_from_byte_vars_assume_canonical, goldilocks_mul_mod_p_from_byte_vars_assume_canonical,
+    goldilocks_sub_mod_p_from_byte_vars_assume_canonical,
+    goldilocks_add_mod_p_digits, goldilocks_mul_mod_p_digits, goldilocks_sub_mod_p_digits, goldilocks_scalar_from_u64_bytes_le_digits,
+    ring_mul_negacyclic_ntt_goldilocks_d64, GoldilocksScalar,
 };
 
-/// A ring element whose coefficients are Frog base-field scalars encoded as canonical 8-byte little-endian limbs.
+/// A ring element whose coefficients are Goldilocks base-field scalars encoded as canonical 8-byte little-endian limbs.
 ///
 /// - Length = ring dimension `d` (one coefficient per ring coefficient).
 /// - Each coefficient is `[u8; 8]` represented as 8 F257 vars in `[0,255]`, and is constrained elsewhere to be `< p`.
 pub(crate) type RingBytes = Vec<[usize; 8]>;
 
-/// A ring element whose coefficients are Frog base-field scalars encoded as balanced base-16 digits.
+/// A ring element whose coefficients are Goldilocks base-field scalars encoded as balanced base-16 digits.
 ///
 /// - Length = ring dimension `d` (one coefficient per ring coefficient).
-/// - Each coefficient is a canonical Frog scalar `[usize; 17]` (bal16 digits).
-pub(crate) type RingDigits = Vec<FrogScalar>;
+/// - Each coefficient is a canonical Goldilocks scalar `[usize; 17]` (bal16 digits).
+pub(crate) type RingDigits = Vec<GoldilocksScalar>;
 
 #[inline]
 fn alloc_const_byte(gb: &mut Dr1csBuilder<F257>, v: u8) -> usize {
@@ -30,7 +30,7 @@ fn alloc_const_byte(gb: &mut Dr1csBuilder<F257>, v: u8) -> usize {
 }
 
 #[inline]
-pub(crate) fn alloc_const_frog_u64(gb: &mut Dr1csBuilder<F257>, v: u64) -> [usize; 8] {
+pub(crate) fn alloc_const_goldilocks_u64(gb: &mut Dr1csBuilder<F257>, v: u64) -> [usize; 8] {
     let bs = v.to_le_bytes();
     let mut out = [0usize; 8];
     for i in 0..8 {
@@ -41,7 +41,7 @@ pub(crate) fn alloc_const_frog_u64(gb: &mut Dr1csBuilder<F257>, v: u64) -> [usiz
 
 #[inline]
 pub(crate) fn ring_zero_bytes(gb: &mut Dr1csBuilder<F257>, d: usize) -> RingBytes {
-    let z = alloc_const_frog_u64(gb, 0u64);
+    let z = alloc_const_goldilocks_u64(gb, 0u64);
     vec![z; d]
 }
 
@@ -62,7 +62,7 @@ pub(crate) fn ring_add_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, b: &Rin
     debug_assert_eq!(a.len(), b.len());
     let mut out = Vec::with_capacity(a.len());
     for i in 0..a.len() {
-        out.push(frog_add_mod_p_from_byte_vars_assume_canonical(gb, &a[i], &b[i]));
+        out.push(goldilocks_add_mod_p_from_byte_vars_assume_canonical(gb, &a[i], &b[i]));
     }
     out
 }
@@ -73,7 +73,7 @@ pub(crate) fn ring_sub_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, b: &Rin
     debug_assert_eq!(a.len(), b.len());
     let mut out = Vec::with_capacity(a.len());
     for i in 0..a.len() {
-        out.push(frog_sub_mod_p_from_byte_vars_assume_canonical(gb, &a[i], &b[i]));
+        out.push(goldilocks_sub_mod_p_from_byte_vars_assume_canonical(gb, &a[i], &b[i]));
     }
     out
 }
@@ -86,7 +86,7 @@ pub(crate) fn ring_scale_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, s: &[
     tiny_cm_bump(|c| c.ring_scale += 1);
     let mut out = Vec::with_capacity(a.len());
     for i in 0..a.len() {
-        out.push(frog_mul_mod_p_from_byte_vars_assume_canonical(gb, &a[i], s));
+        out.push(goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, &a[i], s));
     }
     out
 }
@@ -94,8 +94,8 @@ pub(crate) fn ring_scale_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, s: &[
 /// Compute Lagrange basis coefficients (L0,L1,L2) for interpolation of degree-2 sumcheck message
 /// polynomials at points 0,1,2 evaluated at `r`.
 ///
-/// This mirrors `we_gate_arith::lagrange_degree2` but over Frog base field, with byte encodings.
-pub(crate) fn lagrange_degree2_frog(
+/// This mirrors `we_gate_arith::lagrange_degree2` but over Goldilocks base field, with byte encodings.
+pub(crate) fn lagrange_degree2_goldilocks(
     gb: &mut Dr1csBuilder<F257>,
     r: &[usize; 8],
     inv2: &[usize; 8],
@@ -106,21 +106,21 @@ pub(crate) fn lagrange_degree2_frog(
     // Here we count the higher-level helper call once.
     tiny_cm_bump(|c| c.scalar_sub_const += 0);
     // t1 = r - 1, t2 = r - 2
-    let t1 = frog_sub_mod_p_from_byte_vars_assume_canonical(gb, r, one);
-    let t2 = frog_sub_mod_p_from_byte_vars_assume_canonical(gb, r, two);
+    let t1 = goldilocks_sub_mod_p_from_byte_vars_assume_canonical(gb, r, one);
+    let t2 = goldilocks_sub_mod_p_from_byte_vars_assume_canonical(gb, r, two);
 
     // L0 = (r-1)(r-2)/2
-    let p = frog_mul_mod_p_from_byte_vars_assume_canonical(gb, &t1, &t2);
-    let l0 = frog_mul_mod_p_from_byte_vars_assume_canonical(gb, &p, inv2);
+    let p = goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, &t1, &t2);
+    let l0 = goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, &p, inv2);
 
     // L1 = -r(r-2) = 0 - r(r-2)
-    let p = frog_mul_mod_p_from_byte_vars_assume_canonical(gb, r, &t2);
-    let zero = alloc_const_frog_u64(gb, 0u64);
-    let l1 = frog_sub_mod_p_from_byte_vars_assume_canonical(gb, &zero, &p);
+    let p = goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, r, &t2);
+    let zero = alloc_const_goldilocks_u64(gb, 0u64);
+    let l1 = goldilocks_sub_mod_p_from_byte_vars_assume_canonical(gb, &zero, &p);
 
     // L2 = r(r-1)/2
-    let p = frog_mul_mod_p_from_byte_vars_assume_canonical(gb, r, &t1);
-    let l2 = frog_mul_mod_p_from_byte_vars_assume_canonical(gb, &p, inv2);
+    let p = goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, r, &t1);
+    let l2 = goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, &p, inv2);
 
     (l0, l1, l2)
 }
@@ -141,14 +141,14 @@ pub(crate) fn sumcheck_verify_degree2_ring_bytes(
     }
     let d = claimed_sum.len();
 
-    // Constants in Frog field.
+    // Constants in Goldilocks field.
     // inv2 is computed in host here as a fixed u64 constant; encoded as bytes.
     // (Caller can reuse these across calls later.)
-    let one = alloc_const_frog_u64(gb, 1u64);
-    let two = alloc_const_frog_u64(gb, 2u64);
+    let one = alloc_const_goldilocks_u64(gb, 1u64);
+    let two = alloc_const_goldilocks_u64(gb, 2u64);
     // inv2 mod p (p is odd): (p+1)/2
-    let inv2_u64 = (crate::we_frog_poseidon_f257::FROG_P + 1) / 2;
-    let inv2 = alloc_const_frog_u64(gb, inv2_u64);
+    let inv2_u64 = (crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P + 1) / 2;
+    let inv2 = alloc_const_goldilocks_u64(gb, inv2_u64);
 
     for (m, r) in msgs.iter().zip(rs.iter()) {
         if m[0].len() != d || m[1].len() != d || m[2].len() != d {
@@ -160,7 +160,7 @@ pub(crate) fn sumcheck_verify_degree2_ring_bytes(
         ring_eq_bytes(gb, &g01, &claimed_sum);
 
         // Update claim = g(r) via Lagrange interpolation.
-        let (l0, l1, l2) = lagrange_degree2_frog(gb, r, &inv2, &one, &two);
+        let (l0, l1, l2) = lagrange_degree2_goldilocks(gb, r, &inv2, &one, &two);
         let t0 = ring_scale_bytes(gb, &m[0], &l0);
         let t1 = ring_scale_bytes(gb, &m[1], &l1);
         let t2 = ring_scale_bytes(gb, &m[2], &l2);
@@ -175,20 +175,20 @@ pub(crate) fn sumcheck_verify_degree2_ring_bytes(
 // -----------------------------------------------------------------------------
 
 #[inline]
-pub(crate) fn frog_bytes_to_digits(gb: &mut Dr1csBuilder<F257>, bytes_le: [usize; 8]) -> FrogScalar {
-    frogscalar_from_u64_bytes_le_digits(gb, bytes_le)
+pub(crate) fn goldilocks_bytes_to_digits(gb: &mut Dr1csBuilder<F257>, bytes_le: [usize; 8]) -> GoldilocksScalar {
+    goldilocks_scalar_from_u64_bytes_le_digits(gb, bytes_le)
 }
 
 #[inline]
 pub(crate) fn ring_bytes_to_digits(gb: &mut Dr1csBuilder<F257>, a: &RingBytes) -> RingDigits {
     tiny_cm_bump(|c| c.lc_to_var += 1);
-    a.iter().copied().map(|x| frog_bytes_to_digits(gb, x)).collect()
+    a.iter().copied().map(|x| goldilocks_bytes_to_digits(gb, x)).collect()
 }
 
 #[inline]
 pub(crate) fn ring_zero_digits(gb: &mut Dr1csBuilder<F257>, d: usize) -> RingDigits {
-    let z_bytes = alloc_const_frog_u64(gb, 0u64);
-    let z = frog_bytes_to_digits(gb, z_bytes);
+    let z_bytes = alloc_const_goldilocks_u64(gb, 0u64);
+    let z = goldilocks_bytes_to_digits(gb, z_bytes);
     vec![z; d]
 }
 
@@ -207,20 +207,20 @@ pub(crate) fn ring_eq_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &Ri
 pub(crate) fn ring_add_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &RingDigits) -> RingDigits {
     tiny_cm_bump(|c| c.ring_add += 1);
     debug_assert_eq!(a.len(), b.len());
-    a.iter().zip(b.iter()).map(|(ai, bi)| frog_add_mod_p_digits(gb, ai, bi)).collect()
+    a.iter().zip(b.iter()).map(|(ai, bi)| goldilocks_add_mod_p_digits(gb, ai, bi)).collect()
 }
 
 #[inline]
 pub(crate) fn ring_sub_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &RingDigits) -> RingDigits {
     tiny_cm_bump(|c| c.ring_sub += 1);
     debug_assert_eq!(a.len(), b.len());
-    a.iter().zip(b.iter()).map(|(ai, bi)| frog_sub_mod_p_digits(gb, ai, bi)).collect()
+    a.iter().zip(b.iter()).map(|(ai, bi)| goldilocks_sub_mod_p_digits(gb, ai, bi)).collect()
 }
 
 #[inline]
-pub(crate) fn ring_scale_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, s: &FrogScalar) -> RingDigits {
+pub(crate) fn ring_scale_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, s: &GoldilocksScalar) -> RingDigits {
     tiny_cm_bump(|c| c.ring_scale += 1);
-    a.iter().map(|ai| frog_mul_mod_p_digits(gb, ai, s)).collect()
+    a.iter().map(|ai| goldilocks_mul_mod_p_digits(gb, ai, s)).collect()
 }
 
 /// Negacyclic ring multiplication for ring_dim=64 over Goldilocks (digit-domain).
@@ -233,37 +233,37 @@ pub(crate) fn ring_mul_negacyclic_digits_d64(
     if a.len() != 64 || b.len() != 64 {
         return Err("ring_mul_negacyclic_digits_d64: expected ring_dim=64".to_string());
     }
-    let aa: [FrogScalar; 64] = core::array::from_fn(|i| a[i]);
-    let bb: [FrogScalar; 64] = core::array::from_fn(|i| b[i]);
+    let aa: [GoldilocksScalar; 64] = core::array::from_fn(|i| a[i]);
+    let bb: [GoldilocksScalar; 64] = core::array::from_fn(|i| b[i]);
     let cc = ring_mul_negacyclic_ntt_goldilocks_d64(gb, &aa, &bb);
     Ok(cc.into_iter().collect())
 }
 
 /// Degree-2 Lagrange basis in digit encoding.
-pub(crate) fn lagrange_degree2_frog_digits(
+pub(crate) fn lagrange_degree2_goldilocks_digits(
     gb: &mut Dr1csBuilder<F257>,
-    r: &FrogScalar,
-    inv2: &FrogScalar,
-    one: &FrogScalar,
-    two: &FrogScalar,
-) -> (FrogScalar, FrogScalar, FrogScalar) {
+    r: &GoldilocksScalar,
+    inv2: &GoldilocksScalar,
+    one: &GoldilocksScalar,
+    two: &GoldilocksScalar,
+) -> (GoldilocksScalar, GoldilocksScalar, GoldilocksScalar) {
     // t1 = r - 1, t2 = r - 2
-    let t1 = frog_sub_mod_p_digits(gb, r, one);
-    let t2 = frog_sub_mod_p_digits(gb, r, two);
+    let t1 = goldilocks_sub_mod_p_digits(gb, r, one);
+    let t2 = goldilocks_sub_mod_p_digits(gb, r, two);
 
     // L0 = (r-1)(r-2)/2
-    let p = frog_mul_mod_p_digits(gb, &t1, &t2);
-    let l0 = frog_mul_mod_p_digits(gb, &p, inv2);
+    let p = goldilocks_mul_mod_p_digits(gb, &t1, &t2);
+    let l0 = goldilocks_mul_mod_p_digits(gb, &p, inv2);
 
     // L1 = -r(r-2)
-    let p = frog_mul_mod_p_digits(gb, r, &t2);
-    let zero_bytes = alloc_const_frog_u64(gb, 0u64);
-    let zero = frog_bytes_to_digits(gb, zero_bytes);
-    let l1 = frog_sub_mod_p_digits(gb, &zero, &p);
+    let p = goldilocks_mul_mod_p_digits(gb, r, &t2);
+    let zero_bytes = alloc_const_goldilocks_u64(gb, 0u64);
+    let zero = goldilocks_bytes_to_digits(gb, zero_bytes);
+    let l1 = goldilocks_sub_mod_p_digits(gb, &zero, &p);
 
     // L2 = r(r-1)/2
-    let p = frog_mul_mod_p_digits(gb, r, &t1);
-    let l2 = frog_mul_mod_p_digits(gb, &p, inv2);
+    let p = goldilocks_mul_mod_p_digits(gb, r, &t1);
+    let l2 = goldilocks_mul_mod_p_digits(gb, &p, inv2);
 
     (l0, l1, l2)
 }
@@ -273,20 +273,20 @@ pub(crate) fn sumcheck_verify_degree2_ring_digits(
     gb: &mut Dr1csBuilder<F257>,
     mut claimed_sum: RingDigits,
     msgs: &[[RingDigits; 3]],
-    rs: &[FrogScalar],
+    rs: &[GoldilocksScalar],
 ) -> Result<RingDigits, String> {
     if msgs.len() != rs.len() {
         return Err("sumcheck_verify_degree2_ring_digits: msgs/rs length mismatch".to_string());
     }
     let d = claimed_sum.len();
 
-    let one_bytes = alloc_const_frog_u64(gb, 1u64);
-    let two_bytes = alloc_const_frog_u64(gb, 2u64);
-    let one = frog_bytes_to_digits(gb, one_bytes);
-    let two = frog_bytes_to_digits(gb, two_bytes);
-    let inv2_u64 = (crate::we_frog_poseidon_f257::FROG_P + 1) / 2;
-    let inv2_bytes = alloc_const_frog_u64(gb, inv2_u64);
-    let inv2 = frog_bytes_to_digits(gb, inv2_bytes);
+    let one_bytes = alloc_const_goldilocks_u64(gb, 1u64);
+    let two_bytes = alloc_const_goldilocks_u64(gb, 2u64);
+    let one = goldilocks_bytes_to_digits(gb, one_bytes);
+    let two = goldilocks_bytes_to_digits(gb, two_bytes);
+    let inv2_u64 = (crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P + 1) / 2;
+    let inv2_bytes = alloc_const_goldilocks_u64(gb, inv2_u64);
+    let inv2 = goldilocks_bytes_to_digits(gb, inv2_bytes);
 
     for (m, r) in msgs.iter().zip(rs.iter()) {
         if m[0].len() != d || m[1].len() != d || m[2].len() != d {
@@ -298,7 +298,7 @@ pub(crate) fn sumcheck_verify_degree2_ring_digits(
         ring_eq_digits(gb, &g01, &claimed_sum);
 
         // claim = g(r)
-        let (l0, l1, l2) = lagrange_degree2_frog_digits(gb, r, &inv2, &one, &two);
+        let (l0, l1, l2) = lagrange_degree2_goldilocks_digits(gb, r, &inv2, &one, &two);
         let t0 = ring_scale_digits(gb, &m[0], &l0);
         let t1 = ring_scale_digits(gb, &m[1], &l1);
         let t2 = ring_scale_digits(gb, &m[2], &l2);
@@ -314,28 +314,28 @@ pub(crate) fn sumcheck_verify_degree2_ring_digits(
 // -----------------------------------------------------------------------------
 
 #[inline]
-fn frog_const_u64_digits(gb: &mut Dr1csBuilder<F257>, v: u64) -> FrogScalar {
-    let bytes = alloc_const_frog_u64(gb, v);
-    frog_bytes_to_digits(gb, bytes)
+fn goldilocks_const_u64_digits(gb: &mut Dr1csBuilder<F257>, v: u64) -> GoldilocksScalar {
+    let bytes = alloc_const_goldilocks_u64(gb, v);
+    goldilocks_bytes_to_digits(gb, bytes)
 }
 
 #[inline]
-pub(crate) fn frog_one_minus_digits(gb: &mut Dr1csBuilder<F257>, r: &FrogScalar) -> FrogScalar {
-    let one = frog_const_u64_digits(gb, 1u64);
-    frog_sub_mod_p_digits(gb, &one, r)
+pub(crate) fn goldilocks_one_minus_digits(gb: &mut Dr1csBuilder<F257>, r: &GoldilocksScalar) -> GoldilocksScalar {
+    let one = goldilocks_const_u64_digits(gb, 1u64);
+    goldilocks_sub_mod_p_digits(gb, &one, r)
 }
 
 /// Tensor-expand a list of verifier challenges `c = [c0..c_{t-1}]` into length-2^t coefficients.
 ///
 /// Convention matches LF+/CM: for each bit, expand `acc` into `[acc*(1-c_i), acc*c_i]`.
-pub(crate) fn tensor_frog_scalars_digits(gb: &mut Dr1csBuilder<F257>, c: &[FrogScalar]) -> Vec<FrogScalar> {
-    let mut acc: Vec<FrogScalar> = vec![frog_const_u64_digits(gb, 1u64)];
+pub(crate) fn tensor_goldilocks_scalars_digits(gb: &mut Dr1csBuilder<F257>, c: &[GoldilocksScalar]) -> Vec<GoldilocksScalar> {
+    let mut acc: Vec<GoldilocksScalar> = vec![goldilocks_const_u64_digits(gb, 1u64)];
     for ci in c {
-        let one_minus = frog_one_minus_digits(gb, ci);
-        let mut next: Vec<FrogScalar> = Vec::with_capacity(acc.len() * 2);
+        let one_minus = goldilocks_one_minus_digits(gb, ci);
+        let mut next: Vec<GoldilocksScalar> = Vec::with_capacity(acc.len() * 2);
         for t in &acc {
-            next.push(frog_mul_mod_p_digits(gb, t, &one_minus));
-            next.push(frog_mul_mod_p_digits(gb, t, ci));
+            next.push(goldilocks_mul_mod_p_digits(gb, t, &one_minus));
+            next.push(goldilocks_mul_mod_p_digits(gb, t, ci));
         }
         acc = next;
     }
@@ -343,9 +343,9 @@ pub(crate) fn tensor_frog_scalars_digits(gb: &mut Dr1csBuilder<F257>, c: &[FrogS
 }
 
 /// Lift a tensor-expanded scalar table into constant-coeff ring elements.
-pub(crate) fn tensor_frog_ringconst_digits(
+pub(crate) fn tensor_goldilocks_ringconst_digits(
     gb: &mut Dr1csBuilder<F257>,
-    tensor_scalars: &[FrogScalar],
+    tensor_scalars: &[GoldilocksScalar],
     ring_dim: usize,
 ) -> Vec<RingDigits> {
     tensor_scalars
@@ -364,7 +364,7 @@ pub(crate) fn tensor_frog_ringconst_digits(
 /// and the evaluated ring element is \(\sum_i w_i x^i\), i.e. coefficient `i` equals `w_i`.
 pub(crate) fn eval_x_powers_basis_mle_ring_digits(
     gb: &mut Dr1csBuilder<F257>,
-    r4: &[FrogScalar],
+    r4: &[GoldilocksScalar],
     ring_dim: usize,
 ) -> Result<RingDigits, String> {
     if ring_dim == 0 || !ring_dim.is_power_of_two() {
@@ -373,58 +373,58 @@ pub(crate) fn eval_x_powers_basis_mle_ring_digits(
     if (1usize << r4.len()) != ring_dim {
         return Err("eval_x_powers_basis_mle_ring_digits: r4 length mismatch".to_string());
     }
-    // weights length = ring_dim; each weight is a Frog scalar in digit encoding.
-    let weights = tensor_frog_scalars_digits(gb, r4);
+    // weights length = ring_dim; each weight is a Goldilocks scalar in digit encoding.
+    let weights = tensor_goldilocks_scalars_digits(gb, r4);
     debug_assert_eq!(weights.len(), ring_dim);
     // Interpret weights as the ring coefficients.
     Ok(weights)
 }
 
-/// Compute powers \([1, x, x^2, ..., x^n]\) in Frog scalar digit encoding.
-pub(crate) fn frog_pow_table_digits(
+/// Compute powers \([1, x, x^2, ..., x^n]\) in Goldilocks scalar digit encoding.
+pub(crate) fn goldilocks_pow_table_digits(
     gb: &mut Dr1csBuilder<F257>,
-    x: &FrogScalar,
+    x: &GoldilocksScalar,
     n: usize,
-) -> Vec<FrogScalar> {
+) -> Vec<GoldilocksScalar> {
     tiny_cm_bump(|c| c.scalar_pow_table += 1);
-    let mut out: Vec<FrogScalar> = Vec::with_capacity(n + 1);
-    let mut acc = frog_const_u64_digits(gb, 1u64);
+    let mut out: Vec<GoldilocksScalar> = Vec::with_capacity(n + 1);
+    let mut acc = goldilocks_const_u64_digits(gb, 1u64);
     out.push(acc);
     for _ in 0..n {
-        acc = frog_mul_mod_p_digits(gb, &acc, x);
+        acc = goldilocks_mul_mod_p_digits(gb, &acc, x);
         out.push(acc);
     }
     out
 }
 
-/// Evaluate the multilinear equality polynomial `eq(c, r)` over Frog scalars (digit encoding).
+/// Evaluate the multilinear equality polynomial `eq(c, r)` over Goldilocks scalars (digit encoding).
 ///
-/// This matches `we_gate_arith::eq_eval_vars` but over the Frog base field:
+/// This matches `we_gate_arith::eq_eval_vars` but over the Goldilocks base field:
 /// \(\prod_i (c_i r_i + (1-c_i)(1-r_i))\).
-pub(crate) fn eq_eval_frog_digits(
+pub(crate) fn eq_eval_goldilocks_digits(
     gb: &mut Dr1csBuilder<F257>,
-    c: &[FrogScalar],
-    r: &[FrogScalar],
-) -> Result<FrogScalar, String> {
+    c: &[GoldilocksScalar],
+    r: &[GoldilocksScalar],
+) -> Result<GoldilocksScalar, String> {
     if c.len() != r.len() {
-        return Err("eq_eval_frog_digits: length mismatch".to_string());
+        return Err("eq_eval_goldilocks_digits: length mismatch".to_string());
     }
     tiny_cm_bump(|cc| cc.eq_eval_vars += c.len() as u64);
-    let mut acc = frog_const_u64_digits(gb, 1u64);
+    let mut acc = goldilocks_const_u64_digits(gb, 1u64);
     for (ci, ri) in c.iter().zip(r.iter()) {
-        let one_minus_ci = frog_one_minus_digits(gb, ci);
-        let one_minus_ri = frog_one_minus_digits(gb, ri);
-        let ci_ri = frog_mul_mod_p_digits(gb, ci, ri);
-        let om = frog_mul_mod_p_digits(gb, &one_minus_ci, &one_minus_ri);
-        let t = frog_add_mod_p_digits(gb, &ci_ri, &om);
-        acc = frog_mul_mod_p_digits(gb, &acc, &t);
+        let one_minus_ci = goldilocks_one_minus_digits(gb, ci);
+        let one_minus_ri = goldilocks_one_minus_digits(gb, ri);
+        let ci_ri = goldilocks_mul_mod_p_digits(gb, ci, ri);
+        let om = goldilocks_mul_mod_p_digits(gb, &one_minus_ci, &one_minus_ri);
+        let t = goldilocks_add_mod_p_digits(gb, &ci_ri, &om);
+        acc = goldilocks_mul_mod_p_digits(gb, &acc, &t);
     }
     Ok(acc)
 }
 
 #[inline]
-pub(crate) fn ring_const_coeff_digits(gb: &mut Dr1csBuilder<F257>, c0: &FrogScalar, d: usize) -> RingDigits {
-    let z = frog_const_u64_digits(gb, 0u64);
+pub(crate) fn ring_const_coeff_digits(gb: &mut Dr1csBuilder<F257>, c0: &GoldilocksScalar, d: usize) -> RingDigits {
+    let z = goldilocks_const_u64_digits(gb, 0u64);
     let mut out = vec![z; d];
     if d > 0 {
         out[0] = *c0;
@@ -434,8 +434,8 @@ pub(crate) fn ring_const_coeff_digits(gb: &mut Dr1csBuilder<F257>, c0: &FrogScal
 
 #[inline]
 pub(crate) fn ring_unit_monomial_digits(gb: &mut Dr1csBuilder<F257>, idx: usize, d: usize) -> RingDigits {
-    let z = frog_const_u64_digits(gb, 0u64);
-    let one = frog_const_u64_digits(gb, 1u64);
+    let z = goldilocks_const_u64_digits(gb, 0u64);
+    let one = goldilocks_const_u64_digits(gb, 1u64);
     let mut out = vec![z; d];
     if idx < d {
         out[idx] = one;
@@ -449,7 +449,7 @@ pub(crate) fn ring_unit_monomial_digits(gb: &mut Dr1csBuilder<F257>, idx: usize,
 pub(crate) fn eval_small_mle_ring_digits(
     gb: &mut Dr1csBuilder<F257>,
     table: &[RingDigits],
-    r: &[FrogScalar],
+    r: &[GoldilocksScalar],
 ) -> RingDigits {
     debug_assert!(!table.is_empty());
     debug_assert!(table.len().is_power_of_two());
@@ -491,7 +491,7 @@ pub(crate) fn eval_t_z_optimized_ring_digits(
     s_prime_flat: &[RingDigits],
     dpp: &[RingDigits],
     ring_dim: usize,
-    r: &[FrogScalar],
+    r: &[GoldilocksScalar],
 ) -> Result<RingDigits, String> {
     let sizes = [ring_dim, dpp.len(), s_prime_flat.len(), tensor_c_ring.len()];
     if sizes.iter().any(|&s| s == 0 || !s.is_power_of_two()) {
@@ -520,10 +520,10 @@ pub(crate) fn eval_t_z_optimized_ring_digits(
     res = ring_mul_negacyclic_digits_d64(gb, &res, &v4)?;
 
     // Padding factor: Π_{j=tensor_vars..} (1 - r[j]) as scalar.
-    let mut pad = frog_const_u64_digits(gb, 1u64);
+    let mut pad = goldilocks_const_u64_digits(gb, 1u64);
     for rj in &r[tensor_vars..] {
-        let om = frog_one_minus_digits(gb, rj);
-        pad = frog_mul_mod_p_digits(gb, &pad, &om);
+        let om = goldilocks_one_minus_digits(gb, rj);
+        pad = goldilocks_mul_mod_p_digits(gb, &pad, &om);
     }
     Ok(ring_scale_digits(gb, &res, &pad))
 }
@@ -542,7 +542,7 @@ pub(crate) fn eval_t_z_optimized_ring_digits_pair(
     s_prime_flat: &[RingDigits],
     dpp: &[RingDigits],
     ring_dim: usize,
-    r: &[FrogScalar],
+    r: &[GoldilocksScalar],
 ) -> Result<(RingDigits, RingDigits), String> {
     let sizes = [ring_dim, dpp.len(), s_prime_flat.len(), tensor_c0_ring.len(), tensor_c1_ring.len()];
     if sizes.iter().any(|&s| s == 0 || !s.is_power_of_two()) {
@@ -577,10 +577,10 @@ pub(crate) fn eval_t_z_optimized_ring_digits_pair(
     let mut res1 = ring_mul_negacyclic_digits_d64(gb, &v11, &u)?;
 
     // Shared padding factor.
-    let mut pad = frog_const_u64_digits(gb, 1u64);
+    let mut pad = goldilocks_const_u64_digits(gb, 1u64);
     for rj in &r[tensor_vars..] {
-        let om = frog_one_minus_digits(gb, rj);
-        pad = frog_mul_mod_p_digits(gb, &pad, &om);
+        let om = goldilocks_one_minus_digits(gb, rj);
+        pad = goldilocks_mul_mod_p_digits(gb, &pad, &om);
     }
     res0 = ring_scale_digits(gb, &res0, &pad);
     res1 = ring_scale_digits(gb, &res1, &pad);

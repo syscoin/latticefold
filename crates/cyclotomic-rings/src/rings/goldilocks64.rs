@@ -18,7 +18,6 @@ use crate::{
 /// Goldilocks ring wrapper with **dimension 64** (coefficient representation).
 ///
 /// This is \( \mathbb{F}_{\text{Goldilocks}}[X]/(X^{64}+1) \) in coefficient form.
-/// It is intended to be the drop-in analogue of `FrogRing64`, but over the true
 /// Goldilocks prime \(p = 2^{64} - 2^{32} + 1\).
 ///
 /// NOTE: This type stores elements in *coefficient form* (not CRT/NTT form). For performance,
@@ -535,8 +534,6 @@ impl Decompose for GoldilocksRing64 {
 #[derive(Clone)]
 pub struct Goldilocks64ChallengeSet;
 
-// Keep the same "[-128, 128)" short-challenge shape as `FrogRing64` to make it easy to
-// swap rings without touching higher-level protocol settings (k, bounds, etc.).
 impl LatticefoldChallengeSet<GoldilocksRing64> for Goldilocks64ChallengeSet {
     const BYTES_NEEDED: usize = 64;
 

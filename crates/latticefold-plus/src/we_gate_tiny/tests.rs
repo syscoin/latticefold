@@ -5,21 +5,21 @@ use latticefold::transcript::poseidon::F257;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 use symphony::transcript::PoseidonTraceOp;
 
-use crate::we_frog_poseidon_f257::FROG_P;
+use crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
 use crate::we_gate_tiny::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U32, LIMBS_U64};
 
 use super::challenges::bounded_u32_from_8_digits_base128;
 use super::digits::*;
-use super::frog::{
-    frog_add_mod_p_from_byte_vars, frog_mul_mod_p_from_byte_vars, frog_sub_mod_p_from_byte_vars,
-    frog_mul_const_mod_p_from_byte_vars, frog_u64_enforce_lt_p_from_byte_vars_and_limbs,
-    reduce_u64_mod_frog_from_byte_vars,
+use super::goldilocks::{
+    goldilocks_add_mod_p_from_byte_vars, goldilocks_mul_mod_p_from_byte_vars, goldilocks_sub_mod_p_from_byte_vars,
+    goldilocks_mul_const_mod_p_from_byte_vars, goldilocks_u64_enforce_lt_p_from_byte_vars_and_limbs,
+    reduce_u64_mod_goldilocks_from_byte_vars,
     ring_mul_negacyclic_karatsuba_d64, ring_mul_negacyclic_toom4_d64,
 };
 use super::gadgets::alloc_byte;
 
 use latticefold::transcript::Transcript;
-use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as FrogRing;
+use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as GoldilocksRing;
 
 fn var_to_u8<F: PrimeField>(b: &Dr1csBuilder<F>, v: usize) -> u8 {
     b.assignment[v]
@@ -67,8 +67,8 @@ fn test_poseidon_f257_ops_arithmetization_satisfies() {
     // IMPORTANT: we must not use `crate::recording_transcript::TracePoseidonTranscript`,
     // which lifts F257 digits into the outer base ring. For a tiny-field gate we want the
     // transcript ops directly over F257.
-    let mut tr = symphony::transcript::TracePoseidonTranscript::<FrogRing>::empty::<()>();
-    tr.absorb_field_element(&<FrogRing as stark_rings::PolyRing>::BaseRing::from(123u64));
+    let mut tr = symphony::transcript::TracePoseidonTranscript::<GoldilocksRing>::empty::<()>();
+    tr.absorb_field_element(&<GoldilocksRing as stark_rings::PolyRing>::BaseRing::from(123u64));
     let _c = tr.get_challenge(); // SqueezeField(8) + Absorb(8)
     let _b = tr.squeeze_bytes(17); // SqueezeBytes(17) (no reabsorb)
 
@@ -80,7 +80,7 @@ fn test_poseidon_f257_ops_arithmetization_satisfies() {
 }
 
 #[test]
-fn test_reduce_u64_mod_frog_branch_u_lt_p() {
+fn test_reduce_u64_mod_goldilocks_branch_u_lt_p() {
     let mut b = Dr1csBuilder::<F257>::new();
     b.enforce_var_eq_const(b.one(), F257::ONE);
 
@@ -90,7 +90,7 @@ fn test_reduce_u64_mod_frog_branch_u_lt_p() {
         let bv = alloc_byte::<F257>(&mut b, v);
         u_byte_vars[i] = bv.byte;
     }
-    let (q, z) = reduce_u64_mod_frog_from_byte_vars::<F257>(&mut b, &u_byte_vars);
+    let (q, z) = reduce_u64_mod_goldilocks_from_byte_vars::<F257>(&mut b, &u_byte_vars);
 
     // q should be 0, z == u.
     assert_eq!(var_to_u8::<F257>(&b, q), 0);
@@ -101,38 +101,38 @@ fn test_reduce_u64_mod_frog_branch_u_lt_p() {
 }
 
 #[test]
-fn test_reduce_u64_mod_frog_branch_u_ge_p() {
+fn test_reduce_u64_mod_goldilocks_branch_u_ge_p() {
     let mut b = Dr1csBuilder::<F257>::new();
     b.enforce_var_eq_const(b.one(), F257::ONE);
 
-    let u = FROG_P + 424242u64;
+    let u = GOLDILOCKS_P + 424242u64;
     let mut u_byte_vars = [0usize; 8];
     for (i, v) in u.to_le_bytes().into_iter().enumerate() {
         let bv = alloc_byte::<F257>(&mut b, v);
         u_byte_vars[i] = bv.byte;
     }
-    let (q, z) = reduce_u64_mod_frog_from_byte_vars::<F257>(&mut b, &u_byte_vars);
+    let (q, z) = reduce_u64_mod_goldilocks_from_byte_vars::<F257>(&mut b, &u_byte_vars);
 
     // q should be 1, z == u - p.
     assert_eq!(var_to_u8::<F257>(&b, q), 1);
-    assert_eq!(limbs_to_u64_base128::<F257>(&b, &z), u - FROG_P);
+    assert_eq!(limbs_to_u64_base128::<F257>(&b, &z), u - GOLDILOCKS_P);
 
     let (inst, asg) = b.into_instance();
     inst.check(&asg).expect("branch u>=p satisfied");
 }
 
 #[test]
-fn test_reduce_u64_mod_frog_rejects_wrong_q() {
+fn test_reduce_u64_mod_goldilocks_rejects_wrong_q() {
     let mut b = Dr1csBuilder::<F257>::new();
     b.enforce_var_eq_const(b.one(), F257::ONE);
 
-    let u = FROG_P + 7u64;
+    let u = GOLDILOCKS_P + 7u64;
     let mut u_byte_vars = [0usize; 8];
     for (i, v) in u.to_le_bytes().into_iter().enumerate() {
         let bv = alloc_byte::<F257>(&mut b, v);
         u_byte_vars[i] = bv.byte;
     }
-    let (q, _z) = reduce_u64_mod_frog_from_byte_vars::<F257>(&mut b, &u_byte_vars);
+    let (q, _z) = reduce_u64_mod_goldilocks_from_byte_vars::<F257>(&mut b, &u_byte_vars);
 
     let (inst, mut asg) = b.into_instance();
     // Flip q (should be 1 -> set to 0) without adjusting anything else.
@@ -141,43 +141,43 @@ fn test_reduce_u64_mod_frog_rejects_wrong_q() {
 }
 
 #[test]
-fn test_frog_u64_canonical_from_bytes_accepts_lt_p_and_rejects_ge_p() {
-    // For transcript-absorbed base-field elements we expect canonical encoding u < p_frog.
+fn test_goldilocks_u64_canonical_from_bytes_accepts_lt_p_and_rejects_ge_p() {
+    // For transcript-absorbed base-field elements we expect canonical encoding u < p_goldilocks.
     let mut b = Dr1csBuilder::<F257>::new();
     b.enforce_var_eq_const(b.one(), F257::ONE);
 
     // u < p should satisfy q=0.
-    let u_good = (FROG_P / 2) + 7u64;
+    let u_good = (GOLDILOCKS_P / 2) + 7u64;
     let mut u_byte_vars = [0usize; 8];
     for (i, v) in u_good.to_le_bytes().into_iter().enumerate() {
         let bv = alloc_byte::<F257>(&mut b, v);
         u_byte_vars[i] = bv.byte;
     }
-    let _z = frog_u64_enforce_lt_p_from_byte_vars_and_limbs::<F257>(&mut b, &u_byte_vars);
+    let _z = goldilocks_u64_enforce_lt_p_from_byte_vars_and_limbs::<F257>(&mut b, &u_byte_vars);
 
     // u >= p should fail due to enforced q==0.
-    let u_bad = FROG_P + 9u64;
+    let u_bad = GOLDILOCKS_P + 9u64;
     let mut v_byte_vars = [0usize; 8];
     for (i, v) in u_bad.to_le_bytes().into_iter().enumerate() {
         let bv = alloc_byte::<F257>(&mut b, v);
         v_byte_vars[i] = bv.byte;
     }
-    let _z2 = frog_u64_enforce_lt_p_from_byte_vars_and_limbs::<F257>(&mut b, &v_byte_vars);
+    let _z2 = goldilocks_u64_enforce_lt_p_from_byte_vars_and_limbs::<F257>(&mut b, &v_byte_vars);
 
     let (inst, asg) = b.into_instance();
     assert!(inst.check(&asg).is_err(), "u>=p should violate canonical constraint");
 }
 
 #[test]
-fn test_frog_mul_mod_p_from_bytes_matches_native() {
+fn test_goldilocks_mul_mod_p_from_bytes_matches_native() {
     use rand::{RngCore, SeedableRng};
     let mut rng = rand::rngs::StdRng::seed_from_u64(1234567);
 
     for _ in 0..20 {
         // Sample canonical a,b < p.
-        let a = (rng.next_u64() % FROG_P);
-        let b_u = (rng.next_u64() % FROG_P);
-        let exp = ((a as u128) * (b_u as u128) % (FROG_P as u128)) as u64;
+        let a = (rng.next_u64() % GOLDILOCKS_P);
+        let b_u = (rng.next_u64() % GOLDILOCKS_P);
+        let exp = ((a as u128) * (b_u as u128) % (GOLDILOCKS_P as u128)) as u64;
 
         let mut b = Dr1csBuilder::<F257>::new();
         b.enforce_var_eq_const(b.one(), F257::ONE);
@@ -190,7 +190,7 @@ fn test_frog_mul_mod_p_from_bytes_matches_native() {
             b_bytes[i] = alloc_byte::<F257>(&mut b, v).byte;
         }
 
-        let r_bytes = frog_mul_mod_p_from_byte_vars(&mut b, &a_bytes, &b_bytes);
+        let r_bytes = goldilocks_mul_mod_p_from_byte_vars(&mut b, &a_bytes, &b_bytes);
         let mut out = [0u8; 8];
         for i in 0..8 {
             out[i] = var_to_u8::<F257>(&b, r_bytes[i]);
@@ -204,15 +204,15 @@ fn test_frog_mul_mod_p_from_bytes_matches_native() {
 }
 
 #[test]
-fn test_frog_add_sub_mod_p_from_bytes_matches_native() {
+fn test_goldilocks_add_sub_mod_p_from_bytes_matches_native() {
     use rand::{RngCore, SeedableRng};
     let mut rng = rand::rngs::StdRng::seed_from_u64(222333444);
 
     for _ in 0..20 {
-        let a = rng.next_u64() % FROG_P;
-        let c = rng.next_u64() % FROG_P;
-        let add_exp = ((a as u128 + c as u128) % (FROG_P as u128)) as u64;
-        let sub_exp = ((a as i128 - c as i128).rem_euclid(FROG_P as i128)) as u64;
+        let a = rng.next_u64() % GOLDILOCKS_P;
+        let c = rng.next_u64() % GOLDILOCKS_P;
+        let add_exp = ((a as u128 + c as u128) % (GOLDILOCKS_P as u128)) as u64;
+        let sub_exp = ((a as i128 - c as i128).rem_euclid(GOLDILOCKS_P as i128)) as u64;
 
         let mut b = Dr1csBuilder::<F257>::new();
         b.enforce_var_eq_const(b.one(), F257::ONE);
@@ -225,8 +225,8 @@ fn test_frog_add_sub_mod_p_from_bytes_matches_native() {
             c_bytes[i] = alloc_byte::<F257>(&mut b, v).byte;
         }
 
-        let add_r = frog_add_mod_p_from_byte_vars(&mut b, &a_bytes, &c_bytes);
-        let sub_r = frog_sub_mod_p_from_byte_vars(&mut b, &a_bytes, &c_bytes);
+        let add_r = goldilocks_add_mod_p_from_byte_vars(&mut b, &a_bytes, &c_bytes);
+        let sub_r = goldilocks_sub_mod_p_from_byte_vars(&mut b, &a_bytes, &c_bytes);
 
         let mut out_add = [0u8; 8];
         let mut out_sub = [0u8; 8];
@@ -243,14 +243,14 @@ fn test_frog_add_sub_mod_p_from_bytes_matches_native() {
 }
 
 #[test]
-fn test_frog_mul_const_mod_p_from_bytes_matches_native() {
+fn test_goldilocks_mul_const_mod_p_from_bytes_matches_native() {
     use rand::{RngCore, SeedableRng};
     let mut rng = rand::rngs::StdRng::seed_from_u64(999888777);
 
     for _ in 0..20 {
-        let x = rng.next_u64() % FROG_P;
-        let c = rng.next_u64() % FROG_P;
-        let exp = ((x as u128) * (c as u128) % (FROG_P as u128)) as u64;
+        let x = rng.next_u64() % GOLDILOCKS_P;
+        let c = rng.next_u64() % GOLDILOCKS_P;
+        let exp = ((x as u128) * (c as u128) % (GOLDILOCKS_P as u128)) as u64;
 
         let mut b = Dr1csBuilder::<F257>::new();
         b.enforce_var_eq_const(b.one(), F257::ONE);
@@ -259,7 +259,7 @@ fn test_frog_mul_const_mod_p_from_bytes_matches_native() {
             x_bytes[i] = alloc_byte::<F257>(&mut b, v).byte;
         }
 
-        let r_bytes = frog_mul_const_mod_p_from_byte_vars(&mut b, &x_bytes, c);
+        let r_bytes = goldilocks_mul_const_mod_p_from_byte_vars(&mut b, &x_bytes, c);
         let mut out = [0u8; 8];
         for i in 0..8 {
             out[i] = var_to_u8::<F257>(&b, r_bytes[i]);
@@ -279,8 +279,8 @@ fn test_ring_mul_negacyclic_toom4_d64_matches_native_one_case() {
     let mut a = [0u64; 64];
     let mut c = [0u64; 64];
     for i in 0..64 {
-        a[i] = rng.next_u64() % FROG_P;
-        c[i] = rng.next_u64() % FROG_P;
+        a[i] = rng.next_u64() % GOLDILOCKS_P;
+        c[i] = rng.next_u64() % GOLDILOCKS_P;
     }
 
     // Native expected.
@@ -288,7 +288,7 @@ fn test_ring_mul_negacyclic_toom4_d64_matches_native_one_case() {
     for i in 0..64 {
         for j in 0..64 {
             let idx = i + j;
-            let t = ((a[i] as u128) * (c[j] as u128) + (conv[idx] as u128)) % (FROG_P as u128);
+            let t = ((a[i] as u128) * (c[j] as u128) + (conv[idx] as u128)) % (GOLDILOCKS_P as u128);
             conv[idx] = t as u64;
         }
     }
@@ -296,7 +296,7 @@ fn test_ring_mul_negacyclic_toom4_d64_matches_native_one_case() {
     for k in 0..64 {
         let hi = k + 64;
         let v = if hi < 127 {
-            (conv[k] as i128 - conv[hi] as i128).rem_euclid(FROG_P as i128) as u64
+            (conv[k] as i128 - conv[hi] as i128).rem_euclid(GOLDILOCKS_P as i128) as u64
         } else {
             conv[k]
         };
@@ -318,11 +318,11 @@ fn test_ring_mul_negacyclic_toom4_d64_matches_native_one_case() {
     }
 
     // External boundary conversion: bytes -> canonical bal16 digits once.
-    let a_d: [super::frog::FrogScalar; 64] = core::array::from_fn(|i| {
+    let a_d: [super::goldilocks::GoldilocksScalar; 64] = core::array::from_fn(|i| {
         let v = u64_bytes_to_bal16_digits_cached(&mut b, a_bytes[i]);
         v.try_into().expect("u64 bytes -> 17 digits")
     });
-    let c_d: [super::frog::FrogScalar; 64] = core::array::from_fn(|i| {
+    let c_d: [super::goldilocks::GoldilocksScalar; 64] = core::array::from_fn(|i| {
         let v = u64_bytes_to_bal16_digits_cached(&mut b, c_bytes[i]);
         v.try_into().expect("u64 bytes -> 17 digits")
     });
@@ -362,8 +362,8 @@ fn test_ring_mul_negacyclic_karatsuba_d64_matches_native_one_case() {
     let mut a = [0u64; 64];
     let mut c = [0u64; 64];
     for i in 0..64 {
-        a[i] = rng.next_u64() % FROG_P;
-        c[i] = rng.next_u64() % FROG_P;
+        a[i] = rng.next_u64() % GOLDILOCKS_P;
+        c[i] = rng.next_u64() % GOLDILOCKS_P;
     }
 
     // Native expected.
@@ -371,7 +371,7 @@ fn test_ring_mul_negacyclic_karatsuba_d64_matches_native_one_case() {
     for i in 0..64 {
         for j in 0..64 {
             let idx = i + j;
-            let t = ((a[i] as u128) * (c[j] as u128) + (conv[idx] as u128)) % (FROG_P as u128);
+            let t = ((a[i] as u128) * (c[j] as u128) + (conv[idx] as u128)) % (GOLDILOCKS_P as u128);
             conv[idx] = t as u64;
         }
     }
@@ -379,7 +379,7 @@ fn test_ring_mul_negacyclic_karatsuba_d64_matches_native_one_case() {
     for k in 0..64 {
         let hi = k + 64;
         let v = if hi < 127 {
-            (conv[k] as i128 - conv[hi] as i128).rem_euclid(FROG_P as i128) as u64
+            (conv[k] as i128 - conv[hi] as i128).rem_euclid(GOLDILOCKS_P as i128) as u64
         } else {
             conv[k]
         };
@@ -400,11 +400,11 @@ fn test_ring_mul_negacyclic_karatsuba_d64_matches_native_one_case() {
         }
     }
 
-    let a_d: [super::frog::FrogScalar; 64] = core::array::from_fn(|i| {
+    let a_d: [super::goldilocks::GoldilocksScalar; 64] = core::array::from_fn(|i| {
         let v = u64_bytes_to_bal16_digits_cached(&mut b, a_bytes[i]);
         v.try_into().expect("u64 bytes -> 17 digits")
     });
-    let c_d: [super::frog::FrogScalar; 64] = core::array::from_fn(|i| {
+    let c_d: [super::goldilocks::GoldilocksScalar; 64] = core::array::from_fn(|i| {
         let v = u64_bytes_to_bal16_digits_cached(&mut b, c_bytes[i]);
         v.try_into().expect("u64 bytes -> 17 digits")
     });
@@ -438,7 +438,7 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
     use rand::{RngCore, SeedableRng};
     let mut rng = rand::rngs::StdRng::seed_from_u64(123456789);
 
-    let p = super::frog::GOLDILOCKS_P;
+    let p = super::goldilocks::GOLDILOCKS_P;
 
     let mut a = [0u64; 64];
     let mut c = [0u64; 64];
@@ -481,16 +481,16 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
         }
     }
 
-    let a_d: [super::frog::FrogScalar; 64] = core::array::from_fn(|i| {
+    let a_d: [super::goldilocks::GoldilocksScalar; 64] = core::array::from_fn(|i| {
         let v = u64_bytes_to_bal16_digits_cached(&mut b, a_bytes[i]);
         v.try_into().expect("u64 bytes -> 17 digits")
     });
-    let c_d: [super::frog::FrogScalar; 64] = core::array::from_fn(|i| {
+    let c_d: [super::goldilocks::GoldilocksScalar; 64] = core::array::from_fn(|i| {
         let v = u64_bytes_to_bal16_digits_cached(&mut b, c_bytes[i]);
         v.try_into().expect("u64 bytes -> 17 digits")
     });
 
-    let out = super::frog::ring_mul_negacyclic_ntt_goldilocks_d64(&mut b, &a_d, &c_d);
+    let out = super::goldilocks::ring_mul_negacyclic_ntt_goldilocks_d64(&mut b, &a_d, &c_d);
 
     for k in 0..64 {
         // Decode digits -> u64 in the host.

@@ -54,7 +54,7 @@ pub fn nvars_from_ncols_pow2(ncols: usize) -> Result<usize, String> {
     Ok(usize::BITS as usize - 1 - ncols.leading_zeros() as usize)
 }
 
-/// Default WE-gate parameters for SP1 BabyBear-in-Frog integration over an R1LF cache.
+/// Default WE-gate parameters for SP1 BabyBear-in-Goldilocks integration over an R1LF cache.
 ///
 /// This is the **canonical** parameterization we want statement-bound in the WE arithmetization:
 /// - boundedness digit base: `b = d' = d/2` (matches the monomial-based rgchk/setchk pipeline)
@@ -79,24 +79,24 @@ where
     let l_raw = (lnq / (d_prime as f64).ln()).ceil() as u64;
     let l = next_power_of_two(l_raw as usize) as u64;
 
-    // Production choice (SP1 BabyBear-in-Frog with Frog(d=64)):
+    // Production choice (SP1 BabyBear-in-Goldilocks with Goldilocks(d=64)):
     //
-    // We *fix* (decomp_b, k) to a pair that is good enough for the SP1 BabyBear-in-Frog lift.
+    // We *fix* (decomp_b, k) to a pair that is good enough for the SP1 BabyBear-in-Goldilocks lift.
     // Rationale:
     // SECURITY RATIONALE:
     //
     // The SP1 lift adds auxiliary “quotient/carry” witness coordinates `q_i` to each lifted row:
-    //   (A_i·f)(B_i·f) = (C_i·f) + p_bb * q_i   (mod q_frog).
+    //   (A_i·f)(B_i·f) = (C_i·f) + p_bb * q_i   (mod q_goldilocks).
     //
-    // This is vacuous without boundedness: a cheating prover can always pick `q_i` modulo q_frog
+    // This is vacuous without boundedness: a cheating prover can always pick `q_i` modulo q_goldilocks
     // to satisfy the equation. Therefore we must ensure LF+’s verifier enforces that all witness
-    // coordinates (including the aux tail) are small enough that equality mod q_frog implies the
+    // coordinates (including the aux tail) are small enough that equality mod q_goldilocks implies the
     // intended integer equality (no wraparound).
     //
     // In the current LF+ rgchk/setchk design, the verifier enforces:
     // - digits are represented as unit monomials (set-check), and
     // - the monomial “range-check” identity implies a conservative exponent bound |digit| < d/2
-    //   (Frog64 => |digit| <= D where D = d/2 - 1 = 31).
+    //   (Goldilocks64 => |digit| <= D where D = d/2 - 1 = 31).
     //
     // IMPORTANT: “balanced decomposition digits satisfy |digit| <= b/2” is an *honest prover*
     // property of `decompose_to(b, ...)`. It is NOT a security guarantee unless the verifier also
@@ -106,11 +106,11 @@ where
     // For base `b` and `k` digits, any single coordinate is conservatively bounded by:
     //   |x| <= D * (b^k - 1) / (b - 1).
     //
-    // With Frog64, choose b=12, k=8:
+    // With Goldilocks64, choose b=12, k=8:
     //   max = 31 * (12^8 - 1)/(12 - 1) = 1,211,766,595
     // which covers centered BabyBear values (<= p_bb/2 ≈ 1,006,632,960) and gives significantly
     // more margin for *multiplication-row* no-wrap bounds (quadratic in M), while still staying
-    // below q_frog/(2*p_bb) ≈ 3,951,810,924 for the aux term.
+    // below q_goldilocks/(2*p_bb) ≈ 4,581,298,445.7 for the aux term.
     const SP1_P_BB: u64 = 2013265921;
     let p_bb = cache.stats.p_bb;
     if d == 64 && p_bb == SP1_P_BB {
@@ -119,10 +119,10 @@ where
         // Log the chosen parameters (matches LF_PLUS_PROFILE pattern).
         let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
         if profile {
-            // Conservative verifier-enforced digit max for Frog64 unit monomials.
+            // Conservative verifier-enforced digit max for Goldilocks64 unit monomials.
             let digit_max: u128 = (d / 2 - 1) as u128; // 31
             println!(
-                "[sp1_default_we_params] SP1/Frog64 hardcoded safe params: decomp_b={}, k={}, l={}, max_bound={}",
+                "[sp1_default_we_params] SP1/Goldilocks64 hardcoded safe params: decomp_b={}, k={}, l={}, max_bound={}",
                 decomp_b, k, l,
                 digit_max * ((decomp_b as u128).pow(k as u32) - 1) / (decomp_b as u128 - 1)
             );
@@ -144,7 +144,7 @@ where
     // Production boundedness strategy:
     // Use the existing monomial-based rgchk/setchk pipeline, so we must choose a digit base
     // compatible with `exp(digit)`. We set `decomp_b = d/2` and choose `k` based on `d` so that
-    // the implied bound on lifted values stays well below Frog modulus and avoids wraparound.
+    // the implied bound on lifted values stays well below Goldilocks modulus and avoids wraparound.
     //
     // IMPORTANT:
     // `balanced_decomposition::decompose_to(b, out[k])` requires `out.len()` to be large enough to

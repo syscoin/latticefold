@@ -15,20 +15,20 @@ use crate::we_statement::WeParams;
 use super::challenges::{
     bounded_u32_from_8_digits_base128, digit_to_byte_var, res257_from_u64_bytes_le,
     select_first_ok_u32_try_digits, short_challenge_from_digits_128, squeeze_field_ranges_by_op_index,
-    BoundedU32ChallengeWiring, FrogChallengeWiring, ShortChallengeWiring, TinyCoinOpWiring,
+    BoundedU32ChallengeWiring, GoldilocksChallengeWiring, ShortChallengeWiring, TinyCoinOpWiring,
 };
-use super::coins::{sample_frog_coin_unrolled_rejection_8_digits, FrogRejectionCoinWiring};
+use super::coins::{sample_goldilocks_coin_unrolled_rejection_8_digits, GoldilocksRejectionCoinWiring};
 use super::digits::{
     rebalance_prod12_to_prod13, rebalance_prod21_to_prod22, scale_short_coeffs_by_digits18,
     scale_short_coeffs_by_digits9, sum_bal16_vectors_fixed_len, sum_product_digits_bal16,
     sum_product_digits_bal16_22, sum_products13_coeffwise_fixed_len, sum_products22_coeffwise_fixed_len,
 };
-use super::frog::{
-    frog_add_mod_p_from_byte_vars_assume_canonical, frog_mul_mod_p_from_byte_vars_assume_canonical,
-    frog_sub_mod_p_from_byte_vars_assume_canonical,
-    frog_u64_centered_le_bound_from_byte_vars, frog_u64_enforce_lt_p_from_byte_vars,
-    reduce_u64_mod_frog_from_byte_vars,
-    FrogScalar,
+use super::goldilocks::{
+    goldilocks_add_mod_p_from_byte_vars_assume_canonical, goldilocks_mul_mod_p_from_byte_vars_assume_canonical,
+    goldilocks_sub_mod_p_from_byte_vars_assume_canonical,
+    goldilocks_u64_centered_le_bound_from_byte_vars, goldilocks_u64_enforce_lt_p_from_byte_vars,
+    reduce_u64_mod_goldilocks_from_byte_vars,
+    GoldilocksScalar,
 };
 use super::gadgets::{decompose_existing_byte_var_to_bits, enforce_var_eq};
 use super::params::DIGITS_PER_TRY;
@@ -36,10 +36,10 @@ use super::poseidon::poseidon_f257_arithmetize;
 use super::surfaces::{CmDigitMulSqSurfaceWiring, CmDigitMulSurfaceWiring};
 
 use super::cm_math::{
-    eq_eval_frog_digits, eval_t_z_optimized_ring_digits_pair, frog_bytes_to_digits, frog_pow_table_digits,
+    eq_eval_goldilocks_digits, eval_t_z_optimized_ring_digits_pair, goldilocks_bytes_to_digits, goldilocks_pow_table_digits,
     ring_add_bytes, ring_add_digits, ring_bytes_to_digits, ring_eq_digits, ring_mul_negacyclic_digits_d64,
     ring_scale_digits, ring_zero_bytes, sumcheck_verify_degree2_ring_bytes,
-    tensor_frog_ringconst_digits, tensor_frog_scalars_digits, RingBytes, RingDigits,
+    tensor_goldilocks_ringconst_digits, tensor_goldilocks_scalars_digits, RingBytes, RingDigits,
 };
 use super::op_counts::{tiny_cm_counts_reset, tiny_cm_counts_take};
 
@@ -565,14 +565,14 @@ fn build_short_blocks(
     Ok(out)
 }
 
-fn build_u32_and_frog_blocks(
+fn build_u32_and_goldilocks_blocks(
     glue: &mut GlueCtx,
     pose_wiring: &PoseidonDr1csWiring,
     u32_starts: &[usize],
-) -> Result<(Vec<BoundedU32ChallengeWiring>, Vec<FrogChallengeWiring>), String> {
+) -> Result<(Vec<BoundedU32ChallengeWiring>, Vec<GoldilocksChallengeWiring>), String> {
     let tries: usize = DEFAULT_REJECTION_TRIES;
     let mut u32_out: Vec<BoundedU32ChallengeWiring> = Vec::with_capacity(u32_starts.len());
-    let mut frog_out: Vec<FrogChallengeWiring> = Vec::with_capacity(u32_starts.len());
+    let mut goldilocks_out: Vec<GoldilocksChallengeWiring> = Vec::with_capacity(u32_starts.len());
     for (ui, &u_start_op) in u32_starts.iter().enumerate() {
         // Copy all try digits locally (but keep wiring compact: store only the selected digits).
         let mut all_digits_local: Vec<usize> = Vec::with_capacity(tries * DIGITS_PER_TRY);
@@ -606,7 +606,7 @@ fn build_u32_and_frog_blocks(
         for i in 4..8 {
             u64_bytes[i] = digit_to_byte_var::<F257>(&mut glue.gb, u_digits_local[i]);
         }
-        let (q_bit, frog_limbs) = reduce_u64_mod_frog_from_byte_vars::<F257>(&mut glue.gb, &u64_bytes);
+        let (q_bit, goldilocks_limbs) = reduce_u64_mod_goldilocks_from_byte_vars::<F257>(&mut glue.gb, &u64_bytes);
         let res257 = res257_from_u64_bytes_le(&mut glue.gb, &u64_bytes);
 
         u32_out.push(BoundedU32ChallengeWiring {
@@ -616,39 +616,39 @@ fn build_u32_and_frog_blocks(
             bal16_digits: u_bal16,
             bal16_sq_digits: u_bal16_sq,
         });
-        frog_out.push(FrogChallengeWiring {
+        goldilocks_out.push(GoldilocksChallengeWiring {
             digit_vars: u_digits_local.to_vec(),
             byte_vars: u64_bytes,
             q_bit,
-            limbs: frog_limbs,
+            limbs: goldilocks_limbs,
             res257,
         });
     }
-    Ok((u32_out, frog_out))
+    Ok((u32_out, goldilocks_out))
 }
 
-fn build_frog_rejection_coins(
+fn build_goldilocks_rejection_coins(
     glue: &mut GlueCtx,
     pose_wiring: &PoseidonDr1csWiring,
-    frog_ranges: &[(usize, usize)],
-) -> Result<Vec<FrogRejectionCoinWiring>, String> {
+    goldilocks_ranges: &[(usize, usize)],
+) -> Result<Vec<GoldilocksRejectionCoinWiring>, String> {
     let tries: usize = DEFAULT_REJECTION_TRIES;
-    if !frog_ranges.is_empty() && (frog_ranges.len() % tries != 0) {
+    if !goldilocks_ranges.is_empty() && (goldilocks_ranges.len() % tries != 0) {
         return Err(format!(
-            "frog_squeeze_ops length {} not divisible by tries={}",
-            frog_ranges.len(),
+            "goldilocks_squeeze_ops length {} not divisible by tries={}",
+            goldilocks_ranges.len(),
             tries
         ));
     }
-    let n_coins = if frog_ranges.is_empty() { 0 } else { frog_ranges.len() / tries };
-    let mut out: Vec<FrogRejectionCoinWiring> = Vec::with_capacity(n_coins);
+    let n_coins = if goldilocks_ranges.is_empty() { 0 } else { goldilocks_ranges.len() / tries };
+    let mut out: Vec<GoldilocksRejectionCoinWiring> = Vec::with_capacity(n_coins);
     for coin_idx in 0..n_coins {
         let mut digit_vars: Vec<usize> = Vec::with_capacity(tries * DIGITS_PER_TRY);
         for t in 0..tries {
-            let (start, len) = frog_ranges[coin_idx * tries + t];
+            let (start, len) = goldilocks_ranges[coin_idx * tries + t];
             if len != DIGITS_PER_TRY {
                 return Err(format!(
-                    "frog squeeze len mismatch (got {len}, expected {DIGITS_PER_TRY})"
+                    "goldilocks squeeze len mismatch (got {len}, expected {DIGITS_PER_TRY})"
                 ));
             }
             for gv in &pose_wiring.squeeze_field_vars[start..start + len] {
@@ -656,9 +656,9 @@ fn build_frog_rejection_coins(
             }
         }
         let (coin_local, found_local) =
-            sample_frog_coin_unrolled_rejection_8_digits::<F257>(&mut glue.gb, &digit_vars, tries);
+            sample_goldilocks_coin_unrolled_rejection_8_digits::<F257>(&mut glue.gb, &digit_vars, tries);
         glue.gb.enforce_var_eq_const(found_local, F257::ONE);
-        out.push(FrogRejectionCoinWiring {
+        out.push(GoldilocksRejectionCoinWiring {
             digit_vars,
             found_bit: found_local,
             coin_limbs: coin_local.to_vec(),
@@ -690,24 +690,24 @@ fn compute_tcch(
     }
 
     #[inline]
-    fn alloc_const_frog_u64(gb: &mut Dr1csBuilder<F257>, v: u64) -> [usize; 8] {
+    fn alloc_const_goldilocks_u64(gb: &mut Dr1csBuilder<F257>, v: u64) -> [usize; 8] {
         let bs = v.to_le_bytes();
         let mut out = [0usize; 8];
         for i in 0..8 {
             out[i] = alloc_const_byte(gb, bs[i]);
         }
-        frog_u64_enforce_lt_p_from_byte_vars::<F257>(gb, &out);
+        goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(gb, &out);
         out
     }
 
     #[inline]
-    fn frog_bytes_from_u32_le_bytes(gb: &mut Dr1csBuilder<F257>, u32_le: &[usize; 4]) -> [usize; 8] {
+    fn goldilocks_bytes_from_u32_le_bytes(gb: &mut Dr1csBuilder<F257>, u32_le: &[usize; 4]) -> [usize; 8] {
         let mut out = [0usize; 8];
         out[0..4].copy_from_slice(u32_le);
         for i in 4..8 {
             out[i] = alloc_const_byte(gb, 0u8);
         }
-        frog_u64_enforce_lt_p_from_byte_vars::<F257>(gb, &out);
+        goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(gb, &out);
         out
     }
 
@@ -779,10 +779,10 @@ fn compute_tcch(
                         for blk in 0..n_blocks {
                             let blk_start = ab_start + blk * reb;
                             // Each ring element is encoded as `ring_dim` coefficients, each coefficient as
-                            // `coeff_bytes` bytes (little-endian, canonical for Frog base field).
+                            // `coeff_bytes` bytes (little-endian, canonical for Goldilocks base field).
                             if coeff_bytes != 8 {
                                 return Err(format!(
-                                    "tiny gate: expected Frog base-field coeff_bytes=8 for CM verifier, got {coeff_bytes}"
+                                    "tiny gate: expected Goldilocks base-field coeff_bytes=8 for CM verifier, got {coeff_bytes}"
                                 ));
                             }
 
@@ -795,7 +795,7 @@ fn compute_tcch(
                                     let _ = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, lv);
                                     coeffs[coeff][i] = lv;
                                 }
-                                frog_u64_enforce_lt_p_from_byte_vars::<F257>(&mut glue.gb, &coeffs[coeff]);
+                                goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(&mut glue.gb, &coeffs[coeff]);
                             }
                             coh0_bytes.push(coeffs[0]);
                             comh_all_coeff_bytes.push(coeffs);
@@ -818,48 +818,48 @@ fn compute_tcch(
                         let c1_start = cm_u32_start + lg;
                         if c1_start + lg <= u32_locals.len() {
                             // Challenges c0/c1 are transcript `get_challenge()` outputs: bounded u32 embedded
-                            // into the Frog base field. Represent them as canonical Frog bytes by padding the
+                            // into the Goldilocks base field. Represent them as canonical Goldilocks bytes by padding the
                             // 4-byte u32 with 4 zero bytes (so value < 2^32 < p).
                             let mut c0_bytes: Vec<[usize; 8]> = Vec::with_capacity(lg);
                             let mut c1_bytes: Vec<[usize; 8]> = Vec::with_capacity(lg);
                             for i in 0..lg {
-                                c0_bytes.push(frog_bytes_from_u32_le_bytes(
+                                c0_bytes.push(goldilocks_bytes_from_u32_le_bytes(
                                     &mut glue.gb,
                                     &u32_locals[c0_start + i].byte_vars,
                                 ));
                             }
                             for i in 0..lg {
-                                c1_bytes.push(frog_bytes_from_u32_le_bytes(
+                                c1_bytes.push(goldilocks_bytes_from_u32_le_bytes(
                                     &mut glue.gb,
                                     &u32_locals[c1_start + i].byte_vars,
                                 ));
                             }
 
                             #[inline]
-                            fn tensor_frog_bytes(gb: &mut Dr1csBuilder<F257>, c: &[[usize; 8]]) -> Vec<[usize; 8]> {
-                                let one = alloc_const_frog_u64(gb, 1u64);
+                            fn tensor_goldilocks_bytes(gb: &mut Dr1csBuilder<F257>, c: &[[usize; 8]]) -> Vec<[usize; 8]> {
+                                let one = alloc_const_goldilocks_u64(gb, 1u64);
                                 let mut acc: Vec<[usize; 8]> = vec![one];
                                 for ci in c {
-                                    let one_minus = frog_sub_mod_p_from_byte_vars_assume_canonical(gb, &one, ci);
+                                    let one_minus = goldilocks_sub_mod_p_from_byte_vars_assume_canonical(gb, &one, ci);
                                     let mut next: Vec<[usize; 8]> = Vec::with_capacity(acc.len() * 2);
                                     for t in &acc {
-                                        next.push(frog_mul_mod_p_from_byte_vars_assume_canonical(gb, t, &one_minus));
-                                        next.push(frog_mul_mod_p_from_byte_vars_assume_canonical(gb, t, ci));
+                                        next.push(goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, t, &one_minus));
+                                        next.push(goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, t, ci));
                                     }
                                     acc = next;
                                 }
                                 acc
                             }
 
-                            let tensor_c0 = tensor_frog_bytes(&mut glue.gb, &c0_bytes);
-                            let tensor_c1 = tensor_frog_bytes(&mut glue.gb, &c1_bytes);
+                            let tensor_c0 = tensor_goldilocks_bytes(&mut glue.gb, &c0_bytes);
+                            let tensor_c1 = tensor_goldilocks_bytes(&mut glue.gb, &c1_bytes);
 
                             // Compute full-ring tcch0/tcch1 (as in `CmProof::verify_with_mlen`):
                             //
                             //   tcch{0,1}[l] = Σ_j tensor_c{0,1}[j] * comh[l][j]
                             //
                             // Multiplying a ring element by a base-field scalar is coefficient-wise scaling.
-                            let zero = alloc_const_frog_u64(&mut glue.gb, 0u64);
+                            let zero = alloc_const_goldilocks_u64(&mut glue.gb, 0u64);
                             let mut tcch0_ring: Vec<Vec<[usize; 8]>> = Vec::with_capacity(l_instances);
                             let mut tcch1_ring: Vec<Vec<[usize; 8]>> = Vec::with_capacity(l_instances);
                             for l in 0..l_instances {
@@ -869,20 +869,20 @@ fn compute_tcch(
                                 for j in 0..kappa {
                                     let ch = &comh_all_coeff_bytes[base + j];
                                     for coeff in 0..ring_dim {
-                                        let m0 = frog_mul_mod_p_from_byte_vars_assume_canonical(
+                                        let m0 = goldilocks_mul_mod_p_from_byte_vars_assume_canonical(
                                             &mut glue.gb,
                                             &tensor_c0[j],
                                             &ch[coeff],
                                         );
-                                        let m1 = frog_mul_mod_p_from_byte_vars_assume_canonical(
+                                        let m1 = goldilocks_mul_mod_p_from_byte_vars_assume_canonical(
                                             &mut glue.gb,
                                             &tensor_c1[j],
                                             &ch[coeff],
                                         );
                                         acc0[coeff] =
-                                            frog_add_mod_p_from_byte_vars_assume_canonical(&mut glue.gb, &acc0[coeff], &m0);
+                                            goldilocks_add_mod_p_from_byte_vars_assume_canonical(&mut glue.gb, &acc0[coeff], &m0);
                                         acc1[coeff] =
-                                            frog_add_mod_p_from_byte_vars_assume_canonical(&mut glue.gb, &acc1[coeff], &m1);
+                                            goldilocks_add_mod_p_from_byte_vars_assume_canonical(&mut glue.gb, &acc1[coeff], &m1);
                                     }
                                 }
                                 tcch0_ring.push(acc0);
@@ -991,7 +991,7 @@ fn parse_and_enforce_cm_after_short(
     // Now parse payload_after_short sequentially according to the CM schedule.
     // Infer the ring-element absorb width from the wiring (matches `compute_tcch` logic).
     // This avoids hard-coding `coeff_bytes=8` here; the caller already separately enforces that
-    // absorbed non-reabsorb payloads are canonical Frog bytes at IO boundaries.
+    // absorbed non-reabsorb payloads are canonical Goldilocks bytes at IO boundaries.
     let mut ring_elem_bytes: Option<usize> = None;
     for &(_st, ln) in &pose_wiring.absorb_ranges {
         if ln % ring_dim == 0 && ln > ring_dim {
@@ -1120,7 +1120,7 @@ fn cm_u32_start_idx(wiring: &TinyCoinOpWiring) -> usize {
 }
 
 #[inline]
-fn frog_bytes_from_u32_le_bytes(gb: &mut Dr1csBuilder<F257>, u32_le: &[usize; 4]) -> [usize; 8] {
+fn goldilocks_bytes_from_u32_le_bytes(gb: &mut Dr1csBuilder<F257>, u32_le: &[usize; 4]) -> [usize; 8] {
     let mut out = [0usize; 8];
     out[0..4].copy_from_slice(u32_le);
     for i in 4..8 {
@@ -1496,11 +1496,11 @@ fn enforce_fiat_shamir_reabsorb_semantics(
 }
 
 /// Enforce that every **non-reabsorb** Absorb chunk of length multiple of 8 consists of
-/// canonical Frog base-field encodings (u64 < p_frog), interpreted as 8-byte little-endian scalars.
+/// canonical Goldilocks base-field encodings (u64 < p_goldilocks), interpreted as 8-byte little-endian scalars.
 ///
 /// This is a byte/limb-only binding step: it does not perform any modular arithmetic beyond
 /// the single-subtract canonicality check.
-fn enforce_nonreabsorb_absorbs_are_canonical_frog(
+fn enforce_nonreabsorb_absorbs_are_canonical_goldilocks(
     glue: &mut GlueCtx,
     ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
@@ -1517,7 +1517,7 @@ fn enforce_nonreabsorb_absorbs_are_canonical_frog(
                 let (ab_start, ab_len) = *pose_wiring
                     .absorb_ranges
                     .get(absorb_idx)
-                    .ok_or("pose_wiring.absorb_ranges oob (canonical frog)")?;
+                    .ok_or("pose_wiring.absorb_ranges oob (canonical goldilocks)")?;
                 absorb_idx += 1;
                 let is_reabsorb = expect_reabsorb;
                 expect_reabsorb = false;
@@ -1537,7 +1537,7 @@ fn enforce_nonreabsorb_absorbs_are_canonical_frog(
                         let _ = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, lv);
                         bytes[j] = lv;
                     }
-                    frog_u64_enforce_lt_p_from_byte_vars::<F257>(&mut glue.gb, &bytes);
+                    goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(&mut glue.gb, &bytes);
                 }
             }
             PoseidonTraceOp::SqueezeBytes { .. } => {}
@@ -1582,7 +1582,7 @@ fn sp1_centered_bound_u64(params: &WeParams, ring_dim: usize) -> Result<u64, Str
 
 /// Enforce that every non-reabsorb absorbed 8-byte chunk is not only canonical (<p),
 /// but also lies in the conservative centered range implied by the rgchk digit bound.
-fn enforce_nonreabsorb_absorbs_are_centered_bounded_frog(
+fn enforce_nonreabsorb_absorbs_are_centered_bounded_goldilocks(
     glue: &mut GlueCtx,
     ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
@@ -1601,7 +1601,7 @@ fn enforce_nonreabsorb_absorbs_are_centered_bounded_frog(
                 let (ab_start, ab_len) = *pose_wiring
                     .absorb_ranges
                     .get(absorb_idx)
-                    .ok_or("pose_wiring.absorb_ranges oob (centered frog)")?;
+                    .ok_or("pose_wiring.absorb_ranges oob (centered goldilocks)")?;
                 absorb_idx += 1;
                 let is_reabsorb = expect_reabsorb;
                 expect_reabsorb = false;
@@ -1618,7 +1618,7 @@ fn enforce_nonreabsorb_absorbs_are_centered_bounded_frog(
                         bytes[j] = lv;
                     }
                     let _limbs =
-                        frog_u64_centered_le_bound_from_byte_vars::<F257>(&mut glue.gb, &bytes, bound);
+                        goldilocks_u64_centered_le_bound_from_byte_vars::<F257>(&mut glue.gb, &bytes, bound);
                 }
             }
             PoseidonTraceOp::SqueezeBytes { .. } => {}
@@ -1635,8 +1635,8 @@ fn finalize(
     glue: GlueCtx,
     short_locals: Vec<ShortChallengeWiring>,
     u32_locals: Vec<BoundedU32ChallengeWiring>,
-    frog_locals: Vec<FrogChallengeWiring>,
-    frog_rejection_locals: Vec<FrogRejectionCoinWiring>,
+    goldilocks_locals: Vec<GoldilocksChallengeWiring>,
+    goldilocks_rejection_locals: Vec<GoldilocksRejectionCoinWiring>,
     tcch0_local: Vec<[usize; 8]>,
     tcch1_local: Vec<[usize; 8]>,
     surfaces_mul_local: Vec<CmDigitMulSurfaceWiring>,
@@ -1651,8 +1651,8 @@ fn finalize(
         Vec<F257>,
         Vec<ShortChallengeWiring>,
         Vec<BoundedU32ChallengeWiring>,
-        Vec<FrogChallengeWiring>,
-        Vec<FrogRejectionCoinWiring>,
+        Vec<GoldilocksChallengeWiring>,
+        Vec<GoldilocksRejectionCoinWiring>,
         Vec<[usize; 8]>,
         Vec<[usize; 8]>,
         Vec<CmDigitMulSurfaceWiring>,
@@ -1728,9 +1728,9 @@ fn finalize(
             bal16_sq_digits: w.bal16_sq_digits.into_iter().map(to_glue_global).collect(),
         })
         .collect::<Vec<_>>();
-    let frogs_out = frog_locals
+    let goldilocks_out = goldilocks_locals
         .into_iter()
-        .map(|w| FrogChallengeWiring {
+        .map(|w| GoldilocksChallengeWiring {
             digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
             byte_vars: w.byte_vars.map(to_glue_global),
             q_bit: to_glue_global(w.q_bit),
@@ -1738,9 +1738,9 @@ fn finalize(
             res257: to_glue_global(w.res257),
         })
         .collect::<Vec<_>>();
-    let frog_rejection_out = frog_rejection_locals
+    let goldilocks_rejection_out = goldilocks_rejection_locals
         .into_iter()
-        .map(|w| FrogRejectionCoinWiring {
+        .map(|w| GoldilocksRejectionCoinWiring {
             digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
             found_bit: to_glue_global(w.found_bit),
             coin_limbs: w.coin_limbs.into_iter().map(to_glue_global).collect(),
@@ -1800,8 +1800,8 @@ fn finalize(
         asg,
         shorts_out,
         u32s_out,
-        frogs_out,
-        frog_rejection_out,
+        goldilocks_out,
+        goldilocks_rejection_out,
         tcch0_local
             .into_iter()
             .map(|arr| {
@@ -1841,8 +1841,8 @@ pub(super) fn build(
         Vec<F257>,
         Vec<ShortChallengeWiring>,
         Vec<BoundedU32ChallengeWiring>,
-        Vec<FrogChallengeWiring>,
-        Vec<FrogRejectionCoinWiring>,
+        Vec<GoldilocksChallengeWiring>,
+        Vec<GoldilocksRejectionCoinWiring>,
         Vec<[usize; 8]>,
         Vec<[usize; 8]>,
         Vec<CmDigitMulSurfaceWiring>,
@@ -1861,7 +1861,7 @@ pub(super) fn build(
 
     let short_ranges = squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.short_squeeze_ops)?;
     let u32_ranges = squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.u32_squeeze_ops)?;
-    let frog_ranges = squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.frog_squeeze_ops)?;
+    let goldilocks_ranges = squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.goldilocks_squeeze_ops)?;
     validate_pairs(pairs, short_ranges.len(), u32_ranges.len())?;
     validate_params_and_short_schedule(ring_dim, params, short_ranges.len())?;
 
@@ -1870,9 +1870,9 @@ pub(super) fn build(
 
     // Bind all proof/statement payload absorbs that encode base-field elements as canonical 8-byte scalars.
     // (Skip fiat–shamir reabsorbs, which are F257 digits and may contain 256.)
-    enforce_nonreabsorb_absorbs_are_canonical_frog(&mut glue, ops, &pose_wiring)?;
+    enforce_nonreabsorb_absorbs_are_canonical_goldilocks(&mut glue, ops, &pose_wiring)?;
     lf_stage_log(
-        "enforce_nonreabsorb_absorbs_are_canonical_frog",
+        "enforce_nonreabsorb_absorbs_are_canonical_goldilocks",
         Some(&pose_inst),
         Some(&glue),
         &mut mem_prev,
@@ -1882,7 +1882,7 @@ pub(super) fn build(
     let (n_comh_ring_elems, coeff_bytes) = count_comh_ring_elements(ops, &pose_wiring, ring_dim, wiring)?;
     if ring_dim > 0 && n_comh_ring_elems > 0 && coeff_bytes != 8 {
         return Err(format!(
-            "tiny gate: expected Frog base-field coeff_bytes=8, got {coeff_bytes}"
+            "tiny gate: expected Goldilocks base-field coeff_bytes=8, got {coeff_bytes}"
         ));
     }
     let kappa = params.kappa as usize;
@@ -1893,11 +1893,11 @@ pub(super) fn build(
 
     let short_locals = build_short_blocks(&mut glue, &pose_wiring, ring_dim, &short_ranges)?;
     lf_stage_log("build_short_blocks", Some(&pose_inst), Some(&glue), &mut mem_prev);
-    let (u32_locals, frog_locals) =
-        build_u32_and_frog_blocks(&mut glue, &pose_wiring, &wiring.u32_squeeze_ops)?;
-    lf_stage_log("build_u32_and_frog_blocks", Some(&pose_inst), Some(&glue), &mut mem_prev);
-    let frog_rejection_locals = build_frog_rejection_coins(&mut glue, &pose_wiring, &frog_ranges)?;
-    lf_stage_log("build_frog_rejection_coins", Some(&pose_inst), Some(&glue), &mut mem_prev);
+    let (u32_locals, goldilocks_locals) =
+        build_u32_and_goldilocks_blocks(&mut glue, &pose_wiring, &wiring.u32_squeeze_ops)?;
+    lf_stage_log("build_u32_and_goldilocks_blocks", Some(&pose_inst), Some(&glue), &mut mem_prev);
+    let goldilocks_rejection_locals = build_goldilocks_rejection_coins(&mut glue, &pose_wiring, &goldilocks_ranges)?;
+    lf_stage_log("build_goldilocks_rejection_coins", Some(&pose_inst), Some(&glue), &mut mem_prev);
     let (tcch0_local, tcch1_local) =
         compute_tcch(&mut glue, ops, &pose_wiring, ring_dim, params, wiring, &u32_locals)?;
     lf_stage_log("compute_tcch", Some(&pose_inst), Some(&glue), &mut mem_prev);
@@ -1972,40 +1972,40 @@ pub(super) fn build(
         let mut tensor_c1_ring: Option<Vec<RingDigits>> = None;
         let mut s_prime_flat_ring: Option<Vec<RingDigits>> = None;
         let mut dpp_ring: Option<Vec<RingDigits>> = None;
-        let mut r_point_digits: Option<Vec<FrogScalar>> = None;
+        let mut r_point_digits: Option<Vec<GoldilocksScalar>> = None;
         if ring_dim == 64
             && kappa.is_power_of_two()
             && (k_decomp * ring_dim).is_power_of_two()
             && ell.is_power_of_two()
         {
-            // c0/c1 as Frog scalars (digit encoding), then tensor-expand.
+            // c0/c1 as Goldilocks scalars (digit encoding), then tensor-expand.
             let c0_digits: Vec<_> = c0_u32
                 .iter()
                 .map(|u| {
-                    let bytes = frog_bytes_from_u32_le_bytes(&mut glue.gb, &u.byte_vars);
-                    frog_bytes_to_digits(&mut glue.gb, bytes)
+                    let bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &u.byte_vars);
+                    goldilocks_bytes_to_digits(&mut glue.gb, bytes)
                 })
                 .collect();
             let c1_digits: Vec<_> = c1_u32
                 .iter()
                 .map(|u| {
-                    let bytes = frog_bytes_from_u32_le_bytes(&mut glue.gb, &u.byte_vars);
-                    frog_bytes_to_digits(&mut glue.gb, bytes)
+                    let bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &u.byte_vars);
+                    goldilocks_bytes_to_digits(&mut glue.gb, bytes)
                 })
                 .collect();
-            let t0 = tensor_frog_scalars_digits(&mut glue.gb, &c0_digits);
-            let t1 = tensor_frog_scalars_digits(&mut glue.gb, &c1_digits);
-            tensor_c0_ring = Some(tensor_frog_ringconst_digits(&mut glue.gb, &t0, ring_dim));
-            tensor_c1_ring = Some(tensor_frog_ringconst_digits(&mut glue.gb, &t1, ring_dim));
+            let t0 = tensor_goldilocks_scalars_digits(&mut glue.gb, &c0_digits);
+            let t1 = tensor_goldilocks_scalars_digits(&mut glue.gb, &c1_digits);
+            tensor_c0_ring = Some(tensor_goldilocks_ringconst_digits(&mut glue.gb, &t0, ring_dim));
+            tensor_c1_ring = Some(tensor_goldilocks_ringconst_digits(&mut glue.gb, &t1, ring_dim));
 
             // dpp: dp^i as constant-coeff ring elements.
             let dp = (ring_dim / 2) as u64;
-            let p = crate::we_frog_poseidon_f257::FROG_P;
+            let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
             let mut acc: u64 = 1;
             let mut dpp: Vec<RingDigits> = Vec::with_capacity(ell);
             for _ in 0..ell {
-                let s_bytes = super::cm_math::alloc_const_frog_u64(&mut glue.gb, acc);
-                let s = frog_bytes_to_digits(&mut glue.gb, s_bytes);
+                let s_bytes = super::cm_math::alloc_const_goldilocks_u64(&mut glue.gb, acc);
+                let s = goldilocks_bytes_to_digits(&mut glue.gb, s_bytes);
                 dpp.push(super::cm_math::ring_const_coeff_digits(&mut glue.gb, &s, ring_dim));
                 acc = ((acc as u128) * (dp as u128) % (p as u128)) as u64;
             }
@@ -2020,7 +2020,7 @@ pub(super) fn build(
             }
             let z = glue.gb.new_var(F257::ZERO);
             glue.gb.enforce_var_eq_const(z, F257::ZERO);
-            let c128 = super::cm_math::alloc_const_frog_u64(&mut glue.gb, 128u64);
+            let c128 = super::cm_math::alloc_const_goldilocks_u64(&mut glue.gb, 128u64);
             let mut sflat: Vec<RingDigits> = Vec::with_capacity(need_sprime);
             for blk in 0..need_sprime {
                 let sb = &short_locals[3 + blk];
@@ -2036,8 +2036,8 @@ pub(super) fn build(
                         bbytes[i] = z;
                     }
                     // Centered coefficient = (byte - 128) mod p (canonical).
-                    let centered = frog_sub_mod_p_from_byte_vars_assume_canonical(&mut glue.gb, &bbytes, &c128);
-                    re.push(frog_bytes_to_digits(&mut glue.gb, centered));
+                    let centered = goldilocks_sub_mod_p_from_byte_vars_assume_canonical(&mut glue.gb, &bbytes, &c128);
+                    re.push(goldilocks_bytes_to_digits(&mut glue.gb, centered));
                 }
                 sflat.push(re);
             }
@@ -2069,10 +2069,10 @@ pub(super) fn build(
             if u32_locals.len() < r_end {
                 return Err("tiny gate: not enough u32 challenges to recover setchk r-point".to_string());
             }
-            let mut rdig: Vec<FrogScalar> = Vec::with_capacity(nvars_lin);
+            let mut rdig: Vec<GoldilocksScalar> = Vec::with_capacity(nvars_lin);
             for u in &u32_locals[r_start..r_end] {
-                let bytes = frog_bytes_from_u32_le_bytes(&mut glue.gb, &u.byte_vars);
-                rdig.push(frog_bytes_to_digits(&mut glue.gb, bytes));
+                let bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &u.byte_vars);
+                rdig.push(goldilocks_bytes_to_digits(&mut glue.gb, bytes));
             }
             r_point_digits = Some(rdig);
         }
@@ -2085,11 +2085,11 @@ pub(super) fn build(
                 eprintln!("[LF_MEM]   cm_sumcheck_enter which={which}");
             }
             // rc (currently unused here, but we must consume it to align indices)
-            let rc_bytes = frog_bytes_from_u32_le_bytes(&mut glue.gb, &u32_locals[u32_idx].byte_vars);
+            let rc_bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &u32_locals[u32_idx].byte_vars);
             u32_idx += 1;
             let mut rs: Vec<[usize; 8]> = Vec::with_capacity(nvars_cm);
             for _ in 0..nvars_cm {
-                rs.push(frog_bytes_from_u32_le_bytes(&mut glue.gb, &u32_locals[u32_idx].byte_vars));
+                rs.push(goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &u32_locals[u32_idx].byte_vars));
                 u32_idx += 1;
             }
 
@@ -2141,7 +2141,7 @@ pub(super) fn build(
                 r_point_digits.as_ref(),
             ) {
                 // Convert r_sc to digit encoding.
-                let rs_digits: Vec<FrogScalar> = rs.iter().copied().map(|b| frog_bytes_to_digits(&mut glue.gb, b)).collect();
+                let rs_digits: Vec<GoldilocksScalar> = rs.iter().copied().map(|b| goldilocks_bytes_to_digits(&mut glue.gb, b)).collect();
 
                 // subclaim_eval (ring) in digit encoding (cheap: only 64 coeff conversions).
                 let subclaim_eval = ring_bytes_to_digits(&mut glue.gb, &final_claim_bytes);
@@ -2149,12 +2149,12 @@ pub(super) fn build(
                 // rc powers (need up to z_idx+1).
                 let z_idx = l_instances_expected * (4 + 4 * (params.mlen as usize));
                 let max_pow = z_idx + 1;
-                let rc_d = frog_bytes_to_digits(&mut glue.gb, rc_bytes);
-                let rc_pows = frog_pow_table_digits(&mut glue.gb, &rc_d, max_pow);
+                let rc_d = goldilocks_bytes_to_digits(&mut glue.gb, rc_bytes);
+                let rc_pows = goldilocks_pow_table_digits(&mut glue.gb, &rc_d, max_pow);
                 lf_stage_log("cm_recomb_rc_pows", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
                 // eq(r, ro) where r is the transcript-derived SetChk point (recovered above).
-                let eq = eq_eval_frog_digits(&mut glue.gb, rpt, &rs_digits)?;
+                let eq = eq_eval_goldilocks_digits(&mut glue.gb, rpt, &rs_digits)?;
                 lf_stage_log("cm_recomb_eq_done", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
                 // Evaluate t0(ro), t1(ro).
@@ -2275,8 +2275,8 @@ pub(super) fn build(
         glue,
         short_locals,
         u32_locals,
-        frog_locals,
-        frog_rejection_locals,
+        goldilocks_locals,
+        goldilocks_rejection_locals,
         tcch0_local,
         tcch1_local,
         surfaces_mul_local,

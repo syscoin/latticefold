@@ -4,11 +4,11 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 
 use super::gadgets::{alloc_bool, alloc_u2_from_u8, alloc_u7, bool_and, bool_not, bool_or, const_zero};
 use super::params::{DIGITS_PER_TRY, LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
-use crate::we_frog_poseidon_f257::FROG_P;
+use crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
 
-pub(super) fn frog_p_base128_digits_le() -> [u8; LIMBS_U64] {
+pub(super) fn goldilocks_p_base128_digits_le() -> [u8; LIMBS_U64] {
     let mut out = [0u8; LIMBS_U64];
-    let mut t = FROG_P;
+    let mut t = GOLDILOCKS_P;
     for i in 0..LIMBS_U64 {
         out[i] = (t & (LIMB_BASE_U64 - 1)) as u8;
         t >>= LIMB_BITS;
@@ -187,13 +187,13 @@ fn compute_u_from_8_digits_base257_in_base128<F: PrimeField>(
     u
 }
 
-pub(crate) fn sample_frog_coin_unrolled_rejection_8_digits<F: PrimeField>(
+pub(crate) fn sample_goldilocks_coin_unrolled_rejection_8_digits<F: PrimeField>(
     b: &mut Dr1csBuilder<F>,
     digit_vars: &[usize], // length = tries*8
     tries: usize,
 ) -> ([usize; LIMBS_U64], usize /* found */) {
     assert_eq!(digit_vars.len(), tries * DIGITS_PER_TRY);
-    let p_digits = frog_p_base128_digits_le();
+    let p_digits = goldilocks_p_base128_digits_le();
 
     let mut found = const_zero::<F>(b);
     let mut selected = [0usize; LIMBS_U64];
@@ -220,7 +220,7 @@ pub(crate) fn sample_frog_coin_unrolled_rejection_8_digits<F: PrimeField>(
 }
 
 #[derive(Clone, Debug)]
-pub struct FrogRejectionCoinWiring {
+pub struct GoldilocksRejectionCoinWiring {
     /// Global variable indices of all base-257 digit vars used (tries * 8).
     pub digit_vars: Vec<usize>,
     /// Global variable index of `found` (boolean), enforced to be 1 in the builder.

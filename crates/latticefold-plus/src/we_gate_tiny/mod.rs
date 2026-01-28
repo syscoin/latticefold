@@ -5,7 +5,7 @@ mod gadgets;
 mod digits;
 mod coins;
 mod challenges;
-mod frog;
+mod goldilocks;
 mod cm_math;
 mod surfaces;
 mod poseidon;

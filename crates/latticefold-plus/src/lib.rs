@@ -27,7 +27,7 @@ pub mod we_statement;
 #[cfg(feature = "we_gate")]
 pub mod we_gate_arith;
 #[cfg(feature = "we_gate")]
-pub mod we_frog_poseidon_f257;
+pub mod we_goldilocks_poseidon_f257;
 #[cfg(feature = "we_gate")]
 pub mod we_gate_tiny;
 #[cfg(feature = "we_gate")]

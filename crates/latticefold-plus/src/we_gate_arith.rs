@@ -120,7 +120,7 @@ where
         log_kappa,
         nvars_cm,
         squeeze_field_op_offset,
-        0, // frog_need (not used on this path yet)
+        0, // goldilocks_need (not used on this path yet)
     )?;
     let mut wiring_abs = tiny::TinyCoinOpWiring::default();
     wiring_abs.short_squeeze_ops = wiring_rel
@@ -137,15 +137,15 @@ where
     wiring_abs
         .u32_squeeze_ops
         .splice(0..0, prefix_u32_squeeze_ops.into_iter());
-    wiring_abs.frog_squeeze_ops = Vec::new();
+    wiring_abs.goldilocks_squeeze_ops = Vec::new();
 
     let (
         inst_pose,
         asg_pose,
         _shorts,
         _u32s,
-        _frogs,
-        _frog_rejection,
+        _goldilocks,
+        _goldilocks_rejection,
         _tcch0,
         _tcch1,
         _surfaces_mul,
@@ -857,7 +857,7 @@ where
         log_kappa,
         nvars_cm,
         squeeze_field_op_offset,
-        0, // frog_need (not used on this path yet)
+        0, // goldilocks_need (not used on this path yet)
     )?;
     let mut wiring_abs = tiny::TinyCoinOpWiring::default();
     wiring_abs.short_squeeze_ops = wiring_rel
@@ -873,7 +873,7 @@ where
     wiring_abs
         .u32_squeeze_ops
         .splice(0..0, prefix_u32_squeeze_ops.into_iter());
-    wiring_abs.frog_squeeze_ops = Vec::new();
+    wiring_abs.goldilocks_squeeze_ops = Vec::new();
 
     // Build Poseidon(F257)+coin surfaces with this concrete trace (assignment carries the real absorbs/squeezes).
     let (
@@ -881,8 +881,8 @@ where
         asg_pose,
         _shorts,
         _u32s,
-        _frogs,
-        _frog_rejection,
+        _goldilocks,
+        _goldilocks_rejection,
         _tcch0,
         _tcch1,
         _surfaces_mul,
@@ -1333,7 +1333,7 @@ fn ring_mul_negacyclic_naive<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVar
 // - evaluation/interpolation are pure linear combinations (no constraints)
 // - only the recursive pointwise multiplications introduce mul constraints.
 //
-// This is intended for FrogRing64-scale CM math where ring_mul dominates scalar_mul.
+// This is intended for GoldilocksRing64-scale CM math where ring_mul dominates scalar_mul.
 // -------------------------------------------------------------------------
 
 #[inline]
@@ -1613,7 +1613,7 @@ fn ring_mul_negacyclic<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: 
     // Karatsuba cuts mul count (64^2 -> 3^6 = 729) for d=64 and is algebraically identical.
     // Fall back to the signed schoolbook for non-pow2 dimensions.
     if d.is_power_of_two() && d > 1 {
-        // For d=64 (FrogRing64), Toom-4 beats Karatsuba without requiring NTT roots.
+        // For d=64 (GoldilocksRing64), Toom-4 beats Karatsuba without requiring NTT roots.
         if d == 64 && toom4_points_distinct::<F>() {
             return ring_mul_negacyclic_toom4::<F>(b, x, y);
         }
@@ -5969,7 +5969,7 @@ mod tests {
             .into_iter()
             .map(|i| i + squeeze_field_op_offset)
             .collect();
-        wiring_abs.frog_squeeze_ops = Vec::new();
+        wiring_abs.goldilocks_squeeze_ops = Vec::new();
         // Prepend prefix get_challenge u32 squeezes (same as the shape builder).
         let prefix_u32_squeeze_ops =
             super::collect_get_challenge_squeeze_field_indices(&ops_f257, 0, squeeze_field_op_offset);
@@ -5985,8 +5985,8 @@ mod tests {
             asg_pose,
             _shorts,
             _u32s,
-            _frogs,
-            _frog_rejection,
+            _goldilocks,
+            _goldilocks_rejection,
             _tcch0,
             _tcch1,
             _surfaces_mul,
@@ -6031,7 +6031,7 @@ mod tests {
     }
     #[test]
     #[ignore = "slow: builds Poseidon(F257) dR1CS schedule + checks all constraints (GoldilocksRing64)"]
-    fn test_tiny_gate_shape_builds_and_constraints_check_frog64() {
+    fn test_tiny_gate_shape_builds_and_constraints_check_goldilocks() {
         use cyclotomic_rings::rings::GoldilocksRing64 as RR;
 
         // Minimal-but-valid params to keep the schedule small.
@@ -6098,9 +6098,9 @@ mod tests {
         wiring_abs
             .u32_squeeze_ops
             .splice(0..0, prefix_u32_squeeze_ops.into_iter());
-        wiring_abs.frog_squeeze_ops = Vec::new();
+        wiring_abs.goldilocks_squeeze_ops = Vec::new();
 
-        let (inst, asg, _shorts, _u32s, _frogs, _frog_rejection, _tcch0, _tcch1, _sm, _ssq, _w) =
+        let (inst, asg, _shorts, _u32s, _goldilocks, _goldilocks_rejection, _tcch0, _tcch1, _sm, _ssq, _w) =
             tiny::we_tiny_f257_build_cm_gate_from_trace_ops(
                 None,
                 &ops_f257,
@@ -6712,13 +6712,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "legacy Frog-based WE-gate (2-field split); Theorem 4.3 tiny-field path selected"]
+    #[ignore = "legacy Goldilocks-based WE-gate (2-field split); Theorem 4.3 tiny-field path selected"]
     fn test_we_cm_proof_param_binding_mlen_unsat() {
         // Small-ish instance.
-        type PCF = cyclotomic_rings::rings::FrogPoseidonConfig;
+        type PCF = cyclotomic_rings::rings::GoldilocksPoseidonConfig;
         use cyclotomic_rings::rings::GetPoseidonParams;
         use ark_ff::Zero;
-        use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as RR;
+        use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as RR;
         use stark_rings::PolyRing;
 
         let k = 1usize;
@@ -6778,14 +6778,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "legacy Frog-based WE-gate (2-field split); Theorem 4.3 tiny-field path selected"]
+    #[ignore = "legacy Goldilocks-based WE-gate (2-field split); Theorem 4.3 tiny-field path selected"]
     fn test_we_cm_proof_unsat_on_constraint_var_flip() {
         // Reuse the same construction as the param-binding test, but flip a variable that is
         // guaranteed to appear in some constraint.
-        type PCF = cyclotomic_rings::rings::FrogPoseidonConfig;
+        type PCF = cyclotomic_rings::rings::GoldilocksPoseidonConfig;
         use cyclotomic_rings::rings::GetPoseidonParams;
         use ark_ff::Zero;
-        use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as RR;
+        use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as RR;
         use stark_rings::PolyRing;
 
         let k = 1usize;
@@ -6855,9 +6855,9 @@ mod tests {
         // Record a trace from a real verifier run, then replay that exact trace and ensure:
         // - all absorbs/squeezes line up
         // - verifier returns Ok
-        type PCF = cyclotomic_rings::rings::FrogPoseidonConfig;
+        type PCF = cyclotomic_rings::rings::GoldilocksPoseidonConfig;
         use ark_ff::Zero;
-        use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as RR;
+        use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as RR;
         use stark_rings::PolyRing;
 
         let k = 1usize;
@@ -6895,7 +6895,7 @@ mod tests {
     #[test]
     #[ignore = "slow: builds full Π_plus transcript schedule into Poseidon(F257) dR1CS"]
     fn test_plus_poseidon_schedule_lifts_to_f257_and_satisfies() {
-        use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as RR;
+        use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as RR;
         use stark_rings::PolyRing;
 
         // Small-ish params; we only care about schedule validity.
@@ -6926,14 +6926,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "legacy Frog-based WE-gate (2-field split); Theorem 4.3 tiny-field path selected"]
+    #[ignore = "legacy Goldilocks-based WE-gate (2-field split); Theorem 4.3 tiny-field path selected"]
     fn test_we_cm_proof_public_input_digest_unsat_on_flip() {
         // SP1-style: include exactly one public input digest, absorb it before proving/verifying,
         // and ensure flipping it in `public_x` breaks dR1CS satisfaction.
-        type PCF = cyclotomic_rings::rings::FrogPoseidonConfig;
+        type PCF = cyclotomic_rings::rings::GoldilocksPoseidonConfig;
         use ark_ff::Zero;
         use cyclotomic_rings::rings::GetPoseidonParams;
-        use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as RR;
+        use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as RR;
         use stark_rings::PolyRing;
         use sha2::{Digest, Sha256};
 
@@ -7014,10 +7014,10 @@ mod tests {
     #[test]
     #[ignore]
     fn test_large_trace() {
-        use cyclotomic_rings::rings::FrogPoseidonConfig as PCF;
+        use cyclotomic_rings::rings::GoldilocksPoseidonConfig as PCF;
         use cyclotomic_rings::rings::GetPoseidonParams;
         use sha2::{Digest, Sha256};
-        use cyclotomic_rings::rings::FrogRing64 as RR;
+        use cyclotomic_rings::rings::GoldilocksRing64 as RR;
         use stark_rings::PolyRing;
 
         use crate::we_statement::{digest32_to_bits_field, we_statement_hash_lf_plus, LFP_WE_GATE_DIGEST_V1};
@@ -7106,7 +7106,7 @@ mod tests {
         };
 
         let run_one = |label: &str, sp1_digest_bits: &[FSmall]| {
-            eprintln!("\n[test_large_trace] case={label} n=2^{n_pow} (sparse-base prover, FrogRing64)");
+            eprintln!("\n[test_large_trace] case={label} n=2^{n_pow} (sparse-base prover, GoldilocksRing64)");
             #[cfg(feature = "parallel")]
             eprintln!("[test_large_trace] rayon_threads={}", current_num_threads());
             #[cfg(not(feature = "parallel"))]
@@ -7396,7 +7396,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "legacy Frog-based WE-gate (2-field split); Theorem 4.3 tiny-field path selected"]
+    #[ignore = "legacy Goldilocks-based WE-gate (2-field split); Theorem 4.3 tiny-field path selected"]
     fn test_we_plus_prover_sparse_base_small_mock_sat() {
         init_rayon_stack();
         // A small end-to-end test for the **production** SP1-style path:
@@ -7407,13 +7407,13 @@ mod tests {
         //
         // This is intended to reproduce any "WE gate dr1cs satisfied: constraint ... failed"
         // regressions at a tiny scale (seconds, not minutes).
-        type PCF = cyclotomic_rings::rings::FrogPoseidonConfig;
+        type PCF = cyclotomic_rings::rings::GoldilocksPoseidonConfig;
         use cyclotomic_rings::rings::GetPoseidonParams;
         use sha2::{Digest, Sha256};
 
         // Use the same ring type as the SP1 oneproof harness (`examples/lf_plus_sp1_oneproof.rs`)
         // to ensure Π_decomp (2-digit) assumptions match production.
-        use cyclotomic_rings::rings::FrogRing64 as RR;
+        use cyclotomic_rings::rings::GoldilocksRing64 as RR;
         use stark_rings::PolyRing;
         use stark_rings_linalg::SparseMatrix;
         use std::sync::Arc;

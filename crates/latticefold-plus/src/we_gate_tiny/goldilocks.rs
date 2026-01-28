@@ -5,7 +5,7 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 
 use super::op_counts::tiny_cm_bump;
 
-use super::coins::frog_p_base128_digits_le;
+use super::coins::goldilocks_p_base128_digits_le;
 use super::digits::{
     add_bal16_same_len, alloc_bal16_digit, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
     alloc_carry_pm2, alloc_carry_pm32, alloc_carry_pm128, i32_to_f257,
@@ -13,24 +13,24 @@ use super::digits::{
 };
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
-use crate::we_frog_poseidon_f257::FROG_P;
+// NOTE: keep all modulus constants local to this module; do not import from elsewhere.
 use cyclotomic_rings::rings::goldilocks_ntt64 as gl_ntt64;
 
 /// Goldilocks prime field modulus: \(2^{64} - 2^{32} + 1\).
 ///
-/// This is NTT-friendly (large 2-adicity), unlike the Frog prime used elsewhere in this module.
+/// This is NTT-friendly (large 2-adicity), unlike the Goldilocks prime used elsewhere in this module.
 pub(crate) const GOLDILOCKS_P: u64 = 0xFFFF_FFFF_0000_0001;
 
 // NOTE: We intentionally do not provide a "fast but potentially wrapping" mode here.
 // The pm128 fused carry-chain style relations are not injective over the integers in F257
 // (see tests in `we_gate_tiny/tests.rs` demonstrating the 257 = 16^2 + 1 bubble).
 
-fn frog_p_bal16_digits_le_const() -> [i8; 17] {
+fn goldilocks_p_bal16_digits_le_const() -> [i8; 17] {
     // Match the balancing convention used by `u64_bytes_to_bal16_digits`:
     // carry_{i+1} = (nibble_i + carry_i >= 8), out_i = nibble_i + carry_i - 16*carry_{i+1}.
     let mut out = [0i8; 17];
     let mut carry: i16 = 0;
-    let mut x = FROG_P;
+    let mut x = GOLDILOCKS_P;
     for i in 0..16 {
         let nib = (x & 0xF) as i16;
         x >>= 4;
@@ -89,12 +89,12 @@ fn alloc_u64_as_bal16_digits_witness(b: &mut Dr1csBuilder<F257>, x: u64) -> Vec<
 /// given an unconstrained 64-bit integer `u` as 8 little-endian bytes, produce
 /// `(q, z)` such that:
 /// - `q ∈ {0,1}`
-/// - `u = z + q * p_frog` as an **integer** (no wrap), enforced via base-128 borrows over a
+/// - `u = z + q * p_goldilocks` as an **integer** (no wrap), enforced via base-128 borrows over a
 ///   bit-derived base-128 limb view of `u`.
 ///
 /// This is the "single subtract" reduction justified by \(2^{64} < 2p\).
 /// Takes raw byte variables that are already constrained to be 8-bit.
-pub(super) fn reduce_u64_mod_frog_from_byte_vars<F: PrimeField>(
+pub(super) fn reduce_u64_mod_goldilocks_from_byte_vars<F: PrimeField>(
     b: &mut Dr1csBuilder<F>,
     u_byte_vars: &[usize; 8],
 ) -> (usize /* q bit */, [usize; LIMBS_U64] /* z base-128 limbs */) {
@@ -109,7 +109,7 @@ pub(super) fn reduce_u64_mod_frog_from_byte_vars<F: PrimeField>(
             .unwrap_or(0);
     }
     let u = u64::from_le_bytes(u_buf);
-    let q_u8: u8 = if u >= FROG_P { 1 } else { 0 };
+    let q_u8: u8 = if u >= GOLDILOCKS_P { 1 } else { 0 };
     let q = alloc_bool::<F>(b, q_u8 == 1);
 
     // Decompose u_byte_vars into 64 bits.
@@ -141,7 +141,7 @@ pub(super) fn reduce_u64_mod_frog_from_byte_vars<F: PrimeField>(
 
     // Enforce q matches u >= p by comparing u_limbs (base-128) against p.
     // Comparator: run a base-128 borrow chain on (u - p) with witnessed borrows.
-    let p_digits = frog_p_base128_digits_le();
+    let p_digits = goldilocks_p_base128_digits_le();
     let mut bor = b.new_var(F::ZERO);
     b.enforce_var_eq_const(bor, F::ZERO);
     for i in 0..LIMBS_U64 {
@@ -193,7 +193,7 @@ pub(super) fn reduce_u64_mod_frog_from_byte_vars<F: PrimeField>(
     b.enforce_lc_times_one_eq_const(vec![(F::ONE, q), (-F::ONE, is_ge)]);
 
     // Now compute z limbs as witness and enforce u = z + q*p + base*borrow chain.
-    let z_u64 = if q_u8 == 1 { u - FROG_P } else { u };
+    let z_u64 = if q_u8 == 1 { u - GOLDILOCKS_P } else { u };
     let mut z_limbs = [0usize; LIMBS_U64];
     for i in 0..LIMBS_U64 {
         let zi = ((z_u64 >> (LIMB_BITS * i)) & (LIMB_BASE_U64 - 1)) as u64;
@@ -216,7 +216,7 @@ pub(super) fn reduce_u64_mod_frog_from_byte_vars<F: PrimeField>(
     //
     // We use `z_limbs` directly as the per-limb "difference", so we do not need an extra `diff_i`
     // variable (and its 7-bit range-check) per limb.
-    let p_digits = frog_p_base128_digits_le();
+    let p_digits = goldilocks_p_base128_digits_le();
     let mut borrow = b.new_var(F::ZERO);
     b.enforce_var_eq_const(borrow, F::ZERO);
     for i in 0..LIMBS_U64 {
@@ -256,7 +256,7 @@ pub(super) fn reduce_u64_mod_frog_from_byte_vars<F: PrimeField>(
     (q, z_limbs)
 }
 
-/// Enforce that an 8-byte little-endian integer `u` satisfies `u < p_frog`.
+/// Enforce that an 8-byte little-endian integer `u` satisfies `u < p_goldilocks`.
 ///
 /// This is the preferred "IO boundary" check for transcript-absorbed base-field elements.
 ///
@@ -265,18 +265,18 @@ pub(super) fn reduce_u64_mod_frog_from_byte_vars<F: PrimeField>(
 /// - packs them into 10 base-128 limbs (7-bit each)
 /// - runs a base-128 borrow chain on (u - p)
 /// - enforces the final borrow is 1 (i.e., u < p)
-pub(super) fn frog_u64_enforce_lt_p_from_byte_vars<F: PrimeField>(
+pub(super) fn goldilocks_u64_enforce_lt_p_from_byte_vars<F: PrimeField>(
     b: &mut Dr1csBuilder<F>,
     u_byte_vars: &[usize; 8],
 ) {
-    let _ = frog_u64_enforce_lt_p_from_byte_vars_and_limbs::<F>(b, u_byte_vars);
+    let _ = goldilocks_u64_enforce_lt_p_from_byte_vars_and_limbs::<F>(b, u_byte_vars);
 }
 
-/// Enforce `u < p_frog` and return `u` packed as base-128 limbs.
+/// Enforce `u < p_goldilocks` and return `u` packed as base-128 limbs.
 ///
 /// This is the "lt_p only" variant that avoids computing `u mod p` while still materializing the
 /// limb view needed by some downstream bounded gadgets.
-pub(super) fn frog_u64_enforce_lt_p_from_byte_vars_and_limbs<F: PrimeField>(
+pub(super) fn goldilocks_u64_enforce_lt_p_from_byte_vars_and_limbs<F: PrimeField>(
     b: &mut Dr1csBuilder<F>,
     u_byte_vars: &[usize; 8],
 ) -> [usize; LIMBS_U64] {
@@ -319,7 +319,7 @@ pub(super) fn frog_u64_enforce_lt_p_from_byte_vars_and_limbs<F: PrimeField>(
     }
 
     // Borrow chain for u - p. Final borrow == 1 iff u < p.
-    let p_digits = frog_p_base128_digits_le();
+    let p_digits = goldilocks_p_base128_digits_le();
     let mut borrow = b.new_var(F::ZERO);
     b.enforce_var_eq_const(borrow, F::ZERO);
     for i in 0..LIMBS_U64 {
@@ -372,13 +372,13 @@ pub(super) fn frog_u64_enforce_lt_p_from_byte_vars_and_limbs<F: PrimeField>(
     u_limbs
 }
 
-/// Enforce that a canonical Frog base-field element `u` (encoded as 8 bytes, u < p_frog)
+/// Enforce that a canonical Goldilocks base-field element `u` (encoded as 8 bytes, u < p_goldilocks)
 /// lies in the **centered magnitude** range \(|u| <= bound\), meaning:
 /// - u ∈ [0, bound]  (non-negative)
-/// - OR u ∈ [p_frog - bound, p_frog - 1]  (negative, in centered lift)
+/// - OR u ∈ [p_goldilocks - bound, p_goldilocks - 1]  (negative, in centered lift)
 ///
 /// Returns base-128 limbs of `u`.
-pub(super) fn frog_u64_centered_le_bound_from_byte_vars<F: PrimeField>(
+pub(super) fn goldilocks_u64_centered_le_bound_from_byte_vars<F: PrimeField>(
     b: &mut Dr1csBuilder<F>,
     u_byte_vars: &[usize; 8],
     bound: u64,
@@ -387,7 +387,7 @@ pub(super) fn frog_u64_centered_le_bound_from_byte_vars<F: PrimeField>(
     //
     // We intentionally avoid the heavier "reduce-then-assert-q=0" style gadget here;
     // for centered-bound checks we only need the limb view + the guarantee `u < p`.
-    let u_limbs = frog_u64_enforce_lt_p_from_byte_vars_and_limbs::<F>(b, u_byte_vars);
+    let u_limbs = goldilocks_u64_enforce_lt_p_from_byte_vars_and_limbs::<F>(b, u_byte_vars);
 
     // Witness u as u64 for boolean witnesses.
     let mut u_buf = [0u8; 8];
@@ -531,7 +531,7 @@ pub(super) fn frog_u64_centered_le_bound_from_byte_vars<F: PrimeField>(
     }
 
     let le_bound = le_const_base128::<F>(b, &u_limbs, u, bound);
-    let p_minus_bound = FROG_P.saturating_sub(bound);
+    let p_minus_bound = GOLDILOCKS_P.saturating_sub(bound);
     let ge_p_minus_bound = ge_const_base128::<F>(b, &u_limbs, u, p_minus_bound);
 
     // ok = le_bound OR ge_p_minus_bound
@@ -578,8 +578,8 @@ fn enforce_bal16_vec_eq(b: &mut Dr1csBuilder<F257>, a: &[usize], c: &[usize]) {
     }
 }
 
-fn frog_p_bytes_le() -> [u8; 8] {
-    FROG_P.to_le_bytes()
+fn goldilocks_p_bytes_le() -> [u8; 8] {
+    GOLDILOCKS_P.to_le_bytes()
 }
 
 /// Enforce `prod == q*p + r` in balanced base-16 digits *without* materializing `q*p` or `q*p+r`.
@@ -714,7 +714,7 @@ fn enforce_sub_mod_p_relation_bal16(
     b.enforce_var_eq_const(carry_var, F257::ZERO);
 }
 
-/// General Frog-field multiplication gadget (64-bit prime field) inside the tiny field.
+/// General Goldilocks-field multiplication gadget (64-bit prime field) inside the tiny field.
 ///
 /// Inputs are canonical u64 encodings as 8 little-endian byte vars (0..255), representing
 /// field elements in \([0, p)\).
@@ -724,24 +724,24 @@ fn enforce_sub_mod_p_relation_bal16(
 ///   a \cdot b = q \cdot p + r,\quad 0 \le r < p
 /// \]
 /// using balanced-base16 digit arithmetic (sound in F257), and returns `r` as 8 byte vars.
-pub(super) fn frog_mul_mod_p_from_byte_vars(
+pub(super) fn goldilocks_mul_mod_p_from_byte_vars(
     b: &mut Dr1csBuilder<F257>,
     a_bytes: &[usize; 8],
     b_bytes: &[usize; 8],
 ) -> [usize; 8] {
     // Ensure inputs are canonical (<p).
-    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, a_bytes);
-    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, b_bytes);
-    frog_mul_mod_p_from_byte_vars_assume_canonical(b, a_bytes, b_bytes)
+    goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(b, a_bytes);
+    goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(b, b_bytes);
+    goldilocks_mul_mod_p_from_byte_vars_assume_canonical(b, a_bytes, b_bytes)
 }
 
 #[inline]
-pub(super) fn frog_mul_mod_p_from_byte_vars_assume_canonical(
+pub(super) fn goldilocks_mul_mod_p_from_byte_vars_assume_canonical(
     b: &mut Dr1csBuilder<F257>,
     a_bytes: &[usize; 8],
     b_bytes: &[usize; 8],
 ) -> [usize; 8] {
-    let _prev = b.profile_enter("frog::mul_mod_p");
+    let _prev = b.profile_enter("goldilocks::mul_mod_p");
 
     // Witness compute.
     let mut ab = [0u8; 8];
@@ -763,8 +763,8 @@ pub(super) fn frog_mul_mod_p_from_byte_vars_assume_canonical(
     let a_u = u64::from_le_bytes(ab);
     let b_u = u64::from_le_bytes(bb);
     let prod: u128 = (a_u as u128) * (b_u as u128);
-    let q_u: u64 = (prod / (FROG_P as u128)) as u64;
-    let r_u: u64 = (prod % (FROG_P as u128)) as u64;
+    let q_u: u64 = (prod / (GOLDILOCKS_P as u128)) as u64;
+    let r_u: u64 = (prod % (GOLDILOCKS_P as u128)) as u64;
 
     // Allocate r as byte vars (output). The quotient `q` is internal; we allocate it directly as
     // balanced base-16 digits to avoid the expensive byte->digit conversion.
@@ -774,7 +774,7 @@ pub(super) fn frog_mul_mod_p_from_byte_vars_assume_canonical(
         r_bytes[i] = alloc_u8_var::<F257>(b, r_bytes_u8[i]);
     }
     // Enforce r is canonical (<p).
-    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
+    goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
 
     // Convert a,b,r and p to balanced-base16 digits.
     let a_d = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
@@ -784,7 +784,7 @@ pub(super) fn frog_mul_mod_p_from_byte_vars_assume_canonical(
 
     // Compute prod_digits = a*b (balanced digits, with headroom/carry already enforced in gadget).
     let prod_d = mul_bal16_long_by_long(b, &a_d, &b_d);
-    let p_d_const = frog_p_bal16_digits_le_const();
+    let p_d_const = goldilocks_p_bal16_digits_le_const();
     enforce_prod_eq_qp_plus_r_bal16(b, &prod_d, &q_d, &p_d_const, &r_d);
 
     let out = r_bytes;
@@ -792,28 +792,28 @@ pub(super) fn frog_mul_mod_p_from_byte_vars_assume_canonical(
     out
 }
 
-/// Multiply a canonical Frog scalar `x` by a **known constant** `c` (as u64 in `[0,p)`),
-/// returning a canonical Frog scalar (8-byte little-endian) for `x*c mod p`.
+/// Multiply a canonical Goldilocks scalar `x` by a **known constant** `c` (as u64 in `[0,p)`),
+/// returning a canonical Goldilocks scalar (8-byte little-endian) for `x*c mod p`.
 ///
-/// This is substantially cheaper than `frog_mul_mod_p_from_byte_vars` because it avoids all
+/// This is substantially cheaper than `goldilocks_mul_mod_p_from_byte_vars` because it avoids all
 /// digit×digit multiplications in the 64-bit integer product checks.
-pub(super) fn frog_mul_const_mod_p_from_byte_vars(
+pub(super) fn goldilocks_mul_const_mod_p_from_byte_vars(
     b: &mut Dr1csBuilder<F257>,
     x_bytes: &[usize; 8],
     c: u64,
 ) -> [usize; 8] {
-    assert!(c < FROG_P, "frog_mul_const_mod_p_from_byte_vars requires c < p");
-    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, x_bytes);
-    frog_mul_const_mod_p_from_byte_vars_assume_canonical(b, x_bytes, c)
+    assert!(c < GOLDILOCKS_P, "goldilocks_mul_const_mod_p_from_byte_vars requires c < p");
+    goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(b, x_bytes);
+    goldilocks_mul_const_mod_p_from_byte_vars_assume_canonical(b, x_bytes, c)
 }
 
 #[inline]
-pub(super) fn frog_mul_const_mod_p_from_byte_vars_assume_canonical(
+pub(super) fn goldilocks_mul_const_mod_p_from_byte_vars_assume_canonical(
     b: &mut Dr1csBuilder<F257>,
     x_bytes: &[usize; 8],
     c: u64,
 ) -> [usize; 8] {
-    let _prev = b.profile_enter("frog::mul_const_mod_p");
+    let _prev = b.profile_enter("goldilocks::mul_const_mod_p");
 
     // Witness compute.
     let mut xb = [0u8; 8];
@@ -827,8 +827,8 @@ pub(super) fn frog_mul_const_mod_p_from_byte_vars_assume_canonical(
     }
     let x_u = u64::from_le_bytes(xb);
     let prod: u128 = (x_u as u128) * (c as u128);
-    let q_u: u64 = (prod / (FROG_P as u128)) as u64;
-    let r_u: u64 = (prod % (FROG_P as u128)) as u64;
+    let q_u: u64 = (prod / (GOLDILOCKS_P as u128)) as u64;
+    let r_u: u64 = (prod % (GOLDILOCKS_P as u128)) as u64;
 
     // Allocate r as byte vars (output). The quotient `q` is internal; we allocate it directly as
     // balanced base-16 digits to avoid the expensive byte->digit conversion.
@@ -837,7 +837,7 @@ pub(super) fn frog_mul_const_mod_p_from_byte_vars_assume_canonical(
     for i in 0..8 {
         r_bytes[i] = alloc_u8_var::<F257>(b, r_bytes_u8[i]);
     }
-    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
+    goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
 
     // Convert x,r to bal16 digits (vars). `q` is allocated directly as balanced digits.
     let x_d = u64_bytes_to_bal16_digits_cached(b, *x_bytes);
@@ -846,7 +846,7 @@ pub(super) fn frog_mul_const_mod_p_from_byte_vars_assume_canonical(
 
     // Constant bal16 digits for c and p, computed directly (no variables/constraints).
     let c_d_const = u64_to_bal16_digits_le_const(c);
-    let p_d_const = frog_p_bal16_digits_le_const();
+    let p_d_const = goldilocks_p_bal16_digits_le_const();
 
     // prod_digits = x*c  (const-RHS)
     let prod_d = mul_bal16_long_by_const_rhs(b, &x_d, &c_d_const);
@@ -857,26 +857,26 @@ pub(super) fn frog_mul_const_mod_p_from_byte_vars_assume_canonical(
     out
 }
 
-/// General Frog-field addition gadget inside F257.
+/// General Goldilocks-field addition gadget inside F257.
 ///
 /// Enforces `r = (a + c) mod p` for canonical `a,c < p`, returning canonical `r` as 8 bytes.
-pub(super) fn frog_add_mod_p_from_byte_vars(
+pub(super) fn goldilocks_add_mod_p_from_byte_vars(
     b: &mut Dr1csBuilder<F257>,
     a_bytes: &[usize; 8],
     c_bytes: &[usize; 8],
 ) -> [usize; 8] {
-    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, a_bytes);
-    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, c_bytes);
-    frog_add_mod_p_from_byte_vars_assume_canonical(b, a_bytes, c_bytes)
+    goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(b, a_bytes);
+    goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(b, c_bytes);
+    goldilocks_add_mod_p_from_byte_vars_assume_canonical(b, a_bytes, c_bytes)
 }
 
 #[inline]
-pub(super) fn frog_add_mod_p_from_byte_vars_assume_canonical(
+pub(super) fn goldilocks_add_mod_p_from_byte_vars_assume_canonical(
     b: &mut Dr1csBuilder<F257>,
     a_bytes: &[usize; 8],
     c_bytes: &[usize; 8],
 ) -> [usize; 8] {
-    let _prev = b.profile_enter("frog::add_mod_p");
+    let _prev = b.profile_enter("goldilocks::add_mod_p");
 
     let mut ab = [0u8; 8];
     let mut cb = [0u8; 8];
@@ -897,8 +897,8 @@ pub(super) fn frog_add_mod_p_from_byte_vars_assume_canonical(
     let a_u = u64::from_le_bytes(ab);
     let c_u = u64::from_le_bytes(cb);
     let sum = (a_u as u128) + (c_u as u128);
-    let q_u8: u8 = if sum >= (FROG_P as u128) { 1 } else { 0 };
-    let r_u: u64 = if q_u8 == 1 { (sum - (FROG_P as u128)) as u64 } else { sum as u64 };
+    let q_u8: u8 = if sum >= (GOLDILOCKS_P as u128) { 1 } else { 0 };
+    let r_u: u64 = if q_u8 == 1 { (sum - (GOLDILOCKS_P as u128)) as u64 } else { sum as u64 };
 
     // `q_u8` is a witness-known 0/1 selector; use cached constants instead of allocating a boolean.
     let q = if q_u8 == 1 { b.one() } else { b.zero_var() };
@@ -907,9 +907,9 @@ pub(super) fn frog_add_mod_p_from_byte_vars_assume_canonical(
     for i in 0..8 {
         r_bytes[i] = alloc_u8_var::<F257>(b, r_bytes_u8[i]);
     }
-    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
+    goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
 
-    let p_d0_const = frog_p_bal16_digits_le_const();
+    let p_d0_const = goldilocks_p_bal16_digits_le_const();
     let a_d0 = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
     let c_d0 = u64_bytes_to_bal16_digits_cached(b, *c_bytes);
     let r_d0 = u64_bytes_to_bal16_digits_cached(b, r_bytes);
@@ -920,26 +920,26 @@ pub(super) fn frog_add_mod_p_from_byte_vars_assume_canonical(
     out
 }
 
-/// General Frog-field subtraction gadget inside F257.
+/// General Goldilocks-field subtraction gadget inside F257.
 ///
 /// Enforces `r = (a - c) mod p` for canonical `a,c < p`, returning canonical `r` as 8 bytes.
-pub(super) fn frog_sub_mod_p_from_byte_vars(
+pub(super) fn goldilocks_sub_mod_p_from_byte_vars(
     b: &mut Dr1csBuilder<F257>,
     a_bytes: &[usize; 8],
     c_bytes: &[usize; 8],
 ) -> [usize; 8] {
-    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, a_bytes);
-    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, c_bytes);
-    frog_sub_mod_p_from_byte_vars_assume_canonical(b, a_bytes, c_bytes)
+    goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(b, a_bytes);
+    goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(b, c_bytes);
+    goldilocks_sub_mod_p_from_byte_vars_assume_canonical(b, a_bytes, c_bytes)
 }
 
 #[inline]
-pub(super) fn frog_sub_mod_p_from_byte_vars_assume_canonical(
+pub(super) fn goldilocks_sub_mod_p_from_byte_vars_assume_canonical(
     b: &mut Dr1csBuilder<F257>,
     a_bytes: &[usize; 8],
     c_bytes: &[usize; 8],
 ) -> [usize; 8] {
-    let _prev = b.profile_enter("frog::sub_mod_p");
+    let _prev = b.profile_enter("goldilocks::sub_mod_p");
 
     let mut ab = [0u8; 8];
     let mut cb = [0u8; 8];
@@ -962,7 +962,7 @@ pub(super) fn frog_sub_mod_p_from_byte_vars_assume_canonical(
     let (q_u8, r_u) = if a_u >= c_u {
         (0u8, a_u - c_u)
     } else {
-        (1u8, (a_u as u128 + (FROG_P as u128) - (c_u as u128)) as u64)
+        (1u8, (a_u as u128 + (GOLDILOCKS_P as u128) - (c_u as u128)) as u64)
     };
 
     // `q_u8` is a witness-known 0/1 selector; use cached constants instead of allocating a boolean.
@@ -972,12 +972,12 @@ pub(super) fn frog_sub_mod_p_from_byte_vars_assume_canonical(
     for i in 0..8 {
         r_bytes[i] = alloc_u8_var::<F257>(b, r_bytes_u8[i]);
     }
-    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
+    goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
 
     let a_d0 = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
     let c_d0 = u64_bytes_to_bal16_digits_cached(b, *c_bytes);
     let r_d0 = u64_bytes_to_bal16_digits_cached(b, r_bytes);
-    let p_d0_const = frog_p_bal16_digits_le_const();
+    let p_d0_const = goldilocks_p_bal16_digits_le_const();
     enforce_sub_mod_p_relation_bal16(b, &a_d0, &c_d0, &r_d0, q, q_u8, &p_d0_const);
 
     let out = r_bytes;
@@ -985,7 +985,7 @@ pub(super) fn frog_sub_mod_p_from_byte_vars_assume_canonical(
     out
 }
 
-fn frog_zero_bytes(b: &mut Dr1csBuilder<F257>) -> [usize; 8] {
+fn goldilocks_zero_bytes(b: &mut Dr1csBuilder<F257>) -> [usize; 8] {
     // Allocate a single shared 0-byte variable and reuse it for all 8 limbs.
     //
     // Important: we intentionally do NOT eagerly bit-decompose this byte. If/when a downstream
@@ -997,40 +997,40 @@ fn frog_zero_bytes(b: &mut Dr1csBuilder<F257>) -> [usize; 8] {
     [z0; 8]
 }
 
-fn frog_one_bytes(b: &mut Dr1csBuilder<F257>) -> [usize; 8] {
-    let mut o = frog_zero_bytes(b);
+fn goldilocks_one_bytes(b: &mut Dr1csBuilder<F257>) -> [usize; 8] {
+    let mut o = goldilocks_zero_bytes(b);
     o[0] = b.new_var(F257::ONE);
     b.enforce_var_eq_const(o[0], F257::ONE);
     o
 }
 
-fn frog_from_u64_const_bytes(b: &mut Dr1csBuilder<F257>, c: u64) -> [usize; 8] {
+fn goldilocks_from_u64_const_bytes(b: &mut Dr1csBuilder<F257>, c: u64) -> [usize; 8] {
     let cb = c.to_le_bytes();
     let mut out = [0usize; 8];
     for i in 0..8 {
         out[i] = alloc_u8_var::<F257>(b, cb[i]);
     }
-    frog_u64_enforce_lt_p_from_byte_vars::<F257>(b, &out);
+    goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(b, &out);
     out
 }
 
-fn frog_add_many_mod_p(b: &mut Dr1csBuilder<F257>, terms: &[[usize; 8]]) -> [usize; 8] {
-    let mut acc = frog_zero_bytes(b);
+fn goldilocks_add_many_mod_p(b: &mut Dr1csBuilder<F257>, terms: &[[usize; 8]]) -> [usize; 8] {
+    let mut acc = goldilocks_zero_bytes(b);
     for t in terms {
-        acc = frog_add_mod_p_from_byte_vars_assume_canonical(b, &acc, t);
+        acc = goldilocks_add_mod_p_from_byte_vars_assume_canonical(b, &acc, t);
     }
     acc
 }
 
-/// Frog scalar in balanced base-16 digits (canonical u64 encoding).
+/// Goldilocks scalar in balanced base-16 digits (canonical u64 encoding).
 ///
 /// Representation matches `u64_bytes_to_bal16_digits_cached`:
 /// - 16 balanced digits in [-8,7]
 /// - plus a final carry digit in {0,1}
-pub(crate) type FrogScalar = [usize; 17];
+pub(crate) type GoldilocksScalar = [usize; 17];
 
 #[inline]
-fn vec17_to_arr17(v: Vec<usize>) -> FrogScalar {
+fn vec17_to_arr17(v: Vec<usize>) -> GoldilocksScalar {
     debug_assert_eq!(v.len(), 17);
     let mut out = [0usize; 17];
     for i in 0..17 {
@@ -1040,7 +1040,7 @@ fn vec17_to_arr17(v: Vec<usize>) -> FrogScalar {
 }
 
 #[inline]
-fn digits_to_u64_witness(b: &Dr1csBuilder<F257>, d: &FrogScalar) -> u64 {
+fn digits_to_u64_witness(b: &Dr1csBuilder<F257>, d: &GoldilocksScalar) -> u64 {
     let mut acc: i128 = 0;
     let mut pow: i128 = 1;
     for i in 0..17 {
@@ -1052,22 +1052,22 @@ fn digits_to_u64_witness(b: &Dr1csBuilder<F257>, d: &FrogScalar) -> u64 {
     acc as u64
 }
 
-/// Convert 8 little-endian byte vars (0..255) into a canonical Frog scalar (balanced base-16 digits, len 17).
+/// Convert 8 little-endian byte vars (0..255) into a canonical Goldilocks scalar (balanced base-16 digits, len 17).
 #[inline]
-pub(crate) fn frogscalar_from_u64_bytes_le_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 8]) -> FrogScalar {
+pub(crate) fn goldilocks_scalar_from_u64_bytes_le_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 8]) -> GoldilocksScalar {
     vec17_to_arr17(u64_bytes_to_bal16_digits_cached(b, bytes_le))
 }
 
-/// Digit-domain Frog addition: `r = a + c (mod p)`.
+/// Digit-domain Goldilocks addition: `r = a + c (mod p)`.
 #[inline]
-pub(crate) fn frog_add_mod_p_digits(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, c: &FrogScalar) -> FrogScalar {
+pub(crate) fn goldilocks_add_mod_p_digits(b: &mut Dr1csBuilder<F257>, a: &GoldilocksScalar, c: &GoldilocksScalar) -> GoldilocksScalar {
     tiny_cm_bump(|cc| cc.scalar_add += 1);
-    let p_d = frog_p_bal16_digits_le_const();
+    let p_d = goldilocks_p_bal16_digits_le_const();
     let a_u = digits_to_u64_witness(b, a);
     let c_u = digits_to_u64_witness(b, c);
     let sum = (a_u as u128) + (c_u as u128);
-    let q_u8: u8 = if sum >= (FROG_P as u128) { 1 } else { 0 };
-    let r_u: u64 = if q_u8 == 1 { (sum - (FROG_P as u128)) as u64 } else { sum as u64 };
+    let q_u8: u8 = if sum >= (GOLDILOCKS_P as u128) { 1 } else { 0 };
+    let r_u: u64 = if q_u8 == 1 { (sum - (GOLDILOCKS_P as u128)) as u64 } else { sum as u64 };
     // `q_u8` is witness-known (derived from canonical digits), so use cached constants.
     let q = if q_u8 == 1 { b.one() } else { b.zero_var() };
     let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
@@ -1075,17 +1075,17 @@ pub(crate) fn frog_add_mod_p_digits(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, 
     r_d
 }
 
-/// Digit-domain Frog subtraction: `r = a - c (mod p)`.
+/// Digit-domain Goldilocks subtraction: `r = a - c (mod p)`.
 #[inline]
-pub(crate) fn frog_sub_mod_p_digits(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, c: &FrogScalar) -> FrogScalar {
+pub(crate) fn goldilocks_sub_mod_p_digits(b: &mut Dr1csBuilder<F257>, a: &GoldilocksScalar, c: &GoldilocksScalar) -> GoldilocksScalar {
     tiny_cm_bump(|cc| cc.scalar_sub += 1);
-    let p_d = frog_p_bal16_digits_le_const();
+    let p_d = goldilocks_p_bal16_digits_le_const();
     let a_u = digits_to_u64_witness(b, a);
     let c_u = digits_to_u64_witness(b, c);
     let (q_u8, r_u) = if a_u >= c_u {
         (0u8, a_u - c_u)
     } else {
-        (1u8, (a_u as u128 + (FROG_P as u128) - (c_u as u128)) as u64)
+        (1u8, (a_u as u128 + (GOLDILOCKS_P as u128) - (c_u as u128)) as u64)
     };
     // `q_u8` is witness-known (derived from canonical digits), so use cached constants.
     let q = if q_u8 == 1 { b.one() } else { b.zero_var() };
@@ -1094,16 +1094,16 @@ pub(crate) fn frog_sub_mod_p_digits(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, 
     r_d
 }
 
-/// Digit-domain Frog multiplication: `r = a * c (mod p)`.
+/// Digit-domain Goldilocks multiplication: `r = a * c (mod p)`.
 #[inline]
-pub(crate) fn frog_mul_mod_p_digits(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, c: &FrogScalar) -> FrogScalar {
+pub(crate) fn goldilocks_mul_mod_p_digits(b: &mut Dr1csBuilder<F257>, a: &GoldilocksScalar, c: &GoldilocksScalar) -> GoldilocksScalar {
     tiny_cm_bump(|cc| cc.scalar_mul += 1);
-    let p_d = frog_p_bal16_digits_le_const();
+    let p_d = goldilocks_p_bal16_digits_le_const();
     let a_u = digits_to_u64_witness(b, a);
     let c_u = digits_to_u64_witness(b, c);
     let prod: u128 = (a_u as u128) * (c_u as u128);
-    let q_u: u64 = (prod / (FROG_P as u128)) as u64;
-    let r_u: u64 = (prod % (FROG_P as u128)) as u64;
+    let q_u: u64 = (prod / (GOLDILOCKS_P as u128)) as u64;
+    let r_u: u64 = (prod % (GOLDILOCKS_P as u128)) as u64;
     let q_d = alloc_u64_as_bal16_digits_witness(b, q_u);
     let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
     let prod_d = mul_bal16_long_by_long(b, a, c);
@@ -1120,9 +1120,9 @@ pub(crate) fn frog_mul_mod_p_digits(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, 
 /// Returns `c = a*b mod (X^64 + 1)` as 64 canonical u64 digit-encodings (bal16 digits).
 pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
     b: &mut Dr1csBuilder<F257>,
-    a: &[FrogScalar; 64],
-    c: &[FrogScalar; 64],
-) -> [FrogScalar; 64] {
+    a: &[GoldilocksScalar; 64],
+    c: &[GoldilocksScalar; 64],
+) -> [GoldilocksScalar; 64] {
     // Shared schedule constants from `cyclotomic-rings` (keeps host + gate in sync).
     let p: u64 = gl_ntt64::GOLDILOCKS_P_U64;
     let omega: u64 = gl_ntt64::OMEGA_U64;
@@ -1142,7 +1142,7 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
 
     // --- Digit-field helpers parameterized by modulus p.
     #[inline]
-    fn digits_to_u64_witness(b: &Dr1csBuilder<F257>, d: &FrogScalar) -> u64 {
+    fn digits_to_u64_witness(b: &Dr1csBuilder<F257>, d: &GoldilocksScalar) -> u64 {
         let mut acc: i128 = 0;
         let mut pow: i128 = 1;
         for i in 0..17 {
@@ -1154,7 +1154,7 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
         acc as u64
     }
     #[inline]
-    fn vec17_to_arr17(v: Vec<usize>) -> FrogScalar {
+    fn vec17_to_arr17(v: Vec<usize>) -> GoldilocksScalar {
         debug_assert_eq!(v.len(), 17);
         let mut out = [0usize; 17];
         for i in 0..17 {
@@ -1164,7 +1164,7 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
     }
 
     #[inline]
-    fn add_mod_p(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, c: &FrogScalar, p_u64: u64, p_d: &[i8; 17]) -> FrogScalar {
+    fn add_mod_p(b: &mut Dr1csBuilder<F257>, a: &GoldilocksScalar, c: &GoldilocksScalar, p_u64: u64, p_d: &[i8; 17]) -> GoldilocksScalar {
         let a_u = digits_to_u64_witness(b, a);
         let c_u = digits_to_u64_witness(b, c);
         let sum = (a_u as u128) + (c_u as u128);
@@ -1177,7 +1177,7 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
     }
 
     #[inline]
-    fn sub_mod_p(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, c: &FrogScalar, p_u64: u64, p_d: &[i8; 17]) -> FrogScalar {
+    fn sub_mod_p(b: &mut Dr1csBuilder<F257>, a: &GoldilocksScalar, c: &GoldilocksScalar, p_u64: u64, p_d: &[i8; 17]) -> GoldilocksScalar {
         let a_u = digits_to_u64_witness(b, a);
         let c_u = digits_to_u64_witness(b, c);
         let (q_u8, r_u) = if a_u >= c_u {
@@ -1192,7 +1192,7 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
     }
 
     #[inline]
-    fn mul_mod_p(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, c: &FrogScalar, p_u64: u64, p_d: &[i8; 17]) -> FrogScalar {
+    fn mul_mod_p(b: &mut Dr1csBuilder<F257>, a: &GoldilocksScalar, c: &GoldilocksScalar, p_u64: u64, p_d: &[i8; 17]) -> GoldilocksScalar {
         let a_u = digits_to_u64_witness(b, a);
         let c_u = digits_to_u64_witness(b, c);
         let prod: u128 = (a_u as u128) * (c_u as u128);
@@ -1206,15 +1206,15 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
     }
 
     #[inline]
-    fn mul_const_mod_p(b: &mut Dr1csBuilder<F257>, x: &FrogScalar, k: u64, p_u64: u64, p_d: &[i8; 17]) -> FrogScalar {
+    fn mul_const_mod_p(b: &mut Dr1csBuilder<F257>, x: &GoldilocksScalar, k: u64, p_u64: u64, p_d: &[i8; 17]) -> GoldilocksScalar {
         #[inline]
         fn enforce_prod_const_eq_qp_plus_r_bal16(
             b: &mut Dr1csBuilder<F257>,
-            x_d: &FrogScalar,
+            x_d: &GoldilocksScalar,
             k_d_const: &[i8; 17],
             q_d: &[usize],
             p_d_const: &[i8; 17],
-            r_d: &FrogScalar,
+            r_d: &GoldilocksScalar,
         ) {
             // Enforce: x*k == q*p + r in base-16 carry chain, without materializing x*k digits.
             //
@@ -1317,12 +1317,12 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
     // --- NTT plumbing (use shared twiddle tables).
     fn ntt_in_place(
         b: &mut Dr1csBuilder<F257>,
-        a: &mut [FrogScalar; 64],
+        a: &mut [GoldilocksScalar; 64],
         omega: u64,
         p_u64: u64,
         p_d: &[i8; 17],
     ) {
-        let zero: FrogScalar = [b.zero_var(); 17];
+        let zero: GoldilocksScalar = [b.zero_var(); 17];
         // Bit-reversal permutation (purely structural).
         let mut tmp = *a;
         for i in 0..64 {
@@ -1377,7 +1377,7 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
 
     fn intt_in_place(
         b: &mut Dr1csBuilder<F257>,
-        a: &mut [FrogScalar; 64],
+        a: &mut [GoldilocksScalar; 64],
         omega_inv: u64,
         inv_n: u64,
         p_u64: u64,
@@ -1427,18 +1427,18 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
     out
 }
 
-/// Negacyclic ring multiplication for `d=64` (FrogRing64), where coefficients are canonical Frog scalars.
+/// Negacyclic ring multiplication for `d=64` (GoldilocksRing64), where coefficients are canonical Goldilocks scalars.
 ///
-/// Returns `c = a*b mod (X^64 + 1)` as 64 canonical Frog scalars (bal16 digits).
+/// Returns `c = a*b mod (X^64 + 1)` as 64 canonical Goldilocks scalars (bal16 digits).
 ///
 /// This uses the same **Toom-4** block structure as the native WE gate (`we_gate_arith.rs`),
-/// but implemented over our byte-based Frog-field gadgets. The critical requirement is that
-/// interpolation uses `frog_mul_const_mod_p_from_byte_vars` (cheap const-mul), not full mul.
+/// but implemented over our byte-based Goldilocks-field gadgets. The critical requirement is that
+/// interpolation uses `goldilocks_mul_const_mod_p_from_byte_vars` (cheap const-mul), not full mul.
 pub(super) fn ring_mul_negacyclic_toom4_d64(
     b: &mut Dr1csBuilder<F257>,
-    a: &[FrogScalar; 64],
-    c: &[FrogScalar; 64],
-) -> [FrogScalar; 64] {
+    a: &[GoldilocksScalar; 64],
+    c: &[GoldilocksScalar; 64],
+) -> [GoldilocksScalar; 64] {
     ring_mul_negacyclic_d64_impl::<false>(b, a, c)
 }
 
@@ -1448,23 +1448,23 @@ pub(super) fn ring_mul_negacyclic_toom4_d64(
 /// and much simpler interpolation (mostly ±1 coefficients).
 pub(super) fn ring_mul_negacyclic_karatsuba_d64(
     b: &mut Dr1csBuilder<F257>,
-    a: &[FrogScalar; 64],
-    c: &[FrogScalar; 64],
-) -> [FrogScalar; 64] {
+    a: &[GoldilocksScalar; 64],
+    c: &[GoldilocksScalar; 64],
+) -> [GoldilocksScalar; 64] {
     ring_mul_negacyclic_d64_impl::<true>(b, a, c)
 }
 
 fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
     b: &mut Dr1csBuilder<F257>,
-    a: &[FrogScalar; 64],
-    c: &[FrogScalar; 64],
-) -> [FrogScalar; 64] {
-    let _prev = b.profile_enter("frog::ring_mul_negacyclic_toom4_d64");
+    a: &[GoldilocksScalar; 64],
+    c: &[GoldilocksScalar; 64],
+) -> [GoldilocksScalar; 64] {
+    let _prev = b.profile_enter("goldilocks::ring_mul_negacyclic_toom4_d64");
     // NOTE: We intentionally do NOT canonical-validate all 128 inputs here.
     //
     // Canonicality should be enforced at the *true* byte-boundaries (transcript absorb / IO),
     // not redundantly inside every internal ring multiplication. This function itself reduces
-    // and outputs canonical Frog elements where needed by downstream gadgets.
+    // and outputs canonical Goldilocks elements where needed by downstream gadgets.
     // Precomputed inv(Vandermonde(0,±1,±2,±3)) entries as nums/720.
     const NUMS: [[i64; 7]; 7] = [
         [720, 0, 0, 0, 0, 0, 0],
@@ -1495,16 +1495,16 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
             }
             (t as u128 % (p as u128)) as u64
         }
-        inv_mod_u64(720u64, FROG_P)
+        inv_mod_u64(720u64, GOLDILOCKS_P)
     };
 
     let pts: [i64; 7] = [0, 1, -1, 2, -2, 3, -3];
 
-    let p_d_const = frog_p_bal16_digits_le_const();
-    let zero: FrogScalar = [b.zero_var(); 17];
+    let p_d_const = goldilocks_p_bal16_digits_le_const();
+    let zero: GoldilocksScalar = [b.zero_var(); 17];
 
     #[inline]
-    fn digits_to_u64_witness(b: &Dr1csBuilder<F257>, d: &FrogScalar) -> u64 {
+    fn digits_to_u64_witness(b: &Dr1csBuilder<F257>, d: &GoldilocksScalar) -> u64 {
         let mut acc: i128 = 0;
         let mut pow: i128 = 1;
         for i in 0..17 {
@@ -1517,7 +1517,7 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
     }
 
     #[inline]
-    fn vec17_to_arr17(v: Vec<usize>) -> FrogScalar {
+    fn vec17_to_arr17(v: Vec<usize>) -> GoldilocksScalar {
         debug_assert_eq!(v.len(), 17);
         let mut out = [0usize; 17];
         for i in 0..17 {
@@ -1527,12 +1527,12 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
     }
 
     #[inline]
-    fn add_mod_p(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, c: &FrogScalar, p: &[i8; 17]) -> FrogScalar {
+    fn add_mod_p(b: &mut Dr1csBuilder<F257>, a: &GoldilocksScalar, c: &GoldilocksScalar, p: &[i8; 17]) -> GoldilocksScalar {
         let a_u = digits_to_u64_witness(b, a);
         let c_u = digits_to_u64_witness(b, c);
         let sum = (a_u as u128) + (c_u as u128);
-        let q_u8: u8 = if sum >= (FROG_P as u128) { 1 } else { 0 };
-        let r_u: u64 = if q_u8 == 1 { (sum - (FROG_P as u128)) as u64 } else { sum as u64 };
+        let q_u8: u8 = if sum >= (GOLDILOCKS_P as u128) { 1 } else { 0 };
+        let r_u: u64 = if q_u8 == 1 { (sum - (GOLDILOCKS_P as u128)) as u64 } else { sum as u64 };
         let q = if q_u8 == 1 { b.one() } else { b.zero_var() };
         let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
         enforce_add_mod_p_relation_bal16(b, a, c, &r_d, q, q_u8, p);
@@ -1540,13 +1540,13 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
     }
 
     #[inline]
-    fn sub_mod_p(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, c: &FrogScalar, p: &[i8; 17]) -> FrogScalar {
+    fn sub_mod_p(b: &mut Dr1csBuilder<F257>, a: &GoldilocksScalar, c: &GoldilocksScalar, p: &[i8; 17]) -> GoldilocksScalar {
         let a_u = digits_to_u64_witness(b, a);
         let c_u = digits_to_u64_witness(b, c);
         let (q_u8, r_u) = if a_u >= c_u {
             (0u8, a_u - c_u)
         } else {
-            (1u8, (a_u as u128 + (FROG_P as u128) - (c_u as u128)) as u64)
+            (1u8, (a_u as u128 + (GOLDILOCKS_P as u128) - (c_u as u128)) as u64)
         };
         let q = if q_u8 == 1 { b.one() } else { b.zero_var() };
         let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
@@ -1555,12 +1555,12 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
     }
 
     #[inline]
-    fn mul_mod_p(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, c: &FrogScalar, p: &[i8; 17]) -> FrogScalar {
+    fn mul_mod_p(b: &mut Dr1csBuilder<F257>, a: &GoldilocksScalar, c: &GoldilocksScalar, p: &[i8; 17]) -> GoldilocksScalar {
         let a_u = digits_to_u64_witness(b, a);
         let c_u = digits_to_u64_witness(b, c);
         let prod: u128 = (a_u as u128) * (c_u as u128);
-        let q_u: u64 = (prod / (FROG_P as u128)) as u64;
-        let r_u: u64 = (prod % (FROG_P as u128)) as u64;
+        let q_u: u64 = (prod / (GOLDILOCKS_P as u128)) as u64;
+        let r_u: u64 = (prod % (GOLDILOCKS_P as u128)) as u64;
         let q_d = alloc_u64_as_bal16_digits_witness(b, q_u);
         let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
         let prod_d = mul_bal16_long_by_long(b, a, c);
@@ -1571,14 +1571,14 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
     #[inline]
     fn mul_const_mod_p(
         b: &mut Dr1csBuilder<F257>,
-        x: &FrogScalar,
+        x: &GoldilocksScalar,
         c_u64: u64,
         p: &[i8; 17],
-    ) -> FrogScalar {
+    ) -> GoldilocksScalar {
         let x_u = digits_to_u64_witness(b, x);
         let prod: u128 = (x_u as u128) * (c_u64 as u128);
-        let q_u: u64 = (prod / (FROG_P as u128)) as u64;
-        let r_u: u64 = (prod % (FROG_P as u128)) as u64;
+        let q_u: u64 = (prod / (GOLDILOCKS_P as u128)) as u64;
+        let r_u: u64 = (prod % (GOLDILOCKS_P as u128)) as u64;
         let q_d = alloc_u64_as_bal16_digits_witness(b, q_u);
         let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
         let c_d_const = u64_to_bal16_digits_le_const(c_u64);
@@ -1662,16 +1662,16 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
     }
 
     /// Compute `Σ_i (coeffs[i] * evals[i]) mod p`, where:
-    /// - evals[i] are canonical Frog elements (bal16 digits),
+    /// - evals[i] are canonical Goldilocks elements (bal16 digits),
     /// - coeffs[i] are u64 constants in [0,p).
     ///
     /// This avoids per-term modular reduction: it accumulates the integer products in bal16 digit
     /// space, then performs a single `S = q*p + r` reduction.
     fn lincomb7_mod_p_from_canonical_evals(
         b: &mut Dr1csBuilder<F257>,
-        evals: &[FrogScalar; 7],
+        evals: &[GoldilocksScalar; 7],
         coeffs: &[u64; 7],
-    ) -> FrogScalar {
+    ) -> GoldilocksScalar {
         lincomb_mod_p_from_canonical_evals::<7>(b, evals, coeffs)
     }
 
@@ -1680,9 +1680,9 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
     /// Like `lincomb7_mod_p_from_canonical_evals` but for a fixed arity `N`.
     fn lincomb_mod_p_from_canonical_evals<const N: usize>(
         b: &mut Dr1csBuilder<F257>,
-        evals: &[FrogScalar; N],
+        evals: &[GoldilocksScalar; N],
         coeffs: &[u64; N],
-    ) -> FrogScalar {
+    ) -> GoldilocksScalar {
         // Witness compute q, r for Σ coeff_i * eval_i.
         let mut lo: u128 = 0;
         let mut hi: u64 = 0;
@@ -1703,7 +1703,7 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         let n2 = hi;
         let n1 = (lo >> 64) as u64;
         let n0 = (lo & (u64::MAX as u128)) as u64;
-        let (q_u128, r_u64) = div_rem_u192_by_u64(n2, n1, n0, FROG_P);
+        let (q_u128, r_u64) = div_rem_u192_by_u64(n2, n1, n0, GOLDILOCKS_P);
 
         // Allocate r directly as bal16 digits (canonical u64 encoding).
         let r17 = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u64));
@@ -1714,7 +1714,7 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         // stream the digit convolution of the whole sum:
         //   acc = Σ_i (eval_i * coeff_i)  (coeff_i are u64 constants)
         // producing balanced digits in [-8,7] with a bounded carry.
-        let p_d_const = frog_p_bal16_digits_le_const();
+        let p_d_const = goldilocks_p_bal16_digits_le_const();
         const TARGET_LEN: usize = 43;
 
         // Precompute constant bal16 digits for each coefficient.
@@ -1864,16 +1864,16 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
 
     fn eval_deg3_poly_at_t(
         b: &mut Dr1csBuilder<F257>,
-        a0: &FrogScalar,
-        a1: &FrogScalar,
-        a2: &FrogScalar,
-        a3: &FrogScalar,
+        a0: &GoldilocksScalar,
+        a1: &GoldilocksScalar,
+        a2: &GoldilocksScalar,
+        a3: &GoldilocksScalar,
         t: i64,
-    ) -> FrogScalar {
+    ) -> GoldilocksScalar {
         // coeffs = [1, t, t^2, t^3] mod p
-        let t1 = mod_i64_to_u64(t, FROG_P);
-        let t2 = mod_i64_to_u64(t * t, FROG_P);
-        let t3 = mod_i64_to_u64(t * t * t, FROG_P);
+        let t1 = mod_i64_to_u64(t, GOLDILOCKS_P);
+        let t2 = mod_i64_to_u64(t * t, GOLDILOCKS_P);
+        let t3 = mod_i64_to_u64(t * t * t, GOLDILOCKS_P);
         let coeffs = [1u64, t1, t2, t3];
         let evals = [*a0, *a1, *a2, *a3];
         lincomb_mod_p_from_canonical_evals::<4>(b, &evals, &coeffs)
@@ -1889,19 +1889,19 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
     let c2 = &c[32..48];
     let c3 = &c[48..64];
 
-    // Recursive Toom-4 poly mul for length n=16 over Frog scalars (returns len 31).
+    // Recursive Toom-4 poly mul for length n=16 over Goldilocks scalars (returns len 31).
     fn poly_mul_toom4_len16(
         b: &mut Dr1csBuilder<F257>,
-        a: &Vec<FrogScalar>,
-        c: &Vec<FrogScalar>,
+        a: &Vec<GoldilocksScalar>,
+        c: &Vec<GoldilocksScalar>,
         inv720: u64,
         p_d_const: &[i8; 17],
-    ) -> Vec<FrogScalar> {
+    ) -> Vec<GoldilocksScalar> {
         debug_assert_eq!(a.len(), 16);
         debug_assert_eq!(c.len(), 16);
-        // Base case at n=1 would be frog_mul_mod_p; but for n=16 we do one Toom-4 level (m=4) then base mults at n=4 via schoolbook.
+        // Base case at n=1 would be goldilocks_mul_mod_p; but for n=16 we do one Toom-4 level (m=4) then base mults at n=4 via schoolbook.
 
-        let zero: FrogScalar = [b.zero_var(); 17];
+        let zero: GoldilocksScalar = [b.zero_var(); 17];
 
         // Helper: fixed-shape Karatsuba convolution for n=4 (length-7 output).
         //
@@ -1910,21 +1910,21 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         #[inline(always)]
         fn karatsuba_len4(
             b: &mut Dr1csBuilder<F257>,
-            a: &[FrogScalar; 4],
-            c: &[FrogScalar; 4],
-            zero: FrogScalar,
+            a: &[GoldilocksScalar; 4],
+            c: &[GoldilocksScalar; 4],
+            zero: GoldilocksScalar,
             p_d_const: &[i8; 17],
-        ) -> Vec<FrogScalar> {
+        ) -> Vec<GoldilocksScalar> {
             // 2x2 Karatsuba: 4 muls -> 3 muls.
             #[inline(always)]
             fn karatsuba_len2(
                 b: &mut Dr1csBuilder<F257>,
-                a0: &FrogScalar,
-                a1: &FrogScalar,
-                b0: &FrogScalar,
-                b1: &FrogScalar,
+                a0: &GoldilocksScalar,
+                a1: &GoldilocksScalar,
+                b0: &GoldilocksScalar,
+                b1: &GoldilocksScalar,
                 p_d_const: &[i8; 17],
-            ) -> [FrogScalar; 3] {
+            ) -> [GoldilocksScalar; 3] {
                 // z0 = a0*b0
                 let z0 = mul_mod_p(b, a0, b0, p_d_const);
                 // z2 = a1*b1
@@ -1999,17 +1999,17 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         let (c2, c3) = rest.split_at(m);
 
         let pts: [i64; 7] = [0, 1, -1, 2, -2, 3, -3];
-        let mut w_eval: Vec<Vec<FrogScalar>> = Vec::with_capacity(7);
+        let mut w_eval: Vec<Vec<GoldilocksScalar>> = Vec::with_capacity(7);
         for &t in &pts {
-            let mut ae: Vec<FrogScalar> = Vec::with_capacity(m);
-            let mut ce: Vec<FrogScalar> = Vec::with_capacity(m);
+            let mut ae: Vec<GoldilocksScalar> = Vec::with_capacity(m);
+            let mut ce: Vec<GoldilocksScalar> = Vec::with_capacity(m);
             for i in 0..m {
                 ae.push(eval_deg3_poly_at_t(b, &a0[i], &a1[i], &a2[i], &a3[i], t));
                 ce.push(eval_deg3_poly_at_t(b, &c0[i], &c1[i], &c2[i], &c3[i], t));
             }
             // Base multiply (len-4 × len-4 -> len-7): use Karatsuba to reduce non-native muls.
-            let ae4: [FrogScalar; 4] = [ae[0], ae[1], ae[2], ae[3]];
-            let ce4: [FrogScalar; 4] = [ce[0], ce[1], ce[2], ce[3]];
+            let ae4: [GoldilocksScalar; 4] = [ae[0], ae[1], ae[2], ae[3]];
+            let ce4: [GoldilocksScalar; 4] = [ce[0], ce[1], ce[2], ce[3]];
             w_eval.push(karatsuba_len4(b, &ae4, &ce4, zero, p_d_const)); // len 7 (2m-1)
         }
 
@@ -2030,7 +2030,7 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         // Here m=4 and block length is (2m-1)=7. Shifts by m cause an overlap of length 3:
         // for each j>=1 and k in 0..2, index (j*m+k) receives contributions from
         // block[j][k] and block[j-1][k+m].
-        let mut block: Vec<Vec<FrogScalar>> = vec![vec![zero; 2 * m - 1]; 7];
+        let mut block: Vec<Vec<GoldilocksScalar>> = vec![vec![zero; 2 * m - 1]; 7];
         for k in 0..(2 * m - 1) {
             // For fixed k, the 7 evaluation values are reused across all 7 j-blocks.
             let mut evals = [zero; 7];
@@ -2043,14 +2043,14 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
                 for i in 0..7 {
                     let n = NUMS[j][i];
                     if n != 0 {
-                        coeffs[i] = modmul_i64_u64(n, inv720, FROG_P);
+                        coeffs[i] = modmul_i64_u64(n, inv720, GOLDILOCKS_P);
                     }
                 }
                 block[j][k] = lincomb7_mod_p_from_canonical_evals(b, &evals, &coeffs);
             }
         }
 
-        let mut res: Vec<FrogScalar> = vec![zero; 2 * 16 - 1]; // len 31
+        let mut res: Vec<GoldilocksScalar> = vec![zero; 2 * 16 - 1]; // len 31
         // j=0 has no left-overlap.
         for k in 0..(2 * m - 1) {
             res[k] = block[0][k];
@@ -2073,12 +2073,12 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
     }
 
     // Top-level multiply: either Toom-4 (existing) or Karatsuba/Toom-2.
-    let prod: Vec<FrogScalar> = if !KARATSUBA {
+    let prod: Vec<GoldilocksScalar> = if !KARATSUBA {
         // Evaluate at 7 points, multiply (len16), interpolate into convolution len 127, then fold.
-        let mut w_eval_top: Vec<Vec<FrogScalar>> = Vec::with_capacity(7);
+        let mut w_eval_top: Vec<Vec<GoldilocksScalar>> = Vec::with_capacity(7);
         for &t in &pts {
-            let mut ae: Vec<FrogScalar> = Vec::with_capacity(16);
-            let mut ce: Vec<FrogScalar> = Vec::with_capacity(16);
+            let mut ae: Vec<GoldilocksScalar> = Vec::with_capacity(16);
+            let mut ce: Vec<GoldilocksScalar> = Vec::with_capacity(16);
             for i in 0..16 {
                 ae.push(eval_deg3_poly_at_t(b, &a0[i], &a1[i], &a2[i], &a3[i], t));
                 ce.push(eval_deg3_poly_at_t(b, &c0[i], &c1[i], &c2[i], &c3[i], t));
@@ -2091,7 +2091,7 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         // With block length 31 and shift 16, overlaps are of length 15:
         // for each j>=1 and k in 0..14, index (16j+k) receives contributions from
         // block[j][k] and block[j-1][k+16].
-        let mut block: Vec<Vec<FrogScalar>> = vec![vec![zero; 31]; 7];
+        let mut block: Vec<Vec<GoldilocksScalar>> = vec![vec![zero; 31]; 7];
         for k in 0..31 {
             // For fixed k, the 7 evaluation values are reused across all 7 j-blocks.
             let mut evals = [zero; 7];
@@ -2104,14 +2104,14 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
                 for i in 0..7 {
                     let n = NUMS[j][i];
                     if n != 0 {
-                        coeffs[i] = modmul_i64_u64(n, inv720, FROG_P);
+                        coeffs[i] = modmul_i64_u64(n, inv720, GOLDILOCKS_P);
                     }
                 }
                 block[j][k] = lincomb7_mod_p_from_canonical_evals(b, &evals, &coeffs);
             }
         }
 
-        let mut prod: Vec<FrogScalar> = vec![zero; 2 * 64 - 1]; // len 127
+        let mut prod: Vec<GoldilocksScalar> = vec![zero; 2 * 64 - 1]; // len 127
         // j=0 has no left-overlap.
         for k in 0..31 {
             prod[k] = block[0][k];
@@ -2135,10 +2135,10 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         // Karatsuba/Toom-2 for length 64 using Toom-4 length-16 as the base multiplier.
         fn poly_add_same_len(
             b: &mut Dr1csBuilder<F257>,
-            x: &[FrogScalar],
-            y: &[FrogScalar],
+            x: &[GoldilocksScalar],
+            y: &[GoldilocksScalar],
             p_d_const: &[i8; 17],
-        ) -> Vec<FrogScalar> {
+        ) -> Vec<GoldilocksScalar> {
             debug_assert_eq!(x.len(), y.len());
             x.iter()
                 .zip(y.iter())
@@ -2147,10 +2147,10 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         }
         fn poly_sub_same_len(
             b: &mut Dr1csBuilder<F257>,
-            x: &[FrogScalar],
-            y: &[FrogScalar],
+            x: &[GoldilocksScalar],
+            y: &[GoldilocksScalar],
             p_d_const: &[i8; 17],
-        ) -> Vec<FrogScalar> {
+        ) -> Vec<GoldilocksScalar> {
             debug_assert_eq!(x.len(), y.len());
             x.iter()
                 .zip(y.iter())
@@ -2160,8 +2160,8 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
 
         fn poly_add_into_shifted(
             b: &mut Dr1csBuilder<F257>,
-            acc: &mut Vec<FrogScalar>,
-            src: &[FrogScalar],
+            acc: &mut Vec<GoldilocksScalar>,
+            src: &[GoldilocksScalar],
             shift: usize,
             p_d_const: &[i8; 17],
         ) {
@@ -2173,12 +2173,12 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
 
         fn poly_mul_karatsuba_len32(
             b: &mut Dr1csBuilder<F257>,
-            a32: &[FrogScalar],
-            c32: &[FrogScalar],
+            a32: &[GoldilocksScalar],
+            c32: &[GoldilocksScalar],
             inv720: u64,
-            zero: FrogScalar,
+            zero: GoldilocksScalar,
             p_d_const: &[i8; 17],
-        ) -> Vec<FrogScalar> {
+        ) -> Vec<GoldilocksScalar> {
             debug_assert_eq!(a32.len(), 32);
             debug_assert_eq!(c32.len(), 32);
             let (a0, a1) = a32.split_at(16);
@@ -2200,10 +2200,10 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
             out
         }
 
-        let a_lo: Vec<FrogScalar> = a[0..32].to_vec();
-        let a_hi: Vec<FrogScalar> = a[32..64].to_vec();
-        let c_lo: Vec<FrogScalar> = c[0..32].to_vec();
-        let c_hi: Vec<FrogScalar> = c[32..64].to_vec();
+        let a_lo: Vec<GoldilocksScalar> = a[0..32].to_vec();
+        let a_hi: Vec<GoldilocksScalar> = a[32..64].to_vec();
+        let c_lo: Vec<GoldilocksScalar> = c[0..32].to_vec();
+        let c_hi: Vec<GoldilocksScalar> = c[32..64].to_vec();
 
         let s_a = poly_add_same_len(b, &a_lo, &a_hi, &p_d_const);
         let s_c = poly_add_same_len(b, &c_lo, &c_hi, &p_d_const);

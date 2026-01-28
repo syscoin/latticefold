@@ -119,7 +119,7 @@ fn br_from_i128<BR: Ring + From<u128>>(x: i128) -> BR {
 /// with each digit in `[-digit_abs_max, digit_abs_max]`.
 ///
 /// This is the decomposition model that matches what the verifier can enforce today via
-/// unit-monomial exponents: for Frog(d=64), `digit_abs_max = d/2 - 1 = 31`.
+/// unit-monomial exponents: for Goldilocks(d=64), `digit_abs_max = d/2 - 1 = 31`.
 #[inline]
 fn bounded_decompose_to_digits<BR>(
     x: BR,

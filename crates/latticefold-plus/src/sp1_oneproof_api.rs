@@ -7,8 +7,8 @@
 
 #![cfg(feature = "we_gate")]
 
-use cyclotomic_rings::rings::{FrogPoseidonConfig as PC, GetPoseidonParams};
-use cyclotomic_rings::rings::FrogRing64 as R;
+use cyclotomic_rings::rings::{GetPoseidonParams, GoldilocksPoseidonConfig as PC};
+use cyclotomic_rings::rings::GoldilocksRing64 as R;
 use ark_ff::{BigInteger, PrimeField};
 use latticefold::commitment::AjtaiCommitmentScheme;
 use latticefold::transcript::poseidon::F257;
@@ -94,7 +94,7 @@ pub fn run_sp1_oneproof_we_gate_from_files(
         .map_err(|e| format!("load_sp1_witness_any: {e}"))?;
     let (w_u64, _base_len, _aux_len) = (bundle.witness, bundle.base_len, bundle.aux_len);
 
-    // Map u64 witness -> Frog base field scalars once (centered embedding mod p_bb).
+    // Map u64 witness -> Goldilocks base field scalars once (centered embedding mod p_bb).
     let p_bb = cache.stats.p_bb;
     let mut w_host: Vec<F> = Vec::with_capacity(w_u64.len());
     for &x in &w_u64 {

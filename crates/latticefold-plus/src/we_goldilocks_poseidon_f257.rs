@@ -1,4 +1,4 @@
-//! Experimental: emulate (parts of) Frog verifier plumbing inside a tiny field (F257) dR1CS.
+//! Experimental: emulate (parts of) goldilocks verifier plumbing inside a tiny field (F257) dR1CS.
 //!
 //! ## IMPORTANT: radix choice in F257
 //! This file originally experimented with **base-256 byte limbs** and carry constraints.
@@ -15,8 +15,8 @@
 use ark_ff::{BigInteger, PrimeField};
 use symphony::dpp_sumcheck::Dr1csBuilder;
 
-// TEMP (GL64 experiment): treat the "Frog modulus" as Goldilocks.
-pub(crate) const FROG_P: u64 = 0xFFFF_FFFF_0000_0001u64;
+// TEMP (GL64 experiment): treat the "goldilocks modulus" as Goldilocks.
+pub(crate) const GOLDILOCKS_P: u64 = 0xFFFF_FFFF_0000_0001u64;
 
 const LIMB_BASE_U64: u64 = 128;
 const LIMB_BITS: usize = 7;
@@ -63,9 +63,9 @@ fn alloc_u7<F: PrimeField>(b: &mut Dr1csBuilder<F>, d: u8) -> usize {
     v
 }
 
-fn frog_p_base128_digits_le() -> [u8; LIMBS_U64] {
+fn goldilocks_p_base128_digits_le() -> [u8; LIMBS_U64] {
     let mut out = [0u8; LIMBS_U64];
-    let mut t = FROG_P;
+    let mut t = GOLDILOCKS_P;
     for i in 0..LIMBS_U64 {
         out[i] = (t & (LIMB_BASE_U64 - 1)) as u8;
         t >>= LIMB_BITS;
@@ -97,10 +97,10 @@ fn base128_num_to_u64<F: PrimeField>(b: &Dr1csBuilder<F>, x: &Base128Num) -> u64
     acc
 }
 
-fn cmp_u_ge_frog_p_base128<F: PrimeField>(b: &mut Dr1csBuilder<F>, u: &Base128Num) -> usize {
+fn cmp_u_ge_goldilocks_p_base128<F: PrimeField>(b: &mut Dr1csBuilder<F>, u: &Base128Num) -> usize {
     // Compare u >= p by running a base-128 borrow chain on (u - p).
     let u_u64 = base128_num_to_u64::<F>(b, u);
-    let p_digits = frog_p_base128_digits_le();
+    let p_digits = goldilocks_p_base128_digits_le();
 
     let mut borrow = const_var::<F>(b, F::ZERO);
     let mut borrow_final = const_var::<F>(b, F::ZERO);
@@ -148,25 +148,25 @@ fn cmp_u_ge_frog_p_base128<F: PrimeField>(b: &mut Dr1csBuilder<F>, u: &Base128Nu
     is_ge
 }
 
-fn reduce_u64_mod_frog_base128<F: PrimeField>(b: &mut Dr1csBuilder<F>, u: &Base128Num) -> (Base128Num, usize) {
+fn reduce_u64_mod_goldilocks_base128<F: PrimeField>(b: &mut Dr1csBuilder<F>, u: &Base128Num) -> (Base128Num, usize) {
     // No-loop reduction: since p > 2^63, for u in [0,2^64) we have floor(u/p) ∈ {0,1}.
     let u_u64 = base128_num_to_u64::<F>(b, u);
-    let q_bit = if u_u64 >= FROG_P { 1u8 } else { 0u8 };
+    let q_bit = if u_u64 >= GOLDILOCKS_P { 1u8 } else { 0u8 };
     let q = alloc_bool::<F>(b, q_bit == 1);
 
     // Also enforce q matches (u >= p) via a separate compare (prevents non-canonical choice).
-    let is_ge = cmp_u_ge_frog_p_base128::<F>(b, u);
+    let is_ge = cmp_u_ge_goldilocks_p_base128::<F>(b, u);
     b.enforce_lc_times_one_eq_const(vec![(F::ONE, q), (-F::ONE, is_ge)]);
 
     // z = u - q*p (base-128 subtraction with borrows), and enforce final borrow=0.
-    let z_u64 = if q_bit == 1 { u_u64 - FROG_P } else { u_u64 };
+    let z_u64 = if q_bit == 1 { u_u64 - GOLDILOCKS_P } else { u_u64 };
     let mut z_limbs = [0usize; LIMBS_U64];
     for i in 0..LIMBS_U64 {
         let di = ((z_u64 >> (LIMB_BITS * i)) & (LIMB_BASE_U64 - 1)) as u8;
         z_limbs[i] = alloc_u7::<F>(b, di);
     }
     let z = Base128Num { limbs: z_limbs };
-    let p_digits = frog_p_base128_digits_le();
+    let p_digits = goldilocks_p_base128_digits_le();
 
     let mut borrow = const_var::<F>(b, F::ZERO);
     for i in 0..LIMBS_U64 {
@@ -209,8 +209,8 @@ fn reduce_u64_mod_frog_base128<F: PrimeField>(b: &mut Dr1csBuilder<F>, u: &Base1
 pub fn count_one_boundary_canon_bytes<F: PrimeField>() -> (usize, usize) {
     let mut b = Dr1csBuilder::<F>::new();
     // Build u in [0,2^64), and reduce mod p with a single conditional subtract.
-    let u = alloc_u64_base128::<F>(&mut b, (FROG_P / 2) + 12345);
-    let _zq = reduce_u64_mod_frog_base128::<F>(&mut b, &u);
+    let u = alloc_u64_base128::<F>(&mut b, (GOLDILOCKS_P / 2) + 12345);
+    let _zq = reduce_u64_mod_goldilocks_base128::<F>(&mut b, &u);
     let (inst, _asg) = b.into_instance();
     (inst.nvars, inst.constraints.len())
 }
@@ -234,7 +234,7 @@ mod tests {
     fn print_stub_constraint_count() {
         let (nvars, ncons) = count_one_boundary_canon_bytes::<F257>();
         eprintln!(
-            "[we_frog_poseidon_f257] reduce_u64_mod_frog_base128 nvars={} constraints={}",
+            "[we_GOLDILOCKS_Poseidon_f257] reduce_u64_mod_goldilocks_base128 nvars={} constraints={}",
             nvars, ncons
         );
         assert!(nvars > 0 && ncons > 0);
@@ -245,11 +245,11 @@ mod tests {
         let mut b = Dr1csBuilder::<F257>::new();
         let u_native: u64 = 18446744073709551615u64; // 2^64-1 edge case
         let u = alloc_u64_base128::<F257>(&mut b, u_native);
-        let (z, q) = reduce_u64_mod_frog_base128::<F257>(&mut b, &u);
+        let (z, q) = reduce_u64_mod_goldilocks_base128::<F257>(&mut b, &u);
         let z_u = base128_num_to_u64::<F257>(&b, &z);
         let q_u = b.assignment[q].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0);
-        assert_eq!(z_u, u_native % FROG_P);
-        assert_eq!(q_u, if u_native >= FROG_P { 1 } else { 0 });
+        assert_eq!(z_u, u_native % GOLDILOCKS_P);
+        assert_eq!(q_u, if u_native >= GOLDILOCKS_P { 1 } else { 0 });
         let (inst, asg) = b.into_instance();
         inst.check(&asg).expect("constraints should be satisfied");
     }

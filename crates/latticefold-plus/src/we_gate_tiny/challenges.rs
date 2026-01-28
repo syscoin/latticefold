@@ -26,8 +26,8 @@ pub struct TinyCoinOpWiring {
     /// Each logical `get_challenge()` performs `DEFAULT_REJECTION_TRIES` consecutive `SqueezeField(len=8)`
     /// attempts (each followed by an absorb); this vector stores the **first** squeeze-op index of each group.
     pub u32_squeeze_ops: Vec<usize>,
-    /// `SqueezeField(len=8)` op indices for Frog rejection candidates (length must be `n_coins*tries`).
-    pub frog_squeeze_ops: Vec<usize>,
+    /// `SqueezeField(len=8)` op indices for Goldilocks-field rejection candidates (length must be `n_coins*tries`).
+    pub goldilocks_squeeze_ops: Vec<usize>,
 }
 
 /// Helper: number of `short_challenge(128)` blocks used by CM (the `s` and `s_prime` surface).
@@ -55,7 +55,7 @@ fn cm_bounded_u32_challenges(log_kappa: usize, nvars_cm: usize) -> usize {
 /// This follows the CM transcript schedule in `cm.rs`:
 /// - first consume `short_need` occurrences of `SqueezeField(len=ring_dim)` for `short_challenge(128)`
 /// - then consume `u32_need` occurrences of `SqueezeField(len=8)` for bounded scalar challenges
-/// - optionally, treat the next `frog_need` occurrences of `SqueezeField(len=8)` as Frog coin candidates
+/// - optionally, treat the next `goldilocks_need` occurrences of `SqueezeField(len=8)` as Goldilocks coin candidates
 ///
 /// IMPORTANT:
 /// - This is a **schedule** parser. It does not validate re-absorbs; Poseidon arithmetization handles that.
@@ -68,7 +68,7 @@ pub fn infer_cm_coin_op_wiring_from_ops(
     log_kappa: usize,
     nvars_cm: usize,
     squeeze_field_op_offset: usize,
-    frog_need: usize,
+    goldilocks_need: usize,
 ) -> Result<TinyCoinOpWiring, String> {
     let short_need = cm_short_challenge_blocks(ring_dim, k);
     let u32_need = cm_bounded_u32_challenges(log_kappa, nvars_cm);
@@ -110,9 +110,9 @@ pub fn infer_cm_coin_op_wiring_from_ops(
                     && out.u32_squeeze_ops.len() == u32_need
                     && v.len() == DIGITS_PER_TRY
                     && next_is_reabsorb_try
-                    && out.frog_squeeze_ops.len() < frog_need
+                    && out.goldilocks_squeeze_ops.len() < goldilocks_need
                 {
-                    out.frog_squeeze_ops
+                    out.goldilocks_squeeze_ops
                         .push(squeeze_field_op_idx - squeeze_field_op_offset);
                 }
             }
@@ -120,7 +120,7 @@ pub fn infer_cm_coin_op_wiring_from_ops(
         }
         if out.short_squeeze_ops.len() == short_need
             && out.u32_squeeze_ops.len() == u32_need
-            && out.frog_squeeze_ops.len() == frog_need
+            && out.goldilocks_squeeze_ops.len() == goldilocks_need
         {
             break;
         }
@@ -141,11 +141,11 @@ pub fn infer_cm_coin_op_wiring_from_ops(
             out.u32_squeeze_ops.len()
         ));
     }
-    if out.frog_squeeze_ops.len() != frog_need {
+    if out.goldilocks_squeeze_ops.len() != goldilocks_need {
         return Err(format!(
-            "infer_cm_coin_op_wiring: need {} frog squeezes (len=8), got {}",
-            frog_need,
-            out.frog_squeeze_ops.len()
+            "infer_cm_coin_op_wiring: need {} goldilocks squeezes (len=8), got {}",
+            goldilocks_need,
+            out.goldilocks_squeeze_ops.len()
         ));
     }
     Ok(out)
@@ -317,18 +317,18 @@ pub struct BoundedU32ChallengeWiring {
     pub bal16_sq_digits: Vec<usize>,
 }
 
-/// Wiring for a Frog-field challenge derived from a `get_challenge()` digit block.
+/// Wiring for a Goldilocks-field challenge derived from a `get_challenge()` digit block.
 ///
 /// We also expose the residue mod 257 for cheap tiny-field “stage 0” CM constraints.
 #[derive(Clone, Debug)]
-pub struct FrogChallengeWiring {
+pub struct GoldilocksChallengeWiring {
     /// The 8 digit vars (F257) consumed for this challenge (schedule-only).
     pub digit_vars: Vec<usize>,
     /// The 8 byte-view vars (256 -> 0), little-endian.
     pub byte_vars: [usize; 8],
-    /// Reduction bit `q ∈ {0,1}` such that u64 = z + q*p_frog.
+    /// Reduction bit `q ∈ {0,1}` such that u64 = z + q*p_Goldilocks.
     pub q_bit: usize,
-    /// Reduced Frog value `z` as base-128 limbs (little-endian).
+    /// Reduced Goldilocks value `z` as base-128 limbs (little-endian).
     pub limbs: [usize; LIMBS_U64],
     /// The residue of the u64 byte-view modulo 257 (in F257), i.e. Σ (-1)^i * byte[i].
     pub res257: usize,
