@@ -518,15 +518,15 @@ where
     // (17 digits per coefficient) rather than 8-byte little-endian scalars.
     //
     // This keeps each transcript element in [0..=256], so `lift_recording_trace_ops_to_f257` remains valid.
-    let tiny_digit_transcript_on = std::env::var("LFP_TINY_DIGIT_TRANSCRIPT").ok().as_deref() == Some("1");
+    let tiny_digit_transcript_on =
+        std::env::var("LFP_TINY_DIGIT_TRANSCRIPT").ok().as_deref() == Some("1");
     let mut absorb_ring_digits17 = |tr: &mut TracePoseidonTranscript<R>, ring_dim: usize| {
-        // For schedule/shape generation, the absorbed ring element is `ZERO`, so each coefficient is 0.
-        // Canonical balanced-digit encoding of 0 is 17 zeros.
-        for _coeff in 0..ring_dim {
-            for _dig in 0..17 {
-                tr.absorb_field_element(&BF::<R>::ZERO);
-            }
-        }
+        // Absorb a ring element as balanced base-16 digits directly (one byte per digit).
+        //
+        // For schedule/shape generation, the absorbed ring element is `ZERO`, so each coefficient is 0
+        // and its canonical digit encoding is 17 zeros.
+        let zeros = vec![0u8; ring_dim * 17];
+        tr.absorb_bytes_raw(&zeros);
     };
 
     // Dcom::verify: absorb witness commitments (cm_f, C_Mf, cm_mtau), each ring elem.

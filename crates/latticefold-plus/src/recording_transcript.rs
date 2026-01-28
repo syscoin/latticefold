@@ -167,6 +167,15 @@ where
         self.trace.absorbed.extend_from_slice(&lifted);
         self.trace.ops.push(PoseidonTraceOp::Absorb(lifted));
     }
+
+    /// Absorb a raw byte string into the transcript sponge (one F257 element per byte).
+    ///
+    /// This is used by the tiny-gate "digit transcript" mode to absorb balanced digits directly
+    /// without going through fixed-width base-field encodings (which would multiply bytes by 8).
+    pub fn absorb_bytes_raw(&mut self, bytes: &[u8]) {
+        let elems = bytes.iter().map(|b| F257::from(*b as u64)).collect::<Vec<_>>();
+        self.absorb_f257_elems_vec(elems);
+    }
 }
 
 impl<R: OverField> Transcript<R> for TracePoseidonTranscript<R>
