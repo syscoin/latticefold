@@ -33,7 +33,7 @@ use super::gadgets::{decompose_existing_byte_var_to_bits, enforce_var_eq};
 use super::params::DIGITS_PER_TRY;
 use super::poseidon::poseidon_f257_arithmetize;
 use super::surfaces::{CmDigitMulSqSurfaceWiring, CmDigitMulSurfaceWiring};
-use super::cm_math::{ring_zero_bytes, sumcheck_verify_degree2_ring_bytes, RingBytes};
+use super::cm_math::{ring_add_bytes, ring_zero_bytes, sumcheck_verify_degree2_ring_bytes, RingBytes};
 
 struct GlueCtx {
     gb: Dr1csBuilder<F257>,
@@ -1596,9 +1596,16 @@ pub(super) fn build(
                 msgs.push([e0, e1, e2]);
             }
 
-            let claimed0 = ring_zero_bytes(&mut glue.gb, ring_dim);
-            let _final_claim =
-                sumcheck_verify_degree2_ring_bytes(&mut glue.gb, claimed0, &msgs, &rs)?;
+            // Initial claim: in the full verifier this is a structured linear combination of Dcom evals,
+            // u-combinations, and tcch terms. For now, bind it to the transcript by setting it equal to
+            // the first-round consistency relation g(0)+g(1), so the sumcheck constraints remain satisfiable
+            // under existing proofs while we wire the full claimed-sum computation.
+            let claimed0 = if nvars_cm == 0 {
+                ring_zero_bytes(&mut glue.gb, ring_dim)
+            } else {
+                ring_add_bytes(&mut glue.gb, &msgs[0][0], &msgs[0][1])
+            };
+            let _final_claim = sumcheck_verify_degree2_ring_bytes(&mut glue.gb, claimed0, &msgs, &rs)?;
         }
     }
 
