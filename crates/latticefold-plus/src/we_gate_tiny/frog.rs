@@ -1067,7 +1067,8 @@ pub(crate) fn frog_add_mod_p_digits(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, 
     let sum = (a_u as u128) + (c_u as u128);
     let q_u8: u8 = if sum >= (FROG_P as u128) { 1 } else { 0 };
     let r_u: u64 = if q_u8 == 1 { (sum - (FROG_P as u128)) as u64 } else { sum as u64 };
-    let q = alloc_bool::<F257>(b, q_u8 == 1);
+    // `q_u8` is witness-known (derived from canonical digits), so use cached constants.
+    let q = if q_u8 == 1 { b.one() } else { b.zero_var() };
     let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
     enforce_add_mod_p_relation_bal16(b, a, c, &r_d, q, q_u8, &p_d);
     r_d
@@ -1085,7 +1086,8 @@ pub(crate) fn frog_sub_mod_p_digits(b: &mut Dr1csBuilder<F257>, a: &FrogScalar, 
     } else {
         (1u8, (a_u as u128 + (FROG_P as u128) - (c_u as u128)) as u64)
     };
-    let q = alloc_bool::<F257>(b, q_u8 == 1);
+    // `q_u8` is witness-known (derived from canonical digits), so use cached constants.
+    let q = if q_u8 == 1 { b.one() } else { b.zero_var() };
     let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
     enforce_sub_mod_p_relation_bal16(b, a, c, &r_d, q, q_u8, &p_d);
     r_d
@@ -1195,7 +1197,7 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
         let sum = (a_u as u128) + (c_u as u128);
         let q_u8: u8 = if sum >= (p_u64 as u128) { 1 } else { 0 };
         let r_u: u64 = if q_u8 == 1 { (sum - (p_u64 as u128)) as u64 } else { sum as u64 };
-        let q = alloc_bool::<F257>(b, q_u8 == 1);
+        let q = if q_u8 == 1 { b.one() } else { b.zero_var() };
         let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
         enforce_add_mod_p_relation_bal16(b, a, c, &r_d, q, q_u8, p_d);
         r_d
@@ -1210,7 +1212,7 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
         } else {
             (1u8, (a_u as u128 + (p_u64 as u128) - (c_u as u128)) as u64)
         };
-        let q = alloc_bool::<F257>(b, q_u8 == 1);
+        let q = if q_u8 == 1 { b.one() } else { b.zero_var() };
         let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
         enforce_sub_mod_p_relation_bal16(b, a, c, &r_d, q, q_u8, p_d);
         r_d
@@ -1551,7 +1553,7 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         let sum = (a_u as u128) + (c_u as u128);
         let q_u8: u8 = if sum >= (FROG_P as u128) { 1 } else { 0 };
         let r_u: u64 = if q_u8 == 1 { (sum - (FROG_P as u128)) as u64 } else { sum as u64 };
-        let q = alloc_bool::<F257>(b, q_u8 == 1);
+        let q = if q_u8 == 1 { b.one() } else { b.zero_var() };
         let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
         enforce_add_mod_p_relation_bal16(b, a, c, &r_d, q, q_u8, p);
         r_d
@@ -1566,7 +1568,7 @@ fn ring_mul_negacyclic_d64_impl<const KARATSUBA: bool>(
         } else {
             (1u8, (a_u as u128 + (FROG_P as u128) - (c_u as u128)) as u64)
         };
-        let q = alloc_bool::<F257>(b, q_u8 == 1);
+        let q = if q_u8 == 1 { b.one() } else { b.zero_var() };
         let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
         enforce_sub_mod_p_relation_bal16(b, a, c, &r_d, q, q_u8, p);
         r_d
