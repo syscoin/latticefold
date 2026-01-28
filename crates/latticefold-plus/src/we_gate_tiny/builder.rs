@@ -36,7 +36,7 @@ use super::poseidon::poseidon_f257_arithmetize;
 use super::surfaces::{CmDigitMulSqSurfaceWiring, CmDigitMulSurfaceWiring};
 
 use super::cm_math::{
-    eq_eval_frog_digits, eval_t_z_optimized_ring_digits, frog_bytes_to_digits, frog_pow_table_digits,
+    eq_eval_frog_digits, eval_t_z_optimized_ring_digits_pair, frog_bytes_to_digits, frog_pow_table_digits,
     ring_add_bytes, ring_add_digits, ring_bytes_to_digits, ring_eq_digits, ring_mul_negacyclic_digits_d64,
     ring_scale_digits, ring_zero_bytes, sumcheck_verify_degree2_ring_bytes,
     tensor_frog_ringconst_digits, tensor_frog_scalars_digits, RingBytes, RingDigits,
@@ -2161,10 +2161,15 @@ pub(super) fn build(
                 // Evaluate t0(ro), t1(ro).
                 // `eval_t_z_optimized_ring_digits` only needs `x_powers.len()` (we use the specialized
                 // basis evaluator in digit domain), so we pass a lightweight length-only table.
-                let xp_len = ring_dim;
-                let xp: Vec<RingDigits> = vec![Vec::new(); xp_len];
-                let t0 = eval_t_z_optimized_ring_digits(&mut glue.gb, tc0_ring, sp_ring, dpp, &xp, &rs_digits)?;
-                let t1 = eval_t_z_optimized_ring_digits(&mut glue.gb, tc1_ring, sp_ring, dpp, &xp, &rs_digits)?;
+                let (t0, t1) = eval_t_z_optimized_ring_digits_pair(
+                    &mut glue.gb,
+                    tc0_ring,
+                    tc1_ring,
+                    sp_ring,
+                    dpp,
+                    ring_dim,
+                    &rs_digits,
+                )?;
                 lf_stage_log("cm_recomb_t0t1_done", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
                 // Stream recombination:

@@ -490,10 +490,10 @@ pub(crate) fn eval_t_z_optimized_ring_digits(
     tensor_c_ring: &[RingDigits],
     s_prime_flat: &[RingDigits],
     dpp: &[RingDigits],
-    x_powers: &[RingDigits],
+    ring_dim: usize,
     r: &[FrogScalar],
 ) -> Result<RingDigits, String> {
-    let sizes = [x_powers.len(), dpp.len(), s_prime_flat.len(), tensor_c_ring.len()];
+    let sizes = [ring_dim, dpp.len(), s_prime_flat.len(), tensor_c_ring.len()];
     if sizes.iter().any(|&s| s == 0 || !s.is_power_of_two()) {
         return Err("eval_t_z_optimized_ring_digits: expected power-of-two non-empty factor sizes".to_string());
     }
@@ -512,9 +512,8 @@ pub(crate) fn eval_t_z_optimized_ring_digits(
     let v1 = eval_small_mle_ring_digits(gb, tensor_c_ring, r1);
     let v2 = eval_small_mle_ring_digits(gb, s_prime_flat, r2);
     let v3 = eval_small_mle_ring_digits(gb, dpp, r3);
-    // IMPORTANT: `x_powers` is expected to be the unit-monomial basis table. Use a specialized
-    // evaluator to avoid O(d log d) ring-scalar multiplications.
-    let v4 = eval_x_powers_basis_mle_ring_digits(gb, r4, x_powers.len())?;
+    // `x_powers` is the unit-monomial basis, evaluated via tensor weights.
+    let v4 = eval_x_powers_basis_mle_ring_digits(gb, r4, ring_dim)?;
 
     let mut res = ring_mul_negacyclic_digits_d64(gb, &v1, &v2)?;
     res = ring_mul_negacyclic_digits_d64(gb, &res, &v3)?;
@@ -527,5 +526,64 @@ pub(crate) fn eval_t_z_optimized_ring_digits(
         pad = frog_mul_mod_p_digits(gb, &pad, &om);
     }
     Ok(ring_scale_digits(gb, &res, &pad))
+}
+
+/// Compute `t0(ro)` and `t1(ro)` together, sharing the expensive common subcomputations.
+///
+/// This is identical to calling `eval_t_z_optimized_ring_digits` twice, but avoids duplicating:
+/// - evaluation of `s_prime_flat` MLE,
+/// - evaluation of `dpp` MLE,
+/// - basis `x_powers` tensor weights,
+/// - pad computation.
+pub(crate) fn eval_t_z_optimized_ring_digits_pair(
+    gb: &mut Dr1csBuilder<F257>,
+    tensor_c0_ring: &[RingDigits],
+    tensor_c1_ring: &[RingDigits],
+    s_prime_flat: &[RingDigits],
+    dpp: &[RingDigits],
+    ring_dim: usize,
+    r: &[FrogScalar],
+) -> Result<(RingDigits, RingDigits), String> {
+    let sizes = [ring_dim, dpp.len(), s_prime_flat.len(), tensor_c0_ring.len(), tensor_c1_ring.len()];
+    if sizes.iter().any(|&s| s == 0 || !s.is_power_of_two()) {
+        return Err("eval_t_z_optimized_ring_digits_pair: expected power-of-two non-empty factor sizes".to_string());
+    }
+    if tensor_c0_ring.len() != tensor_c1_ring.len() {
+        return Err("eval_t_z_optimized_ring_digits_pair: tensor_c length mismatch".to_string());
+    }
+    let vars4 = [ring_dim, dpp.len(), s_prime_flat.len(), tensor_c0_ring.len()].map(|s| ark_std::log2(s) as usize);
+    let tensor_vars = vars4.iter().sum::<usize>();
+    if r.len() < tensor_vars {
+        return Err("eval_t_z_optimized_ring_digits_pair: r too short".to_string());
+    }
+    let r4 = &r[0..vars4[0]];
+    let r3 = &r[vars4[0]..vars4[0] + vars4[1]];
+    let r2 = &r[vars4[0] + vars4[1]..vars4[0] + vars4[1] + vars4[2]];
+    let r1 = &r[vars4[0] + vars4[1] + vars4[2]..tensor_vars];
+
+    let v2 = eval_small_mle_ring_digits(gb, s_prime_flat, r2);
+    let v3 = eval_small_mle_ring_digits(gb, dpp, r3);
+    let v4 = eval_x_powers_basis_mle_ring_digits(gb, r4, ring_dim)?;
+
+    // Common product u = v2*v3*v4.
+    let mut u = ring_mul_negacyclic_digits_d64(gb, &v2, &v3)?;
+    u = ring_mul_negacyclic_digits_d64(gb, &u, &v4)?;
+
+    // v1 differs between t0/t1.
+    let v10 = eval_small_mle_ring_digits(gb, tensor_c0_ring, r1);
+    let v11 = eval_small_mle_ring_digits(gb, tensor_c1_ring, r1);
+
+    let mut res0 = ring_mul_negacyclic_digits_d64(gb, &v10, &u)?;
+    let mut res1 = ring_mul_negacyclic_digits_d64(gb, &v11, &u)?;
+
+    // Shared padding factor.
+    let mut pad = frog_const_u64_digits(gb, 1u64);
+    for rj in &r[tensor_vars..] {
+        let om = frog_one_minus_digits(gb, rj);
+        pad = frog_mul_mod_p_digits(gb, &pad, &om);
+    }
+    res0 = ring_scale_digits(gb, &res0, &pad);
+    res1 = ring_scale_digits(gb, &res1, &pad);
+    Ok((res0, res1))
 }
 
