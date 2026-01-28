@@ -626,7 +626,8 @@ fn parse_and_enforce_cm_after_short(
     let mut absorb_idx = 0usize;
     let mut squeeze_field_op_idx = 0usize;
     let mut after_short = false;
-    let mut prev_was_squeeze_field = false;
+    let mut last_squeeze_len: Option<usize> = None;
+    let mut last_squeeze_is_get_challenge_try = false;
     let mut payload_after_short: Vec<(usize, usize)> = Vec::new();
     for op in ops {
         match op {
@@ -635,8 +636,11 @@ fn parse_and_enforce_cm_after_short(
                     after_short = true;
                 }
                 squeeze_field_op_idx += 1;
-                // `get_challenge()` reabsorbs the squeezed digits; skip that absorb.
-                prev_was_squeeze_field = !v.is_empty();
+                // Only `get_challenge()` reabsorbs: it always squeezes 8 digits and then immediately
+                // absorbs those same 8 digits. `squeeze_bytes(n)` is also recorded as `SqueezeField(len=n)`
+                // but is *not* reabsorbed.
+                last_squeeze_len = Some(v.len());
+                last_squeeze_is_get_challenge_try = v.len() == DIGITS_PER_TRY;
             }
             PoseidonTraceOp::Absorb(_v) => {
                 let (ab_start, ab_len) = *pose_wiring
@@ -644,15 +648,17 @@ fn parse_and_enforce_cm_after_short(
                     .get(absorb_idx)
                     .ok_or("tiny gate: pose_wiring.absorb_ranges oob (cm-after-short)")?;
                 absorb_idx += 1;
-                let is_reabsorb = prev_was_squeeze_field;
-                prev_was_squeeze_field = false;
+                let is_reabsorb = last_squeeze_is_get_challenge_try && last_squeeze_len == Some(ab_len);
+                last_squeeze_len = None;
+                last_squeeze_is_get_challenge_try = false;
                 if after_short && !is_reabsorb {
                     payload_after_short.push((ab_start, ab_len));
                 }
             }
             PoseidonTraceOp::SqueezeBytes { .. } => {
                 // Legacy; does not affect absorb parsing.
-                prev_was_squeeze_field = false;
+                last_squeeze_len = None;
+                last_squeeze_is_get_challenge_try = false;
             }
         }
     }
