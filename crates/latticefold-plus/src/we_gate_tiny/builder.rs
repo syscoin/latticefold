@@ -1507,11 +1507,15 @@ fn enforce_nonreabsorb_absorbs_are_canonical_goldilocks(
 ) -> Result<(), String> {
     let mut absorb_idx = 0usize;
     let mut expect_reabsorb = false;
-    for op in ops {
+    for (op_i, op) in ops.iter().enumerate() {
         match op {
             PoseidonTraceOp::SqueezeField(v) => {
-                // Only get_challenge() does a fiat–shamir reabsorb, and it always squeezes 8 digits.
-                expect_reabsorb = v.len() == DIGITS_PER_TRY;
+                // Only `get_challenge()` does a fiat–shamir reabsorb. In the trace that is
+                // exactly: SqueezeField(len=8) immediately followed by Absorb(len=8).
+                //
+                // Be strict here so we don't accidentally treat other squeezes as reabsorbs.
+                expect_reabsorb = v.len() == DIGITS_PER_TRY
+                    && matches!(ops.get(op_i + 1), Some(PoseidonTraceOp::Absorb(a)) if a.len() == DIGITS_PER_TRY);
             }
             PoseidonTraceOp::Absorb(_v) => {
                 let (ab_start, ab_len) = *pose_wiring
@@ -1540,7 +1544,9 @@ fn enforce_nonreabsorb_absorbs_are_canonical_goldilocks(
                     goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(&mut glue.gb, &bytes);
                 }
             }
-            PoseidonTraceOp::SqueezeBytes { .. } => {}
+            PoseidonTraceOp::SqueezeBytes { .. } => {
+                expect_reabsorb = false;
+            }
         }
     }
     Ok(())
@@ -1592,10 +1598,11 @@ fn enforce_nonreabsorb_absorbs_are_centered_bounded_goldilocks(
     let bound = sp1_centered_bound_u64(params, ring_dim)?;
     let mut absorb_idx = 0usize;
     let mut expect_reabsorb = false;
-    for op in ops {
+    for (op_i, op) in ops.iter().enumerate() {
         match op {
             PoseidonTraceOp::SqueezeField(v) => {
-                expect_reabsorb = v.len() == DIGITS_PER_TRY;
+                expect_reabsorb = v.len() == DIGITS_PER_TRY
+                    && matches!(ops.get(op_i + 1), Some(PoseidonTraceOp::Absorb(a)) if a.len() == DIGITS_PER_TRY);
             }
             PoseidonTraceOp::Absorb(_v) => {
                 let (ab_start, ab_len) = *pose_wiring
@@ -1621,7 +1628,9 @@ fn enforce_nonreabsorb_absorbs_are_centered_bounded_goldilocks(
                         goldilocks_u64_centered_le_bound_from_byte_vars::<F257>(&mut glue.gb, &bytes, bound);
                 }
             }
-            PoseidonTraceOp::SqueezeBytes { .. } => {}
+            PoseidonTraceOp::SqueezeBytes { .. } => {
+                expect_reabsorb = false;
+            }
         }
     }
     Ok(())
