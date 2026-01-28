@@ -6,6 +6,7 @@ mod digits;
 mod coins;
 mod challenges;
 mod frog;
+mod cm_math;
 mod surfaces;
 mod poseidon;
 mod builder;

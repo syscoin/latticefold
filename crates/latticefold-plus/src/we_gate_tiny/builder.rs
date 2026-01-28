@@ -33,6 +33,7 @@ use super::gadgets::{decompose_existing_byte_var_to_bits, enforce_var_eq};
 use super::params::DIGITS_PER_TRY;
 use super::poseidon::poseidon_f257_arithmetize;
 use super::surfaces::{CmDigitMulSqSurfaceWiring, CmDigitMulSurfaceWiring};
+use super::cm_math::{ring_zero_bytes, sumcheck_verify_degree2_ring_bytes, RingBytes};
 
 struct GlueCtx {
     gb: Dr1csBuilder<F257>,
@@ -781,6 +782,62 @@ fn parse_and_enforce_cm_after_short(
     Ok((comh_absorbs, sc_msg_absorbs, eval_absorbs))
 }
 
+#[inline]
+fn cm_u32_start_idx(wiring: &TinyCoinOpWiring) -> usize {
+    if wiring.short_squeeze_ops.is_empty() {
+        return wiring.u32_squeeze_ops.len();
+    }
+    let first_short_op = *wiring
+        .short_squeeze_ops
+        .iter()
+        .min()
+        .expect("non-empty short_squeeze_ops");
+    wiring.u32_squeeze_ops.iter().filter(|&&idx| idx < first_short_op).count()
+}
+
+#[inline]
+fn frog_bytes_from_u32_le_bytes(gb: &mut Dr1csBuilder<F257>, u32_le: &[usize; 4]) -> [usize; 8] {
+    let mut out = [0usize; 8];
+    out[0..4].copy_from_slice(u32_le);
+    for i in 4..8 {
+        let z = gb.new_var(F257::ZERO);
+        gb.enforce_var_eq_const(z, F257::ZERO);
+        out[i] = z;
+    }
+    // Canonicality (<p) is guaranteed since value < 2^32.
+    out
+}
+
+fn parse_ring_elem_absorb_as_ringbytes(
+    glue: &mut GlueCtx,
+    pose_wiring: &PoseidonDr1csWiring,
+    ring_dim: usize,
+    ab_start: usize,
+    ab_len: usize,
+) -> Result<RingBytes, String> {
+    if ring_dim == 0 {
+        return Ok(Vec::new());
+    }
+    if ab_len % ring_dim != 0 {
+        return Err("tiny gate: ring absorb len not divisible by ring_dim".to_string());
+    }
+    let coeff_bytes = ab_len / ring_dim;
+    if coeff_bytes != 8 {
+        return Err("tiny gate: expected 8-byte coeff encoding for RingBytes".to_string());
+    }
+    let mut out: RingBytes = Vec::with_capacity(ring_dim);
+    for coeff in 0..ring_dim {
+        let mut cbytes = [0usize; 8];
+        let off = ab_start + coeff * 8;
+        for i in 0..8 {
+            let gv = pose_wiring.absorb_vars[off + i];
+            cbytes[i] = glue.copy_digit(gv);
+        }
+        out.push(cbytes);
+    }
+    Ok(out)
+}
+
 struct SurfaceLocal<const RAW: usize, const NORM: usize> {
     short_block_idx: usize,
     u32_idx: usize,
@@ -1490,8 +1547,7 @@ pub(super) fn build(
     }
 
     // Parse and constrain the CM segment after short challenges (sumcheck headers, etc.).
-    // (This is preparatory wiring for the full CM verifier arithmetic.)
-    let _ = parse_and_enforce_cm_after_short(
+    let (comh_absorbs, sc_msg_absorbs, _eval_absorbs) = parse_and_enforce_cm_after_short(
         &mut glue,
         ops,
         &pose_wiring,
@@ -1500,6 +1556,51 @@ pub(super) fn build(
         wiring,
         l_instances_expected,
     )?;
+
+    // CM sumcheck verifier wiring (degree-2), starting from a placeholder claimed_sum=0 ring.
+    // This already enforces transcript-consistency of the per-round prover messages and the
+    // verifier challenges `r_sc` (derived from transcript u32 coins).
+    //
+    // Claimed sums and recombination will be wired once Dcom prefix verifier math is integrated.
+    if ring_dim > 0 && l_instances_expected > 0 && !comh_absorbs.is_empty() {
+        let cm_u32_start = cm_u32_start_idx(wiring);
+        let kappa = params.kappa as usize;
+        let log_kappa = ark_std::log2(kappa.next_power_of_two()) as usize;
+        let nvars_cm = params.nvars_cm as usize;
+
+        // Sumcheck challenges after absorb_comh: c0/c1, then for each sumcheck: rc, r_sc[0..nvars_cm]
+        let mut u32_idx = cm_u32_start + 2 * log_kappa;
+        for which in 0..2 {
+            // rc (currently unused here, but we must consume it to align indices)
+            let _rc_bytes = frog_bytes_from_u32_le_bytes(&mut glue.gb, &u32_locals[u32_idx].byte_vars);
+            u32_idx += 1;
+            let mut rs: Vec<[usize; 8]> = Vec::with_capacity(nvars_cm);
+            for _ in 0..nvars_cm {
+                rs.push(frog_bytes_from_u32_le_bytes(&mut glue.gb, &u32_locals[u32_idx].byte_vars));
+                u32_idx += 1;
+            }
+
+            // Parse sumcheck msg absorbs into ring bytes: each round has 3 ring elements.
+            let mut msgs: Vec<[RingBytes; 3]> = Vec::with_capacity(nvars_cm);
+            let abs = &sc_msg_absorbs[which];
+            if abs.len() != nvars_cm * 3 {
+                return Err("tiny gate: sumcheck msg absorb count mismatch".to_string());
+            }
+            for round in 0..nvars_cm {
+                let (s0, l0) = abs[round * 3 + 0];
+                let (s1, l1) = abs[round * 3 + 1];
+                let (s2, l2) = abs[round * 3 + 2];
+                let e0 = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s0, l0)?;
+                let e1 = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s1, l1)?;
+                let e2 = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s2, l2)?;
+                msgs.push([e0, e1, e2]);
+            }
+
+            let claimed0 = ring_zero_bytes(&mut glue.gb, ring_dim);
+            let _final_claim =
+                sumcheck_verify_degree2_ring_bytes(&mut glue.gb, claimed0, &msgs, &rs)?;
+        }
+    }
 
     let (mut surfaces_mul_local, all_sum_digits, all_sum_coeffwise) =
         build_mul_surfaces(&mut glue, ring_dim, pairs, &short_locals, &u32_locals)?;
