@@ -5,7 +5,7 @@ use crate::transcript::DEFAULT_REJECTION_TRIES;
 
 use ark_ff::Field;
 use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
-use latticefold::transcript::poseidon::F257;
+use latticefold::transcript::poseidon::{f257_poseidon_config, F257};
 use symphony::dpp_poseidon::{merge_sparse_dr1cs_share_one, Constraint, PoseidonDr1csWiring, SparseDr1csInstance};
 use symphony::dpp_sumcheck::Dr1csBuilder;
 use symphony::transcript::PoseidonTraceOp;
@@ -41,6 +41,282 @@ use super::cm_math::{
     ring_scale_digits, ring_unit_monomial_digits, ring_zero_bytes, sumcheck_verify_degree2_ring_bytes,
     tensor_frog_ringconst_digits, tensor_frog_scalars_digits, RingBytes, RingDigits,
 };
+
+#[inline]
+fn tiny_opmix_on() -> bool {
+    std::env::var("LFP_WE_GATE_OPMIX").is_ok()
+}
+
+#[inline]
+fn lf_mem_on() -> bool {
+    match std::env::var("LF_MEM") {
+        Ok(v) => v != "0",
+        Err(_) => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LfMemSample {
+    rss_bytes: Option<u64>,
+    hwm_bytes: Option<u64>,
+    vmsize_bytes: Option<u64>,
+}
+
+fn parse_proc_status_kib(s: &str, key: &str) -> Option<u64> {
+    // Format: `Key:   12345 kB`
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix(key) {
+            let rest = rest.trim();
+            let mut it = rest.split_whitespace();
+            let n = it.next()?.parse::<u64>().ok()?;
+            let unit = it.next().unwrap_or("kB");
+            if unit != "kB" {
+                return None;
+            }
+            return Some(n);
+        }
+    }
+    None
+}
+
+fn lf_mem_sample() -> LfMemSample {
+    // Linux-only (best effort). When unavailable (macOS, etc.), return Nones.
+    let Ok(s) = std::fs::read_to_string("/proc/self/status") else {
+        return LfMemSample::default();
+    };
+    let rss_kib = parse_proc_status_kib(&s, "VmRSS:");
+    let hwm_kib = parse_proc_status_kib(&s, "VmHWM:");
+    let vmsize_kib = parse_proc_status_kib(&s, "VmSize:");
+    LfMemSample {
+        rss_bytes: rss_kib.map(|x| x.saturating_mul(1024)),
+        hwm_bytes: hwm_kib.map(|x| x.saturating_mul(1024)),
+        vmsize_bytes: vmsize_kib.map(|x| x.saturating_mul(1024)),
+    }
+}
+
+#[inline]
+fn fmt_mib(x: Option<u64>) -> String {
+    x.map(|b| format!("{:.1}MiB", (b as f64) / (1024.0 * 1024.0)))
+        .unwrap_or_else(|| "?".to_string())
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LfStageCounts {
+    pose_constraints: usize,
+    pose_vars: usize,
+    glue_constraints: usize,
+    glue_vars: usize,
+}
+
+fn lf_stage_log(
+    stage: &'static str,
+    pose_inst: Option<&SparseDr1csInstance<F257>>,
+    glue: Option<&GlueCtx>,
+    prev: &mut Option<LfStageCounts>,
+) {
+    if !lf_mem_on() {
+        return;
+    }
+    let mem = lf_mem_sample();
+    let cur = LfStageCounts {
+        pose_constraints: pose_inst.map(|p| p.constraints.len()).unwrap_or(0),
+        pose_vars: pose_inst.map(|p| p.nvars).unwrap_or(0),
+        glue_constraints: glue.map(|g| g.gb.rows.len()).unwrap_or(0),
+        glue_vars: glue.map(|g| g.gb.assignment.len()).unwrap_or(0),
+    };
+    let (d_pose_c, d_pose_v, d_glue_c, d_glue_v) = match prev {
+        Some(p) => (
+            cur.pose_constraints.saturating_sub(p.pose_constraints),
+            cur.pose_vars.saturating_sub(p.pose_vars),
+            cur.glue_constraints.saturating_sub(p.glue_constraints),
+            cur.glue_vars.saturating_sub(p.glue_vars),
+        ),
+        None => (0, 0, 0, 0),
+    };
+    let caches = glue.map(|g| {
+        format!(
+            " local_map={} byte_bits_cache={} u64_bal16_cache={} u32_bal16_cache={}",
+            g.local_map.len(),
+            g.gb.byte_bits_cache.len(),
+            g.gb.u64_bal16_cache.len(),
+            g.gb.u32_bal16_cache.len()
+        )
+    });
+
+    eprintln!(
+        "[LF_MEM] stage={} rss={} hwm={} vmsize={} | pose(c={},v={},Δc={},Δv={}) glue(c={},v={},Δc={},Δv={}){}",
+        stage,
+        fmt_mib(mem.rss_bytes),
+        fmt_mib(mem.hwm_bytes),
+        fmt_mib(mem.vmsize_bytes),
+        cur.pose_constraints,
+        cur.pose_vars,
+        d_pose_c,
+        d_pose_v,
+        cur.glue_constraints,
+        cur.glue_vars,
+        d_glue_c,
+        d_glue_v,
+        caches.as_deref().unwrap_or(""),
+    );
+    *prev = Some(cur);
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TinyAbsorbBreakdownCounts {
+    comh_ops: usize,
+    comh_bytes_total: usize,
+    sc_msgs_ops_0: usize,
+    sc_msgs_bytes_total_0: usize,
+    sc_msgs_ops_1: usize,
+    sc_msgs_bytes_total_1: usize,
+    eval_ops_0: usize,
+    eval_bytes_total_0: usize,
+    eval_ops_1: usize,
+    eval_bytes_total_1: usize,
+}
+
+#[inline]
+fn sum_absorb_bytes(ranges: &[(usize, usize)]) -> usize {
+    ranges.iter().map(|&(_st, ln)| ln).sum::<usize>()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_print_tiny_opmix(
+    cfg: Option<&PoseidonConfig<F257>>,
+    ops: &[PoseidonTraceOp<F257>],
+    pose_inst: &SparseDr1csInstance<F257>,
+    glue: &GlueCtx,
+    absorb_counts: &TinyAbsorbBreakdownCounts,
+    pairs_len: usize,
+    mul_surfaces_len: usize,
+    sq_surfaces_len: usize,
+    sum_all_pairs_digits_len: usize,
+    sum_all_pairs_coeffwise_len: usize,
+    sq_sum_all_pairs_digits_len: usize,
+    sq_sum_all_pairs_coeffwise_len: usize,
+) {
+    if !tiny_opmix_on() {
+        return;
+    }
+
+    let default_cfg;
+    let poseidon_cfg = match cfg {
+        Some(c) => c,
+        None => {
+            default_cfg = f257_poseidon_config();
+            &default_cfg
+        }
+    };
+
+    // Poseidon schedule permutes (for cost estimates).
+    let pose_permutes_total = symphony::poseidon_trace::count_permutes_for_ops(poseidon_cfg, ops);
+    let last_short_sq = ops.iter().rposition(|op| match op {
+        PoseidonTraceOp::SqueezeField(v) => v.len() == DIGITS_PER_TRY,
+        _ => false,
+    });
+    let pose_permutes_before_cm = last_short_sq
+        .map(|i| symphony::poseidon_trace::count_permutes_for_ops(poseidon_cfg, &ops[..=i]))
+        .unwrap_or(0);
+    let pose_permutes_after_cm = pose_permutes_total.saturating_sub(pose_permutes_before_cm);
+
+    // Poseidon trace op mix.
+    let mut n_absorb = 0usize;
+    let mut absorb_elems = 0usize;
+    let mut n_sq_field = 0usize;
+    let mut sq_field_elems = 0usize;
+    let mut n_sq_bytes = 0usize;
+    let mut sq_bytes = 0usize;
+    for op in ops {
+        match op {
+            PoseidonTraceOp::Absorb(v) => {
+                n_absorb += 1;
+                absorb_elems += v.len();
+            }
+            PoseidonTraceOp::SqueezeField(v) => {
+                n_sq_field += 1;
+                sq_field_elems += v.len();
+            }
+            PoseidonTraceOp::SqueezeBytes { n, .. } => {
+                n_sq_bytes += 1;
+                sq_bytes += *n;
+            }
+        }
+    }
+
+    // Constraint mix.
+    let c_pose = pose_inst.constraints.len();
+    let c_pose_no_bytes =
+        symphony::dpp_poseidon::poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes::<F257>(
+            poseidon_cfg,
+            ops,
+        )
+        .map(|(inst, _asg, _w)| inst.constraints.len())
+        .unwrap_or(0usize);
+    let c_glue = glue.gb.rows.len();
+
+    eprintln!("==============================================================");
+    eprintln!("LF+ WE tiny gate op-mix (Poseidon(F257) + tiny CM gadgets)");
+    eprintln!(
+        "  poseidon trace: permutes={} absorb_ops={} absorb_elems={} squeeze_field_ops={} squeeze_field_elems={} squeeze_bytes_ops={} squeeze_bytes_total={}",
+        pose_permutes_total,
+        n_absorb,
+        absorb_elems,
+        n_sq_field,
+        sq_field_elems,
+        n_sq_bytes,
+        sq_bytes
+    );
+    eprintln!(
+        "  poseidon permutes split: before_cm={} after_cm={}",
+        pose_permutes_before_cm, pose_permutes_after_cm
+    );
+    eprintln!("  dr1cs constraints by part: poseidon={} glue={}", c_pose, c_glue);
+    eprintln!(
+        "  poseidon constraints(no_bytes)={} delta_squeeze_bytes={}",
+        c_pose_no_bytes,
+        c_pose.saturating_sub(c_pose_no_bytes)
+    );
+    eprintln!(
+        "  absorb(non-reabsorb) breakdown: cm(comh_ops={} comh_bytes={} sc_msgs_ops=[{},{}] sc_msgs_bytes=[{},{}] eval_ops=[{},{}] eval_bytes=[{},{}])",
+        absorb_counts.comh_ops,
+        absorb_counts.comh_bytes_total,
+        absorb_counts.sc_msgs_ops_0,
+        absorb_counts.sc_msgs_ops_1,
+        absorb_counts.sc_msgs_bytes_total_0,
+        absorb_counts.sc_msgs_bytes_total_1,
+        absorb_counts.eval_ops_0,
+        absorb_counts.eval_ops_1,
+        absorb_counts.eval_bytes_total_0,
+        absorb_counts.eval_bytes_total_1,
+    );
+    eprintln!(
+        "  glue builder: nvars={} nconstraints={} local_map={} byte_bits_cache={} u64_bal16_cache={} u32_bal16_cache={}",
+        glue.gb.assignment.len(),
+        glue.gb.rows.len(),
+        glue.local_map.len(),
+        glue.gb.byte_bits_cache.len(),
+        glue.gb.u64_bal16_cache.len(),
+        glue.gb.u32_bal16_cache.len(),
+    );
+    eprintln!(
+        "  surfaces: pairs={} mul_surfaces={} sq_surfaces={} sum_all_pairs_digits={} sum_all_pairs_coeffwise={} sq_sum_all_pairs_digits={} sq_sum_all_pairs_coeffwise={}",
+        pairs_len,
+        mul_surfaces_len,
+        sq_surfaces_len,
+        sum_all_pairs_digits_len,
+        sum_all_pairs_coeffwise_len,
+        sq_sum_all_pairs_digits_len,
+        sq_sum_all_pairs_coeffwise_len,
+    );
+    if glue.gb.profile_enabled {
+        eprintln!("{}", glue.gb.profile_report(40));
+    } else {
+        // Note: this is opt-in and can be noisy; keep it off by default.
+        eprintln!("  (dr1cs scope profile disabled; set LF_PROFILE_DR1CS=1 for top scopes)");
+    }
+    eprintln!("==============================================================");
+}
 
 struct GlueCtx {
     gb: Dr1csBuilder<F257>,
@@ -1348,19 +1624,41 @@ fn finalize(
     let (glue_inst, glue_asg) = gb.into_instance();
     let glue_nvars = glue_inst.nvars;
 
+    // Save lightweight stats for optional op-mix reporting (before moving instances into merge).
+    let c_pose = pose_inst.constraints.len();
+    let c_glue = glue_inst.constraints.len();
+    let glue_eq_constraints = local_map.len();
+
     let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(vec![
         (pose_inst, pose_asg),
         (glue_inst, glue_asg),
     ])
     .map_err(|e| format!("merge poseidon+cm+mul_glue failed: {e}"))?;
 
+    let c_after_merge = inst.constraints.len();
     enforce_fiat_shamir_reabsorb_semantics(&mut inst, ops, &pose_wiring)?;
+    let c_after_reabsorb = inst.constraints.len();
 
     let pose_nvars = inst.nvars - (glue_nvars - 1);
     let glue_offset = pose_nvars - 1;
     for (&gv, &lv) in local_map.iter() {
         let gg = if lv == 0 { 0 } else { lv + glue_offset };
         enforce_var_eq::<F257>(&mut inst, gv, gg);
+    }
+    let c_after_glue_eq = inst.constraints.len();
+
+    if tiny_opmix_on() {
+        eprintln!(
+            "LF+ WE tiny gate merged: nvars={} constraints={} (poseidon={} glue={} merge={} reabsorb_delta={} glue_eq_constraints={} glue_eq_delta={})",
+            inst.nvars,
+            c_after_glue_eq,
+            c_pose,
+            c_glue,
+            c_after_merge,
+            c_after_reabsorb.saturating_sub(c_after_merge),
+            glue_eq_constraints,
+            c_after_glue_eq.saturating_sub(c_after_reabsorb),
+        );
     }
     let to_glue_global = |glue_local: usize| -> usize {
         if glue_local == 0 { 0 } else { glue_local + glue_offset }
@@ -1563,6 +1861,20 @@ pub(super) fn build(
         wiring,
         l_instances_expected,
     )?;
+
+    // Capture a lightweight absorb breakdown summary for optional op-mix reporting.
+    let absorb_counts = TinyAbsorbBreakdownCounts {
+        comh_ops: comh_absorbs.len(),
+        comh_bytes_total: sum_absorb_bytes(&comh_absorbs),
+        sc_msgs_ops_0: sc_msg_absorbs.get(0).map(|v| v.len()).unwrap_or(0),
+        sc_msgs_bytes_total_0: sc_msg_absorbs.get(0).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
+        sc_msgs_ops_1: sc_msg_absorbs.get(1).map(|v| v.len()).unwrap_or(0),
+        sc_msgs_bytes_total_1: sc_msg_absorbs.get(1).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
+        eval_ops_0: eval_absorbs.get(0).map(|v| v.len()).unwrap_or(0),
+        eval_bytes_total_0: eval_absorbs.get(0).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
+        eval_ops_1: eval_absorbs.get(1).map(|v| v.len()).unwrap_or(0),
+        eval_bytes_total_1: eval_absorbs.get(1).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
+    };
 
     // CM sumcheck verifier wiring (degree-2), starting from a placeholder claimed_sum=0 ring.
     // This already enforces transcript-consistency of the per-round prover messages and the
@@ -1874,6 +2186,24 @@ pub(super) fn build(
         s.sum_all_pairs_digits = all_sq_sum_digits.clone();
         s.sum_all_pairs_coeffwise = all_sq_sum_coeffwise.clone();
     }
+
+    // Optional: print an op-mix breakdown for tiny-field porting estimates.
+    //
+    // Enable with: `LFP_WE_GATE_OPMIX=1 ...`
+    maybe_print_tiny_opmix(
+        cfg,
+        ops,
+        &pose_inst,
+        &glue,
+        &absorb_counts,
+        pairs.len(),
+        surfaces_mul_local.len(),
+        surfaces_sq_local.len(),
+        all_sum_digits.len(),
+        all_sum_coeffwise.len(),
+        all_sq_sum_digits.len(),
+        all_sq_sum_coeffwise.len(),
+    );
 
     finalize(
         pose_inst,
