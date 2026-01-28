@@ -21,10 +21,9 @@ use crate::{
 /// It is intended to be the drop-in analogue of `FrogRing64`, but over the true
 /// Goldilocks prime \(p = 2^{64} - 2^{32} + 1\).
 ///
-/// NOTE: This type is *coefficient-form* (not CRT/NTT form). It still benefits LF+/WE
-/// because it makes the protocol parameterization and transcript scheduling "pow2-d=64"
-/// over Goldilocks explicit; NTT-friendly multiplication can be added later on top of
-/// this correct algebraic baseline.
+/// NOTE: This type stores elements in *coefficient form* (not CRT/NTT form). For performance,
+/// multiplication is implemented via a negacyclic NTT using the shared `goldilocks_ntt64`
+/// schedule (so host + tiny-gate agree on ordering/roots/stage conventions).
 #[repr(transparent)]
 #[derive(
     Copy, Clone, Debug, Default, Eq, PartialEq, Hash, CanonicalSerialize, CanonicalDeserialize,
