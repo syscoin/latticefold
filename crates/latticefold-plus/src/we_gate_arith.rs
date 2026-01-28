@@ -6857,7 +6857,7 @@ mod tests {
         // - verifier returns Ok
         type PCF = cyclotomic_rings::rings::GoldilocksPoseidonConfig;
         use ark_ff::Zero;
-        use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as RR;
+        use cyclotomic_rings::rings::GoldilocksRing64 as RR;
         use stark_rings::PolyRing;
 
         let k = 1usize;
