@@ -6029,7 +6029,79 @@ mod tests {
         assert_eq!(shape.inst.nvars, inst.nvars);
         assert_eq!(shape.inst.constraints.len(), inst.constraints.len());
     }
+    #[test]
+    #[ignore = "slow: builds Poseidon(F257) dR1CS schedule + checks all constraints (FrogRing64)"]
+    fn test_tiny_gate_shape_builds_and_constraints_check_frog64() {
+        use cyclotomic_rings::rings::FrogRing64 as RR;
 
+        // Minimal-but-valid params to keep the schedule small.
+        let ring_dim = <RR as PolyRing>::dimension() as u64;
+        let params = WeParams {
+            nvars_setchk: 1,
+            degree_setchk: 3,
+            nvars_cm: 1,
+            degree_cm: 2,
+            kappa: 1,
+            ring_dim_d: ring_dim,
+            decomp_b: 16,
+            k: 1,
+            l: 1,
+            mlen: 0,
+        };
+
+        // Exercise one digit-mul surface.
+        let pairs: Vec<(usize, usize)> = vec![(0, 0)];
+
+        // Rebuild the instance + assignment directly (so we can call `check()`).
+        let trace = super::poseidon_trace_schedule_for_plus::<RR>(0, &params, 1, 0)
+            .expect("poseidon_trace_schedule_for_plus");
+        let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<RR>>(&trace.ops)
+            .expect("lift_recording_trace_ops_to_f257");
+
+        let squeeze_field_op_offset =
+            super::first_squeeze_field_op_index_of_len(&ops_f257, <RR as PolyRing>::dimension())
+                .expect("first short SqueezeField(len=ring_dim) exists");
+        let k = params.k as usize;
+        let log_kappa = ark_std::log2((params.kappa as usize).next_power_of_two()) as usize;
+        let nvars_cm = params.nvars_cm as usize;
+        let wiring_rel = tiny::infer_cm_coin_op_wiring_from_ops(
+            &ops_f257,
+            <RR as PolyRing>::dimension(),
+            k,
+            log_kappa,
+            nvars_cm,
+            squeeze_field_op_offset,
+            0,
+        )
+        .expect("infer_cm_coin_op_wiring_from_ops");
+
+        let mut wiring_abs = tiny::TinyCoinOpWiring::default();
+        wiring_abs.short_squeeze_ops = wiring_rel
+            .short_squeeze_ops
+            .into_iter()
+            .map(|i| i + squeeze_field_op_offset)
+            .collect();
+        wiring_abs.u32_squeeze_ops = wiring_rel
+            .u32_squeeze_ops
+            .into_iter()
+            .map(|i| i + squeeze_field_op_offset)
+            .collect();
+        wiring_abs.frog_squeeze_ops = Vec::new();
+
+        let (inst, asg, _shorts, _u32s, _frogs, _frog_rejection, _tcch0, _tcch1, _sm, _ssq, _w) =
+            tiny::we_tiny_f257_build_cm_gate_from_trace_ops(
+                None,
+                &ops_f257,
+                <RR as PolyRing>::dimension(),
+                &params,
+                &wiring_abs,
+                &pairs,
+            )
+            .expect("we_tiny_f257_build_cm_gate_from_trace_ops");
+
+        assert!(!inst.constraints.is_empty());
+        inst.check(&asg).expect("dr1cs check");
+    }
     #[test]
     #[ignore = "very slow in debug: runs full DPP prove+decap; run with `--release`"]
     fn test_tiny_gate_ringlwe_lock_roundtrip_small() {
