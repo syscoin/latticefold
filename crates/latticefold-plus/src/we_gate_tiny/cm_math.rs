@@ -37,22 +37,28 @@ fn alloc_const_byte(gb: &mut Dr1csBuilder<F257>, v: u8) -> usize {
 
 #[inline]
 pub(crate) fn alloc_const_goldilocks_u64(gb: &mut Dr1csBuilder<F257>, v: u64) -> [usize; 8] {
+    let _prev = gb.profile_enter("cm_math::alloc_const_goldilocks_u64");
     let bs = v.to_le_bytes();
     let mut out = [0usize; 8];
     for i in 0..8 {
         out[i] = alloc_const_byte(gb, bs[i]);
     }
+    gb.profile_exit(_prev);
     out
 }
 
 #[inline]
 pub(crate) fn ring_zero_bytes(gb: &mut Dr1csBuilder<F257>, d: usize) -> RingBytes {
+    let _prev = gb.profile_enter("cm_math::ring_zero_bytes");
     let z = alloc_const_goldilocks_u64(gb, 0u64);
-    vec![z; d]
+    let out = vec![z; d];
+    gb.profile_exit(_prev);
+    out
 }
 
 #[inline]
 pub(crate) fn ring_eq_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, b: &RingBytes) {
+    let _prev = gb.profile_enter("cm_math::ring_eq_bytes");
     tiny_cm_bump(|c| c.ring_eq += 1);
     debug_assert_eq!(a.len(), b.len());
     for (ai, bi) in a.iter().zip(b.iter()) {
@@ -60,27 +66,32 @@ pub(crate) fn ring_eq_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, b: &Ring
             gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, ai[j]), (-F257::ONE, bi[j])]);
         }
     }
+    gb.profile_exit(_prev);
 }
 
 #[inline]
 pub(crate) fn ring_add_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, b: &RingBytes) -> RingBytes {
+    let _prev = gb.profile_enter("cm_math::ring_add_bytes");
     tiny_cm_bump(|c| c.ring_add += 1);
     debug_assert_eq!(a.len(), b.len());
     let mut out = Vec::with_capacity(a.len());
     for i in 0..a.len() {
         out.push(goldilocks_add_mod_p_from_byte_vars_assume_canonical(gb, &a[i], &b[i]));
     }
+    gb.profile_exit(_prev);
     out
 }
 
 #[inline]
 pub(crate) fn ring_sub_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, b: &RingBytes) -> RingBytes {
+    let _prev = gb.profile_enter("cm_math::ring_sub_bytes");
     tiny_cm_bump(|c| c.ring_sub += 1);
     debug_assert_eq!(a.len(), b.len());
     let mut out = Vec::with_capacity(a.len());
     for i in 0..a.len() {
         out.push(goldilocks_sub_mod_p_from_byte_vars_assume_canonical(gb, &a[i], &b[i]));
     }
+    gb.profile_exit(_prev);
     out
 }
 
@@ -89,11 +100,13 @@ pub(crate) fn ring_sub_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, b: &Rin
 /// Since the scalar is in the base field, this is per-coefficient multiplication.
 #[inline]
 pub(crate) fn ring_scale_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, s: &[usize; 8]) -> RingBytes {
+    let _prev = gb.profile_enter("cm_math::ring_scale_bytes");
     tiny_cm_bump(|c| c.ring_scale += 1);
     let mut out = Vec::with_capacity(a.len());
     for i in 0..a.len() {
         out.push(goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, &a[i], s));
     }
+    gb.profile_exit(_prev);
     out
 }
 
@@ -108,6 +121,7 @@ pub(crate) fn lagrange_degree2_goldilocks(
     one: &[usize; 8],
     two: &[usize; 8],
 ) -> ([usize; 8], [usize; 8], [usize; 8]) {
+    let _prev = gb.profile_enter("cm_math::lagrange_degree2_goldilocks_bytes");
     // 2 subs, 4 muls, plus one "mul by const" semantic (inv2) in the big-gate accounting.
     // Here we count the higher-level helper call once.
     tiny_cm_bump(|c| c.scalar_sub_const += 0);
@@ -128,6 +142,7 @@ pub(crate) fn lagrange_degree2_goldilocks(
     let p = goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, r, &t1);
     let l2 = goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, &p, inv2);
 
+    gb.profile_exit(_prev);
     (l0, l1, l2)
 }
 
@@ -145,6 +160,7 @@ pub(crate) fn sumcheck_verify_degree2_ring_bytes(
     if msgs.len() != rs.len() {
         return Err("sumcheck_verify_degree2_ring_bytes: msgs/rs length mismatch".to_string());
     }
+    let _prev = gb.profile_enter("cm_math::sumcheck_verify_degree2_ring_bytes");
     let d = claimed_sum.len();
 
     // Constants in Goldilocks field.
@@ -158,6 +174,7 @@ pub(crate) fn sumcheck_verify_degree2_ring_bytes(
 
     for (m, r) in msgs.iter().zip(rs.iter()) {
         if m[0].len() != d || m[1].len() != d || m[2].len() != d {
+            gb.profile_exit(_prev);
             return Err("sumcheck_verify_degree2_ring_bytes: ring dimension mismatch".to_string());
         }
 
@@ -173,6 +190,7 @@ pub(crate) fn sumcheck_verify_degree2_ring_bytes(
         let s01 = ring_add_bytes(gb, &t0, &t1);
         claimed_sum = ring_add_bytes(gb, &s01, &t2);
     }
+    gb.profile_exit(_prev);
     Ok(claimed_sum)
 }
 
@@ -182,24 +200,34 @@ pub(crate) fn sumcheck_verify_degree2_ring_bytes(
 
 #[inline]
 pub(crate) fn goldilocks_bytes_to_digits(gb: &mut Dr1csBuilder<F257>, bytes_le: [usize; 8]) -> GoldilocksScalar {
-    goldilocks_scalar_from_u64_bytes_le_digits(gb, bytes_le)
+    let _prev = gb.profile_enter("cm_math::goldilocks_bytes_to_digits");
+    let out = goldilocks_scalar_from_u64_bytes_le_digits(gb, bytes_le);
+    gb.profile_exit(_prev);
+    out
 }
 
 #[inline]
 pub(crate) fn ring_bytes_to_digits(gb: &mut Dr1csBuilder<F257>, a: &RingBytes) -> RingDigits {
+    let _prev = gb.profile_enter("cm_math::ring_bytes_to_digits");
     tiny_cm_bump(|c| c.lc_to_var += 1);
-    a.iter().copied().map(|x| goldilocks_bytes_to_digits(gb, x)).collect()
+    let out: RingDigits = a.iter().copied().map(|x| goldilocks_bytes_to_digits(gb, x)).collect();
+    gb.profile_exit(_prev);
+    out
 }
 
 #[inline]
 pub(crate) fn ring_zero_digits(gb: &mut Dr1csBuilder<F257>, d: usize) -> RingDigits {
+    let _prev = gb.profile_enter("cm_math::ring_zero_digits");
     let z_bytes = alloc_const_goldilocks_u64(gb, 0u64);
     let z = goldilocks_bytes_to_digits(gb, z_bytes);
-    vec![z; d]
+    let out = vec![z; d];
+    gb.profile_exit(_prev);
+    out
 }
 
 #[inline]
 pub(crate) fn ring_eq_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &RingDigits) {
+    let _prev = gb.profile_enter("cm_math::ring_eq_digits");
     tiny_cm_bump(|c| c.ring_eq += 1);
     debug_assert_eq!(a.len(), b.len());
     for (ai, bi) in a.iter().zip(b.iter()) {
@@ -207,10 +235,12 @@ pub(crate) fn ring_eq_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &Ri
             gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, ai[j]), (-F257::ONE, bi[j])]);
         }
     }
+    gb.profile_exit(_prev);
 }
 
 #[inline]
 pub(crate) fn ring_add_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &RingDigits) -> RingDigits {
+    let _prev = gb.profile_enter("cm_math::ring_add_digits");
     tiny_cm_bump(|c| c.ring_add += 1);
     debug_assert_eq!(a.len(), b.len());
     // Scalar ops come overwhelmingly from ring ops; build per-coefficient shards in parallel.
@@ -240,11 +270,13 @@ pub(crate) fn ring_add_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &R
         let digits: GoldilocksScalar = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
         out.push(digits);
     }
+    gb.profile_exit(_prev);
     out
 }
 
 #[inline]
 pub(crate) fn ring_sub_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &RingDigits) -> RingDigits {
+    let _prev = gb.profile_enter("cm_math::ring_sub_digits");
     tiny_cm_bump(|c| c.ring_sub += 1);
     debug_assert_eq!(a.len(), b.len());
     tiny_cm_bump(|c| c.scalar_sub += a.len() as u64);
@@ -273,11 +305,13 @@ pub(crate) fn ring_sub_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &R
         let digits: GoldilocksScalar = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
         out.push(digits);
     }
+    gb.profile_exit(_prev);
     out
 }
 
 #[inline]
 pub(crate) fn ring_scale_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, s: &GoldilocksScalar) -> RingDigits {
+    let _prev = gb.profile_enter("cm_math::ring_scale_digits");
     tiny_cm_bump(|c| c.ring_scale += 1);
     tiny_cm_bump(|c| c.scalar_mul += a.len() as u64);
     let base_asg: &[F257] = &gb.assignment;
@@ -305,6 +339,7 @@ pub(crate) fn ring_scale_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, s: 
         let digits: GoldilocksScalar = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
         out.push(digits);
     }
+    gb.profile_exit(_prev);
     out
 }
 
@@ -445,6 +480,7 @@ pub(crate) fn sumcheck_verify_degree2_ring_digits(
     if msgs.len() != rs.len() {
         return Err("sumcheck_verify_degree2_ring_digits: msgs/rs length mismatch".to_string());
     }
+    let _prev = gb.profile_enter("cm_math::sumcheck_verify_degree2_ring_digits");
     let d = claimed_sum.len();
 
     let one_bytes = alloc_const_goldilocks_u64(gb, 1u64);
@@ -457,6 +493,7 @@ pub(crate) fn sumcheck_verify_degree2_ring_digits(
 
     for (m, r) in msgs.iter().zip(rs.iter()) {
         if m[0].len() != d || m[1].len() != d || m[2].len() != d {
+            gb.profile_exit(_prev);
             return Err("sumcheck_verify_degree2_ring_digits: ring dimension mismatch".to_string());
         }
 
@@ -473,6 +510,7 @@ pub(crate) fn sumcheck_verify_degree2_ring_digits(
         claimed_sum = ring_add_digits(gb, &s01, &t2);
     }
 
+    gb.profile_exit(_prev);
     Ok(claimed_sum)
 }
 
@@ -540,10 +578,12 @@ pub(crate) fn eval_x_powers_basis_mle_ring_digits(
     if (1usize << r4.len()) != ring_dim {
         return Err("eval_x_powers_basis_mle_ring_digits: r4 length mismatch".to_string());
     }
+    let _prev = gb.profile_enter("cm_math::eval_x_powers_basis_mle_ring_digits");
     // weights length = ring_dim; each weight is a Goldilocks scalar in digit encoding.
     let weights = tensor_goldilocks_scalars_digits(gb, r4);
     debug_assert_eq!(weights.len(), ring_dim);
     // Interpret weights as the ring coefficients.
+    gb.profile_exit(_prev);
     Ok(weights)
 }
 
@@ -553,6 +593,7 @@ pub(crate) fn goldilocks_pow_table_digits(
     x: &GoldilocksScalar,
     n: usize,
 ) -> Vec<GoldilocksScalar> {
+    let _prev = gb.profile_enter("cm_math::goldilocks_pow_table_digits");
     tiny_cm_bump(|c| c.scalar_pow_table += 1);
     let mut out: Vec<GoldilocksScalar> = Vec::with_capacity(n + 1);
     let mut acc = goldilocks_const_u64_digits(gb, 1u64);
@@ -561,6 +602,7 @@ pub(crate) fn goldilocks_pow_table_digits(
         acc = goldilocks_mul_mod_p_digits(gb, &acc, x);
         out.push(acc);
     }
+    gb.profile_exit(_prev);
     out
 }
 
@@ -576,6 +618,7 @@ pub(crate) fn eq_eval_goldilocks_digits(
     if c.len() != r.len() {
         return Err("eq_eval_goldilocks_digits: length mismatch".to_string());
     }
+    let _prev = gb.profile_enter("cm_math::eq_eval_goldilocks_digits");
     tiny_cm_bump(|cc| cc.eq_eval_vars += c.len() as u64);
     let mut acc = goldilocks_const_u64_digits(gb, 1u64);
     for (ci, ri) in c.iter().zip(r.iter()) {
@@ -586,27 +629,32 @@ pub(crate) fn eq_eval_goldilocks_digits(
         let t = goldilocks_add_mod_p_digits(gb, &ci_ri, &om);
         acc = goldilocks_mul_mod_p_digits(gb, &acc, &t);
     }
+    gb.profile_exit(_prev);
     Ok(acc)
 }
 
 #[inline]
 pub(crate) fn ring_const_coeff_digits(gb: &mut Dr1csBuilder<F257>, c0: &GoldilocksScalar, d: usize) -> RingDigits {
+    let _prev = gb.profile_enter("cm_math::ring_const_coeff_digits");
     let z = goldilocks_const_u64_digits(gb, 0u64);
     let mut out = vec![z; d];
     if d > 0 {
         out[0] = *c0;
     }
+    gb.profile_exit(_prev);
     out
 }
 
 #[inline]
 pub(crate) fn ring_unit_monomial_digits(gb: &mut Dr1csBuilder<F257>, idx: usize, d: usize) -> RingDigits {
+    let _prev = gb.profile_enter("cm_math::ring_unit_monomial_digits");
     let z = goldilocks_const_u64_digits(gb, 0u64);
     let one = goldilocks_const_u64_digits(gb, 1u64);
     let mut out = vec![z; d];
     if idx < d {
         out[idx] = one;
     }
+    gb.profile_exit(_prev);
     out
 }
 
@@ -618,6 +666,7 @@ pub(crate) fn eval_small_mle_ring_digits(
     table: &[RingDigits],
     r: &[GoldilocksScalar],
 ) -> RingDigits {
+    let _prev = gb.profile_enter("cm_math::eval_small_mle_ring_digits");
     debug_assert!(!table.is_empty());
     debug_assert!(table.len().is_power_of_two());
     debug_assert_eq!(table.len(), 1usize << r.len());
@@ -640,7 +689,9 @@ pub(crate) fn eval_small_mle_ring_digits(
         cur = next;
     }
     debug_assert_eq!(cur.len(), 1);
-    cur.pop().unwrap()
+    let out = cur.pop().unwrap();
+    gb.profile_exit(_prev);
+    out
 }
 
 /// Evaluate the CM tensor product t(z) at `r`, mirroring `tensor_eval::eval_t_z_optimized`.
@@ -669,6 +720,7 @@ pub(crate) fn eval_t_z_optimized_ring_digits(
     if r.len() < tensor_vars {
         return Err("eval_t_z_optimized_ring_digits: r too short".to_string());
     }
+    let _prev = gb.profile_enter("cm_math::eval_t_z_optimized_ring_digits");
 
     // Split r into chunks (innermost to outermost) as in tensor_eval::eval_t_z_optimized.
     let r4 = &r[0..vars4[0]]; // x_powers (lowest bits)
@@ -680,11 +732,35 @@ pub(crate) fn eval_t_z_optimized_ring_digits(
     let v2 = eval_small_mle_ring_digits(gb, s_prime_flat, r2);
     let v3 = eval_small_mle_ring_digits(gb, dpp, r3);
     // `x_powers` is the unit-monomial basis, evaluated via tensor weights.
-    let v4 = eval_x_powers_basis_mle_ring_digits(gb, r4, ring_dim)?;
+    let v4 = match eval_x_powers_basis_mle_ring_digits(gb, r4, ring_dim) {
+        Ok(v) => v,
+        Err(e) => {
+            gb.profile_exit(_prev);
+            return Err(e);
+        }
+    };
 
-    let mut res = ring_mul_negacyclic_digits_d64(gb, &v1, &v2)?;
-    res = ring_mul_negacyclic_digits_d64(gb, &res, &v3)?;
-    res = ring_mul_negacyclic_digits_d64(gb, &res, &v4)?;
+    let mut res = match ring_mul_negacyclic_digits_d64(gb, &v1, &v2) {
+        Ok(v) => v,
+        Err(e) => {
+            gb.profile_exit(_prev);
+            return Err(e);
+        }
+    };
+    res = match ring_mul_negacyclic_digits_d64(gb, &res, &v3) {
+        Ok(v) => v,
+        Err(e) => {
+            gb.profile_exit(_prev);
+            return Err(e);
+        }
+    };
+    res = match ring_mul_negacyclic_digits_d64(gb, &res, &v4) {
+        Ok(v) => v,
+        Err(e) => {
+            gb.profile_exit(_prev);
+            return Err(e);
+        }
+    };
 
     // Padding factor: Π_{j=tensor_vars..} (1 - r[j]) as scalar.
     let mut pad = goldilocks_const_u64_digits(gb, 1u64);
@@ -692,7 +768,9 @@ pub(crate) fn eval_t_z_optimized_ring_digits(
         let om = goldilocks_one_minus_digits(gb, rj);
         pad = goldilocks_mul_mod_p_digits(gb, &pad, &om);
     }
-    Ok(ring_scale_digits(gb, &res, &pad))
+    let out = Ok(ring_scale_digits(gb, &res, &pad));
+    gb.profile_exit(_prev);
+    out
 }
 
 /// Compute `t0(ro)` and `t1(ro)` together, sharing the expensive common subcomputations.
@@ -723,6 +801,7 @@ pub(crate) fn eval_t_z_optimized_ring_digits_pair(
     if r.len() < tensor_vars {
         return Err("eval_t_z_optimized_ring_digits_pair: r too short".to_string());
     }
+    let _prev = gb.profile_enter("cm_math::eval_t_z_optimized_ring_digits_pair");
     let r4 = &r[0..vars4[0]];
     let r3 = &r[vars4[0]..vars4[0] + vars4[1]];
     let r2 = &r[vars4[0] + vars4[1]..vars4[0] + vars4[1] + vars4[2]];
@@ -730,18 +809,48 @@ pub(crate) fn eval_t_z_optimized_ring_digits_pair(
 
     let v2 = eval_small_mle_ring_digits(gb, s_prime_flat, r2);
     let v3 = eval_small_mle_ring_digits(gb, dpp, r3);
-    let v4 = eval_x_powers_basis_mle_ring_digits(gb, r4, ring_dim)?;
+    let v4 = match eval_x_powers_basis_mle_ring_digits(gb, r4, ring_dim) {
+        Ok(v) => v,
+        Err(e) => {
+            gb.profile_exit(_prev);
+            return Err(e);
+        }
+    };
 
     // Common product u = v2*v3*v4.
-    let mut u = ring_mul_negacyclic_digits_d64(gb, &v2, &v3)?;
-    u = ring_mul_negacyclic_digits_d64(gb, &u, &v4)?;
+    let mut u = match ring_mul_negacyclic_digits_d64(gb, &v2, &v3) {
+        Ok(v) => v,
+        Err(e) => {
+            gb.profile_exit(_prev);
+            return Err(e);
+        }
+    };
+    u = match ring_mul_negacyclic_digits_d64(gb, &u, &v4) {
+        Ok(v) => v,
+        Err(e) => {
+            gb.profile_exit(_prev);
+            return Err(e);
+        }
+    };
 
     // v1 differs between t0/t1.
     let v10 = eval_small_mle_ring_digits(gb, tensor_c0_ring, r1);
     let v11 = eval_small_mle_ring_digits(gb, tensor_c1_ring, r1);
 
-    let mut res0 = ring_mul_negacyclic_digits_d64(gb, &v10, &u)?;
-    let mut res1 = ring_mul_negacyclic_digits_d64(gb, &v11, &u)?;
+    let mut res0 = match ring_mul_negacyclic_digits_d64(gb, &v10, &u) {
+        Ok(v) => v,
+        Err(e) => {
+            gb.profile_exit(_prev);
+            return Err(e);
+        }
+    };
+    let mut res1 = match ring_mul_negacyclic_digits_d64(gb, &v11, &u) {
+        Ok(v) => v,
+        Err(e) => {
+            gb.profile_exit(_prev);
+            return Err(e);
+        }
+    };
 
     // Shared padding factor.
     let mut pad = goldilocks_const_u64_digits(gb, 1u64);
@@ -751,6 +860,8 @@ pub(crate) fn eval_t_z_optimized_ring_digits_pair(
     }
     res0 = ring_scale_digits(gb, &res0, &pad);
     res1 = ring_scale_digits(gb, &res1, &pad);
-    Ok((res0, res1))
+    let out = Ok((res0, res1));
+    gb.profile_exit(_prev);
+    out
 }
 
