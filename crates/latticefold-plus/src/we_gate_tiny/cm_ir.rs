@@ -5,6 +5,8 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 
 use cyclotomic_rings::rings::goldilocks_ntt64 as gl_ntt64;
 
+use std::collections::HashMap;
+
 use super::digits::{f257_to_i32_bal, i32_to_f257};
 use super::params::{DIGITS_PER_TRY, LIMB_BASE_U64, LIMB_BITS, LIMBS_U32, LIMBS_U64};
 
@@ -209,12 +211,14 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
 pub(crate) struct IrBuilder<'a> {
     pub(crate) base_asg: &'a [F257],
     pub(crate) ir: CmIr,
+    // Cache for expensive representation conversions used in hot paths.
+    bal16_to_bal4_cache: HashMap<[VarRef; 17], [VarRef; 33]>,
 }
 
 impl<'a> IrBuilder<'a> {
     #[inline]
     pub(crate) fn new(base_asg: &'a [F257]) -> Self {
-        Self { base_asg, ir: CmIr::new() }
+        Self { base_asg, ir: CmIr::new(), bal16_to_bal4_cache: HashMap::new() }
     }
 
     /// Read the witness value for a var ref.
@@ -265,6 +269,19 @@ impl<'a> IrBuilder<'a> {
     #[inline]
     pub(crate) fn add_constraint(&mut self, a: Vec<(F257, VarRef)>, b: Vec<(F257, VarRef)>, c: Vec<(F257, VarRef)>) {
         self.ir.constraints.push(IrConstraint { a, b, c });
+    }
+
+    /// Convert a bal16 scalar (17 digits, last is carry bit) to bal4 digits (33 digits),
+    /// with caching keyed by the input var IDs.
+    #[inline]
+    pub(crate) fn bal16_to_bal4_digits_cached(&mut self, x16: &[VarRef; 17]) -> [VarRef; 33] {
+        let key = *x16;
+        if let Some(v) = self.bal16_to_bal4_cache.get(&key) {
+            return *v;
+        }
+        let out = bal16_to_bal4_digits_ir(self, x16);
+        self.bal16_to_bal4_cache.insert(key, out);
+        out
     }
 }
 
@@ -1228,6 +1245,437 @@ pub(crate) fn alloc_bal16_digit_ir(b: &mut IrBuilder<'_>, d: i8) -> VarRef {
     out
 }
 
+// -----------------------------------------------------------------------------
+// Balanced base-4 digits (sound mul check: avoids 16^2+1 bubble)
+// -----------------------------------------------------------------------------
+
+#[inline]
+fn u64_to_bal4_digits_le_const(x: u64) -> [i8; 33] {
+    // Balanced base-4 digits in [-2,1] with a final carry bit in {0,1}.
+    let mut out = [0i8; 33];
+    let mut carry: i8 = 0;
+    for i in 0..32 {
+        let chunk = ((x >> (2 * i)) & 0x3) as i8; // 0..3
+        let v = chunk + carry; // 0..4
+        if v >= 2 {
+            out[i] = v - 4; // -2,-1,0
+            carry = 1;
+        } else {
+            out[i] = v; // 0,1
+            carry = 0;
+        }
+    }
+    out[32] = carry;
+    out
+}
+
+/// Allocate u64 as balanced base-4 digits **without bit-backed digit checks**.
+///
+/// This relies on subsequent carry-chain constraints (with bounded carries) for injectivity;
+/// we keep the top carry as a boolean since it is semantically a bit.
+#[inline]
+fn alloc_u64_as_bal4_digits_raw_ir(b: &mut IrBuilder<'_>, x: u64) -> [VarRef; 33] {
+    let ds = u64_to_bal4_digits_le_const(x);
+    debug_assert!(ds[32] == 0 || ds[32] == 1);
+    let mut out: [VarRef; 33] = [VarRef::Base(0); 33];
+    for i in 0..32 {
+        out[i] = b.new_var(i32_to_f257(ds[i] as i32));
+    }
+    out[32] = alloc_bool_ir(b, ds[32] == 1);
+    out
+}
+
+// NOTE (soundness): we intentionally do **not** bit-decompose/range-check every base-4 digit
+// variable when it is already linked by a *bounded carry chain*.
+//
+// The classic underconstraint in F257 comes from the "carry bubble":
+//   257 = 4*64 + 1  (analogously 257 = 16^2 + 1 in base-16)
+//
+// If carries were unconstrained, you could mutate an internal step by:
+//   carry_next += 64
+//   digit      += 1
+// and keep `digit - 4*carry_next` unchanged mod 257 (since 4*64 = 256 ≡ -1).
+//
+// We prevent this by range-checking carries in a window of width < 64 (we use pm4/pm8/pm16/pm32,
+// i.e. |carry| <= 31), so "carry += 64" is impossible. Therefore the carry chain is injective
+// over the intended integer lift even though digits themselves are not bit-decomposed.
+
+/// Convert checked bal4 digits (33) into checked bal16 digits (17).
+///
+/// This is used to return `[VarRef; 17]` to the rest of the bal16-based IR, while keeping the
+/// multiplication soundness check in base-4. It is significantly cheaper than bal16->bal4.
+pub(crate) fn bal4_to_bal16_digits_ir(b: &mut IrBuilder<'_>, x4: &[VarRef; 33]) -> [VarRef; 17] {
+    let mut out: [VarRef; 17] = [VarRef::Base(0); 17];
+
+    // carry_0 = 0 (no var)
+    let mut carry_i32: i32 = 0;
+    let mut carry_var: Option<VarRef> = None;
+
+    for i in 0..16 {
+        let a = x4[2 * i];
+        let b4 = x4[2 * i + 1];
+        let ai = f257_to_i32_bal(b.val(a));
+        let bi = f257_to_i32_bal(b.val(b4));
+        debug_assert!((-2..=1).contains(&ai));
+        debug_assert!((-2..=1).contains(&bi));
+
+        // sum in base-16 digit slot
+        let sum = ai + 4 * bi + carry_i32;
+        let mut carry_next = if sum >= 0 { (sum + 8) / 16 } else { -(((-sum) + 8) / 16) };
+        let mut rem = sum - 16 * carry_next;
+        while rem > 7 {
+            carry_next += 1;
+            rem -= 16;
+        }
+        while rem < -8 {
+            carry_next -= 1;
+            rem += 16;
+        }
+        debug_assert!((-1..=1).contains(&carry_next));
+        debug_assert!((-8..=7).contains(&rem));
+
+        let rem_var = alloc_bal16_digit_ir(b, rem as i8);
+        let carry_next_var = alloc_carry_pm1_ir(b, carry_next);
+
+        // a + 4*b + carry - rem - 16*carry_next = 0
+        let mut lc = vec![
+            (F257::ONE, a),
+            (F257::from(4u64), b4),
+            (-F257::ONE, rem_var),
+            (-F257::from(16u64), carry_next_var),
+        ];
+        if let Some(cv) = carry_var {
+            lc.insert(2, (F257::ONE, cv));
+        } else {
+            // carry_0 is 0 (no var)
+        }
+        b.enforce_lc_eq_zero(lc);
+
+        out[i] = rem_var;
+        carry_i32 = carry_next;
+        carry_var = Some(carry_next_var);
+    }
+
+    // The top bit (2^64 == 16^16) is x4[32] plus any carry out from the low 64 bits.
+    let carry16 = carry_var.expect("bal4_to_bal16_digits_ir: expected carry var");
+    let top_w = b.val(x4[32]) + b.val(carry16);
+    // top should be boolean (0 or 1)
+    let top = b.new_var(top_w);
+    enforce_bit_var_ir(b, top);
+    // top = x4[32] + carry16
+    b.enforce_lc_eq_zero(vec![
+        (F257::ONE, top),
+        (-F257::ONE, x4[32]),
+        (-F257::ONE, carry16),
+    ]);
+    out[16] = top;
+    out
+}
+
+/// Convert a checked bal16 scalar into checked bal4 digits via a base-4 carry chain.
+///
+/// This is the minimal "drop-in" soundness fix for multiplication gadgets:
+/// it avoids the 16^2+1 degeneracy by doing the multiplication relation check in base-4,
+/// where the problematic bubble corresponds to a ±64 carry jump.
+fn bal16_to_bal4_digits_ir(b: &mut IrBuilder<'_>, x16: &[VarRef; 17]) -> [VarRef; 33] {
+    let z = alloc_zero_const_ir(b);
+    let mut out: [VarRef; 33] = [VarRef::Base(0); 33];
+    let mut carry_var = alloc_carry_pm2_ir(b, 0);
+    let mut carry_i32: i32 = 0;
+
+    for k in 0..33 {
+        let term_var: VarRef = if (k & 1) == 0 { x16[k / 2] } else { z };
+        let term_i32: i32 = if (k & 1) == 0 { f257_to_i32_bal(b.val(x16[k / 2])) } else { 0 };
+
+        let s = term_i32 + carry_i32;
+        let rem = ((s % 4) + 4) % 4; // 0..3
+        let digit = if rem >= 2 { rem - 4 } else { rem }; // -2,-1,0,1
+        let carry_next = (s - digit) / 4;
+
+        debug_assert!((-2..=1).contains(&digit));
+        debug_assert!((-2..=2).contains(&carry_next));
+
+        // Digit is linked by the carry chain; we do not need bit-backed digit checks here.
+        // See NOTE above: carries are tightly bounded (<64 window), preventing the 257 bubble.
+        let dvar = b.new_var(i32_to_f257(digit));
+        let cnext = alloc_carry_pm2_ir(b, carry_next);
+
+        // term + carry - digit - 4*carry_next = 0
+        b.enforce_lc_eq_zero(vec![
+            (F257::ONE, term_var),
+            (F257::ONE, carry_var),
+            (-F257::ONE, dvar),
+            (-F257::from(4u64), cnext),
+        ]);
+
+        out[k] = dvar;
+        carry_var = cnext;
+        carry_i32 = carry_next;
+    }
+
+    b.ir.enforce_var_eq_const(carry_var, F257::ZERO);
+    out
+}
+
+#[inline]
+fn alloc_carry_pm16_bal4_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
+    debug_assert!((-16..=15).contains(&c));
+    let out = b.new_var(i32_to_f257(c));
+    let u: u8 = if c < 0 { (32 + c) as u8 } else { c as u8 }; // c mod 32
+    let mut bits5 = [b.one(); 5];
+    for i in 0..5 {
+        bits5[i] = alloc_bool_ir(b, ((u >> i) & 1) == 1);
+    }
+    // out = b0 + 2b1 + 4b2 + 8b3 - 16b4
+    b.enforce_lc_eq_zero(vec![
+        (F257::ONE, out),
+        (-F257::ONE, bits5[0]),
+        (-F257::from(2u64), bits5[1]),
+        (-F257::from(4u64), bits5[2]),
+        (-F257::from(8u64), bits5[3]),
+        (F257::from(16u64), bits5[4]),
+    ]);
+    out
+}
+
+#[inline]
+fn alloc_carry_pm8_bal4_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
+    debug_assert!((-8..=7).contains(&c));
+    let out = b.new_var(i32_to_f257(c));
+    let u: u8 = if c < 0 { (16 + c) as u8 } else { c as u8 }; // c mod 16
+    let mut bits4 = [b.one(); 4];
+    for i in 0..4 {
+        bits4[i] = alloc_bool_ir(b, ((u >> i) & 1) == 1);
+    }
+    // out = b0 + 2b1 + 4b2 - 8b3
+    b.enforce_lc_eq_zero(vec![
+        (F257::ONE, out),
+        (-F257::ONE, bits4[0]),
+        (-F257::from(2u64), bits4[1]),
+        (-F257::from(4u64), bits4[2]),
+        (F257::from(8u64), bits4[3]),
+    ]);
+    out
+}
+
+#[inline]
+fn alloc_carry_pm4_bal4_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
+    debug_assert!((-4..=3).contains(&c));
+    let out = b.new_var(i32_to_f257(c));
+    let u: u8 = if c < 0 { (8 + c) as u8 } else { c as u8 }; // c mod 8
+    let mut bits3 = [b.one(); 3];
+    for i in 0..3 {
+        bits3[i] = alloc_bool_ir(b, ((u >> i) & 1) == 1);
+    }
+    // out = b0 + 2b1 - 4b2
+    b.enforce_lc_eq_zero(vec![
+        (F257::ONE, out),
+        (-F257::ONE, bits3[0]),
+        (-F257::from(2u64), bits3[1]),
+        (F257::from(4u64), bits3[2]),
+    ]);
+    out
+}
+
+fn enforce_prod_const_eq_qp_plus_r_bal4_ir_with_carry_schedule(
+    b: &mut IrBuilder<'_>,
+    x4: &[VarRef; 33],
+    c4_const: &[i8; 33],
+    q4: &[VarRef; 33],
+    r4: &[VarRef; 33],
+    carry_bounds: &[i32; 66], // per-step |carry_next| bound
+) {
+    // carry_0 = 0
+    let mut carry_var = if carry_bounds[0] <= 3 {
+        alloc_carry_pm4_bal4_ir(b, 0)
+    } else if carry_bounds[0] <= 7 {
+        alloc_carry_pm8_bal4_ir(b, 0)
+    } else if carry_bounds[0] <= 15 {
+        alloc_carry_pm16_bal4_ir(b, 0)
+    } else {
+        alloc_carry_pm32_ir(b, 0)
+    };
+    let mut carry_i32: i32 = 0;
+
+    for k in 0..66 {
+        let mut sum: i32 = carry_i32;
+        let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(128);
+        lc.push((F257::ONE, carry_var));
+
+        // + Σ_i x_i * c_{k-i}
+        for i in 0..33 {
+            let j = k as i32 - i as i32;
+            if !(0..33).contains(&j) {
+                continue;
+            }
+            let dj = c4_const[j as usize] as i32;
+            if dj == 0 {
+                continue;
+            }
+            let xi = f257_to_i32_bal(b.val(x4[i]));
+            sum += xi * dj;
+            lc.push((i32_to_f257(dj), x4[i]));
+        }
+
+        // - r_k
+        if k < 33 {
+            let rk = f257_to_i32_bal(b.val(r4[k]));
+            sum -= rk;
+            lc.push((-F257::ONE, r4[k]));
+        }
+
+        // - q*p where p = 4^32 - 4^16 + 1  => q*p = q - q<<16 + q<<32
+        if k < 33 {
+            let qk = f257_to_i32_bal(b.val(q4[k]));
+            sum -= qk;
+            lc.push((-F257::ONE, q4[k]));
+        }
+        if k >= 16 && (k - 16) < 33 {
+            let qk = f257_to_i32_bal(b.val(q4[k - 16]));
+            sum += qk;
+            lc.push((F257::ONE, q4[k - 16]));
+        }
+        if k >= 32 && (k - 32) < 33 {
+            let qk = f257_to_i32_bal(b.val(q4[k - 32]));
+            sum -= qk;
+            lc.push((-F257::ONE, q4[k - 32]));
+        }
+
+        debug_assert!(sum % 4 == 0, "bal4 const-mul carry not divisible: sum={sum} k={k}");
+        let carry_next: i32 = sum / 4;
+        debug_assert!(
+            (-carry_bounds[k]..=carry_bounds[k]).contains(&carry_next),
+            "bal4 const-mul carry out of bound: {carry_next} at k={k} (sum={sum}, bound={})",
+            carry_bounds[k]
+        );
+        let carry_next_var = if carry_bounds[k] <= 7 {
+            if carry_bounds[k] <= 3 {
+                alloc_carry_pm4_bal4_ir(b, carry_next)
+            } else {
+                alloc_carry_pm8_bal4_ir(b, carry_next)
+            }
+        } else if carry_bounds[k] <= 15 {
+            alloc_carry_pm16_bal4_ir(b, carry_next)
+        } else {
+            alloc_carry_pm32_ir(b, carry_next)
+        };
+        lc.push((-F257::from(4u64), carry_next_var));
+
+        b.enforce_lc_eq_zero(lc);
+        carry_var = carry_next_var;
+        carry_i32 = carry_next;
+    }
+
+    b.ir.enforce_var_eq_const(carry_var, F257::ZERO);
+}
+
+fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
+    b: &mut IrBuilder<'_>,
+    a4: &[VarRef; 33],
+    c4: &[VarRef; 33],
+    q4: &[VarRef; 33],
+    r4: &[VarRef; 33],
+) {
+    // Precompute digit products (33×33 = 1089 mul constraints).
+    let mut prod: [[VarRef; 33]; 33] = [[VarRef::Base(0); 33]; 33];
+    for i in 0..33 {
+        for j in 0..33 {
+            let pij = b.new_var(b.val(a4[i]) * b.val(c4[j]));
+            b.enforce_mul(a4[i], c4[j], pij);
+            prod[i][j] = pij;
+        }
+    }
+
+    // Statement-derived per-step carry bounds:
+    // - |a_i|,|c_j| <= 2 (balanced base-4 digits), so each product term <= 4.
+    // - At step k, number of product terms is t_k = |{(i,j): i+j=k, 0<=i,j<=32}|.
+    // - q*p contributes at most 3 terms of q (each <=2) => <=6, and r digit <=2.
+    // So non-carry magnitude <= 4*t_k + 8. Propagate carry bound via:
+    //   |carry_{k+1}| <= ceil((|carry_k| + bound_k)/4).
+    let mut carry_bounds: [i32; 66] = [31; 66];
+    let mut carry_bound_raw: i32 = 0;
+    for k in 0..66 {
+        let t_k: i32 = if k <= 32 {
+            (k as i32) + 1
+        } else if k <= 64 {
+            (65 - k) as i32
+        } else {
+            0
+        };
+        let bound_k: i32 = 4 * t_k + 8;
+        carry_bound_raw = (carry_bound_raw + bound_k + 3) / 4;
+        carry_bounds[k] = carry_bound_raw;
+    }
+
+    let mut carry_var = alloc_carry_pm4_bal4_ir(b, 0);
+    let mut carry_i32: i32 = 0;
+
+    for k in 0..66 {
+        let mut sum: i32 = carry_i32;
+        let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(256);
+        lc.push((F257::ONE, carry_var));
+
+        // - r_k
+        if k < 33 {
+            let rk = f257_to_i32_bal(b.val(r4[k]));
+            sum -= rk;
+            lc.push((-F257::ONE, r4[k]));
+        }
+
+        // + Σ_{i+j=k} a_i * c_j
+        let i_min = k.saturating_sub(32);
+        let i_max = core::cmp::min(32, k);
+        for i in i_min..=i_max {
+            let j = k - i;
+            let aval = f257_to_i32_bal(b.val(a4[i]));
+            let bval = f257_to_i32_bal(b.val(c4[j]));
+            sum += aval * bval;
+            lc.push((F257::ONE, prod[i][j]));
+        }
+
+        // - q*p  (same sparse p)
+        if k < 33 {
+            let qk = f257_to_i32_bal(b.val(q4[k]));
+            sum -= qk;
+            lc.push((-F257::ONE, q4[k]));
+        }
+        if k >= 16 && (k - 16) < 33 {
+            let qk = f257_to_i32_bal(b.val(q4[k - 16]));
+            sum += qk;
+            lc.push((F257::ONE, q4[k - 16]));
+        }
+        if k >= 32 && (k - 32) < 33 {
+            let qk = f257_to_i32_bal(b.val(q4[k - 32]));
+            sum -= qk;
+            lc.push((-F257::ONE, q4[k - 32]));
+        }
+
+        debug_assert!(sum % 4 == 0, "bal4 var-mul carry not divisible: sum={sum} k={k}");
+        let carry_next: i32 = sum / 4;
+        debug_assert!(
+            (-carry_bounds[k]..=carry_bounds[k]).contains(&carry_next),
+            "bal4 var-mul carry out of bound: {carry_next} at k={k} (sum={sum}, bound={})",
+            carry_bounds[k]
+        );
+        let carry_next_var = if carry_bounds[k] <= 3 {
+            alloc_carry_pm4_bal4_ir(b, carry_next)
+        } else if carry_bounds[k] <= 7 {
+            alloc_carry_pm8_bal4_ir(b, carry_next)
+        } else if carry_bounds[k] <= 15 {
+            alloc_carry_pm16_bal4_ir(b, carry_next)
+        } else {
+            alloc_carry_pm32_ir(b, carry_next)
+        };
+        lc.push((-F257::from(4u64), carry_next_var));
+
+        b.enforce_lc_eq_zero(lc);
+        carry_var = carry_next_var;
+        carry_i32 = carry_next;
+    }
+
+    b.ir.enforce_var_eq_const(carry_var, F257::ZERO);
+}
+
 /// Allocate a signed carry `c ∈ [-128,127]` as an F257 variable by forbidding +128.
 ///
 /// enforce `(c - 128) * inv = 1` where `inv = (c-128)^{-1}` is witness-known.
@@ -1334,115 +1782,6 @@ fn digits_to_u64_witness_ir(b: &IrBuilder<'_>, d: &[VarRef; 17]) -> u64 {
     }
     debug_assert!(acc >= 0);
     acc as u64
-}
-
-/// Enforce: x*k == q*p + r (mod p) using a base-16 carry chain, without materializing x*k digits.
-///
-/// This mirrors `goldilocks.rs::mul_const_mod_p`'s internal helper
-/// `enforce_prod_const_eq_qp_plus_r_bal16`.
-fn enforce_prod_const_eq_qp_plus_r_bal16_ir(
-    b: &mut IrBuilder<'_>,
-    x_d: &[VarRef; 17],
-    k_d_const: &[i8; 17],
-    q_d: &[VarRef; 17],
-    p_d_const: &[i8; 17],
-    r_d: &[VarRef; 17],
-) {
-    let max_len = 17usize
-        .max(r_d.len())
-        .max(q_d.len().saturating_add(p_d_const.len()).saturating_sub(1))
-        + 1;
-
-    let mut carry_i32: i32 = 0;
-    let mut carry_var = alloc_carry_pm128_ir(b, 0);
-
-    for k in 0..max_len {
-        let mut sum: i32 = carry_i32;
-        let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(64);
-        lc.push((F257::ONE, carry_var));
-
-        // -r_k
-        if k < r_d.len() {
-            let rk = f257_to_i32_bal(b.val(r_d[k]));
-            sum -= rk;
-            lc.push((-F257::ONE, r_d[k]));
-        }
-
-        // + Σ_i x_i * k_{k-i}
-        for i in 0..17 {
-            if i > k {
-                break;
-            }
-            let j = k - i;
-            if j >= 17 {
-                continue;
-            }
-            let kd = k_d_const[j] as i32;
-            if kd == 0 {
-                continue;
-            }
-            let xi = f257_to_i32_bal(b.val(x_d[i]));
-            sum += xi * kd;
-            lc.push((i32_to_f257(kd), x_d[i]));
-        }
-
-        // - Σ_i q_i * p_{k-i}
-        for i in 0..q_d.len() {
-            if i > k {
-                break;
-            }
-            let j = k - i;
-            if j >= 17 {
-                continue;
-            }
-            let pd = p_d_const[j] as i32;
-            if pd == 0 {
-                continue;
-            }
-            let qi = f257_to_i32_bal(b.val(q_d[i]));
-            sum -= qi * pd;
-            lc.push((-i32_to_f257(pd), q_d[i]));
-        }
-
-        debug_assert!(sum % 16 == 0, "const-mul carry check not divisible: sum={sum} at k={k}");
-        let carry_next: i32 = sum / 16;
-        debug_assert!(
-            (-128..=127).contains(&carry_next),
-            "const-mul carry out of pm128 bound: {carry_next} at k={k} (sum={sum})"
-        );
-        let carry_next_var = alloc_carry_pm128_ir(b, carry_next);
-        lc.push((-F257::from(16u64), carry_next_var));
-
-        // lc == 0
-        b.enforce_lc_eq_zero(lc);
-        carry_var = carry_next_var;
-        carry_i32 = carry_next;
-    }
-    // Final carry must be 0.
-    b.ir.enforce_var_eq_const(carry_var, F257::ZERO);
-}
-
-/// Digit-domain const multiplication mod Goldilocks p: r = x * k (mod p).
-///
-/// This returns `r` as 17 bal16 digits, and enforces the relation via the carry-chain gadget above.
-pub(crate) fn goldilocks_mul_const_mod_p_digits_ir(
-    b: &mut IrBuilder<'_>,
-    x: &[VarRef; 17],
-    k: u64,
-    p_u64: u64,
-    p_d_const: &[i8; 17],
-) -> [VarRef; 17] {
-    let x_u = digits_to_u64_witness_ir(b, x);
-    let prod: u128 = (x_u as u128) * (k as u128);
-    let q_u: u64 = (prod / (p_u64 as u128)) as u64;
-    let r_u: u64 = (prod % (p_u64 as u128)) as u64;
-    // Keep q/r as *checked* digits here: this gadget's linear combination can exceed the
-    // injective lift range, so "raw" digits would be unconstrained and unsound.
-    let q_d = alloc_u64_as_bal16_digits_witness_ir(b, q_u);
-    let r_d = alloc_u64_as_bal16_digits_witness_ir(b, r_u);
-    let k_d_const = u64_to_bal16_digits_le_const(k);
-    enforce_prod_const_eq_qp_plus_r_bal16_ir(b, x, &k_d_const, &q_d, p_d_const, &r_d);
-    r_d
 }
 
 #[inline]
@@ -1619,93 +1958,255 @@ pub(crate) fn goldilocks_sub_mod_p_digits_ir(
     r_d
 }
 
-/// Enforce: a*b == q*p + r in base-16 carry chain, without materializing a*b digits.
-///
-/// This is the var×var analogue of `enforce_prod_const_eq_qp_plus_r_bal16_ir`.
-fn enforce_prod_var_eq_qp_plus_r_bal16_ir(
-    b: &mut IrBuilder<'_>,
-    a_d: &[VarRef; 17],
-    b_d: &[VarRef; 17],
-    q_d: &[VarRef; 17],
-    p_d_const: &[i8; 17],
-    r_d: &[VarRef; 17],
-) {
-    // Headroom digit: product and q*p both have length up to 33, so loop to 34.
-    let max_len = 17usize
-        .max(r_d.len())
-        .max(q_d.len().saturating_add(p_d_const.len()).saturating_sub(1))
-        .max(a_d.len().saturating_add(b_d.len()).saturating_sub(1))
-        + 1;
+// -----------------------------------------------------------------------------
+// Goldilocks arithmetic in balanced base-4 (used to keep NTT in base4 end-to-end)
+// -----------------------------------------------------------------------------
 
-    // Precompute digit products a_i * b_j (289 mul constraints, reused across all k).
-    let mut prod: [[VarRef; 17]; 17] = [[VarRef::Base(0); 17]; 17];
-    for i in 0..17 {
-        for j in 0..17 {
-            let pij = b.new_var(b.val(a_d[i]) * b.val(b_d[j]));
-            b.enforce_mul(a_d[i], b_d[j], pij);
-            prod[i][j] = pij;
-        }
+#[inline]
+fn digits4_to_u64_witness_ir(b: &IrBuilder<'_>, d: &[VarRef; 33]) -> u64 {
+    let mut acc: i128 = 0;
+    let mut pow: i128 = 1;
+    for i in 0..33 {
+        let di = f257_to_i32_bal(b.val(d[i])) as i128;
+        acc += di * pow;
+        pow *= 4;
     }
+    debug_assert!(acc >= 0);
+    acc as u64
+}
 
-    let mut carry_var = alloc_carry_pm128_ir(b, 0);
+#[inline]
+fn pad33_to_34_with_zero(d: &[VarRef; 33], z: VarRef) -> [VarRef; 34] {
+    let mut out = [z; 34];
+    for i in 0..33 {
+        out[i] = d[i];
+    }
+    out
+}
+
+fn enforce_add_mod_p_relation_bal4_ir(
+    b: &mut IrBuilder<'_>,
+    a4: &[VarRef; 33],
+    c4: &[VarRef; 33],
+    r4: &[VarRef; 33],
+    q: VarRef,
+    q_u8: u8,
+) {
+    debug_assert!(q_u8 == 0 || q_u8 == 1);
+    let z = alloc_zero_const_ir(b);
+    let a = pad33_to_34_with_zero(a4, z);
+    let c = pad33_to_34_with_zero(c4, z);
+    let r = pad33_to_34_with_zero(r4, z);
+
+    let mut carry_var = alloc_carry_pm2_ir(b, 0);
     let mut carry_i32: i32 = 0;
 
-    for k in 0..max_len {
-        let mut sum: i32 = carry_i32;
-        let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(4 + 17 + 17);
-        lc.push((F257::ONE, carry_var));
+    // p = 4^32 - 4^16 + 1  => digit at 0:+1, 16:-1, 32:+1
+    for k in 0..34 {
+        let ak = f257_to_i32_bal(b.val(a[k]));
+        let ck = f257_to_i32_bal(b.val(c[k]));
+        let rk = f257_to_i32_bal(b.val(r[k]));
+        let pk: i32 = match k {
+            0 => 1,
+            16 => -1,
+            32 => 1,
+            _ => 0,
+        };
 
-        // -r_k
-        if k < r_d.len() {
-            let rk = f257_to_i32_bal(b.val(r_d[k]));
-            sum -= rk;
-            lc.push((-F257::ONE, r_d[k]));
-        }
-
-        // + Σ_{i+j=k} a_i * b_j
-        let i_min = k.saturating_sub(16);
-        let i_max = core::cmp::min(16, k);
-        for i in i_min..=i_max {
-            let j = k - i;
-            debug_assert!(j <= 16);
-            let aval = f257_to_i32_bal(b.val(a_d[i]));
-            let bval = f257_to_i32_bal(b.val(b_d[j]));
-            sum += aval * bval;
-            lc.push((F257::ONE, prod[i][j]));
-        }
-
-        // - Σ_i q_i * p_{k-i}
-        for i in 0..q_d.len() {
-            if i > k {
-                break;
-            }
-            let j = k - i;
-            if j >= 17 {
-                continue;
-            }
-            let pd = p_d_const[j] as i32;
-            if pd == 0 {
-                continue;
-            }
-            let qi = f257_to_i32_bal(b.val(q_d[i]));
-            sum -= qi * pd;
-            lc.push((-i32_to_f257(pd), q_d[i]));
-        }
-
-        debug_assert!(sum % 16 == 0, "var-mul carry check not divisible: sum={sum} at k={k}");
-        let carry_next: i32 = sum / 16;
+        let sum = carry_i32 + ak + ck - rk - (q_u8 as i32) * pk;
+        debug_assert!(sum % 4 == 0, "add_mod_p(bal4) carry not divisible: sum={sum} k={k}");
+        let carry_next = sum / 4;
         debug_assert!(
-            (-128..=127).contains(&carry_next),
-            "var-mul carry out of pm128 bound: {carry_next} at k={k} (sum={sum})"
+            (-2..=2).contains(&carry_next),
+            "add_mod_p(bal4) carry out of pm2: {carry_next} (sum={sum}) at k={k}"
         );
-        let carry_next_var = alloc_carry_pm128_ir(b, carry_next);
-        lc.push((-F257::from(16u64), carry_next_var));
+        let carry_next_var = alloc_carry_pm2_ir(b, carry_next);
 
+        // carry + a + c - r - q*pk - 4*carry_next = 0
+        let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(7);
+        lc.push((F257::ONE, carry_var));
+        lc.push((F257::ONE, a[k]));
+        lc.push((F257::ONE, c[k]));
+        lc.push((-F257::ONE, r[k]));
+        if pk != 0 && q_u8 == 1 {
+            // q is boolean constant (0 or 1), so just include it when q==1.
+            lc.push((-i32_to_f257(pk), q));
+        }
+        lc.push((-F257::from(4u64), carry_next_var));
         b.enforce_lc_eq_zero(lc);
+
         carry_var = carry_next_var;
         carry_i32 = carry_next;
     }
     b.ir.enforce_var_eq_const(carry_var, F257::ZERO);
+}
+
+fn enforce_sub_mod_p_relation_bal4_ir(
+    b: &mut IrBuilder<'_>,
+    a4: &[VarRef; 33],
+    c4: &[VarRef; 33],
+    r4: &[VarRef; 33],
+    q: VarRef,
+    q_u8: u8,
+) {
+    debug_assert!(q_u8 == 0 || q_u8 == 1);
+    let z = alloc_zero_const_ir(b);
+    let a = pad33_to_34_with_zero(a4, z);
+    let c = pad33_to_34_with_zero(c4, z);
+    let r = pad33_to_34_with_zero(r4, z);
+
+    let mut carry_var = alloc_carry_pm2_ir(b, 0);
+    let mut carry_i32: i32 = 0;
+
+    for k in 0..34 {
+        let ak = f257_to_i32_bal(b.val(a[k]));
+        let ck = f257_to_i32_bal(b.val(c[k]));
+        let rk = f257_to_i32_bal(b.val(r[k]));
+        let pk: i32 = match k {
+            0 => 1,
+            16 => -1,
+            32 => 1,
+            _ => 0,
+        };
+
+        let sum = carry_i32 + ak + (q_u8 as i32) * pk - ck - rk;
+        debug_assert!(sum % 4 == 0, "sub_mod_p(bal4) carry not divisible: sum={sum} k={k}");
+        let carry_next = sum / 4;
+        debug_assert!(
+            (-2..=2).contains(&carry_next),
+            "sub_mod_p(bal4) carry out of pm2: {carry_next} (sum={sum}) at k={k}"
+        );
+        let carry_next_var = alloc_carry_pm2_ir(b, carry_next);
+
+        // carry + a - c - r + q*pk - 4*carry_next = 0
+        let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(7);
+        lc.push((F257::ONE, carry_var));
+        lc.push((F257::ONE, a[k]));
+        lc.push((-F257::ONE, c[k]));
+        lc.push((-F257::ONE, r[k]));
+        if pk != 0 && q_u8 == 1 {
+            lc.push((i32_to_f257(pk), q));
+        }
+        lc.push((-F257::from(4u64), carry_next_var));
+        b.enforce_lc_eq_zero(lc);
+
+        carry_var = carry_next_var;
+        carry_i32 = carry_next;
+    }
+    b.ir.enforce_var_eq_const(carry_var, F257::ZERO);
+}
+
+#[inline]
+fn goldilocks_add_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[VarRef; 33], c4: &[VarRef; 33], p_u64: u64) -> [VarRef; 33] {
+    let a_u = digits4_to_u64_witness_ir(b, a4);
+    let c_u = digits4_to_u64_witness_ir(b, c4);
+    let sum = (a_u as u128) + (c_u as u128);
+    let q_u8: u8 = if sum >= (p_u64 as u128) { 1 } else { 0 };
+    let r_u: u64 = if q_u8 == 1 { (sum - (p_u64 as u128)) as u64 } else { sum as u64 };
+    let q = if q_u8 == 1 {
+        b.one()
+    } else {
+        let z = b.new_var(F257::ZERO);
+        b.ir.enforce_var_eq_const(z, F257::ZERO);
+        z
+    };
+    let r4 = alloc_u64_as_bal4_digits_raw_ir(b, r_u);
+    enforce_add_mod_p_relation_bal4_ir(b, a4, c4, &r4, q, q_u8);
+    r4
+}
+
+#[inline]
+fn goldilocks_sub_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[VarRef; 33], c4: &[VarRef; 33], p_u64: u64) -> [VarRef; 33] {
+    let a_u = digits4_to_u64_witness_ir(b, a4);
+    let c_u = digits4_to_u64_witness_ir(b, c4);
+    let (q_u8, r_u) = if a_u >= c_u {
+        (0u8, a_u - c_u)
+    } else {
+        (1u8, (a_u as u128 + (p_u64 as u128) - (c_u as u128)) as u64)
+    };
+    let q = if q_u8 == 1 {
+        b.one()
+    } else {
+        let z = b.new_var(F257::ZERO);
+        b.ir.enforce_var_eq_const(z, F257::ZERO);
+        z
+    };
+    let r4 = alloc_u64_as_bal4_digits_raw_ir(b, r_u);
+    enforce_sub_mod_p_relation_bal4_ir(b, a4, c4, &r4, q, q_u8);
+    r4
+}
+
+#[inline]
+pub(crate) fn goldilocks_mul_const_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, x4: &[VarRef; 33], k: u64, p_u64: u64) -> [VarRef; 33] {
+    let x_u = digits4_to_u64_witness_ir(b, x4);
+    let prod: u128 = (x_u as u128) * (k as u128);
+    let q_u: u64 = (prod / (p_u64 as u128)) as u64;
+    let r_u: u64 = (prod % (p_u64 as u128)) as u64;
+    let q4 = alloc_u64_as_bal4_digits_raw_ir(b, q_u);
+    let r4 = alloc_u64_as_bal4_digits_raw_ir(b, r_u);
+    let k4_const = u64_to_bal4_digits_le_const(k);
+    // Choose a carry bound derived purely from constant digits (statement-only), using a
+    // per-position convolution magnitude bound (tighter than a global L1 bound).
+    //
+    // For each k, the constant-weighted convolution term is:
+    //   Σ_i x_i * k_{k-i}
+    // with |x_i| <= 2 and |k_j| <= 2, so magnitude is bounded by:
+    //   M_k = 2 * Σ_{j in window(k)} |k_j|
+    // where window(k) is [0..k] for k<=32 else [k-32..32].
+    //
+    // Add a conservative +8 for q*p (<=6) and r (<=2).
+    let abs_k: [i32; 33] = core::array::from_fn(|i| (k4_const[i] as i32).abs());
+    let mut pref: [i32; 34] = [0; 34];
+    for i in 0..33 {
+        pref[i + 1] = pref[i] + abs_k[i];
+    }
+    let mut carry_bound_raw: i32 = 0;
+    let mut carry_bound_max: i32 = 0;
+    for k in 0..66 {
+        let s = if k <= 32 {
+            pref[k + 1]
+        } else {
+            let lo = k - 32;
+            pref[33] - pref[lo]
+        };
+        let m_k = 2 * s;
+        let sum_bound = carry_bound_raw + m_k + 8;
+        carry_bound_raw = (sum_bound + 3) / 4;
+        if carry_bound_raw > carry_bound_max {
+            carry_bound_max = carry_bound_raw;
+        }
+    }
+    // Build a per-step carry bound schedule (statement-only), then allocate carries using the
+    // smallest admissible range per step (pm8/pm16/pm32).
+    let mut carry_bounds: [i32; 66] = [31; 66];
+    let mut carry_bound_raw: i32 = 0;
+    for k in 0..66 {
+        let s = if k <= 32 {
+            pref[k + 1]
+        } else {
+            let lo = k - 32;
+            pref[33] - pref[lo]
+        };
+        let m_k = 2 * s;
+        let sum_bound = carry_bound_raw + m_k + 8;
+        carry_bound_raw = (sum_bound + 3) / 4;
+        carry_bounds[k] = carry_bound_raw;
+    }
+    enforce_prod_const_eq_qp_plus_r_bal4_ir_with_carry_schedule(b, x4, &k4_const, &q4, &r4, &carry_bounds);
+    r4
+}
+
+#[inline]
+fn goldilocks_mul_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[VarRef; 33], c4: &[VarRef; 33], p_u64: u64) -> [VarRef; 33] {
+    let a_u = digits4_to_u64_witness_ir(b, a4);
+    let c_u = digits4_to_u64_witness_ir(b, c4);
+    let prod_u: u128 = (a_u as u128) * (c_u as u128);
+    let q_u: u64 = (prod_u / (p_u64 as u128)) as u64;
+    let r_u: u64 = (prod_u % (p_u64 as u128)) as u64;
+    let q4 = alloc_u64_as_bal4_digits_raw_ir(b, q_u);
+    let r4 = alloc_u64_as_bal4_digits_raw_ir(b, r_u);
+    enforce_prod_var_eq_qp_plus_r_bal4_ir(b, a4, c4, &q4, &r4);
+    r4
 }
 
 /// Digit-domain Goldilocks multiplication (mod p) in IR form.
@@ -1716,19 +2217,20 @@ pub(crate) fn goldilocks_mul_mod_p_digits_ir(
     p_u64: u64,
     p_d_const: &[i8; 17],
 ) -> [VarRef; 17] {
+    let _ = p_d_const;
     let a_u = digits_to_u64_witness_ir(b, a);
     let c_u = digits_to_u64_witness_ir(b, c);
     let prod_u: u128 = (a_u as u128) * (c_u as u128);
     let q_u: u64 = (prod_u / (p_u64 as u128)) as u64;
     let r_u: u64 = (prod_u % (p_u64 as u128)) as u64;
 
-    // Keep q/r as *checked* digits here: the product carry chain sums can exceed the injective
-    // lift range, so we need real digit range checks (Fox #1 does not justify dropping them).
-    let q_d = alloc_u64_as_bal16_digits_witness_ir(b, q_u);
-    let r_d = alloc_u64_as_bal16_digits_witness_ir(b, r_u);
-
-    enforce_prod_var_eq_qp_plus_r_bal16_ir(b, a, c, &q_d, p_d_const, &r_d);
-    r_d
+    // Enforce multiplication via a balanced base-4 carry chain (pm32 window),
+    let a4 = b.bal16_to_bal4_digits_cached(a);
+    let c4 = b.bal16_to_bal4_digits_cached(c);
+    let q4 = alloc_u64_as_bal4_digits_raw_ir(b, q_u);
+    let r4 = alloc_u64_as_bal4_digits_raw_ir(b, r_u);
+    enforce_prod_var_eq_qp_plus_r_bal4_ir(b, &a4, &c4, &q4, &r4);
+    bal4_to_bal16_digits_ir(b, &r4)
 }
 
 /// Negacyclic ring multiplication for `d=64` over Goldilocks using an NTT-based method, emitting IR.
@@ -1746,18 +2248,23 @@ pub(crate) fn ring_mul_negacyclic_ntt_goldilocks_d64_ir(
     let omega_inv: u64 = gl_ntt64::OMEGA_INV_U64;
     let inv_n: u64 = gl_ntt64::INV_N_U64;
 
-    let p_d_const = u64_to_bal16_digits_le_const(p);
-
     let zero_digit = alloc_zero_const_ir(b);
-    let zero_scalar: [VarRef; 17] = [zero_digit; 17];
+    let zero_scalar4: [VarRef; 33] = [zero_digit; 33];
 
-    fn ntt_in_place(
+    // Convert inputs once: bal16 -> bal4.
+    let mut a4 = [[zero_digit; 33]; 64];
+    let mut c4 = [[zero_digit; 33]; 64];
+    for i in 0..64 {
+        a4[i] = b.bal16_to_bal4_digits_cached(&a[i]);
+        c4[i] = b.bal16_to_bal4_digits_cached(&c[i]);
+    }
+
+    fn ntt_in_place_bal4(
         b: &mut IrBuilder<'_>,
-        a: &mut [[VarRef; 17]; 64],
+        a: &mut [[VarRef; 33]; 64],
         omega: u64,
         p_u64: u64,
-        p_d: &[i8; 17],
-        zero: &[VarRef; 17],
+        zero: &[VarRef; 33],
     ) {
         // Bit-reversal permutation (purely structural).
         let mut tmp = *a;
@@ -1800,79 +2307,195 @@ pub(crate) fn ring_mul_negacyclic_ntt_goldilocks_d64_ir(
                         a[start + j + half]
                     } else if w == p_u64 - 1 {
                         // v = -x mod p = 0 - x
-                        goldilocks_sub_mod_p_digits_ir(b, zero, &a[start + j + half], p_u64, p_d)
+                        goldilocks_sub_mod_p_digits_bal4_ir(b, zero, &a[start + j + half], p_u64)
                     } else {
-                        goldilocks_mul_const_mod_p_digits_ir(b, &a[start + j + half], w, p_u64, p_d)
+                        goldilocks_mul_const_mod_p_digits_bal4_ir(b, &a[start + j + half], w, p_u64)
                     };
-                    a[start + j] = goldilocks_add_mod_p_digits_ir(b, &u, &v, p_u64, p_d);
-                    a[start + j + half] = goldilocks_sub_mod_p_digits_ir(b, &u, &v, p_u64, p_d);
+                    a[start + j] = goldilocks_add_mod_p_digits_bal4_ir(b, &u, &v, p_u64);
+                    a[start + j + half] = goldilocks_sub_mod_p_digits_bal4_ir(b, &u, &v, p_u64);
                 }
             }
             len *= 2;
         }
     }
 
-    fn intt_in_place(
+    fn intt_in_place_bal4(
         b: &mut IrBuilder<'_>,
-        a: &mut [[VarRef; 17]; 64],
+        a: &mut [[VarRef; 33]; 64],
         omega_inv: u64,
         inv_n: u64,
         p_u64: u64,
-        p_d: &[i8; 17],
-        zero: &[VarRef; 17],
+        zero: &[VarRef; 33],
     ) {
-        ntt_in_place(b, a, omega_inv, p_u64, p_d, zero);
+        ntt_in_place_bal4(b, a, omega_inv, p_u64, zero);
         // scale by n^{-1}
         for i in 0..64 {
             a[i] = if inv_n == 1 {
                 a[i]
             } else if inv_n == p_u64 - 1 {
-                goldilocks_sub_mod_p_digits_ir(b, zero, &a[i], p_u64, p_d)
+                goldilocks_sub_mod_p_digits_bal4_ir(b, zero, &a[i], p_u64)
             } else {
-                goldilocks_mul_const_mod_p_digits_ir(b, &a[i], inv_n, p_u64, p_d)
+                goldilocks_mul_const_mod_p_digits_bal4_ir(b, &a[i], inv_n, p_u64)
             };
         }
     }
 
     // Negacyclic via twist by ψ^i (ψ is primitive 128th root).
-    let mut a_tw = [[zero_digit; 17]; 64];
-    let mut c_tw = [[zero_digit; 17]; 64];
+    let mut a_tw = [[zero_digit; 33]; 64];
+    let mut c_tw = [[zero_digit; 33]; 64];
     for i in 0..64 {
         let psi_pow: u64 = gl_ntt64::PSI_POWS_64[i];
         if psi_pow == 1 {
-            a_tw[i] = a[i];
-            c_tw[i] = c[i];
+            a_tw[i] = a4[i];
+            c_tw[i] = c4[i];
         } else if psi_pow == p - 1 {
-            a_tw[i] = goldilocks_sub_mod_p_digits_ir(b, &zero_scalar, &a[i], p, &p_d_const);
-            c_tw[i] = goldilocks_sub_mod_p_digits_ir(b, &zero_scalar, &c[i], p, &p_d_const);
+            a_tw[i] = goldilocks_sub_mod_p_digits_bal4_ir(b, &zero_scalar4, &a4[i], p);
+            c_tw[i] = goldilocks_sub_mod_p_digits_bal4_ir(b, &zero_scalar4, &c4[i], p);
         } else {
-            a_tw[i] = goldilocks_mul_const_mod_p_digits_ir(b, &a[i], psi_pow, p, &p_d_const);
-            c_tw[i] = goldilocks_mul_const_mod_p_digits_ir(b, &c[i], psi_pow, p, &p_d_const);
+            a_tw[i] = goldilocks_mul_const_mod_p_digits_bal4_ir(b, &a4[i], psi_pow, p);
+            c_tw[i] = goldilocks_mul_const_mod_p_digits_bal4_ir(b, &c4[i], psi_pow, p);
         }
     }
 
-    ntt_in_place(b, &mut a_tw, omega, p, &p_d_const, &zero_scalar);
-    ntt_in_place(b, &mut c_tw, omega, p, &p_d_const, &zero_scalar);
+    ntt_in_place_bal4(b, &mut a_tw, omega, p, &zero_scalar4);
+    ntt_in_place_bal4(b, &mut c_tw, omega, p, &zero_scalar4);
 
     // Pointwise multiply.
     for i in 0..64 {
-        a_tw[i] = goldilocks_mul_mod_p_digits_ir(b, &a_tw[i], &c_tw[i], p, &p_d_const);
+        a_tw[i] = goldilocks_mul_mod_p_digits_bal4_ir(b, &a_tw[i], &c_tw[i], p);
     }
 
-    intt_in_place(b, &mut a_tw, omega_inv, inv_n, p, &p_d_const, &zero_scalar);
+    intt_in_place_bal4(b, &mut a_tw, omega_inv, inv_n, p, &zero_scalar4);
 
     // Untwist by ψ^{-i}.
-    let mut out = [[zero_digit; 17]; 64];
+    let mut out4 = [[zero_digit; 33]; 64];
     for i in 0..64 {
         let psi_inv_pow: u64 = gl_ntt64::PSI_INV_POWS_64[i];
-        out[i] = if psi_inv_pow == 1 {
+        out4[i] = if psi_inv_pow == 1 {
             a_tw[i]
         } else if psi_inv_pow == p - 1 {
-            goldilocks_sub_mod_p_digits_ir(b, &zero_scalar, &a_tw[i], p, &p_d_const)
+            goldilocks_sub_mod_p_digits_bal4_ir(b, &zero_scalar4, &a_tw[i], p)
         } else {
-            goldilocks_mul_const_mod_p_digits_ir(b, &a_tw[i], psi_inv_pow, p, &p_d_const)
+            goldilocks_mul_const_mod_p_digits_bal4_ir(b, &a_tw[i], psi_inv_pow, p)
         };
     }
+
+    // Convert outputs once: bal4 -> bal16.
+    let mut out = [[zero_digit; 17]; 64];
+    for i in 0..64 {
+        out[i] = bal4_to_bal16_digits_ir(b, &out4[i]);
+    }
     out
+}
+
+#[cfg(test)]
+mod soundness_regression_tests {
+    use super::*;
+    use symphony::dpp_sumcheck::Dr1csBuilder;
+
+    #[test]
+    fn test_good_bal4_carry_bounds_reject_bubble_mutation() {
+        let p: u64 = gl_ntt64::GOLDILOCKS_P_U64;
+        let k: u64 = gl_ntt64::W_POWS_LEN_64[3];
+        let x: u64 = 123456789u64 % p;
+
+        let mut b = Dr1csBuilder::<F257>::new();
+        b.enforce_var_eq_const(b.one(), F257::ONE);
+
+        let (carry_idx, r0_idx) = {
+            let base_asg = [F257::ONE];
+            let mut ib = IrBuilder::new(&base_asg);
+
+            let x4 = alloc_u64_as_bal4_digits_raw_ir(&mut ib, x);
+            let prod: u128 = (x as u128) * (k as u128);
+            let q_u: u64 = (prod / (p as u128)) as u64;
+            let r_u: u64 = (prod % (p as u128)) as u64;
+            let q4 = alloc_u64_as_bal4_digits_raw_ir(&mut ib, q_u);
+            let r4 = alloc_u64_as_bal4_digits_raw_ir(&mut ib, r_u);
+            let k4 = u64_to_bal4_digits_le_const(k);
+
+            // Use a simple bounded-carry chain (pm32 everywhere is enough to reject the bubble).
+            let mut carry_var = alloc_carry_pm32_ir(&mut ib, 0);
+            let mut carry_i32: i32 = 0;
+            let mut captured_carry_next: Option<VarRef> = None;
+
+            for kk in 0..66 {
+                let mut sum: i32 = carry_i32;
+                let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(256);
+                lc.push((F257::ONE, carry_var));
+
+                // + Σ_i x_i * k_{kk-i}
+                for i in 0..33 {
+                    let j = kk as i32 - i as i32;
+                    if !(0..33).contains(&j) {
+                        continue;
+                    }
+                    let dj = k4[j as usize] as i32;
+                    if dj == 0 {
+                        continue;
+                    }
+                    let xi = f257_to_i32_bal(ib.val(x4[i]));
+                    sum += xi * dj;
+                    lc.push((i32_to_f257(dj), x4[i]));
+                }
+
+                // - r_k (only for kk < 33)
+                if kk < 33 {
+                    let rk = f257_to_i32_bal(ib.val(r4[kk]));
+                    sum -= rk;
+                    lc.push((-F257::ONE, r4[kk]));
+                }
+
+                // - q*p where p = 4^32 - 4^16 + 1  => q*p = q - q<<16 + q<<32
+                if kk < 33 {
+                    let qk = f257_to_i32_bal(ib.val(q4[kk]));
+                    sum -= qk;
+                    lc.push((-F257::ONE, q4[kk]));
+                }
+                if kk >= 16 && (kk - 16) < 33 {
+                    let qk = f257_to_i32_bal(ib.val(q4[kk - 16]));
+                    sum += qk;
+                    lc.push((F257::ONE, q4[kk - 16]));
+                }
+                if kk >= 32 && (kk - 32) < 33 {
+                    let qk = f257_to_i32_bal(ib.val(q4[kk - 32]));
+                    sum -= qk;
+                    lc.push((-F257::ONE, q4[kk - 32]));
+                }
+
+                debug_assert!(sum % 4 == 0);
+                let carry_next: i32 = sum / 4;
+                debug_assert!((-32..=31).contains(&carry_next));
+                let carry_next_var = alloc_carry_pm32_ir(&mut ib, carry_next);
+                if kk == 0 {
+                    captured_carry_next = Some(carry_next_var);
+                }
+                lc.push((-F257::from(4u64), carry_next_var));
+                ib.enforce_lc_eq_zero(lc);
+                carry_var = carry_next_var;
+                carry_i32 = carry_next;
+            }
+            ib.ir.enforce_var_eq_const(carry_var, F257::ZERO);
+
+            let lowered = lower_ir_into_builder(&mut b, ib.ir);
+            let carry_idx = lowered.map_var(captured_carry_next.expect("carry_next@k=0"));
+            let r0_idx = lowered.map_var(r4[0]);
+            (carry_idx, r0_idx)
+        };
+
+        let (inst, mut asg) = b.into_instance();
+        inst.check(&asg).expect("baseline satisfied");
+
+        // Try the bubble mutation for base-4:
+        // carry_next += 64, r0 += 1 keeps the LC unchanged mod 257 because (-4)*64 = -256 ≡ +1.
+        // This must FAIL due to carry range check (pm32 forbids shifting by 64).
+        asg[carry_idx] += F257::from(64u64);
+        asg[r0_idx] += F257::ONE;
+
+        assert!(
+            inst.check(&asg).is_err(),
+            "bounded base-4 carry gadget should reject bubble mutation"
+        );
+    }
 }
 

@@ -6,7 +6,7 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 use super::coins::goldilocks_p_base128_digits_le;
 use super::digits::u64_bytes_to_bal16_digits;
 use super::cm_ir::{
-    goldilocks_add_mod_p_digits_ir, goldilocks_mul_const_mod_p_digits_ir,
+    bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_ir, goldilocks_mul_const_mod_p_digits_bal4_ir,
     goldilocks_mul_mod_p_digits_ir, goldilocks_sub_mod_p_digits_ir, lower_ir_into_builder, IrBuilder as CmIrBuilder,
     VarRef as IrVarRef,
 };
@@ -477,14 +477,14 @@ pub(super) fn goldilocks_mul_const_mod_p_from_byte_vars_assume_canonical(
     let r_d_bytes = u64_bytes_to_bal16_digits(b, r_bytes);
     debug_assert_eq!(r_d_bytes.len(), 17);
 
-    let p_d_const = goldilocks_p_bal16_digits_le_const();
-
     // Build IR fragment against a snapshot of the current base assignment, then lower.
     let (ir, out_ir) = {
         let base_asg: &[F257] = &b.assignment;
         let mut ib = CmIrBuilder::new(base_asg);
         let x_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(x_d[j]));
-        let out_ir = goldilocks_mul_const_mod_p_digits_ir(&mut ib, &x_ir, c, GOLDILOCKS_P, &p_d_const);
+        let x4 = ib.bal16_to_bal4_digits_cached(&x_ir);
+        let r4 = goldilocks_mul_const_mod_p_digits_bal4_ir(&mut ib, &x4, c, GOLDILOCKS_P);
+        let out_ir = bal4_to_bal16_digits_ir(&mut ib, &r4);
         (ib.ir, out_ir)
     };
     let lowered = lower_ir_into_builder(b, ir);
