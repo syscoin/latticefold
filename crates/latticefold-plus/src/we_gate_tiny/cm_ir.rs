@@ -909,26 +909,23 @@ pub(crate) fn alloc_carry_pm1_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
 #[inline]
 pub(crate) fn alloc_carry_pm8_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
     debug_assert!((-8..=7).contains(&c));
-    let off: u8 = (c + 8) as u8; // in [0,15]
+    // Balanced signed encoding with 4 bits:
+    //   c = b0 + 2*b1 + 4*b2 - 8*b3  ∈ [-8,7]
+    //
+    // This is strictly cheaper than the older "offset + recombine" encoding
+    // (no extra `off_var`, one fewer linear constraint), while remaining a sound range check.
+    let u: u8 = if c < 0 { (16 + c) as u8 } else { c as u8 }; // c mod 16
     let mut bits4 = [b.one(); 4];
     for i in 0..4 {
-        bits4[i] = alloc_bool_ir(b, ((off >> i) & 1) == 1);
+        bits4[i] = alloc_bool_ir(b, ((u >> i) & 1) == 1);
     }
-    let off_var = b.new_var(F257::from(off as u64));
-    // off = Σ 2^i * bits[i]
+    let c_var = b.new_var(i32_to_f257(c));
     b.enforce_lc_eq_zero(vec![
-        (F257::ONE, off_var),
+        (F257::ONE, c_var),
         (-F257::ONE, bits4[0]),
         (-F257::from(2u64), bits4[1]),
         (-F257::from(4u64), bits4[2]),
-        (-F257::from(8u64), bits4[3]),
-    ]);
-    let c_var = b.new_var(i32_to_f257(c));
-    // c = off - 8
-    b.enforce_lc_eq_zero(vec![
-        (F257::ONE, c_var),
-        (-F257::ONE, off_var),
-        (F257::from(8u64), b.one()),
+        (F257::from(8u64), bits4[3]),
     ]);
     c_var
 }
@@ -936,63 +933,69 @@ pub(crate) fn alloc_carry_pm8_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
 #[inline]
 pub(crate) fn alloc_carry_pm16_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
     debug_assert!((-16..=15).contains(&c));
-    let off: u8 = (c + 16) as u8; // in [0,31]
+    // Balanced signed encoding with 5 bits:
+    //   c = b0 + 2*b1 + 4*b2 + 8*b3 - 16*b4  ∈ [-16,15]
+    let u: u8 = if c < 0 { (32 + c) as u8 } else { c as u8 }; // c mod 32
     let mut bits5 = [b.one(); 5];
     for i in 0..5 {
-        bits5[i] = alloc_bool_ir(b, ((off >> i) & 1) == 1);
+        bits5[i] = alloc_bool_ir(b, ((u >> i) & 1) == 1);
     }
-    let off_var = b.new_var(F257::from(off as u64));
-    let mut lc = vec![(F257::ONE, off_var)];
-    let mut pow: u64 = 1;
-    for i in 0..5 {
-        lc.push((-F257::from(pow), bits5[i]));
-        pow <<= 1;
-    }
-    b.enforce_lc_eq_zero(lc);
     let c_var = b.new_var(i32_to_f257(c));
-    b.enforce_lc_eq_zero(vec![(F257::ONE, c_var), (-F257::ONE, off_var), (F257::from(16u64), b.one())]);
+    b.enforce_lc_eq_zero(vec![
+        (F257::ONE, c_var),
+        (-F257::ONE, bits5[0]),
+        (-F257::from(2u64), bits5[1]),
+        (-F257::from(4u64), bits5[2]),
+        (-F257::from(8u64), bits5[3]),
+        (F257::from(16u64), bits5[4]),
+    ]);
     c_var
 }
 
 #[inline]
 pub(crate) fn alloc_carry_pm32_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
     debug_assert!((-32..=31).contains(&c));
-    let off: u8 = (c + 32) as u8; // in [0,63]
+    // Balanced signed encoding with 6 bits:
+    //   c = b0 + 2*b1 + 4*b2 + 8*b3 + 16*b4 - 32*b5  ∈ [-32,31]
+    let u: u8 = if c < 0 { (64 + c) as u8 } else { c as u8 }; // c mod 64
     let mut bits6 = [b.one(); 6];
     for i in 0..6 {
-        bits6[i] = alloc_bool_ir(b, ((off >> i) & 1) == 1);
+        bits6[i] = alloc_bool_ir(b, ((u >> i) & 1) == 1);
     }
-    let off_var = b.new_var(F257::from(off as u64));
-    let mut lc = vec![(F257::ONE, off_var)];
-    let mut pow: u64 = 1;
-    for i in 0..6 {
-        lc.push((-F257::from(pow), bits6[i]));
-        pow <<= 1;
-    }
-    b.enforce_lc_eq_zero(lc);
     let c_var = b.new_var(i32_to_f257(c));
-    b.enforce_lc_eq_zero(vec![(F257::ONE, c_var), (-F257::ONE, off_var), (F257::from(32u64), b.one())]);
+    b.enforce_lc_eq_zero(vec![
+        (F257::ONE, c_var),
+        (-F257::ONE, bits6[0]),
+        (-F257::from(2u64), bits6[1]),
+        (-F257::from(4u64), bits6[2]),
+        (-F257::from(8u64), bits6[3]),
+        (-F257::from(16u64), bits6[4]),
+        (F257::from(32u64), bits6[5]),
+    ]);
     c_var
 }
 
 #[inline]
 pub(crate) fn alloc_carry_pm64_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
     debug_assert!((-64..=63).contains(&c));
-    let off: u8 = (c + 64) as u8; // in [0,127]
+    // Balanced signed encoding with 7 bits:
+    //   c = b0 + 2*b1 + 4*b2 + 8*b3 + 16*b4 + 32*b5 - 64*b6  ∈ [-64,63]
+    let u: u8 = if c < 0 { (128 + c) as u8 } else { c as u8 }; // c mod 128
     let mut bits7 = [b.one(); 7];
     for i in 0..7 {
-        bits7[i] = alloc_bool_ir(b, ((off >> i) & 1) == 1);
+        bits7[i] = alloc_bool_ir(b, ((u >> i) & 1) == 1);
     }
-    let off_var = b.new_var(F257::from(off as u64));
-    let mut lc = vec![(F257::ONE, off_var)];
-    let mut pow: u64 = 1;
-    for i in 0..7 {
-        lc.push((-F257::from(pow), bits7[i]));
-        pow <<= 1;
-    }
-    b.enforce_lc_eq_zero(lc);
     let c_var = b.new_var(i32_to_f257(c));
-    b.enforce_lc_eq_zero(vec![(F257::ONE, c_var), (-F257::ONE, off_var), (F257::from(64u64), b.one())]);
+    b.enforce_lc_eq_zero(vec![
+        (F257::ONE, c_var),
+        (-F257::ONE, bits7[0]),
+        (-F257::from(2u64), bits7[1]),
+        (-F257::from(4u64), bits7[2]),
+        (-F257::from(8u64), bits7[3]),
+        (-F257::from(16u64), bits7[4]),
+        (-F257::from(32u64), bits7[5]),
+        (F257::from(64u64), bits7[6]),
+    ]);
     c_var
 }
 

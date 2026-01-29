@@ -403,6 +403,74 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
 }
 
 #[test]
+fn test_scalar_mul_mod_p_ir_constraint_delta_smoke() {
+    use std::time::Instant;
+
+    // This is a micro-benchmark style smoke test: it prints the incremental constraint/var
+    // cost of a digit-domain Goldilocks mul mod p, without building the full tiny gate.
+    //
+    // Run with `-- --nocapture` to see the numbers.
+    let p_u64 = super::goldilocks::GOLDILOCKS_P;
+    let p_d = super::goldilocks::goldilocks_p_bal16_digits_le_const();
+
+    let mut b = Dr1csBuilder::<F257>::new();
+    b.enforce_var_eq_const(b.one(), F257::ONE);
+
+    // Fixed inputs (avoid randomness in tests).
+    let a_u: u64 = 123456789u64 % p_u64;
+    let c_u: u64 = 987654321u64 % p_u64;
+    let a_bytes = super::cm_math::alloc_const_goldilocks_u64(&mut b, a_u);
+    let c_bytes = super::cm_math::alloc_const_goldilocks_u64(&mut b, c_u);
+    let a = super::cm_math::goldilocks_bytes_to_digits(&mut b, a_bytes);
+    let c = super::cm_math::goldilocks_bytes_to_digits(&mut b, c_bytes);
+
+    let n_iters: usize = 200;
+    let t0 = Instant::now();
+    let rows0 = b.rows.len();
+    let vars0 = b.assignment.len();
+
+    for _ in 0..n_iters {
+        let base_asg: Vec<F257> = b.assignment.clone();
+        let mut ib = super::cm_ir::IrBuilder::new(&base_asg);
+        let a_ir: [super::cm_ir::VarRef; 17] = core::array::from_fn(|j| super::cm_ir::VarRef::Base(a[j]));
+        let c_ir: [super::cm_ir::VarRef; 17] = core::array::from_fn(|j| super::cm_ir::VarRef::Base(c[j]));
+        let out_ir = super::cm_ir::goldilocks_mul_mod_p_digits_ir(&mut ib, &a_ir, &c_ir, p_u64, &p_d);
+        let lowered = super::cm_ir::lower_ir_into_builder(&mut b, ib.ir);
+        let _out: [usize; 17] = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
+    }
+
+    let dt = t0.elapsed();
+    let rows1 = b.rows.len();
+    let vars1 = b.assignment.len();
+    eprintln!(
+        "== micro scalar_mul_mod_p: iters={} delta_constraints={} (~{:.1}/iter) delta_vars={} (~{:.1}/iter) elapsed={:?} ==",
+        n_iters,
+        rows1 - rows0,
+        (rows1 - rows0) as f64 / (n_iters as f64),
+        vars1 - vars0,
+        (vars1 - vars0) as f64 / (n_iters as f64),
+        dt
+    );
+
+    // Basic sanity: output witness should decode to the native product.
+    let exp: u64 = ((a_u as u128) * (c_u as u128) % (p_u64 as u128)) as u64;
+    let base_asg: Vec<F257> = b.assignment.clone();
+    let mut ib = super::cm_ir::IrBuilder::new(&base_asg);
+    let a_ir: [super::cm_ir::VarRef; 17] = core::array::from_fn(|j| super::cm_ir::VarRef::Base(a[j]));
+    let c_ir: [super::cm_ir::VarRef; 17] = core::array::from_fn(|j| super::cm_ir::VarRef::Base(c[j]));
+    let out_ir = super::cm_ir::goldilocks_mul_mod_p_digits_ir(&mut ib, &a_ir, &c_ir, p_u64, &p_d);
+    let lowered = super::cm_ir::lower_ir_into_builder(&mut b, ib.ir);
+    let out: [usize; 17] = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
+    let mut acc: i128 = 0;
+    let mut pow: i128 = 1;
+    for j in 0..17 {
+        acc += (f257_to_i32_bal(b.assignment[out[j]]) as i128) * pow;
+        pow *= 16;
+    }
+    assert_eq!(acc as u64, exp);
+}
+
+#[test]
 fn test_bounded_u32_from_8_digits_base128_matches_byte_view() {
     let mut b = Dr1csBuilder::<F257>::new();
     b.enforce_var_eq_const(b.one(), F257::ONE);
