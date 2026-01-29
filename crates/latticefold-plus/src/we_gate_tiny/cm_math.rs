@@ -7,12 +7,14 @@ use rayon::prelude::*;
 use super::op_counts::tiny_cm_bump;
 use super::goldilocks::{
     goldilocks_add_mod_p_from_byte_vars_assume_canonical, goldilocks_mul_mod_p_from_byte_vars_assume_canonical,
+    goldilocks_mul_const_mod_p_from_byte_vars_assume_canonical,
     goldilocks_sub_mod_p_from_byte_vars_assume_canonical,
     goldilocks_scalar_from_u64_bytes_le_digits,
     goldilocks_p_bal16_digits_le_const, GoldilocksScalar,
 };
 use super::cm_ir::{
-    goldilocks_add_mod_p_digits_ir, goldilocks_mul_mod_p_digits_ir, goldilocks_sub_mod_p_digits_ir, lower_ir_into_builder,
+    bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_ir, goldilocks_mul_const_mod_p_digits_bal4_ir,
+    goldilocks_mul_mod_p_digits_ir, goldilocks_sub_mod_p_digits_ir, lower_ir_into_builder,
     ring_mul_negacyclic_ntt_goldilocks_d64_ir, IrBuilder, VarRef as IrVarRef,
 };
 
@@ -117,7 +119,7 @@ pub(crate) fn ring_scale_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, s: &[
 pub(crate) fn lagrange_degree2_goldilocks(
     gb: &mut Dr1csBuilder<F257>,
     r: &[usize; 8],
-    inv2: &[usize; 8],
+    _inv2: &[usize; 8],
     one: &[usize; 8],
     two: &[usize; 8],
 ) -> ([usize; 8], [usize; 8], [usize; 8]) {
@@ -131,7 +133,8 @@ pub(crate) fn lagrange_degree2_goldilocks(
 
     // L0 = (r-1)(r-2)/2
     let p = goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, &t1, &t2);
-    let l0 = goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, &p, inv2);
+    let inv2_u64 = (crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P + 1) / 2;
+    let l0 = goldilocks_mul_const_mod_p_from_byte_vars_assume_canonical(gb, &p, inv2_u64);
 
     // L1 = -r(r-2) = 0 - r(r-2)
     let p = goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, r, &t2);
@@ -140,7 +143,7 @@ pub(crate) fn lagrange_degree2_goldilocks(
 
     // L2 = r(r-1)/2
     let p = goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, r, &t1);
-    let l2 = goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, &p, inv2);
+    let l2 = goldilocks_mul_const_mod_p_from_byte_vars_assume_canonical(gb, &p, inv2_u64);
 
     gb.profile_exit(_prev);
     (l0, l1, l2)
@@ -441,6 +444,24 @@ fn goldilocks_mul_mod_p_digits(
     out
 }
 
+#[inline]
+fn goldilocks_mul_const_mod_p_digits(gb: &mut Dr1csBuilder<F257>, a: &GoldilocksScalar, k: u64) -> GoldilocksScalar {
+    let _prev = gb.profile_enter("cm_math::scalar_mul_const_mod_p_digits");
+    tiny_cm_bump(|cc| cc.scalar_mul_const += 1);
+    let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+    debug_assert!(k < p_u64);
+    let base_asg: &[F257] = &gb.assignment;
+    let mut ib = IrBuilder::new(base_asg);
+    let a_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(a[j]));
+    let a4 = ib.bal16_to_bal4_digits_cached(&a_ir);
+    let r4 = goldilocks_mul_const_mod_p_digits_bal4_ir(&mut ib, &a4, k, p_u64);
+    let out_ir = bal4_to_bal16_digits_ir(&mut ib, &r4);
+    let lowered = lower_ir_into_builder(gb, ib.ir);
+    let out = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
+    gb.profile_exit(_prev);
+    out
+}
+
 /// Degree-2 Lagrange basis in digit encoding.
 pub(crate) fn lagrange_degree2_goldilocks_digits(
     gb: &mut Dr1csBuilder<F257>,
@@ -449,13 +470,15 @@ pub(crate) fn lagrange_degree2_goldilocks_digits(
     one: &GoldilocksScalar,
     two: &GoldilocksScalar,
 ) -> (GoldilocksScalar, GoldilocksScalar, GoldilocksScalar) {
+    let inv2_u64 = (crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P + 1) / 2;
     // t1 = r - 1, t2 = r - 2
     let t1 = goldilocks_sub_mod_p_digits(gb, r, one);
     let t2 = goldilocks_sub_mod_p_digits(gb, r, two);
 
     // L0 = (r-1)(r-2)/2
     let p = goldilocks_mul_mod_p_digits(gb, &t1, &t2);
-    let l0 = goldilocks_mul_mod_p_digits(gb, &p, inv2);
+    let _ = inv2;
+    let l0 = goldilocks_mul_const_mod_p_digits(gb, &p, inv2_u64);
 
     // L1 = -r(r-2)
     let p = goldilocks_mul_mod_p_digits(gb, r, &t2);
@@ -465,7 +488,7 @@ pub(crate) fn lagrange_degree2_goldilocks_digits(
 
     // L2 = r(r-1)/2
     let p = goldilocks_mul_mod_p_digits(gb, r, &t1);
-    let l2 = goldilocks_mul_mod_p_digits(gb, &p, inv2);
+    let l2 = goldilocks_mul_const_mod_p_digits(gb, &p, inv2_u64);
 
     (l0, l1, l2)
 }
