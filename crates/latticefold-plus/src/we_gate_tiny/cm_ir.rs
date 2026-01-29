@@ -78,6 +78,14 @@ pub(crate) struct CmIrStats {
     /// Non-linear constraints emitted via `add_constraint` (bool/range gadgets etc),
     /// excluding `enforce_mul`.
     pub(crate) other_non_linear_constraints: u64,
+    /// Total number of (coeff,var) terms across all A/B/C linear combinations.
+    pub(crate) total_terms_a: u64,
+    pub(crate) total_terms_b: u64,
+    pub(crate) total_terms_c: u64,
+    /// Max number of terms in any single A/B/C linear combination.
+    pub(crate) max_terms_a: u32,
+    pub(crate) max_terms_b: u32,
+    pub(crate) max_terms_c: u32,
 }
 
 /// A parallel-build-friendly constraint fragment.
@@ -110,6 +118,12 @@ impl CmIr {
     #[inline]
     pub(crate) fn enforce_lc_times_one_eq_zero(&mut self, lc: Vec<(F257, VarRef)>) {
         self.stats.linear_constraints += 1;
+        self.stats.total_terms_a += lc.len() as u64;
+        self.stats.total_terms_b += 1;
+        self.stats.total_terms_c += 1;
+        self.stats.max_terms_a = self.stats.max_terms_a.max(lc.len() as u32);
+        self.stats.max_terms_b = self.stats.max_terms_b.max(1);
+        self.stats.max_terms_c = self.stats.max_terms_c.max(1);
         self.constraints.push(IrConstraint {
             a: lc,
             b: vec![(F257::ONE, VarRef::Base(0))],
@@ -128,6 +142,12 @@ impl CmIr {
     #[inline]
     pub(crate) fn enforce_mul(&mut self, a: VarRef, b: VarRef, c: VarRef) {
         self.stats.mul_constraints += 1;
+        self.stats.total_terms_a += 1;
+        self.stats.total_terms_b += 1;
+        self.stats.total_terms_c += 1;
+        self.stats.max_terms_a = self.stats.max_terms_a.max(1);
+        self.stats.max_terms_b = self.stats.max_terms_b.max(1);
+        self.stats.max_terms_c = self.stats.max_terms_c.max(1);
         self.constraints.push(IrConstraint {
             a: vec![(F257::ONE, a)],
             b: vec![(F257::ONE, b)],
@@ -147,6 +167,12 @@ impl CmIr {
         } else {
             self.stats.other_non_linear_constraints += 1;
         }
+        self.stats.total_terms_a += a.len() as u64;
+        self.stats.total_terms_b += b.len() as u64;
+        self.stats.total_terms_c += c.len() as u64;
+        self.stats.max_terms_a = self.stats.max_terms_a.max(a.len() as u32);
+        self.stats.max_terms_b = self.stats.max_terms_b.max(b.len() as u32);
+        self.stats.max_terms_c = self.stats.max_terms_c.max(c.len() as u32);
         self.constraints.push(IrConstraint { a, b, c });
     }
 

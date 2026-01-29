@@ -275,6 +275,7 @@ fn test_goldilocks_mul_const_mod_p_from_bytes_matches_native() {
 #[test]
 fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
     use rand::{RngCore, SeedableRng};
+    use std::time::Instant;
     let mut rng = rand::rngs::StdRng::seed_from_u64(123456789);
 
     let p = super::goldilocks::GOLDILOCKS_P;
@@ -307,6 +308,7 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
     }
 
     // Circuit: boundary conversion bytes->digits only (stand-in for external IO).
+    let t0 = Instant::now();
     let mut b = Dr1csBuilder::<F257>::new();
     b.enforce_var_eq_const(b.one(), F257::ONE);
     let mut a_bytes = [[0usize; 8]; 64];
@@ -319,6 +321,7 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
             c_bytes[i][j] = alloc_byte::<F257>(&mut b, v).byte;
         }
     }
+    let t_after_alloc_bytes = Instant::now();
 
     let a_d: [super::goldilocks::GoldilocksScalar; 64] = core::array::from_fn(|i| {
         let v = u64_bytes_to_bal16_digits(&mut b, a_bytes[i]);
@@ -328,6 +331,7 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
         let v = u64_bytes_to_bal16_digits(&mut b, c_bytes[i]);
         v.try_into().expect("u64 bytes -> 17 digits")
     });
+    let t_after_bytes_to_digits = Instant::now();
 
     // Use the IR implementation (the old non-IR gadget has been removed).
     // Clone assignment so we can later mutably borrow `b` to lower IR.
@@ -338,15 +342,23 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
     let c_ir: [[super::cm_ir::VarRef; 17]; 64] =
         core::array::from_fn(|i| core::array::from_fn(|j| super::cm_ir::VarRef::Base(c_d[i][j])));
     let out_ir = super::cm_ir::ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &a_ir, &c_ir);
+    let t_after_build_ir = Instant::now();
     let ir_stats = ib.ir.stats;
     eprintln!(
-        "== ringmul IR stats: linear={} mul={} other_non_linear={} total={} ==",
+        "== ringmul IR stats: linear={} mul={} other_non_linear={} total={} | terms(a,b,c)=({},{},{}) max(a,b,c)=({},{},{}) ==",
         ir_stats.linear_constraints,
         ir_stats.mul_constraints,
         ir_stats.other_non_linear_constraints,
-        ir_stats.linear_constraints + ir_stats.mul_constraints + ir_stats.other_non_linear_constraints
+        ir_stats.linear_constraints + ir_stats.mul_constraints + ir_stats.other_non_linear_constraints,
+        ir_stats.total_terms_a,
+        ir_stats.total_terms_b,
+        ir_stats.total_terms_c,
+        ir_stats.max_terms_a,
+        ir_stats.max_terms_b,
+        ir_stats.max_terms_c,
     );
     let lowered = super::cm_ir::lower_ir_into_builder(&mut b, ib.ir);
+    let t_after_lower_ir = Instant::now();
     let out: [super::goldilocks::GoldilocksScalar; 64] = core::array::from_fn(|i| {
         core::array::from_fn(|j| lowered.map_var(out_ir[i][j]))
     });
@@ -361,6 +373,7 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
         }
         assert_eq!(acc as u64, exp[k]);
     }
+    let t_after_decode_check = Instant::now();
 
     eprintln!(
         "== dR1CS dump: ring_mul_negacyclic_ntt_goldilocks_d64_ir | nvars={} nconstraints={} ==",
@@ -372,7 +385,21 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
     }
 
     let (inst, asg) = b.into_instance();
+    let t_after_into_instance = Instant::now();
     inst.check(&asg).expect("ring mul (goldilocks ntt, IR) constraints satisfied");
+    let t_after_check = Instant::now();
+
+    eprintln!(
+        "== ringmul timings (release): total={:?} alloc_bytes={:?} bytes_to_digits={:?} build_ir={:?} lower_ir={:?} decode_check={:?} into_instance={:?} check={:?} ==",
+        t_after_check.duration_since(t0),
+        t_after_alloc_bytes.duration_since(t0),
+        t_after_bytes_to_digits.duration_since(t_after_alloc_bytes),
+        t_after_build_ir.duration_since(t_after_bytes_to_digits),
+        t_after_lower_ir.duration_since(t_after_build_ir),
+        t_after_decode_check.duration_since(t_after_lower_ir),
+        t_after_into_instance.duration_since(t_after_decode_check),
+        t_after_check.duration_since(t_after_into_instance),
+    );
 }
 
 #[test]
