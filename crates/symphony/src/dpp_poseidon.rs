@@ -251,7 +251,7 @@ pub fn merge_sparse_dr1cs_share_one_with_glue_relaxed<F: PrimeField>(
 }
 
 fn merge_sparse_dr1cs_share_one_with_glue_impl<F: PrimeField>(
-    mut parts: Vec<(SparseDr1csInstance<F>, Vec<F>)>,
+    parts: Vec<(SparseDr1csInstance<F>, Vec<F>)>,
     glue: &[(usize, usize, usize, usize)],
     check_assignment_consistency: bool,
 ) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {

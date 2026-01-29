@@ -93,9 +93,9 @@ where
     let mut a_terms: Vec<(<<R as PolyRing>::BaseRing as Field>::BasePrimeField, usize)> =
         Vec::new();
     // Reuse constant-one/zero LCs on B/C.
-    let mut b_terms: Vec<(<<R as PolyRing>::BaseRing as Field>::BasePrimeField, usize)> =
+    let b_terms: Vec<(<<R as PolyRing>::BaseRing as Field>::BasePrimeField, usize)> =
         vec![(<<R as PolyRing>::BaseRing as Field>::BasePrimeField::ONE, 0)];
-    let mut c_terms: Vec<(<<R as PolyRing>::BaseRing as Field>::BasePrimeField, usize)> =
+    let c_terms: Vec<(<<R as PolyRing>::BaseRing as Field>::BasePrimeField, usize)> =
         vec![(<<R as PolyRing>::BaseRing as Field>::BasePrimeField::ZERO, 0)];
     for i in 0..kappa {
         for lane in 0..d {
@@ -230,9 +230,9 @@ where
     // Σ_{j,lane_in} coeff(j,lane_in -> lane_out) * msg[j][lane_in] = commitment[i][lane_out]
     let mut constraints: Vec<Constraint> = Vec::with_capacity(kappa * d);
     let mut a_terms: Vec<(<<R as PolyRing>::BaseRing as Field>::BasePrimeField, usize)> = Vec::new();
-    let mut b_terms: Vec<(<<R as PolyRing>::BaseRing as Field>::BasePrimeField, usize)> =
+    let b_terms: Vec<(<<R as PolyRing>::BaseRing as Field>::BasePrimeField, usize)> =
         vec![(<<R as PolyRing>::BaseRing as Field>::BasePrimeField::ONE, 0)];
-    let mut c_terms: Vec<(<<R as PolyRing>::BaseRing as Field>::BasePrimeField, usize)> =
+    let c_terms: Vec<(<<R as PolyRing>::BaseRing as Field>::BasePrimeField, usize)> =
         vec![(<<R as PolyRing>::BaseRing as Field>::BasePrimeField::ZERO, 0)];
     for i in 0..kappa {
         for lane_out in 0..d {

@@ -6,8 +6,7 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 use super::gadgets::decompose_existing_byte_var_to_bits;
 use super::cm_ir::{
     alloc_bal16_digit_ir, alloc_carry_pm2_ir, lower_ir_into_builder, IrBuilder as CmIrBuilder,
-    add_bal16_loose_same_len_ir, add_bal16_same_len_ir, add3_bal16_same_len_ir, mul_bal16_small_ir, neg_bal16_digits_ir,
-    rebalance_tail_pm11_to_pm2_ir,
+    add_bal16_loose_same_len_ir, add_bal16_same_len_ir, mul_bal16_small_ir, neg_bal16_digits_ir, rebalance_tail_pm11_to_pm2_ir,
     sub_bal16_same_len_ir,
     u32_bytes_to_bal16_digits_from_bits_ir, u64_bytes_to_bal16_digits_from_bits_ir, VarRef as CmVarRef,
     Bal16CheckedIr as CmBal16CheckedIr,
@@ -226,32 +225,6 @@ fn normalize_bal16_loose_same_len_with_bound(
     let out: Vec<usize> = out_ir.0.into_iter().map(|v| lowered.map_var(v)).collect();
     let carry = lowered.map_var(carry_ir);
 
-    b.profile_exit(_prev);
-    (Bal16Checked(out), carry)
-}
-
-/// Add three balanced base-16 digit vectors of the same length.
-///
-/// Assumes each digit is in [-8,7]. Enforces output digits in [-8,7] and carry in [-2,2].
-pub(crate) fn add3_bal16_same_len(
-    b: &mut Dr1csBuilder<F257>,
-    a: &Bal16Checked,
-    c: &Bal16Checked,
-    d: &Bal16Checked,
-) -> (Bal16Checked, usize /* carry_out */) {
-    let _prev = b.profile_enter("digits::add3_bal16_same_len");
-    let (ir, out_ir, carry_ir) = {
-        let base_asg: &[F257] = &b.assignment;
-        let mut ib = CmIrBuilder::new(base_asg);
-        let a_ir = CmBal16CheckedIr(a.as_slice().iter().copied().map(CmVarRef::Base).collect());
-        let c_ir = CmBal16CheckedIr(c.as_slice().iter().copied().map(CmVarRef::Base).collect());
-        let d_ir = CmBal16CheckedIr(d.as_slice().iter().copied().map(CmVarRef::Base).collect());
-        let (out_ir, carry_ir) = add3_bal16_same_len_ir(&mut ib, &a_ir, &c_ir, &d_ir);
-        (ib.ir, out_ir, carry_ir)
-    };
-    let lowered = lower_ir_into_builder(b, ir);
-    let out: Vec<usize> = out_ir.0.into_iter().map(|v| lowered.map_var(v)).collect();
-    let carry = lowered.map_var(carry_ir);
     b.profile_exit(_prev);
     (Bal16Checked(out), carry)
 }
