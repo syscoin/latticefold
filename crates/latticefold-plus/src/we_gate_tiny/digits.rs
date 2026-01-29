@@ -4,6 +4,9 @@ use latticefold::transcript::poseidon::F257;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits, ByteVar};
+use super::cm_ir::{
+    alloc_bal16_digit_ir, alloc_carry_pm128_ir, alloc_carry_pm2_ir, lower_ir_into_builder, IrBuilder as CmIrBuilder,
+};
 
 // -----------------------------------------------------------------------------
 // Balanced base-16 (nibble) gadgets for *bounded* integer arithmetic in F257.
@@ -67,72 +70,24 @@ fn byte_to_nibbles(b: &mut Dr1csBuilder<F257>, byte: &ByteVar) -> (usize, usize)
 
 /// Allocate a balanced base-16 digit variable in [-8,7] from witness `d`.
 pub(crate) fn alloc_bal16_digit(b: &mut Dr1csBuilder<F257>, d: i8) -> usize {
-    assert!((-8..=7).contains(&d));
-    let nib = if d < 0 { (d as i16 + 16) as u8 } else { d as u8 };
-    debug_assert!(nib < 16);
-    let mut bits4 = [0usize; 4];
-    for i in 0..4 {
-        bits4[i] = alloc_bool::<F257>(b, ((nib >> i) & 1) == 1);
-    }
-    // Balanced digit can be expressed directly as:
-    //   d = b0 + 2*b1 + 4*b2 - 8*b3
-    // where bits represent the nibble in [0..15] and b3 is the sign bit.
-    let out = b.new_var(i32_to_f257(d as i32));
-    b.enforce_lc_times_one_eq_const(vec![
-        (F257::ONE, out),
-        (-F257::ONE, bits4[0]),
-        (-F257::from(2u64), bits4[1]),
-        (-F257::from(4u64), bits4[2]),
-        (F257::from(8u64), bits4[3]),
-    ]);
-    out
+    // IR is the source of truth; lower a tiny IR fragment into this builder.
+    let base_one = b.assignment[b.one()];
+    let base_asg = [base_one];
+    let mut ib = CmIrBuilder::new(&base_asg);
+    let out_ir = alloc_bal16_digit_ir(&mut ib, d);
+    let lowered = lower_ir_into_builder(b, ib.ir);
+    lowered.map_var(out_ir)
 }
 
 
 /// Allocate a signed carry `c ∈ [-2,2]` as an F257 variable, with a tight boolean decomposition.
 pub(crate) fn alloc_carry_pm2(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
-    assert!((-2..=2).contains(&c));
-    // Avoid boolean decomposition: enforce membership with the vanishing polynomial
-    //   (c-2)(c-1)c(c+1)(c+2) = 0
-    // over F257, which has exactly the intended roots since 257 is prime > 5.
-    let c_var = b.new_var(i32_to_f257(c));
-
-    // t1 = (c-2)(c-1)
-    let cv = b.assignment[c_var];
-    let t1_val = (cv - F257::from(2u64)) * (cv - F257::ONE);
-    let t1 = b.new_var(t1_val);
-    b.add_constraint(
-        vec![(F257::ONE, c_var), (-F257::from(2u64), b.one())],
-        vec![(F257::ONE, c_var), (-F257::ONE, b.one())],
-        vec![(F257::ONE, t1)],
-    );
-
-    // t2 = t1 * c
-    let t2_val = t1_val * cv;
-    let t2 = b.new_var(t2_val);
-    b.add_constraint(
-        vec![(F257::ONE, t1)],
-        vec![(F257::ONE, c_var)],
-        vec![(F257::ONE, t2)],
-    );
-
-    // t3 = t2 * (c+1)
-    let t3_val = t2_val * (cv + F257::ONE);
-    let t3 = b.new_var(t3_val);
-    b.add_constraint(
-        vec![(F257::ONE, t2)],
-        vec![(F257::ONE, c_var), (F257::ONE, b.one())],
-        vec![(F257::ONE, t3)],
-    );
-
-    // t3 * (c+2) = 0
-    b.add_constraint(
-        vec![(F257::ONE, t3)],
-        vec![(F257::ONE, c_var), (F257::from(2u64), b.one())],
-        vec![(F257::ZERO, b.one())],
-    );
-
-    c_var
+    let base_one = b.assignment[b.one()];
+    let base_asg = [base_one];
+    let mut ib = CmIrBuilder::new(&base_asg);
+    let c_ir = alloc_carry_pm2_ir(&mut ib, c);
+    let lowered = lower_ir_into_builder(b, ib.ir);
+    lowered.map_var(c_ir)
 }
 
 /// Allocate a signed carry `c ∈ [-128,127]` as an F257 variable by range-checking an offset.
@@ -140,24 +95,12 @@ pub(crate) fn alloc_carry_pm2(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
 /// We represent `off = c + 128` as an 8-bit value in [0,255] (so it admits a byte decomposition),
 /// then enforce `c = off - 128` as a linear relation in F257.
 pub(crate) fn alloc_carry_pm128(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
-    assert!((-128..=127).contains(&c));
-    // In F257, the balanced representative map is unique on [-128,128].
-    // Restricting to [-128,127] is therefore exactly "forbid +128".
-    //
-    // We can enforce this with a single non-equality constraint:
-    //   (c - 128) * inv = 1
-    // which is satisfiable iff c != 128.
-    let c_var = b.new_var(i32_to_f257(c));
-    let diff = b.assignment[c_var] - F257::from(128u64);
-    debug_assert!(diff != F257::ZERO, "alloc_carry_pm128: witness hit forbidden value 128");
-    let inv = b.new_var(diff.inverse().unwrap());
-    // (c - 128) * inv = 1
-    b.add_constraint(
-        vec![(F257::ONE, c_var), (-F257::from(128u64), b.one())],
-        vec![(F257::ONE, inv)],
-        vec![(F257::ONE, b.one())],
-    );
-    c_var
+    let base_one = b.assignment[b.one()];
+    let base_asg = [base_one];
+    let mut ib = CmIrBuilder::new(&base_asg);
+    let c_ir = alloc_carry_pm128_ir(&mut ib, c);
+    let lowered = lower_ir_into_builder(b, ib.ir);
+    lowered.map_var(c_ir)
 }
 
 /// Allocate a signed carry `c ∈ [-64,63]` as an F257 variable by range-checking an offset.
