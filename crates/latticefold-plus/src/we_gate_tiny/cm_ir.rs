@@ -254,6 +254,11 @@ pub(crate) fn alloc_bal16_digit_ir(b: &mut IrBuilder<'_>, d: i8) -> VarRef {
         bits4[i] = alloc_bool_ir(b, ((nib >> i) & 1) == 1);
     }
     let out = b.new_var(i32_to_f257(d as i32));
+    debug_assert_eq!(
+        f257_to_i32_bal(b.val(out)),
+        d as i32,
+        "alloc_bal16_digit_ir: witness mismatch"
+    );
     // out = b0 + 2*b1 + 4*b2 - 8*b3  (equivalently +8*b3 on LHS)
     b.enforce_lc_eq_zero(vec![
         (F257::ONE, out),
@@ -272,6 +277,11 @@ pub(crate) fn alloc_bal16_digit_ir(b: &mut IrBuilder<'_>, d: i8) -> VarRef {
 pub(crate) fn alloc_carry_pm128_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
     assert!((-128..=127).contains(&c));
     let c_var = b.new_var(i32_to_f257(c));
+    debug_assert_eq!(
+        f257_to_i32_bal(b.val(c_var)),
+        c,
+        "alloc_carry_pm128_ir: witness mismatch"
+    );
     let diff = b.val(c_var) - F257::from(128u64);
     debug_assert!(diff != F257::ZERO, "alloc_carry_pm128_ir: witness hit forbidden value 128");
     let inv = b.new_var(diff.inverse().unwrap());

@@ -25,7 +25,7 @@ pub(crate) const GOLDILOCKS_P: u64 = 0xFFFF_FFFF_0000_0001;
 // The pm128 fused carry-chain style relations are not injective over the integers in F257
 // (see tests in `we_gate_tiny/tests.rs` demonstrating the 257 = 16^2 + 1 bubble).
 
-fn goldilocks_p_bal16_digits_le_const() -> [i8; 17] {
+pub(crate) fn goldilocks_p_bal16_digits_le_const() -> [i8; 17] {
     // Match the balancing convention used by `u64_bytes_to_bal16_digits`:
     // carry_{i+1} = (nibble_i + carry_i >= 8), out_i = nibble_i + carry_i - 16*carry_{i+1}.
     let mut out = [0i8; 17];

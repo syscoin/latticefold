@@ -2226,6 +2226,8 @@ fn build_cm_glue_for_which(
                     let mut ib = IrBuilder::new(base_asg);
                     let out0 = ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &t0_ir, &e00_ir);
                     let out1 = ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &t1_ir, &e00_ir);
+                    // Keep op-mix accounting consistent even when ring-muls are built via IR shards.
+                    super::op_counts::tiny_cm_bump(|c| c.ring_mul_negacyclic += 2);
                     Ok((ib.ir, out0, out1))
                 })
                 .collect::<Result<Vec<_>, _>>()?;

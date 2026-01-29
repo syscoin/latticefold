@@ -2,14 +2,19 @@ use ark_ff::Field;
 use latticefold::transcript::poseidon::F257;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 
+use rayon::prelude::*;
+
 use super::op_counts::tiny_cm_bump;
 use super::goldilocks::{
     goldilocks_add_mod_p_from_byte_vars_assume_canonical, goldilocks_mul_mod_p_from_byte_vars_assume_canonical,
     goldilocks_sub_mod_p_from_byte_vars_assume_canonical,
     goldilocks_add_mod_p_digits, goldilocks_mul_mod_p_digits, goldilocks_sub_mod_p_digits, goldilocks_scalar_from_u64_bytes_le_digits,
-    GoldilocksScalar,
+    goldilocks_p_bal16_digits_le_const, GoldilocksScalar,
 };
-use super::cm_ir::{lower_ir_into_builder, ring_mul_negacyclic_ntt_goldilocks_d64_ir, IrBuilder, VarRef as IrVarRef};
+use super::cm_ir::{
+    goldilocks_add_mod_p_digits_ir, goldilocks_mul_mod_p_digits_ir, goldilocks_sub_mod_p_digits_ir, lower_ir_into_builder,
+    ring_mul_negacyclic_ntt_goldilocks_d64_ir, IrBuilder, VarRef as IrVarRef,
+};
 
 /// A ring element whose coefficients are Goldilocks base-field scalars encoded as canonical 8-byte little-endian limbs.
 ///
@@ -208,20 +213,99 @@ pub(crate) fn ring_eq_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &Ri
 pub(crate) fn ring_add_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &RingDigits) -> RingDigits {
     tiny_cm_bump(|c| c.ring_add += 1);
     debug_assert_eq!(a.len(), b.len());
-    a.iter().zip(b.iter()).map(|(ai, bi)| goldilocks_add_mod_p_digits(gb, ai, bi)).collect()
+    // Scalar ops come overwhelmingly from ring ops; build per-coefficient shards in parallel.
+    tiny_cm_bump(|c| c.scalar_add += a.len() as u64);
+    let base_asg: &[F257] = &gb.assignment;
+    let frags: Vec<(_, [IrVarRef; 17])> = (0..a.len())
+        .into_par_iter()
+        .map(|i| {
+            let mut ib = IrBuilder::new(base_asg);
+            let ai: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(a[i][j]));
+            let bi: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(b[i][j]));
+            let out = goldilocks_add_mod_p_digits_ir(
+                &mut ib,
+                &ai,
+                &bi,
+                crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P,
+                &goldilocks_p_bal16_digits_le_const(),
+            );
+            Ok::<_, String>((ib.ir, out))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .expect("ring_add_digits IR emit should be infallible");
+
+    let mut out: RingDigits = Vec::with_capacity(a.len());
+    for (ir, out_ir) in frags {
+        let lowered = lower_ir_into_builder(gb, ir);
+        let digits: GoldilocksScalar = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
+        out.push(digits);
+    }
+    out
 }
 
 #[inline]
 pub(crate) fn ring_sub_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &RingDigits) -> RingDigits {
     tiny_cm_bump(|c| c.ring_sub += 1);
     debug_assert_eq!(a.len(), b.len());
-    a.iter().zip(b.iter()).map(|(ai, bi)| goldilocks_sub_mod_p_digits(gb, ai, bi)).collect()
+    tiny_cm_bump(|c| c.scalar_sub += a.len() as u64);
+    let base_asg: &[F257] = &gb.assignment;
+    let frags: Vec<(_, [IrVarRef; 17])> = (0..a.len())
+        .into_par_iter()
+        .map(|i| {
+            let mut ib = IrBuilder::new(base_asg);
+            let ai: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(a[i][j]));
+            let bi: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(b[i][j]));
+            let out = goldilocks_sub_mod_p_digits_ir(
+                &mut ib,
+                &ai,
+                &bi,
+                crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P,
+                &goldilocks_p_bal16_digits_le_const(),
+            );
+            Ok::<_, String>((ib.ir, out))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .expect("ring_sub_digits IR emit should be infallible");
+
+    let mut out: RingDigits = Vec::with_capacity(a.len());
+    for (ir, out_ir) in frags {
+        let lowered = lower_ir_into_builder(gb, ir);
+        let digits: GoldilocksScalar = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
+        out.push(digits);
+    }
+    out
 }
 
 #[inline]
 pub(crate) fn ring_scale_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, s: &GoldilocksScalar) -> RingDigits {
     tiny_cm_bump(|c| c.ring_scale += 1);
-    a.iter().map(|ai| goldilocks_mul_mod_p_digits(gb, ai, s)).collect()
+    tiny_cm_bump(|c| c.scalar_mul += a.len() as u64);
+    let base_asg: &[F257] = &gb.assignment;
+    let s_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(s[j]));
+    let frags: Vec<(_, [IrVarRef; 17])> = (0..a.len())
+        .into_par_iter()
+        .map(|i| {
+            let mut ib = IrBuilder::new(base_asg);
+            let ai: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(a[i][j]));
+            let out = goldilocks_mul_mod_p_digits_ir(
+                &mut ib,
+                &ai,
+                &s_ir,
+                crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P,
+                &goldilocks_p_bal16_digits_le_const(),
+            );
+            Ok::<_, String>((ib.ir, out))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .expect("ring_scale_digits IR emit should be infallible");
+
+    let mut out: RingDigits = Vec::with_capacity(a.len());
+    for (ir, out_ir) in frags {
+        let lowered = lower_ir_into_builder(gb, ir);
+        let digits: GoldilocksScalar = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
+        out.push(digits);
+    }
+    out
 }
 
 /// Negacyclic ring multiplication for ring_dim=64 over Goldilocks (digit-domain).
