@@ -200,15 +200,22 @@ where
 }
 
 fn dr1cs_from_symphony<F: PrimeField>(inst: SymDr1cs<F>) -> Dr1csInstanceSparse<F> {
-    let mut a = Vec::with_capacity(inst.constraints.len());
-    let mut b = Vec::with_capacity(inst.constraints.len());
-    let mut c = Vec::with_capacity(inst.constraints.len());
-    for mut row in inst.constraints {
-        a.push(SparseVec::new(std::mem::take(&mut row.a)));
-        b.push(SparseVec::new(std::mem::take(&mut row.b)));
-        c.push(SparseVec::new(std::mem::take(&mut row.c)));
+    let SymDr1cs {
+        nvars,
+        constraints,
+        a_terms,
+        b_terms,
+        c_terms,
+    } = inst;
+    let mut a = Vec::with_capacity(constraints.len());
+    let mut b = Vec::with_capacity(constraints.len());
+    let mut c = Vec::with_capacity(constraints.len());
+    for row in constraints {
+        a.push(SparseVec::new(a_terms[row.a.clone()].to_vec()));
+        b.push(SparseVec::new(b_terms[row.b.clone()].to_vec()));
+        c.push(SparseVec::new(c_terms[row.c.clone()].to_vec()));
     }
-    Dr1csInstanceSparse { n: inst.nvars, a, b, c }
+    Dr1csInstanceSparse { n: nvars, a, b, c }
 }
 
 fn chunk_dr1cs_sparse<F: PrimeField>(inst: Dr1csInstanceSparse<F>, k_block: usize) -> Vec<Dr1csInstanceSparse<F>> {
