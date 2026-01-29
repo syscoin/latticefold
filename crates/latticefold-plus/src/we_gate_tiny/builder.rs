@@ -1500,11 +1500,16 @@ fn enforce_fiat_shamir_reabsorb_semantics(
                     for j in 0..sq_len {
                         let v_sq = pose_wiring.squeeze_field_vars[sq_start + j];
                         let v_ab = pose_wiring.absorb_vars[ab_start + j];
-                        inst.constraints.push(Constraint {
-                            a: vec![(F257::ONE, v_ab), (-F257::ONE, v_sq)],
-                            b: vec![(F257::ONE, 0)],
-                            c: vec![(F257::ZERO, 0)],
-                        });
+                        let a0 = inst.a_terms.len();
+                        inst.a_terms.extend_from_slice(&[(F257::ONE, v_ab), (-F257::ONE, v_sq)]);
+                        let a1 = inst.a_terms.len();
+                        let b0 = inst.b_terms.len();
+                        inst.b_terms.push((F257::ONE, 0));
+                        let b1 = inst.b_terms.len();
+                        let c0 = inst.c_terms.len();
+                        inst.c_terms.push((F257::ZERO, 0));
+                        let c1 = inst.c_terms.len();
+                        inst.constraints.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
                     }
                 }
             }

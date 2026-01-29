@@ -215,18 +215,29 @@ where
                 };
                 if j == 0 {
                     // v_ab == pub_var
-                    inst.constraints.push(Constraint {
-                        a: vec![(F257::ONE, v_ab), (-F257::ONE, pub_var)],
-                        b: vec![(F257::ONE, 0)],
-                        c: vec![(F257::ZERO, 0)],
-                    });
+                    let a0 = inst.a_terms.len();
+                    inst.a_terms
+                        .extend_from_slice(&[(F257::ONE, v_ab), (-F257::ONE, pub_var)]);
+                    let a1 = inst.a_terms.len();
+                    let b0 = inst.b_terms.len();
+                    inst.b_terms.push((F257::ONE, 0));
+                    let b1 = inst.b_terms.len();
+                    let c0 = inst.c_terms.len();
+                    inst.c_terms.push((F257::ZERO, 0));
+                    let c1 = inst.c_terms.len();
+                    inst.constraints.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
                 } else {
                     // v_ab == 0
-                    inst.constraints.push(Constraint {
-                        a: vec![(F257::ONE, v_ab)],
-                        b: vec![(F257::ONE, 0)],
-                        c: vec![(F257::ZERO, 0)],
-                    });
+                    let a0 = inst.a_terms.len();
+                    inst.a_terms.extend_from_slice(&[(F257::ONE, v_ab)]);
+                    let a1 = inst.a_terms.len();
+                    let b0 = inst.b_terms.len();
+                    inst.b_terms.push((F257::ONE, 0));
+                    let b1 = inst.b_terms.len();
+                    let c0 = inst.c_terms.len();
+                    inst.c_terms.push((F257::ZERO, 0));
+                    let c1 = inst.c_terms.len();
+                    inst.constraints.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
                 }
             }
         }
@@ -975,11 +986,17 @@ fn enforce_reabsorb_equals_squeeze<F: PrimeField>(
                     let v_sq = wiring.squeeze_field_vars[sq_start + j];
                     let v_ab = wiring.absorb_vars[ab_start + j];
                     // (v_ab - v_sq) * 1 = 0
-                    inst.constraints.push(Constraint {
-                        a: vec![(F::ONE, v_ab), (-F::ONE, v_sq)],
-                        b: vec![(F::ONE, 0)],
-                        c: vec![(F::ZERO, 0)],
-                    });
+                    let a0 = inst.a_terms.len();
+                    inst.a_terms
+                        .extend_from_slice(&[(F::ONE, v_ab), (-F::ONE, v_sq)]);
+                    let a1 = inst.a_terms.len();
+                    let b0 = inst.b_terms.len();
+                    inst.b_terms.push((F::ONE, 0));
+                    let b1 = inst.b_terms.len();
+                    let c0 = inst.c_terms.len();
+                    inst.c_terms.push((F::ZERO, 0));
+                    let c1 = inst.c_terms.len();
+                    inst.constraints.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
                 }
             }
             symphony::transcript::PoseidonTraceOp::SqueezeBytes { .. } => {}
@@ -5831,11 +5848,16 @@ where
             let ga = remap(pa, xa, &offsets);
             let gb = remap(pb, xb, &offsets);
             // (ga - gb) * 1 = 0
-            inst.constraints.push(Constraint {
-                a: vec![(F::ONE, ga), (-F::ONE, gb)],
-                b: vec![(F::ONE, 0)],
-                c: vec![(F::ZERO, 0)],
-            });
+            let a0 = inst.a_terms.len();
+            inst.a_terms.extend_from_slice(&[(F::ONE, ga), (-F::ONE, gb)]);
+            let a1 = inst.a_terms.len();
+            let b0 = inst.b_terms.len();
+            inst.b_terms.push((F::ONE, 0));
+            let b1 = inst.b_terms.len();
+            let c0 = inst.c_terms.len();
+            inst.c_terms.push((F::ZERO, 0));
+            let c1 = inst.c_terms.len();
+            inst.constraints.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
         }
         inst.nvars = asg.len();
         Ok((inst, asg))

@@ -254,10 +254,15 @@ fn u32_lt_const_le_bytes<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &[ByteVar; 4
 #[inline]
 pub(super) fn enforce_var_eq<F: PrimeField>(inst: &mut SparseDr1csInstance<F>, x: usize, y: usize) {
     // Enforce (x - y) * 1 = 0
-    inst.constraints.push(Constraint {
-        a: vec![(F::ONE, x), (-F::ONE, y)],
-        b: vec![(F::ONE, 0)],
-        c: vec![(F::ZERO, 0)],
-    });
+    let a0 = inst.a_terms.len();
+    inst.a_terms.extend_from_slice(&[(F::ONE, x), (-F::ONE, y)]);
+    let a1 = inst.a_terms.len();
+    let b0 = inst.b_terms.len();
+    inst.b_terms.push((F::ONE, 0));
+    let b1 = inst.b_terms.len();
+    let c0 = inst.c_terms.len();
+    inst.c_terms.push((F::ZERO, 0));
+    let c1 = inst.c_terms.len();
+    inst.constraints.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
 }
 
