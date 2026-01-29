@@ -1,4 +1,4 @@
-use ark_ff::Field;
+use ark_ff::{Field, PrimeField};
 use latticefold::transcript::poseidon::F257;
 use symphony::dpp_poseidon::{Constraint, SparseDr1csInstance};
 use symphony::dpp_sumcheck::Dr1csBuilder;
@@ -6,6 +6,7 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 use cyclotomic_rings::rings::goldilocks_ntt64 as gl_ntt64;
 
 use super::digits::{f257_to_i32_bal, i32_to_f257};
+use super::params::{DIGITS_PER_TRY, LIMB_BITS, LIMBS_U32};
 
 /// Variable reference for a CM IR fragment.
 ///
@@ -239,6 +240,187 @@ pub(crate) fn alloc_bool_ir(b: &mut IrBuilder<'_>, bit: bool) -> VarRef {
         vec![(F257::ZERO, b.one())],
     );
     x
+}
+
+/// Enforce an existing var is boolean: v*(1-v)=0.
+#[inline]
+pub(crate) fn enforce_bit_var_ir(b: &mut IrBuilder<'_>, v: VarRef) {
+    b.add_constraint(
+        vec![(F257::ONE, v)],
+        vec![(F257::ONE, b.one()), (-F257::ONE, v)],
+        vec![(F257::ZERO, b.one())],
+    );
+}
+
+/// Boolean indicator for (d == 256), using the inverse trick.
+///
+/// Returns `is256 ∈ {0,1}` and enforces:
+/// - diff = d - 256
+/// - prod = diff * inv
+/// - prod = 1 - is256
+/// - diff * is256 = 0
+///
+/// This forces is256=1 iff d==256, else is256=0 (over F257).
+pub(crate) fn digit_is_256_bit_ir(b: &mut IrBuilder<'_>, d: VarRef) -> VarRef {
+    let dval = b.val(d);
+    let is256 = alloc_bool_ir(b, dval == F257::from(256u64));
+
+    let diff = b.new_var(dval - F257::from(256u64));
+    // diff = d - 256
+    b.enforce_lc_eq_zero(vec![
+        (F257::ONE, diff),
+        (-F257::ONE, d),
+        (F257::from(256u64), b.one()),
+    ]);
+
+    let inv = b.new_var(if dval == F257::from(256u64) {
+        F257::ZERO
+    } else {
+        (dval - F257::from(256u64)).inverse().unwrap()
+    });
+    let prod = b.new_var(b.val(diff) * b.val(inv));
+    b.enforce_mul(diff, inv, prod);
+
+    // prod = 1 - is256
+    b.enforce_lc_eq_zero(vec![(F257::ONE, prod), (F257::ONE, is256), (-F257::ONE, b.one())]);
+
+    // diff * is256 = 0
+    let z = alloc_zero_const_ir(b);
+    b.enforce_mul(diff, is256, z);
+
+    is256
+}
+
+/// Map a base-257 digit `d ∈ {0..=256}` to a byte `b ∈ {0..=255}` via the transcript rule:
+/// `256 -> 0`, else `b=d`.
+///
+/// In F257 arithmetic this is: `b = d + is_eq256(d)`, since `256 ≡ -1 (mod 257)`.
+///
+/// NOTE: this does **not** bit-decompose/range-check `byte`; callsites should do that in the
+/// builder layer (so they can reuse caches).
+pub(crate) fn digit_to_byte_ir(b: &mut IrBuilder<'_>, d: VarRef) -> VarRef {
+    let is256 = digit_is_256_bit_ir(b, d);
+    let byte = b.new_var(b.val(d) + b.val(is256));
+    b.enforce_lc_eq_zero(vec![(F257::ONE, byte), (-F257::ONE, d), (-F257::ONE, is256)]);
+    byte
+}
+
+/// Select the first acceptable `get_challenge()` try (fixed schedule) in IR form.
+///
+/// Input `digits_by_try` is length `tries * DIGITS_PER_TRY`, ordered by try then digit index.
+/// Accept iff the first 4 digits are all != 256.
+///
+/// Returns:
+/// - selected digits `[d0..d7]` (each equals the corresponding digit of the chosen try)
+/// - `found_bit` indicating that an acceptable try exists (enforced by caller if desired)
+pub(crate) fn select_first_ok_u32_try_digits_ir(
+    b: &mut IrBuilder<'_>,
+    digits_by_try: &[VarRef],
+    tries: usize,
+) -> ([VarRef; DIGITS_PER_TRY], VarRef) {
+    assert_eq!(digits_by_try.len(), tries * DIGITS_PER_TRY);
+
+    // found accumulates OR of ok bits; select_t picks first ok.
+    let mut found = b.new_var(F257::ZERO);
+    b.ir.enforce_var_eq_const(found, F257::ZERO);
+    enforce_bit_var_ir(b, found);
+
+    let mut selects: Vec<VarRef> = Vec::with_capacity(tries);
+
+    for t in 0..tries {
+        let base = t * DIGITS_PER_TRY;
+        let e0 = digit_is_256_bit_ir(b, digits_by_try[base + 0]);
+        let e1 = digit_is_256_bit_ir(b, digits_by_try[base + 1]);
+        let e2 = digit_is_256_bit_ir(b, digits_by_try[base + 2]);
+        let e3 = digit_is_256_bit_ir(b, digits_by_try[base + 3]);
+
+        // o = 1 - e
+        let one_minus = |b: &mut IrBuilder<'_>, e: VarRef| -> VarRef {
+            let v = b.new_var(F257::ONE - b.val(e));
+            b.enforce_lc_eq_zero(vec![(F257::ONE, v), (F257::ONE, e), (-F257::ONE, b.one())]);
+            v
+        };
+        let o0 = one_minus(b, e0);
+        let o1 = one_minus(b, e1);
+        let o2 = one_minus(b, e2);
+        let o3 = one_minus(b, e3);
+
+        // ok = o0*o1*o2*o3 (boolean)
+        let ok01 = b.new_var(b.val(o0) * b.val(o1));
+        b.enforce_mul(o0, o1, ok01);
+        let ok23 = b.new_var(b.val(o2) * b.val(o3));
+        b.enforce_mul(o2, o3, ok23);
+        let ok = b.new_var(b.val(ok01) * b.val(ok23));
+        b.enforce_mul(ok01, ok23, ok);
+        enforce_bit_var_ir(b, ok);
+
+        let not_found = one_minus(b, found);
+        let sel = b.new_var(b.val(ok) * b.val(not_found));
+        b.enforce_mul(ok, not_found, sel);
+        enforce_bit_var_ir(b, sel);
+        selects.push(sel);
+
+        // found' = found + sel
+        let found_next = b.new_var(b.val(found) + b.val(sel));
+        b.enforce_lc_eq_zero(vec![(F257::ONE, found_next), (-F257::ONE, found), (-F257::ONE, sel)]);
+        enforce_bit_var_ir(b, found_next);
+        found = found_next;
+    }
+
+    // selected digit i = Σ_t sel_t * digit_{t,i}
+    let mut out: [VarRef; DIGITS_PER_TRY] = core::array::from_fn(|_| b.one());
+    for i in 0..DIGITS_PER_TRY {
+        let mut prods: Vec<VarRef> = Vec::with_capacity(tries);
+        let mut acc = F257::ZERO;
+        for t in 0..tries {
+            let d = digits_by_try[t * DIGITS_PER_TRY + i];
+            let p = b.new_var(b.val(selects[t]) * b.val(d));
+            b.enforce_mul(selects[t], d, p);
+            acc += b.val(p);
+            prods.push(p);
+        }
+        let v = b.new_var(acc);
+        let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(1 + prods.len());
+        lc.push((F257::ONE, v));
+        for p in prods {
+            lc.push((-F257::ONE, p));
+        }
+        b.enforce_lc_eq_zero(lc);
+        out[i] = v;
+    }
+
+    (out, found)
+}
+
+/// Pack a u32 from its little-endian bit variables into base-128 limbs (little-endian).
+///
+/// Assumes the first 32 bits of `bits32` are boolean.
+pub(crate) fn u32_bits_to_base128_limbs_ir(b: &mut IrBuilder<'_>, bits32: &[VarRef; 32]) -> [VarRef; LIMBS_U32] {
+    let mut limbs: [VarRef; LIMBS_U32] = core::array::from_fn(|_| b.one());
+    for li in 0..LIMBS_U32 {
+        let start = li * LIMB_BITS;
+        let end = core::cmp::min(start + LIMB_BITS, 32);
+
+        // Witness limb value from bits.
+        let mut limb_u8: u8 = 0;
+        for j in start..end {
+            let bit = b.val(bits32[j]).into_bigint().to_bytes_le().get(0).copied().unwrap_or(0);
+            debug_assert!(bit == 0 || bit == 1);
+            limb_u8 |= (bit as u8) << (j - start);
+        }
+        let limb = b.new_var(F257::from(limb_u8 as u64));
+
+        // Enforce limb = Σ 2^k * bits32[start+k]
+        let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(1 + (end - start));
+        lc.push((F257::ONE, limb));
+        for j in start..end {
+            let p2 = F257::from(1u64 << (j - start));
+            lc.push((-p2, bits32[j]));
+        }
+        b.enforce_lc_eq_zero(lc);
+        limbs[li] = limb;
+    }
+    limbs
 }
 
 /// Allocate a signed carry `c ∈ {-1,0,1}` using the vanishing polynomial over F257:

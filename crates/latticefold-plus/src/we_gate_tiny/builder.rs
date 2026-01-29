@@ -620,7 +620,7 @@ fn build_u32_and_goldilocks_blocks(
         let mut u64_bytes = [0usize; 8];
         u64_bytes[0..4].copy_from_slice(&u_bytes);
         for i in 4..8 {
-            u64_bytes[i] = digit_to_byte_var::<F257>(&mut glue.gb, u_digits_local[i]);
+            u64_bytes[i] = digit_to_byte_var(&mut glue.gb, u_digits_local[i]);
         }
         let (q_bit, goldilocks_limbs) = reduce_u64_mod_goldilocks_from_byte_vars::<F257>(&mut glue.gb, &u64_bytes);
         let res257 = res257_from_u64_bytes_le(&mut glue.gb, &u64_bytes);

@@ -9,8 +9,12 @@ use super::op_counts::tiny_cm_bump;
 use super::digits::{
     alloc_bal16_digit, f257_to_i32_bal, mul_u32ish9_to_fixed_bal16, u32_bytes_to_bal16_digits_cached,
 };
-use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
-use super::params::{DIGITS_PER_TRY, LIMB_BITS, LIMBS_U32, LIMBS_U64};
+use super::gadgets::decompose_existing_byte_var_to_bits;
+use super::params::{DIGITS_PER_TRY, LIMBS_U32, LIMBS_U64};
+use super::cm_ir::{
+    digit_to_byte_ir, lower_ir_into_builder, select_first_ok_u32_try_digits_ir, u32_bits_to_base128_limbs_ir,
+    IrBuilder as CmIrBuilder, VarRef as CmVarRef,
+};
 use crate::transcript::DEFAULT_REJECTION_TRIES;
 
 /// Explicit wiring of which Poseidon `SqueezeField` ops (by **squeeze-field op index**) are used
@@ -166,124 +170,16 @@ pub(super) fn select_first_ok_u32_try_digits(
     tries: usize,
 ) -> ([usize; DIGITS_PER_TRY], usize) {
     assert_eq!(digits_by_try.len(), tries * DIGITS_PER_TRY);
-
-    // Enforce an existing var is boolean: v*(1-v)=0.
-    #[inline]
-    fn enforce_bit_var<F: PrimeField>(b: &mut Dr1csBuilder<F>, v: usize) {
-        b.add_constraint(
-            vec![(F::ONE, v)],
-            vec![(F::ONE, b.one()), (-F::ONE, v)],
-            vec![(F::ZERO, b.one())],
-        );
-    }
-
-    // Boolean witness for (d == 256), with inverse trick constraints.
-    fn digit_is_256_bit(b: &mut Dr1csBuilder<F257>, d: usize) -> usize {
-        let du16 = digit_u16::<F257>(b, d);
-        debug_assert!(du16 < 257);
-        let is256 = alloc_bool::<F257>(b, du16 == 256);
-
-        // diff = d - 256
-        let diff = b.new_var(b.assignment[d] - F257::from(256u64));
-        b.enforce_lc_times_one_eq_const(vec![
-            (F257::ONE, diff),
-            (-F257::ONE, d),
-            (F257::from(256u64), b.one()),
-        ]);
-
-        // inv = 0 if diff==0 else diff^{-1}
-        let inv = b.new_var(if du16 == 256 {
-            F257::ZERO
-        } else {
-            (b.assignment[d] - F257::from(256u64)).inverse().unwrap()
-        });
-        let prod = b.new_var(b.assignment[diff] * b.assignment[inv]);
-        b.enforce_mul(diff, inv, prod);
-        // prod = 1 - is256
-        b.enforce_lc_times_one_eq_const(vec![
-            (F257::ONE, prod),
-            (F257::ONE, is256),
-            (-F257::ONE, b.one()),
-        ]);
-        // diff * is256 = 0
-        let z = b.new_var(F257::ZERO);
-        b.enforce_var_eq_const(z, F257::ZERO);
-        b.enforce_mul(diff, is256, z);
-        is256
-    }
-
-    // found accumulates OR of ok bits; select_t picks first ok.
-    let mut found = b.new_var(F257::ZERO);
-    b.enforce_var_eq_const(found, F257::ZERO);
-    enforce_bit_var::<F257>(b, found);
-
-    let mut selects: Vec<usize> = Vec::with_capacity(tries);
-    for t in 0..tries {
-        let base = t * DIGITS_PER_TRY;
-        let e0 = digit_is_256_bit(b, digits_by_try[base + 0]);
-        let e1 = digit_is_256_bit(b, digits_by_try[base + 1]);
-        let e2 = digit_is_256_bit(b, digits_by_try[base + 2]);
-        let e3 = digit_is_256_bit(b, digits_by_try[base + 3]);
-
-        // o = 1 - e
-        let one_minus = |b: &mut Dr1csBuilder<F257>, e: usize| -> usize {
-            let v = b.new_var(F257::ONE - b.assignment[e]);
-            b.enforce_lc_times_one_eq_const(vec![(F257::ONE, v), (F257::ONE, e), (-F257::ONE, b.one())]);
-            v
-        };
-        let o0 = one_minus(b, e0);
-        let o1 = one_minus(b, e1);
-        let o2 = one_minus(b, e2);
-        let o3 = one_minus(b, e3);
-
-        // ok = o0*o1*o2*o3 (boolean)
-        let ok01 = b.new_var(b.assignment[o0] * b.assignment[o1]);
-        b.enforce_mul(o0, o1, ok01);
-        let ok23 = b.new_var(b.assignment[o2] * b.assignment[o3]);
-        b.enforce_mul(o2, o3, ok23);
-        let ok = b.new_var(b.assignment[ok01] * b.assignment[ok23]);
-        b.enforce_mul(ok01, ok23, ok);
-        enforce_bit_var::<F257>(b, ok);
-
-        let not_found = one_minus(b, found);
-        let sel = b.new_var(b.assignment[ok] * b.assignment[not_found]);
-        b.enforce_mul(ok, not_found, sel);
-        enforce_bit_var::<F257>(b, sel);
-        selects.push(sel);
-
-        // found' = found + sel
-        let found_next = b.new_var(b.assignment[found] + b.assignment[sel]);
-        b.enforce_lc_times_one_eq_const(vec![
-            (F257::ONE, found_next),
-            (-F257::ONE, found),
-            (-F257::ONE, sel),
-        ]);
-        enforce_bit_var::<F257>(b, found_next);
-        found = found_next;
-    }
-
-    // selected digit i = Σ_t sel_t * digit_{t,i}
-    let mut out = [0usize; DIGITS_PER_TRY];
-    for i in 0..DIGITS_PER_TRY {
-        let mut prods: Vec<usize> = Vec::with_capacity(tries);
-        let mut acc = F257::ZERO;
-        for t in 0..tries {
-            let d = digits_by_try[t * DIGITS_PER_TRY + i];
-            let p = b.new_var(b.assignment[selects[t]] * b.assignment[d]);
-            b.enforce_mul(selects[t], d, p);
-            acc += b.assignment[p];
-            prods.push(p);
-        }
-        let v = b.new_var(acc);
-        let mut lc: Vec<(F257, usize)> = Vec::with_capacity(1 + prods.len());
-        lc.push((F257::ONE, v));
-        for &p in &prods {
-            lc.push((-F257::ONE, p));
-        }
-        b.enforce_lc_times_one_eq_const(lc);
-        out[i] = v;
-    }
-
+    let (ir, out_ir, found_ir) = {
+        let base_asg: &[F257] = &b.assignment;
+        let mut ib = CmIrBuilder::new(base_asg);
+        let digits_ir: Vec<CmVarRef> = digits_by_try.iter().copied().map(CmVarRef::Base).collect();
+        let (out_ir, found_ir) = select_first_ok_u32_try_digits_ir(&mut ib, &digits_ir, tries);
+        (ib.ir, out_ir, found_ir)
+    };
+    let lowered = lower_ir_into_builder(b, ir);
+    let out: [usize; DIGITS_PER_TRY] = core::array::from_fn(|i| lowered.map_var(out_ir[i]));
+    let found = lowered.map_var(found_ir);
     (out, found)
 }
 
@@ -357,46 +253,20 @@ pub(super) fn digit_u16<F: PrimeField>(b: &Dr1csBuilder<F>, d: usize) -> u16 {
 /// `256 -> 0`, else `b=d`.
 ///
 /// In F257 arithmetic this is: `b = d + is_eq256(d)`, since `256 ≡ -1 (mod 257)`.
-pub(super) fn digit_to_byte_var<F: PrimeField>(b: &mut Dr1csBuilder<F>, d: usize) -> usize {
-    let du16 = digit_u16::<F>(b, d);
-    debug_assert!(du16 < 257);
-    let is256 = alloc_bool::<F>(b, du16 == 256);
-
-    // Enforce is256 <-> (d == 256) via inverse trick.
-    let diff = b.new_var(b.assignment[d] - F::from(256u64));
-    b.enforce_lc_times_one_eq_const(vec![
-        (F::ONE, diff),
-        (-F::ONE, d),
-        (F::from(256u64), b.one()),
-    ]);
-    let inv = b.new_var(if du16 == 256 {
-        F::ZERO
-    } else {
-        (b.assignment[d] - F::from(256u64)).inverse().unwrap()
-    });
-    let prod = b.new_var(b.assignment[diff] * b.assignment[inv]);
-    b.enforce_mul(diff, inv, prod);
-    // prod = 1 - is256
-    b.enforce_lc_times_one_eq_const(vec![
-        (F::ONE, prod),
-        (F::ONE, is256),
-        (-F::ONE, b.one()),
-    ]);
-    // diff * is256 = 0
-    let z = b.new_var(F::ZERO);
-    b.enforce_var_eq_const(z, F::ZERO);
-    b.enforce_mul(diff, is256, z);
-
-    // byte = d + is256  (since 256 -> 0)
-    let byte = b.new_var(b.assignment[d] + b.assignment[is256]);
-    b.enforce_lc_times_one_eq_const(vec![
-        (F::ONE, byte),
-        (-F::ONE, d),
-        (-F::ONE, is256),
-    ]);
+pub(super) fn digit_to_byte_var(b: &mut Dr1csBuilder<F257>, d: usize) -> usize {
+    // IR is the source of truth for the "256 -> 0" digit→byte mapping.
+    // Keep byte bit-decomposition/caching in the builder layer.
+    let (ir, byte_ir) = {
+        let base_asg: &[F257] = &b.assignment;
+        let mut ib = CmIrBuilder::new(base_asg);
+        let byte_ir = digit_to_byte_ir(&mut ib, CmVarRef::Base(d));
+        (ib.ir, byte_ir)
+    };
+    let lowered = lower_ir_into_builder(b, ir);
+    let byte = lowered.map_var(byte_ir);
 
     // Range-check byte to 8 bits.
-    let _bits = decompose_existing_byte_var_to_bits::<F>(b, byte);
+    let _bits = decompose_existing_byte_var_to_bits::<F257>(b, byte);
     byte
 }
 
@@ -414,7 +284,7 @@ pub(super) fn bounded_u32_from_8_digits_base128(
     // First 4 digits -> bytes in 0..255.
     let mut bytes = [0usize; 4];
     for i in 0..4 {
-        bytes[i] = digit_to_byte_var::<F257>(b, digits[i]);
+        bytes[i] = digit_to_byte_var(b, digits[i]);
     }
 
     // Balanced base-16 digits (len 9) for the same u32 (used by CM mul gadgets).
@@ -430,33 +300,18 @@ pub(super) fn bounded_u32_from_8_digits_base128(
         }
     }
 
-    // Group bits into 7-bit base-128 limbs.
-    let mut limbs = [0usize; LIMBS_U32];
-    for li in 0..LIMBS_U32 {
-        let start = li * LIMB_BITS;
-        let end = usize::min(start + LIMB_BITS, 32);
-        // Witness limb value from bits.
-        let mut limb_u8: u8 = 0;
-        for j in start..end {
-            let bit = b.assignment[bits32[j]]
-                .into_bigint()
-                .to_bytes_le()
-                .get(0)
-                .copied()
-                .unwrap_or(0);
-            debug_assert!(bit == 0 || bit == 1);
-            limb_u8 |= (bit as u8) << (j - start);
-        }
-        let limb = b.new_var(F257::from(limb_u8 as u64));
-        // Enforce limb = Σ 2^k * bits32[start+k]
-        let mut lc = vec![(F257::ONE, limb)];
-        for j in start..end {
-            let p2 = F257::from(1u64 << (j - start));
-            lc.push((-p2, bits32[j]));
-        }
-        b.enforce_lc_times_one_eq_const(lc);
-        limbs[li] = limb;
-    }
+    // Group bits into 7-bit base-128 limbs (IR is the source of truth).
+    let limbs: [usize; LIMBS_U32] = {
+        let (ir, limbs_ir) = {
+            let base_asg: &[F257] = &b.assignment;
+            let mut ib = CmIrBuilder::new(base_asg);
+            let bits_ir: [CmVarRef; 32] = core::array::from_fn(|i| CmVarRef::Base(bits32[i]));
+            let limbs_ir = u32_bits_to_base128_limbs_ir(&mut ib, &bits_ir);
+            (ib.ir, limbs_ir)
+        };
+        let lowered = lower_ir_into_builder(b, ir);
+        core::array::from_fn(|i| lowered.map_var(limbs_ir[i]))
+    };
 
     (limbs, bytes, bal16_digits, bal16_sq_digits)
 }
@@ -545,7 +400,7 @@ pub(super) fn short_challenge_from_digits_128(
     debug_assert_eq!(digit_vars.len(), ring_dim);
     let mut byte_vars = Vec::with_capacity(ring_dim);
     for &d in digit_vars {
-        byte_vars.push(digit_to_byte_var::<F257>(b, d));
+        byte_vars.push(digit_to_byte_var(b, d));
     }
     let coeff_vars = short_challenge_from_bytes::<F257>(b, &byte_vars, 128, ring_dim);
 
