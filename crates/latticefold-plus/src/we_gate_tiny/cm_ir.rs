@@ -233,6 +233,9 @@ impl CmIr {
     ) -> Result<(), String> {
         let CmIr { local_asg, constraints, a_terms, b_terms, c_terms, .. } = self;
         let base_nvars = base_asg.len();
+        // Big win for wall-time: avoid repeated reallocations during append.
+        base_asg.reserve(local_asg.len().saturating_sub(1));
+        base_inst.constraints.reserve(constraints.len());
         // Append local vars (skip local_asg[0]=ONE).
         base_asg.extend_from_slice(&local_asg[1..]);
         let map = |v: VarRef, base_nvars: usize| -> usize {
@@ -296,6 +299,9 @@ impl LoweredIr {
 pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> LoweredIr {
     let CmIr { local_asg, constraints, a_terms, b_terms, c_terms, .. } = ir;
     let base_nvars = gb.assignment.len();
+    // Big win for wall-time: avoid repeated reallocations during append.
+    gb.assignment.reserve(local_asg.len().saturating_sub(1));
+    gb.rows.reserve(constraints.len());
     let mut local_to_var: Vec<usize> = Vec::with_capacity(local_asg.len());
     local_to_var.push(0); // Local(0) unused
     for &v in local_asg.iter().skip(1) {
