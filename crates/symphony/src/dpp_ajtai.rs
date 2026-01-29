@@ -14,7 +14,6 @@ use rayon::prelude::*;
 use stark_rings::{OverField, PolyRing, Ring};
 
 use crate::dpp_poseidon::{Constraint, SparseDr1csInstance};
-use core::ops::Range;
 
 /// Build a sparse dR1CS instance that enforces `AjtaiCommitmentScheme::commit(message) == commitment`.
 ///

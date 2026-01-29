@@ -6859,12 +6859,12 @@ mod tests {
 
         // Pick a var index that appears in the first constraint (and is not the shared ONE=0).
         let c0 = &out.inst.constraints[0];
-        let pick = |terms: &Vec<(BF<RR>, usize)>| -> Option<usize> {
+        let pick = |terms: &[(BF<RR>, usize)]| -> Option<usize> {
             terms.iter().map(|(_, v)| *v).find(|&v| v != 0)
         };
-        let v = pick(&c0.a)
-            .or_else(|| pick(&c0.b))
-            .or_else(|| pick(&c0.c))
+        let v = pick(&out.inst.a_terms[c0.a.clone()])
+            .or_else(|| pick(&out.inst.b_terms[c0.b.clone()]))
+            .or_else(|| pick(&out.inst.c_terms[c0.c.clone()]))
             .expect("constraint should mention some non-one variable");
 
         let mut bad = out.assignment.clone();
