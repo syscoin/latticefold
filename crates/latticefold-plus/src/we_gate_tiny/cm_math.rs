@@ -314,6 +314,7 @@ pub(crate) fn ring_mul_negacyclic_digits_d64(
     a: &RingDigits,
     b: &RingDigits,
 ) -> Result<RingDigits, String> {
+    let _prev = gb.profile_enter("cm_math::ring_mul_negacyclic_digits_d64");
     tiny_cm_bump(|c| c.ring_mul_negacyclic += 1);
     if a.len() != 64 || b.len() != 64 {
         return Err("ring_mul_negacyclic_digits_d64: expected ring_dim=64".to_string());
@@ -333,7 +334,9 @@ pub(crate) fn ring_mul_negacyclic_digits_d64(
     let out: [GoldilocksScalar; 64] = core::array::from_fn(|i| {
         core::array::from_fn(|j| lowered.map_var(out_ir[i][j]))
     });
-    Ok(out.into_iter().collect())
+    let out = Ok(out.into_iter().collect());
+    gb.profile_exit(_prev);
+    out
 }
 
 // -----------------------------------------------------------------------------
@@ -346,6 +349,7 @@ fn goldilocks_add_mod_p_digits(
     a: &GoldilocksScalar,
     c: &GoldilocksScalar,
 ) -> GoldilocksScalar {
+    let _prev = gb.profile_enter("cm_math::scalar_add_mod_p_digits");
     tiny_cm_bump(|cc| cc.scalar_add += 1);
     let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
     let p_d = goldilocks_p_bal16_digits_le_const();
@@ -355,7 +359,9 @@ fn goldilocks_add_mod_p_digits(
     let c_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(c[j]));
     let out_ir = goldilocks_add_mod_p_digits_ir(&mut ib, &a_ir, &c_ir, p_u64, &p_d);
     let lowered = lower_ir_into_builder(gb, ib.ir);
-    core::array::from_fn(|j| lowered.map_var(out_ir[j]))
+    let out = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
+    gb.profile_exit(_prev);
+    out
 }
 
 #[inline]
@@ -364,6 +370,7 @@ fn goldilocks_sub_mod_p_digits(
     a: &GoldilocksScalar,
     c: &GoldilocksScalar,
 ) -> GoldilocksScalar {
+    let _prev = gb.profile_enter("cm_math::scalar_sub_mod_p_digits");
     tiny_cm_bump(|cc| cc.scalar_sub += 1);
     let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
     let p_d = goldilocks_p_bal16_digits_le_const();
@@ -373,7 +380,9 @@ fn goldilocks_sub_mod_p_digits(
     let c_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(c[j]));
     let out_ir = goldilocks_sub_mod_p_digits_ir(&mut ib, &a_ir, &c_ir, p_u64, &p_d);
     let lowered = lower_ir_into_builder(gb, ib.ir);
-    core::array::from_fn(|j| lowered.map_var(out_ir[j]))
+    let out = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
+    gb.profile_exit(_prev);
+    out
 }
 
 #[inline]
@@ -382,6 +391,7 @@ fn goldilocks_mul_mod_p_digits(
     a: &GoldilocksScalar,
     c: &GoldilocksScalar,
 ) -> GoldilocksScalar {
+    let _prev = gb.profile_enter("cm_math::scalar_mul_mod_p_digits");
     tiny_cm_bump(|cc| cc.scalar_mul += 1);
     let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
     let p_d = goldilocks_p_bal16_digits_le_const();
@@ -391,7 +401,9 @@ fn goldilocks_mul_mod_p_digits(
     let c_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(c[j]));
     let out_ir = goldilocks_mul_mod_p_digits_ir(&mut ib, &a_ir, &c_ir, p_u64, &p_d);
     let lowered = lower_ir_into_builder(gb, ib.ir);
-    core::array::from_fn(|j| lowered.map_var(out_ir[j]))
+    let out = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
+    gb.profile_exit(_prev);
+    out
 }
 
 /// Degree-2 Lagrange basis in digit encoding.
