@@ -243,12 +243,6 @@ pub struct ShortChallengeWiring {
     pub coeff_bal16_digits: Vec<[usize; 3]>,
 }
 
-#[inline]
-pub(super) fn digit_u16<F: PrimeField>(b: &Dr1csBuilder<F>, d: usize) -> u16 {
-    let bytes = b.assignment[d].into_bigint().to_bytes_le();
-    (bytes.get(0).copied().unwrap_or(0) as u16) | ((bytes.get(1).copied().unwrap_or(0) as u16) << 8)
-}
-
 /// Map a base-257 digit `d ∈ {0..=256}` to a byte `b ∈ {0..=255}` via the transcript rule:
 /// `256 -> 0`, else `b=d`.
 ///

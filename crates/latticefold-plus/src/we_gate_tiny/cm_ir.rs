@@ -1,4 +1,4 @@
-use ark_ff::{Field, PrimeField};
+use ark_ff::Field;
 use latticefold::transcript::poseidon::F257;
 use symphony::dpp_poseidon::{Constraint, SparseDr1csInstance};
 use symphony::dpp_sumcheck::Dr1csBuilder;
@@ -613,12 +613,15 @@ pub(crate) fn u32_bytes_to_bal16_digits_from_bits_ir(
                 msb
             };
 
-            let d_i: i32 = f257_to_i32_bal(b.val(b0))
-                + 2 * f257_to_i32_bal(b.val(b1))
-                + 4 * f257_to_i32_bal(b.val(b2))
-                + 8 * f257_to_i32_bal(b.val(msb));
-            let carry_i: i32 = carry.map(|v| f257_to_i32_bal(b.val(v))).unwrap_or(0);
-            let c_i: i32 = f257_to_i32_bal(b.val(c_out));
+            // These are all boolean witnesses; avoid bigint conversions in hot loops.
+            let bit_i32 = |x: VarRef| -> i32 {
+                let xv = b.val(x);
+                debug_assert!(xv == F257::ZERO || xv == F257::ONE);
+                if xv == F257::ONE { 1 } else { 0 }
+            };
+            let d_i: i32 = bit_i32(b0) + 2 * bit_i32(b1) + 4 * bit_i32(b2) + 8 * bit_i32(msb);
+            let carry_i: i32 = carry.map(bit_i32).unwrap_or(0);
+            let c_i: i32 = bit_i32(c_out);
             let v: i32 = d_i + carry_i - 16 * c_i;
             debug_assert!((-8..=7).contains(&v), "u32_bytes_to_bal16_digits_from_bits_ir: digit out of range");
 
@@ -670,12 +673,15 @@ pub(crate) fn u64_bytes_to_bal16_digits_from_bits_ir(
                 msb
             };
 
-            let d_i: i32 = f257_to_i32_bal(b.val(b0))
-                + 2 * f257_to_i32_bal(b.val(b1))
-                + 4 * f257_to_i32_bal(b.val(b2))
-                + 8 * f257_to_i32_bal(b.val(msb));
-            let carry_i: i32 = carry.map(|v| f257_to_i32_bal(b.val(v))).unwrap_or(0);
-            let c_i: i32 = f257_to_i32_bal(b.val(c_out));
+            // These are all boolean witnesses; avoid bigint conversions in hot loops.
+            let bit_i32 = |x: VarRef| -> i32 {
+                let xv = b.val(x);
+                debug_assert!(xv == F257::ZERO || xv == F257::ONE);
+                if xv == F257::ONE { 1 } else { 0 }
+            };
+            let d_i: i32 = bit_i32(b0) + 2 * bit_i32(b1) + 4 * bit_i32(b2) + 8 * bit_i32(msb);
+            let carry_i: i32 = carry.map(bit_i32).unwrap_or(0);
+            let c_i: i32 = bit_i32(c_out);
             let v: i32 = d_i + carry_i - 16 * c_i;
             debug_assert!((-8..=7).contains(&v), "u64_bytes_to_bal16_digits_from_bits_ir: digit out of range");
 
