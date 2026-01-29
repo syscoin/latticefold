@@ -808,10 +808,8 @@ fn compute_tcch(
                                 for i in 0..8 {
                                     let gv = pose_wiring.absorb_vars[coeff_start + i];
                                     let lv = glue.copy_digit(gv);
-                                    let _ = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, lv);
                                     coeffs[coeff][i] = lv;
                                 }
-                                goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(&mut glue.gb, &coeffs[coeff]);
                             }
                             coh0_bytes.push(coeffs[0]);
                             comh_all_coeff_bytes.push(coeffs);
