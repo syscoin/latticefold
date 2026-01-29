@@ -5,7 +5,6 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 
 use cyclotomic_rings::rings::goldilocks_ntt64 as gl_ntt64;
 
-use rayon::prelude::*;
 use std::collections::HashMap;
 use core::ops::Range;
 
@@ -248,26 +247,22 @@ impl CmIr {
                 }
             }
         };
-        // Parallel lowering: dominates wall-time for large IRs (e.g. ringmul).
-        let lowered_rows: Vec<Constraint<F257>> = constraints
-            .into_par_iter()
-            .map(|ic| {
-                let mut a: Vec<(F257, usize)> = Vec::with_capacity(ic.a.len());
-                for &(coef, v) in &a_terms[ic.a.clone()] {
-                    a.push((coef, map(v, base_nvars)));
-                }
-                let mut b: Vec<(F257, usize)> = Vec::with_capacity(ic.b.len());
-                for &(coef, v) in &b_terms[ic.b.clone()] {
-                    b.push((coef, map(v, base_nvars)));
-                }
-                let mut c: Vec<(F257, usize)> = Vec::with_capacity(ic.c.len());
-                for &(coef, v) in &c_terms[ic.c.clone()] {
-                    c.push((coef, map(v, base_nvars)));
-                }
-                Constraint { a, b, c }
-            })
-            .collect();
-        base_inst.constraints.extend(lowered_rows);
+        // Stream lowering directly into the destination to avoid per-shard transient allocations.
+        for ic in constraints {
+            let mut a: Vec<(F257, usize)> = Vec::with_capacity(ic.a.len());
+            for &(coef, v) in &a_terms[ic.a.clone()] {
+                a.push((coef, map(v, base_nvars)));
+            }
+            let mut b: Vec<(F257, usize)> = Vec::with_capacity(ic.b.len());
+            for &(coef, v) in &b_terms[ic.b.clone()] {
+                b.push((coef, map(v, base_nvars)));
+            }
+            let mut c: Vec<(F257, usize)> = Vec::with_capacity(ic.c.len());
+            for &(coef, v) in &c_terms[ic.c.clone()] {
+                c.push((coef, map(v, base_nvars)));
+            }
+            base_inst.constraints.push(Constraint { a, b, c });
+        }
         base_inst.nvars = base_asg.len();
         Ok(())
     }
@@ -316,32 +311,28 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
 
     let lowered = LoweredIr { base_nvars, local_to_var };
 
-    // Parallel lowering: this is the dominant wall-time for large IRs, and is embarrassingly parallel.
-    let lowered_ref = &lowered;
-    let lowered_rows: Vec<Constraint<F257>> = constraints
-        .into_par_iter()
-        .map(|ic| {
-            let mut a: Vec<(F257, usize)> = Vec::with_capacity(ic.a.len());
-            for &(coef, v) in &a_terms[ic.a.clone()] {
-                a.push((coef, lowered_ref.map_var(v)));
-            }
-            let mut b: Vec<(F257, usize)> = Vec::with_capacity(ic.b.len());
-            for &(coef, v) in &b_terms[ic.b.clone()] {
-                b.push((coef, lowered_ref.map_var(v)));
-            }
-            let mut c: Vec<(F257, usize)> = Vec::with_capacity(ic.c.len());
-            for &(coef, v) in &c_terms[ic.c.clone()] {
-                c.push((coef, lowered_ref.map_var(v)));
-            }
-            Constraint { a, b, c }
-        })
-        .collect();
-
-    let n_new = lowered_rows.len() as u64;
-    gb.rows.extend(lowered_rows);
-    // Maintain the existing profiling semantics without paying per-constraint `add_constraint` overhead.
-    if gb.profile_enabled {
-        let key = gb.profile_current.unwrap_or("unlabeled");
+    // Stream lowering directly into the destination to avoid per-shard transient allocations.
+    //
+    // We still avoid `gb.add_constraint` overhead by batching the profile counter update.
+    let do_profile = gb.profile_enabled;
+    let key = gb.profile_current.unwrap_or("unlabeled");
+    let n_new = constraints.len() as u64;
+    for ic in constraints {
+        let mut a: Vec<(F257, usize)> = Vec::with_capacity(ic.a.len());
+        for &(coef, v) in &a_terms[ic.a.clone()] {
+            a.push((coef, lowered.map_var(v)));
+        }
+        let mut b: Vec<(F257, usize)> = Vec::with_capacity(ic.b.len());
+        for &(coef, v) in &b_terms[ic.b.clone()] {
+            b.push((coef, lowered.map_var(v)));
+        }
+        let mut c: Vec<(F257, usize)> = Vec::with_capacity(ic.c.len());
+        for &(coef, v) in &c_terms[ic.c.clone()] {
+            c.push((coef, lowered.map_var(v)));
+        }
+        gb.rows.push(Constraint { a, b, c });
+    }
+    if do_profile {
         gb.profile.entry(key).or_default().constraints += n_new;
     }
 
