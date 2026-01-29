@@ -1409,8 +1409,7 @@ pub(crate) fn bal4_to_bal16_digits_ir(b: &mut IrBuilder<'_>, x4: &[VarRef; 33]) 
 fn bal16_to_bal4_digits_ir(b: &mut IrBuilder<'_>, x16: &[VarRef; 17]) -> [VarRef; 33] {
     let z = alloc_zero_const_ir(b);
     let mut out: [VarRef; 33] = [VarRef::Base(0); 33];
-    // carry_0 = 0 (use a constant-zero var; no need to range-check)
-    let mut carry_var = z;
+    let mut carry_var = alloc_carry_pm2_ir(b, 0);
     let mut carry_i32: i32 = 0;
 
     for k in 0..33 {
@@ -1423,22 +1422,12 @@ fn bal16_to_bal4_digits_ir(b: &mut IrBuilder<'_>, x16: &[VarRef; 17]) -> [VarRef
         let carry_next = (s - digit) / 4;
 
         debug_assert!((-2..=1).contains(&digit));
-        if (k & 1) == 0 {
-            // Even step includes a base-16 digit term in [-8,7], so carry can reach ±2.
-            debug_assert!((-2..=2).contains(&carry_next));
-        } else {
-            // Odd step term is 0, so carry shrinks to {-1,0,1}.
-            debug_assert!((-1..=1).contains(&carry_next));
-        }
+        debug_assert!((-2..=2).contains(&carry_next));
 
         // Digit is linked by the carry chain; we do not need bit-backed digit checks here.
         // See NOTE above: carries are tightly bounded (<64 window), preventing the 257 bubble.
         let dvar = b.new_var(i32_to_f257(digit));
-        let cnext = if (k & 1) == 0 {
-            alloc_carry_pm2_ir(b, carry_next)
-        } else {
-            alloc_carry_pm1_ir(b, carry_next)
-        };
+        let cnext = alloc_carry_pm2_ir(b, carry_next);
 
         // term + carry - digit - 4*carry_next = 0
         b.enforce_lc_eq_zero(vec![
@@ -1857,8 +1846,8 @@ fn enforce_add_mod_p_relation_bal16_ir(
     let c = pad17_to_18_with_zero(c_d, z_digit);
     let r = pad17_to_18_with_zero(r_d, z_digit);
 
-    // carry_0 = 0 (no var)
-    let mut carry_var: Option<VarRef> = None;
+    // carry_0 = 0
+    let mut carry_var = alloc_carry_pm2_ir(b, 0);
     let mut carry_i32: i32 = 0;
 
     for k in 0..18 {
@@ -1871,16 +1860,14 @@ fn enforce_add_mod_p_relation_bal16_ir(
         debug_assert!(sum % 16 == 0, "add_mod_p carry not divisible: sum={sum} k={k}");
         let carry_next = sum / 16;
         debug_assert!(
-            (-1..=1).contains(&carry_next),
-            "add_mod_p carry out of pm1: {carry_next} (sum={sum}) at k={k}"
+            (-2..=2).contains(&carry_next),
+            "add_mod_p carry out of pm2: {carry_next} (sum={sum}) at k={k}"
         );
-        let carry_next_var = alloc_carry_pm1_ir(b, carry_next);
+        let carry_next_var = alloc_carry_pm2_ir(b, carry_next);
 
         // carry + a + c - r - q*pk - 16*carry_next = 0
         let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(6);
-        if let Some(cv) = carry_var {
-            lc.push((F257::ONE, cv));
-        }
+        lc.push((F257::ONE, carry_var));
         lc.push((F257::ONE, a[k]));
         lc.push((F257::ONE, c[k]));
         lc.push((-F257::ONE, r[k]));
@@ -1890,10 +1877,10 @@ fn enforce_add_mod_p_relation_bal16_ir(
         lc.push((-F257::from(16u64), carry_next_var));
         b.enforce_lc_eq_zero(lc);
 
-        carry_var = Some(carry_next_var);
+        carry_var = carry_next_var;
         carry_i32 = carry_next;
     }
-    b.ir.enforce_var_eq_const(carry_var.expect("enforce_add_mod_p_relation_bal16_ir: empty"), F257::ZERO);
+    b.ir.enforce_var_eq_const(carry_var, F257::ZERO);
 }
 
 /// Enforce `a + q*p = c + r` over balanced base-16 digits with carry bound [-2,2].
@@ -1912,8 +1899,7 @@ fn enforce_sub_mod_p_relation_bal16_ir(
     let c = pad17_to_18_with_zero(c_d, z_digit);
     let r = pad17_to_18_with_zero(r_d, z_digit);
 
-    // carry_0 = 0 (no var)
-    let mut carry_var: Option<VarRef> = None;
+    let mut carry_var = alloc_carry_pm2_ir(b, 0);
     let mut carry_i32: i32 = 0;
 
     for k in 0..18 {
@@ -1926,16 +1912,14 @@ fn enforce_sub_mod_p_relation_bal16_ir(
         debug_assert!(sum % 16 == 0, "sub_mod_p carry not divisible: sum={sum} k={k}");
         let carry_next = sum / 16;
         debug_assert!(
-            (-1..=1).contains(&carry_next),
-            "sub_mod_p carry out of pm1: {carry_next} (sum={sum}) at k={k}"
+            (-2..=2).contains(&carry_next),
+            "sub_mod_p carry out of pm2: {carry_next} (sum={sum}) at k={k}"
         );
-        let carry_next_var = alloc_carry_pm1_ir(b, carry_next);
+        let carry_next_var = alloc_carry_pm2_ir(b, carry_next);
 
         // carry + a - c - r + q*pk - 16*carry_next = 0
         let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(6);
-        if let Some(cv) = carry_var {
-            lc.push((F257::ONE, cv));
-        }
+        lc.push((F257::ONE, carry_var));
         lc.push((F257::ONE, a[k]));
         lc.push((-F257::ONE, c[k]));
         lc.push((-F257::ONE, r[k]));
@@ -1945,10 +1929,10 @@ fn enforce_sub_mod_p_relation_bal16_ir(
         lc.push((-F257::from(16u64), carry_next_var));
         b.enforce_lc_eq_zero(lc);
 
-        carry_var = Some(carry_next_var);
+        carry_var = carry_next_var;
         carry_i32 = carry_next;
     }
-    b.ir.enforce_var_eq_const(carry_var.expect("enforce_sub_mod_p_relation_bal16_ir: empty"), F257::ZERO);
+    b.ir.enforce_var_eq_const(carry_var, F257::ZERO);
 }
 
 /// Digit-domain Goldilocks addition (mod p) in IR form.
@@ -2043,9 +2027,7 @@ fn enforce_add_mod_p_relation_bal4_ir(
     let c = pad33_to_34_with_zero(c4, z);
     let r = pad33_to_34_with_zero(r4, z);
 
-    // carry_0 = 0 (no var). In balanced base-4 with digits in [-2,1], the carry in these
-    // add/sub mod-p relations stays in {-1,0,1}, so we allocate pm1 carries for k>=0.
-    let mut carry_var: Option<VarRef> = None;
+    let mut carry_var = alloc_carry_pm2_ir(b, 0);
     let mut carry_i32: i32 = 0;
 
     // p = 4^32 - 4^16 + 1  => digit at 0:+1, 16:-1, 32:+1
@@ -2064,16 +2046,14 @@ fn enforce_add_mod_p_relation_bal4_ir(
         debug_assert!(sum % 4 == 0, "add_mod_p(bal4) carry not divisible: sum={sum} k={k}");
         let carry_next = sum / 4;
         debug_assert!(
-            (-1..=1).contains(&carry_next),
-            "add_mod_p(bal4) carry out of pm1: {carry_next} (sum={sum}) at k={k}"
+            (-2..=2).contains(&carry_next),
+            "add_mod_p(bal4) carry out of pm2: {carry_next} (sum={sum}) at k={k}"
         );
-        let carry_next_var = alloc_carry_pm1_ir(b, carry_next);
+        let carry_next_var = alloc_carry_pm2_ir(b, carry_next);
 
         // carry + a + c - r - q*pk - 4*carry_next = 0
         let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(7);
-        if let Some(cv) = carry_var {
-            lc.push((F257::ONE, cv));
-        }
+        lc.push((F257::ONE, carry_var));
         lc.push((F257::ONE, a[k]));
         lc.push((F257::ONE, c[k]));
         lc.push((-F257::ONE, r[k]));
@@ -2084,10 +2064,10 @@ fn enforce_add_mod_p_relation_bal4_ir(
         lc.push((-F257::from(4u64), carry_next_var));
         b.enforce_lc_eq_zero(lc);
 
-        carry_var = Some(carry_next_var);
+        carry_var = carry_next_var;
         carry_i32 = carry_next;
     }
-    b.ir.enforce_var_eq_const(carry_var.expect("enforce_add_mod_p_relation_bal4_ir: empty"), F257::ZERO);
+    b.ir.enforce_var_eq_const(carry_var, F257::ZERO);
 }
 
 fn enforce_sub_mod_p_relation_bal4_ir(
@@ -2104,8 +2084,7 @@ fn enforce_sub_mod_p_relation_bal4_ir(
     let c = pad33_to_34_with_zero(c4, z);
     let r = pad33_to_34_with_zero(r4, z);
 
-    // carry_0 = 0 (no var)
-    let mut carry_var: Option<VarRef> = None;
+    let mut carry_var = alloc_carry_pm2_ir(b, 0);
     let mut carry_i32: i32 = 0;
 
     for k in 0..34 {
@@ -2123,16 +2102,14 @@ fn enforce_sub_mod_p_relation_bal4_ir(
         debug_assert!(sum % 4 == 0, "sub_mod_p(bal4) carry not divisible: sum={sum} k={k}");
         let carry_next = sum / 4;
         debug_assert!(
-            (-1..=1).contains(&carry_next),
-            "sub_mod_p(bal4) carry out of pm1: {carry_next} (sum={sum}) at k={k}"
+            (-2..=2).contains(&carry_next),
+            "sub_mod_p(bal4) carry out of pm2: {carry_next} (sum={sum}) at k={k}"
         );
-        let carry_next_var = alloc_carry_pm1_ir(b, carry_next);
+        let carry_next_var = alloc_carry_pm2_ir(b, carry_next);
 
         // carry + a - c - r + q*pk - 4*carry_next = 0
         let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(7);
-        if let Some(cv) = carry_var {
-            lc.push((F257::ONE, cv));
-        }
+        lc.push((F257::ONE, carry_var));
         lc.push((F257::ONE, a[k]));
         lc.push((-F257::ONE, c[k]));
         lc.push((-F257::ONE, r[k]));
@@ -2142,10 +2119,10 @@ fn enforce_sub_mod_p_relation_bal4_ir(
         lc.push((-F257::from(4u64), carry_next_var));
         b.enforce_lc_eq_zero(lc);
 
-        carry_var = Some(carry_next_var);
+        carry_var = carry_next_var;
         carry_i32 = carry_next;
     }
-    b.ir.enforce_var_eq_const(carry_var.expect("enforce_sub_mod_p_relation_bal4_ir: empty"), F257::ZERO);
+    b.ir.enforce_var_eq_const(carry_var, F257::ZERO);
 }
 
 #[inline]
