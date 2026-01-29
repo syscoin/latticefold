@@ -338,6 +338,13 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
     let c_ir: [[super::cm_ir::VarRef; 17]; 64] =
         core::array::from_fn(|i| core::array::from_fn(|j| super::cm_ir::VarRef::Base(c_d[i][j])));
     let out_ir = super::cm_ir::ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &a_ir, &c_ir);
+    let ir_stats = ib.ir.stats;
+    eprintln!(
+        "== ringmul IR stats: linear={} non_linear={} total={} ==",
+        ir_stats.linear_constraints,
+        ir_stats.non_linear_constraints,
+        ir_stats.linear_constraints + ir_stats.non_linear_constraints
+    );
     let lowered = super::cm_ir::lower_ir_into_builder(&mut b, ib.ir);
     let out: [super::goldilocks::GoldilocksScalar; 64] = core::array::from_fn(|i| {
         core::array::from_fn(|j| lowered.map_var(out_ir[i][j]))

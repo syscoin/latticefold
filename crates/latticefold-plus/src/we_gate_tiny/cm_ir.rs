@@ -69,6 +69,14 @@ pub(crate) struct IrConstraint {
     pub(crate) c: Vec<(F257, VarRef)>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CmIrStats {
+    /// Constraints of the form (LC) * 1 = 0 (purely linear).
+    pub(crate) linear_constraints: u64,
+    /// Constraints where the right side is not the constant ONE (contains multiplication).
+    pub(crate) non_linear_constraints: u64,
+}
+
 /// A parallel-build-friendly constraint fragment.
 ///
 /// This deliberately avoids any dependence on `Dr1csBuilder` internals/caches, so it can be built
@@ -78,12 +86,13 @@ pub(crate) struct CmIr {
     /// Witness values for local vars. Index 0 is reserved as ONE.
     pub(crate) local_asg: Vec<F257>,
     pub(crate) constraints: Vec<IrConstraint>,
+    pub(crate) stats: CmIrStats,
 }
 
 impl CmIr {
     #[inline]
     pub(crate) fn new() -> Self {
-        Self { local_asg: vec![F257::ONE], constraints: Vec::new() }
+        Self { local_asg: vec![F257::ONE], constraints: Vec::new(), stats: CmIrStats::default() }
     }
 
     /// Allocate a new local var with the given witness value.
@@ -97,6 +106,7 @@ impl CmIr {
     /// Enforce `(Σ lc) * 1 = 0`.
     #[inline]
     pub(crate) fn enforce_lc_times_one_eq_zero(&mut self, lc: Vec<(F257, VarRef)>) {
+        self.stats.linear_constraints += 1;
         self.constraints.push(IrConstraint {
             a: lc,
             b: vec![(F257::ONE, VarRef::Base(0))],
@@ -114,11 +124,27 @@ impl CmIr {
     /// Enforce `a * b = c`.
     #[inline]
     pub(crate) fn enforce_mul(&mut self, a: VarRef, b: VarRef, c: VarRef) {
+        self.stats.non_linear_constraints += 1;
         self.constraints.push(IrConstraint {
             a: vec![(F257::ONE, a)],
             b: vec![(F257::ONE, b)],
             c: vec![(F257::ONE, c)],
         });
+    }
+
+    /// Add a raw R1CS constraint with linear combinations over `VarRef`.
+    ///
+    /// Used for boolean/range gadgets and other small non-linear constraints.
+    #[inline]
+    pub(crate) fn add_constraint(&mut self, a: Vec<(F257, VarRef)>, b: Vec<(F257, VarRef)>, c: Vec<(F257, VarRef)>) {
+        // Classify purely linear constraints that multiply by ONE.
+        let is_linear = b.len() == 1 && b[0].0 == F257::ONE && b[0].1 == VarRef::Base(0);
+        if is_linear {
+            self.stats.linear_constraints += 1;
+        } else {
+            self.stats.non_linear_constraints += 1;
+        }
+        self.constraints.push(IrConstraint { a, b, c });
     }
 
     /// Lower this IR fragment into an existing sparse DR1CS instance/assignment in-place.
@@ -268,7 +294,7 @@ impl<'a> IrBuilder<'a> {
     /// Add a raw R1CS constraint with linear combinations over `VarRef`.
     #[inline]
     pub(crate) fn add_constraint(&mut self, a: Vec<(F257, VarRef)>, b: Vec<(F257, VarRef)>, c: Vec<(F257, VarRef)>) {
-        self.ir.constraints.push(IrConstraint { a, b, c });
+        self.ir.add_constraint(a, b, c);
     }
 
     /// Convert a bal16 scalar (17 digits, last is carry bit) to bal4 digits (33 digits),
