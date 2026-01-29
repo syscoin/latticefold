@@ -334,100 +334,6 @@ pub(crate) fn alloc_carry_pm2_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
     c_var
 }
 
-/// Allocate a signed carry `c ∈ {-1,0,1}` using the vanishing polynomial (c-1)c(c+1)=0.
-fn alloc_carry_pm1_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
-    debug_assert!((-1..=1).contains(&c));
-    let c_var = b.new_var(i32_to_f257(c));
-
-    // cm1 = c - 1
-    let cm1 = b.new_var(b.val(c_var) - F257::ONE);
-    b.enforce_lc_eq_zero(vec![
-        (F257::ONE, cm1),
-        (-F257::ONE, c_var),
-        (F257::ONE, b.one()),
-    ]);
-
-    // t = (c-1)*c
-    let t = b.new_var(b.val(cm1) * b.val(c_var));
-    b.enforce_mul(cm1, c_var, t);
-
-    // cp1 = c + 1
-    let cp1 = b.new_var(b.val(c_var) + F257::ONE);
-    b.enforce_lc_eq_zero(vec![
-        (F257::ONE, cp1),
-        (-F257::ONE, c_var),
-        (-F257::ONE, b.one()),
-    ]);
-
-    // t*(c+1) = 0
-    let z = b.new_var(F257::ZERO);
-    b.ir.enforce_var_eq_const(z, F257::ZERO);
-    b.enforce_mul(t, cp1, z);
-
-    c_var
-}
-
-/// Allocate a signed carry `c ∈ [-16,15]` by 5-bit decomposition of (c+16).
-fn alloc_carry_pm16_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
-    debug_assert!((-16..=15).contains(&c));
-    let off_u8: u8 = (c + 16) as u8; // in [0,31]
-
-    let mut bits = [VarRef::Base(0); 5];
-    for i in 0..5 {
-        bits[i] = alloc_bool_ir(b, ((off_u8 >> i) & 1) == 1);
-    }
-
-    let off_var = b.new_var(F257::from(off_u8 as u64));
-    // off = Σ 2^i bits[i]
-    b.enforce_lc_eq_zero(vec![
-        (F257::ONE, off_var),
-        (-F257::ONE, bits[0]),
-        (-F257::from(2u64), bits[1]),
-        (-F257::from(4u64), bits[2]),
-        (-F257::from(8u64), bits[3]),
-        (-F257::from(16u64), bits[4]),
-    ]);
-
-    // c = off - 16
-    let c_var = b.new_var(i32_to_f257(c));
-    b.enforce_lc_eq_zero(vec![
-        (F257::ONE, c_var),
-        (-F257::ONE, off_var),
-        (F257::from(16u64), b.one()),
-    ]);
-    c_var
-}
-
-/// Allocate a signed carry `c ∈ [-8,7]` by 4-bit decomposition of (c+8).
-fn alloc_carry_pm8_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
-    debug_assert!((-8..=7).contains(&c));
-    let off_u8: u8 = (c + 8) as u8; // in [0,15]
-
-    let mut bits = [VarRef::Base(0); 4];
-    for i in 0..4 {
-        bits[i] = alloc_bool_ir(b, ((off_u8 >> i) & 1) == 1);
-    }
-
-    let off_var = b.new_var(F257::from(off_u8 as u64));
-    // off = Σ 2^i bits[i]
-    b.enforce_lc_eq_zero(vec![
-        (F257::ONE, off_var),
-        (-F257::ONE, bits[0]),
-        (-F257::from(2u64), bits[1]),
-        (-F257::from(4u64), bits[2]),
-        (-F257::from(8u64), bits[3]),
-    ]);
-
-    // c = off - 8
-    let c_var = b.new_var(i32_to_f257(c));
-    b.enforce_lc_eq_zero(vec![
-        (F257::ONE, c_var),
-        (-F257::ONE, off_var),
-        (F257::from(8u64), b.one()),
-    ]);
-    c_var
-}
-
 #[inline]
 fn u64_to_bal16_digits_le_const(mut x: u64) -> [i8; 17] {
     // Match the balancing convention used elsewhere: digits in [-8,7] plus carry in {0,1}.
@@ -485,32 +391,78 @@ fn enforce_prod_const_eq_qp_plus_r_bal16_ir(
     p_d_const: &[i8; 17],
     r_d: &[VarRef; 17],
 ) {
-    // Sound no-wrap enforcement (IR analogue of `goldilocks.rs::enforce_prod_eq_qp_plus_r_bal16`):
-    // materialize `prod = x*k` and `qp = q*p` via the sound const-RHS multiplier, add `r`, and
-    // enforce equality to `prod` using the bal16 add gadget (pm1 carries).
-    let zero = alloc_zero_const_ir(b);
-
-    // prod = x*k  (const-RHS)
-    let prod = mul_bal16_long_by_const_rhs_ir(b, x_d, k_d_const);
-
-    // qp = q*p  (const-RHS)
-    let qp = mul_bal16_long_by_const_rhs_ir(b, q_d, p_d_const);
-
-    let max_len = prod
-        .len()
+    let max_len = 17usize
         .max(r_d.len())
-        .max(qp.len())
         .max(q_d.len().saturating_add(p_d_const.len()).saturating_sub(1))
         + 1;
 
-    let prod_pad = pad_bal16_ir(b, prod, max_len, zero);
-    let r_pad = pad_bal16_ir(b, r_d.to_vec(), max_len, zero);
-    let qp_pad = pad_bal16_ir(b, qp, max_len, zero);
+    let mut carry_i32: i32 = 0;
+    let mut carry_var = alloc_carry_pm128_ir(b, 0);
 
-    let (sum, carry) = add_bal16_same_len_ir(b, &qp_pad, &r_pad);
-    b.ir.enforce_var_eq_const(carry, F257::ZERO);
+    for k in 0..max_len {
+        let mut sum: i32 = carry_i32;
+        let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(64);
+        lc.push((F257::ONE, carry_var));
 
-    enforce_bal16_vec_eq_ir(b, &prod_pad, &sum);
+        // -r_k
+        if k < r_d.len() {
+            let rk = f257_to_i32_bal(b.val(r_d[k]));
+            sum -= rk;
+            lc.push((-F257::ONE, r_d[k]));
+        }
+
+        // + Σ_i x_i * k_{k-i}
+        for i in 0..17 {
+            if i > k {
+                break;
+            }
+            let j = k - i;
+            if j >= 17 {
+                continue;
+            }
+            let kd = k_d_const[j] as i32;
+            if kd == 0 {
+                continue;
+            }
+            let xi = f257_to_i32_bal(b.val(x_d[i]));
+            sum += xi * kd;
+            lc.push((i32_to_f257(kd), x_d[i]));
+        }
+
+        // - Σ_i q_i * p_{k-i}
+        for i in 0..q_d.len() {
+            if i > k {
+                break;
+            }
+            let j = k - i;
+            if j >= 17 {
+                continue;
+            }
+            let pd = p_d_const[j] as i32;
+            if pd == 0 {
+                continue;
+            }
+            let qi = f257_to_i32_bal(b.val(q_d[i]));
+            sum -= qi * pd;
+            lc.push((-i32_to_f257(pd), q_d[i]));
+        }
+
+        debug_assert!(sum % 16 == 0, "const-mul carry check not divisible: sum={sum} at k={k}");
+        let carry_next: i32 = sum / 16;
+        debug_assert!(
+            (-128..=127).contains(&carry_next),
+            "const-mul carry out of pm128 bound: {carry_next} at k={k} (sum={sum})"
+        );
+        let carry_next_var = alloc_carry_pm128_ir(b, carry_next);
+        lc.push((-F257::from(16u64), carry_next_var));
+
+        // lc == 0
+        b.enforce_lc_eq_zero(lc);
+        carry_var = carry_next_var;
+        carry_i32 = carry_next;
+    }
+    // Final carry must be 0.
+    b.ir.enforce_var_eq_const(carry_var, F257::ZERO);
 }
 
 /// Digit-domain const multiplication mod Goldilocks p: r = x * k (mod p).
@@ -548,335 +500,6 @@ fn alloc_zero_const_ir(b: &mut IrBuilder<'_>) -> VarRef {
     let z = b.new_var(F257::ZERO);
     b.ir.enforce_var_eq_const(z, F257::ZERO);
     z
-}
-
-#[inline]
-fn enforce_bal16_vec_eq_ir(b: &mut IrBuilder<'_>, a: &[VarRef], c: &[VarRef]) {
-    debug_assert_eq!(a.len(), c.len());
-    for (&ai, &ci) in a.iter().zip(c.iter()) {
-        b.enforce_lc_eq_zero(vec![(F257::ONE, ai), (-F257::ONE, ci)]);
-    }
-}
-
-#[inline]
-fn pad_bal16_ir(b: &mut IrBuilder<'_>, mut v: Vec<VarRef>, target_len: usize, zero: VarRef) -> Vec<VarRef> {
-    if v.len() > target_len {
-        for &dv in &v[target_len..] {
-            b.ir.enforce_var_eq_const(dv, F257::ZERO);
-        }
-        v.truncate(target_len);
-        return v;
-    }
-    if v.len() < target_len {
-        v.extend(std::iter::repeat(zero).take(target_len - v.len()));
-    }
-    v
-}
-
-/// Add two balanced base-16 digit vectors of the same length.
-///
-/// Assumes each digit is in [-8,7]. Enforces output digits in [-8,7] and carry in {-1,0,1}.
-fn add_bal16_same_len_ir(b: &mut IrBuilder<'_>, a: &[VarRef], c: &[VarRef]) -> (Vec<VarRef>, VarRef) {
-    debug_assert_eq!(a.len(), c.len());
-    let n = a.len();
-    let mut out: Vec<VarRef> = Vec::with_capacity(n);
-    let mut carry_i32: i32 = 0;
-    let mut carry = alloc_zero_const_ir(b);
-
-    for i in 0..n {
-        let ai = f257_to_i32_bal(b.val(a[i]));
-        let ci = f257_to_i32_bal(b.val(c[i]));
-        let sum = ai + ci + carry_i32;
-
-        // Choose carry_out so remainder in [-8,7].
-        let mut carry_next = if sum >= 0 { (sum + 8) / 16 } else { -(((-sum) + 8) / 16) };
-        let mut rem = sum - 16 * carry_next;
-        while rem > 7 {
-            carry_next += 1;
-            rem -= 16;
-        }
-        while rem < -8 {
-            carry_next -= 1;
-            rem += 16;
-        }
-        debug_assert!((-1..=1).contains(&carry_next));
-        debug_assert!((-8..=7).contains(&rem));
-
-        let out_digit = alloc_bal16_digit_ir(b, rem as i8);
-        let carry_next_var = alloc_carry_pm1_ir(b, carry_next);
-
-        // a_i + c_i + carry - out_i - 16*carry_next = 0
-        b.enforce_lc_eq_zero(vec![
-            (F257::ONE, a[i]),
-            (F257::ONE, c[i]),
-            (F257::ONE, carry),
-            (-F257::ONE, out_digit),
-            (-F257::from(16u64), carry_next_var),
-        ]);
-
-        out.push(out_digit);
-        carry_i32 = carry_next;
-        carry = carry_next_var;
-    }
-
-    (out, carry)
-}
-
-#[inline]
-fn add_bal16_loose_in_place_ir(b: &mut IrBuilder<'_>, acc: &mut [VarRef], src: &[VarRef]) {
-    debug_assert_eq!(acc.len(), src.len());
-    for i in 0..acc.len() {
-        let v = b.new_var(b.val(acc[i]) + b.val(src[i]));
-        b.enforce_lc_eq_zero(vec![(F257::ONE, v), (-F257::ONE, acc[i]), (-F257::ONE, src[i])]);
-        acc[i] = v;
-    }
-}
-
-fn normalize_bal16_loose_same_len_with_bound_ir(
-    b: &mut IrBuilder<'_>,
-    loose: &[VarRef],
-    digit_abs_bound: i32,
-) -> (Vec<VarRef>, VarRef) {
-    debug_assert!(digit_abs_bound >= 0);
-    // Critical for no-wrap soundness when interpreting F257 as integers.
-    debug_assert!(digit_abs_bound < 128);
-
-    #[inline]
-    fn alloc_carry_with_bound_ir(b: &mut IrBuilder<'_>, c: i32, bound: i32) -> VarRef {
-        debug_assert!(bound >= 0);
-        if bound <= 1 {
-            alloc_carry_pm1_ir(b, c)
-        } else if bound <= 2 {
-            alloc_carry_pm2_ir(b, c)
-        } else if bound <= 7 {
-            alloc_carry_pm8_ir(b, c)
-        } else if bound <= 15 {
-            alloc_carry_pm16_ir(b, c)
-        } else {
-            // For our current uses (17×17 const-RHS with acc_bound<128), this should not happen.
-            alloc_carry_pm128_ir(b, c)
-        }
-    }
-
-    // Compute a conservative, statement-derived carry bound schedule from `digit_abs_bound`.
-    let mut carry_bound: i32 = 0;
-    let mut carry_bounds: Vec<i32> = Vec::with_capacity(loose.len());
-    for _ in 0..loose.len() {
-        let max_sum = digit_abs_bound + carry_bound;
-        carry_bound = ((max_sum + 8) / 16) + 1;
-        carry_bounds.push(carry_bound);
-        debug_assert!(carry_bound < 128);
-    }
-
-    let mut out: Vec<VarRef> = Vec::with_capacity(loose.len());
-    let mut carry_i32: i32 = 0;
-    let mut carry_var = alloc_zero_const_ir(b);
-
-    // div_floor(x/16) for possibly-negative x.
-    let div_floor = |x: i32, d: i32| -> i32 {
-        debug_assert!(d > 0);
-        if x >= 0 { x / d } else { -(((-x) + d - 1) / d) }
-    };
-
-    for (i, &dv) in loose.iter().enumerate() {
-        let di = f257_to_i32_bal(b.val(dv));
-        debug_assert!((-digit_abs_bound..=digit_abs_bound).contains(&di));
-        let sum = di + carry_i32;
-
-        let mut carry_next = div_floor(sum + 8, 16);
-        let mut rem = sum - 16 * carry_next;
-        while rem > 7 {
-            carry_next += 1;
-            rem -= 16;
-        }
-        while rem < -8 {
-            carry_next -= 1;
-            rem += 16;
-        }
-        debug_assert!((-8..=7).contains(&rem));
-        debug_assert!((-carry_bounds[i]..=carry_bounds[i]).contains(&carry_next));
-
-        let rem_digit = alloc_bal16_digit_ir(b, rem as i8);
-        let carry_next_var = alloc_carry_with_bound_ir(b, carry_next, carry_bounds[i]);
-
-        // loose_i + carry_i - rem_i - 16*carry_{i+1} = 0
-        b.enforce_lc_eq_zero(vec![
-            (F257::ONE, dv),
-            (F257::ONE, carry_var),
-            (-F257::ONE, rem_digit),
-            (-F257::from(16u64), carry_next_var),
-        ]);
-
-        out.push(rem_digit);
-        carry_i32 = carry_next;
-        carry_var = carry_next_var;
-    }
-
-    (out, carry_var)
-}
-
-fn rebalance_tail_pm16_to_pm1_ir(b: &mut IrBuilder<'_>, digits: &[VarRef]) -> Vec<VarRef> {
-    debug_assert!(!digits.is_empty());
-    let l = digits.len();
-    let tail = f257_to_i32_bal(b.val(digits[l - 1]));
-    debug_assert!((-16..=15).contains(&tail));
-
-    let mut carry1 = if tail >= 0 { (tail + 8) / 16 } else { -(((-tail) + 8) / 16) };
-    let mut rem = tail - 16 * carry1;
-    while rem > 7 {
-        carry1 += 1;
-        rem -= 16;
-    }
-    while rem < -8 {
-        carry1 -= 1;
-        rem += 16;
-    }
-    debug_assert!((-8..=7).contains(&rem));
-    debug_assert!((-1..=1).contains(&carry1));
-
-    let rem_digit = alloc_bal16_digit_ir(b, rem as i8);
-    let carry1_var = alloc_carry_pm1_ir(b, carry1);
-    b.enforce_lc_eq_zero(vec![
-        (F257::ONE, digits[l - 1]),
-        (-F257::ONE, rem_digit),
-        (-F257::from(16u64), carry1_var),
-    ]);
-
-    let mut out = Vec::with_capacity(l + 1);
-    out.extend_from_slice(&digits[..l - 1]);
-    out.push(rem_digit);
-    out.push(carry1_var);
-    out
-}
-
-fn shift_pad_bal16_ir(digits: &[VarRef], shift: usize, target_len: usize, zero_digit: VarRef) -> Vec<VarRef> {
-    debug_assert!(shift <= target_len);
-    debug_assert!(digits.len() + shift <= target_len);
-    let mut out = Vec::with_capacity(target_len);
-    out.extend(std::iter::repeat(zero_digit).take(shift));
-    out.extend_from_slice(digits);
-    out.extend(std::iter::repeat(zero_digit).take(target_len - shift - digits.len()));
-    out
-}
-
-/// Multiply balanced base-16 digits by **constant** balanced digits (little-endian),
-/// specialized for `a_len <= 4`.
-fn mul_bal16_small_const_rhs4_ir(
-    b: &mut IrBuilder<'_>,
-    a: &[VarRef; 4],
-    a_len: usize,
-    bb_const: &[i8],
-) -> Vec<VarRef> {
-    debug_assert!(a_len >= 1 && a_len <= 4);
-    let la = a_len;
-    let lb = bb_const.len();
-
-    #[inline]
-    fn f257_from_i8(x: i8) -> F257 {
-        if x >= 0 { F257::from(x as u64) } else { -F257::from((-x) as u64) }
-    }
-
-    let mut out: Vec<VarRef> = Vec::with_capacity(la + lb);
-    let mut carry_i32: i32 = 0;
-    let mut carry_var = alloc_zero_const_ir(b);
-
-    let div_floor = |x: i32, d: i32| -> i32 {
-        debug_assert!(d > 0);
-        if x >= 0 { x / d } else { -(((-x) + d - 1) / d) }
-    };
-
-    for k in 0..(la + lb - 1) {
-        let mut sum: i32 = carry_i32;
-        let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(8);
-        lc.push((F257::ONE, carry_var));
-
-        for i in 0..la {
-            let j = k as i32 - i as i32;
-            if j < 0 || j >= lb as i32 {
-                continue;
-            }
-            let j = j as usize;
-            let aval = f257_to_i32_bal(b.val(a[i]));
-            let bval = bb_const[j] as i32;
-            sum += aval * bval;
-            let cf = f257_from_i8(bb_const[j]);
-            if cf != F257::ZERO {
-                lc.push((cf, a[i]));
-            }
-        }
-
-        // With <=4 terms of magnitude <=56 and carry in <=15, |sum| < 257.
-        let mut carry = div_floor(sum + 8, 16);
-        let mut rem = sum - 16 * carry;
-        while rem > 7 {
-            carry += 1;
-            rem -= 16;
-        }
-        while rem < -8 {
-            carry -= 1;
-            rem += 16;
-        }
-        debug_assert!((-8..=7).contains(&rem));
-        debug_assert!((-16..=15).contains(&carry));
-
-        let digit_var = alloc_bal16_digit_ir(b, rem as i8);
-        let carry_out_var = alloc_carry_pm16_ir(b, carry);
-        lc.push((-F257::ONE, digit_var));
-        lc.push((-F257::from(16u64), carry_out_var));
-        b.enforce_lc_eq_zero(lc);
-
-        out.push(digit_var);
-        carry_i32 = carry;
-        carry_var = carry_out_var;
-    }
-
-    out.push(carry_var);
-    out
-}
-
-/// Multiply a long balanced digit vector by a **constant** long balanced digit vector.
-///
-/// IR analogue of `digits::mul_bal16_long_by_const_rhs`, implementing the provably-sound Fox #1
-/// loose-accumulation path (sufficient for all current uses: 17×17 with acc_bound<128).
-fn mul_bal16_long_by_const_rhs_ir(b: &mut IrBuilder<'_>, a: &[VarRef], bb_const: &[i8]) -> Vec<VarRef> {
-    if a.is_empty() || bb_const.is_empty() {
-        return vec![alloc_zero_const_ir(b)];
-    }
-
-    const BLK: usize = 4;
-    let zero = alloc_zero_const_ir(b);
-    let blocks = (a.len() + (BLK - 1)) / BLK;
-    let per_block_len = bb_const.len() + BLK + 2;
-    let target_len = per_block_len + BLK * (blocks - 1) + 3;
-
-    let per_term_bound: i32 = 10;
-    let acc_bound: i32 = (blocks as i32) * per_term_bound;
-
-    debug_assert!(a.len() <= 19 && bb_const.len() <= 17 && acc_bound < 128);
-
-    // Build all shifted block-products.
-    let mut terms: Vec<Vec<VarRef>> = Vec::with_capacity(blocks);
-    for blk in 0..blocks {
-        let start = blk * BLK;
-        let end = core::cmp::min(start + BLK, a.len());
-        let mut coeff4 = [zero; 4];
-        for j in 0..(end - start) {
-            coeff4[j] = a[start + j];
-        }
-        let raw = mul_bal16_small_const_rhs4_ir(b, &coeff4, end - start, bb_const);
-        let reb = rebalance_tail_pm16_to_pm1_ir(b, &raw);
-        let shifted = shift_pad_bal16_ir(&reb, blk * BLK, target_len, zero);
-        terms.push(shifted);
-    }
-
-    // Fox #1: accumulate as loose digits, normalize once.
-    let mut acc = vec![zero; target_len];
-    for t in &terms {
-        add_bal16_loose_in_place_ir(b, &mut acc, t);
-    }
-    let (norm, carry) = normalize_bal16_loose_same_len_with_bound_ir(b, &acc, acc_bound);
-    b.ir.enforce_var_eq_const(carry, F257::ZERO);
-    norm
 }
 
 /// Enforce `a + c = q*p + r` over balanced base-16 digits with carry bound [-2,2].

@@ -1207,6 +1207,102 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
 
     #[inline]
     fn mul_const_mod_p(b: &mut Dr1csBuilder<F257>, x: &GoldilocksScalar, k: u64, p_u64: u64, p_d: &[i8; 17]) -> GoldilocksScalar {
+        #[inline]
+        fn enforce_prod_const_eq_qp_plus_r_bal16(
+            b: &mut Dr1csBuilder<F257>,
+            x_d: &GoldilocksScalar,
+            k_d_const: &[i8; 17],
+            q_d: &[usize],
+            p_d_const: &[i8; 17],
+            r_d: &GoldilocksScalar,
+        ) {
+            // Enforce: x*k == q*p + r in base-16 carry chain, without materializing x*k digits.
+            //
+            // This is the const-RHS analogue of `enforce_prod_eq_qp_plus_r_bal16` and avoids the
+            // expensive `digits::mul_bal16_long_by_const_rhs` gadget entirely.
+            let max_len = 17usize
+                .max(r_d.len())
+                .max(q_d.len().saturating_add(p_d_const.len()).saturating_sub(1))
+                + 1; // headroom digit
+
+            let mut carry_var = b.new_var(F257::ZERO);
+            b.enforce_var_eq_const(carry_var, F257::ZERO);
+            let mut carry_i32: i32 = 0;
+
+            // Pad r to max_len with zero digits (constant 0 var).
+            let zero = b.zero_var();
+            b.enforce_var_eq_const(zero, F257::ZERO);
+
+            for k in 0..max_len {
+                let mut sum: i32 = carry_i32;
+                let mut lc: Vec<(F257, usize)> = Vec::with_capacity(4 + q_d.len() + 17);
+                lc.push((F257::ONE, carry_var));
+
+                // -r_k
+                if k < r_d.len() {
+                    let rk = super::digits::f257_to_i32_bal(b.assignment[r_d[k]]);
+                    sum -= rk;
+                    lc.push((-F257::ONE, r_d[k]));
+                } else {
+                    // r pad is zero
+                    lc.push((-F257::ONE, zero));
+                }
+
+                // + Σ_i x_i * k_{k-i}
+                for i in 0..17 {
+                    if i > k {
+                        break;
+                    }
+                    let j = k - i;
+                    if j >= 17 {
+                        continue;
+                    }
+                    let kd = k_d_const[j] as i32;
+                    if kd == 0 {
+                        continue;
+                    }
+                    let xi = super::digits::f257_to_i32_bal(b.assignment[x_d[i]]);
+                    sum += xi * kd;
+                    lc.push((i32_to_f257(kd), x_d[i]));
+                }
+
+                // - Σ_i q_i * p_{k-i}
+                for i in 0..q_d.len() {
+                    if i > k {
+                        break;
+                    }
+                    let j = k - i;
+                    if j >= 17 {
+                        continue;
+                    }
+                    let pd = p_d_const[j] as i32;
+                    if pd == 0 {
+                        continue;
+                    }
+                    let qi = super::digits::f257_to_i32_bal(b.assignment[q_d[i]]);
+                    sum -= qi * pd;
+                    lc.push((-i32_to_f257(pd), q_d[i]));
+                }
+
+                debug_assert!(
+                    sum % 16 == 0,
+                    "const-mul carry check not divisible: sum={sum} at k={k}"
+                );
+                let carry_next: i32 = sum / 16;
+                debug_assert!(
+                    (-128..=127).contains(&carry_next),
+                    "const-mul carry out of pm128 bound: {carry_next} at k={k} (sum={sum})"
+                );
+                let carry_next_var = alloc_carry_pm128(b, carry_next);
+                lc.push((-F257::from(16u64), carry_next_var));
+                b.enforce_lc_times_one_eq_const(lc);
+
+                carry_var = carry_next_var;
+                carry_i32 = carry_next;
+            }
+            b.enforce_var_eq_const(carry_var, F257::ZERO);
+        }
+
         let x_u = digits_to_u64_witness(b, x);
         let prod: u128 = (x_u as u128) * (k as u128);
         let q_u: u64 = (prod / (p_u64 as u128)) as u64;
@@ -1214,10 +1310,7 @@ pub(super) fn ring_mul_negacyclic_ntt_goldilocks_d64(
         let q_d = alloc_u64_as_bal16_digits_witness(b, q_u);
         let r_d = vec17_to_arr17(alloc_u64_as_bal16_digits_witness(b, r_u));
         let k_d_const = u64_to_bal16_digits_le_const(k);
-        // Sound no-wrap enforcement: materialize `x*k` and reuse the shared `prod == q*p + r` helper.
-        // This avoids the pm128 fused carry-chain relation, which is not injective over integers in F257.
-        let prod_d = mul_bal16_long_by_const_rhs(b, x, &k_d_const);
-        enforce_prod_eq_qp_plus_r_bal16(b, &prod_d, &q_d, p_d, &r_d);
+        enforce_prod_const_eq_qp_plus_r_bal16(b, x, &k_d_const, &q_d, p_d, &r_d);
         r_d
     }
 
