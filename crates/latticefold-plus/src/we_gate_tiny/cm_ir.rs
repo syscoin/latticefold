@@ -73,8 +73,11 @@ pub(crate) struct IrConstraint {
 pub(crate) struct CmIrStats {
     /// Constraints of the form (LC) * 1 = 0 (purely linear).
     pub(crate) linear_constraints: u64,
-    /// Constraints where the right side is not the constant ONE (contains multiplication).
-    pub(crate) non_linear_constraints: u64,
+    /// Constraints of the canonical form `a*b=c` emitted via `enforce_mul`.
+    pub(crate) mul_constraints: u64,
+    /// Non-linear constraints emitted via `add_constraint` (bool/range gadgets etc),
+    /// excluding `enforce_mul`.
+    pub(crate) other_non_linear_constraints: u64,
 }
 
 /// A parallel-build-friendly constraint fragment.
@@ -124,7 +127,7 @@ impl CmIr {
     /// Enforce `a * b = c`.
     #[inline]
     pub(crate) fn enforce_mul(&mut self, a: VarRef, b: VarRef, c: VarRef) {
-        self.stats.non_linear_constraints += 1;
+        self.stats.mul_constraints += 1;
         self.constraints.push(IrConstraint {
             a: vec![(F257::ONE, a)],
             b: vec![(F257::ONE, b)],
@@ -142,7 +145,7 @@ impl CmIr {
         if is_linear {
             self.stats.linear_constraints += 1;
         } else {
-            self.stats.non_linear_constraints += 1;
+            self.stats.other_non_linear_constraints += 1;
         }
         self.constraints.push(IrConstraint { a, b, c });
     }

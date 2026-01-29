@@ -340,10 +340,11 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
     let out_ir = super::cm_ir::ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &a_ir, &c_ir);
     let ir_stats = ib.ir.stats;
     eprintln!(
-        "== ringmul IR stats: linear={} non_linear={} total={} ==",
+        "== ringmul IR stats: linear={} mul={} other_non_linear={} total={} ==",
         ir_stats.linear_constraints,
-        ir_stats.non_linear_constraints,
-        ir_stats.linear_constraints + ir_stats.non_linear_constraints
+        ir_stats.mul_constraints,
+        ir_stats.other_non_linear_constraints,
+        ir_stats.linear_constraints + ir_stats.mul_constraints + ir_stats.other_non_linear_constraints
     );
     let lowered = super::cm_ir::lower_ir_into_builder(&mut b, ib.ir);
     let out: [super::goldilocks::GoldilocksScalar; 64] = core::array::from_fn(|i| {
