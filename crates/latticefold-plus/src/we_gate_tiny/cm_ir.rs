@@ -253,7 +253,7 @@ pub(crate) fn alloc_bal16_digit_ir(b: &mut IrBuilder<'_>, d: i8) -> VarRef {
     for i in 0..4 {
         bits4[i] = alloc_bool_ir(b, ((nib >> i) & 1) == 1);
     }
-    let out = b.new_var(F257::from(d as i32 as u64));
+    let out = b.new_var(i32_to_f257(d as i32));
     // out = b0 + 2*b1 + 4*b2 - 8*b3  (equivalently +8*b3 on LHS)
     b.enforce_lc_eq_zero(vec![
         (F257::ONE, out),
