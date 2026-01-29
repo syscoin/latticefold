@@ -40,7 +40,7 @@ use super::surfaces::{CmDigitMulSqSurfaceWiring, CmDigitMulSurfaceWiring};
 
 use super::cm_math::{
     eq_eval_goldilocks_digits, eval_t_z_optimized_ring_digits_pair, goldilocks_bytes_to_digits, goldilocks_pow_table_digits,
-    ring_add_bytes, ring_add_digits, ring_bytes_to_digits, ring_eq_digits, ring_mul_negacyclic_digits_d64,
+    ring_add_bytes, ring_add_digits, ring_bytes_to_digits, ring_eq_digits,
     ring_scale_digits, ring_zero_bytes, sumcheck_verify_degree2_ring_bytes,
     tensor_goldilocks_ringconst_digits, tensor_goldilocks_scalars_digits, RingBytes, RingDigits,
 };
@@ -2152,6 +2152,7 @@ fn build_cm_glue_for_which(
         // Stream recombination.
         let rows_per_l = 1 + params.mlen as usize;
         let mut eval_acc = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+        let mut e00s: Vec<RingDigits> = Vec::with_capacity(l_instances_expected);
         for l in 0..l_instances_expected {
             let l_idx = l * (4 + 4 * (params.mlen as usize));
             let mut inner = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
@@ -2186,14 +2187,59 @@ fn build_cm_glue_for_which(
             let eq_inner = ring_scale_digits(&mut glue.gb, &inner, &eq);
             eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &eq_inner);
 
-            // t(z) terms (use e00 from this l)
+            // Save e00 for the t(z) terms; we'll build all the expensive ring-muls in parallel as IR shards.
             let e00 = e00_opt.ok_or_else(|| "tiny gate: missing e00 in recombination".to_string())?;
-            let t0e = ring_mul_negacyclic_digits_d64(&mut glue.gb, &t0, &e00)?;
-            let t1e = ring_mul_negacyclic_digits_d64(&mut glue.gb, &t1, &e00)?;
-            let t0e_s = ring_scale_digits(&mut glue.gb, &t0e, &rc_pows[z_idx]);
-            let t1e_s = ring_scale_digits(&mut glue.gb, &t1e, &rc_pows[z_idx + 1]);
-            eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &t0e_s);
-            eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &t1e_s);
+            e00s.push(e00);
+        }
+
+        // t(z) terms: for each l, add t0(ro)*e00(l)*rc^z + t1(ro)*e00(l)*rc^{z+1}.
+        //
+        // These ring-muls are independent across l, so we build them as IR fragments in parallel,
+        // then lower sequentially into this module's builder.
+        {
+            use super::cm_ir::{lower_ir_into_builder, ring_mul_negacyclic_ntt_goldilocks_d64_ir, IrBuilder, VarRef as IrVarRef};
+
+            #[inline]
+            fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
+                if a.len() != 64 {
+                    return Err("tiny gate: expected ring_dim=64 for IR ring-mul".to_string());
+                }
+                Ok(core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j]))))
+            }
+
+            #[inline]
+            fn map_ring_out(out_ir: &[[IrVarRef; 17]; 64], lowered: &super::cm_ir::LoweredIr) -> RingDigits {
+                let out: [GoldilocksScalar; 64] = core::array::from_fn(|i| {
+                    core::array::from_fn(|j| lowered.map_var(out_ir[i][j]))
+                });
+                out.into_iter().collect()
+            }
+
+            let t0_ir = ringdigits64_to_ir(&t0)?;
+            let t1_ir = ringdigits64_to_ir(&t1)?;
+            let base_asg: &[F257] = &glue.gb.assignment;
+
+            let frags: Vec<(_, [[IrVarRef; 17]; 64], [[IrVarRef; 17]; 64])> = e00s
+                .par_iter()
+                .map(|e00| -> Result<_, String> {
+                    let e00_ir = ringdigits64_to_ir(e00)?;
+                    let mut ib = IrBuilder::new(base_asg);
+                    let out0 = ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &t0_ir, &e00_ir);
+                    let out1 = ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &t1_ir, &e00_ir);
+                    Ok((ib.ir, out0, out1))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            for (ir, out0_ir, out1_ir) in frags {
+                let lowered = lower_ir_into_builder(&mut glue.gb, ir);
+                let t0e = map_ring_out(&out0_ir, &lowered);
+                let t1e = map_ring_out(&out1_ir, &lowered);
+
+                let t0e_s = ring_scale_digits(&mut glue.gb, &t0e, &rc_pows[z_idx]);
+                let t1e_s = ring_scale_digits(&mut glue.gb, &t1e, &rc_pows[z_idx + 1]);
+                eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &t0e_s);
+                eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &t1e_s);
+            }
         }
 
         ring_eq_digits(&mut glue.gb, &subclaim_eval, &eval_acc);

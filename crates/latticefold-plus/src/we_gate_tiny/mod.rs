@@ -7,6 +7,7 @@ mod coins;
 mod challenges;
 mod goldilocks;
 mod cm_math;
+mod cm_ir;
 mod surfaces;
 mod poseidon;
 mod builder;

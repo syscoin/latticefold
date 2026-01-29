@@ -7,8 +7,9 @@ use super::goldilocks::{
     goldilocks_add_mod_p_from_byte_vars_assume_canonical, goldilocks_mul_mod_p_from_byte_vars_assume_canonical,
     goldilocks_sub_mod_p_from_byte_vars_assume_canonical,
     goldilocks_add_mod_p_digits, goldilocks_mul_mod_p_digits, goldilocks_sub_mod_p_digits, goldilocks_scalar_from_u64_bytes_le_digits,
-    ring_mul_negacyclic_ntt_goldilocks_d64, GoldilocksScalar,
+    GoldilocksScalar,
 };
+use super::cm_ir::{lower_ir_into_builder, ring_mul_negacyclic_ntt_goldilocks_d64_ir, IrBuilder, VarRef as IrVarRef};
 
 /// A ring element whose coefficients are Goldilocks base-field scalars encoded as canonical 8-byte little-endian limbs.
 ///
@@ -233,10 +234,22 @@ pub(crate) fn ring_mul_negacyclic_digits_d64(
     if a.len() != 64 || b.len() != 64 {
         return Err("ring_mul_negacyclic_digits_d64: expected ring_dim=64".to_string());
     }
-    let aa: [GoldilocksScalar; 64] = core::array::from_fn(|i| a[i]);
-    let bb: [GoldilocksScalar; 64] = core::array::from_fn(|i| b[i]);
-    let cc = ring_mul_negacyclic_ntt_goldilocks_d64(gb, &aa, &bb);
-    Ok(cc.into_iter().collect())
+
+    // Build an IR fragment for the ring-mul using only the current base assignment (read-only),
+    // then lower into the mutable builder.
+    //
+    // This is the key decoupling needed to later build many ring-muls in parallel as IR shards.
+    let a_ir: [[IrVarRef; 17]; 64] = core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j])));
+    let b_ir: [[IrVarRef; 17]; 64] = core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(b[i][j])));
+
+    let mut irb = IrBuilder::new(&gb.assignment);
+    let out_ir = ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut irb, &a_ir, &b_ir);
+    let lowered = lower_ir_into_builder(gb, irb.ir);
+
+    let out: [GoldilocksScalar; 64] = core::array::from_fn(|i| {
+        core::array::from_fn(|j| lowered.map_var(out_ir[i][j]))
+    });
+    Ok(out.into_iter().collect())
 }
 
 /// Degree-2 Lagrange basis in digit encoding.
