@@ -1012,7 +1012,14 @@ fn alloc_carry_with_bound_ir(b: &mut IrBuilder<'_>, c: i32, bound: i32) -> VarRe
     } else if bound <= 63 {
         alloc_carry_pm64_ir(b, c)
     } else {
-        alloc_carry_pm128_ir(b, c)
+        // IMPORTANT (soundness): for bounds > 63 we do not have a cheap, sound range-check gadget.
+        // If this triggers, it indicates a caller violated the preconditions / bound tracking.
+        assert!(
+            bound <= 63,
+            "alloc_carry_with_bound_ir: unsupported bound={bound} (c={c}); caller violated preconditions"
+        );
+        // Unreachable, but keep a return for type-checking.
+        alloc_carry_pm64_ir(b, c)
     }
 }
 
@@ -2216,29 +2223,6 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
     }
 
     b.ir.enforce_var_eq_const(carry_var, F257::ZERO);
-}
-
-/// Allocate a signed carry `c ∈ [-128,127]` as an F257 variable by forbidding +128.
-///
-/// enforce `(c - 128) * inv = 1` where `inv = (c-128)^{-1}` is witness-known.
-pub(crate) fn alloc_carry_pm128_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
-    assert!((-128..=127).contains(&c));
-    let c_var = b.new_var(i32_to_f257(c));
-    debug_assert_eq!(
-        f257_to_i32_bal(b.val(c_var)),
-        c,
-        "alloc_carry_pm128_ir: witness mismatch"
-    );
-    let diff = b.val(c_var) - F257::from(128u64);
-    debug_assert!(diff != F257::ZERO, "alloc_carry_pm128_ir: witness hit forbidden value 128");
-    let inv = b.new_var(diff.inverse().unwrap());
-    // (c - 128) * inv = 1
-    b.add_constraint(
-        vec![(F257::ONE, c_var), (-F257::from(128u64), b.one())],
-        vec![(F257::ONE, inv)],
-        vec![(F257::ONE, b.one())],
-    );
-    c_var
 }
 
 /// Allocate a signed carry `c ∈ [-2,2]` as an F257 variable, with the vanishing polynomial gadget.
