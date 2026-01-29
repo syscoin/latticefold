@@ -1551,11 +1551,6 @@ fn enforce_prod_const_eq_qp_plus_r_bal4_ir_with_carry_schedule(
     r4: &[VarRef; 33],
     carry_bounds: &[i32; 66], // per-step |carry_next| bound
 ) {
-    // Hot path: precompute centered-lift values once to avoid repeated bigint work in the carry loop.
-    let x_v: [i32; 33] = core::array::from_fn(|i| f257_to_i32_bal(b.val(x4[i])));
-    let q_v: [i32; 33] = core::array::from_fn(|i| f257_to_i32_bal(b.val(q4[i])));
-    let r_v: [i32; 33] = core::array::from_fn(|i| f257_to_i32_bal(b.val(r4[i])));
-
     // carry_0 = 0
     let mut carry_var = if carry_bounds[0] <= 3 {
         alloc_carry_pm4_bal4_ir(b, 0)
@@ -1585,27 +1580,32 @@ fn enforce_prod_const_eq_qp_plus_r_bal4_ir_with_carry_schedule(
             if dj == 0 {
                 continue;
             }
-            sum += x_v[i] * dj;
+            let xi = f257_to_i32_bal(b.val(x4[i]));
+            sum += xi * dj;
             lc.push((i32_to_f257(dj), x4[i]));
         }
 
         // - r_k
         if k < 33 {
-            sum -= r_v[k];
+            let rk = f257_to_i32_bal(b.val(r4[k]));
+            sum -= rk;
             lc.push((-F257::ONE, r4[k]));
         }
 
         // - q*p where p = 4^32 - 4^16 + 1  => q*p = q - q<<16 + q<<32
         if k < 33 {
-            sum -= q_v[k];
+            let qk = f257_to_i32_bal(b.val(q4[k]));
+            sum -= qk;
             lc.push((-F257::ONE, q4[k]));
         }
         if k >= 16 && (k - 16) < 33 {
-            sum += q_v[k - 16];
+            let qk = f257_to_i32_bal(b.val(q4[k - 16]));
+            sum += qk;
             lc.push((F257::ONE, q4[k - 16]));
         }
         if k >= 32 && (k - 32) < 33 {
-            sum -= q_v[k - 32];
+            let qk = f257_to_i32_bal(b.val(q4[k - 32]));
+            sum -= qk;
             lc.push((-F257::ONE, q4[k - 32]));
         }
 
@@ -1644,10 +1644,6 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
     q4: &[VarRef; 33],
     r4: &[VarRef; 33],
 ) {
-    // Hot path: precompute centered-lift values for q,r once (avoid repeated bigint work in carry loop).
-    let q_v: [i32; 33] = core::array::from_fn(|i| f257_to_i32_bal(b.val(q4[i])));
-    let r_v: [i32; 33] = core::array::from_fn(|i| f257_to_i32_bal(b.val(r4[i])));
-
     // Second Karatsuba cut: avoid 17×17 and 16×16 naive inner multiplies.
     //
     // We still do the *sound* base-4 carry-chain enforcement; we just reduce digit×digit muls.
@@ -1961,7 +1957,8 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
 
         // - r_k
         if k < 33 {
-            sum -= r_v[k];
+            let rk = f257_to_i32_bal(b.val(r4[k]));
+            sum -= rk;
             lc.push((-F257::ONE, r4[k]));
         }
 
@@ -1988,15 +1985,18 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
 
         // - q*p  (same sparse p)
         if k < 33 {
-            sum -= q_v[k];
+            let qk = f257_to_i32_bal(b.val(q4[k]));
+            sum -= qk;
             lc.push((-F257::ONE, q4[k]));
         }
         if k >= 16 && (k - 16) < 33 {
-            sum += q_v[k - 16];
+            let qk = f257_to_i32_bal(b.val(q4[k - 16]));
+            sum += qk;
             lc.push((F257::ONE, q4[k - 16]));
         }
         if k >= 32 && (k - 32) < 33 {
-            sum -= q_v[k - 32];
+            let qk = f257_to_i32_bal(b.val(q4[k - 32]));
+            sum -= qk;
             lc.push((-F257::ONE, q4[k - 32]));
         }
 
