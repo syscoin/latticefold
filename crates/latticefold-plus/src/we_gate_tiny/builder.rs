@@ -672,7 +672,7 @@ fn build_goldilocks_rejection_coins(
             }
         }
         let (coin_local, found_local) =
-            sample_goldilocks_coin_unrolled_rejection_8_digits::<F257>(&mut glue.gb, &digit_vars, tries);
+            sample_goldilocks_coin_unrolled_rejection_8_digits(&mut glue.gb, &digit_vars, tries);
         glue.gb.enforce_var_eq_const(found_local, F257::ONE);
         out.push(GoldilocksRejectionCoinWiring {
             digit_vars,
