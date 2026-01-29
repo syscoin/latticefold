@@ -276,8 +276,8 @@ pub(crate) fn add_bal16_same_len_ir(b: &mut IrBuilder<'_>, a: &[VarRef], c: &[Va
     let n = a.len();
     let mut out: Vec<VarRef> = Vec::with_capacity(n);
     let mut carry_i32: i32 = 0;
-    let mut carry = b.new_var(F257::ZERO);
-    b.ir.enforce_var_eq_const(carry, F257::ZERO);
+    // carry starts at 0; do NOT allocate a var for it.
+    let mut carry: Option<VarRef> = None;
 
     for i in 0..n {
         let ai = f257_to_i32_bal(b.val(a[i]));
@@ -300,20 +300,23 @@ pub(crate) fn add_bal16_same_len_ir(b: &mut IrBuilder<'_>, a: &[VarRef], c: &[Va
         let carry_next_var = alloc_carry_pm1_ir(b, carry_next);
 
         // a_i + c_i + carry - out_i - 16*carry_next = 0
-        b.enforce_lc_eq_zero(vec![
+        let mut lc = vec![
             (F257::ONE, a[i]),
             (F257::ONE, c[i]),
-            (F257::ONE, carry),
             (-F257::ONE, out_digit),
             (-F257::from(16u64), carry_next_var),
-        ]);
+        ];
+        if let Some(carry_var) = carry {
+            lc.insert(2, (F257::ONE, carry_var));
+        }
+        b.enforce_lc_eq_zero(lc);
 
         out.push(out_digit);
         carry_i32 = carry_next;
-        carry = carry_next_var;
+        carry = Some(carry_next_var);
     }
 
-    (out, carry)
+    (out, carry.expect("add_bal16_same_len_ir: non-empty input must produce carry var"))
 }
 
 /// Negate a balanced base-16 digit vector (little-endian), producing digits in [-8,7].
@@ -321,8 +324,8 @@ pub(crate) fn neg_bal16_digits_ir(b: &mut IrBuilder<'_>, x: &[VarRef]) -> (Vec<V
     let n = x.len();
     let mut out: Vec<VarRef> = Vec::with_capacity(n);
     let mut carry_i32: i32 = 0;
-    let mut carry = b.new_var(F257::ZERO);
-    b.ir.enforce_var_eq_const(carry, F257::ZERO);
+    // carry starts at 0; do NOT allocate a var for it.
+    let mut carry: Option<VarRef> = None;
 
     for i in 0..n {
         let xi = f257_to_i32_bal(b.val(x[i]));
@@ -344,19 +347,22 @@ pub(crate) fn neg_bal16_digits_ir(b: &mut IrBuilder<'_>, x: &[VarRef]) -> (Vec<V
         let carry_next_var = alloc_carry_pm1_ir(b, carry_next);
 
         // carry - x_i - out_i - 16*carry_next = 0
-        b.enforce_lc_eq_zero(vec![
-            (F257::ONE, carry),
+        let mut lc = vec![
             (-F257::ONE, x[i]),
             (-F257::ONE, out_digit),
             (-F257::from(16u64), carry_next_var),
-        ]);
+        ];
+        if let Some(carry_var) = carry {
+            lc.insert(0, (F257::ONE, carry_var));
+        }
+        b.enforce_lc_eq_zero(lc);
 
         out.push(out_digit);
         carry_i32 = carry_next;
-        carry = carry_next_var;
+        carry = Some(carry_next_var);
     }
 
-    (out, carry)
+    (out, carry.expect("neg_bal16_digits_ir: non-empty input must produce carry var"))
 }
 
 /// Subtract two balanced base-16 digit vectors of the same length: `a - c`.
@@ -404,9 +410,8 @@ pub(crate) fn u32_bytes_to_bal16_digits_from_bits_ir(
     b: &mut IrBuilder<'_>,
     bytes_bits: &[[VarRef; 8]; 4],
 ) -> [VarRef; 9] {
-    // carry is fixed to 0.
-    let mut carry = b.new_var(F257::ZERO);
-    b.ir.enforce_var_eq_const(carry, F257::ZERO);
+    // carry starts at 0; do NOT allocate a var for it.
+    let mut carry: Option<VarRef> = None;
 
     let mut out: [VarRef; 9] = core::array::from_fn(|_| b.one());
     let mut out_idx = 0usize;
@@ -417,38 +422,43 @@ pub(crate) fn u32_bytes_to_bal16_digits_from_bits_ir(
             (byte[0], byte[1], byte[2], byte[3]),
             (byte[4], byte[5], byte[6], byte[7]),
         ] {
-            let c_out = bal16_carry_out_ir(b, carry, b0, b1, b2, msb);
+            // When carry_in == 0, carry_out is exactly msb; avoid extra muls/vars.
+            let c_out = if let Some(carry_in) = carry {
+                bal16_carry_out_ir(b, carry_in, b0, b1, b2, msb)
+            } else {
+                msb
+            };
 
             let d_i: i32 = f257_to_i32_bal(b.val(b0))
                 + 2 * f257_to_i32_bal(b.val(b1))
                 + 4 * f257_to_i32_bal(b.val(b2))
                 + 8 * f257_to_i32_bal(b.val(msb));
-            let carry_i: i32 = f257_to_i32_bal(b.val(carry));
+            let carry_i: i32 = carry.map(|v| f257_to_i32_bal(b.val(v))).unwrap_or(0);
             let c_i: i32 = f257_to_i32_bal(b.val(c_out));
             let v: i32 = d_i + carry_i - 16 * c_i;
             debug_assert!((-8..=7).contains(&v), "u32_bytes_to_bal16_digits_from_bits_ir: digit out of range");
 
             let out_digit = b.new_var(i32_to_f257(v));
-            b.enforce_affine(
-                out_digit,
-                vec![
-                    (F257::ONE, carry),
-                    (F257::ONE, b0),
-                    (F257::from(2u64), b1),
-                    (F257::from(4u64), b2),
-                    (F257::from(8u64), msb),
-                    (-F257::from(16u64), c_out),
-                ],
-            );
+            let mut terms = vec![
+                (F257::ONE, b0),
+                (F257::from(2u64), b1),
+                (F257::from(4u64), b2),
+                (F257::from(8u64), msb),
+                (-F257::from(16u64), c_out),
+            ];
+            if let Some(carry_in) = carry {
+                terms.insert(0, (F257::ONE, carry_in));
+            }
+            b.enforce_affine(out_digit, terms);
 
             out[out_idx] = out_digit;
             out_idx += 1;
-            carry = c_out;
+            carry = Some(c_out);
         }
     }
 
     debug_assert_eq!(out_idx, 8);
-    out[8] = carry;
+    out[8] = carry.expect("u32_bytes_to_bal16_digits_from_bits_ir: expected final carry");
     out
 }
 
@@ -459,8 +469,8 @@ pub(crate) fn u64_bytes_to_bal16_digits_from_bits_ir(
     b: &mut IrBuilder<'_>,
     bytes_bits: &[[VarRef; 8]; 8],
 ) -> [VarRef; 17] {
-    let mut carry = b.new_var(F257::ZERO);
-    b.ir.enforce_var_eq_const(carry, F257::ZERO);
+    // carry starts at 0; do NOT allocate a var for it.
+    let mut carry: Option<VarRef> = None;
 
     let mut out: [VarRef; 17] = core::array::from_fn(|_| b.one());
     let mut out_idx = 0usize;
@@ -470,38 +480,42 @@ pub(crate) fn u64_bytes_to_bal16_digits_from_bits_ir(
             (byte[0], byte[1], byte[2], byte[3]),
             (byte[4], byte[5], byte[6], byte[7]),
         ] {
-            let c_out = bal16_carry_out_ir(b, carry, b0, b1, b2, msb);
+            let c_out = if let Some(carry_in) = carry {
+                bal16_carry_out_ir(b, carry_in, b0, b1, b2, msb)
+            } else {
+                msb
+            };
 
             let d_i: i32 = f257_to_i32_bal(b.val(b0))
                 + 2 * f257_to_i32_bal(b.val(b1))
                 + 4 * f257_to_i32_bal(b.val(b2))
                 + 8 * f257_to_i32_bal(b.val(msb));
-            let carry_i: i32 = f257_to_i32_bal(b.val(carry));
+            let carry_i: i32 = carry.map(|v| f257_to_i32_bal(b.val(v))).unwrap_or(0);
             let c_i: i32 = f257_to_i32_bal(b.val(c_out));
             let v: i32 = d_i + carry_i - 16 * c_i;
             debug_assert!((-8..=7).contains(&v), "u64_bytes_to_bal16_digits_from_bits_ir: digit out of range");
 
             let out_digit = b.new_var(i32_to_f257(v));
-            b.enforce_affine(
-                out_digit,
-                vec![
-                    (F257::ONE, carry),
-                    (F257::ONE, b0),
-                    (F257::from(2u64), b1),
-                    (F257::from(4u64), b2),
-                    (F257::from(8u64), msb),
-                    (-F257::from(16u64), c_out),
-                ],
-            );
+            let mut terms = vec![
+                (F257::ONE, b0),
+                (F257::from(2u64), b1),
+                (F257::from(4u64), b2),
+                (F257::from(8u64), msb),
+                (-F257::from(16u64), c_out),
+            ];
+            if let Some(carry_in) = carry {
+                terms.insert(0, (F257::ONE, carry_in));
+            }
+            b.enforce_affine(out_digit, terms);
 
             out[out_idx] = out_digit;
             out_idx += 1;
-            carry = c_out;
+            carry = Some(c_out);
         }
     }
 
     debug_assert_eq!(out_idx, 16);
-    out[16] = carry;
+    out[16] = carry.expect("u64_bytes_to_bal16_digits_from_bits_ir: expected final carry");
     out
 }
 
