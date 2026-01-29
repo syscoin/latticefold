@@ -119,7 +119,6 @@ pub(crate) fn ring_scale_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, s: &[
 pub(crate) fn lagrange_degree2_goldilocks(
     gb: &mut Dr1csBuilder<F257>,
     r: &[usize; 8],
-    _inv2: &[usize; 8],
     one: &[usize; 8],
     two: &[usize; 8],
 ) -> ([usize; 8], [usize; 8], [usize; 8]) {
@@ -171,9 +170,6 @@ pub(crate) fn sumcheck_verify_degree2_ring_bytes(
     // (Caller can reuse these across calls later.)
     let one = alloc_const_goldilocks_u64(gb, 1u64);
     let two = alloc_const_goldilocks_u64(gb, 2u64);
-    // inv2 mod p (p is odd): (p+1)/2
-    let inv2_u64 = (crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P + 1) / 2;
-    let inv2 = alloc_const_goldilocks_u64(gb, inv2_u64);
 
     for (m, r) in msgs.iter().zip(rs.iter()) {
         if m[0].len() != d || m[1].len() != d || m[2].len() != d {
@@ -186,7 +182,7 @@ pub(crate) fn sumcheck_verify_degree2_ring_bytes(
         ring_eq_bytes(gb, &g01, &claimed_sum);
 
         // Update claim = g(r) via Lagrange interpolation.
-        let (l0, l1, l2) = lagrange_degree2_goldilocks(gb, r, &inv2, &one, &two);
+        let (l0, l1, l2) = lagrange_degree2_goldilocks(gb, r, &one, &two);
         let t0 = ring_scale_bytes(gb, &m[0], &l0);
         let t1 = ring_scale_bytes(gb, &m[1], &l1);
         let t2 = ring_scale_bytes(gb, &m[2], &l2);
@@ -466,7 +462,6 @@ fn goldilocks_mul_const_mod_p_digits(gb: &mut Dr1csBuilder<F257>, a: &Goldilocks
 pub(crate) fn lagrange_degree2_goldilocks_digits(
     gb: &mut Dr1csBuilder<F257>,
     r: &GoldilocksScalar,
-    inv2: &GoldilocksScalar,
     one: &GoldilocksScalar,
     two: &GoldilocksScalar,
 ) -> (GoldilocksScalar, GoldilocksScalar, GoldilocksScalar) {
@@ -477,7 +472,6 @@ pub(crate) fn lagrange_degree2_goldilocks_digits(
 
     // L0 = (r-1)(r-2)/2
     let p = goldilocks_mul_mod_p_digits(gb, &t1, &t2);
-    let _ = inv2;
     let l0 = goldilocks_mul_const_mod_p_digits(gb, &p, inv2_u64);
 
     // L1 = -r(r-2)
@@ -510,9 +504,6 @@ pub(crate) fn sumcheck_verify_degree2_ring_digits(
     let two_bytes = alloc_const_goldilocks_u64(gb, 2u64);
     let one = goldilocks_bytes_to_digits(gb, one_bytes);
     let two = goldilocks_bytes_to_digits(gb, two_bytes);
-    let inv2_u64 = (crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P + 1) / 2;
-    let inv2_bytes = alloc_const_goldilocks_u64(gb, inv2_u64);
-    let inv2 = goldilocks_bytes_to_digits(gb, inv2_bytes);
 
     for (m, r) in msgs.iter().zip(rs.iter()) {
         if m[0].len() != d || m[1].len() != d || m[2].len() != d {
@@ -525,7 +516,7 @@ pub(crate) fn sumcheck_verify_degree2_ring_digits(
         ring_eq_digits(gb, &g01, &claimed_sum);
 
         // claim = g(r)
-        let (l0, l1, l2) = lagrange_degree2_goldilocks_digits(gb, r, &inv2, &one, &two);
+        let (l0, l1, l2) = lagrange_degree2_goldilocks_digits(gb, r, &one, &two);
         let t0 = ring_scale_digits(gb, &m[0], &l0);
         let t1 = ring_scale_digits(gb, &m[1], &l1);
         let t2 = ring_scale_digits(gb, &m[2], &l2);
