@@ -1160,6 +1160,180 @@ pub(crate) fn add_bal16_same_len_ir(b: &mut IrBuilder<'_>, a: &Bal16CheckedIr, c
     (Bal16CheckedIr(out), carry.expect("add_bal16_same_len_ir: non-empty input must produce carry var"))
 }
 
+/// Add three balanced base-16 digit vectors of the same length.
+///
+/// Assumes each digit is in [-8,7]. Enforces output digits in [-8,7] and carry in [-2,2].
+pub(crate) fn add3_bal16_same_len_ir(
+    b: &mut IrBuilder<'_>,
+    a: &Bal16CheckedIr,
+    c: &Bal16CheckedIr,
+    d: &Bal16CheckedIr,
+) -> (Bal16CheckedIr, VarRef) {
+    assert_eq!(a.len(), c.len());
+    assert_eq!(a.len(), d.len());
+    let n = a.len();
+    let mut out: Vec<VarRef> = Vec::with_capacity(n);
+    let mut carry_i32: i32 = 0;
+    // carry starts at 0; do NOT allocate a var for it.
+    let mut carry: Option<VarRef> = None;
+
+    for i in 0..n {
+        let ai = f257_to_i32_bal(b.val(a[i]));
+        let ci = f257_to_i32_bal(b.val(c[i]));
+        let di = f257_to_i32_bal(b.val(d[i]));
+        let sum = ai + ci + di + carry_i32;
+
+        let mut carry_next = if sum >= 0 { (sum + 8) / 16 } else { -(((-sum) + 8) / 16) };
+        let mut rem = sum - 16 * carry_next;
+        while rem > 7 {
+            carry_next += 1;
+            rem -= 16;
+        }
+        while rem < -8 {
+            carry_next -= 1;
+            rem += 16;
+        }
+        debug_assert!((-2..=2).contains(&carry_next));
+        debug_assert!((-8..=7).contains(&rem));
+
+        let out_digit = alloc_bal16_digit_ir(b, rem as i8);
+        let carry_next_var = alloc_carry_pm2_ir(b, carry_next);
+
+        // a_i + c_i + d_i + carry - out_i - 16*carry_next = 0
+        let mut lc = vec![
+            (F257::ONE, a[i]),
+            (F257::ONE, c[i]),
+            (F257::ONE, d[i]),
+            (-F257::ONE, out_digit),
+            (-F257::from(16u64), carry_next_var),
+        ];
+        if let Some(carryv) = carry {
+            lc.insert(3, (F257::ONE, carryv));
+        }
+        b.enforce_lc_eq_zero(lc);
+
+        out.push(out_digit);
+        carry_i32 = carry_next;
+        carry = Some(carry_next_var);
+    }
+
+    (Bal16CheckedIr(out), carry.expect("add3_bal16_same_len_ir: non-empty input must produce carry var"))
+}
+
+/// Multiply two balanced base-16 digit vectors (little-endian), specialized for min(len)<=3.
+///
+/// Outputs little-endian digits with each digit in [-8,7], and a final carry digit.
+pub(crate) fn mul_bal16_small_ir(b: &mut IrBuilder<'_>, a: &[VarRef], bb: &[VarRef]) -> Vec<VarRef> {
+    let la = a.len();
+    let lb = bb.len();
+    assert!(la > 0 && lb > 0);
+    assert!(la.min(lb) <= 3, "mul_bal16_small_ir requires min(len) <= 3");
+
+    let mut out: Vec<VarRef> = Vec::with_capacity(la + lb);
+    let mut carry_i32: i32 = 0;
+    // carry starts at 0; do NOT allocate a var for it.
+    let mut carry: Option<VarRef> = None;
+
+    let div_floor = |x: i32, d: i32| -> i32 {
+        debug_assert!(d > 0);
+        if x >= 0 { x / d } else { -(((-x) + d - 1) / d) }
+    };
+
+    for k in 0..(la + lb - 1) {
+        let mut sum: i32 = carry_i32;
+        let mut prods: Vec<VarRef> = Vec::new();
+
+        for i in 0..la {
+            let j = k as i32 - i as i32;
+            if j < 0 || j >= lb as i32 {
+                continue;
+            }
+            let j = j as usize;
+            let aval = f257_to_i32_bal(b.val(a[i]));
+            let bval = f257_to_i32_bal(b.val(bb[j]));
+            sum += aval * bval;
+
+            let pv = b.new_var(b.val(a[i]) * b.val(bb[j]));
+            b.enforce_mul(a[i], bb[j], pv);
+            prods.push(pv);
+        }
+
+        let mut carry_next = div_floor(sum + 8, 16);
+        let mut rem = sum - 16 * carry_next;
+        while rem > 7 {
+            carry_next += 1;
+            rem -= 16;
+        }
+        while rem < -8 {
+            carry_next -= 1;
+            rem += 16;
+        }
+        debug_assert!((-8..=7).contains(&rem));
+        debug_assert!((-14..=14).contains(&carry_next));
+
+        let digit_var = alloc_bal16_digit_ir(b, rem as i8);
+        // Use a simple statement-only carry allocator (superset of [-14,14]).
+        let carry_next_var = alloc_carry_pm16_ir(b, carry_next);
+
+        // carry + sum(prods) - digit - 16*carry_next = 0
+        let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(2 + prods.len());
+        if let Some(carryv) = carry {
+            lc.push((F257::ONE, carryv));
+        }
+        for &p in &prods {
+            lc.push((F257::ONE, p));
+        }
+        lc.push((-F257::ONE, digit_var));
+        lc.push((-F257::from(16u64), carry_next_var));
+        b.enforce_lc_eq_zero(lc);
+
+        out.push(digit_var);
+        carry_i32 = carry_next;
+        carry = Some(carry_next_var);
+    }
+
+    out.push(carry.expect("mul_bal16_small_ir: non-empty must produce carry"));
+    out
+}
+
+/// Rebalance the final digit of a `mul_bal16_small` product.
+///
+/// Input tail is assumed to be in [-11,11]; output replaces it with a balanced digit in [-8,7]
+/// and appends a carry in [-2,2], enforcing: tail = rem + 16*carry2.
+pub(crate) fn rebalance_tail_pm11_to_pm2_ir(b: &mut IrBuilder<'_>, digits: &[VarRef]) -> Vec<VarRef> {
+    assert!(!digits.is_empty());
+    let l = digits.len();
+    let tail = f257_to_i32_bal(b.val(digits[l - 1]));
+    debug_assert!((-11..=11).contains(&tail));
+
+    let mut carry2 = if tail >= 0 { (tail + 8) / 16 } else { -(((-tail) + 8) / 16) };
+    let mut rem = tail - 16 * carry2;
+    while rem > 7 {
+        carry2 += 1;
+        rem -= 16;
+    }
+    while rem < -8 {
+        carry2 -= 1;
+        rem += 16;
+    }
+    debug_assert!((-8..=7).contains(&rem));
+    debug_assert!((-2..=2).contains(&carry2));
+
+    let rem_digit = alloc_bal16_digit_ir(b, rem as i8);
+    let carry2_var = alloc_carry_pm2_ir(b, carry2);
+    b.enforce_lc_eq_zero(vec![
+        (F257::ONE, digits[l - 1]),
+        (-F257::ONE, rem_digit),
+        (-F257::from(16u64), carry2_var),
+    ]);
+
+    let mut out = Vec::with_capacity(l + 1);
+    out.extend_from_slice(&digits[..l - 1]);
+    out.push(rem_digit);
+    out.push(carry2_var);
+    out
+}
+
 /// Negate a balanced base-16 digit vector (little-endian), producing digits in [-8,7].
 pub(crate) fn neg_bal16_digits_ir(b: &mut IrBuilder<'_>, x: &Bal16CheckedIr) -> (Bal16CheckedIr, VarRef) {
     let n = x.len();

@@ -3,10 +3,12 @@ use ark_ff::{Field, PrimeField};
 use latticefold::transcript::poseidon::F257;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 
-use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
+use super::gadgets::decompose_existing_byte_var_to_bits;
 use super::cm_ir::{
     alloc_bal16_digit_ir, alloc_carry_pm2_ir, lower_ir_into_builder, IrBuilder as CmIrBuilder,
-    add_bal16_same_len_ir, neg_bal16_digits_ir, sub_bal16_same_len_ir,
+    add_bal16_loose_same_len_ir, add_bal16_same_len_ir, add3_bal16_same_len_ir, mul_bal16_small_ir, neg_bal16_digits_ir,
+    rebalance_tail_pm11_to_pm2_ir,
+    sub_bal16_same_len_ir,
     u32_bytes_to_bal16_digits_from_bits_ir, u64_bytes_to_bal16_digits_from_bits_ir, VarRef as CmVarRef,
     Bal16CheckedIr as CmBal16CheckedIr,
     Bal16LooseIr as CmBal16LooseIr,
@@ -17,7 +19,13 @@ use super::cm_ir::{
 // Balanced base-16 (nibble) gadgets for *bounded* integer arithmetic in F257.
 // -----------------------------------------------------------------------------
 
-const NIBBLE_BASE: i32 = 16;
+#[inline]
+fn enforce_var_eq_const_ir(b: &mut Dr1csBuilder<F257>, x: usize, c: F257) {
+    let base_asg: &[F257] = &b.assignment;
+    let mut ib = CmIrBuilder::new(base_asg);
+    ib.ir.enforce_var_eq_const(CmVarRef::Base(x), c);
+    let _lowered = lower_ir_into_builder(b, ib.ir);
+}
 
 #[inline]
 pub(crate) fn f257_to_i32_bal(x: F257) -> i32 {
@@ -174,16 +182,21 @@ pub(crate) fn add_bal16_same_len(
 #[inline]
 fn add_bal16_loose_in_place(b: &mut Dr1csBuilder<F257>, acc: &mut Bal16Loose, src: &Bal16Checked) {
     debug_assert_eq!(acc.len(), src.len());
-    for i in 0..acc.len() {
-        let v = b.new_var(b.assignment[acc.digits[i]] + b.assignment[src.0[i]]);
-        // v = acc[i] + src[i]
-        b.enforce_lc_times_one_eq_const(vec![
-            (F257::ONE, v),
-            (-F257::ONE, acc.digits[i]),
-            (-F257::ONE, src.0[i]),
-        ]);
-        acc.digits[i] = v;
-    }
+    let (ir, out_ir) = {
+        let base_asg: &[F257] = &b.assignment;
+        let mut ib = CmIrBuilder::new(base_asg);
+        let acc_ir = CmBal16LooseIr {
+            digits: acc.digits.iter().copied().map(CmVarRef::Base).collect(),
+            abs_bound: acc.abs_bound,
+        };
+        // `src` digits are in [-8,7], so abs bound 8 is conservative.
+        let src_ir = CmBal16LooseIr { digits: src.0.iter().copied().map(CmVarRef::Base).collect(), abs_bound: 8 };
+        let out_ir = add_bal16_loose_same_len_ir(&mut ib, &acc_ir, &src_ir);
+        (ib.ir, out_ir)
+    };
+    let lowered = lower_ir_into_builder(b, ir);
+    acc.digits = out_ir.digits.into_iter().map(|v| lowered.map_var(v)).collect();
+    // Keep `acc.abs_bound` unchanged: callers already track a conservative bound.
 }
 
 /// Normalize a loose base-16 digit vector (little-endian) into balanced digits in [-8,7].
@@ -226,57 +239,21 @@ pub(crate) fn add3_bal16_same_len(
     c: &Bal16Checked,
     d: &Bal16Checked,
 ) -> (Bal16Checked, usize /* carry_out */) {
-    let _prev = b.profile_enter("digits::add_bal16_same_len");
-    assert_eq!(a.len(), c.len());
-    assert_eq!(a.len(), d.len());
-    let n = a.len();
-    let mut out: Vec<usize> = Vec::with_capacity(n);
-    let mut carry_i32: i32 = 0;
-    let mut carry = b.zero_var();
-
-    for i in 0..n {
-        let ai = f257_to_i32_bal(b.assignment[a[i]]);
-        let ci = f257_to_i32_bal(b.assignment[c[i]]);
-        let di = f257_to_i32_bal(b.assignment[d[i]]);
-        let sum = ai + ci + di + carry_i32;
-
-        // Choose carry_out so remainder in [-8,7].
-        let mut carry_next = if sum >= 0 { (sum + 8) / 16 } else { -(((-sum) + 8) / 16) };
-        let mut rem = sum - 16 * carry_next;
-        while rem > 7 {
-            carry_next += 1;
-            rem -= 16;
-        }
-        while rem < -8 {
-            carry_next -= 1;
-            rem += 16;
-        }
-        // With 3 inputs in [-8,7], carry stays in [-2,2].
-        assert!((-2..=2).contains(&carry_next));
-        assert!((-8..=7).contains(&rem));
-
-        let out_digit = alloc_bal16_digit(b, rem as i8);
-        // Statement-only arming: do not branch on witness carry value.
-        let carry_next_var = alloc_carry_pm2(b, carry_next);
-
-        // a_i + c_i + d_i + carry - out_i - 16*carry_next = 0
-        b.enforce_lc_times_one_eq_const(vec![
-            (F257::ONE, a[i]),
-            (F257::ONE, c[i]),
-            (F257::ONE, d[i]),
-            (F257::ONE, carry),
-            (-F257::ONE, out_digit),
-            (-F257::from(16u64), carry_next_var),
-        ]);
-
-        out.push(out_digit);
-        carry_i32 = carry_next;
-        carry = carry_next_var;
-    }
-
-    let res = (Bal16Checked(out), carry);
+    let _prev = b.profile_enter("digits::add3_bal16_same_len");
+    let (ir, out_ir, carry_ir) = {
+        let base_asg: &[F257] = &b.assignment;
+        let mut ib = CmIrBuilder::new(base_asg);
+        let a_ir = CmBal16CheckedIr(a.as_slice().iter().copied().map(CmVarRef::Base).collect());
+        let c_ir = CmBal16CheckedIr(c.as_slice().iter().copied().map(CmVarRef::Base).collect());
+        let d_ir = CmBal16CheckedIr(d.as_slice().iter().copied().map(CmVarRef::Base).collect());
+        let (out_ir, carry_ir) = add3_bal16_same_len_ir(&mut ib, &a_ir, &c_ir, &d_ir);
+        (ib.ir, out_ir, carry_ir)
+    };
+    let lowered = lower_ir_into_builder(b, ir);
+    let out: Vec<usize> = out_ir.0.into_iter().map(|v| lowered.map_var(v)).collect();
+    let carry = lowered.map_var(carry_ir);
     b.profile_exit(_prev);
-    res
+    (Bal16Checked(out), carry)
 }
 
 /// Negate a balanced base-16 digit vector (little-endian), producing digits in [-8,7].
@@ -375,105 +352,15 @@ pub(crate) fn scale_short_coeffs_by_digits18(
 
 /// Rebalance the final digit of a `mul_bal16_small` product.
 pub(crate) fn rebalance_tail_pm11_to_pm2(b: &mut Dr1csBuilder<F257>, digits: &[usize]) -> Vec<usize> {
-    assert!(!digits.is_empty());
-    let l = digits.len();
-    let tail = f257_to_i32_bal(b.assignment[digits[l - 1]]);
-    debug_assert!((-11..=11).contains(&tail));
-
-    let mut carry2 = if tail >= 0 { (tail + 8) / 16 } else { -(((-tail) + 8) / 16) };
-    let mut rem = tail - 16 * carry2;
-    while rem > 7 {
-        carry2 += 1;
-        rem -= 16;
-    }
-    while rem < -8 {
-        carry2 -= 1;
-        rem += 16;
-    }
-    debug_assert!((-8..=7).contains(&rem));
-    debug_assert!((-2..=2).contains(&carry2));
-
-    let rem_digit = alloc_bal16_digit(b, rem as i8);
-    let carry2_var = alloc_carry_pm2(b, carry2);
-    b.enforce_lc_times_one_eq_const(vec![
-        (F257::ONE, digits[l - 1]),
-        (-F257::ONE, rem_digit),
-        (-F257::from(16u64), carry2_var),
-    ]);
-
-    let mut out = Vec::with_capacity(l + 1);
-    out.extend_from_slice(&digits[..l - 1]);
-    out.push(rem_digit);
-    out.push(carry2_var);
-    out
-}
-
-/// Allocate a signed carry `c ∈ [-14,14]` by allocating an offset `off = c + 16` and
-/// enforcing `off ∈ [2,30]`.
-///
-/// This is used by `mul_bal16_small` where the per-digit carry can exceed 11 in magnitude
-/// (e.g. when digits take value -8 and products include 64).
-fn alloc_carry_pm14(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
-    assert!((-14..=14).contains(&c));
-    let off = (c + 16) as u8; // in [2,30]
-
-    // 5-bit decomposition of off.
-    let mut bits = [0usize; 5];
-    for i in 0..5 {
-        bits[i] = alloc_bool::<F257>(b, ((off >> i) & 1) == 1);
-    }
-    let off_var = b.new_var(F257::from(off as u64));
-    // off = Σ 2^i * bits[i]
-    b.enforce_lc_times_one_eq_const(vec![
-        (F257::ONE, off_var),
-        (-F257::ONE, bits[0]),
-        (-F257::from(2u64), bits[1]),
-        (-F257::from(4u64), bits[2]),
-        (-F257::from(8u64), bits[3]),
-        (-F257::from(16u64), bits[4]),
-    ]);
-
-    // Enforce off <= 30  <=> off != 31  <=> NOT(all 5 bits are 1).
-    let t01 = b.new_var(b.assignment[bits[0]] * b.assignment[bits[1]]);
-    b.enforce_mul(bits[0], bits[1], t01);
-    let t012 = b.new_var(b.assignment[t01] * b.assignment[bits[2]]);
-    b.enforce_mul(t01, bits[2], t012);
-    let t0123 = b.new_var(b.assignment[t012] * b.assignment[bits[3]]);
-    b.enforce_mul(t012, bits[3], t0123);
-    let all1 = b.new_var(b.assignment[t0123] * b.assignment[bits[4]]);
-    b.enforce_mul(t0123, bits[4], all1);
-    b.enforce_var_eq_const(all1, F257::ZERO);
-
-    // Enforce off >= 2  <=> (b1 OR b2 OR b3 OR b4) == 1.
-    // or = 1 - Π (1-bi) for i=1..4
-    let one_minus = |b: &mut Dr1csBuilder<F257>, x: usize| -> usize {
-        let v = b.new_var(F257::ONE - b.assignment[x]);
-        b.enforce_lc_times_one_eq_const(vec![(F257::ONE, v), (F257::ONE, x), (-F257::ONE, b.one())]);
-        v
+    let (ir, out_ir) = {
+        let base_asg: &[F257] = &b.assignment;
+        let mut ib = CmIrBuilder::new(base_asg);
+        let digits_ir: Vec<CmVarRef> = digits.iter().copied().map(CmVarRef::Base).collect();
+        let out_ir = rebalance_tail_pm11_to_pm2_ir(&mut ib, &digits_ir);
+        (ib.ir, out_ir)
     };
-    let om1 = one_minus(b, bits[1]);
-    let om2 = one_minus(b, bits[2]);
-    let om3 = one_minus(b, bits[3]);
-    let om4 = one_minus(b, bits[4]);
-    let p12 = b.new_var(b.assignment[om1] * b.assignment[om2]);
-    b.enforce_mul(om1, om2, p12);
-    let p123 = b.new_var(b.assignment[p12] * b.assignment[om3]);
-    b.enforce_mul(p12, om3, p123);
-    let p1234 = b.new_var(b.assignment[p123] * b.assignment[om4]);
-    b.enforce_mul(p123, om4, p1234);
-    // or = 1 - p1234
-    let or = b.new_var(F257::ONE - b.assignment[p1234]);
-    b.enforce_lc_times_one_eq_const(vec![(F257::ONE, or), (F257::ONE, p1234), (-F257::ONE, b.one())]);
-    b.enforce_var_eq_const(or, F257::ONE);
-
-    // Return carry var: c = off - 16
-    let carry_var = b.new_var(F257::from(off as u64) - F257::from(16u64));
-    b.enforce_lc_times_one_eq_const(vec![
-        (F257::ONE, carry_var),
-        (-F257::ONE, off_var),
-        (F257::from(16u64), b.one()),
-    ]);
-    carry_var
+    let lowered = lower_ir_into_builder(b, ir);
+    out_ir.into_iter().map(|v| lowered.map_var(v)).collect()
 }
 
 fn shift_pad_bal16(digits: &[usize], shift: usize, target_len: usize, zero_digit: usize) -> Bal16Checked {
@@ -509,7 +396,7 @@ pub(crate) fn sum_product_digits_bal16(
             add_bal16_loose_in_place(b, &mut acc, &padded);
         }
         let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc);
-        b.enforce_var_eq_const(carry, F257::ZERO);
+        enforce_var_eq_const_ir(b, carry, F257::ZERO);
         return norm;
     }
 
@@ -519,7 +406,7 @@ pub(crate) fn sum_product_digits_bal16(
         let padded = shift_pad_bal16(p13, 0, target_len, zero);
         let (new_acc, carry) = add_bal16_same_len(b, &acc, &padded);
         acc = new_acc;
-        b.enforce_var_eq_const(carry, F257::ZERO);
+        enforce_var_eq_const_ir(b, carry, F257::ZERO);
     }
     acc
 }
@@ -542,7 +429,7 @@ pub(crate) fn sum_product_digits_bal16_22(
             add_bal16_loose_in_place(b, &mut acc, &padded);
         }
         let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc);
-        b.enforce_var_eq_const(carry, F257::ZERO);
+        enforce_var_eq_const_ir(b, carry, F257::ZERO);
         return norm;
     }
 
@@ -551,7 +438,7 @@ pub(crate) fn sum_product_digits_bal16_22(
         let padded = shift_pad_bal16(p22, 0, target_len, zero);
         let (new_acc, carry) = add_bal16_same_len(b, &acc, &padded);
         acc = new_acc;
-        b.enforce_var_eq_const(carry, F257::ZERO);
+        enforce_var_eq_const_ir(b, carry, F257::ZERO);
     }
     acc
 }
@@ -572,7 +459,7 @@ pub(crate) fn sum_bal16_vectors_fixed_len(
             add_bal16_loose_in_place(b, &mut acc, v);
         }
         let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc);
-        b.enforce_var_eq_const(carry, F257::ZERO);
+        enforce_var_eq_const_ir(b, carry, F257::ZERO);
         return norm;
     }
 
@@ -581,7 +468,7 @@ pub(crate) fn sum_bal16_vectors_fixed_len(
         assert_eq!(v.len(), len);
         let (new_acc, carry) = add_bal16_same_len(b, &acc, v);
         acc = new_acc;
-        b.enforce_var_eq_const(carry, F257::ZERO);
+        enforce_var_eq_const_ir(b, carry, F257::ZERO);
     }
     acc
 }
@@ -606,7 +493,7 @@ pub(crate) fn sum_products13_coeffwise_fixed_len(
                 add_bal16_loose_in_place(b, &mut acc, &padded);
             }
             let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc);
-            b.enforce_var_eq_const(carry, F257::ZERO);
+            enforce_var_eq_const_ir(b, carry, F257::ZERO);
             acc_checked = norm;
         } else {
             for surf in per_surface_products13 {
@@ -614,7 +501,7 @@ pub(crate) fn sum_products13_coeffwise_fixed_len(
                 let padded = shift_pad_bal16(p13, 0, out_len, zero);
                 let (new_acc, carry) = add_bal16_same_len(b, &acc_checked, &padded);
                 acc_checked = new_acc;
-                b.enforce_var_eq_const(carry, F257::ZERO);
+                enforce_var_eq_const_ir(b, carry, F257::ZERO);
             }
         }
         out.push(acc_checked);
@@ -642,7 +529,7 @@ pub(crate) fn sum_products22_coeffwise_fixed_len(
                 add_bal16_loose_in_place(b, &mut acc, &padded);
             }
             let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc);
-            b.enforce_var_eq_const(carry, F257::ZERO);
+            enforce_var_eq_const_ir(b, carry, F257::ZERO);
             acc_checked = norm;
         } else {
             for surf in per_surface_products22 {
@@ -650,7 +537,7 @@ pub(crate) fn sum_products22_coeffwise_fixed_len(
                 let padded = shift_pad_bal16(p22, 0, out_len, zero);
                 let (new_acc, carry) = add_bal16_same_len(b, &acc_checked, &padded);
                 acc_checked = new_acc;
-                b.enforce_var_eq_const(carry, F257::ZERO);
+                enforce_var_eq_const_ir(b, carry, F257::ZERO);
             }
         }
         out.push(acc_checked);
@@ -744,7 +631,7 @@ pub(crate) fn mul_u32ish9_to_fixed_bal16(
     }
 
     for &dv in &raw[out_len..] {
-        b.enforce_var_eq_const(dv, F257::ZERO);
+        enforce_var_eq_const_ir(b, dv, F257::ZERO);
     }
     raw[..out_len].to_vec()
 }
@@ -774,7 +661,7 @@ pub(crate) fn mul_bal16_long_by_u32ish9(b: &mut Dr1csBuilder<F257>, a: &[usize],
         let top = acc[target_len - 1];
         let (top_sum, top_carry) = add_bal16_same_len(b, &Bal16Checked(vec![top]), &Bal16Checked(vec![carry]));
         acc.0[target_len - 1] = top_sum[0];
-        b.enforce_var_eq_const(top_carry, F257::ZERO);
+        enforce_var_eq_const_ir(b, top_carry, F257::ZERO);
     }
     acc.into_vec()
 }
@@ -828,7 +715,7 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
                 add_bal16_loose_in_place(b, &mut acc, &shifted);
             }
             let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc);
-            b.enforce_var_eq_const(carry, F257::ZERO);
+            enforce_var_eq_const_ir(b, carry, F257::ZERO);
             b.profile_exit(_prev);
             return norm.into_vec();
         }
@@ -857,7 +744,7 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
         let (top_sum, top_carry) =
             add_bal16_same_len(b, &Bal16Checked(vec![top]), &Bal16Checked(vec![carry]));
         acc.0[target_len - 1] = top_sum[0];
-        b.enforce_var_eq_const(top_carry, F257::ZERO);
+        enforce_var_eq_const_ir(b, top_carry, F257::ZERO);
     }
 
     let out = acc.into_vec();
@@ -867,75 +754,18 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
 
 /// Multiply two balanced base-16 digit vectors (little-endian), specialized for min(len)<=3.
 pub(crate) fn mul_bal16_small(b: &mut Dr1csBuilder<F257>, a: &[usize], bb: &[usize]) -> Vec<usize> {
-    let la = a.len();
-    let lb = bb.len();
-    assert!(la > 0 && lb > 0);
-    assert!(la.min(lb) <= 3, "mul_bal16_small requires min(len) <= 3");
-
-    let mut out: Vec<usize> = Vec::with_capacity(la + lb);
-    let mut carry_i32: i32 = 0;
-    let mut carry_var = b.zero_var();
-
-    for k in 0..(la + lb - 1) {
-        let mut sum: i32 = carry_i32;
-        let mut prods: Vec<usize> = Vec::new();
-        for i in 0..la {
-            let j = k as i32 - i as i32;
-            if j < 0 || j >= lb as i32 {
-                continue;
-            }
-            let j = j as usize;
-            let aval = f257_to_i32_bal(b.assignment[a[i]]);
-            let bval = f257_to_i32_bal(b.assignment[bb[j]]);
-            sum += aval * bval;
-            let pv = b.new_var(b.assignment[a[i]] * b.assignment[bb[j]]);
-            b.enforce_mul(a[i], bb[j], pv);
-            prods.push(pv);
-        }
-
-        let div_floor = |x: i32, d: i32| -> i32 {
-            debug_assert!(d > 0);
-            if x >= 0 {
-                x / d
-            } else {
-                -(((-x) + d - 1) / d)
-            }
-        };
-        let mut carry = div_floor(sum + 8, NIBBLE_BASE);
-        let mut rem = sum - NIBBLE_BASE * carry;
-        while rem > 7 {
-            carry += 1;
-            rem -= NIBBLE_BASE;
-        }
-        while rem < -8 {
-            carry -= 1;
-            rem += NIBBLE_BASE;
-        }
-        assert!((-8..=7).contains(&rem));
-        assert!(
-            (-14..=14).contains(&carry),
-            "carry out of expected range: {carry} from sum {sum}"
-        );
-
-        let digit_var = alloc_bal16_digit(b, rem as i8);
-        // Statement-only arming: avoid witness-dependent gadget selection.
-        let carry_out_var = alloc_carry_pm14(b, carry);
-
-        let mut lc: Vec<(F257, usize)> = Vec::new();
-        lc.push((F257::ONE, carry_var));
-        for &p in &prods {
-            lc.push((F257::ONE, p));
-        }
-        lc.push((-F257::ONE, digit_var));
-        lc.push((-F257::from(16u64), carry_out_var));
-        b.enforce_lc_times_one_eq_const(lc);
-
-        out.push(digit_var);
-        carry_i32 = carry;
-        carry_var = carry_out_var;
-    }
-
-    out.push(carry_var);
+    let _prev = b.profile_enter("digits::mul_bal16_small");
+    let (ir, out_ir) = {
+        let base_asg: &[F257] = &b.assignment;
+        let mut ib = CmIrBuilder::new(base_asg);
+        let a_ir: Vec<CmVarRef> = a.iter().copied().map(CmVarRef::Base).collect();
+        let b_ir: Vec<CmVarRef> = bb.iter().copied().map(CmVarRef::Base).collect();
+        let out_ir = mul_bal16_small_ir(&mut ib, &a_ir, &b_ir);
+        (ib.ir, out_ir)
+    };
+    let lowered = lower_ir_into_builder(b, ir);
+    let out: Vec<usize> = out_ir.into_iter().map(|v| lowered.map_var(v)).collect();
+    b.profile_exit(_prev);
     out
 }
 
