@@ -1616,13 +1616,62 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
     q4: &[VarRef; 33],
     r4: &[VarRef; 33],
 ) {
-    // Precompute digit products (33×33 = 1089 mul constraints).
-    let mut prod: [[VarRef; 33]; 33] = [[VarRef::Base(0); 33]; 33];
-    for i in 0..33 {
-        for j in 0..33 {
+    // Precompute digit products using a Karatsuba split to reduce mul constraints:
+    //
+    // Split at m=17 (low 17 digits, high 16 digits):
+    //   a = a0 + 4^17 a1
+    //   c = c0 + 4^17 c1
+    //
+    // Then:
+    //   a*c = z0 + 4^17 z1 + 4^34 z2
+    // where
+    //   z0 = a0*c0                  (17×17 muls = 289)
+    //   z2 = a1*c1                  (16×16 muls = 256)
+    //   z1 = (a0+a1)*(c0+c1) - z0 - z2   (17×17 muls = 289)
+    //
+    // Total mul constraints: 289 + 256 + 289 = 834 (vs 1089 naive).
+    const M: usize = 17;
+    const HI: usize = 16;
+
+    let mut z0: [[VarRef; M]; M] = [[VarRef::Base(0); M]; M];
+    for i in 0..M {
+        for j in 0..M {
             let pij = b.new_var(b.val(a4[i]) * b.val(c4[j]));
             b.enforce_mul(a4[i], c4[j], pij);
-            prod[i][j] = pij;
+            z0[i][j] = pij;
+        }
+    }
+    let mut z2: [[VarRef; HI]; HI] = [[VarRef::Base(0); HI]; HI];
+    for i in 0..HI {
+        for j in 0..HI {
+            let ai = a4[M + i];
+            let cj = c4[M + j];
+            let pij = b.new_var(b.val(ai) * b.val(cj));
+            b.enforce_mul(ai, cj, pij);
+            z2[i][j] = pij;
+        }
+    }
+
+    // sum_a[i] = a0[i] + a1[i] (with padding at i=16), likewise sum_c.
+    let z = alloc_zero_const_ir(b);
+    let mut sum_a: [VarRef; M] = [VarRef::Base(0); M];
+    let mut sum_c: [VarRef; M] = [VarRef::Base(0); M];
+    for i in 0..M {
+        let ahi = if i < HI { a4[M + i] } else { z };
+        let chi = if i < HI { c4[M + i] } else { z };
+        let sa = b.new_var(b.val(a4[i]) + b.val(ahi));
+        let sc = b.new_var(b.val(c4[i]) + b.val(chi));
+        b.enforce_lc_eq_zero(vec![(F257::ONE, sa), (-F257::ONE, a4[i]), (-F257::ONE, ahi)]);
+        b.enforce_lc_eq_zero(vec![(F257::ONE, sc), (-F257::ONE, c4[i]), (-F257::ONE, chi)]);
+        sum_a[i] = sa;
+        sum_c[i] = sc;
+    }
+    let mut sprod: [[VarRef; M]; M] = [[VarRef::Base(0); M]; M];
+    for i in 0..M {
+        for j in 0..M {
+            let pij = b.new_var(b.val(sum_a[i]) * b.val(sum_c[j]));
+            b.enforce_mul(sum_a[i], sum_c[j], pij);
+            sprod[i][j] = pij;
         }
     }
 
@@ -1662,15 +1711,61 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
             lc.push((-F257::ONE, r4[k]));
         }
 
-        // + Σ_{i+j=k} a_i * c_j
-        let i_min = k.saturating_sub(32);
-        let i_max = core::cmp::min(32, k);
-        for i in i_min..=i_max {
-            let j = k - i;
-            let aval = f257_to_i32_bal(b.val(a4[i]));
-            let bval = f257_to_i32_bal(b.val(c4[j]));
-            sum += aval * bval;
-            lc.push((F257::ONE, prod[i][j]));
+        // + a*c via Karatsuba pieces (z0 + 4^17 z1 + 4^34 z2).
+        //
+        // z0 contribution: degree k (0..32)
+        if k <= 2 * (M - 1) {
+            let i_min = k.saturating_sub(M - 1);
+            let i_max = core::cmp::min(M - 1, k);
+            for i in i_min..=i_max {
+                let j = k - i;
+                let aval = f257_to_i32_bal(b.val(a4[i]));
+                let bval = f257_to_i32_bal(b.val(c4[j]));
+                sum += aval * bval;
+                lc.push((F257::ONE, z0[i][j]));
+            }
+        }
+        // z1 contribution: degree (k-17) in (a0+a1)*(c0+c1) - z0 - z2, shifted by +17.
+        if (M..=(M + 2 * (M - 1))).contains(&k) {
+            let t = k - M;
+            let i_min = t.saturating_sub(M - 1);
+            let i_max = core::cmp::min(M - 1, t);
+            for i in i_min..=i_max {
+                let j = t - i;
+                let aval = f257_to_i32_bal(b.val(sum_a[i]));
+                let bval = f257_to_i32_bal(b.val(sum_c[j]));
+                sum += aval * bval;
+                lc.push((F257::ONE, sprod[i][j]));
+
+                // - z0 coefficient at degree t (when defined)
+                if t <= 2 * (M - 1) {
+                    // here i,j are already within [0..M), so z0[i][j] exists
+                    let a0 = f257_to_i32_bal(b.val(a4[i]));
+                    let c0 = f257_to_i32_bal(b.val(c4[j]));
+                    sum -= a0 * c0;
+                    lc.push((-F257::ONE, z0[i][j]));
+                }
+                // - z2 coefficient at degree t (only for degrees 0..30), using the same i,j when <16
+                if i < HI && j < HI && t <= 2 * (HI - 1) {
+                    let a1 = f257_to_i32_bal(b.val(a4[M + i]));
+                    let c1 = f257_to_i32_bal(b.val(c4[M + j]));
+                    sum -= a1 * c1;
+                    lc.push((-F257::ONE, z2[i][j]));
+                }
+            }
+        }
+        // z2 contribution: degree (k-34) in a1*c1, shifted by +34.
+        if k >= 2 * M && k <= 2 * M + 2 * (HI - 1) {
+            let t = k - 2 * M;
+            let i_min = t.saturating_sub(HI - 1);
+            let i_max = core::cmp::min(HI - 1, t);
+            for i in i_min..=i_max {
+                let j = t - i;
+                let aval = f257_to_i32_bal(b.val(a4[M + i]));
+                let bval = f257_to_i32_bal(b.val(c4[M + j]));
+                sum += aval * bval;
+                lc.push((F257::ONE, z2[i][j]));
+            }
         }
 
         // - q*p  (same sparse p)
