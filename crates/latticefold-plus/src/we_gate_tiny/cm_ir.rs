@@ -230,16 +230,14 @@ impl<'a> IrBuilder<'a> {
 /// Constraints:
 /// - x ∈ {0,1} via x*(x-1)=0
 pub(crate) fn alloc_bool_ir(b: &mut IrBuilder<'_>, bit: bool) -> VarRef {
+    // Match `gadgets::alloc_bool` exactly, but over `VarRef`.
     let x = b.new_var(if bit { F257::ONE } else { F257::ZERO });
-    let xm1 = b.new_var(b.val(x) - F257::ONE);
-    // xm1 = x - 1
-    // xm1 = x + (-1)
-    b.enforce_affine(xm1, vec![(F257::ONE, x), (-F257::ONE, b.one())]);
-    // x*(x-1)=0
-    let z = b.new_var(F257::ZERO);
-    b.enforce_mul(x, xm1, z);
-    // force z == 0
-    b.ir.enforce_var_eq_const(z, F257::ZERO);
+    // x*(1-x)=0
+    b.add_constraint(
+        vec![(F257::ONE, x)],
+        vec![(F257::ONE, b.one()), (-F257::ONE, x)],
+        vec![(F257::ZERO, b.one())],
+    );
     x
 }
 

@@ -60,6 +60,67 @@ fn limbs_u32_from_base128<F: PrimeField>(b: &Dr1csBuilder<F>, limbs: &[usize; LI
 }
 
 #[test]
+fn test_ir_alloc_bal16_digit_semantics_match() {
+    // Legacy builder gadget vs IR-lowered gadget should agree on decoded witness and satisfy constraints.
+    for d in -8i8..=7i8 {
+        // Non-IR
+        let mut b0 = Dr1csBuilder::<F257>::new();
+        b0.enforce_var_eq_const(b0.one(), F257::ONE);
+        let v0 = alloc_bal16_digit(&mut b0, d);
+        {
+            let (inst, asg) = b0.clone().into_instance();
+            inst.check(&asg).expect("non-IR alloc_bal16_digit constraints satisfied");
+        }
+        assert_eq!(f257_to_i32_bal(b0.assignment[v0]), d as i32);
+
+        // IR
+        let mut b1 = Dr1csBuilder::<F257>::new();
+        b1.enforce_var_eq_const(b1.one(), F257::ONE);
+        let base_asg: Vec<F257> = b1.assignment.clone();
+        let mut ib = super::cm_ir::IrBuilder::new(&base_asg);
+        let v_ir = super::cm_ir::alloc_bal16_digit_ir(&mut ib, d);
+        let lowered = super::cm_ir::lower_ir_into_builder(&mut b1, ib.ir);
+        let v1 = lowered.map_var(v_ir);
+        {
+            let (inst, asg) = b1.clone().into_instance();
+            inst.check(&asg).expect("IR alloc_bal16_digit_ir constraints satisfied");
+        }
+        assert_eq!(f257_to_i32_bal(b1.assignment[v1]), d as i32);
+    }
+}
+
+#[test]
+fn test_ir_alloc_carry_semantics_match() {
+    // pm2
+    for c in -2i32..=2i32 {
+        let mut b = Dr1csBuilder::<F257>::new();
+        b.enforce_var_eq_const(b.one(), F257::ONE);
+        let base_asg: Vec<F257> = b.assignment.clone();
+        let mut ib = super::cm_ir::IrBuilder::new(&base_asg);
+        let v_ir = super::cm_ir::alloc_carry_pm2_ir(&mut ib, c);
+        let lowered = super::cm_ir::lower_ir_into_builder(&mut b, ib.ir);
+        let v = lowered.map_var(v_ir);
+        let (inst, asg) = b.into_instance();
+        inst.check(&asg).expect("alloc_carry_pm2_ir constraints satisfied");
+        assert_eq!(f257_to_i32_bal(asg[v]), c);
+    }
+
+    // pm128: spot-check a few values (and avoid the forbidden +128).
+    for &c in &[-128i32, -127, -1, 0, 1, 127] {
+        let mut b = Dr1csBuilder::<F257>::new();
+        b.enforce_var_eq_const(b.one(), F257::ONE);
+        let base_asg: Vec<F257> = b.assignment.clone();
+        let mut ib = super::cm_ir::IrBuilder::new(&base_asg);
+        let v_ir = super::cm_ir::alloc_carry_pm128_ir(&mut ib, c);
+        let lowered = super::cm_ir::lower_ir_into_builder(&mut b, ib.ir);
+        let v = lowered.map_var(v_ir);
+        let (inst, asg) = b.into_instance();
+        inst.check(&asg).expect("alloc_carry_pm128_ir constraints satisfied");
+        assert_eq!(f257_to_i32_bal(asg[v]), c);
+    }
+}
+
+#[test]
 fn test_poseidon_f257_ops_arithmetization_satisfies() {
     // Record a tiny transcript trace in the **actual sponge field** (F257).
     //
@@ -329,7 +390,19 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
         v.try_into().expect("u64 bytes -> 17 digits")
     });
 
-    let out = super::goldilocks::ring_mul_negacyclic_ntt_goldilocks_d64(&mut b, &a_d, &c_d);
+    // Use the IR implementation (the old non-IR gadget has been removed).
+    // Clone assignment so we can later mutably borrow `b` to lower IR.
+    let base_asg: Vec<F257> = b.assignment.clone();
+    let mut ib = super::cm_ir::IrBuilder::new(&base_asg);
+    let a_ir: [[super::cm_ir::VarRef; 17]; 64] =
+        core::array::from_fn(|i| core::array::from_fn(|j| super::cm_ir::VarRef::Base(a_d[i][j])));
+    let c_ir: [[super::cm_ir::VarRef; 17]; 64] =
+        core::array::from_fn(|i| core::array::from_fn(|j| super::cm_ir::VarRef::Base(c_d[i][j])));
+    let out_ir = super::cm_ir::ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &a_ir, &c_ir);
+    let lowered = super::cm_ir::lower_ir_into_builder(&mut b, ib.ir);
+    let out: [super::goldilocks::GoldilocksScalar; 64] = core::array::from_fn(|i| {
+        core::array::from_fn(|j| lowered.map_var(out_ir[i][j]))
+    });
 
     for k in 0..64 {
         // Decode digits -> u64 in the host.
@@ -343,7 +416,7 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
     }
 
     eprintln!(
-        "== dR1CS dump: ring_mul_negacyclic_ntt_goldilocks_d64 | nvars={} nconstraints={} ==",
+        "== dR1CS dump: ring_mul_negacyclic_ntt_goldilocks_d64_ir | nvars={} nconstraints={} ==",
         b.assignment.len(),
         b.rows.len()
     );
@@ -352,7 +425,7 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
     }
 
     let (inst, asg) = b.into_instance();
-    inst.check(&asg).expect("ring mul (goldilocks ntt) constraints satisfied");
+    inst.check(&asg).expect("ring mul (goldilocks ntt, IR) constraints satisfied");
 }
 
 #[test]

@@ -8,7 +8,7 @@ use super::op_counts::tiny_cm_bump;
 use super::goldilocks::{
     goldilocks_add_mod_p_from_byte_vars_assume_canonical, goldilocks_mul_mod_p_from_byte_vars_assume_canonical,
     goldilocks_sub_mod_p_from_byte_vars_assume_canonical,
-    goldilocks_add_mod_p_digits, goldilocks_mul_mod_p_digits, goldilocks_sub_mod_p_digits, goldilocks_scalar_from_u64_bytes_le_digits,
+    goldilocks_scalar_from_u64_bytes_le_digits,
     goldilocks_p_bal16_digits_le_const, GoldilocksScalar,
 };
 use super::cm_ir::{
@@ -336,6 +336,64 @@ pub(crate) fn ring_mul_negacyclic_digits_d64(
     Ok(out.into_iter().collect())
 }
 
+// -----------------------------------------------------------------------------
+// Scalar digit-domain ops via CM IR (removes duplicate non-IR routines)
+// -----------------------------------------------------------------------------
+
+#[inline]
+fn goldilocks_add_mod_p_digits_via_ir(
+    gb: &mut Dr1csBuilder<F257>,
+    a: &GoldilocksScalar,
+    c: &GoldilocksScalar,
+) -> GoldilocksScalar {
+    tiny_cm_bump(|cc| cc.scalar_add += 1);
+    let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+    let p_d = goldilocks_p_bal16_digits_le_const();
+    let base_asg: &[F257] = &gb.assignment;
+    let mut ib = IrBuilder::new(base_asg);
+    let a_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(a[j]));
+    let c_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(c[j]));
+    let out_ir = goldilocks_add_mod_p_digits_ir(&mut ib, &a_ir, &c_ir, p_u64, &p_d);
+    let lowered = lower_ir_into_builder(gb, ib.ir);
+    core::array::from_fn(|j| lowered.map_var(out_ir[j]))
+}
+
+#[inline]
+fn goldilocks_sub_mod_p_digits_via_ir(
+    gb: &mut Dr1csBuilder<F257>,
+    a: &GoldilocksScalar,
+    c: &GoldilocksScalar,
+) -> GoldilocksScalar {
+    tiny_cm_bump(|cc| cc.scalar_sub += 1);
+    let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+    let p_d = goldilocks_p_bal16_digits_le_const();
+    let base_asg: &[F257] = &gb.assignment;
+    let mut ib = IrBuilder::new(base_asg);
+    let a_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(a[j]));
+    let c_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(c[j]));
+    let out_ir = goldilocks_sub_mod_p_digits_ir(&mut ib, &a_ir, &c_ir, p_u64, &p_d);
+    let lowered = lower_ir_into_builder(gb, ib.ir);
+    core::array::from_fn(|j| lowered.map_var(out_ir[j]))
+}
+
+#[inline]
+fn goldilocks_mul_mod_p_digits_via_ir(
+    gb: &mut Dr1csBuilder<F257>,
+    a: &GoldilocksScalar,
+    c: &GoldilocksScalar,
+) -> GoldilocksScalar {
+    tiny_cm_bump(|cc| cc.scalar_mul += 1);
+    let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+    let p_d = goldilocks_p_bal16_digits_le_const();
+    let base_asg: &[F257] = &gb.assignment;
+    let mut ib = IrBuilder::new(base_asg);
+    let a_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(a[j]));
+    let c_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(c[j]));
+    let out_ir = goldilocks_mul_mod_p_digits_ir(&mut ib, &a_ir, &c_ir, p_u64, &p_d);
+    let lowered = lower_ir_into_builder(gb, ib.ir);
+    core::array::from_fn(|j| lowered.map_var(out_ir[j]))
+}
+
 /// Degree-2 Lagrange basis in digit encoding.
 pub(crate) fn lagrange_degree2_goldilocks_digits(
     gb: &mut Dr1csBuilder<F257>,
@@ -345,22 +403,22 @@ pub(crate) fn lagrange_degree2_goldilocks_digits(
     two: &GoldilocksScalar,
 ) -> (GoldilocksScalar, GoldilocksScalar, GoldilocksScalar) {
     // t1 = r - 1, t2 = r - 2
-    let t1 = goldilocks_sub_mod_p_digits(gb, r, one);
-    let t2 = goldilocks_sub_mod_p_digits(gb, r, two);
+    let t1 = goldilocks_sub_mod_p_digits_via_ir(gb, r, one);
+    let t2 = goldilocks_sub_mod_p_digits_via_ir(gb, r, two);
 
     // L0 = (r-1)(r-2)/2
-    let p = goldilocks_mul_mod_p_digits(gb, &t1, &t2);
-    let l0 = goldilocks_mul_mod_p_digits(gb, &p, inv2);
+    let p = goldilocks_mul_mod_p_digits_via_ir(gb, &t1, &t2);
+    let l0 = goldilocks_mul_mod_p_digits_via_ir(gb, &p, inv2);
 
     // L1 = -r(r-2)
-    let p = goldilocks_mul_mod_p_digits(gb, r, &t2);
+    let p = goldilocks_mul_mod_p_digits_via_ir(gb, r, &t2);
     let zero_bytes = alloc_const_goldilocks_u64(gb, 0u64);
     let zero = goldilocks_bytes_to_digits(gb, zero_bytes);
-    let l1 = goldilocks_sub_mod_p_digits(gb, &zero, &p);
+    let l1 = goldilocks_sub_mod_p_digits_via_ir(gb, &zero, &p);
 
     // L2 = r(r-1)/2
-    let p = goldilocks_mul_mod_p_digits(gb, r, &t1);
-    let l2 = goldilocks_mul_mod_p_digits(gb, &p, inv2);
+    let p = goldilocks_mul_mod_p_digits_via_ir(gb, r, &t1);
+    let l2 = goldilocks_mul_mod_p_digits_via_ir(gb, &p, inv2);
 
     (l0, l1, l2)
 }
@@ -419,7 +477,7 @@ fn goldilocks_const_u64_digits(gb: &mut Dr1csBuilder<F257>, v: u64) -> Goldilock
 #[inline]
 pub(crate) fn goldilocks_one_minus_digits(gb: &mut Dr1csBuilder<F257>, r: &GoldilocksScalar) -> GoldilocksScalar {
     let one = goldilocks_const_u64_digits(gb, 1u64);
-    goldilocks_sub_mod_p_digits(gb, &one, r)
+    goldilocks_sub_mod_p_digits_via_ir(gb, &one, r)
 }
 
 /// Tensor-expand a list of verifier challenges `c = [c0..c_{t-1}]` into length-2^t coefficients.
@@ -431,8 +489,8 @@ pub(crate) fn tensor_goldilocks_scalars_digits(gb: &mut Dr1csBuilder<F257>, c: &
         let one_minus = goldilocks_one_minus_digits(gb, ci);
         let mut next: Vec<GoldilocksScalar> = Vec::with_capacity(acc.len() * 2);
         for t in &acc {
-            next.push(goldilocks_mul_mod_p_digits(gb, t, &one_minus));
-            next.push(goldilocks_mul_mod_p_digits(gb, t, ci));
+            next.push(goldilocks_mul_mod_p_digits_via_ir(gb, t, &one_minus));
+            next.push(goldilocks_mul_mod_p_digits_via_ir(gb, t, ci));
         }
         acc = next;
     }
@@ -488,7 +546,7 @@ pub(crate) fn goldilocks_pow_table_digits(
     let mut acc = goldilocks_const_u64_digits(gb, 1u64);
     out.push(acc);
     for _ in 0..n {
-        acc = goldilocks_mul_mod_p_digits(gb, &acc, x);
+        acc = goldilocks_mul_mod_p_digits_via_ir(gb, &acc, x);
         out.push(acc);
     }
     out
@@ -511,10 +569,10 @@ pub(crate) fn eq_eval_goldilocks_digits(
     for (ci, ri) in c.iter().zip(r.iter()) {
         let one_minus_ci = goldilocks_one_minus_digits(gb, ci);
         let one_minus_ri = goldilocks_one_minus_digits(gb, ri);
-        let ci_ri = goldilocks_mul_mod_p_digits(gb, ci, ri);
-        let om = goldilocks_mul_mod_p_digits(gb, &one_minus_ci, &one_minus_ri);
-        let t = goldilocks_add_mod_p_digits(gb, &ci_ri, &om);
-        acc = goldilocks_mul_mod_p_digits(gb, &acc, &t);
+        let ci_ri = goldilocks_mul_mod_p_digits_via_ir(gb, ci, ri);
+        let om = goldilocks_mul_mod_p_digits_via_ir(gb, &one_minus_ci, &one_minus_ri);
+        let t = goldilocks_add_mod_p_digits_via_ir(gb, &ci_ri, &om);
+        acc = goldilocks_mul_mod_p_digits_via_ir(gb, &acc, &t);
     }
     Ok(acc)
 }
@@ -620,7 +678,7 @@ pub(crate) fn eval_t_z_optimized_ring_digits(
     let mut pad = goldilocks_const_u64_digits(gb, 1u64);
     for rj in &r[tensor_vars..] {
         let om = goldilocks_one_minus_digits(gb, rj);
-        pad = goldilocks_mul_mod_p_digits(gb, &pad, &om);
+        pad = goldilocks_mul_mod_p_digits_via_ir(gb, &pad, &om);
     }
     Ok(ring_scale_digits(gb, &res, &pad))
 }
@@ -677,7 +735,7 @@ pub(crate) fn eval_t_z_optimized_ring_digits_pair(
     let mut pad = goldilocks_const_u64_digits(gb, 1u64);
     for rj in &r[tensor_vars..] {
         let om = goldilocks_one_minus_digits(gb, rj);
-        pad = goldilocks_mul_mod_p_digits(gb, &pad, &om);
+        pad = goldilocks_mul_mod_p_digits_via_ir(gb, &pad, &om);
     }
     res0 = ring_scale_digits(gb, &res0, &pad);
     res1 = ring_scale_digits(gb, &res1, &pad);
