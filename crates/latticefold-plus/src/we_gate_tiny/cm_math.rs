@@ -708,88 +708,9 @@ pub(crate) fn eval_small_mle_ring_digits(
     out
 }
 
-/// Evaluate the CM tensor product t(z) at `r`, mirroring `tensor_eval::eval_t_z_optimized`.
-///
-/// Expected factor order / bit slicing (LSB-first):
-/// - `x_powers` (size = d) uses the lowest `log2(d)` bits
-/// - `dpp` (size = ell) uses the next `log2(ell)` bits
-/// - `s_prime_flat` (size = k*d) uses the next `log2(k*d)` bits
-/// - `tensor_c_ring` (size = kappa) uses the next `log2(kappa)` bits
-///
-/// Any remaining high bits are padded with the factor \(\prod (1 - r_i)\).
-pub(crate) fn eval_t_z_optimized_ring_digits(
-    gb: &mut Dr1csBuilder<F257>,
-    tensor_c_ring: &[RingDigits],
-    s_prime_flat: &[RingDigits],
-    dpp: &[RingDigits],
-    ring_dim: usize,
-    r: &[GoldilocksScalar],
-) -> Result<RingDigits, String> {
-    let sizes = [ring_dim, dpp.len(), s_prime_flat.len(), tensor_c_ring.len()];
-    if sizes.iter().any(|&s| s == 0 || !s.is_power_of_two()) {
-        return Err("eval_t_z_optimized_ring_digits: expected power-of-two non-empty factor sizes".to_string());
-    }
-    let vars4 = sizes.map(|s| ark_std::log2(s) as usize);
-    let tensor_vars = vars4.iter().sum::<usize>();
-    if r.len() < tensor_vars {
-        return Err("eval_t_z_optimized_ring_digits: r too short".to_string());
-    }
-    let _prev = gb.profile_enter("cm_math::eval_t_z_optimized_ring_digits");
-
-    // Split r into chunks (innermost to outermost) as in tensor_eval::eval_t_z_optimized.
-    let r4 = &r[0..vars4[0]]; // x_powers (lowest bits)
-    let r3 = &r[vars4[0]..vars4[0] + vars4[1]];
-    let r2 = &r[vars4[0] + vars4[1]..vars4[0] + vars4[1] + vars4[2]];
-    let r1 = &r[vars4[0] + vars4[1] + vars4[2]..tensor_vars];
-
-    let v1 = eval_small_mle_ring_digits(gb, tensor_c_ring, r1);
-    let v2 = eval_small_mle_ring_digits(gb, s_prime_flat, r2);
-    let v3 = eval_small_mle_ring_digits(gb, dpp, r3);
-    // `x_powers` is the unit-monomial basis, evaluated via tensor weights.
-    let v4 = match eval_x_powers_basis_mle_ring_digits(gb, r4, ring_dim) {
-        Ok(v) => v,
-        Err(e) => {
-            gb.profile_exit(_prev);
-            return Err(e);
-        }
-    };
-
-    let mut res = match ring_mul_negacyclic_digits_d64(gb, &v1, &v2) {
-        Ok(v) => v,
-        Err(e) => {
-            gb.profile_exit(_prev);
-            return Err(e);
-        }
-    };
-    res = match ring_mul_negacyclic_digits_d64(gb, &res, &v3) {
-        Ok(v) => v,
-        Err(e) => {
-            gb.profile_exit(_prev);
-            return Err(e);
-        }
-    };
-    res = match ring_mul_negacyclic_digits_d64(gb, &res, &v4) {
-        Ok(v) => v,
-        Err(e) => {
-            gb.profile_exit(_prev);
-            return Err(e);
-        }
-    };
-
-    // Padding factor: Π_{j=tensor_vars..} (1 - r[j]) as scalar.
-    let mut pad = goldilocks_const_u64_digits(gb, 1u64);
-    for rj in &r[tensor_vars..] {
-        let om = goldilocks_one_minus_digits(gb, rj);
-        pad = goldilocks_mul_mod_p_digits(gb, &pad, &om);
-    }
-    let out = Ok(ring_scale_digits(gb, &res, &pad));
-    gb.profile_exit(_prev);
-    out
-}
-
 /// Compute `t0(ro)` and `t1(ro)` together, sharing the expensive common subcomputations.
 ///
-/// This is identical to calling `eval_t_z_optimized_ring_digits` twice, but avoids duplicating:
+/// This is logically identical to calling the single-evaluation routine twice, but avoids duplicating:
 /// - evaluation of `s_prime_flat` MLE,
 /// - evaluation of `dpp` MLE,
 /// - basis `x_powers` tensor weights,
