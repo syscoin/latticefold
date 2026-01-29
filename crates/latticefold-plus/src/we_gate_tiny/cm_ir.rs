@@ -270,7 +270,6 @@ pub(crate) fn alloc_bal16_digit_ir(b: &mut IrBuilder<'_>, d: i8) -> VarRef {
 
 /// Allocate a signed carry `c ∈ [-128,127]` as an F257 variable by forbidding +128.
 ///
-/// This mirrors `digits::alloc_carry_pm128`:
 /// enforce `(c - 128) * inv = 1` where `inv = (c-128)^{-1}` is witness-known.
 pub(crate) fn alloc_carry_pm128_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
     assert!((-128..=127).contains(&c));
@@ -333,7 +332,7 @@ pub(crate) fn alloc_carry_pm2_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
 }
 
 #[inline]
-fn u64_to_bal16_digits_le_const(mut x: u64) -> [i8; 17] {
+pub(crate) fn u64_to_bal16_digits_le_const(mut x: u64) -> [i8; 17] {
     // Match the balancing convention used elsewhere: digits in [-8,7] plus carry in {0,1}.
     let mut out = [0i8; 17];
     let mut carry: i16 = 0;
@@ -354,7 +353,7 @@ fn u64_to_bal16_digits_le_const(mut x: u64) -> [i8; 17] {
 }
 
 #[inline]
-fn alloc_u64_as_bal16_digits_witness_ir(b: &mut IrBuilder<'_>, x: u64) -> [VarRef; 17] {
+pub(crate) fn alloc_u64_as_bal16_digits_witness_ir(b: &mut IrBuilder<'_>, x: u64) -> [VarRef; 17] {
     let ds = u64_to_bal16_digits_le_const(x);
     let mut out: [VarRef; 17] = [VarRef::Base(0); 17];
     for i in 0..16 {

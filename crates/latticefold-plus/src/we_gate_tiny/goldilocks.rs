@@ -5,10 +5,11 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 
 use super::coins::goldilocks_p_base128_digits_le;
 use super::digits::{
-    add_bal16_same_len, alloc_bal16_digit, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
+    add_bal16_same_len, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
     alloc_carry_pm2, i32_to_f257,
     u64_bytes_to_bal16_digits_cached,
 };
+use super::cm_ir::{alloc_u64_as_bal16_digits_witness_ir, lower_ir_into_builder, u64_to_bal16_digits_le_const, IrBuilder as CmIrBuilder};
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
 // NOTE: keep all modulus constants local to this module; do not import from elsewhere.
@@ -44,42 +45,19 @@ pub(crate) fn goldilocks_p_bal16_digits_le_const() -> [i8; 17] {
     out
 }
 
-fn u64_to_bal16_digits_le_const(mut x: u64) -> [i8; 17] {
-    // Match `u64_bytes_to_bal16_digits`: balanced digits in [-8,7] with carry in {0,1}.
-    let mut out = [0i8; 17];
-    let mut carry: i16 = 0;
-    for i in 0..16 {
-        let nib = (x & 0xF) as i16;
-        x >>= 4;
-        let v = nib + carry;
-        if v >= 8 {
-            out[i] = (v - 16) as i8;
-            carry = 1;
-        } else {
-            out[i] = v as i8;
-            carry = 0;
-        }
-    }
-    out[16] = carry as i8;
-    out
-}
-
 /// Allocate a u64 witness value as balanced base-16 digits (len 17) as F257 variables.
 ///
 /// The digits follow the same convention as `u64_bytes_to_bal16_digits` / `u64_to_bal16_digits_le_const`:
 /// - digits[0..16] are in [-8,7]
 /// - digits[16] is the final carry in {0,1}
 fn alloc_u64_as_bal16_digits_witness(b: &mut Dr1csBuilder<F257>, x: u64) -> Vec<usize> {
-    let ds = u64_to_bal16_digits_le_const(x);
-    let mut out: Vec<usize> = Vec::with_capacity(17);
-    for i in 0..16 {
-        // NOTE: This function allocates *witness digits* (for q in mul/lincomb reductions).
-        // For statement-only arming, do NOT hard-code witness-derived digits as constants.
-        out.push(alloc_bal16_digit(b, ds[i]));
-    }
-    // Final carry is already in {0,1}.
-    out.push(alloc_bool::<F257>(b, ds[16] == 1));
-    out
+    // IR is the source of truth; lower a tiny IR fragment into this builder.
+    let base_one = b.assignment[b.one()];
+    let base_asg = [base_one];
+    let mut ib = CmIrBuilder::new(&base_asg);
+    let out_ir = alloc_u64_as_bal16_digits_witness_ir(&mut ib, x);
+    let lowered = lower_ir_into_builder(b, ib.ir);
+    (0..17).map(|i| lowered.map_var(out_ir[i])).collect()
 }
 
 /// Boundary-only canonicalization gadget:
