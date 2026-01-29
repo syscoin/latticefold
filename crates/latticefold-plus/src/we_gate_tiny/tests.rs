@@ -270,7 +270,140 @@ fn test_goldilocks_mul_const_mod_p_from_bytes_matches_native() {
     }
 }
 
+#[test]
+fn test_goldilocks_mul_mod_p_digits_ir_matches_native_and_rejects_tamper() {
+    use rand::{RngCore, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0FFEE_u64);
 
+    // Decode a 17-digit bal16 vector into a u64 witness (assumes canonical, so no wrap).
+    let digits_to_u64 = |b: &Dr1csBuilder<F257>, d: &[usize; 17]| -> u64 {
+        let mut acc: i128 = 0;
+        let mut pow: i128 = 1;
+        for j in 0..17 {
+            acc += (f257_to_i32_bal(b.assignment[d[j]]) as i128) * pow;
+            pow *= 16;
+        }
+        debug_assert!(acc >= 0);
+        acc as u64
+    };
+
+    for _ in 0..10 {
+        let a = rng.next_u64() % GOLDILOCKS_P;
+        let c = rng.next_u64() % GOLDILOCKS_P;
+        let exp = ((a as u128) * (c as u128) % (GOLDILOCKS_P as u128)) as u64;
+
+        let mut b = Dr1csBuilder::<F257>::new();
+        b.enforce_var_eq_const(b.one(), F257::ONE);
+
+        let mut a_bytes = [0usize; 8];
+        let mut c_bytes = [0usize; 8];
+        for (i, v) in a.to_le_bytes().into_iter().enumerate() {
+            a_bytes[i] = alloc_byte::<F257>(&mut b, v).byte;
+        }
+        for (i, v) in c.to_le_bytes().into_iter().enumerate() {
+            c_bytes[i] = alloc_byte::<F257>(&mut b, v).byte;
+        }
+
+        // Boundary conversion bytes->digits.
+        let a_d: [usize; 17] = u64_bytes_to_bal16_digits_cached(&mut b, a_bytes)
+            .try_into()
+            .expect("u64 bytes -> 17 digits");
+        let c_d: [usize; 17] = u64_bytes_to_bal16_digits_cached(&mut b, c_bytes)
+            .try_into()
+            .expect("u64 bytes -> 17 digits");
+
+        // IR mul gadget (var×var).
+        let a_ir: [super::cm_ir::VarRef; 17] =
+            core::array::from_fn(|j| super::cm_ir::VarRef::Base(a_d[j]));
+        let c_ir: [super::cm_ir::VarRef; 17] =
+            core::array::from_fn(|j| super::cm_ir::VarRef::Base(c_d[j]));
+
+        let base_asg = b.assignment.clone();
+        let mut ib = super::cm_ir::IrBuilder::new(&base_asg);
+        let out_ir = super::cm_ir::goldilocks_mul_mod_p_digits_ir(
+            &mut ib,
+            &a_ir,
+            &c_ir,
+            GOLDILOCKS_P,
+            &super::goldilocks::goldilocks_p_bal16_digits_le_const(),
+        );
+        let lowered = super::cm_ir::lower_ir_into_builder(&mut b, ib.ir);
+        let out: [usize; 17] = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
+
+        assert_eq!(digits_to_u64(&b, &out), exp);
+
+        let (inst, mut asg) = b.into_instance();
+        // Tamper with one output digit without adjusting any internal witnesses.
+        asg[out[0]] += F257::ONE;
+        assert!(
+            inst.check(&asg).is_err(),
+            "tampering IR mul output should violate constraints"
+        );
+    }
+}
+
+#[test]
+fn test_goldilocks_mul_mod_p_digits_ir_matches_old_digits_gadget() {
+    use rand::{RngCore, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0xBADC0DE_u64);
+
+    for _ in 0..10 {
+        let a = rng.next_u64() % GOLDILOCKS_P;
+        let c = rng.next_u64() % GOLDILOCKS_P;
+
+        let mut b = Dr1csBuilder::<F257>::new();
+        b.enforce_var_eq_const(b.one(), F257::ONE);
+
+        let mut a_bytes = [0usize; 8];
+        let mut c_bytes = [0usize; 8];
+        for (i, v) in a.to_le_bytes().into_iter().enumerate() {
+            a_bytes[i] = alloc_byte::<F257>(&mut b, v).byte;
+        }
+        for (i, v) in c.to_le_bytes().into_iter().enumerate() {
+            c_bytes[i] = alloc_byte::<F257>(&mut b, v).byte;
+        }
+
+        let a_d: [usize; 17] = u64_bytes_to_bal16_digits_cached(&mut b, a_bytes)
+            .try_into()
+            .expect("u64 bytes -> 17 digits");
+        let c_d: [usize; 17] = u64_bytes_to_bal16_digits_cached(&mut b, c_bytes)
+            .try_into()
+            .expect("u64 bytes -> 17 digits");
+
+        // Old (non-IR) digit gadget.
+        let out_old = super::goldilocks::goldilocks_mul_mod_p_digits(&mut b, &a_d, &c_d);
+
+        // New IR digit gadget.
+        let a_ir: [super::cm_ir::VarRef; 17] =
+            core::array::from_fn(|j| super::cm_ir::VarRef::Base(a_d[j]));
+        let c_ir: [super::cm_ir::VarRef; 17] =
+            core::array::from_fn(|j| super::cm_ir::VarRef::Base(c_d[j]));
+        let base_asg = b.assignment.clone();
+        let mut ib = super::cm_ir::IrBuilder::new(&base_asg);
+        let out_ir = super::cm_ir::goldilocks_mul_mod_p_digits_ir(
+            &mut ib,
+            &a_ir,
+            &c_ir,
+            GOLDILOCKS_P,
+            &super::goldilocks::goldilocks_p_bal16_digits_le_const(),
+        );
+        let lowered = super::cm_ir::lower_ir_into_builder(&mut b, ib.ir);
+        let out_new: [usize; 17] = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
+
+        // Enforce out_old == out_new digitwise.
+        for j in 0..17 {
+            b.enforce_lc_times_one_eq_const(vec![(F257::ONE, out_old[j]), (-F257::ONE, out_new[j])]);
+        }
+
+        let (inst, mut asg) = b.into_instance();
+        // Tamper new output; should break equality constraints if either gadget is sound.
+        asg[out_new[0]] += F257::ONE;
+        assert!(
+            inst.check(&asg).is_err(),
+            "tampering new output should violate old==new constraints"
+        );
+    }
+}
 
 #[test]
 fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
@@ -353,6 +486,74 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
 
     let (inst, asg) = b.into_instance();
     inst.check(&asg).expect("ring mul (goldilocks ntt) constraints satisfied");
+}
+
+#[test]
+fn test_ring_mul_negacyclic_ntt_goldilocks_d64_ir_matches_old_gadget_and_rejects_tamper() {
+    use rand::{RngCore, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x5151_5151_u64);
+
+    let p = super::goldilocks::GOLDILOCKS_P;
+
+    let mut a = [0u64; 64];
+    let mut c = [0u64; 64];
+    for i in 0..64 {
+        a[i] = rng.next_u64() % p;
+        c[i] = rng.next_u64() % p;
+    }
+
+    // Circuit: boundary conversion bytes->digits only (stand-in for external IO).
+    let mut b = Dr1csBuilder::<F257>::new();
+    b.enforce_var_eq_const(b.one(), F257::ONE);
+    let mut a_bytes = [[0usize; 8]; 64];
+    let mut c_bytes = [[0usize; 8]; 64];
+    for i in 0..64 {
+        for (j, v) in a[i].to_le_bytes().into_iter().enumerate() {
+            a_bytes[i][j] = alloc_byte::<F257>(&mut b, v).byte;
+        }
+        for (j, v) in c[i].to_le_bytes().into_iter().enumerate() {
+            c_bytes[i][j] = alloc_byte::<F257>(&mut b, v).byte;
+        }
+    }
+
+    let a_d: [super::goldilocks::GoldilocksScalar; 64] = core::array::from_fn(|i| {
+        let v = u64_bytes_to_bal16_digits_cached(&mut b, a_bytes[i]);
+        v.try_into().expect("u64 bytes -> 17 digits")
+    });
+    let c_d: [super::goldilocks::GoldilocksScalar; 64] = core::array::from_fn(|i| {
+        let v = u64_bytes_to_bal16_digits_cached(&mut b, c_bytes[i]);
+        v.try_into().expect("u64 bytes -> 17 digits")
+    });
+
+    // Old gadget (direct builder emission).
+    let out_old = super::goldilocks::ring_mul_negacyclic_ntt_goldilocks_d64(&mut b, &a_d, &c_d);
+
+    // New gadget (IR emission + lowering).
+    let a_ir: [[super::cm_ir::VarRef; 17]; 64] =
+        core::array::from_fn(|i| core::array::from_fn(|j| super::cm_ir::VarRef::Base(a_d[i][j])));
+    let c_ir: [[super::cm_ir::VarRef; 17]; 64] =
+        core::array::from_fn(|i| core::array::from_fn(|j| super::cm_ir::VarRef::Base(c_d[i][j])));
+    let base_asg = b.assignment.clone();
+    let mut ib = super::cm_ir::IrBuilder::new(&base_asg);
+    let out_ir = super::cm_ir::ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &a_ir, &c_ir);
+    let lowered = super::cm_ir::lower_ir_into_builder(&mut b, ib.ir);
+    let out_new: [[usize; 17]; 64] =
+        core::array::from_fn(|i| core::array::from_fn(|j| lowered.map_var(out_ir[i][j])));
+
+    // Enforce equality digitwise for all coefficients.
+    for i in 0..64 {
+        for j in 0..17 {
+            b.enforce_lc_times_one_eq_const(vec![(F257::ONE, out_old[i][j]), (-F257::ONE, out_new[i][j])]);
+        }
+    }
+
+    let (inst, mut asg) = b.into_instance();
+    // Tamper one new output digit; should break the equality constraints.
+    asg[out_new[0][0]] += F257::ONE;
+    assert!(
+        inst.check(&asg).is_err(),
+        "tampering IR ring-mul output should violate old==new constraints"
+    );
 }
 
 #[test]
