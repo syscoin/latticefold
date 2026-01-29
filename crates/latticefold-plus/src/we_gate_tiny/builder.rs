@@ -29,7 +29,7 @@ use super::digits::{
 use super::goldilocks::{
     goldilocks_add_mod_p_from_byte_vars_assume_canonical, goldilocks_mul_mod_p_from_byte_vars_assume_canonical,
     goldilocks_sub_mod_p_from_byte_vars_assume_canonical,
-    goldilocks_u64_centered_le_bound_from_byte_vars, goldilocks_u64_enforce_lt_p_from_byte_vars,
+    goldilocks_u64_enforce_lt_p_from_byte_vars,
     reduce_u64_mod_goldilocks_from_byte_vars,
     GoldilocksScalar,
 };
@@ -1569,90 +1569,6 @@ fn build_canonical_goldilocks_glue_for_ranges(
         }
     }
     Ok(glue)
-}
-
-fn sp1_centered_bound_u64(params: &WeParams, ring_dim: usize) -> Result<u64, String> {
-    // Conservative digit bound from rgchk: |digit| <= D where D = d/2 - 1.
-    if ring_dim < 4 || (ring_dim % 2) != 0 {
-        return Err("tiny gate: ring_dim must be even and >= 4".to_string());
-    }
-    let d: u128 = ring_dim as u128;
-    let d_half: u128 = d / 2;
-    if d_half < 2 {
-        return Err("tiny gate: ring_dim too small".to_string());
-    }
-    let D: u128 = d_half - 1;
-    let b: u128 = params.decomp_b as u128;
-    let k: u32 = params.k as u32;
-    if b < 2 {
-        return Err("tiny gate: decomp_b must be >= 2".to_string());
-    }
-    if k == 0 {
-        return Err("tiny gate: k must be >= 1".to_string());
-    }
-    // bound = D * (b^k - 1)/(b - 1)
-    let mut pow: u128 = 1;
-    for _ in 0..k {
-        pow = pow.saturating_mul(b);
-    }
-    let num = pow.saturating_sub(1);
-    let denom = b - 1;
-    let geom = num / denom;
-    let bound_u128 = D.saturating_mul(geom);
-    if bound_u128 > (u64::MAX as u128) {
-        return Err("tiny gate: centered bound overflows u64".to_string());
-    }
-    Ok(bound_u128 as u64)
-}
-
-/// Enforce that every non-reabsorb absorbed 8-byte chunk is not only canonical (<p),
-/// but also lies in the conservative centered range implied by the rgchk digit bound.
-fn enforce_nonreabsorb_absorbs_are_centered_bounded_goldilocks(
-    glue: &mut GlueCtx,
-    ops: &[PoseidonTraceOp<F257>],
-    pose_wiring: &PoseidonDr1csWiring,
-    params: &WeParams,
-    ring_dim: usize,
-) -> Result<(), String> {
-    let bound = sp1_centered_bound_u64(params, ring_dim)?;
-    let mut absorb_idx = 0usize;
-    let mut expect_reabsorb = false;
-    for (op_i, op) in ops.iter().enumerate() {
-        match op {
-            PoseidonTraceOp::SqueezeField(v) => {
-                expect_reabsorb = v.len() == DIGITS_PER_TRY
-                    && matches!(ops.get(op_i + 1), Some(PoseidonTraceOp::Absorb(a)) if a.len() == DIGITS_PER_TRY);
-            }
-            PoseidonTraceOp::Absorb(_v) => {
-                let (ab_start, ab_len) = *pose_wiring
-                    .absorb_ranges
-                    .get(absorb_idx)
-                    .ok_or("pose_wiring.absorb_ranges oob (centered goldilocks)")?;
-                absorb_idx += 1;
-                let is_reabsorb = expect_reabsorb;
-                expect_reabsorb = false;
-                if is_reabsorb || (ab_len % 8) != 0 {
-                    continue;
-                }
-                let n_elems = ab_len / 8;
-                for e in 0..n_elems {
-                    let mut bytes = [0usize; 8];
-                    for j in 0..8 {
-                        let gv = pose_wiring.absorb_vars[ab_start + e * 8 + j];
-                        let lv = glue.copy_digit(gv);
-                        let _ = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, lv);
-                        bytes[j] = lv;
-                    }
-                    let _limbs =
-                        goldilocks_u64_centered_le_bound_from_byte_vars::<F257>(&mut glue.gb, &bytes, bound);
-                }
-            }
-            PoseidonTraceOp::SqueezeBytes { .. } => {
-                expect_reabsorb = false;
-            }
-        }
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

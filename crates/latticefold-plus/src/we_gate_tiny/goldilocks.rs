@@ -4,12 +4,12 @@ use latticefold::transcript::poseidon::F257;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 
 use super::coins::goldilocks_p_base128_digits_le;
-use super::digits::{
-    add_bal16_same_len, mul_bal16_long_by_const_rhs, mul_bal16_long_by_long,
-    alloc_carry_pm2, i32_to_f257,
-    u64_bytes_to_bal16_digits_cached,
+use super::digits::u64_bytes_to_bal16_digits_cached;
+use super::cm_ir::{
+    goldilocks_add_mod_p_digits_ir, goldilocks_mul_const_mod_p_digits_ir,
+    goldilocks_mul_mod_p_digits_ir, goldilocks_sub_mod_p_digits_ir, lower_ir_into_builder, IrBuilder as CmIrBuilder,
+    VarRef as IrVarRef,
 };
-use super::cm_ir::{alloc_u64_as_bal16_digits_witness_ir, lower_ir_into_builder, u64_to_bal16_digits_le_const, IrBuilder as CmIrBuilder};
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
 // NOTE: keep all modulus constants local to this module; do not import from elsewhere.
@@ -43,21 +43,6 @@ pub(crate) fn goldilocks_p_bal16_digits_le_const() -> [i8; 17] {
     }
     out[16] = carry as i8;
     out
-}
-
-/// Allocate a u64 witness value as balanced base-16 digits (len 17) as F257 variables.
-///
-/// The digits follow the same convention as `u64_bytes_to_bal16_digits` / `u64_to_bal16_digits_le_const`:
-/// - digits[0..16] are in [-8,7]
-/// - digits[16] is the final carry in {0,1}
-fn alloc_u64_as_bal16_digits_witness(b: &mut Dr1csBuilder<F257>, x: u64) -> Vec<usize> {
-    // IR is the source of truth; lower a tiny IR fragment into this builder.
-    let base_one = b.assignment[b.one()];
-    let base_asg = [base_one];
-    let mut ib = CmIrBuilder::new(&base_asg);
-    let out_ir = alloc_u64_as_bal16_digits_witness_ir(&mut ib, x);
-    let lowered = lower_ir_into_builder(b, ib.ir);
-    (0..17).map(|i| lowered.map_var(out_ir[i])).collect()
 }
 
 /// Boundary-only canonicalization gadget:
@@ -347,346 +332,10 @@ pub(super) fn goldilocks_u64_enforce_lt_p_from_byte_vars_and_limbs<F: PrimeField
     u_limbs
 }
 
-/// Enforce that a canonical Goldilocks base-field element `u` (encoded as 8 bytes, u < p_goldilocks)
-/// lies in the **centered magnitude** range \(|u| <= bound\), meaning:
-/// - u ∈ [0, bound]  (non-negative)
-/// - OR u ∈ [p_goldilocks - bound, p_goldilocks - 1]  (negative, in centered lift)
-///
-/// Returns base-128 limbs of `u`.
-pub(super) fn goldilocks_u64_centered_le_bound_from_byte_vars<F: PrimeField>(
-    b: &mut Dr1csBuilder<F>,
-    u_byte_vars: &[usize; 8],
-    bound: u64,
-) -> [usize; LIMBS_U64] {
-    // First, enforce canonical encoding (u < p) and get base-128 limbs for u.
-    //
-    // We intentionally avoid the heavier "reduce-then-assert-q=0" style gadget here;
-    // for centered-bound checks we only need the limb view + the guarantee `u < p`.
-    let u_limbs = goldilocks_u64_enforce_lt_p_from_byte_vars_and_limbs::<F>(b, u_byte_vars);
-
-    // Witness u as u64 for boolean witnesses.
-    let mut u_buf = [0u8; 8];
-    for i in 0..8 {
-        u_buf[i] = b.assignment[u_byte_vars[i]]
-            .into_bigint()
-            .to_bytes_le()
-            .get(0)
-            .copied()
-            .unwrap_or(0);
-    }
-    let u = u64::from_le_bytes(u_buf);
-
-    // Helper: compare u <= c using base-128 borrow chain on (c - u).
-    fn le_const_base128<F: PrimeField>(
-        b: &mut Dr1csBuilder<F>,
-        u_limbs: &[usize; LIMBS_U64],
-        u_wit: u64,
-        c: u64,
-    ) -> usize {
-        let le = alloc_bool::<F>(b, u_wit <= c);
-
-        let mut borrow = b.new_var(F::ZERO);
-        b.enforce_var_eq_const(borrow, F::ZERO);
-        for i in 0..LIMBS_U64 {
-            let ui = ((u_wit >> (LIMB_BITS * i)) & (LIMB_BASE_U64 - 1)) as i16;
-            let ci = ((c >> (LIMB_BITS * i)) & (LIMB_BASE_U64 - 1)) as i16;
-            let bi = if i == 0 {
-                0i16
-            } else {
-                b.assignment[borrow]
-                    .into_bigint()
-                    .to_bytes_le()
-                    .get(0)
-                    .copied()
-                    .unwrap_or(0) as i16
-            };
-            let mut t = ci - ui - bi;
-            let bor_next_u8 = if t < 0 { 1u8 } else { 0u8 };
-            if t < 0 {
-                t += LIMB_BASE_U64 as i16;
-            }
-            let diff_i = b.new_var(F::from((t as u64) & (LIMB_BASE_U64 - 1)));
-            // Range-check diff_i to 7 bits.
-            let mut dbits = [0usize; LIMB_BITS];
-            for k in 0..LIMB_BITS {
-                dbits[k] = alloc_bool::<F>(b, (((t as u8) >> k) & 1) == 1);
-            }
-            let mut lc_diff = vec![(F::ONE, diff_i)];
-            let mut pow = F::ONE;
-            for k in 0..LIMB_BITS {
-                lc_diff.push((-pow, dbits[k]));
-                pow *= F::from(2u64);
-            }
-            b.enforce_lc_times_one_eq_const(lc_diff);
-
-            let bor_next = alloc_bool::<F>(b, bor_next_u8 == 1);
-            // c_i - u_i - bor_i + base*bor_{i+1} - diff_i == 0
-            b.enforce_lc_times_one_eq_const(vec![
-                (F::from(ci as u64), b.one()),
-                (-F::ONE, u_limbs[i]),
-                (-F::ONE, borrow),
-                (F::from(LIMB_BASE_U64), bor_next),
-                (-F::ONE, diff_i),
-            ]);
-            borrow = bor_next;
-        }
-        // le == 1 - final_borrow
-        let one_minus_bor = b.new_var(F::ONE - b.assignment[borrow]);
-        b.enforce_lc_times_one_eq_const(vec![
-            (F::ONE, one_minus_bor),
-            (F::ONE, borrow),
-            (-F::ONE, b.one()),
-        ]);
-        b.enforce_lc_times_one_eq_const(vec![(F::ONE, le), (-F::ONE, one_minus_bor)]);
-        le
-    }
-
-    // Helper: compare u >= c using base-128 borrow chain on (u - c).
-    fn ge_const_base128<F: PrimeField>(
-        b: &mut Dr1csBuilder<F>,
-        u_limbs: &[usize; LIMBS_U64],
-        u_wit: u64,
-        c: u64,
-    ) -> usize {
-        let ge = alloc_bool::<F>(b, u_wit >= c);
-        let mut borrow = b.new_var(F::ZERO);
-        b.enforce_var_eq_const(borrow, F::ZERO);
-        for i in 0..LIMBS_U64 {
-            let ui = ((u_wit >> (LIMB_BITS * i)) & (LIMB_BASE_U64 - 1)) as i16;
-            let ci = ((c >> (LIMB_BITS * i)) & (LIMB_BASE_U64 - 1)) as i16;
-            let bi = if i == 0 {
-                0i16
-            } else {
-                b.assignment[borrow]
-                    .into_bigint()
-                    .to_bytes_le()
-                    .get(0)
-                    .copied()
-                    .unwrap_or(0) as i16
-            };
-            let mut t = ui - ci - bi;
-            let bor_next_u8 = if t < 0 { 1u8 } else { 0u8 };
-            if t < 0 {
-                t += LIMB_BASE_U64 as i16;
-            }
-            let diff_i = b.new_var(F::from((t as u64) & (LIMB_BASE_U64 - 1)));
-            // Range-check diff_i to 7 bits.
-            let mut dbits = [0usize; LIMB_BITS];
-            for k in 0..LIMB_BITS {
-                dbits[k] = alloc_bool::<F>(b, (((t as u8) >> k) & 1) == 1);
-            }
-            let mut lc_diff = vec![(F::ONE, diff_i)];
-            let mut pow = F::ONE;
-            for k in 0..LIMB_BITS {
-                lc_diff.push((-pow, dbits[k]));
-                pow *= F::from(2u64);
-            }
-            b.enforce_lc_times_one_eq_const(lc_diff);
-
-            let bor_next = alloc_bool::<F>(b, bor_next_u8 == 1);
-            // u_i - c_i - bor_i + base*bor_{i+1} - diff_i == 0
-            b.enforce_lc_times_one_eq_const(vec![
-                (F::ONE, u_limbs[i]),
-                (-F::from(ci as u64), b.one()),
-                (-F::ONE, borrow),
-                (F::from(LIMB_BASE_U64), bor_next),
-                (-F::ONE, diff_i),
-            ]);
-            borrow = bor_next;
-        }
-        // ge == 1 - final_borrow
-        let one_minus_bor = b.new_var(F::ONE - b.assignment[borrow]);
-        b.enforce_lc_times_one_eq_const(vec![
-            (F::ONE, one_minus_bor),
-            (F::ONE, borrow),
-            (-F::ONE, b.one()),
-        ]);
-        b.enforce_lc_times_one_eq_const(vec![(F::ONE, ge), (-F::ONE, one_minus_bor)]);
-        ge
-    }
-
-    let le_bound = le_const_base128::<F>(b, &u_limbs, u, bound);
-    let p_minus_bound = GOLDILOCKS_P.saturating_sub(bound);
-    let ge_p_minus_bound = ge_const_base128::<F>(b, &u_limbs, u, p_minus_bound);
-
-    // ok = le_bound OR ge_p_minus_bound
-    let and = b.new_var(b.assignment[le_bound] * b.assignment[ge_p_minus_bound]);
-    b.enforce_mul(le_bound, ge_p_minus_bound, and);
-    let ok = b.new_var(b.assignment[le_bound] + b.assignment[ge_p_minus_bound] - b.assignment[and]);
-    b.enforce_lc_times_one_eq_const(vec![
-        (F::ONE, ok),
-        (-F::ONE, le_bound),
-        (-F::ONE, ge_p_minus_bound),
-        (F::ONE, and),
-    ]);
-    b.enforce_var_eq_const(ok, F::ONE);
-
-    u_limbs
-}
-
 fn alloc_u8_var<F: PrimeField>(b: &mut Dr1csBuilder<F>, v: u8) -> usize {
     let x = b.new_var(F::from(v as u64));
     let _ = decompose_existing_byte_var_to_bits::<F>(b, x);
     x
-}
-
-fn pad_bal16(b: &mut Dr1csBuilder<F257>, mut v: Vec<usize>, target_len: usize) -> Vec<usize> {
-    if v.len() > target_len {
-        // Enforce truncated tail digits are zero, then truncate.
-        for &dv in &v[target_len..] {
-            b.enforce_var_eq_const(dv, F257::ZERO);
-        }
-        v.truncate(target_len);
-        return v;
-    }
-    if v.len() < target_len {
-        let z = b.zero_var();
-        v.extend(std::iter::repeat(z).take(target_len - v.len()));
-    }
-    v
-}
-
-fn enforce_bal16_vec_eq(b: &mut Dr1csBuilder<F257>, a: &[usize], c: &[usize]) {
-    debug_assert_eq!(a.len(), c.len());
-    for (&ai, &ci) in a.iter().zip(c.iter()) {
-        b.enforce_lc_times_one_eq_const(vec![(F257::ONE, ai), (-F257::ONE, ci)]);
-    }
-}
-
-fn goldilocks_p_bytes_le() -> [u8; 8] {
-    GOLDILOCKS_P.to_le_bytes()
-}
-
-/// Enforce `prod == q*p + r` in balanced base-16 digits *without* materializing `q*p` or `q*p+r`.
-///
-/// This is a big `alloc_bool` saver in hot paths (mul and mul-by-const), because it avoids
-/// allocating and range-checking intermediate digit vectors that are only used for equality.
-fn enforce_prod_eq_qp_plus_r_bal16(
-    b: &mut Dr1csBuilder<F257>,
-    prod_d: &[usize],
-    q_d: &[usize],
-    p_d_const: &[i8],
-    r_d: &[usize],
-) {
-    // Sound no-wrap enforcement:
-    // materialize `qp = q*p` in bal16 digits (using the safe mul-by-const gadget),
-    // add `r`, and enforce equality to `prod` using the bal16 add gadget (pm1 carries).
-    let max_len = prod_d
-        .len()
-        .max(r_d.len())
-        .max(q_d.len().saturating_add(p_d_const.len()).saturating_sub(1))
-        + 1; // headroom digit
-
-    let prod_pad = pad_bal16(b, prod_d.to_vec(), max_len);
-    let r_pad = pad_bal16(b, r_d.to_vec(), max_len);
-
-    let qp = mul_bal16_long_by_const_rhs(b, q_d, p_d_const);
-    let qp_pad = pad_bal16(b, qp, max_len);
-
-    let (sum, carry) = add_bal16_same_len(b, &qp_pad, &r_pad);
-    b.enforce_var_eq_const(carry, F257::ZERO);
-
-    enforce_bal16_vec_eq(b, &prod_pad, &sum);
-}
-
-/// Enforce `a + c = q*p + r` over balanced base-16 digits with a tight carry bound.
-fn enforce_add_mod_p_relation_bal16(
-    b: &mut Dr1csBuilder<F257>,
-    a_d: &[usize],
-    c_d: &[usize],
-    r_d: &[usize],
-    q: usize,
-    q_u8: u8,
-    p_d_const: &[i8; 17],
-) {
-    debug_assert!(q_u8 == 0 || q_u8 == 1);
-    let a = pad_bal16(b, a_d.to_vec(), 18);
-    let c = pad_bal16(b, c_d.to_vec(), 18);
-    let r = pad_bal16(b, r_d.to_vec(), 18);
-
-    let mut carry_var = b.zero_var();
-    let mut carry_i32: i32 = 0;
-
-    for k in 0..18 {
-        let ak = super::digits::f257_to_i32_bal(b.assignment[a[k]]);
-        let ck = super::digits::f257_to_i32_bal(b.assignment[c[k]]);
-        let rk = super::digits::f257_to_i32_bal(b.assignment[r[k]]);
-        let pk = if k < 17 { p_d_const[k] as i32 } else { 0 };
-
-        let sum = carry_i32 + ak + ck - rk - (q_u8 as i32) * pk;
-        debug_assert!(sum % 16 == 0, "add_mod_p carry not divisible: sum={sum} k={k}");
-        let carry_next = sum / 16;
-        debug_assert!(
-            (-2..=2).contains(&carry_next),
-            "add_mod_p carry out of pm2: {carry_next} (sum={sum}) at k={k}"
-        );
-        let carry_next_var = alloc_carry_pm2(b, carry_next);
-
-        let mut lc: Vec<(F257, usize)> = Vec::with_capacity(6);
-        lc.push((F257::ONE, carry_var));
-        lc.push((F257::ONE, a[k]));
-        lc.push((F257::ONE, c[k]));
-        lc.push((-F257::ONE, r[k]));
-        if k < 17 && p_d_const[k] != 0 {
-            lc.push((-i32_to_f257(p_d_const[k] as i32), q));
-        }
-        lc.push((-F257::from(16u64), carry_next_var));
-        b.enforce_lc_times_one_eq_const(lc);
-
-        carry_var = carry_next_var;
-        carry_i32 = carry_next;
-    }
-    b.enforce_var_eq_const(carry_var, F257::ZERO);
-}
-
-/// Enforce `a + q*p = c + r` over balanced base-16 digits with a tight carry bound.
-fn enforce_sub_mod_p_relation_bal16(
-    b: &mut Dr1csBuilder<F257>,
-    a_d: &[usize],
-    c_d: &[usize],
-    r_d: &[usize],
-    q: usize,
-    q_u8: u8,
-    p_d_const: &[i8; 17],
-) {
-    debug_assert!(q_u8 == 0 || q_u8 == 1);
-    let a = pad_bal16(b, a_d.to_vec(), 18);
-    let c = pad_bal16(b, c_d.to_vec(), 18);
-    let r = pad_bal16(b, r_d.to_vec(), 18);
-
-    let mut carry_var = b.zero_var();
-    let mut carry_i32: i32 = 0;
-
-    for k in 0..18 {
-        let ak = super::digits::f257_to_i32_bal(b.assignment[a[k]]);
-        let ck = super::digits::f257_to_i32_bal(b.assignment[c[k]]);
-        let rk = super::digits::f257_to_i32_bal(b.assignment[r[k]]);
-        let pk = if k < 17 { p_d_const[k] as i32 } else { 0 };
-
-        let sum = carry_i32 + ak + (q_u8 as i32) * pk - ck - rk;
-        debug_assert!(sum % 16 == 0, "sub_mod_p carry not divisible: sum={sum} k={k}");
-        let carry_next = sum / 16;
-        debug_assert!(
-            (-2..=2).contains(&carry_next),
-            "sub_mod_p carry out of pm2: {carry_next} (sum={sum}) at k={k}"
-        );
-        let carry_next_var = alloc_carry_pm2(b, carry_next);
-
-        let mut lc: Vec<(F257, usize)> = Vec::with_capacity(6);
-        lc.push((F257::ONE, carry_var));
-        lc.push((F257::ONE, a[k]));
-        lc.push((-F257::ONE, c[k]));
-        lc.push((-F257::ONE, r[k]));
-        if k < 17 && p_d_const[k] != 0 {
-            lc.push((i32_to_f257(p_d_const[k] as i32), q));
-        }
-        lc.push((-F257::from(16u64), carry_next_var));
-        b.enforce_lc_times_one_eq_const(lc);
-
-        carry_var = carry_next_var;
-        carry_i32 = carry_next;
-    }
-    b.enforce_var_eq_const(carry_var, F257::ZERO);
 }
 
 /// General Goldilocks-field multiplication gadget (64-bit prime field) inside the tiny field.
@@ -738,7 +387,6 @@ pub(super) fn goldilocks_mul_mod_p_from_byte_vars_assume_canonical(
     let a_u = u64::from_le_bytes(ab);
     let b_u = u64::from_le_bytes(bb);
     let prod: u128 = (a_u as u128) * (b_u as u128);
-    let q_u: u64 = (prod / (GOLDILOCKS_P as u128)) as u64;
     let r_u: u64 = (prod % (GOLDILOCKS_P as u128)) as u64;
 
     // Allocate r as byte vars (output). The quotient `q` is internal; we allocate it directly as
@@ -751,16 +399,29 @@ pub(super) fn goldilocks_mul_mod_p_from_byte_vars_assume_canonical(
     // Enforce r is canonical (<p).
     goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
 
-    // Convert a,b,r and p to balanced-base16 digits.
-    let a_d = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
-    let b_d = u64_bytes_to_bal16_digits_cached(b, *b_bytes);
-    let r_d = u64_bytes_to_bal16_digits_cached(b, r_bytes);
-    let q_d = alloc_u64_as_bal16_digits_witness(b, q_u);
-
-    // Compute prod_digits = a*b (balanced digits, with headroom/carry already enforced in gadget).
-    let prod_d = mul_bal16_long_by_long(b, &a_d, &b_d);
+    // IR is the source of truth in the digit domain; tie `r_bytes` to the IR digits.
     let p_d_const = goldilocks_p_bal16_digits_le_const();
-    enforce_prod_eq_qp_plus_r_bal16(b, &prod_d, &q_d, &p_d_const, &r_d);
+    let a_d = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
+    let c_d = u64_bytes_to_bal16_digits_cached(b, *b_bytes);
+    let r_d_bytes = u64_bytes_to_bal16_digits_cached(b, r_bytes);
+    debug_assert_eq!(a_d.len(), 17);
+    debug_assert_eq!(c_d.len(), 17);
+    debug_assert_eq!(r_d_bytes.len(), 17);
+
+    let (ir, out_ir) = {
+        let base_asg: &[F257] = &b.assignment;
+        let mut ib = CmIrBuilder::new(base_asg);
+        let a_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(a_d[j]));
+        let c_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(c_d[j]));
+        let out_ir = goldilocks_mul_mod_p_digits_ir(&mut ib, &a_ir, &c_ir, GOLDILOCKS_P, &p_d_const);
+        (ib.ir, out_ir)
+    };
+    let lowered = lower_ir_into_builder(b, ir);
+    let r_d_ir: [usize; 17] = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
+
+    for j in 0..17 {
+        b.enforce_lc_times_one_eq_const(vec![(F257::ONE, r_d_bytes[j]), (-F257::ONE, r_d_ir[j])]);
+    }
 
     let out = r_bytes;
     b.profile_exit(_prev);
@@ -802,7 +463,6 @@ pub(super) fn goldilocks_mul_const_mod_p_from_byte_vars_assume_canonical(
     }
     let x_u = u64::from_le_bytes(xb);
     let prod: u128 = (x_u as u128) * (c as u128);
-    let q_u: u64 = (prod / (GOLDILOCKS_P as u128)) as u64;
     let r_u: u64 = (prod % (GOLDILOCKS_P as u128)) as u64;
 
     // Allocate r as byte vars (output). The quotient `q` is internal; we allocate it directly as
@@ -814,18 +474,32 @@ pub(super) fn goldilocks_mul_const_mod_p_from_byte_vars_assume_canonical(
     }
     goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
 
-    // Convert x,r to bal16 digits (vars). `q` is allocated directly as balanced digits.
+    // IR is the source of truth for const-mul mod p in the digit domain.
+    //
+    // We still output canonical bytes, so we tie the IR-produced digits to the digit expansion
+    // of `r_bytes`.
     let x_d = u64_bytes_to_bal16_digits_cached(b, *x_bytes);
-    let r_d = u64_bytes_to_bal16_digits_cached(b, r_bytes);
-    let q_d = alloc_u64_as_bal16_digits_witness(b, q_u);
+    debug_assert_eq!(x_d.len(), 17);
+    let r_d_bytes = u64_bytes_to_bal16_digits_cached(b, r_bytes);
+    debug_assert_eq!(r_d_bytes.len(), 17);
 
-    // Constant bal16 digits for c and p, computed directly (no variables/constraints).
-    let c_d_const = u64_to_bal16_digits_le_const(c);
     let p_d_const = goldilocks_p_bal16_digits_le_const();
 
-    // prod_digits = x*c  (const-RHS)
-    let prod_d = mul_bal16_long_by_const_rhs(b, &x_d, &c_d_const);
-    enforce_prod_eq_qp_plus_r_bal16(b, &prod_d, &q_d, &p_d_const, &r_d);
+    // Build IR fragment against a snapshot of the current base assignment, then lower.
+    let (ir, out_ir) = {
+        let base_asg: &[F257] = &b.assignment;
+        let mut ib = CmIrBuilder::new(base_asg);
+        let x_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(x_d[j]));
+        let out_ir = goldilocks_mul_const_mod_p_digits_ir(&mut ib, &x_ir, c, GOLDILOCKS_P, &p_d_const);
+        (ib.ir, out_ir)
+    };
+    let lowered = lower_ir_into_builder(b, ir);
+    let r_d_ir: [usize; 17] = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
+
+    // Constrain digit expansions equal: r_d_bytes == r_d_ir
+    for j in 0..17 {
+        b.enforce_lc_times_one_eq_const(vec![(F257::ONE, r_d_bytes[j]), (-F257::ONE, r_d_ir[j])]);
+    }
 
     let out = r_bytes;
     b.profile_exit(_prev);
@@ -872,11 +546,7 @@ pub(super) fn goldilocks_add_mod_p_from_byte_vars_assume_canonical(
     let a_u = u64::from_le_bytes(ab);
     let c_u = u64::from_le_bytes(cb);
     let sum = (a_u as u128) + (c_u as u128);
-    let q_u8: u8 = if sum >= (GOLDILOCKS_P as u128) { 1 } else { 0 };
-    let r_u: u64 = if q_u8 == 1 { (sum - (GOLDILOCKS_P as u128)) as u64 } else { sum as u64 };
-
-    // `q_u8` is a witness-known 0/1 selector; use cached constants instead of allocating a boolean.
-    let q = if q_u8 == 1 { b.one() } else { b.zero_var() };
+    let r_u: u64 = (sum % (GOLDILOCKS_P as u128)) as u64;
     let r_bytes_u8 = r_u.to_le_bytes();
     let mut r_bytes = [0usize; 8];
     for i in 0..8 {
@@ -884,11 +554,29 @@ pub(super) fn goldilocks_add_mod_p_from_byte_vars_assume_canonical(
     }
     goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
 
-    let p_d0_const = goldilocks_p_bal16_digits_le_const();
-    let a_d0 = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
-    let c_d0 = u64_bytes_to_bal16_digits_cached(b, *c_bytes);
-    let r_d0 = u64_bytes_to_bal16_digits_cached(b, r_bytes);
-    enforce_add_mod_p_relation_bal16(b, &a_d0, &c_d0, &r_d0, q, q_u8, &p_d0_const);
+    // IR is the source of truth in the digit domain; tie `r_bytes` to the IR digits.
+    let p_d_const = goldilocks_p_bal16_digits_le_const();
+    let a_d = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
+    let c_d = u64_bytes_to_bal16_digits_cached(b, *c_bytes);
+    let r_d_bytes = u64_bytes_to_bal16_digits_cached(b, r_bytes);
+    debug_assert_eq!(a_d.len(), 17);
+    debug_assert_eq!(c_d.len(), 17);
+    debug_assert_eq!(r_d_bytes.len(), 17);
+
+    let (ir, out_ir) = {
+        let base_asg: &[F257] = &b.assignment;
+        let mut ib = CmIrBuilder::new(base_asg);
+        let a_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(a_d[j]));
+        let c_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(c_d[j]));
+        let out_ir = goldilocks_add_mod_p_digits_ir(&mut ib, &a_ir, &c_ir, GOLDILOCKS_P, &p_d_const);
+        (ib.ir, out_ir)
+    };
+    let lowered = lower_ir_into_builder(b, ir);
+    let r_d_ir: [usize; 17] = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
+
+    for j in 0..17 {
+        b.enforce_lc_times_one_eq_const(vec![(F257::ONE, r_d_bytes[j]), (-F257::ONE, r_d_ir[j])]);
+    }
 
     let out = r_bytes;
     b.profile_exit(_prev);
@@ -934,14 +622,11 @@ pub(super) fn goldilocks_sub_mod_p_from_byte_vars_assume_canonical(
     }
     let a_u = u64::from_le_bytes(ab);
     let c_u = u64::from_le_bytes(cb);
-    let (q_u8, r_u) = if a_u >= c_u {
-        (0u8, a_u - c_u)
+    let r_u: u64 = if a_u >= c_u {
+        a_u - c_u
     } else {
-        (1u8, (a_u as u128 + (GOLDILOCKS_P as u128) - (c_u as u128)) as u64)
+        (a_u as u128 + (GOLDILOCKS_P as u128) - (c_u as u128)) as u64
     };
-
-    // `q_u8` is a witness-known 0/1 selector; use cached constants instead of allocating a boolean.
-    let q = if q_u8 == 1 { b.one() } else { b.zero_var() };
     let r_bytes_u8 = r_u.to_le_bytes();
     let mut r_bytes = [0usize; 8];
     for i in 0..8 {
@@ -949,52 +634,33 @@ pub(super) fn goldilocks_sub_mod_p_from_byte_vars_assume_canonical(
     }
     goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(b, &r_bytes);
 
-    let a_d0 = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
-    let c_d0 = u64_bytes_to_bal16_digits_cached(b, *c_bytes);
-    let r_d0 = u64_bytes_to_bal16_digits_cached(b, r_bytes);
-    let p_d0_const = goldilocks_p_bal16_digits_le_const();
-    enforce_sub_mod_p_relation_bal16(b, &a_d0, &c_d0, &r_d0, q, q_u8, &p_d0_const);
+    // IR is the source of truth in the digit domain; tie `r_bytes` to the IR digits.
+    let p_d_const = goldilocks_p_bal16_digits_le_const();
+    let a_d = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
+    let c_d = u64_bytes_to_bal16_digits_cached(b, *c_bytes);
+    let r_d_bytes = u64_bytes_to_bal16_digits_cached(b, r_bytes);
+    debug_assert_eq!(a_d.len(), 17);
+    debug_assert_eq!(c_d.len(), 17);
+    debug_assert_eq!(r_d_bytes.len(), 17);
+
+    let (ir, out_ir) = {
+        let base_asg: &[F257] = &b.assignment;
+        let mut ib = CmIrBuilder::new(base_asg);
+        let a_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(a_d[j]));
+        let c_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(c_d[j]));
+        let out_ir = goldilocks_sub_mod_p_digits_ir(&mut ib, &a_ir, &c_ir, GOLDILOCKS_P, &p_d_const);
+        (ib.ir, out_ir)
+    };
+    let lowered = lower_ir_into_builder(b, ir);
+    let r_d_ir: [usize; 17] = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
+
+    for j in 0..17 {
+        b.enforce_lc_times_one_eq_const(vec![(F257::ONE, r_d_bytes[j]), (-F257::ONE, r_d_ir[j])]);
+    }
 
     let out = r_bytes;
     b.profile_exit(_prev);
     out
-}
-
-fn goldilocks_zero_bytes(b: &mut Dr1csBuilder<F257>) -> [usize; 8] {
-    // Allocate a single shared 0-byte variable and reuse it for all 8 limbs.
-    //
-    // Important: we intentionally do NOT eagerly bit-decompose this byte. If/when a downstream
-    // gadget truly needs bits (e.g. digit conversion), `decompose_existing_byte_var_to_bits`
-    // will do it once and cache it by variable index. Eager decomposition here is pure overhead
-    // because `0` is already fixed by a constant constraint.
-    let z0 = b.new_var(F257::ZERO);
-    b.enforce_var_eq_const(z0, F257::ZERO);
-    [z0; 8]
-}
-
-fn goldilocks_one_bytes(b: &mut Dr1csBuilder<F257>) -> [usize; 8] {
-    let mut o = goldilocks_zero_bytes(b);
-    o[0] = b.new_var(F257::ONE);
-    b.enforce_var_eq_const(o[0], F257::ONE);
-    o
-}
-
-fn goldilocks_from_u64_const_bytes(b: &mut Dr1csBuilder<F257>, c: u64) -> [usize; 8] {
-    let cb = c.to_le_bytes();
-    let mut out = [0usize; 8];
-    for i in 0..8 {
-        out[i] = alloc_u8_var::<F257>(b, cb[i]);
-    }
-    goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(b, &out);
-    out
-}
-
-fn goldilocks_add_many_mod_p(b: &mut Dr1csBuilder<F257>, terms: &[[usize; 8]]) -> [usize; 8] {
-    let mut acc = goldilocks_zero_bytes(b);
-    for t in terms {
-        acc = goldilocks_add_mod_p_from_byte_vars_assume_canonical(b, &acc, t);
-    }
-    acc
 }
 
 /// Goldilocks scalar in balanced base-16 digits (canonical u64 encoding).

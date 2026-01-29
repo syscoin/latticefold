@@ -3,9 +3,10 @@ use ark_ff::{BigInteger, Field, PrimeField};
 use latticefold::transcript::poseidon::F257;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 
-use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits, ByteVar};
+use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::cm_ir::{
     alloc_bal16_digit_ir, alloc_carry_pm128_ir, alloc_carry_pm2_ir, lower_ir_into_builder, IrBuilder as CmIrBuilder,
+    u32_bytes_to_bal16_digits_from_bits_ir, u64_bytes_to_bal16_digits_from_bits_ir, VarRef as CmVarRef,
 };
 
 // -----------------------------------------------------------------------------
@@ -31,41 +32,6 @@ pub(crate) fn i32_to_f257(x: i32) -> F257 {
         v += 257;
     }
     F257::from(v as u64)
-}
-
-fn nibble_from_bits(b: &mut Dr1csBuilder<F257>, bits: [usize; 4], v: u8) -> usize {
-    debug_assert!(v < 16);
-    let out = b.new_var(F257::from(v as u64));
-    // out = Σ 2^i * bits[i]
-    b.enforce_lc_times_one_eq_const(vec![
-        (F257::ONE, out),
-        (-F257::ONE, bits[0]),
-        (-F257::from(2u64), bits[1]),
-        (-F257::from(4u64), bits[2]),
-        (-F257::from(8u64), bits[3]),
-    ]);
-    out
-}
-
-/// Build the low/high nibble vars of a byte var (0..15 each), reusing the existing bit vars.
-fn byte_to_nibbles(b: &mut Dr1csBuilder<F257>, byte: &ByteVar) -> (usize, usize) {
-    let v8 = b.assignment[byte.byte]
-        .into_bigint()
-        .to_bytes_le()
-        .get(0)
-        .copied()
-        .unwrap_or(0) as u8;
-    let lo = nibble_from_bits(
-        b,
-        [byte.bits[0], byte.bits[1], byte.bits[2], byte.bits[3]],
-        v8 & 0x0f,
-    );
-    let hi = nibble_from_bits(
-        b,
-        [byte.bits[4], byte.bits[5], byte.bits[6], byte.bits[7]],
-        (v8 >> 4) & 0x0f,
-    );
-    (lo, hi)
 }
 
 /// Allocate a balanced base-16 digit variable in [-8,7] from witness `d`.
@@ -1429,91 +1395,20 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
 /// Convert 4 little-endian byte vars (0..255) into balanced base-16 digits (len 9).
 pub(crate) fn u32_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 4]) -> Vec<usize> {
     let _prev = b.profile_enter("digits::u32_bytes_to_bal16_digits");
-    struct Nib {
-        bits: [usize; 4],
-        msb: usize,
-    }
-    let mut nibbles: Vec<Nib> = Vec::with_capacity(8);
-    for &bv in &bytes_le {
-        let bits8 = decompose_existing_byte_var_to_bits::<F257>(b, bv);
-        nibbles.push(Nib { bits: [bits8[0], bits8[1], bits8[2], bits8[3]], msb: bits8[3] });
-        nibbles.push(Nib { bits: [bits8[4], bits8[5], bits8[6], bits8[7]], msb: bits8[7] });
-    }
-    debug_assert_eq!(nibbles.len(), 8);
-
-    let mut out: Vec<usize> = Vec::with_capacity(9);
-    let mut carry = b.new_var(F257::ZERO);
-    b.enforce_var_eq_const(carry, F257::ZERO);
-    // `carry` is fixed to 0, so booleanity is implied; no need for an extra boolean constraint.
-
-    for nib in &nibbles {
-        let b0 = nib.bits[0];
-        let b1 = nib.bits[1];
-        let b2 = nib.bits[2];
-        let msb = nib.msb;
-
-        let t01 = b.new_var(b.assignment[b0] * b.assignment[b1]);
-        b.enforce_mul(b0, b1, t01);
-        let t012 = b.new_var(b.assignment[t01] * b.assignment[b2]);
-        b.enforce_mul(t01, b2, t012);
-        // Carry-out rule for balanced digits:
-        // carry_out = msb OR (carry_in AND (b0&b1&b2) AND !msb)
-        //
-        // Implement as:
-        //   carry_t      = carry_in * (b0&b1&b2)
-        //   carry_t_msb  = carry_t * msb
-        //   carry_out    = msb + carry_t - carry_t_msb
-        // This avoids building explicit NOT/AND/OR helper vars.
-        let carry_t = b.new_var(b.assignment[carry] * b.assignment[t012]);
-        b.enforce_mul(carry, t012, carry_t);
-        let carry_t_msb = b.new_var(b.assignment[carry_t] * b.assignment[msb]);
-        b.enforce_mul(carry_t, msb, carry_t_msb);
-        let c_out = b.new_var(b.assignment[msb] + b.assignment[carry_t] - b.assignment[carry_t_msb]);
-        b.enforce_lc_times_one_eq_const(vec![
-            (F257::ONE, c_out),
-            (-F257::ONE, msb),
-            (-F257::ONE, carry_t),
-            (F257::ONE, carry_t_msb),
-        ]);
-        // `c_out` is a boolean expression over booleans, so it is boolean.
-
-        let d_i =
-            (b.assignment[b0].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as i32)
-                + 2 * (b.assignment[b1].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as i32)
-                + 4 * (b.assignment[b2].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as i32)
-                + 8 * (b.assignment[msb].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as i32);
-        let carry_i = b.assignment[carry]
-            .into_bigint()
-            .to_bytes_le()
-            .get(0)
-            .copied()
-            .unwrap_or(0) as i32;
-        let c_i = b.assignment[c_out]
-            .into_bigint()
-            .to_bytes_le()
-            .get(0)
-            .copied()
-            .unwrap_or(0) as i32;
-        let v = d_i + carry_i - 16 * c_i;
-        debug_assert!((-8..=7).contains(&v));
-        let out_digit = b.new_var(i32_to_f257(v));
-        b.enforce_lc_times_one_eq_const(vec![
-            (F257::ONE, out_digit),
-            (-F257::ONE, carry),
-            (-F257::ONE, b0),
-            (-F257::from(2u64), b1),
-            (-F257::from(4u64), b2),
-            (-F257::from(8u64), msb),
-            (F257::from(16u64), c_out),
-        ]);
-
-        out.push(out_digit);
-        carry = c_out;
-    }
-
-    out.push(carry);
     b.profile_exit(_prev);
-    out
+    let bytes_bits: [[usize; 8]; 4] = core::array::from_fn(|i| decompose_existing_byte_var_to_bits::<F257>(b, bytes_le[i]));
+
+    let (ir, out_ir) = {
+        let base_asg: &[F257] = &b.assignment;
+        let mut ib = CmIrBuilder::new(base_asg);
+        let bits_ir: [[CmVarRef; 8]; 4] =
+            core::array::from_fn(|i| core::array::from_fn(|j| CmVarRef::Base(bytes_bits[i][j])));
+        let out_ir = u32_bytes_to_bal16_digits_from_bits_ir(&mut ib, &bits_ir);
+        (ib.ir, out_ir)
+    };
+    let lowered = lower_ir_into_builder(b, ir);
+    let out: [usize; 9] = core::array::from_fn(|k| lowered.map_var(out_ir[k]));
+    out.to_vec()
 }
 
 pub(crate) fn u32_bytes_to_bal16_digits_cached(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 4]) -> Vec<usize> {
@@ -1531,85 +1426,20 @@ pub(crate) fn u32_bytes_to_bal16_digits_cached(b: &mut Dr1csBuilder<F257>, bytes
 /// carry digit (also in {0,1} for a canonical u64 byte encoding).
 pub(crate) fn u64_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 8]) -> Vec<usize> {
     let _prev = b.profile_enter("digits::u64_bytes_to_bal16_digits");
-    struct Nib {
-        bits: [usize; 4],
-        msb: usize,
-    }
-    let mut nibbles: Vec<Nib> = Vec::with_capacity(16);
-    for &bv in &bytes_le {
-        let bits8 = decompose_existing_byte_var_to_bits::<F257>(b, bv);
-        nibbles.push(Nib { bits: [bits8[0], bits8[1], bits8[2], bits8[3]], msb: bits8[3] });
-        nibbles.push(Nib { bits: [bits8[4], bits8[5], bits8[6], bits8[7]], msb: bits8[7] });
-    }
-    debug_assert_eq!(nibbles.len(), 16);
-
-    let mut out: Vec<usize> = Vec::with_capacity(17);
-    let mut carry = b.new_var(F257::ZERO);
-    b.enforce_var_eq_const(carry, F257::ZERO);
-    // `carry` is fixed to 0, so booleanity is implied; no need for an extra boolean constraint.
-
-    for nib in &nibbles {
-        let b0 = nib.bits[0];
-        let b1 = nib.bits[1];
-        let b2 = nib.bits[2];
-        let msb = nib.msb;
-
-        let t01 = b.new_var(b.assignment[b0] * b.assignment[b1]);
-        b.enforce_mul(b0, b1, t01);
-        let t012 = b.new_var(b.assignment[t01] * b.assignment[b2]);
-        b.enforce_mul(t01, b2, t012);
-        // Carry-out rule for balanced digits (same as u32 path):
-        // carry_out = msb OR (carry_in AND (b0&b1&b2) AND !msb)
-        let carry_t = b.new_var(b.assignment[carry] * b.assignment[t012]);
-        b.enforce_mul(carry, t012, carry_t);
-        let carry_t_msb = b.new_var(b.assignment[carry_t] * b.assignment[msb]);
-        b.enforce_mul(carry_t, msb, carry_t_msb);
-        let c_out = b.new_var(b.assignment[msb] + b.assignment[carry_t] - b.assignment[carry_t_msb]);
-        b.enforce_lc_times_one_eq_const(vec![
-            (F257::ONE, c_out),
-            (-F257::ONE, msb),
-            (-F257::ONE, carry_t),
-            (F257::ONE, carry_t_msb),
-        ]);
-        // `c_out` is a boolean expression over booleans, so it is boolean.
-
-        let d_i =
-            (b.assignment[b0].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as i32)
-                + 2 * (b.assignment[b1].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as i32)
-                + 4 * (b.assignment[b2].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as i32)
-                + 8 * (b.assignment[msb].into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as i32);
-        let carry_i = b.assignment[carry]
-            .into_bigint()
-            .to_bytes_le()
-            .get(0)
-            .copied()
-            .unwrap_or(0) as i32;
-        let c_i = b.assignment[c_out]
-            .into_bigint()
-            .to_bytes_le()
-            .get(0)
-            .copied()
-            .unwrap_or(0) as i32;
-        let v = d_i + carry_i - 16 * c_i;
-        debug_assert!((-8..=7).contains(&v));
-        let out_digit = b.new_var(i32_to_f257(v));
-        b.enforce_lc_times_one_eq_const(vec![
-            (F257::ONE, out_digit),
-            (-F257::ONE, carry),
-            (-F257::ONE, b0),
-            (-F257::from(2u64), b1),
-            (-F257::from(4u64), b2),
-            (-F257::from(8u64), msb),
-            (F257::from(16u64), c_out),
-        ]);
-
-        out.push(out_digit);
-        carry = c_out;
-    }
-
-    out.push(carry);
     b.profile_exit(_prev);
-    out
+    let bytes_bits: [[usize; 8]; 8] = core::array::from_fn(|i| decompose_existing_byte_var_to_bits::<F257>(b, bytes_le[i]));
+
+    let (ir, out_ir) = {
+        let base_asg: &[F257] = &b.assignment;
+        let mut ib = CmIrBuilder::new(base_asg);
+        let bits_ir: [[CmVarRef; 8]; 8] =
+            core::array::from_fn(|i| core::array::from_fn(|j| CmVarRef::Base(bytes_bits[i][j])));
+        let out_ir = u64_bytes_to_bal16_digits_from_bits_ir(&mut ib, &bits_ir);
+        (ib.ir, out_ir)
+    };
+    let lowered = lower_ir_into_builder(b, ir);
+    let out: [usize; 17] = core::array::from_fn(|k| lowered.map_var(out_ir[k]));
+    out.to_vec()
 }
 
 pub(crate) fn u64_bytes_to_bal16_digits_cached(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 8]) -> Vec<usize> {
