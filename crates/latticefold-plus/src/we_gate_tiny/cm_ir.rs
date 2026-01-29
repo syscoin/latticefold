@@ -1702,6 +1702,10 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
     // Build a Karatsuba(9+8) multiplication "oracle" that can contribute coefficient `deg` of A*C
     // as a linear combination of bounded product vars.
     let kara17_build = |b: &mut IrBuilder<'_>, a: &[VarRef; M], c: &[VarRef; M]| -> Kara17 {
+        // Precompute centered-lift i32 values for inputs once (avoid repeated bigint work).
+        let a_v: [i32; M] = core::array::from_fn(|i| f257_to_i32_bal(b.val(a[i])));
+        let c_v: [i32; M] = core::array::from_fn(|i| f257_to_i32_bal(b.val(c[i])));
+
         // ll: a[0..9] * c[0..9]
         let mut ll: [[VarRef; M0]; M0] = [[VarRef::Base(0); M0]; M0];
         let mut ll_v: [[i32; M0]; M0] = [[0i32; M0]; M0];
@@ -1710,7 +1714,7 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
                 let pij = b.new_var(b.val(a[i]) * b.val(c[j]));
                 b.enforce_mul(a[i], c[j], pij);
                 ll[i][j] = pij;
-                ll_v[i][j] = f257_to_i32_bal(b.val(pij));
+                ll_v[i][j] = a_v[i] * c_v[j];
             }
         }
         // hh: a[9..17] * c[9..17]
@@ -1723,12 +1727,14 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
                 let pij = b.new_var(b.val(ai) * b.val(cj));
                 b.enforce_mul(ai, cj, pij);
                 hh[i][j] = pij;
-                hh_v[i][j] = f257_to_i32_bal(b.val(pij));
+                hh_v[i][j] = a_v[M0 + i] * c_v[M0 + j];
             }
         }
         // ss: (aL + aHpad) * (cL + cHpad), with pad at index 8.
         let mut sa: [VarRef; M0] = [VarRef::Base(0); M0];
         let mut sc: [VarRef; M0] = [VarRef::Base(0); M0];
+        let mut sa_v: [i32; M0] = [0i32; M0];
+        let mut sc_v: [i32; M0] = [0i32; M0];
         for i in 0..M0 {
             let ahi = if i < H0 { a[M0 + i] } else { z };
             let chi = if i < H0 { c[M0 + i] } else { z };
@@ -1738,6 +1744,8 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
             b.enforce_lc_eq_zero(vec![(F257::ONE, s1), (-F257::ONE, c[i]), (-F257::ONE, chi)]);
             sa[i] = s0;
             sc[i] = s1;
+            sa_v[i] = a_v[i] + if i < H0 { a_v[M0 + i] } else { 0 };
+            sc_v[i] = c_v[i] + if i < H0 { c_v[M0 + i] } else { 0 };
         }
         let mut ss: [[VarRef; M0]; M0] = [[VarRef::Base(0); M0]; M0];
         let mut ss_v: [[i32; M0]; M0] = [[0i32; M0]; M0];
@@ -1746,13 +1754,16 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
                 let pij = b.new_var(b.val(sa[i]) * b.val(sc[j]));
                 b.enforce_mul(sa[i], sc[j], pij);
                 ss[i][j] = pij;
-                ss_v[i][j] = f257_to_i32_bal(b.val(pij));
+                ss_v[i][j] = sa_v[i] * sc_v[j];
             }
         }
         Kara17 { ll, ll_v, hh, hh_v, ss, ss_v }
     };
 
     let kara16_build = |b: &mut IrBuilder<'_>, a: &[VarRef; HI], c: &[VarRef; HI]| -> Kara16 {
+        let a_v: [i32; HI] = core::array::from_fn(|i| f257_to_i32_bal(b.val(a[i])));
+        let c_v: [i32; HI] = core::array::from_fn(|i| f257_to_i32_bal(b.val(c[i])));
+
         // ll: a[0..8] * c[0..8]
         let mut ll: [[VarRef; H0]; H0] = [[VarRef::Base(0); H0]; H0];
         let mut ll_v: [[i32; H0]; H0] = [[0i32; H0]; H0];
@@ -1761,7 +1772,7 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
                 let pij = b.new_var(b.val(a[i]) * b.val(c[j]));
                 b.enforce_mul(a[i], c[j], pij);
                 ll[i][j] = pij;
-                ll_v[i][j] = f257_to_i32_bal(b.val(pij));
+                ll_v[i][j] = a_v[i] * c_v[j];
             }
         }
         // hh: a[8..16] * c[8..16]
@@ -1774,12 +1785,14 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
                 let pij = b.new_var(b.val(ai) * b.val(cj));
                 b.enforce_mul(ai, cj, pij);
                 hh[i][j] = pij;
-                hh_v[i][j] = f257_to_i32_bal(b.val(pij));
+                hh_v[i][j] = a_v[H0 + i] * c_v[H0 + j];
             }
         }
         // ss: (aL+aH)*(cL+cH)
         let mut sa: [VarRef; H0] = [VarRef::Base(0); H0];
         let mut sc: [VarRef; H0] = [VarRef::Base(0); H0];
+        let mut sa_v: [i32; H0] = [0i32; H0];
+        let mut sc_v: [i32; H0] = [0i32; H0];
         for i in 0..H0 {
             let s0 = b.new_var(b.val(a[i]) + b.val(a[H0 + i]));
             let s1 = b.new_var(b.val(c[i]) + b.val(c[H0 + i]));
@@ -1787,6 +1800,8 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
             b.enforce_lc_eq_zero(vec![(F257::ONE, s1), (-F257::ONE, c[i]), (-F257::ONE, c[H0 + i])]);
             sa[i] = s0;
             sc[i] = s1;
+            sa_v[i] = a_v[i] + a_v[H0 + i];
+            sc_v[i] = c_v[i] + c_v[H0 + i];
         }
         let mut ss: [[VarRef; H0]; H0] = [[VarRef::Base(0); H0]; H0];
         let mut ss_v: [[i32; H0]; H0] = [[0i32; H0]; H0];
@@ -1795,7 +1810,7 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
                 let pij = b.new_var(b.val(sa[i]) * b.val(sc[j]));
                 b.enforce_mul(sa[i], sc[j], pij);
                 ss[i][j] = pij;
-                ss_v[i][j] = f257_to_i32_bal(b.val(pij));
+                ss_v[i][j] = sa_v[i] * sc_v[j];
             }
         }
         Kara16 { ll, ll_v, hh, hh_v, ss, ss_v }
