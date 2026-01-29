@@ -1573,7 +1573,13 @@ pub(crate) fn ring_mul_negacyclic_ntt_goldilocks_d64_ir(
         ntt_in_place(b, a, omega_inv, p_u64, p_d, zero);
         // scale by n^{-1}
         for i in 0..64 {
-            a[i] = goldilocks_mul_const_mod_p_digits_ir(b, &a[i], inv_n, p_u64, p_d);
+            a[i] = if inv_n == 1 {
+                a[i]
+            } else if inv_n == p_u64 - 1 {
+                goldilocks_sub_mod_p_digits_ir(b, zero, &a[i], p_u64, p_d)
+            } else {
+                goldilocks_mul_const_mod_p_digits_ir(b, &a[i], inv_n, p_u64, p_d)
+            };
         }
     }
 
@@ -1585,6 +1591,9 @@ pub(crate) fn ring_mul_negacyclic_ntt_goldilocks_d64_ir(
         if psi_pow == 1 {
             a_tw[i] = a[i];
             c_tw[i] = c[i];
+        } else if psi_pow == p - 1 {
+            a_tw[i] = goldilocks_sub_mod_p_digits_ir(b, &zero_scalar, &a[i], p, &p_d_const);
+            c_tw[i] = goldilocks_sub_mod_p_digits_ir(b, &zero_scalar, &c[i], p, &p_d_const);
         } else {
             a_tw[i] = goldilocks_mul_const_mod_p_digits_ir(b, &a[i], psi_pow, p, &p_d_const);
             c_tw[i] = goldilocks_mul_const_mod_p_digits_ir(b, &c[i], psi_pow, p, &p_d_const);
@@ -1607,6 +1616,8 @@ pub(crate) fn ring_mul_negacyclic_ntt_goldilocks_d64_ir(
         let psi_inv_pow: u64 = gl_ntt64::PSI_INV_POWS_64[i];
         out[i] = if psi_inv_pow == 1 {
             a_tw[i]
+        } else if psi_inv_pow == p - 1 {
+            goldilocks_sub_mod_p_digits_ir(b, &zero_scalar, &a_tw[i], p, &p_d_const)
         } else {
             goldilocks_mul_const_mod_p_digits_ir(b, &a_tw[i], psi_inv_pow, p, &p_d_const)
         };
