@@ -1668,25 +1668,30 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
 
     #[derive(Clone)]
     struct Kara17 {
-        ll: [[VarRef; M0]; M0], // 9x9
-        hh: [[VarRef; H0]; H0], // 8x8
-        ss: [[VarRef; M0]; M0], // 9x9
+        ll: [[VarRef; M0]; M0],
+        ll_v: [[i32; M0]; M0],
+        hh: [[VarRef; H0]; H0],
+        hh_v: [[i32; H0]; H0],
+        ss: [[VarRef; M0]; M0],
+        ss_v: [[i32; M0]; M0],
     }
     #[derive(Clone)]
     struct Kara16 {
-        ll: [[VarRef; H0]; H0], // 8x8
-        hh: [[VarRef; H0]; H0], // 8x8
-        ss: [[VarRef; H0]; H0], // 8x8
+        ll: [[VarRef; H0]; H0],
+        ll_v: [[i32; H0]; H0],
+        hh: [[VarRef; H0]; H0],
+        hh_v: [[i32; H0]; H0],
+        ss: [[VarRef; H0]; H0],
+        ss_v: [[i32; H0]; H0],
     }
 
     let z = alloc_zero_const_ir(b);
 
-    // Helper: push +/-1 * var into LC and update integer-lift sum using witness.
+    // Helper: push +/-1 * var into LC and update integer-lift sum using precomputed witness.
     #[inline]
-    fn push_pm1(b: &IrBuilder<'_>, lc: &mut Vec<(F257, VarRef)>, sum: &mut i32, var: VarRef, sign: i32) {
+    fn push_pm1(lc: &mut Vec<(F257, VarRef)>, sum: &mut i32, var: VarRef, var_v: i32, sign: i32) {
         debug_assert!(sign == 1 || sign == -1);
-        let v = f257_to_i32_bal(b.val(var));
-        *sum += sign * v;
+        *sum += sign * var_v;
         if sign == 1 {
             lc.push((F257::ONE, var));
         } else {
@@ -1699,15 +1704,18 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
     let kara17_build = |b: &mut IrBuilder<'_>, a: &[VarRef; M], c: &[VarRef; M]| -> Kara17 {
         // ll: a[0..9] * c[0..9]
         let mut ll: [[VarRef; M0]; M0] = [[VarRef::Base(0); M0]; M0];
+        let mut ll_v: [[i32; M0]; M0] = [[0i32; M0]; M0];
         for i in 0..M0 {
             for j in 0..M0 {
                 let pij = b.new_var(b.val(a[i]) * b.val(c[j]));
                 b.enforce_mul(a[i], c[j], pij);
                 ll[i][j] = pij;
+                ll_v[i][j] = f257_to_i32_bal(b.val(pij));
             }
         }
         // hh: a[9..17] * c[9..17]
         let mut hh: [[VarRef; H0]; H0] = [[VarRef::Base(0); H0]; H0];
+        let mut hh_v: [[i32; H0]; H0] = [[0i32; H0]; H0];
         for i in 0..H0 {
             for j in 0..H0 {
                 let ai = a[M0 + i];
@@ -1715,6 +1723,7 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
                 let pij = b.new_var(b.val(ai) * b.val(cj));
                 b.enforce_mul(ai, cj, pij);
                 hh[i][j] = pij;
+                hh_v[i][j] = f257_to_i32_bal(b.val(pij));
             }
         }
         // ss: (aL + aHpad) * (cL + cHpad), with pad at index 8.
@@ -1731,28 +1740,33 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
             sc[i] = s1;
         }
         let mut ss: [[VarRef; M0]; M0] = [[VarRef::Base(0); M0]; M0];
+        let mut ss_v: [[i32; M0]; M0] = [[0i32; M0]; M0];
         for i in 0..M0 {
             for j in 0..M0 {
                 let pij = b.new_var(b.val(sa[i]) * b.val(sc[j]));
                 b.enforce_mul(sa[i], sc[j], pij);
                 ss[i][j] = pij;
+                ss_v[i][j] = f257_to_i32_bal(b.val(pij));
             }
         }
-        Kara17 { ll, hh, ss }
+        Kara17 { ll, ll_v, hh, hh_v, ss, ss_v }
     };
 
     let kara16_build = |b: &mut IrBuilder<'_>, a: &[VarRef; HI], c: &[VarRef; HI]| -> Kara16 {
         // ll: a[0..8] * c[0..8]
         let mut ll: [[VarRef; H0]; H0] = [[VarRef::Base(0); H0]; H0];
+        let mut ll_v: [[i32; H0]; H0] = [[0i32; H0]; H0];
         for i in 0..H0 {
             for j in 0..H0 {
                 let pij = b.new_var(b.val(a[i]) * b.val(c[j]));
                 b.enforce_mul(a[i], c[j], pij);
                 ll[i][j] = pij;
+                ll_v[i][j] = f257_to_i32_bal(b.val(pij));
             }
         }
         // hh: a[8..16] * c[8..16]
         let mut hh: [[VarRef; H0]; H0] = [[VarRef::Base(0); H0]; H0];
+        let mut hh_v: [[i32; H0]; H0] = [[0i32; H0]; H0];
         for i in 0..H0 {
             for j in 0..H0 {
                 let ai = a[H0 + i];
@@ -1760,6 +1774,7 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
                 let pij = b.new_var(b.val(ai) * b.val(cj));
                 b.enforce_mul(ai, cj, pij);
                 hh[i][j] = pij;
+                hh_v[i][j] = f257_to_i32_bal(b.val(pij));
             }
         }
         // ss: (aL+aH)*(cL+cH)
@@ -1774,14 +1789,16 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
             sc[i] = s1;
         }
         let mut ss: [[VarRef; H0]; H0] = [[VarRef::Base(0); H0]; H0];
+        let mut ss_v: [[i32; H0]; H0] = [[0i32; H0]; H0];
         for i in 0..H0 {
             for j in 0..H0 {
                 let pij = b.new_var(b.val(sa[i]) * b.val(sc[j]));
                 b.enforce_mul(sa[i], sc[j], pij);
                 ss[i][j] = pij;
+                ss_v[i][j] = f257_to_i32_bal(b.val(pij));
             }
         }
-        Kara16 { ll, hh, ss }
+        Kara16 { ll, ll_v, hh, hh_v, ss, ss_v }
     };
 
     // Big split: sum_a = a0 + a1pad (len 17), sum_c likewise.
@@ -1809,7 +1826,6 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
 
     #[inline]
     fn kara17_add_coeff(
-        b: &IrBuilder<'_>,
         k: &Kara17,
         deg: usize,
         lc: &mut Vec<(F257, VarRef)>,
@@ -1823,7 +1839,7 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
             let i_max = core::cmp::min(M0 - 1, deg);
             for i in i_min..=i_max {
                 let j = deg - i;
-                push_pm1(b, lc, sum, k.ll[i][j], sign);
+                push_pm1(lc, sum, k.ll[i][j], k.ll_v[i][j], sign);
             }
         }
         // middle: ss - ll - hh, shifted by +9
@@ -1833,12 +1849,12 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
             let i_max = core::cmp::min(M0 - 1, t);
             for i in i_min..=i_max {
                 let j = t - i;
-                push_pm1(b, lc, sum, k.ss[i][j], sign);
+                push_pm1(lc, sum, k.ss[i][j], k.ss_v[i][j], sign);
                 // - ll
-                push_pm1(b, lc, sum, k.ll[i][j], -sign);
+                push_pm1(lc, sum, k.ll[i][j], k.ll_v[i][j], -sign);
                 // - hh (only if within 8x8 and t<=14)
                 if i < H0 && j < H0 && t <= 2 * (H0 - 1) {
-                    push_pm1(b, lc, sum, k.hh[i][j], -sign);
+                    push_pm1(lc, sum, k.hh[i][j], k.hh_v[i][j], -sign);
                 }
             }
         }
@@ -1849,14 +1865,13 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
             let i_max = core::cmp::min(H0 - 1, t);
             for i in i_min..=i_max {
                 let j = t - i;
-                push_pm1(b, lc, sum, k.hh[i][j], sign);
+                push_pm1(lc, sum, k.hh[i][j], k.hh_v[i][j], sign);
             }
         }
     }
 
     #[inline]
     fn kara16_add_coeff(
-        b: &IrBuilder<'_>,
         k: &Kara16,
         deg: usize,
         lc: &mut Vec<(F257, VarRef)>,
@@ -1869,7 +1884,7 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
             let i_max = core::cmp::min(H0 - 1, deg);
             for i in i_min..=i_max {
                 let j = deg - i;
-                push_pm1(b, lc, sum, k.ll[i][j], sign);
+                push_pm1(lc, sum, k.ll[i][j], k.ll_v[i][j], sign);
             }
         }
         if (H0..=(H0 + 2 * (H0 - 1))).contains(&deg) {
@@ -1878,9 +1893,9 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
             let i_max = core::cmp::min(H0 - 1, t);
             for i in i_min..=i_max {
                 let j = t - i;
-                push_pm1(b, lc, sum, k.ss[i][j], sign);
-                push_pm1(b, lc, sum, k.ll[i][j], -sign);
-                push_pm1(b, lc, sum, k.hh[i][j], -sign);
+                push_pm1(lc, sum, k.ss[i][j], k.ss_v[i][j], sign);
+                push_pm1(lc, sum, k.ll[i][j], k.ll_v[i][j], -sign);
+                push_pm1(lc, sum, k.hh[i][j], k.hh_v[i][j], -sign);
             }
         }
         if deg >= 2 * H0 && deg <= 2 * H0 + 2 * (H0 - 1) {
@@ -1889,7 +1904,7 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
             let i_max = core::cmp::min(H0 - 1, t);
             for i in i_min..=i_max {
                 let j = t - i;
-                push_pm1(b, lc, sum, k.hh[i][j], sign);
+                push_pm1(lc, sum, k.hh[i][j], k.hh_v[i][j], sign);
             }
         }
     }
@@ -1936,21 +1951,21 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
         //
         // z0 contribution: degree k in a0*c0 (0..32)
         if k <= 2 * (M - 1) {
-            kara17_add_coeff(b, &kara_z0, k, &mut lc, &mut sum, 1);
+            kara17_add_coeff(&kara_z0, k, &mut lc, &mut sum, 1);
         }
         // z1 contribution: degree t=k-17 in (a0+a1)*(c0+c1) - z0 - z2, shifted by +17.
         if (M..=(M + 2 * (M - 1))).contains(&k) {
             let t = k - M; // 0..32
-            kara17_add_coeff(b, &kara_sprod, t, &mut lc, &mut sum, 1);
-            kara17_add_coeff(b, &kara_z0, t, &mut lc, &mut sum, -1);
+            kara17_add_coeff(&kara_sprod, t, &mut lc, &mut sum, 1);
+            kara17_add_coeff(&kara_z0, t, &mut lc, &mut sum, -1);
             if t <= 2 * (HI - 1) {
-                kara16_add_coeff(b, &kara_z2, t, &mut lc, &mut sum, -1);
+                kara16_add_coeff(&kara_z2, t, &mut lc, &mut sum, -1);
             }
         }
         // z2 contribution: degree u=k-34 in a1*c1, shifted by +34.
         if k >= 2 * M && k <= 2 * M + 2 * (HI - 1) {
             let u = k - 2 * M; // 0..30
-            kara16_add_coeff(b, &kara_z2, u, &mut lc, &mut sum, 1);
+            kara16_add_coeff(&kara_z2, u, &mut lc, &mut sum, 1);
         }
 
         // - q*p  (same sparse p)
