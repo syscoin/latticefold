@@ -6,6 +6,7 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 use cyclotomic_rings::rings::goldilocks_ntt64 as gl_ntt64;
 
 use std::collections::HashMap;
+use core::ops::Range;
 
 use super::digits::{f257_to_i32_bal, i32_to_f257};
 use super::params::{DIGITS_PER_TRY, LIMB_BASE_U64, LIMB_BITS, LIMBS_U32, LIMBS_U64};
@@ -64,9 +65,9 @@ pub(crate) enum VarRef {
 
 #[derive(Clone, Debug)]
 pub(crate) struct IrConstraint {
-    pub(crate) a: Vec<(F257, VarRef)>,
-    pub(crate) b: Vec<(F257, VarRef)>,
-    pub(crate) c: Vec<(F257, VarRef)>,
+    pub(crate) a: Range<usize>,
+    pub(crate) b: Range<usize>,
+    pub(crate) c: Range<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -97,13 +98,28 @@ pub(crate) struct CmIr {
     /// Witness values for local vars. Index 0 is reserved as ONE.
     pub(crate) local_asg: Vec<F257>,
     pub(crate) constraints: Vec<IrConstraint>,
+    /// Term pools for each side of R1CS constraints.
+    ///
+    /// This avoids per-constraint heap allocations during IR build, which is a major wall-time cost.
+    pub(crate) a_terms: Vec<(F257, VarRef)>,
+    pub(crate) b_terms: Vec<(F257, VarRef)>,
+    pub(crate) c_terms: Vec<(F257, VarRef)>,
     pub(crate) stats: CmIrStats,
 }
 
 impl CmIr {
     #[inline]
     pub(crate) fn new() -> Self {
-        Self { local_asg: vec![F257::ONE], constraints: Vec::new(), stats: CmIrStats::default() }
+        // Reserve term 0 on B/C as the constant-one and constant-zero "atoms" so linear constraints
+        // can reference them without allocating new vectors.
+        Self {
+            local_asg: vec![F257::ONE],
+            constraints: Vec::new(),
+            a_terms: Vec::new(),
+            b_terms: vec![(F257::ONE, VarRef::Base(0))],
+            c_terms: vec![(F257::ZERO, VarRef::Base(0))],
+            stats: CmIrStats::default(),
+        }
     }
 
     /// Allocate a new local var with the given witness value.
@@ -124,10 +140,13 @@ impl CmIr {
         self.stats.max_terms_a = self.stats.max_terms_a.max(lc.len() as u32);
         self.stats.max_terms_b = self.stats.max_terms_b.max(1);
         self.stats.max_terms_c = self.stats.max_terms_c.max(1);
+        let a0 = self.a_terms.len();
+        self.a_terms.extend(lc);
+        let a1 = self.a_terms.len();
         self.constraints.push(IrConstraint {
-            a: lc,
-            b: vec![(F257::ONE, VarRef::Base(0))],
-            c: vec![(F257::ZERO, VarRef::Base(0))],
+            a: a0..a1,
+            b: 0..1, // (ONE, Base(0))
+            c: 0..1, // (ZERO, Base(0))
         });
     }
 
@@ -148,11 +167,16 @@ impl CmIr {
         self.stats.max_terms_a = self.stats.max_terms_a.max(1);
         self.stats.max_terms_b = self.stats.max_terms_b.max(1);
         self.stats.max_terms_c = self.stats.max_terms_c.max(1);
-        self.constraints.push(IrConstraint {
-            a: vec![(F257::ONE, a)],
-            b: vec![(F257::ONE, b)],
-            c: vec![(F257::ONE, c)],
-        });
+        let a0 = self.a_terms.len();
+        self.a_terms.push((F257::ONE, a));
+        let a1 = self.a_terms.len();
+        let b0 = self.b_terms.len();
+        self.b_terms.push((F257::ONE, b));
+        let b1 = self.b_terms.len();
+        let c0 = self.c_terms.len();
+        self.c_terms.push((F257::ONE, c));
+        let c1 = self.c_terms.len();
+        self.constraints.push(IrConstraint { a: a0..a1, b: b0..b1, c: c0..c1 });
     }
 
     /// Add a raw R1CS constraint with linear combinations over `VarRef`.
@@ -173,7 +197,30 @@ impl CmIr {
         self.stats.max_terms_a = self.stats.max_terms_a.max(a.len() as u32);
         self.stats.max_terms_b = self.stats.max_terms_b.max(b.len() as u32);
         self.stats.max_terms_c = self.stats.max_terms_c.max(c.len() as u32);
-        self.constraints.push(IrConstraint { a, b, c });
+        let a0 = self.a_terms.len();
+        self.a_terms.extend(a);
+        let a1 = self.a_terms.len();
+
+        let b_rng = if is_linear {
+            0..1
+        } else {
+            let b0 = self.b_terms.len();
+            self.b_terms.extend(b);
+            let b1 = self.b_terms.len();
+            b0..b1
+        };
+
+        // Reuse constant-zero on C when possible.
+        let c_rng = if c.len() == 1 && c[0].0 == F257::ZERO && c[0].1 == VarRef::Base(0) {
+            0..1
+        } else {
+            let c0 = self.c_terms.len();
+            self.c_terms.extend(c);
+            let c1 = self.c_terms.len();
+            c0..c1
+        };
+
+        self.constraints.push(IrConstraint { a: a0..a1, b: b_rng, c: c_rng });
     }
 
     /// Lower this IR fragment into an existing sparse DR1CS instance/assignment in-place.
@@ -184,9 +231,10 @@ impl CmIr {
         base_inst: &mut SparseDr1csInstance<F257>,
         base_asg: &mut Vec<F257>,
     ) -> Result<(), String> {
+        let CmIr { local_asg, constraints, a_terms, b_terms, c_terms, .. } = self;
         let base_nvars = base_asg.len();
         // Append local vars (skip local_asg[0]=ONE).
-        base_asg.extend_from_slice(&self.local_asg[1..]);
+        base_asg.extend_from_slice(&local_asg[1..]);
         let map = |v: VarRef, base_nvars: usize| -> usize {
             match v {
                 VarRef::Base(i) => i,
@@ -196,10 +244,19 @@ impl CmIr {
                 }
             }
         };
-        for ic in self.constraints {
-            let a = ic.a.into_iter().map(|(c, v)| (c, map(v, base_nvars))).collect();
-            let b = ic.b.into_iter().map(|(c, v)| (c, map(v, base_nvars))).collect();
-            let c = ic.c.into_iter().map(|(c, v)| (c, map(v, base_nvars))).collect();
+        for ic in constraints {
+            let mut a: Vec<(F257, usize)> = Vec::with_capacity(ic.a.len());
+            for &(coef, v) in &a_terms[ic.a.clone()] {
+                a.push((coef, map(v, base_nvars)));
+            }
+            let mut b: Vec<(F257, usize)> = Vec::with_capacity(ic.b.len());
+            for &(coef, v) in &b_terms[ic.b.clone()] {
+                b.push((coef, map(v, base_nvars)));
+            }
+            let mut c: Vec<(F257, usize)> = Vec::with_capacity(ic.c.len());
+            for &(coef, v) in &c_terms[ic.c.clone()] {
+                c.push((coef, map(v, base_nvars)));
+            }
             base_inst.constraints.push(Constraint { a, b, c });
         }
         base_inst.nvars = base_asg.len();
@@ -237,19 +294,29 @@ impl LoweredIr {
 /// - all local witnesses as new vars
 /// - all constraints as R1CS constraints over concrete var indices
 pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> LoweredIr {
+    let CmIr { local_asg, constraints, a_terms, b_terms, c_terms, .. } = ir;
     let base_nvars = gb.assignment.len();
-    let mut local_to_var: Vec<usize> = Vec::with_capacity(ir.local_asg.len());
+    let mut local_to_var: Vec<usize> = Vec::with_capacity(local_asg.len());
     local_to_var.push(0); // Local(0) unused
-    for &v in ir.local_asg.iter().skip(1) {
+    for &v in local_asg.iter().skip(1) {
         local_to_var.push(gb.new_var(v));
     }
 
     let lowered = LoweredIr { base_nvars, local_to_var };
 
-    for ic in ir.constraints {
-        let a = ic.a.into_iter().map(|(c, v)| (c, lowered.map_var(v))).collect();
-        let b = ic.b.into_iter().map(|(c, v)| (c, lowered.map_var(v))).collect();
-        let c = ic.c.into_iter().map(|(c, v)| (c, lowered.map_var(v))).collect();
+    for ic in constraints {
+        let mut a: Vec<(F257, usize)> = Vec::with_capacity(ic.a.len());
+        for &(coef, v) in &a_terms[ic.a.clone()] {
+            a.push((coef, lowered.map_var(v)));
+        }
+        let mut b: Vec<(F257, usize)> = Vec::with_capacity(ic.b.len());
+        for &(coef, v) in &b_terms[ic.b.clone()] {
+            b.push((coef, lowered.map_var(v)));
+        }
+        let mut c: Vec<(F257, usize)> = Vec::with_capacity(ic.c.len());
+        for &(coef, v) in &c_terms[ic.c.clone()] {
+            c.push((coef, lowered.map_var(v)));
+        }
         gb.add_constraint(a, b, c);
     }
 
