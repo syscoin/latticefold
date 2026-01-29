@@ -1565,7 +1565,9 @@ fn enforce_prod_const_eq_qp_plus_r_bal4_ir_with_carry_schedule(
 
     for k in 0..66 {
         let mut sum: i32 = carry_i32;
-        let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(128);
+        // Hot path: keep this tight to reduce allocator pressure.
+        // Empirically this stays well below ~80 terms.
+        let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(96);
         lc.push((F257::ONE, carry_var));
 
         // + Σ_i x_i * c_{k-i}
@@ -1918,7 +1920,9 @@ fn enforce_prod_var_eq_qp_plus_r_bal4_ir(
 
     for k in 0..66 {
         let mut sum: i32 = carry_i32;
-        let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(256);
+        // Hot path: keep this tight to reduce allocator pressure.
+        // Empirically `max_terms_a` is < 80 (see ringmul IR stats), and total lc terms stays < 96.
+        let mut lc: Vec<(F257, VarRef)> = Vec::with_capacity(96);
         lc.push((F257::ONE, carry_var));
 
         // - r_k
