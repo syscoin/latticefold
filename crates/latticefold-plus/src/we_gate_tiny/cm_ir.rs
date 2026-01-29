@@ -241,6 +241,131 @@ pub(crate) fn alloc_bool_ir(b: &mut IrBuilder<'_>, bit: bool) -> VarRef {
     x
 }
 
+/// Allocate a signed carry `c ∈ {-1,0,1}` using the vanishing polynomial over F257:
+/// \[
+///   (c-1)\,c\,(c+1) = 0.
+/// \]
+///
+/// Since 257 is prime > 3, this has exactly the intended roots in F257.
+pub(crate) fn alloc_carry_pm1_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
+    assert!((-1..=1).contains(&c));
+    let c_var = b.new_var(i32_to_f257(c));
+
+    // t = (c-1)*c
+    let cv = b.val(c_var);
+    let t = b.new_var((cv - F257::ONE) * cv);
+    b.add_constraint(
+        vec![(F257::ONE, c_var), (-F257::ONE, b.one())],
+        vec![(F257::ONE, c_var)],
+        vec![(F257::ONE, t)],
+    );
+    // t*(c+1) = 0
+    b.add_constraint(
+        vec![(F257::ONE, t)],
+        vec![(F257::ONE, c_var), (F257::ONE, b.one())],
+        vec![(F257::ZERO, b.one())],
+    );
+    c_var
+}
+
+/// Add two balanced base-16 digit vectors of the same length.
+///
+/// Assumes each digit is in [-8,7]. Enforces output digits in [-8,7] and carry in {-1,0,1}.
+pub(crate) fn add_bal16_same_len_ir(b: &mut IrBuilder<'_>, a: &[VarRef], c: &[VarRef]) -> (Vec<VarRef>, VarRef) {
+    assert_eq!(a.len(), c.len());
+    let n = a.len();
+    let mut out: Vec<VarRef> = Vec::with_capacity(n);
+    let mut carry_i32: i32 = 0;
+    let mut carry = b.new_var(F257::ZERO);
+    b.ir.enforce_var_eq_const(carry, F257::ZERO);
+
+    for i in 0..n {
+        let ai = f257_to_i32_bal(b.val(a[i]));
+        let ci = f257_to_i32_bal(b.val(c[i]));
+        let sum = ai + ci + carry_i32;
+        let mut carry_next = if sum >= 0 { (sum + 8) / 16 } else { -(((-sum) + 8) / 16) };
+        let mut rem = sum - 16 * carry_next;
+        while rem > 7 {
+            carry_next += 1;
+            rem -= 16;
+        }
+        while rem < -8 {
+            carry_next -= 1;
+            rem += 16;
+        }
+        debug_assert!((-1..=1).contains(&carry_next));
+        debug_assert!((-8..=7).contains(&rem));
+
+        let out_digit = alloc_bal16_digit_ir(b, rem as i8);
+        let carry_next_var = alloc_carry_pm1_ir(b, carry_next);
+
+        // a_i + c_i + carry - out_i - 16*carry_next = 0
+        b.enforce_lc_eq_zero(vec![
+            (F257::ONE, a[i]),
+            (F257::ONE, c[i]),
+            (F257::ONE, carry),
+            (-F257::ONE, out_digit),
+            (-F257::from(16u64), carry_next_var),
+        ]);
+
+        out.push(out_digit);
+        carry_i32 = carry_next;
+        carry = carry_next_var;
+    }
+
+    (out, carry)
+}
+
+/// Negate a balanced base-16 digit vector (little-endian), producing digits in [-8,7].
+pub(crate) fn neg_bal16_digits_ir(b: &mut IrBuilder<'_>, x: &[VarRef]) -> (Vec<VarRef>, VarRef) {
+    let n = x.len();
+    let mut out: Vec<VarRef> = Vec::with_capacity(n);
+    let mut carry_i32: i32 = 0;
+    let mut carry = b.new_var(F257::ZERO);
+    b.ir.enforce_var_eq_const(carry, F257::ZERO);
+
+    for i in 0..n {
+        let xi = f257_to_i32_bal(b.val(x[i]));
+        let sum = (-xi) + carry_i32;
+        let mut carry_next = if sum >= 0 { (sum + 8) / 16 } else { -(((-sum) + 8) / 16) };
+        let mut rem = sum - 16 * carry_next;
+        while rem > 7 {
+            carry_next += 1;
+            rem -= 16;
+        }
+        while rem < -8 {
+            carry_next -= 1;
+            rem += 16;
+        }
+        debug_assert!((-1..=1).contains(&carry_next));
+        debug_assert!((-8..=7).contains(&rem));
+
+        let out_digit = alloc_bal16_digit_ir(b, rem as i8);
+        let carry_next_var = alloc_carry_pm1_ir(b, carry_next);
+
+        // carry - x_i - out_i - 16*carry_next = 0
+        b.enforce_lc_eq_zero(vec![
+            (F257::ONE, carry),
+            (-F257::ONE, x[i]),
+            (-F257::ONE, out_digit),
+            (-F257::from(16u64), carry_next_var),
+        ]);
+
+        out.push(out_digit);
+        carry_i32 = carry_next;
+        carry = carry_next_var;
+    }
+
+    (out, carry)
+}
+
+/// Subtract two balanced base-16 digit vectors of the same length: `a - c`.
+pub(crate) fn sub_bal16_same_len_ir(b: &mut IrBuilder<'_>, a: &[VarRef], c: &[VarRef]) -> (Vec<VarRef>, VarRef) {
+    assert_eq!(a.len(), c.len());
+    let (neg_c, _carry_neg) = neg_bal16_digits_ir(b, c);
+    add_bal16_same_len_ir(b, a, &neg_c)
+}
+
 /// Compute the balanced-digit carry-out bit for a nibble.
 ///
 /// Inputs are boolean vars:

@@ -6,6 +6,7 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::cm_ir::{
     alloc_bal16_digit_ir, alloc_carry_pm128_ir, alloc_carry_pm2_ir, lower_ir_into_builder, IrBuilder as CmIrBuilder,
+    add_bal16_same_len_ir, alloc_carry_pm1_ir, neg_bal16_digits_ir, sub_bal16_same_len_ir,
     u32_bytes_to_bal16_digits_from_bits_ir, u64_bytes_to_bal16_digits_from_bits_ir, VarRef as CmVarRef,
 };
 
@@ -185,32 +186,14 @@ pub(crate) fn alloc_carry_pm8(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
 // convolution multipliers. For 17×17 balanced digits, the worst-case carry magnitude can exceed
 // 63 (e.g. ≈ 68), so pm64 would reject some valid witnesses. pm128 is safe.
 
-/// Allocate a signed carry `c ∈ {-1,0,1}` using two booleans.
-///
-/// Constrain `b_pos * b_neg = 0` and `c = b_pos - b_neg`.
 pub(crate) fn alloc_carry_pm1(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
-    assert!((-1..=1).contains(&c));
-    // Avoid boolean decomposition: enforce membership with the vanishing polynomial
-    //   (c-1)c(c+1) = 0
-    // over F257, which has exactly the intended roots since 257 is prime > 3.
-    let c_var = b.new_var(i32_to_f257(c));
-    let cv = b.assignment[c_var];
-
-    // t = (c-1)*c
-    let t_val = (cv - F257::ONE) * cv;
-    let t = b.new_var(t_val);
-    b.add_constraint(
-        vec![(F257::ONE, c_var), (-F257::ONE, b.one())],
-        vec![(F257::ONE, c_var)],
-        vec![(F257::ONE, t)],
-    );
-    // t*(c+1) = 0
-    b.add_constraint(
-        vec![(F257::ONE, t)],
-        vec![(F257::ONE, c_var), (F257::ONE, b.one())],
-        vec![(F257::ZERO, b.one())],
-    );
-    c_var
+    // IR is the source of truth; lower a tiny IR fragment into this builder.
+    let base_one = b.assignment[b.one()];
+    let base_asg = [base_one];
+    let mut ib = CmIrBuilder::new(&base_asg);
+    let c_ir = alloc_carry_pm1_ir(&mut ib, c);
+    let lowered = lower_ir_into_builder(b, ib.ir);
+    lowered.map_var(c_ir)
 }
 
 
@@ -223,49 +206,17 @@ pub(crate) fn add_bal16_same_len(
     c: &[usize],
 ) -> (Vec<usize>, usize /* carry_out */) {
     let _prev = b.profile_enter("digits::add_bal16_same_len");
-    assert_eq!(a.len(), c.len());
-    let n = a.len();
-    let mut out: Vec<usize> = Vec::with_capacity(n);
-    let mut carry_i32: i32 = 0;
-    let mut carry = b.zero_var();
-
-    for i in 0..n {
-        let ai = f257_to_i32_bal(b.assignment[a[i]]);
-        let ci = f257_to_i32_bal(b.assignment[c[i]]);
-        let sum = ai + ci + carry_i32;
-        // Choose carry_out so remainder in [-8,7].
-        let mut carry_next = if sum >= 0 { (sum + 8) / 16 } else { -(((-sum) + 8) / 16) };
-        let mut rem = sum - 16 * carry_next;
-        while rem > 7 {
-            carry_next += 1;
-            rem -= 16;
-        }
-        while rem < -8 {
-            carry_next -= 1;
-            rem += 16;
-        }
-        // For inputs in [-8,7], carry is always in {-1,0,1}.
-        assert!((-1..=1).contains(&carry_next));
-        assert!((-8..=7).contains(&rem));
-
-        let out_digit = alloc_bal16_digit(b, rem as i8);
-        // Statement-only arming: do not branch on witness carry value.
-        let carry_next_var = alloc_carry_pm1(b, carry_next);
-
-        // a_i + c_i + carry - out_i - 16*carry_next = 0
-        b.enforce_lc_times_one_eq_const(vec![
-            (F257::ONE, a[i]),
-            (F257::ONE, c[i]),
-            (F257::ONE, carry),
-            (-F257::ONE, out_digit),
-            (-F257::from(16u64), carry_next_var),
-        ]);
-
-        out.push(out_digit);
-        carry_i32 = carry_next;
-        carry = carry_next_var;
-    }
-
+    let (ir, out_ir, carry_ir) = {
+        let base_asg: &[F257] = &b.assignment;
+        let mut ib = CmIrBuilder::new(base_asg);
+        let a_ir: Vec<CmVarRef> = a.iter().copied().map(CmVarRef::Base).collect();
+        let c_ir: Vec<CmVarRef> = c.iter().copied().map(CmVarRef::Base).collect();
+        let (out_ir, carry_ir) = add_bal16_same_len_ir(&mut ib, &a_ir, &c_ir);
+        (ib.ir, out_ir, carry_ir)
+    };
+    let lowered = lower_ir_into_builder(b, ir);
+    let out: Vec<usize> = out_ir.into_iter().map(|v| lowered.map_var(v)).collect();
+    let carry = lowered.map_var(carry_ir);
     let res = (out, carry);
     b.profile_exit(_prev);
     res
@@ -480,44 +431,16 @@ pub(crate) fn neg_bal16_digits(
     b: &mut Dr1csBuilder<F257>,
     x: &[usize],
 ) -> (Vec<usize>, usize /* carry_out */) {
-    let n = x.len();
-    let mut out: Vec<usize> = Vec::with_capacity(n);
-    let mut carry_i32: i32 = 0;
-    let mut carry = b.zero_var();
-
-    for i in 0..n {
-        let xi = f257_to_i32_bal(b.assignment[x[i]]);
-        let sum = (-xi) + carry_i32;
-        let mut carry_next = if sum >= 0 { (sum + 8) / 16 } else { -(((-sum) + 8) / 16) };
-        let mut rem = sum - 16 * carry_next;
-        while rem > 7 {
-            carry_next += 1;
-            rem -= 16;
-        }
-        while rem < -8 {
-            carry_next -= 1;
-            rem += 16;
-        }
-        debug_assert!((-1..=1).contains(&carry_next));
-        debug_assert!((-8..=7).contains(&rem));
-
-        let out_digit = alloc_bal16_digit(b, rem as i8);
-        // Statement-only arming: do not branch on witness carry value.
-        let carry_next_var = alloc_carry_pm1(b, carry_next);
-
-        // carry - x_i - out_i - 16*carry_next = 0
-        b.enforce_lc_times_one_eq_const(vec![
-            (F257::ONE, carry),
-            (-F257::ONE, x[i]),
-            (-F257::ONE, out_digit),
-            (-F257::from(16u64), carry_next_var),
-        ]);
-
-        out.push(out_digit);
-        carry_i32 = carry_next;
-        carry = carry_next_var;
-    }
-
+    let (ir, out_ir, carry_ir) = {
+        let base_asg: &[F257] = &b.assignment;
+        let mut ib = CmIrBuilder::new(base_asg);
+        let x_ir: Vec<CmVarRef> = x.iter().copied().map(CmVarRef::Base).collect();
+        let (out_ir, carry_ir) = neg_bal16_digits_ir(&mut ib, &x_ir);
+        (ib.ir, out_ir, carry_ir)
+    };
+    let lowered = lower_ir_into_builder(b, ir);
+    let out: Vec<usize> = out_ir.into_iter().map(|v| lowered.map_var(v)).collect();
+    let carry = lowered.map_var(carry_ir);
     (out, carry)
 }
 
@@ -527,10 +450,18 @@ pub(crate) fn sub_bal16_same_len(
     a: &[usize],
     c: &[usize],
 ) -> (Vec<usize>, usize /* carry_out */) {
-    assert_eq!(a.len(), c.len());
-    let (neg_c, carry_neg) = neg_bal16_digits(b, c);
-    let _ = carry_neg;
-    add_bal16_same_len(b, a, &neg_c)
+    let (ir, out_ir, carry_ir) = {
+        let base_asg: &[F257] = &b.assignment;
+        let mut ib = CmIrBuilder::new(base_asg);
+        let a_ir: Vec<CmVarRef> = a.iter().copied().map(CmVarRef::Base).collect();
+        let c_ir: Vec<CmVarRef> = c.iter().copied().map(CmVarRef::Base).collect();
+        let (out_ir, carry_ir) = sub_bal16_same_len_ir(&mut ib, &a_ir, &c_ir);
+        (ib.ir, out_ir, carry_ir)
+    };
+    let lowered = lower_ir_into_builder(b, ir);
+    let out: Vec<usize> = out_ir.into_iter().map(|v| lowered.map_var(v)).collect();
+    let carry = lowered.map_var(carry_ir);
+    (out, carry)
 }
 
 #[inline]
