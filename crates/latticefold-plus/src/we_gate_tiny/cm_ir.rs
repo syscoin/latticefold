@@ -404,9 +404,11 @@ pub(crate) fn u32_bits_to_base128_limbs_ir(b: &mut IrBuilder<'_>, bits32: &[VarR
         // Witness limb value from bits.
         let mut limb_u8: u8 = 0;
         for j in start..end {
-            let bit = b.val(bits32[j]).into_bigint().to_bytes_le().get(0).copied().unwrap_or(0);
-            debug_assert!(bit == 0 || bit == 1);
-            limb_u8 |= (bit as u8) << (j - start);
+            let bv = b.val(bits32[j]);
+            debug_assert!(bv == F257::ZERO || bv == F257::ONE, "u32_bits_to_base128_limbs_ir: non-boolean bit witness");
+            if bv == F257::ONE {
+                limb_u8 |= 1u8 << (j - start);
+            }
         }
         let limb = b.new_var(F257::from(limb_u8 as u64));
 
