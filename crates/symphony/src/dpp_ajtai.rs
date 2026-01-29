@@ -14,6 +14,7 @@ use rayon::prelude::*;
 use stark_rings::{OverField, PolyRing, Ring};
 
 use crate::dpp_poseidon::{Constraint, SparseDr1csInstance};
+use core::ops::Range;
 
 /// Build a sparse dR1CS instance that enforces `AjtaiCommitmentScheme::commit(message) == commitment`.
 ///
@@ -87,10 +88,16 @@ where
         })
         .collect();
 
-    // Build linear constraints.
+    // Build linear constraints (pooled term storage).
     // Variable indices: 0 is 1, and 1+j is msg[j].
-    let mut constraints: Vec<Constraint<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>> =
-        Vec::with_capacity(kappa * d);
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(kappa * d);
+    let mut a_terms: Vec<(<<R as PolyRing>::BaseRing as Field>::BasePrimeField, usize)> =
+        Vec::new();
+    // Reuse constant-one/zero LCs on B/C.
+    let mut b_terms: Vec<(<<R as PolyRing>::BaseRing as Field>::BasePrimeField, usize)> =
+        vec![(<<R as PolyRing>::BaseRing as Field>::BasePrimeField::ONE, 0)];
+    let mut c_terms: Vec<(<<R as PolyRing>::BaseRing as Field>::BasePrimeField, usize)> =
+        vec![(<<R as PolyRing>::BaseRing as Field>::BasePrimeField::ZERO, 0)];
     for i in 0..kappa {
         for lane in 0..d {
             let mut a_lc: Vec<(<<R as PolyRing>::BaseRing as Field>::BasePrimeField, usize)> =
@@ -120,15 +127,23 @@ where
                 a_lc.push((-rhs_bf, 0));
             }
 
-            constraints.push(Constraint {
-                a: a_lc,
-                b: vec![(<<R as PolyRing>::BaseRing as Field>::BasePrimeField::ONE, 0)], // * 1
-                c: vec![(<<R as PolyRing>::BaseRing as Field>::BasePrimeField::ZERO, 0)], // = 0
-            });
+            let a0 = a_terms.len();
+            a_terms.extend(a_lc);
+            let a1 = a_terms.len();
+            constraints.push(Constraint { a: a0..a1, b: 0..1, c: 0..1 });
         }
     }
 
-    Ok((SparseDr1csInstance { nvars: assignment.len(), constraints }, assignment))
+    Ok((
+        SparseDr1csInstance {
+            nvars: assignment.len(),
+            constraints,
+            a_terms,
+            b_terms,
+            c_terms,
+        },
+        assignment,
+    ))
 }
 
 /// Same as `ajtai_open_dr1cs_from_scheme`, but supports **general ring elements** in `message`.
@@ -214,8 +229,12 @@ where
 
     // Constraints: for each commitment row i and output coeff lane_out:
     // Σ_{j,lane_in} coeff(j,lane_in -> lane_out) * msg[j][lane_in] = commitment[i][lane_out]
-    let mut constraints: Vec<Constraint<<<R as PolyRing>::BaseRing as Field>::BasePrimeField>> =
-        Vec::with_capacity(kappa * d);
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(kappa * d);
+    let mut a_terms: Vec<(<<R as PolyRing>::BaseRing as Field>::BasePrimeField, usize)> = Vec::new();
+    let mut b_terms: Vec<(<<R as PolyRing>::BaseRing as Field>::BasePrimeField, usize)> =
+        vec![(<<R as PolyRing>::BaseRing as Field>::BasePrimeField::ONE, 0)];
+    let mut c_terms: Vec<(<<R as PolyRing>::BaseRing as Field>::BasePrimeField, usize)> =
+        vec![(<<R as PolyRing>::BaseRing as Field>::BasePrimeField::ZERO, 0)];
     for i in 0..kappa {
         for lane_out in 0..d {
             let mut a_lc: Vec<(<<R as PolyRing>::BaseRing as Field>::BasePrimeField, usize)> = Vec::new();
@@ -244,15 +263,23 @@ where
                 a_lc.push((-fp, 0));
             }
 
-            constraints.push(Constraint {
-                a: a_lc,
-                b: vec![(<<R as PolyRing>::BaseRing as Field>::BasePrimeField::ONE, 0)],
-                c: vec![(<<R as PolyRing>::BaseRing as Field>::BasePrimeField::ZERO, 0)],
-            });
+            let a0 = a_terms.len();
+            a_terms.extend(a_lc);
+            let a1 = a_terms.len();
+            constraints.push(Constraint { a: a0..a1, b: 0..1, c: 0..1 });
         }
     }
 
-    Ok((SparseDr1csInstance { nvars: assignment.len(), constraints }, assignment))
+    Ok((
+        SparseDr1csInstance {
+            nvars: assignment.len(),
+            constraints,
+            a_terms,
+            b_terms,
+            c_terms,
+        },
+        assignment,
+    ))
 }
 
 #[cfg(test)]

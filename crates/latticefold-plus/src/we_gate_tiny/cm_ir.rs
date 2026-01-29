@@ -231,11 +231,14 @@ impl CmIr {
         base_inst: &mut SparseDr1csInstance<F257>,
         base_asg: &mut Vec<F257>,
     ) -> Result<(), String> {
-        let CmIr { local_asg, constraints, a_terms, b_terms, c_terms, .. } = self;
+        let CmIr { local_asg, constraints, a_terms, b_terms, c_terms, stats } = self;
         let base_nvars = base_asg.len();
         // Big win for wall-time: avoid repeated reallocations during append.
         base_asg.reserve(local_asg.len().saturating_sub(1));
         base_inst.constraints.reserve(constraints.len());
+        base_inst.a_terms.reserve(stats.total_terms_a as usize);
+        base_inst.b_terms.reserve(stats.total_terms_b as usize);
+        base_inst.c_terms.reserve(stats.total_terms_c as usize);
         // Append local vars (skip local_asg[0]=ONE).
         base_asg.extend_from_slice(&local_asg[1..]);
         let map = |v: VarRef, base_nvars: usize| -> usize {
@@ -247,21 +250,23 @@ impl CmIr {
                 }
             }
         };
-        // Stream lowering directly into the destination to avoid per-shard transient allocations.
         for ic in constraints {
-            let mut a: Vec<(F257, usize)> = Vec::with_capacity(ic.a.len());
+            let a0 = base_inst.a_terms.len();
             for &(coef, v) in &a_terms[ic.a.clone()] {
-                a.push((coef, map(v, base_nvars)));
+                base_inst.a_terms.push((coef, map(v, base_nvars)));
             }
-            let mut b: Vec<(F257, usize)> = Vec::with_capacity(ic.b.len());
+            let a1 = base_inst.a_terms.len();
+            let b0 = base_inst.b_terms.len();
             for &(coef, v) in &b_terms[ic.b.clone()] {
-                b.push((coef, map(v, base_nvars)));
+                base_inst.b_terms.push((coef, map(v, base_nvars)));
             }
-            let mut c: Vec<(F257, usize)> = Vec::with_capacity(ic.c.len());
+            let b1 = base_inst.b_terms.len();
+            let c0 = base_inst.c_terms.len();
             for &(coef, v) in &c_terms[ic.c.clone()] {
-                c.push((coef, map(v, base_nvars)));
+                base_inst.c_terms.push((coef, map(v, base_nvars)));
             }
-            base_inst.constraints.push(Constraint { a, b, c });
+            let c1 = base_inst.c_terms.len();
+            base_inst.constraints.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
         }
         base_inst.nvars = base_asg.len();
         Ok(())
@@ -298,11 +303,14 @@ impl LoweredIr {
 /// - all local witnesses as new vars
 /// - all constraints as R1CS constraints over concrete var indices
 pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> LoweredIr {
-    let CmIr { local_asg, constraints, a_terms, b_terms, c_terms, .. } = ir;
+    let CmIr { local_asg, constraints, a_terms, b_terms, c_terms, stats } = ir;
     let base_nvars = gb.assignment.len();
     // Big win for wall-time: avoid repeated reallocations during append.
     gb.assignment.reserve(local_asg.len().saturating_sub(1));
     gb.rows.reserve(constraints.len());
+    gb.a_terms.reserve(stats.total_terms_a as usize);
+    gb.b_terms.reserve(stats.total_terms_b as usize);
+    gb.c_terms.reserve(stats.total_terms_c as usize);
     let mut local_to_var: Vec<usize> = Vec::with_capacity(local_asg.len());
     local_to_var.push(0); // Local(0) unused
     for &v in local_asg.iter().skip(1) {
@@ -311,26 +319,28 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
 
     let lowered = LoweredIr { base_nvars, local_to_var };
 
-    // Stream lowering directly into the destination to avoid per-shard transient allocations.
-    //
+    // Stream lowering directly into the destination (pooled term storage).
     // We still avoid `gb.add_constraint` overhead by batching the profile counter update.
     let do_profile = gb.profile_enabled;
     let key = gb.profile_current.unwrap_or("unlabeled");
     let n_new = constraints.len() as u64;
     for ic in constraints {
-        let mut a: Vec<(F257, usize)> = Vec::with_capacity(ic.a.len());
+        let a0 = gb.a_terms.len();
         for &(coef, v) in &a_terms[ic.a.clone()] {
-            a.push((coef, lowered.map_var(v)));
+            gb.a_terms.push((coef, lowered.map_var(v)));
         }
-        let mut b: Vec<(F257, usize)> = Vec::with_capacity(ic.b.len());
+        let a1 = gb.a_terms.len();
+        let b0 = gb.b_terms.len();
         for &(coef, v) in &b_terms[ic.b.clone()] {
-            b.push((coef, lowered.map_var(v)));
+            gb.b_terms.push((coef, lowered.map_var(v)));
         }
-        let mut c: Vec<(F257, usize)> = Vec::with_capacity(ic.c.len());
+        let b1 = gb.b_terms.len();
+        let c0 = gb.c_terms.len();
         for &(coef, v) in &c_terms[ic.c.clone()] {
-            c.push((coef, lowered.map_var(v)));
+            gb.c_terms.push((coef, lowered.map_var(v)));
         }
-        gb.rows.push(Constraint { a, b, c });
+        let c1 = gb.c_terms.len();
+        gb.rows.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
     }
     if do_profile {
         gb.profile.entry(key).or_default().constraints += n_new;

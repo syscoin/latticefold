@@ -5,6 +5,7 @@
 
 use ark_ff::{BigInteger, PrimeField};
 use rayon::prelude::*;
+use core::ops::Range;
 
 use crate::poseidon_trace::{permute_with_round_trace, PoseidonReplayError};
 use crate::poseidon_trace::{replay_ops, PoseidonReplayError as ReplayErr, PoseidonSpongeReplayResult};
@@ -57,16 +58,19 @@ fn debug_log(hypothesis_id: &str, location: &str, message: &str, data_json: &str
 }
 
 #[derive(Clone, Debug)]
-pub struct Constraint<F: PrimeField> {
-    pub a: Vec<(F, usize)>,
-    pub b: Vec<(F, usize)>,
-    pub c: Vec<(F, usize)>,
+pub struct Constraint {
+    pub a: Range<usize>,
+    pub b: Range<usize>,
+    pub c: Range<usize>,
 }
 
 #[derive(Clone, Debug)]
 pub struct SparseDr1csInstance<F: PrimeField> {
     pub nvars: usize,
-    pub constraints: Vec<Constraint<F>>,
+    pub constraints: Vec<Constraint>,
+    pub a_terms: Vec<(F, usize)>,
+    pub b_terms: Vec<(F, usize)>,
+    pub c_terms: Vec<(F, usize)>,
 }
 
 impl<F: PrimeField> SparseDr1csInstance<F> {
@@ -95,9 +99,9 @@ impl<F: PrimeField> SparseDr1csInstance<F> {
             .par_iter()
             .enumerate()
             .find_any(|(_, row)| {
-                let a = Self::eval_lc(&row.a, assignment);
-                let b = Self::eval_lc(&row.b, assignment);
-                let c = Self::eval_lc(&row.c, assignment);
+                let a = Self::eval_lc(&self.a_terms[row.a.clone()], assignment);
+                let b = Self::eval_lc(&self.b_terms[row.b.clone()], assignment);
+                let c = Self::eval_lc(&self.c_terms[row.c.clone()], assignment);
                 a * b != c
             });
 
@@ -116,13 +120,13 @@ impl<F: PrimeField> SparseDr1csInstance<F> {
             let mut ra = vec![F::ZERO; n];
             let mut rb = vec![F::ZERO; n];
             let mut rc = vec![F::ZERO; n];
-            for (coeff, idx) in &row.a {
+            for (coeff, idx) in &self.a_terms[row.a.clone()] {
                 ra[*idx] += *coeff;
             }
-            for (coeff, idx) in &row.b {
+            for (coeff, idx) in &self.b_terms[row.b.clone()] {
                 rb[*idx] += *coeff;
             }
-            for (coeff, idx) in &row.c {
+            for (coeff, idx) in &self.c_terms[row.c.clone()] {
                 rc[*idx] += *coeff;
             }
                 (ra, rb, rc)
@@ -156,10 +160,16 @@ pub fn merge_sparse_dr1cs_share_one<F: PrimeField>(
 
     let total_constraints: usize = parts.iter().map(|(inst, _)| inst.constraints.len()).sum();
     let total_assignment_len: usize = parts.iter().map(|(_, asg)| asg.len()).sum();
+    let total_terms_a: usize = parts.iter().map(|(inst, _)| inst.a_terms.len()).sum();
+    let total_terms_b: usize = parts.iter().map(|(inst, _)| inst.b_terms.len()).sum();
+    let total_terms_c: usize = parts.iter().map(|(inst, _)| inst.c_terms.len()).sum();
 
     let mut merged_assignment: Vec<F> = Vec::with_capacity(total_assignment_len.saturating_sub(parts.len()) + 1);
     merged_assignment.push(F::ONE);
-    let mut merged_constraints: Vec<Constraint<F>> = Vec::with_capacity(total_constraints);
+    let mut merged_constraints: Vec<Constraint> = Vec::with_capacity(total_constraints);
+    let mut merged_a_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_a);
+    let mut merged_b_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_b);
+    let mut merged_c_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_c);
 
     for (mut inst, asg) in parts.drain(..) {
         if asg.is_empty() || asg[0] != F::ONE {
@@ -172,26 +182,34 @@ pub fn merge_sparse_dr1cs_share_one<F: PrimeField>(
         // Map part var0 -> merged var0, and shift the rest by current offset.
         let offset = merged_assignment.len() - 1;
         if offset != 0 {
-            for row in inst.constraints.iter_mut() {
-                for (_c, idx) in row.a.iter_mut() {
-                    if *idx != 0 {
-                        *idx += offset;
-                    }
+            for (_c, idx) in inst.a_terms.iter_mut() {
+                if *idx != 0 {
+                    *idx += offset;
                 }
-                for (_c, idx) in row.b.iter_mut() {
-                    if *idx != 0 {
-                        *idx += offset;
-                    }
+            }
+            for (_c, idx) in inst.b_terms.iter_mut() {
+                if *idx != 0 {
+                    *idx += offset;
                 }
-                for (_c, idx) in row.c.iter_mut() {
-                    if *idx != 0 {
-                        *idx += offset;
-                    }
+            }
+            for (_c, idx) in inst.c_terms.iter_mut() {
+                if *idx != 0 {
+                    *idx += offset;
                 }
             }
         }
 
-        merged_constraints.extend(inst.constraints.drain(..));
+        let a_base = merged_a_terms.len();
+        let b_base = merged_b_terms.len();
+        let c_base = merged_c_terms.len();
+        merged_a_terms.extend(inst.a_terms.drain(..));
+        merged_b_terms.extend(inst.b_terms.drain(..));
+        merged_c_terms.extend(inst.c_terms.drain(..));
+        merged_constraints.extend(inst.constraints.drain(..).map(|row| Constraint {
+            a: (a_base + row.a.start)..(a_base + row.a.end),
+            b: (b_base + row.b.start)..(b_base + row.b.end),
+            c: (c_base + row.c.start)..(c_base + row.c.end),
+        }));
         merged_assignment.extend_from_slice(&asg[1..]);
     }
 
@@ -199,6 +217,9 @@ pub fn merge_sparse_dr1cs_share_one<F: PrimeField>(
         SparseDr1csInstance {
             nvars: merged_assignment.len(),
             constraints: merged_constraints,
+            a_terms: merged_a_terms,
+            b_terms: merged_b_terms,
+            c_terms: merged_c_terms,
         },
         merged_assignment,
     ))
@@ -458,70 +479,42 @@ fn merge_sparse_dr1cs_share_one_with_glue_impl<F: PrimeField>(
     }
 
     let total_constraints: usize = parts.iter().map(|(inst, _)| inst.constraints.len()).sum::<usize>();
-    let mut merged_constraints: Vec<Constraint<F>> = Vec::with_capacity(total_constraints);
+    let total_terms_a: usize = parts.iter().map(|(inst, _)| inst.a_terms.len()).sum();
+    let total_terms_b: usize = parts.iter().map(|(inst, _)| inst.b_terms.len()).sum();
+    let total_terms_c: usize = parts.iter().map(|(inst, _)| inst.c_terms.len()).sum();
 
-    // Merge constraints with remapped indices.
-    //
-    // Default is a single-pass, allocation-friendly merge.
-    //
-    // For very large gates (multi-million constraints), this merge can become a wall-time
-    // bottleneck and appear “single-core bound” in system monitors. In that case, we allow a
-    // parallel remap that preserves constraint order and does not allocate *extra* constraints
-    // beyond the final merged list (it still must allocate the final `merged_constraints`).
-    let use_parallel_merge = total_constraints >= 2_000_000;
+    let mut merged_constraints: Vec<Constraint> = Vec::with_capacity(total_constraints);
+    let mut merged_a_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_a);
+    let mut merged_b_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_b);
+    let mut merged_c_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_c);
 
-    if use_parallel_merge {
-        let remapped_parts: Vec<Vec<Constraint<F>>> = parts
-            .par_iter()
-            .enumerate()
-            .map(|(part_idx, (inst, _asg))| {
-                let offset = offsets[part_idx];
-                let remap_idx = |idx: usize| -> usize {
-                    let g = if idx == 0 { 0 } else { idx + offset };
-                    new_index[g]
-                };
-                let remap_lc = |lc: &[(F, usize)]| -> Vec<(F, usize)> {
-                    let mut out = Vec::with_capacity(lc.len());
-                    for (c, i) in lc {
-                        out.push((*c, remap_idx(*i)));
-                    }
-                    out
-                };
-                inst.constraints
-                    .par_iter()
-                    .map(|row| Constraint {
-                        a: remap_lc(&row.a),
-                        b: remap_lc(&row.b),
-                        c: remap_lc(&row.c),
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-
-        for v in remapped_parts {
-            merged_constraints.extend(v);
-        }
-    } else {
-        for (part_idx, (inst, _asg)) in parts.iter().enumerate() {
-            let offset = offsets[part_idx];
-            let remap_idx = |idx: usize| -> usize {
-                let g = if idx == 0 { 0 } else { idx + offset };
-                new_index[g]
-            };
-            for row in &inst.constraints {
-                let remap_lc = |lc: &[(F, usize)]| -> Vec<(F, usize)> {
-                    let mut out = Vec::with_capacity(lc.len());
-                    for (c, i) in lc {
-                        out.push((*c, remap_idx(*i)));
-                    }
-                    out
-                };
-                merged_constraints.push(Constraint {
-                    a: remap_lc(&row.a),
-                    b: remap_lc(&row.b),
-                    c: remap_lc(&row.c),
-                });
+    // Merge constraints with remapped indices directly into pooled term arrays.
+    for (part_idx, (inst, _asg)) in parts.iter().enumerate() {
+        let offset = offsets[part_idx];
+        let remap_idx = |idx: usize| -> usize {
+            let g = if idx == 0 { 0 } else { idx + offset };
+            new_index[g]
+        };
+        for row in &inst.constraints {
+            let a0 = merged_a_terms.len();
+            for (c, i) in &inst.a_terms[row.a.clone()] {
+                merged_a_terms.push((*c, remap_idx(*i)));
             }
+            let a1 = merged_a_terms.len();
+
+            let b0 = merged_b_terms.len();
+            for (c, i) in &inst.b_terms[row.b.clone()] {
+                merged_b_terms.push((*c, remap_idx(*i)));
+            }
+            let b1 = merged_b_terms.len();
+
+            let c0 = merged_c_terms.len();
+            for (c, i) in &inst.c_terms[row.c.clone()] {
+                merged_c_terms.push((*c, remap_idx(*i)));
+            }
+            let c1 = merged_c_terms.len();
+
+            merged_constraints.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
         }
     }
 
@@ -542,6 +535,9 @@ fn merge_sparse_dr1cs_share_one_with_glue_impl<F: PrimeField>(
         SparseDr1csInstance {
             nvars: new_assignment.len(),
             constraints: merged_constraints,
+            a_terms: merged_a_terms,
+            b_terms: merged_b_terms,
+            c_terms: merged_c_terms,
         },
         new_assignment,
     ))
@@ -550,7 +546,10 @@ fn merge_sparse_dr1cs_share_one_with_glue_impl<F: PrimeField>(
 #[derive(Clone, Debug)]
 struct Dr1csBuilder<F: PrimeField> {
     assignment: Vec<F>,
-    rows: Vec<Constraint<F>>,
+    rows: Vec<Constraint>,
+    a_terms: Vec<(F, usize)>,
+    b_terms: Vec<(F, usize)>,
+    c_terms: Vec<(F, usize)>,
 }
 
 impl<F: PrimeField> Dr1csBuilder<F> {
@@ -559,6 +558,9 @@ impl<F: PrimeField> Dr1csBuilder<F> {
         Self {
             assignment: vec![F::ONE],
             rows: Vec::new(),
+            a_terms: Vec::new(),
+            b_terms: Vec::new(),
+            c_terms: Vec::new(),
         }
     }
 
@@ -573,7 +575,16 @@ impl<F: PrimeField> Dr1csBuilder<F> {
     }
 
     fn add_constraint(&mut self, a: Vec<(F, usize)>, b: Vec<(F, usize)>, c: Vec<(F, usize)>) {
-        self.rows.push(Constraint { a, b, c });
+        let a0 = self.a_terms.len();
+        self.a_terms.extend(a);
+        let a1 = self.a_terms.len();
+        let b0 = self.b_terms.len();
+        self.b_terms.extend(b);
+        let b1 = self.b_terms.len();
+        let c0 = self.c_terms.len();
+        self.c_terms.extend(c);
+        let c1 = self.c_terms.len();
+        self.rows.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
     }
 
     fn enforce_lc_times_one_eq_var(&mut self, lc: Vec<(F, usize)>, out: usize) {
@@ -687,6 +698,9 @@ impl<F: PrimeField> Dr1csBuilder<F> {
         let inst = SparseDr1csInstance {
             nvars,
             constraints: self.rows,
+            a_terms: self.a_terms,
+            b_terms: self.b_terms,
+            c_terms: self.c_terms,
         };
         (inst, self.assignment)
     }

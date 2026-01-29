@@ -13,6 +13,7 @@
 use ark_ff::PrimeField;
 
 use std::collections::BTreeMap;
+use core::ops::Range;
 
 use crate::dpp_poseidon::{Constraint, SparseDr1csInstance};
 
@@ -25,7 +26,10 @@ pub struct Dr1csProfileCounts {
 #[derive(Clone, Debug)]
 pub struct Dr1csBuilder<F: PrimeField> {
     pub assignment: Vec<F>,
-    pub rows: Vec<Constraint<F>>,
+    pub rows: Vec<Constraint>,
+    pub a_terms: Vec<(F, usize)>,
+    pub b_terms: Vec<(F, usize)>,
+    pub c_terms: Vec<(F, usize)>,
     /// Cache for reusing a byte var's bit-decomposition across gadgets.
     ///
     /// Key: byte variable index. Value: 8 boolean bit variable indices (little-endian).
@@ -63,6 +67,9 @@ impl<F: PrimeField> Dr1csBuilder<F> {
         Self {
             assignment: vec![F::ONE],
             rows: Vec::new(),
+            a_terms: Vec::new(),
+            b_terms: Vec::new(),
+            c_terms: Vec::new(),
             byte_bits_cache: BTreeMap::new(),
             u64_bal16_cache: BTreeMap::new(),
             u32_bal16_cache: BTreeMap::new(),
@@ -82,21 +89,51 @@ impl<F: PrimeField> Dr1csBuilder<F> {
         }
         idx
     }
+    #[inline]
+    fn push_terms(pool: &mut Vec<(F, usize)>, terms: &[(F, usize)]) -> Range<usize> {
+        let start = pool.len();
+        pool.extend_from_slice(terms);
+        let end = pool.len();
+        start..end
+    }
+
     pub fn add_constraint(&mut self, a: Vec<(F, usize)>, b: Vec<(F, usize)>, c: Vec<(F, usize)>) {
-        self.rows.push(Constraint { a, b, c });
+        self.add_constraint_slices(&a, &b, &c);
         if self.profile_enabled {
             let key = self.profile_current.unwrap_or("unlabeled");
             self.profile.entry(key).or_default().constraints += 1;
         }
     }
+
+    #[inline]
+    pub fn add_constraint_slices(&mut self, a: &[(F, usize)], b: &[(F, usize)], c: &[(F, usize)]) {
+        let ar = Self::push_terms(&mut self.a_terms, a);
+        let br = Self::push_terms(&mut self.b_terms, b);
+        let cr = Self::push_terms(&mut self.c_terms, c);
+        self.rows.push(Constraint { a: ar, b: br, c: cr });
+    }
     pub fn enforce_lc_times_one_eq_const(&mut self, lc: Vec<(F, usize)>) {
-        self.add_constraint(lc, vec![(F::ONE, self.one())], vec![(F::ZERO, self.one())]);
+        let one = self.one();
+        self.add_constraint_slices(&lc, &[(F::ONE, one)], &[(F::ZERO, one)]);
+        if self.profile_enabled {
+            let key = self.profile_current.unwrap_or("unlabeled");
+            self.profile.entry(key).or_default().constraints += 1;
+        }
     }
     pub fn enforce_var_eq_const(&mut self, x: usize, c: F) {
-        self.add_constraint(vec![(F::ONE, x)], vec![(F::ONE, self.one())], vec![(c, self.one())]);
+        let one = self.one();
+        self.add_constraint_slices(&[(F::ONE, x)], &[(F::ONE, one)], &[(c, one)]);
+        if self.profile_enabled {
+            let key = self.profile_current.unwrap_or("unlabeled");
+            self.profile.entry(key).or_default().constraints += 1;
+        }
     }
     pub fn enforce_mul(&mut self, x: usize, y: usize, out: usize) {
-        self.add_constraint(vec![(F::ONE, x)], vec![(F::ONE, y)], vec![(F::ONE, out)]);
+        self.add_constraint_slices(&[(F::ONE, x)], &[(F::ONE, y)], &[(F::ONE, out)]);
+        if self.profile_enabled {
+            let key = self.profile_current.unwrap_or("unlabeled");
+            self.profile.entry(key).or_default().constraints += 1;
+        }
     }
 
     /// Return a reusable variable constrained to 0.
@@ -110,7 +147,13 @@ impl<F: PrimeField> Dr1csBuilder<F> {
         v
     }
     pub fn into_instance(self) -> (SparseDr1csInstance<F>, Vec<F>) {
-        let inst = SparseDr1csInstance { nvars: self.assignment.len(), constraints: self.rows };
+        let inst = SparseDr1csInstance {
+            nvars: self.assignment.len(),
+            constraints: self.rows,
+            a_terms: self.a_terms,
+            b_terms: self.b_terms,
+            c_terms: self.c_terms,
+        };
         (inst, self.assignment)
     }
 
