@@ -8,6 +8,48 @@ use cyclotomic_rings::rings::goldilocks_ntt64 as gl_ntt64;
 use super::digits::{f257_to_i32_bal, i32_to_f257};
 use super::params::{DIGITS_PER_TRY, LIMB_BASE_U64, LIMB_BITS, LIMBS_U32, LIMBS_U64};
 
+// -----------------------------------------------------------------------------
+// Fox #1 (maintainable): explicit checked vs loose digit types (IR-side)
+// -----------------------------------------------------------------------------
+//
+// The goal is to make "checked vs loose" explicit in function signatures inside the IR, so we
+// don't accidentally feed loose digits into gadgets that assume canonical balanced digits.
+//
+// - Bal16CheckedIr: each digit is intended to be in [-8,7] (range is proven when digits are
+//   allocated via `alloc_bal16_digit_ir`, which uses 4 boolean bits).
+// - Bal16LooseIr: digits are field elements with a static integer-lift bound |d_i| ≤ M < 128,
+//   so linear constraints are injective over the integers (no mod-257 aliasing).
+
+#[derive(Clone, Debug)]
+pub(crate) struct Bal16CheckedIr(pub(crate) Vec<VarRef>);
+
+impl Bal16CheckedIr {
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl core::ops::Deref for Bal16CheckedIr {
+    type Target = [VarRef];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Bal16LooseIr {
+    pub(crate) digits: Vec<VarRef>,
+    pub(crate) abs_bound: i32,
+}
+
+impl Bal16LooseIr {
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.digits.len()
+    }
+}
+
 /// Variable reference for a CM IR fragment.
 ///
 /// - `Base(i)` refers to an existing variable in the *base* glue module (same numbering as the base glue instance).
@@ -697,10 +739,215 @@ pub(crate) fn alloc_carry_pm1_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
     c_var
 }
 
+// Small carry ranges (statement-only): allocate by offsetting into a small unsigned range and
+// bit-decomposing that offset. This is used by normalization of loose digits.
+#[inline]
+pub(crate) fn alloc_carry_pm8_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
+    debug_assert!((-8..=7).contains(&c));
+    let off: u8 = (c + 8) as u8; // in [0,15]
+    let mut bits4 = [b.one(); 4];
+    for i in 0..4 {
+        bits4[i] = alloc_bool_ir(b, ((off >> i) & 1) == 1);
+    }
+    let off_var = b.new_var(F257::from(off as u64));
+    // off = Σ 2^i * bits[i]
+    b.enforce_lc_eq_zero(vec![
+        (F257::ONE, off_var),
+        (-F257::ONE, bits4[0]),
+        (-F257::from(2u64), bits4[1]),
+        (-F257::from(4u64), bits4[2]),
+        (-F257::from(8u64), bits4[3]),
+    ]);
+    let c_var = b.new_var(i32_to_f257(c));
+    // c = off - 8
+    b.enforce_lc_eq_zero(vec![
+        (F257::ONE, c_var),
+        (-F257::ONE, off_var),
+        (F257::from(8u64), b.one()),
+    ]);
+    c_var
+}
+
+#[inline]
+pub(crate) fn alloc_carry_pm16_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
+    debug_assert!((-16..=15).contains(&c));
+    let off: u8 = (c + 16) as u8; // in [0,31]
+    let mut bits5 = [b.one(); 5];
+    for i in 0..5 {
+        bits5[i] = alloc_bool_ir(b, ((off >> i) & 1) == 1);
+    }
+    let off_var = b.new_var(F257::from(off as u64));
+    let mut lc = vec![(F257::ONE, off_var)];
+    let mut pow: u64 = 1;
+    for i in 0..5 {
+        lc.push((-F257::from(pow), bits5[i]));
+        pow <<= 1;
+    }
+    b.enforce_lc_eq_zero(lc);
+    let c_var = b.new_var(i32_to_f257(c));
+    b.enforce_lc_eq_zero(vec![(F257::ONE, c_var), (-F257::ONE, off_var), (F257::from(16u64), b.one())]);
+    c_var
+}
+
+#[inline]
+pub(crate) fn alloc_carry_pm32_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
+    debug_assert!((-32..=31).contains(&c));
+    let off: u8 = (c + 32) as u8; // in [0,63]
+    let mut bits6 = [b.one(); 6];
+    for i in 0..6 {
+        bits6[i] = alloc_bool_ir(b, ((off >> i) & 1) == 1);
+    }
+    let off_var = b.new_var(F257::from(off as u64));
+    let mut lc = vec![(F257::ONE, off_var)];
+    let mut pow: u64 = 1;
+    for i in 0..6 {
+        lc.push((-F257::from(pow), bits6[i]));
+        pow <<= 1;
+    }
+    b.enforce_lc_eq_zero(lc);
+    let c_var = b.new_var(i32_to_f257(c));
+    b.enforce_lc_eq_zero(vec![(F257::ONE, c_var), (-F257::ONE, off_var), (F257::from(32u64), b.one())]);
+    c_var
+}
+
+#[inline]
+pub(crate) fn alloc_carry_pm64_ir(b: &mut IrBuilder<'_>, c: i32) -> VarRef {
+    debug_assert!((-64..=63).contains(&c));
+    let off: u8 = (c + 64) as u8; // in [0,127]
+    let mut bits7 = [b.one(); 7];
+    for i in 0..7 {
+        bits7[i] = alloc_bool_ir(b, ((off >> i) & 1) == 1);
+    }
+    let off_var = b.new_var(F257::from(off as u64));
+    let mut lc = vec![(F257::ONE, off_var)];
+    let mut pow: u64 = 1;
+    for i in 0..7 {
+        lc.push((-F257::from(pow), bits7[i]));
+        pow <<= 1;
+    }
+    b.enforce_lc_eq_zero(lc);
+    let c_var = b.new_var(i32_to_f257(c));
+    b.enforce_lc_eq_zero(vec![(F257::ONE, c_var), (-F257::ONE, off_var), (F257::from(64u64), b.one())]);
+    c_var
+}
+
+#[inline]
+fn alloc_carry_with_bound_ir(b: &mut IrBuilder<'_>, c: i32, bound: i32) -> VarRef {
+    debug_assert!(bound >= 0);
+    if bound <= 1 {
+        alloc_carry_pm1_ir(b, c)
+    } else if bound <= 2 {
+        alloc_carry_pm2_ir(b, c)
+    } else if bound <= 7 {
+        alloc_carry_pm8_ir(b, c)
+    } else if bound <= 15 {
+        alloc_carry_pm16_ir(b, c)
+    } else if bound <= 31 {
+        alloc_carry_pm32_ir(b, c)
+    } else if bound <= 63 {
+        alloc_carry_pm64_ir(b, c)
+    } else {
+        alloc_carry_pm128_ir(b, c)
+    }
+}
+
+/// Digitwise addition in the *loose* domain (no carries, no digit range checks).
+pub(crate) fn add_bal16_loose_same_len_ir(b: &mut IrBuilder<'_>, a: &Bal16LooseIr, c: &Bal16LooseIr) -> Bal16LooseIr {
+    assert_eq!(a.len(), c.len());
+    let n = a.len();
+    let mut out: Vec<VarRef> = Vec::with_capacity(n);
+    for i in 0..n {
+        let v = b.new_var(b.val(a.digits[i]) + b.val(c.digits[i]));
+        // v = a_i + c_i
+        b.enforce_lc_eq_zero(vec![(F257::ONE, v), (-F257::ONE, a.digits[i]), (-F257::ONE, c.digits[i])]);
+        out.push(v);
+    }
+    Bal16LooseIr {
+        digits: out,
+        abs_bound: a.abs_bound.saturating_add(c.abs_bound),
+    }
+}
+
+/// Normalize a *loose* base-16 digit vector into checked balanced digits ([-8,7]).
+///
+/// For each i: `loose_i + carry_i = checked_i + 16*carry_{i+1}`.
+pub(crate) fn normalize_bal16_loose_same_len_ir(b: &mut IrBuilder<'_>, loose: &Bal16LooseIr) -> (Bal16CheckedIr, VarRef) {
+    debug_assert!(loose.abs_bound >= 0);
+    debug_assert!(loose.abs_bound < 128);
+    let n = loose.len();
+    let digit_abs_bound = loose.abs_bound;
+
+    // Conservative carry bound schedule (same reasoning as builder-side).
+    let mut carry_bound: i32 = 0;
+    let mut carry_bounds: Vec<i32> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let max_sum = digit_abs_bound + carry_bound;
+        carry_bound = ((max_sum + 8) / 16) + 1;
+        carry_bounds.push(carry_bound);
+        debug_assert!(carry_bound < 128);
+    }
+
+    let mut out: Vec<VarRef> = Vec::with_capacity(n);
+    let mut carry_i32: i32 = 0;
+    // carry_0 = 0 (no var)
+    let mut carry_var: Option<VarRef> = None;
+
+    let div_floor = |x: i32, d: i32| -> i32 {
+        debug_assert!(d > 0);
+        if x >= 0 { x / d } else { -(((-x) + d - 1) / d) }
+    };
+
+    for i in 0..n {
+        let dv = loose.digits[i];
+        let di = f257_to_i32_bal(b.val(dv));
+        debug_assert!(
+            (-digit_abs_bound..=digit_abs_bound).contains(&di),
+            "normalize_bal16_loose_same_len_ir: digit out of assumed bound"
+        );
+        let sum = di + carry_i32;
+
+        let mut carry_next = div_floor(sum + 8, 16);
+        let mut rem = sum - 16 * carry_next;
+        while rem > 7 {
+            carry_next += 1;
+            rem -= 16;
+        }
+        while rem < -8 {
+            carry_next -= 1;
+            rem += 16;
+        }
+        debug_assert!((-8..=7).contains(&rem));
+        debug_assert!(
+            (-carry_bounds[i]..=carry_bounds[i]).contains(&carry_next),
+            "normalize_bal16_loose_same_len_ir: carry out of bound"
+        );
+
+        let rem_digit = alloc_bal16_digit_ir(b, rem as i8);
+        let carry_next_var = alloc_carry_with_bound_ir(b, carry_next, carry_bounds[i]);
+
+        // loose_i + carry_i - rem_i - 16*carry_{i+1} = 0
+        let mut lc = vec![
+            (F257::ONE, dv),
+            (-F257::ONE, rem_digit),
+            (-F257::from(16u64), carry_next_var),
+        ];
+        if let Some(carryv) = carry_var {
+            lc.insert(1, (F257::ONE, carryv));
+        }
+        b.enforce_lc_eq_zero(lc);
+
+        out.push(rem_digit);
+        carry_i32 = carry_next;
+        carry_var = Some(carry_next_var);
+    }
+
+    (Bal16CheckedIr(out), carry_var.expect("normalize_bal16_loose_same_len_ir: non-empty"))
+}
+
 /// Add two balanced base-16 digit vectors of the same length.
 ///
 /// Assumes each digit is in [-8,7]. Enforces output digits in [-8,7] and carry in {-1,0,1}.
-pub(crate) fn add_bal16_same_len_ir(b: &mut IrBuilder<'_>, a: &[VarRef], c: &[VarRef]) -> (Vec<VarRef>, VarRef) {
+pub(crate) fn add_bal16_same_len_ir(b: &mut IrBuilder<'_>, a: &Bal16CheckedIr, c: &Bal16CheckedIr) -> (Bal16CheckedIr, VarRef) {
     assert_eq!(a.len(), c.len());
     let n = a.len();
     let mut out: Vec<VarRef> = Vec::with_capacity(n);
@@ -745,11 +992,11 @@ pub(crate) fn add_bal16_same_len_ir(b: &mut IrBuilder<'_>, a: &[VarRef], c: &[Va
         carry = Some(carry_next_var);
     }
 
-    (out, carry.expect("add_bal16_same_len_ir: non-empty input must produce carry var"))
+    (Bal16CheckedIr(out), carry.expect("add_bal16_same_len_ir: non-empty input must produce carry var"))
 }
 
 /// Negate a balanced base-16 digit vector (little-endian), producing digits in [-8,7].
-pub(crate) fn neg_bal16_digits_ir(b: &mut IrBuilder<'_>, x: &[VarRef]) -> (Vec<VarRef>, VarRef) {
+pub(crate) fn neg_bal16_digits_ir(b: &mut IrBuilder<'_>, x: &Bal16CheckedIr) -> (Bal16CheckedIr, VarRef) {
     let n = x.len();
     let mut out: Vec<VarRef> = Vec::with_capacity(n);
     let mut carry_i32: i32 = 0;
@@ -791,11 +1038,11 @@ pub(crate) fn neg_bal16_digits_ir(b: &mut IrBuilder<'_>, x: &[VarRef]) -> (Vec<V
         carry = Some(carry_next_var);
     }
 
-    (out, carry.expect("neg_bal16_digits_ir: non-empty input must produce carry var"))
+    (Bal16CheckedIr(out), carry.expect("neg_bal16_digits_ir: non-empty input must produce carry var"))
 }
 
 /// Subtract two balanced base-16 digit vectors of the same length: `a - c`.
-pub(crate) fn sub_bal16_same_len_ir(b: &mut IrBuilder<'_>, a: &[VarRef], c: &[VarRef]) -> (Vec<VarRef>, VarRef) {
+pub(crate) fn sub_bal16_same_len_ir(b: &mut IrBuilder<'_>, a: &Bal16CheckedIr, c: &Bal16CheckedIr) -> (Bal16CheckedIr, VarRef) {
     assert_eq!(a.len(), c.len());
     let (neg_c, _carry_neg) = neg_bal16_digits_ir(b, c);
     add_bal16_same_len_ir(b, a, &neg_c)
@@ -1189,6 +1436,8 @@ pub(crate) fn goldilocks_mul_const_mod_p_digits_ir(
     let prod: u128 = (x_u as u128) * (k as u128);
     let q_u: u64 = (prod / (p_u64 as u128)) as u64;
     let r_u: u64 = (prod % (p_u64 as u128)) as u64;
+    // Keep q/r as *checked* digits here: this gadget's linear combination can exceed the
+    // injective lift range, so "raw" digits would be unconstrained and unsound.
     let q_d = alloc_u64_as_bal16_digits_witness_ir(b, q_u);
     let r_d = alloc_u64_as_bal16_digits_witness_ir(b, r_u);
     let k_d_const = u64_to_bal16_digits_le_const(k);
@@ -1473,6 +1722,8 @@ pub(crate) fn goldilocks_mul_mod_p_digits_ir(
     let q_u: u64 = (prod_u / (p_u64 as u128)) as u64;
     let r_u: u64 = (prod_u % (p_u64 as u128)) as u64;
 
+    // Keep q/r as *checked* digits here: the product carry chain sums can exceed the injective
+    // lift range, so we need real digit range checks (Fox #1 does not justify dropping them).
     let q_d = alloc_u64_as_bal16_digits_witness_ir(b, q_u);
     let r_d = alloc_u64_as_bal16_digits_witness_ir(b, r_u);
 

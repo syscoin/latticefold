@@ -25,6 +25,7 @@ use super::digits::{
     rebalance_prod12_to_prod13, rebalance_prod21_to_prod22, scale_short_coeffs_by_digits18,
     scale_short_coeffs_by_digits9, sum_bal16_vectors_fixed_len, sum_product_digits_bal16,
     sum_product_digits_bal16_22, sum_products13_coeffwise_fixed_len, sum_products22_coeffwise_fixed_len,
+    Bal16Checked,
 };
 use super::goldilocks::{
     goldilocks_add_mod_p_from_byte_vars_assume_canonical, goldilocks_mul_mod_p_from_byte_vars_assume_canonical,
@@ -1181,7 +1182,7 @@ struct SurfaceLocal<const RAW: usize, const NORM: usize> {
     u32_idx: usize,
     products_raw: Vec<[usize; RAW]>,
     products_norm: Vec<[usize; NORM]>,
-    sum_digits: Vec<usize>,
+    sum_digits: Bal16Checked,
 }
 
 type UDigitsFn = for<'a> fn(&'a BoundedU32ChallengeWiring) -> &'a [usize];
@@ -1196,10 +1197,10 @@ fn build_surfaces_generic<const RAW: usize, const NORM: usize, const SUM: usize>
     u_digits_of: UDigitsFn,
     scale_fn: fn(&mut Dr1csBuilder<F257>, &[[usize; 3]], &[usize]) -> Vec<[usize; RAW]>,
     rebalance_fn: fn(&mut Dr1csBuilder<F257>, &[usize; RAW]) -> [usize; NORM],
-    sum_product_digits_fn: fn(&mut Dr1csBuilder<F257>, &[[usize; NORM]], usize) -> Vec<usize>,
-    sum_products_coeffwise_fn: fn(&mut Dr1csBuilder<F257>, &[&[[usize; NORM]]], usize, usize) -> Vec<Vec<usize>>,
+    sum_product_digits_fn: fn(&mut Dr1csBuilder<F257>, &[[usize; NORM]], usize) -> Bal16Checked,
+    sum_products_coeffwise_fn: fn(&mut Dr1csBuilder<F257>, &[&[[usize; NORM]]], usize, usize) -> Vec<Bal16Checked>,
     u_digits_len: usize,
-) -> Result<(Vec<SurfaceLocal<RAW, NORM>>, Vec<usize>, Vec<Vec<usize>>), String> {
+) -> Result<(Vec<SurfaceLocal<RAW, NORM>>, Bal16Checked, Vec<Bal16Checked>), String> {
     let mut surfaces: Vec<SurfaceLocal<RAW, NORM>> = Vec::with_capacity(pairs.len());
     let zero_f = glue.gb.new_var(F257::ZERO);
     glue.gb.enforce_var_eq_const(zero_f, F257::ZERO);
@@ -1332,7 +1333,7 @@ fn build_surfaces_generic<const RAW: usize, const NORM: usize, const SUM: usize>
     }
 
     let all_sum_digits = {
-        let refs: Vec<&[usize]> = surfaces.iter().map(|s| s.sum_digits.as_slice()).collect();
+        let refs: Vec<&Bal16Checked> = surfaces.iter().map(|s| &s.sum_digits).collect();
         sum_bal16_vectors_fixed_len(&mut glue.gb, &refs, SUM)
     };
     let all_sum_coeffwise = {
@@ -1383,7 +1384,7 @@ fn build_mul_surfaces(
     fn u_digits(u: &BoundedU32ChallengeWiring) -> &[usize] {
         &u.bal16_digits
     }
-    fn sum_digits(gb: &mut Dr1csBuilder<F257>, p: &[[usize; 13]], target_len: usize) -> Vec<usize> {
+    fn sum_digits(gb: &mut Dr1csBuilder<F257>, p: &[[usize; 13]], target_len: usize) -> Bal16Checked {
         sum_product_digits_bal16(gb, p, target_len)
     }
 
@@ -1407,11 +1408,13 @@ fn build_mul_surfaces(
             u32_idx: s.u32_idx,
             products: s.products_raw,
             products13: s.products_norm,
-            sum_digits: s.sum_digits,
+            sum_digits: s.sum_digits.into_vec(),
             sum_all_pairs_digits: Arc::new(Vec::new()),
             sum_all_pairs_coeffwise: Arc::new(Vec::new()),
         })
         .collect();
+    let all_sum_digits = all_sum_digits.into_vec();
+    let all_sum_coeffwise = all_sum_coeffwise.into_iter().map(|v| v.into_vec()).collect();
     Ok((surfaces, all_sum_digits, all_sum_coeffwise))
 }
 
@@ -1425,7 +1428,7 @@ fn build_sq_surfaces(
     fn u_digits(u: &BoundedU32ChallengeWiring) -> &[usize] {
         &u.bal16_sq_digits
     }
-    fn sum_digits(gb: &mut Dr1csBuilder<F257>, p: &[[usize; 22]], target_len: usize) -> Vec<usize> {
+    fn sum_digits(gb: &mut Dr1csBuilder<F257>, p: &[[usize; 22]], target_len: usize) -> Bal16Checked {
         sum_product_digits_bal16_22(gb, p, target_len)
     }
 
@@ -1449,11 +1452,13 @@ fn build_sq_surfaces(
             u32_idx: s.u32_idx,
             products21: s.products_raw,
             products22: s.products_norm,
-            sum_digits: s.sum_digits,
+            sum_digits: s.sum_digits.into_vec(),
             sum_all_pairs_digits: Arc::new(Vec::new()),
             sum_all_pairs_coeffwise: Arc::new(Vec::new()),
         })
         .collect();
+    let all_sum_digits = all_sum_digits.into_vec();
+    let all_sum_coeffwise = all_sum_coeffwise.into_iter().map(|v| v.into_vec()).collect();
     Ok((surfaces, all_sum_digits, all_sum_coeffwise))
 }
 

@@ -1,4 +1,4 @@
-use ark_ff::{BigInteger, PrimeField};
+use ark_ff::PrimeField;
 
 use latticefold::transcript::poseidon::F257;
 use symphony::transcript::PoseidonTraceOp;

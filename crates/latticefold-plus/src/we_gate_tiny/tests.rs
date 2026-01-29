@@ -628,20 +628,24 @@ fn test_add_bal16_same_len_roundtrip() {
     b.enforce_var_eq_const(b.one(), F257::ONE);
 
     // a = 0x0777 (3 digits), b = 0x0001 (3 digits)
-    let a = vec![
+    let a = Bal16Checked(vec![
         alloc_bal16_digit(&mut b, 0x7),
         alloc_bal16_digit(&mut b, 0x7),
         alloc_bal16_digit(&mut b, 0x7),
-    ];
-    let c = vec![alloc_bal16_digit(&mut b, 1), alloc_bal16_digit(&mut b, 0), alloc_bal16_digit(&mut b, 0)];
+    ]);
+    let c = Bal16Checked(vec![
+        alloc_bal16_digit(&mut b, 1),
+        alloc_bal16_digit(&mut b, 0),
+        alloc_bal16_digit(&mut b, 0),
+    ]);
 
     let (sum, carry) = add_bal16_same_len(&mut b, &a, &c);
     let (inst, asg) = b.into_instance();
     inst.check(&asg).expect("add_bal16_same_len satisfiable");
 
-    let a_i = decode(&asg, &a);
-    let c_i = decode(&asg, &c);
-    let sum_i = decode(&asg, &sum)
+    let a_i = decode(&asg, a.as_slice());
+    let c_i = decode(&asg, c.as_slice());
+    let sum_i = decode(&asg, sum.as_slice())
         + (f257_to_i32_bal(asg[carry]) as i128) * 16i128.pow(sum.len() as u32);
     assert_eq!(sum_i, a_i + c_i);
 }
@@ -677,8 +681,8 @@ fn test_neg_and_sub_bal16_roundtrip() {
 
         let mut b = Dr1csBuilder::<F257>::new();
         b.enforce_var_eq_const(b.one(), F257::ONE);
-        let xvars: Vec<usize> = xd.iter().map(|&d| alloc_bal16_digit(&mut b, d)).collect();
-        let yvars: Vec<usize> = yd.iter().map(|&d| alloc_bal16_digit(&mut b, d)).collect();
+        let xvars = Bal16Checked(xd.iter().map(|&d| alloc_bal16_digit(&mut b, d)).collect());
+        let yvars = Bal16Checked(yd.iter().map(|&d| alloc_bal16_digit(&mut b, d)).collect());
 
         let (nx, c0) = neg_bal16_digits(&mut b, &xvars);
         let (diff, c1) = sub_bal16_same_len(&mut b, &xvars, &yvars);
@@ -699,8 +703,8 @@ fn test_neg_and_sub_bal16_roundtrip() {
             }
             acc
         };
-        assert_eq!(decode(&nx), -(x as i128));
-        assert_eq!(decode(&diff), (x as i128) - (y as i128));
+        assert_eq!(decode(nx.as_slice()), -(x as i128));
+        assert_eq!(decode(diff.as_slice()), (x as i128) - (y as i128));
     }
 }
 

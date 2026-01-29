@@ -1,4 +1,4 @@
-use ark_ff::{BigInteger, Field, PrimeField};
+use ark_ff::{Field, PrimeField};
 
 use latticefold::transcript::poseidon::F257;
 use symphony::dpp_sumcheck::Dr1csBuilder;
@@ -8,6 +8,10 @@ use super::cm_ir::{
     alloc_bal16_digit_ir, alloc_carry_pm128_ir, alloc_carry_pm2_ir, lower_ir_into_builder, IrBuilder as CmIrBuilder,
     add_bal16_same_len_ir, alloc_carry_pm1_ir, neg_bal16_digits_ir, sub_bal16_same_len_ir,
     u32_bytes_to_bal16_digits_from_bits_ir, u64_bytes_to_bal16_digits_from_bits_ir, VarRef as CmVarRef,
+    Bal16CheckedIr as CmBal16CheckedIr,
+    Bal16LooseIr as CmBal16LooseIr,
+    alloc_carry_pm8_ir, alloc_carry_pm16_ir, alloc_carry_pm32_ir, alloc_carry_pm64_ir,
+    normalize_bal16_loose_same_len_ir,
 };
 
 // -----------------------------------------------------------------------------
@@ -71,56 +75,23 @@ pub(crate) fn alloc_carry_pm128(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
 
 /// Allocate a signed carry `c ∈ [-64,63]` as an F257 variable by range-checking an offset.
 pub(crate) fn alloc_carry_pm64(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
-    assert!((-64..=63).contains(&c));
-    let off_u8: u8 = (c + 64) as u8; // in [0,127]
-    // 7-bit decomposition of off.
-    let mut bits = [0usize; 7];
-    for i in 0..7 {
-        bits[i] = alloc_bool::<F257>(b, ((off_u8 >> i) & 1) == 1);
-    }
-    let off_var = b.new_var(F257::from(off_u8 as u64));
-    // off = Σ 2^i * bits[i]
-    let mut lc = vec![(F257::ONE, off_var)];
-    let mut pow = F257::ONE;
-    for i in 0..7 {
-        lc.push((-pow, bits[i]));
-        pow *= F257::from(2u64);
-    }
-    b.enforce_lc_times_one_eq_const(lc);
-    // c = off - 64
-    let c_var = b.new_var(i32_to_f257(c));
-    b.enforce_lc_times_one_eq_const(vec![
-        (F257::ONE, c_var),
-        (-F257::ONE, off_var),
-        (F257::from(64u64), b.one()),
-    ]);
-    c_var
+    // IR is the source of truth; lower a tiny IR fragment into this builder.
+    let base_one = b.assignment[b.one()];
+    let base_asg = [base_one];
+    let mut ib = CmIrBuilder::new(&base_asg);
+    let c_ir = alloc_carry_pm64_ir(&mut ib, c);
+    let lowered = lower_ir_into_builder(b, ib.ir);
+    lowered.map_var(c_ir)
 }
 
 /// Allocate a signed carry `c ∈ [-32,31]` as an F257 variable by range-checking an offset.
 pub(crate) fn alloc_carry_pm32(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
-    assert!((-32..=31).contains(&c));
-    let off_u8: u8 = (c + 32) as u8; // in [0,63]
-    // 6-bit decomposition of off.
-    let mut bits = [0usize; 6];
-    for i in 0..6 {
-        bits[i] = alloc_bool::<F257>(b, ((off_u8 >> i) & 1) == 1);
-    }
-    let off_var = b.new_var(F257::from(off_u8 as u64));
-    let mut lc = vec![(F257::ONE, off_var)];
-    let mut pow = F257::ONE;
-    for i in 0..6 {
-        lc.push((-pow, bits[i]));
-        pow *= F257::from(2u64);
-    }
-    b.enforce_lc_times_one_eq_const(lc);
-    let c_var = b.new_var(i32_to_f257(c));
-    b.enforce_lc_times_one_eq_const(vec![
-        (F257::ONE, c_var),
-        (-F257::ONE, off_var),
-        (F257::from(32u64), b.one()),
-    ]);
-    c_var
+    let base_one = b.assignment[b.one()];
+    let base_asg = [base_one];
+    let mut ib = CmIrBuilder::new(&base_asg);
+    let c_ir = alloc_carry_pm32_ir(&mut ib, c);
+    let lowered = lower_ir_into_builder(b, ib.ir);
+    lowered.map_var(c_ir)
 }
 
 // NOTE: We intentionally do NOT expose "wide carry" allocators like pm256/pm512/pm1024.
@@ -131,54 +102,22 @@ pub(crate) fn alloc_carry_pm32(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
 
 /// Allocate a signed carry `c ∈ [-16,15]` as an F257 variable by range-checking an offset.
 pub(crate) fn alloc_carry_pm16(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
-    assert!((-16..=15).contains(&c));
-    let off_u8: u8 = (c + 16) as u8; // in [0,31]
-    // 5-bit decomposition of off.
-    let mut bits = [0usize; 5];
-    for i in 0..5 {
-        bits[i] = alloc_bool::<F257>(b, ((off_u8 >> i) & 1) == 1);
-    }
-    let off_var = b.new_var(F257::from(off_u8 as u64));
-    let mut lc = vec![(F257::ONE, off_var)];
-    let mut pow = F257::ONE;
-    for i in 0..5 {
-        lc.push((-pow, bits[i]));
-        pow *= F257::from(2u64);
-    }
-    b.enforce_lc_times_one_eq_const(lc);
-    let c_var = b.new_var(i32_to_f257(c));
-    b.enforce_lc_times_one_eq_const(vec![
-        (F257::ONE, c_var),
-        (-F257::ONE, off_var),
-        (F257::from(16u64), b.one()),
-    ]);
-    c_var
+    let base_one = b.assignment[b.one()];
+    let base_asg = [base_one];
+    let mut ib = CmIrBuilder::new(&base_asg);
+    let c_ir = alloc_carry_pm16_ir(&mut ib, c);
+    let lowered = lower_ir_into_builder(b, ib.ir);
+    lowered.map_var(c_ir)
 }
 
 /// Allocate a signed carry `c ∈ [-8,7]` as an F257 variable by range-checking an offset.
 pub(crate) fn alloc_carry_pm8(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
-    assert!((-8..=7).contains(&c));
-    let off_u8: u8 = (c + 8) as u8; // in [0,15]
-    // 4-bit decomposition of off.
-    let mut bits = [0usize; 4];
-    for i in 0..4 {
-        bits[i] = alloc_bool::<F257>(b, ((off_u8 >> i) & 1) == 1);
-    }
-    let off_var = b.new_var(F257::from(off_u8 as u64));
-    b.enforce_lc_times_one_eq_const(vec![
-        (F257::ONE, off_var),
-        (-F257::ONE, bits[0]),
-        (-F257::from(2u64), bits[1]),
-        (-F257::from(4u64), bits[2]),
-        (-F257::from(8u64), bits[3]),
-    ]);
-    let c_var = b.new_var(i32_to_f257(c));
-    b.enforce_lc_times_one_eq_const(vec![
-        (F257::ONE, c_var),
-        (-F257::ONE, off_var),
-        (F257::from(8u64), b.one()),
-    ]);
-    c_var
+    let base_one = b.assignment[b.one()];
+    let base_asg = [base_one];
+    let mut ib = CmIrBuilder::new(&base_asg);
+    let c_ir = alloc_carry_pm8_ir(&mut ib, c);
+    let lowered = lower_ir_into_builder(b, ib.ir);
+    lowered.map_var(c_ir)
 }
 
 // NOTE: We intentionally do not use a narrower carry range (like pm64) for the streaming
@@ -196,27 +135,89 @@ pub(crate) fn alloc_carry_pm1(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
 }
 
 
+// -----------------------------------------------------------------------------
+// Fox #1 (maintainable): explicit checked vs loose digit types
+// -----------------------------------------------------------------------------
+//
+// The core maintenance goal is to make it *obvious in signatures* whether a function expects:
+// - **checked** balanced base-16 digits (each digit ∈ [-8,7], proven by bit constraints), or
+// - **loose** digits (redundant representation with a static bound |d_i| ≤ M < 128, no bits).
+//
+// This prevents accidentally feeding a "loose" vector into a gadget that assumes canonical digits,
+// and makes conversion points explicit.
+
+#[derive(Clone, Debug)]
+pub(crate) struct Bal16Checked(pub(crate) Vec<usize>);
+
+impl Bal16Checked {
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[usize] {
+        &self.0
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    pub(crate) fn into_vec(self) -> Vec<usize> {
+        self.0
+    }
+}
+
+impl core::ops::Deref for Bal16Checked {
+    type Target = [usize];
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Bal16Loose {
+    pub(crate) digits: Vec<usize>,
+    /// Static bound on digit magnitudes, required to satisfy |d_i| < 128 (no-wrap in F257).
+    pub(crate) abs_bound: i32,
+}
+
+impl Bal16Loose {
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[usize] {
+        &self.digits
+    }
+
+    #[inline]
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [usize] {
+        &mut self.digits
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.digits.len()
+    }
+}
+
 /// Add two balanced base-16 digit vectors of the same length.
 ///
 /// Assumes each digit is in [-8,7]. Enforces output digits in [-8,7] and carry in {-1,0,1}.
 pub(crate) fn add_bal16_same_len(
     b: &mut Dr1csBuilder<F257>,
-    a: &[usize],
-    c: &[usize],
-) -> (Vec<usize>, usize /* carry_out */) {
+    a: &Bal16Checked,
+    c: &Bal16Checked,
+) -> (Bal16Checked, usize /* carry_out */) {
     let _prev = b.profile_enter("digits::add_bal16_same_len");
     let (ir, out_ir, carry_ir) = {
         let base_asg: &[F257] = &b.assignment;
         let mut ib = CmIrBuilder::new(base_asg);
-        let a_ir: Vec<CmVarRef> = a.iter().copied().map(CmVarRef::Base).collect();
-        let c_ir: Vec<CmVarRef> = c.iter().copied().map(CmVarRef::Base).collect();
+        let a_ir = CmBal16CheckedIr(a.as_slice().iter().copied().map(CmVarRef::Base).collect());
+        let c_ir = CmBal16CheckedIr(c.as_slice().iter().copied().map(CmVarRef::Base).collect());
         let (out_ir, carry_ir) = add_bal16_same_len_ir(&mut ib, &a_ir, &c_ir);
         (ib.ir, out_ir, carry_ir)
     };
     let lowered = lower_ir_into_builder(b, ir);
-    let out: Vec<usize> = out_ir.into_iter().map(|v| lowered.map_var(v)).collect();
+    let out: Vec<usize> = out_ir.0.into_iter().map(|v| lowered.map_var(v)).collect();
     let carry = lowered.map_var(carry_ir);
-    let res = (out, carry);
+    let res = (Bal16Checked(out), carry);
     b.profile_exit(_prev);
     res
 }
@@ -246,17 +247,17 @@ pub(crate) fn add_bal16_same_len(
 /// This preserves the integer value \(\sum_i digit[i]·16^i\) but allows digits to grow
 /// outside [-8,7]. The caller must keep a conservative bound on digit magnitudes < 128.
 #[inline]
-fn add_bal16_loose_in_place(b: &mut Dr1csBuilder<F257>, acc: &mut [usize], src: &[usize]) {
+fn add_bal16_loose_in_place(b: &mut Dr1csBuilder<F257>, acc: &mut Bal16Loose, src: &Bal16Checked) {
     debug_assert_eq!(acc.len(), src.len());
     for i in 0..acc.len() {
-        let v = b.new_var(b.assignment[acc[i]] + b.assignment[src[i]]);
+        let v = b.new_var(b.assignment[acc.digits[i]] + b.assignment[src.0[i]]);
         // v = acc[i] + src[i]
         b.enforce_lc_times_one_eq_const(vec![
             (F257::ONE, v),
-            (-F257::ONE, acc[i]),
-            (-F257::ONE, src[i]),
+            (-F257::ONE, acc.digits[i]),
+            (-F257::ONE, src.0[i]),
         ]);
-        acc[i] = v;
+        acc.digits[i] = v;
     }
 }
 
@@ -266,101 +267,29 @@ fn add_bal16_loose_in_place(b: &mut Dr1csBuilder<F257>, acc: &mut [usize], src: 
 /// The caller typically enforces `carry_out == 0` (i.e. the value fits).
 fn normalize_bal16_loose_same_len_with_bound(
     b: &mut Dr1csBuilder<F257>,
-    loose: &[usize],
-    digit_abs_bound: i32,
-) -> (Vec<usize>, usize) {
+    loose: &Bal16Loose,
+) -> (Bal16Checked, usize) {
     let _prev = b.profile_enter("digits::normalize_bal16_loose");
-    debug_assert!(digit_abs_bound >= 0);
-    // Critical for no-wrap soundness when interpreting F257 as integers.
-    debug_assert!(digit_abs_bound < 128);
+    debug_assert!(loose.abs_bound >= 0);
+    debug_assert!(loose.abs_bound < 128);
 
-    #[inline]
-    fn alloc_carry_with_bound(b: &mut Dr1csBuilder<F257>, c: i32, bound: i32) -> usize {
-        debug_assert!(bound >= 0);
-        if bound <= 1 {
-            alloc_carry_pm1(b, c)
-        } else if bound <= 2 {
-            alloc_carry_pm2(b, c)
-        } else if bound <= 7 {
-            alloc_carry_pm8(b, c)
-        } else if bound <= 15 {
-            alloc_carry_pm16(b, c)
-        } else if bound <= 31 {
-            alloc_carry_pm32(b, c)
-        } else if bound <= 63 {
-            alloc_carry_pm64(b, c)
-        } else {
-            alloc_carry_pm128(b, c)
-        }
-    }
-
-    // Compute a conservative, statement-derived carry bound schedule from `digit_abs_bound`.
-    //
-    // If |d_i| <= B and |carry_i| <= C, then |d_i + carry_i| <= B + C, so
-    // |carry_{i+1}| <= floor((B + C + 8)/16) + 1.
-    let mut carry_bound: i32 = 0;
-    let mut carry_bounds: Vec<i32> = Vec::with_capacity(loose.len());
-    for _ in 0..loose.len() {
-        let max_sum = digit_abs_bound + carry_bound;
-        carry_bound = ((max_sum + 8) / 16) + 1;
-        carry_bounds.push(carry_bound);
-        debug_assert!(carry_bound < 128);
-    }
-
-    let mut out: Vec<usize> = Vec::with_capacity(loose.len());
-    let mut carry_i32: i32 = 0;
-    let mut carry_var = b.zero_var();
-
-    // div_floor(x/16) for possibly-negative x.
-    let div_floor = |x: i32, d: i32| -> i32 {
-        debug_assert!(d > 0);
-        if x >= 0 { x / d } else { -(((-x) + d - 1) / d) }
+    // Delegate to the IR "source of truth" implementation, then lower into this builder.
+    let (ir, out_ir, carry_ir) = {
+        let base_asg: &[F257] = &b.assignment;
+        let mut ib = CmIrBuilder::new(base_asg);
+        let loose_ir = CmBal16LooseIr {
+            digits: loose.digits.iter().copied().map(CmVarRef::Base).collect(),
+            abs_bound: loose.abs_bound,
+        };
+        let (out_ir, carry_ir) = normalize_bal16_loose_same_len_ir(&mut ib, &loose_ir);
+        (ib.ir, out_ir, carry_ir)
     };
-
-    for (i, &dv) in loose.iter().enumerate() {
-        let di = f257_to_i32_bal(b.assignment[dv]);
-        debug_assert!(
-            (-digit_abs_bound..=digit_abs_bound).contains(&di),
-            "normalize_bal16_loose: digit out of assumed bound (|d|<={}): got {di}",
-            digit_abs_bound
-        );
-        let sum = di + carry_i32;
-
-        let mut carry_next = div_floor(sum + 8, NIBBLE_BASE);
-        let mut rem = sum - NIBBLE_BASE * carry_next;
-        while rem > 7 {
-            carry_next += 1;
-            rem -= NIBBLE_BASE;
-        }
-        while rem < -8 {
-            carry_next -= 1;
-            rem += NIBBLE_BASE;
-        }
-        debug_assert!((-8..=7).contains(&rem));
-        debug_assert!(
-            (-carry_bounds[i]..=carry_bounds[i]).contains(&carry_next),
-            "normalize_bal16_loose: carry out of bound at i={i}: {carry_next} (bound={})",
-            carry_bounds[i]
-        );
-
-        let rem_digit = alloc_bal16_digit(b, rem as i8);
-        let carry_next_var = alloc_carry_with_bound(b, carry_next, carry_bounds[i]);
-
-        // loose_i + carry_i - rem_i - 16*carry_{i+1} = 0
-        b.enforce_lc_times_one_eq_const(vec![
-            (F257::ONE, dv),
-            (F257::ONE, carry_var),
-            (-F257::ONE, rem_digit),
-            (-F257::from(16u64), carry_next_var),
-        ]);
-
-        out.push(rem_digit);
-        carry_i32 = carry_next;
-        carry_var = carry_next_var;
-    }
+    let lowered = lower_ir_into_builder(b, ir);
+    let out: Vec<usize> = out_ir.0.into_iter().map(|v| lowered.map_var(v)).collect();
+    let carry = lowered.map_var(carry_ir);
 
     b.profile_exit(_prev);
-    (out, carry_var)
+    (Bal16Checked(out), carry)
 }
 
 /// Add three balanced base-16 digit vectors of the same length.
@@ -368,10 +297,10 @@ fn normalize_bal16_loose_same_len_with_bound(
 /// Assumes each digit is in [-8,7]. Enforces output digits in [-8,7] and carry in [-2,2].
 pub(crate) fn add3_bal16_same_len(
     b: &mut Dr1csBuilder<F257>,
-    a: &[usize],
-    c: &[usize],
-    d: &[usize],
-) -> (Vec<usize>, usize /* carry_out */) {
+    a: &Bal16Checked,
+    c: &Bal16Checked,
+    d: &Bal16Checked,
+) -> (Bal16Checked, usize /* carry_out */) {
     let _prev = b.profile_enter("digits::add_bal16_same_len");
     assert_eq!(a.len(), c.len());
     assert_eq!(a.len(), d.len());
@@ -420,7 +349,7 @@ pub(crate) fn add3_bal16_same_len(
         carry = carry_next_var;
     }
 
-    let res = (out, carry);
+    let res = (Bal16Checked(out), carry);
     b.profile_exit(_prev);
     res
 }
@@ -428,39 +357,39 @@ pub(crate) fn add3_bal16_same_len(
 /// Negate a balanced base-16 digit vector (little-endian), producing digits in [-8,7].
 pub(crate) fn neg_bal16_digits(
     b: &mut Dr1csBuilder<F257>,
-    x: &[usize],
-) -> (Vec<usize>, usize /* carry_out */) {
+    x: &Bal16Checked,
+) -> (Bal16Checked, usize /* carry_out */) {
     let (ir, out_ir, carry_ir) = {
         let base_asg: &[F257] = &b.assignment;
         let mut ib = CmIrBuilder::new(base_asg);
-        let x_ir: Vec<CmVarRef> = x.iter().copied().map(CmVarRef::Base).collect();
+        let x_ir = CmBal16CheckedIr(x.as_slice().iter().copied().map(CmVarRef::Base).collect());
         let (out_ir, carry_ir) = neg_bal16_digits_ir(&mut ib, &x_ir);
         (ib.ir, out_ir, carry_ir)
     };
     let lowered = lower_ir_into_builder(b, ir);
-    let out: Vec<usize> = out_ir.into_iter().map(|v| lowered.map_var(v)).collect();
+    let out: Vec<usize> = out_ir.0.into_iter().map(|v| lowered.map_var(v)).collect();
     let carry = lowered.map_var(carry_ir);
-    (out, carry)
+    (Bal16Checked(out), carry)
 }
 
 /// Subtract two balanced base-16 digit vectors of the same length: `a - c`.
 pub(crate) fn sub_bal16_same_len(
     b: &mut Dr1csBuilder<F257>,
-    a: &[usize],
-    c: &[usize],
-) -> (Vec<usize>, usize /* carry_out */) {
+    a: &Bal16Checked,
+    c: &Bal16Checked,
+) -> (Bal16Checked, usize /* carry_out */) {
     let (ir, out_ir, carry_ir) = {
         let base_asg: &[F257] = &b.assignment;
         let mut ib = CmIrBuilder::new(base_asg);
-        let a_ir: Vec<CmVarRef> = a.iter().copied().map(CmVarRef::Base).collect();
-        let c_ir: Vec<CmVarRef> = c.iter().copied().map(CmVarRef::Base).collect();
+        let a_ir = CmBal16CheckedIr(a.as_slice().iter().copied().map(CmVarRef::Base).collect());
+        let c_ir = CmBal16CheckedIr(c.as_slice().iter().copied().map(CmVarRef::Base).collect());
         let (out_ir, carry_ir) = sub_bal16_same_len_ir(&mut ib, &a_ir, &c_ir);
         (ib.ir, out_ir, carry_ir)
     };
     let lowered = lower_ir_into_builder(b, ir);
-    let out: Vec<usize> = out_ir.into_iter().map(|v| lowered.map_var(v)).collect();
+    let out: Vec<usize> = out_ir.0.into_iter().map(|v| lowered.map_var(v)).collect();
     let carry = lowered.map_var(carry_ir);
-    (out, carry)
+    (Bal16Checked(out), carry)
 }
 
 #[inline]
@@ -660,14 +589,14 @@ pub(crate) fn rebalance_tail_pm16_to_pm1(b: &mut Dr1csBuilder<F257>, digits: &[u
     out
 }
 
-fn shift_pad_bal16(digits: &[usize], shift: usize, target_len: usize, zero_digit: usize) -> Vec<usize> {
+fn shift_pad_bal16(digits: &[usize], shift: usize, target_len: usize, zero_digit: usize) -> Bal16Checked {
     assert!(shift <= target_len);
     assert!(digits.len() + shift <= target_len);
     let mut out = Vec::with_capacity(target_len);
     out.extend(std::iter::repeat(zero_digit).take(shift));
     out.extend_from_slice(digits);
     out.extend(std::iter::repeat(zero_digit).take(target_len - shift - digits.len()));
-    out
+    Bal16Checked(out)
 }
 
 #[inline]
@@ -679,11 +608,26 @@ pub(crate) fn sum_product_digits_bal16(
     b: &mut Dr1csBuilder<F257>,
     products13: &[[usize; 13]],
     target_len: usize,
-) -> Vec<usize> {
+) -> Bal16Checked {
     assert!(target_len >= 13);
     let zero = bal16_zero(b);
 
-    let mut acc = vec![zero; target_len];
+    // Fox #1: when we sum only a few vectors, accumulate as *loose* digits and normalize once.
+    let per_term_bound: i32 = 10; // conservative (matches other Fox #1 paths in this module)
+    let acc_bound: i32 = (products13.len() as i32) * per_term_bound;
+    if acc_bound < 128 {
+        let mut acc = Bal16Loose { digits: vec![zero; target_len], abs_bound: acc_bound };
+        for p13 in products13 {
+            let padded = shift_pad_bal16(p13, 0, target_len, zero);
+            add_bal16_loose_in_place(b, &mut acc, &padded);
+        }
+        let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc);
+        b.enforce_var_eq_const(carry, F257::ZERO);
+        return norm;
+    }
+
+    // Fallback: normalize after every addition.
+    let mut acc = Bal16Checked(vec![zero; target_len]);
     for p13 in products13 {
         let padded = shift_pad_bal16(p13, 0, target_len, zero);
         let (new_acc, carry) = add_bal16_same_len(b, &acc, &padded);
@@ -697,10 +641,25 @@ pub(crate) fn sum_product_digits_bal16_22(
     b: &mut Dr1csBuilder<F257>,
     products22: &[[usize; 22]],
     target_len: usize,
-) -> Vec<usize> {
+) -> Bal16Checked {
     assert!(target_len >= 22);
     let zero = bal16_zero(b);
-    let mut acc = vec![zero; target_len];
+
+    // Fox #1: loose accumulation when bounds permit.
+    let per_term_bound: i32 = 10;
+    let acc_bound: i32 = (products22.len() as i32) * per_term_bound;
+    if acc_bound < 128 {
+        let mut acc = Bal16Loose { digits: vec![zero; target_len], abs_bound: acc_bound };
+        for p22 in products22 {
+            let padded = shift_pad_bal16(p22, 0, target_len, zero);
+            add_bal16_loose_in_place(b, &mut acc, &padded);
+        }
+        let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc);
+        b.enforce_var_eq_const(carry, F257::ZERO);
+        return norm;
+    }
+
+    let mut acc = Bal16Checked(vec![zero; target_len]);
     for p22 in products22 {
         let padded = shift_pad_bal16(p22, 0, target_len, zero);
         let (new_acc, carry) = add_bal16_same_len(b, &acc, &padded);
@@ -712,11 +671,25 @@ pub(crate) fn sum_product_digits_bal16_22(
 
 pub(crate) fn sum_bal16_vectors_fixed_len(
     b: &mut Dr1csBuilder<F257>,
-    vecs: &[&[usize]],
+    vecs: &[&Bal16Checked],
     len: usize,
-) -> Vec<usize> {
+) -> Bal16Checked {
     let zero = bal16_zero(b);
-    let mut acc = vec![zero; len];
+    // Fox #1: loose accumulation when bounds permit.
+    let per_term_bound: i32 = 10;
+    let acc_bound: i32 = (vecs.len() as i32) * per_term_bound;
+    if acc_bound < 128 {
+        let mut acc = Bal16Loose { digits: vec![zero; len], abs_bound: acc_bound };
+        for v in vecs {
+            assert_eq!(v.len(), len);
+            add_bal16_loose_in_place(b, &mut acc, v);
+        }
+        let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc);
+        b.enforce_var_eq_const(carry, F257::ZERO);
+        return norm;
+    }
+
+    let mut acc = Bal16Checked(vec![zero; len]);
     for v in vecs {
         assert_eq!(v.len(), len);
         let (new_acc, carry) = add_bal16_same_len(b, &acc, v);
@@ -731,19 +704,33 @@ pub(crate) fn sum_products13_coeffwise_fixed_len(
     per_surface_products13: &[&[[usize; 13]]],
     ring_dim: usize,
     out_len: usize,
-) -> Vec<Vec<usize>> {
+) -> Vec<Bal16Checked> {
     let zero = bal16_zero(b);
-    let mut out: Vec<Vec<usize>> = Vec::with_capacity(ring_dim);
+    let per_term_bound: i32 = 10;
+    let acc_bound: i32 = (per_surface_products13.len() as i32) * per_term_bound;
+    let mut out: Vec<Bal16Checked> = Vec::with_capacity(ring_dim);
     for coeff_idx in 0..ring_dim {
-        let mut acc = vec![zero; out_len];
-        for surf in per_surface_products13 {
-            let p13 = &surf[coeff_idx];
-            let padded = shift_pad_bal16(p13, 0, out_len, zero);
-            let (new_acc, carry) = add_bal16_same_len(b, &acc, &padded);
-            acc = new_acc;
+        let mut acc_checked = Bal16Checked(vec![zero; out_len]);
+        if acc_bound < 128 {
+            let mut acc = Bal16Loose { digits: vec![zero; out_len], abs_bound: acc_bound };
+            for surf in per_surface_products13 {
+                let p13 = &surf[coeff_idx];
+                let padded = shift_pad_bal16(p13, 0, out_len, zero);
+                add_bal16_loose_in_place(b, &mut acc, &padded);
+            }
+            let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc);
             b.enforce_var_eq_const(carry, F257::ZERO);
+            acc_checked = norm;
+        } else {
+            for surf in per_surface_products13 {
+                let p13 = &surf[coeff_idx];
+                let padded = shift_pad_bal16(p13, 0, out_len, zero);
+                let (new_acc, carry) = add_bal16_same_len(b, &acc_checked, &padded);
+                acc_checked = new_acc;
+                b.enforce_var_eq_const(carry, F257::ZERO);
+            }
         }
-        out.push(acc);
+        out.push(acc_checked);
     }
     out
 }
@@ -753,19 +740,33 @@ pub(crate) fn sum_products22_coeffwise_fixed_len(
     per_surface_products22: &[&[[usize; 22]]],
     ring_dim: usize,
     out_len: usize,
-) -> Vec<Vec<usize>> {
+) -> Vec<Bal16Checked> {
     let zero = bal16_zero(b);
-    let mut out: Vec<Vec<usize>> = Vec::with_capacity(ring_dim);
+    let per_term_bound: i32 = 10;
+    let acc_bound: i32 = (per_surface_products22.len() as i32) * per_term_bound;
+    let mut out: Vec<Bal16Checked> = Vec::with_capacity(ring_dim);
     for coeff_idx in 0..ring_dim {
-        let mut acc = vec![zero; out_len];
-        for surf in per_surface_products22 {
-            let p22 = &surf[coeff_idx];
-            let padded = shift_pad_bal16(p22, 0, out_len, zero);
-            let (new_acc, carry) = add_bal16_same_len(b, &acc, &padded);
-            acc = new_acc;
+        let mut acc_checked = Bal16Checked(vec![zero; out_len]);
+        if acc_bound < 128 {
+            let mut acc = Bal16Loose { digits: vec![zero; out_len], abs_bound: acc_bound };
+            for surf in per_surface_products22 {
+                let p22 = &surf[coeff_idx];
+                let padded = shift_pad_bal16(p22, 0, out_len, zero);
+                add_bal16_loose_in_place(b, &mut acc, &padded);
+            }
+            let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc);
             b.enforce_var_eq_const(carry, F257::ZERO);
+            acc_checked = norm;
+        } else {
+            for surf in per_surface_products22 {
+                let p22 = &surf[coeff_idx];
+                let padded = shift_pad_bal16(p22, 0, out_len, zero);
+                let (new_acc, carry) = add_bal16_same_len(b, &acc_checked, &padded);
+                acc_checked = new_acc;
+                b.enforce_var_eq_const(carry, F257::ZERO);
+            }
         }
-        out.push(acc);
+        out.push(acc_checked);
     }
     out
 }
@@ -800,7 +801,7 @@ pub(crate) fn rebalance_prod21_to_prod22(
     out
 }
 
-fn mul_bal16_9_by_9_u32ish(b: &mut Dr1csBuilder<F257>, a9: &[usize], b9: &[usize]) -> Vec<usize> {
+fn mul_bal16_9_by_9_u32ish(b: &mut Dr1csBuilder<F257>, a9: &[usize], b9: &[usize]) -> Bal16Checked {
     assert_eq!(a9.len(), 9);
     assert_eq!(b9.len(), 9);
 
@@ -826,13 +827,14 @@ fn mul_bal16_9_by_9_u32ish(b: &mut Dr1csBuilder<F257>, a9: &[usize], b9: &[usize
     let s2 = shift_pad_bal16(&p2, 6, target_len, zero_digit);
 
     let (mut t01, carry01) = add_bal16_same_len(b, &s0, &s1);
-    t01.push(carry01);
+    t01.0.push(carry01);
 
-    let mut s2_pad = s2;
-    s2_pad.push(zero_digit);
+    let mut s2_pad_v = s2.into_vec();
+    s2_pad_v.push(zero_digit);
+    let s2_pad = Bal16Checked(s2_pad_v);
     debug_assert_eq!(t01.len(), s2_pad.len());
     let (mut out, carry) = add_bal16_same_len(b, &t01, &s2_pad);
-    out.push(carry);
+    out.0.push(carry);
     out
 }
 
@@ -847,7 +849,7 @@ pub(crate) fn mul_u32ish9_to_fixed_bal16(
     assert!(out_len >= 16, "u32*u32 fits in 16 nibbles; use >=16 for headroom");
 
     let zero = bal16_zero(b);
-    let raw = mul_bal16_9_by_9_u32ish(b, a9, b9);
+    let raw = mul_bal16_9_by_9_u32ish(b, a9, b9).into_vec();
     if raw.len() <= out_len {
         let mut out = raw;
         out.extend(std::iter::repeat(zero).take(out_len - out.len()));
@@ -868,7 +870,7 @@ pub(crate) fn mul_bal16_long_by_u32ish9(b: &mut Dr1csBuilder<F257>, a: &[usize],
     let zero = bal16_zero(b);
     let blocks = (a.len() + 2) / 3;
     let target_len = 3 * blocks + 13 + 1;
-    let mut acc = vec![zero; target_len];
+    let mut acc = Bal16Checked(vec![zero; target_len]);
 
     for blk in 0..blocks {
         let start = blk * 3;
@@ -883,11 +885,11 @@ pub(crate) fn mul_bal16_long_by_u32ish9(b: &mut Dr1csBuilder<F257>, a: &[usize],
         let (new_acc, carry) = add_bal16_same_len(b, &acc, &shifted);
         acc = new_acc;
         let top = acc[target_len - 1];
-        let (top_sum, top_carry) = add_bal16_same_len(b, &[top], &[carry]);
-        acc[target_len - 1] = top_sum[0];
+        let (top_sum, top_carry) = add_bal16_same_len(b, &Bal16Checked(vec![top]), &Bal16Checked(vec![carry]));
+        acc.0[target_len - 1] = top_sum[0];
         b.enforce_var_eq_const(top_carry, F257::ZERO);
     }
-    acc
+    acc.into_vec()
 }
 
 pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb: &[usize]) -> Vec<usize> {
@@ -925,7 +927,7 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
         let per_term_bound: i32 = 10; // conservative: digits in [-8,7] plus small tail carry
         let acc_bound: i32 = (blocks as i32) * per_term_bound;
         if acc_bound < 128 {
-            let mut acc = vec![zero; target_len];
+            let mut acc = Bal16Loose { digits: vec![zero; target_len], abs_bound: acc_bound };
             for blk in 0..blocks {
                 let start = blk * 3;
                 let end = core::cmp::min(start + 3, short.len());
@@ -938,10 +940,10 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
                 let shifted = shift_pad_bal16(&reb, blk * 3, target_len, zero);
                 add_bal16_loose_in_place(b, &mut acc, &shifted);
             }
-            let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc, acc_bound);
+            let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc);
             b.enforce_var_eq_const(carry, F257::ZERO);
             b.profile_exit(_prev);
-            return norm;
+            return norm.into_vec();
         }
     }
 
@@ -951,7 +953,7 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
     let blocks = (short.len() + 2) / 3;
     let per_block_len = long.len() + 5;
     let target_len = per_block_len + 3 * (blocks - 1) + 2;
-    let mut acc = vec![zero; target_len];
+    let mut acc = Bal16Checked(vec![zero; target_len]);
     for blk in 0..blocks {
         let start = blk * 3;
         let end = core::cmp::min(start + 3, short.len());
@@ -965,12 +967,13 @@ pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb
         let (new_acc, carry) = add_bal16_same_len(b, &acc, &shifted);
         acc = new_acc;
         let top = acc[target_len - 1];
-        let (top_sum, top_carry) = add_bal16_same_len(b, &[top], &[carry]);
-        acc[target_len - 1] = top_sum[0];
+        let (top_sum, top_carry) =
+            add_bal16_same_len(b, &Bal16Checked(vec![top]), &Bal16Checked(vec![carry]));
+        acc.0[target_len - 1] = top_sum[0];
         b.enforce_var_eq_const(top_carry, F257::ZERO);
     }
 
-    let out = acc;
+    let out = acc.into_vec();
     b.profile_exit(_prev);
     out
 }
@@ -1256,7 +1259,7 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
 
     if a.len() <= 19 && bb_const.len() <= 17 && acc_bound < 128 {
         // Build all shifted block-products using the sound 4-term multiplier.
-        let mut terms: Vec<Vec<usize>> = Vec::with_capacity(blocks);
+        let mut terms: Vec<Bal16Checked> = Vec::with_capacity(blocks);
         for blk in 0..blocks {
             let start = blk * BLK;
             let end = core::cmp::min(start + BLK, a.len());
@@ -1271,21 +1274,21 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
         }
 
         // Fox #1: accumulate as loose digits, normalize once.
-        let mut acc = vec![zero; target_len];
+        let mut acc = Bal16Loose { digits: vec![zero; target_len], abs_bound: acc_bound };
         for t in &terms {
             add_bal16_loose_in_place(b, &mut acc, t);
         }
-        let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc, acc_bound);
+        let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc);
         b.enforce_var_eq_const(carry, F257::ZERO);
         b.profile_exit(_prev);
-        return norm;
+        return norm.into_vec();
     }
 
     // -------------------------------------------------------------------------
     // Fallback for very large operands (acc_bound >= 128).
     // Uses 3-at-a-time reduction instead of loose accumulation.
     // -------------------------------------------------------------------------
-    let mut terms: Vec<Vec<usize>> = Vec::with_capacity(blocks);
+    let mut terms: Vec<Bal16Checked> = Vec::with_capacity(blocks);
     for blk in 0..blocks {
         let start = blk * BLK;
         let end = core::cmp::min(start + BLK, a.len());
@@ -1317,7 +1320,7 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
             stack.push(sum);
         }
     }
-    let out = stack.pop().unwrap();
+    let out = stack.pop().unwrap().into_vec();
     b.profile_exit(_prev);
     out
 }
