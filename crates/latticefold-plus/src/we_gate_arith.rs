@@ -6226,27 +6226,27 @@ mod tests {
             eprintln!("[tiny_gate] DR1CS unsat: {e}");
             if let Some(ci) = parse_failed_constraint_idx(&e) {
                 if let Some(con) = shape.inst.constraints.get(ci) {
-                    let av = dot(&con.a, &asg);
-                    let bv = dot(&con.b, &asg);
-                    let cv = dot(&con.c, &asg);
+                    let av = dot(&shape.inst.a_terms[con.a.clone()], &asg);
+                    let bv = dot(&shape.inst.b_terms[con.b.clone()], &asg);
+                    let cv = dot(&shape.inst.c_terms[con.c.clone()], &asg);
                     let res = av * bv - cv;
                     eprintln!(
                         "[tiny_gate] failing constraint idx={ci}  (A·z)={av:?} (B·z)={bv:?} (C·z)={cv:?}  residual=A·B-C={res:?}"
                     );
                     eprintln!("[tiny_gate] constraint a-len={} b-len={} c-len={}", con.a.len(), con.b.len(), con.c.len());
                     // Print a small prefix of each term list (enough to see which vars are involved).
-                    let show = |name: &str, terms: &Vec<(F257, usize)>| {
+                    let show = |name: &str, terms: &[(F257, usize)]| {
                         let k = terms.len().min(12);
                         eprintln!("[tiny_gate] {name} first {k} terms: {:?}", &terms[..k]);
                     };
                     // NOTE: `Constraint` here is over `F257` in this test.
-                    show("A", &con.a);
-                    show("B", &con.b);
-                    show("C", &con.c);
+                    show("A", &shape.inst.a_terms[con.a.clone()]);
+                    show("B", &shape.inst.b_terms[con.b.clone()]);
+                    show("C", &shape.inst.c_terms[con.c.clone()]);
 
                     // Also print the concrete z-values for the vars appearing in A (common for glue/equality failures).
                     if con.a.len() <= 8 {
-                        for (c, idx) in &con.a {
+                        for (c, idx) in &shape.inst.a_terms[con.a.clone()] {
                             if *idx == 0 {
                                 eprintln!("[tiny_gate] A term: coeff={c:?} var=ONE value=1");
                             } else {
@@ -7279,14 +7279,20 @@ mod tests {
             let t3 = std::time::Instant::now();
             // Avoid cloning multi-million sparse rows: consume the constraints and move (a,b,c) out.
             let (inst, assignment, public_len) = (shape.inst, assignment, shape.public_len);
-            let n = inst.nvars;
-            let mut a = Vec::with_capacity(inst.constraints.len());
-            let mut b = Vec::with_capacity(inst.constraints.len());
-            let mut c = Vec::with_capacity(inst.constraints.len());
-            for mut row in inst.constraints {
-                a.push(SparseVec::new(std::mem::take(&mut row.a)));
-                b.push(SparseVec::new(std::mem::take(&mut row.b)));
-                c.push(SparseVec::new(std::mem::take(&mut row.c)));
+            let symphony::dpp_poseidon::SparseDr1csInstance {
+                nvars: n,
+                constraints,
+                a_terms,
+                b_terms,
+                c_terms,
+            } = inst;
+            let mut a = Vec::with_capacity(constraints.len());
+            let mut b = Vec::with_capacity(constraints.len());
+            let mut c = Vec::with_capacity(constraints.len());
+            for row in constraints {
+                a.push(SparseVec::new(a_terms[row.a.clone()].to_vec()));
+                b.push(SparseVec::new(b_terms[row.b.clone()].to_vec()));
+                c.push(SparseVec::new(c_terms[row.c.clone()].to_vec()));
             }
             let inst_sparse = DppInst::<FSmall> { n, a, b, c };
             eprintln!("[test_large_trace] dr1cs->sparse: {:?}", t3.elapsed());
