@@ -12,8 +12,9 @@ pub fn lift_recording_trace_ops_to_f257<BF: PrimeField>(
     ops: &[crate::recording_transcript::PoseidonTraceOp<BF>],
 ) -> Result<Vec<PoseidonTraceOp<F257>>, String> {
     fn bf_to_u16<BF: PrimeField>(x: &BF) -> u16 {
-        let bytes = x.into_bigint().to_bytes_le();
-        (bytes.get(0).copied().unwrap_or(0) as u16) | ((bytes.get(1).copied().unwrap_or(0) as u16) << 8)
+        // Avoid `to_bytes_le()` allocations: read low limb directly.
+        let limb0: u64 = x.into_bigint().as_ref().get(0).copied().unwrap_or(0);
+        (limb0 & 0xFFFF) as u16
     }
     let mut out: Vec<PoseidonTraceOp<F257>> = Vec::with_capacity(ops.len());
     for op in ops {

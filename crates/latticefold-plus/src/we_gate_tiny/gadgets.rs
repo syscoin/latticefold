@@ -1,4 +1,4 @@
-use ark_ff::{BigInteger, PrimeField};
+use ark_ff::PrimeField;
 
 use symphony::dpp_poseidon::{Constraint, SparseDr1csInstance};
 use symphony::dpp_sumcheck::Dr1csBuilder;
@@ -77,12 +77,15 @@ pub(super) fn decompose_existing_byte_var_to_bits<F: PrimeField>(
     }
     // Constrain: byte_var = Σ 2^i * bit_i, with bit_i boolean.
     let mut bits = [0usize; 8];
-    let v8 = b.assignment[byte_var]
+    // Avoid `to_bytes_le()` allocations: read low limb directly.
+    let limb0: u64 = b
+        .assignment[byte_var]
         .into_bigint()
-        .to_bytes_le()
+        .as_ref()
         .get(0)
         .copied()
-        .unwrap_or(0) as u16;
+        .unwrap_or(0);
+    let v8: u16 = (limb0 & 0xFF) as u16;
     debug_assert!(v8 <= 255);
     for i in 0..8 {
         bits[i] = alloc_bool::<F>(b, ((v8 >> i) & 1) == 1);
@@ -99,6 +102,7 @@ pub(super) fn decompose_existing_byte_var_to_bits<F: PrimeField>(
     bits
 }
 
+#[allow(dead_code)]
 pub(super) fn alloc_u7<F: PrimeField>(b: &mut Dr1csBuilder<F>, v7: u8) -> usize {
     debug_assert!(v7 < 128);
     let mut bits = [0usize; LIMB_BITS];
@@ -116,6 +120,7 @@ pub(super) fn alloc_u7<F: PrimeField>(b: &mut Dr1csBuilder<F>, v7: u8) -> usize 
     v
 }
 
+#[allow(dead_code)]
 pub(super) fn alloc_u2_from_u8<F: PrimeField>(b: &mut Dr1csBuilder<F>, v2: u8) -> usize {
     debug_assert!(v2 <= 2);
     let b0 = alloc_bool::<F>(b, (v2 & 1) == 1);
@@ -130,6 +135,7 @@ pub(super) fn alloc_u2_from_u8<F: PrimeField>(b: &mut Dr1csBuilder<F>, v2: u8) -
 }
 
 #[inline]
+#[allow(dead_code)]
 pub(super) fn const_zero<F: PrimeField>(b: &mut Dr1csBuilder<F>) -> usize {
     let v = b.new_var(F::ZERO);
     b.enforce_var_eq_const(v, F::ZERO);

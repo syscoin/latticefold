@@ -341,13 +341,15 @@ pub(super) fn short_challenge_coeff_from_byte_var<F: PrimeField>(
     let half = u / 2;
 
     // low = Σ_{i<logu} 2^i * bits[i]
-    let low_u64 = (b.assignment[byte_var]
+    // Avoid `to_bytes_le()` allocations: read low limb directly.
+    let limb0: u64 = b
+        .assignment[byte_var]
         .into_bigint()
-        .to_bytes_le()
+        .as_ref()
         .get(0)
         .copied()
-        .unwrap_or(0) as u64)
-        & (u - 1);
+        .unwrap_or(0);
+    let low_u64 = (limb0 & 0xFF) & (u - 1);
     let low = b.new_var(F::from(low_u64));
     let mut lc = vec![(F::ONE, low)];
     let mut p2 = F::ONE;

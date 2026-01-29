@@ -61,12 +61,14 @@ pub(super) fn reduce_u64_mod_goldilocks_from_byte_vars<F: PrimeField>(
     // Witness compute.
     let mut u_buf = [0u8; 8];
     for i in 0..8 {
-        u_buf[i] = b.assignment[u_byte_vars[i]]
+        let limb0: u64 = b
+            .assignment[u_byte_vars[i]]
             .into_bigint()
-            .to_bytes_le()
+            .as_ref()
             .get(0)
             .copied()
             .unwrap_or(0);
+        u_buf[i] = (limb0 & 0xFF) as u8;
     }
     let u = u64::from_le_bytes(u_buf);
     let q_u8: u8 = if u >= GOLDILOCKS_P { 1 } else { 0 };
@@ -110,12 +112,8 @@ pub(super) fn reduce_u64_mod_goldilocks_from_byte_vars<F: PrimeField>(
         let bi = if i == 0 {
             0i16
         } else {
-            b.assignment[bor]
-                .into_bigint()
-                .to_bytes_le()
-                .get(0)
-                .copied()
-                .unwrap_or(0) as i16
+            let limb0: u64 = b.assignment[bor].into_bigint().as_ref().get(0).copied().unwrap_or(0);
+            (limb0 & 0x1) as i16
         };
         let mut t = ui - pi - bi;
         let bor_next_u8 = if t < 0 { 1u8 } else { 0u8 };
@@ -186,12 +184,8 @@ pub(super) fn reduce_u64_mod_goldilocks_from_byte_vars<F: PrimeField>(
         let bi = if i == 0 {
             0i16
         } else {
-            b.assignment[borrow]
-                .into_bigint()
-                .to_bytes_le()
-                .get(0)
-                .copied()
-                .unwrap_or(0) as i16
+            let limb0: u64 = b.assignment[borrow].into_bigint().as_ref().get(0).copied().unwrap_or(0);
+            (limb0 & 0x1) as i16
         };
         let rhs = ui - (q_u8 as i16) * pi - bi - zi;
         let borrow_next_u8 = if rhs < 0 { 1u8 } else { 0u8 };

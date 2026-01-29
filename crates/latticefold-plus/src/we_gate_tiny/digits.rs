@@ -19,10 +19,9 @@ const NIBBLE_BASE: i32 = 16;
 #[inline]
 pub(crate) fn f257_to_i32_bal(x: F257) -> i32 {
     // Interpret F257 element as a signed integer in (-128..128] via centered lift.
-    let bytes = x.into_bigint().to_bytes_le();
-    let u16v = (bytes.get(0).copied().unwrap_or(0) as u16)
-        | ((bytes.get(1).copied().unwrap_or(0) as u16) << 8);
-    let u = u16v as i32;
+    // Avoid `to_bytes_le()` allocations: read low limb directly.
+    let limb0: u64 = x.into_bigint().as_ref().get(0).copied().unwrap_or(0);
+    let u: i32 = (limb0 & 0xFFFF) as i32; // canonical rep in [0,256]
     if u <= 128 { u } else { u - 257 }
 }
 
