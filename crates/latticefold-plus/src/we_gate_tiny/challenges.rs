@@ -7,7 +7,7 @@ use symphony::transcript::PoseidonTraceOp;
 use super::op_counts::tiny_cm_bump;
 
 use super::digits::{
-    alloc_bal16_digit, f257_to_i32_bal, mul_u32ish9_to_fixed_bal16, u32_bytes_to_bal16_digits_cached,
+    alloc_bal16_digit, f257_to_i32_bal, mul_u32ish9_to_fixed_bal16, u32_bytes_to_bal16_digits,
 };
 use super::gadgets::decompose_existing_byte_var_to_bits;
 use super::params::{DIGITS_PER_TRY, LIMBS_U32, LIMBS_U64};
@@ -282,7 +282,7 @@ pub(super) fn bounded_u32_from_8_digits_base128(
     }
 
     // Balanced base-16 digits (len 9) for the same u32 (used by CM mul gadgets).
-    let bal16_digits = u32_bytes_to_bal16_digits_cached(b, bytes);
+    let bal16_digits = u32_bytes_to_bal16_digits(b, bytes);
     let bal16_sq_digits = mul_u32ish9_to_fixed_bal16(b, &bal16_digits, &bal16_digits, 18);
 
     // Bits 0..31 of the u32, little-endian.

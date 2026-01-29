@@ -1324,6 +1324,9 @@ pub(crate) fn mul_bal16_long_by_const_rhs(
 
 /// Convert 4 little-endian byte vars (0..255) into balanced base-16 digits (len 9).
 pub(crate) fn u32_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 4]) -> Vec<usize> {
+    if let Some(v) = b.u32_bal16_cache.get(&bytes_le) {
+        return v.clone();
+    }
     let _prev = b.profile_enter("digits::u32_bytes_to_bal16_digits");
     b.profile_exit(_prev);
     let bytes_bits: [[usize; 8]; 4] = core::array::from_fn(|i| decompose_existing_byte_var_to_bits::<F257>(b, bytes_le[i]));
@@ -1338,14 +1341,7 @@ pub(crate) fn u32_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
     };
     let lowered = lower_ir_into_builder(b, ir);
     let out: [usize; 9] = core::array::from_fn(|k| lowered.map_var(out_ir[k]));
-    out.to_vec()
-}
-
-pub(crate) fn u32_bytes_to_bal16_digits_cached(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 4]) -> Vec<usize> {
-    if let Some(v) = b.u32_bal16_cache.get(&bytes_le) {
-        return v.clone();
-    }
-    let v = u32_bytes_to_bal16_digits(b, bytes_le);
+    let v = out.to_vec();
     b.u32_bal16_cache.insert(bytes_le, v.clone());
     v
 }
@@ -1355,6 +1351,9 @@ pub(crate) fn u32_bytes_to_bal16_digits_cached(b: &mut Dr1csBuilder<F257>, bytes
 /// Output digits are little-endian base-16 with each digit in [-8,7], followed by a final
 /// carry digit (also in {0,1} for a canonical u64 byte encoding).
 pub(crate) fn u64_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 8]) -> Vec<usize> {
+    if let Some(v) = b.u64_bal16_cache.get(&bytes_le) {
+        return v.clone();
+    }
     let _prev = b.profile_enter("digits::u64_bytes_to_bal16_digits");
     b.profile_exit(_prev);
     let bytes_bits: [[usize; 8]; 8] = core::array::from_fn(|i| decompose_existing_byte_var_to_bits::<F257>(b, bytes_le[i]));
@@ -1369,14 +1368,7 @@ pub(crate) fn u64_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
     };
     let lowered = lower_ir_into_builder(b, ir);
     let out: [usize; 17] = core::array::from_fn(|k| lowered.map_var(out_ir[k]));
-    out.to_vec()
-}
-
-pub(crate) fn u64_bytes_to_bal16_digits_cached(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 8]) -> Vec<usize> {
-    if let Some(v) = b.u64_bal16_cache.get(&bytes_le) {
-        return v.clone();
-    }
-    let v = u64_bytes_to_bal16_digits(b, bytes_le);
+    let v = out.to_vec();
     b.u64_bal16_cache.insert(bytes_le, v.clone());
     v
 }

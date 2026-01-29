@@ -4,7 +4,7 @@ use latticefold::transcript::poseidon::F257;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 
 use super::coins::goldilocks_p_base128_digits_le;
-use super::digits::u64_bytes_to_bal16_digits_cached;
+use super::digits::u64_bytes_to_bal16_digits;
 use super::cm_ir::{
     goldilocks_add_mod_p_digits_ir, goldilocks_mul_const_mod_p_digits_ir,
     goldilocks_mul_mod_p_digits_ir, goldilocks_sub_mod_p_digits_ir, lower_ir_into_builder, IrBuilder as CmIrBuilder,
@@ -395,9 +395,9 @@ pub(super) fn goldilocks_mul_mod_p_from_byte_vars_assume_canonical(
 
     // IR is the source of truth in the digit domain; tie `r_bytes` to the IR digits.
     let p_d_const = goldilocks_p_bal16_digits_le_const();
-    let a_d = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
-    let c_d = u64_bytes_to_bal16_digits_cached(b, *b_bytes);
-    let r_d_bytes = u64_bytes_to_bal16_digits_cached(b, r_bytes);
+    let a_d = u64_bytes_to_bal16_digits(b, *a_bytes);
+    let c_d = u64_bytes_to_bal16_digits(b, *b_bytes);
+    let r_d_bytes = u64_bytes_to_bal16_digits(b, r_bytes);
     debug_assert_eq!(a_d.len(), 17);
     debug_assert_eq!(c_d.len(), 17);
     debug_assert_eq!(r_d_bytes.len(), 17);
@@ -472,9 +472,9 @@ pub(super) fn goldilocks_mul_const_mod_p_from_byte_vars_assume_canonical(
     //
     // We still output canonical bytes, so we tie the IR-produced digits to the digit expansion
     // of `r_bytes`.
-    let x_d = u64_bytes_to_bal16_digits_cached(b, *x_bytes);
+    let x_d = u64_bytes_to_bal16_digits(b, *x_bytes);
     debug_assert_eq!(x_d.len(), 17);
-    let r_d_bytes = u64_bytes_to_bal16_digits_cached(b, r_bytes);
+    let r_d_bytes = u64_bytes_to_bal16_digits(b, r_bytes);
     debug_assert_eq!(r_d_bytes.len(), 17);
 
     let p_d_const = goldilocks_p_bal16_digits_le_const();
@@ -550,9 +550,9 @@ pub(super) fn goldilocks_add_mod_p_from_byte_vars_assume_canonical(
 
     // IR is the source of truth in the digit domain; tie `r_bytes` to the IR digits.
     let p_d_const = goldilocks_p_bal16_digits_le_const();
-    let a_d = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
-    let c_d = u64_bytes_to_bal16_digits_cached(b, *c_bytes);
-    let r_d_bytes = u64_bytes_to_bal16_digits_cached(b, r_bytes);
+    let a_d = u64_bytes_to_bal16_digits(b, *a_bytes);
+    let c_d = u64_bytes_to_bal16_digits(b, *c_bytes);
+    let r_d_bytes = u64_bytes_to_bal16_digits(b, r_bytes);
     debug_assert_eq!(a_d.len(), 17);
     debug_assert_eq!(c_d.len(), 17);
     debug_assert_eq!(r_d_bytes.len(), 17);
@@ -630,9 +630,9 @@ pub(super) fn goldilocks_sub_mod_p_from_byte_vars_assume_canonical(
 
     // IR is the source of truth in the digit domain; tie `r_bytes` to the IR digits.
     let p_d_const = goldilocks_p_bal16_digits_le_const();
-    let a_d = u64_bytes_to_bal16_digits_cached(b, *a_bytes);
-    let c_d = u64_bytes_to_bal16_digits_cached(b, *c_bytes);
-    let r_d_bytes = u64_bytes_to_bal16_digits_cached(b, r_bytes);
+    let a_d = u64_bytes_to_bal16_digits(b, *a_bytes);
+    let c_d = u64_bytes_to_bal16_digits(b, *c_bytes);
+    let r_d_bytes = u64_bytes_to_bal16_digits(b, r_bytes);
     debug_assert_eq!(a_d.len(), 17);
     debug_assert_eq!(c_d.len(), 17);
     debug_assert_eq!(r_d_bytes.len(), 17);
@@ -659,7 +659,7 @@ pub(super) fn goldilocks_sub_mod_p_from_byte_vars_assume_canonical(
 
 /// Goldilocks scalar in balanced base-16 digits (canonical u64 encoding).
 ///
-/// Representation matches `u64_bytes_to_bal16_digits_cached`:
+/// Representation matches `u64_bytes_to_bal16_digits`:
 /// - 16 balanced digits in [-8,7]
 /// - plus a final carry digit in {0,1}
 pub(crate) type GoldilocksScalar = [usize; 17];
@@ -677,5 +677,5 @@ fn vec17_to_arr17(v: Vec<usize>) -> GoldilocksScalar {
 /// Convert 8 little-endian byte vars (0..255) into a canonical Goldilocks scalar (balanced base-16 digits, len 17).
 #[inline]
 pub(crate) fn goldilocks_scalar_from_u64_bytes_le_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [usize; 8]) -> GoldilocksScalar {
-    vec17_to_arr17(u64_bytes_to_bal16_digits_cached(b, bytes_le))
+    vec17_to_arr17(u64_bytes_to_bal16_digits(b, bytes_le))
 }

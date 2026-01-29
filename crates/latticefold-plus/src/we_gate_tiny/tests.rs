@@ -321,11 +321,11 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
     }
 
     let a_d: [super::goldilocks::GoldilocksScalar; 64] = core::array::from_fn(|i| {
-        let v = u64_bytes_to_bal16_digits_cached(&mut b, a_bytes[i]);
+        let v = u64_bytes_to_bal16_digits(&mut b, a_bytes[i]);
         v.try_into().expect("u64 bytes -> 17 digits")
     });
     let c_d: [super::goldilocks::GoldilocksScalar; 64] = core::array::from_fn(|i| {
-        let v = u64_bytes_to_bal16_digits_cached(&mut b, c_bytes[i]);
+        let v = u64_bytes_to_bal16_digits(&mut b, c_bytes[i]);
         v.try_into().expect("u64 bytes -> 17 digits")
     });
 
