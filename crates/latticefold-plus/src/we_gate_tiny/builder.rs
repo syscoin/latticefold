@@ -2303,6 +2303,8 @@ fn build_cm_glue_for_which(
                     let mut u_ir_build_time = Duration::ZERO;
                     let mut u_lower_time = Duration::ZERO;
                     let mut u_frag_count: usize = 0;
+                    // Fixed batch size to avoid more env vars.
+                    let u_ir_batch_size: usize = 64;
 
                     // rc powers for claimed_sum
                     let z_idx = l_instances_expected * (4 + 4 * (params.mlen as usize));
@@ -2371,8 +2373,7 @@ fn build_cm_glue_for_which(
                                 }
 
                                 // Batch size for IR shards (controls peak memory).
-                                // Keep this fixed to avoid introducing more env vars.
-                                let batch_size: usize = 64;
+                                let batch_size: usize = u_ir_batch_size;
 
                                 for chunk in terms.chunks(batch_size) {
                                     // Build IR fragments in parallel (no access to glue.gb mutably).
@@ -2452,7 +2453,7 @@ fn build_cm_glue_for_which(
                             u_lower_time,
                             u_frag_count,
                             expected_muls,
-                            batch_size,
+                            u_ir_batch_size,
                             rayon::current_num_threads().max(1),
                         );
                     }
