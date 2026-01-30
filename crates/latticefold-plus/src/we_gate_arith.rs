@@ -20,8 +20,6 @@ use symphony::dpp_poseidon::{
     PoseidonDr1csWiring, SparseDr1csInstance,
 };
 use symphony::dpp_sumcheck::Dr1csBuilder;
-use latticefold::commitment::AjtaiCommitmentScheme;
-use crate::setchk::OUT_E_AGG_SEED;
 use symphony::dpp_sumcheck::{sumcheck_verify_degree3, RingVars};
 
 #[cfg(feature = "we_gate")]
@@ -579,14 +577,17 @@ where
         tr.absorb_field_element(&ri);
     }
 
-    // Tiny-field variant note:
-    // Instead of digest-binding `out.e/out.b` via Ajtai (which is cheap over the native base field
-    // but expensive when arithmetized inside F257), we absorb the full `flat(out.e,out.b)` vector.
-    //
-    // Flatten order matches `setchk::absorb_evaluations_digest`: claim index -> block -> lane, then out.b.
-    let out_e_blocks = 1usize + mlen_mats;
-    let n_out_flat = out_e_blocks * out_e0_len * d + out_b_len;
-    for _ in 0..n_out_flat {
+    // setchk::absorb_evaluations(out.e, out.b):
+    // Absorb all `out.e` blocks (each is a Vec<Vec<R>> of length `k_rg`, and each `Vec<R>` has
+    // length `d`), then absorb `out.b` (len=1 ring element).
+    for _ in 0..dcom_eval_vec_len {
+        for _ in 0..out_e0_len {
+            for _ in 0..d {
+                tr.absorb(&R::ZERO);
+            }
+        }
+    }
+    for _ in 0..out_b_len {
         tr.absorb(&R::ZERO);
     }
 
@@ -2768,7 +2769,7 @@ where
     let ring_zero = scalar_var_to_ringvars::<R>(&mut b, z0);
     let v_sc = sumcheck_verify_degree3::<BF<R>>(&mut b, ring_zero.clone(), &msg_vars_sc, &r_point_vars)?;
 
-    // Allocate out.e/out.b ring vars once (used by SetChk digest + RgChk + CM u computation).
+    // Allocate out.e/out.b ring vars once (used by transcript absorbs + RgChk + CM u computation).
     let mut out_e_vars: Vec<Vec<Vec<RingVars>>> = Vec::with_capacity(out_sc.e.len());
     for ek in &out_sc.e {
         let mut ek_vars: Vec<Vec<RingVars>> = Vec::with_capacity(ek.len());
@@ -2776,6 +2777,9 @@ where
             let mut ej_vars: Vec<RingVars> = Vec::with_capacity(ej.len());
             for r in ej {
                 let rv = ring_to_ringvars::<R>(&mut b, r);
+                // setchk::absorb_evaluations absorbs *all* blocks and all lanes of out.e.
+                absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat_prefix, &rv);
+                absorb_dcom_out_e(rv.coeffs.len());
                 ej_vars.push(rv);
             }
             ek_vars.push(ej_vars);
@@ -2785,116 +2789,22 @@ where
     let mut out_b_vars: Vec<RingVars> = Vec::with_capacity(out_sc.b.len());
     for bb in &out_sc.b {
         let rv = ring_to_ringvars::<R>(&mut b, bb);
+        // setchk::absorb_evaluations absorbs out.b after all out.e blocks.
+        absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat_prefix, &rv);
+        absorb_dcom_out_b(rv.coeffs.len());
         out_b_vars.push(rv);
     }
 
-    // Ajtai aggregate commitment binding for out.e/out.b (cheap, linear constraints).
-    let mut out_flat_vals: Vec<R> = Vec::new();
-    let mut out_flat_vars: Vec<RingVars> = Vec::new();
-    for i in 0..out_sc.e[0].len() {
-        for blk in 0..out_e_vars.len() {
-            for lane in 0..out_e_vars[blk][i].len() {
-                out_flat_vals.push(out_sc.e[blk][i][lane]);
-                out_flat_vars.push(out_e_vars[blk][i][lane].clone());
-            }
-        }
-    }
-    for i in 0..out_sc.b.len() {
-        out_flat_vals.push(out_sc.b[i]);
-        out_flat_vars.push(out_b_vars[i].clone());
-    }
-    if out_flat_vals.is_empty() {
-        return Err("WeGateDr1csBuilder: empty out.e/out.b aggregate".to_string());
-    }
-    let kappa = params.kappa as usize;
-    if kappa == 0 {
-        return Err("WeGateDr1csBuilder: kappa=0 invalid".to_string());
-    }
-    let out_e_agg_scheme = AjtaiCommitmentScheme::<R>::seeded(
-        b"setchk_out_e_agg",
-        OUT_E_AGG_SEED,
-        kappa,
-        out_flat_vals.len(),
-    );
-    // IMPORTANT:
-    // `setchk::absorb_evaluations_digest` commits to the full `flat` vector; it only uses
-    // `commit_const_coeff_fast` as an optimization when the witness is const-coeff.
-    //
-    // For the WE gate, we must support the general case without assuming const-coeff shape here.
-    let out_e_agg = out_e_agg_scheme
-        .commit(&out_flat_vals)
-        .map_err(|e| format!("WeGateDr1csBuilder: out_e_agg commit failed: {e:?}"))?
-        .as_ref()
-        .to_vec();
-    // Absorb the aggregate commitment (kappa ring elements) into the transcript.
-    let mut out_e_agg_vars: Vec<RingVars> = Vec::with_capacity(kappa);
-    for ce in &out_e_agg {
-        let mut coeffs = Vec::with_capacity(ce.coeffs().len());
-        for &c in ce.coeffs() {
-            // Witness variable (NOT const); constrained by Ajtai opening below.
-            coeffs.push(b.new_var(bf_from_base_ring::<R>(c)));
-        }
-        out_e_agg_vars.push(RingVars::new(coeffs));
-    }
-    for rv in &out_e_agg_vars {
-        absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat_prefix, &rv);
-        absorb_dcom_out_e(rv.d());
-    }
-
-    // Ajtai opening constraints: enforce `commit(flat) == out_e_agg`.
-    //
-    // Since the Ajtai matrix entries are *constants* (seeded), multiplication by `a_ij` is a
-    // fixed linear map on the coefficient vector of each `flat[j]` (negacyclic convolution).
-    // We therefore enforce the commitment relation using only linear constraints (no ring mul gadget).
-    let n_out_agg = out_flat_vals.len();
-    let d = R::dimension();
-    // Precompute Ajtai matrix columns `col[j] = commit(e_j)` once. Each `col[j][i]` is `a_ij`.
-    let mut cols: Vec<Vec<R>> = Vec::with_capacity(n_out_agg);
-    for j in 0..n_out_agg {
-        let mut basis = vec![R::ZERO; n_out_agg];
-        basis[j] = R::ONE;
-        let col = out_e_agg_scheme
-            .commit(&basis)
-            .map_err(|e| format!("WeGateDr1csBuilder: out_e_agg basis commit failed: {e:?}"))?
-            .as_ref()
-            .to_vec();
-        cols.push(col);
-    }
-    // Enforce each output coefficient directly as a linear form over input coefficients.
-    for i in 0..kappa {
-        for k_out in 0..d {
-            let mut lc: Vec<(BF<R>, usize)> = Vec::new();
-            for j in 0..n_out_agg {
-                let aij = &cols[j][i];
-                let a_coeffs = aij.coeffs();
-                for v in 0..d {
-                    let (u, sign) = if k_out >= v {
-                        (k_out - v, BF::<R>::ONE)
-                    } else {
-                        (k_out + d - v, -BF::<R>::ONE)
-                    };
-                    let w = bf_from_base_ring::<R>(a_coeffs[u]) * sign;
-                    if w != BF::<R>::ZERO {
-                        lc.push((w, out_flat_vars[j].coeffs[v]));
-                    }
-                }
-            }
-            let rhs_var = out_e_agg_vars[i].coeffs[k_out];
-            lc.push((-BF::<R>::ONE, rhs_var));
-            b.enforce_lc_times_one_eq_const(lc);
-        }
-    }
-
-    // SetChk recombination: enforce ver == v_sc and digest-absorb out.e/out.b.
+    // SetChk recombination: enforce ver == v_sc.
     let rc_pow_base = rc_var.unwrap_or_else(|| const_var(&mut b, BF::<R>::ONE));
     let rc_pows = scalar_pow_table::<BF<R>>(&mut b, rc_pow_base, nclaims_setchk.saturating_sub(1));
     // Accumulate verifier scalar as an LC to avoid O(n) scalar_add constraints.
     let mut ver_lc: Lc<BF<R>> = Vec::new();
 
     // CRITICAL (FS binding):
-    // The transcript absorbs the Ajtai aggregate commitment for out.e/out.b (above),
-    // which is enforced by linear constraints. The SetChk algebraic verification below
-    // still uses only `out.e[0]` (as before).
+    // The transcript absorbs *all* `out.e` blocks and `out.b` (see allocation above),
+    // matching `setchk::absorb_evaluations`. The SetChk algebraic verification below
+    // still uses only `out.e[0]` (as in `Out::verify`), and does not depend on the other blocks.
     for i in 0..out_sc.e[0].len() {
         let eq = eq_eval_vars::<BF<R>>(&mut b, &c_vars[i], &r_point_vars);
         let beta = beta_vars[i];
@@ -2905,21 +2815,16 @@ where
 
         // e_sum = Σ term as a scalar LC (no scalar_add chain).
         let mut e_sum_lc: Lc<BF<R>> = Vec::new();
-        // Absorb all blocks e[blk][i][lane][j]
-        for blk in 0..out_e_vars.len() {
-            for lane in 0..out_e_vars[blk][i].len() {
-                let ejv = &out_e_vars[blk][i][lane];
-                let ev1 = ring_eval_at_scalar::<R>(&mut b, ejv, beta);
-                let ev2 = ring_eval_at_scalar::<R>(&mut b, ejv, beta2);
-
-                // Only block 0 participates in the SetChk check.
-                if blk == 0 {
-                    let ev1_sq = scalar_mul::<BF<R>>(&mut b, ev1, ev1);
-                    let diff = scalar_sub::<BF<R>>(&mut b, ev1_sq, ev2);
-                    let term = scalar_mul::<BF<R>>(&mut b, diff, alpha_pows[lane]);
-                    e_sum_lc.push((BF::<R>::ONE, term));
-                }
-            }
+        // Only block 0 participates in the SetChk check (as in `setchk::Out::verify`).
+        let blk0 = 0usize;
+        for lane in 0..out_e_vars[blk0][i].len() {
+            let ejv = &out_e_vars[blk0][i][lane];
+            let ev1 = ring_eval_at_scalar::<R>(&mut b, ejv, beta);
+            let ev2 = ring_eval_at_scalar::<R>(&mut b, ejv, beta2);
+            let ev1_sq = scalar_mul::<BF<R>>(&mut b, ev1, ev1);
+            let diff = scalar_sub::<BF<R>>(&mut b, ev1_sq, ev2);
+            let term = scalar_mul::<BF<R>>(&mut b, diff, alpha_pows[lane]);
+            e_sum_lc.push((BF::<R>::ONE, term));
         }
         let e_sum = if e_sum_lc.is_empty() {
             const_var(&mut b, BF::<R>::ZERO)
@@ -5235,11 +5140,15 @@ where
             expect_get_challenge(&mut op_idx, &mut absorb_ops, &mut squeezed_field_elems)?;
             expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?;
         }
-        // absorb_evaluations_digest(out.e, out.b):
-        // SetChk binds all outputs via an Ajtai aggregate commitment and absorbs that commitment.
-        // (κ ring elements, each absorbed as len=d base-field elems).
-        let kappa = dcom.fcoms.first().map(|f| f.cm_f.len()).unwrap_or(0);
-        for _ in 0..kappa {
+        // setchk::absorb_evaluations(out.e, out.b): absorb all out.e blocks then out.b.
+        for ek in &out.e {
+            for ej in ek {
+                for _ in 0..ej.len() {
+                    expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
+                }
+            }
+        }
+        for _ in 0..out.b.len() {
             expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
         }
 

@@ -386,14 +386,9 @@ where
             sets,
             nvars: self.nvars,
         };
-        let kappa = self
-            .instances
-            .first()
-            .map(|inst| inst.fcoms.cm_f.len())
-            .unwrap_or(0);
         // (Fiat–Shamir): absorb witness commitments before sampling set-check challenges.
         absorb_fcoms_instances(&self.instances, transcript);
-        let out_rel = in_rel.set_check(crate::setchk::ExternalMats::Ring(M), transcript, kappa);
+        let out_rel = in_rel.set_check(crate::setchk::ExternalMats::Ring(M), transcript);
 
         // Avoid allocating a full eq-table of size 2^nvars.
         // We instead stream eq-weights in small blocks in the evaluation routines below.
@@ -522,14 +517,9 @@ where
             sets,
             nvars: self.nvars,
         };
-        let kappa = self
-            .instances
-            .first()
-            .map(|inst| inst.fcoms.cm_f.len())
-            .unwrap_or(0);
         // (Fiat–Shamir): absorb witness commitments before sampling set-check challenges.
         absorb_fcoms_instances(&self.instances, transcript);
-        let out_rel = in_rel.set_check(crate::setchk::ExternalMats::Base(M0), transcript, kappa);
+        let out_rel = in_rel.set_check(crate::setchk::ExternalMats::Base(M0), transcript);
 
         let one_minus_r = out_rel
             .r
@@ -673,12 +663,7 @@ where
 
         // (Fiat–Shamir): mirror prover-side ordering; absorb commitments before coins.
         absorb_fcoms_fcoms(&self.fcoms, transcript);
-        let kappa = self
-            .fcoms
-            .first()
-            .map(|f| f.cm_f.len())
-            .unwrap_or(0);
-        self.out.verify(transcript, kappa)?;
+        self.out.verify(transcript)?;
 
         absorb_evaluations(&self.evals, transcript);
 
