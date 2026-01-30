@@ -30,8 +30,6 @@ pub struct TinyCoinOpWiring {
     /// Each logical `get_challenge()` performs `DEFAULT_REJECTION_TRIES` consecutive `SqueezeField(len=8)`
     /// attempts (each followed by an absorb); this vector stores the **first** squeeze-op index of each group.
     pub u32_squeeze_ops: Vec<usize>,
-    /// `SqueezeField(len=8)` op indices for Goldilocks-field rejection candidates (length must be `n_coins*tries`).
-    pub goldilocks_squeeze_ops: Vec<usize>,
 }
 
 /// Helper: number of `short_challenge(128)` blocks used by CM (the `s` and `s_prime` surface).
@@ -59,7 +57,6 @@ fn cm_bounded_u32_challenges(log_kappa: usize, nvars_cm: usize) -> usize {
 /// This follows the CM transcript schedule in `cm.rs`:
 /// - first consume `short_need` occurrences of `SqueezeField(len=ring_dim)` for `short_challenge(128)`
 /// - then consume `u32_need` occurrences of `SqueezeField(len=8)` for bounded scalar challenges
-/// - optionally, treat the next `goldilocks_need` occurrences of `SqueezeField(len=8)` as Goldilocks coin candidates
 ///
 /// IMPORTANT:
 /// - This is a **schedule** parser. It does not validate re-absorbs; Poseidon arithmetization handles that.
@@ -72,7 +69,6 @@ pub fn infer_cm_coin_op_wiring_from_ops(
     log_kappa: usize,
     nvars_cm: usize,
     squeeze_field_op_offset: usize,
-    goldilocks_need: usize,
 ) -> Result<TinyCoinOpWiring, String> {
     let short_need = cm_short_challenge_blocks(ring_dim, k);
     let u32_need = cm_bounded_u32_challenges(log_kappa, nvars_cm);
@@ -110,22 +106,11 @@ pub fn infer_cm_coin_op_wiring_from_ops(
                             .push(squeeze_field_op_idx - squeeze_field_op_offset);
                     }
                     u32_try_blocks_seen += 1;
-                } else if out.short_squeeze_ops.len() == short_need
-                    && out.u32_squeeze_ops.len() == u32_need
-                    && v.len() == DIGITS_PER_TRY
-                    && next_is_reabsorb_try
-                    && out.goldilocks_squeeze_ops.len() < goldilocks_need
-                {
-                    out.goldilocks_squeeze_ops
-                        .push(squeeze_field_op_idx - squeeze_field_op_offset);
                 }
             }
             squeeze_field_op_idx += 1;
         }
-        if out.short_squeeze_ops.len() == short_need
-            && out.u32_squeeze_ops.len() == u32_need
-            && out.goldilocks_squeeze_ops.len() == goldilocks_need
-        {
+        if out.short_squeeze_ops.len() == short_need && out.u32_squeeze_ops.len() == u32_need {
             break;
         }
     }
@@ -143,13 +128,6 @@ pub fn infer_cm_coin_op_wiring_from_ops(
             "infer_cm_coin_op_wiring: need {} u32 challenge starts (len=8), got {}",
             u32_need,
             out.u32_squeeze_ops.len()
-        ));
-    }
-    if out.goldilocks_squeeze_ops.len() != goldilocks_need {
-        return Err(format!(
-            "infer_cm_coin_op_wiring: need {} goldilocks squeezes (len=8), got {}",
-            goldilocks_need,
-            out.goldilocks_squeeze_ops.len()
         ));
     }
     Ok(out)

@@ -118,7 +118,6 @@ where
         log_kappa,
         nvars_cm,
         squeeze_field_op_offset,
-        0, // goldilocks_need (not used on this path yet)
     )?;
     let mut wiring_abs = tiny::TinyCoinOpWiring::default();
     wiring_abs.short_squeeze_ops = wiring_rel
@@ -135,7 +134,6 @@ where
     wiring_abs
         .u32_squeeze_ops
         .splice(0..0, prefix_u32_squeeze_ops.into_iter());
-    wiring_abs.goldilocks_squeeze_ops = Vec::new();
 
     let (
         inst_pose,
@@ -143,7 +141,6 @@ where
         _shorts,
         _u32s,
         _goldilocks,
-        _goldilocks_rejection,
         _tcch0,
         _tcch1,
         _surfaces_mul,
@@ -894,7 +891,6 @@ where
         log_kappa,
         nvars_cm,
         squeeze_field_op_offset,
-        0, // goldilocks_need (not used on this path yet)
     )?;
     let mut wiring_abs = tiny::TinyCoinOpWiring::default();
     wiring_abs.short_squeeze_ops = wiring_rel
@@ -910,7 +906,6 @@ where
     wiring_abs
         .u32_squeeze_ops
         .splice(0..0, prefix_u32_squeeze_ops.into_iter());
-    wiring_abs.goldilocks_squeeze_ops = Vec::new();
 
     // Build Poseidon(F257)+coin surfaces with this concrete trace (assignment carries the real absorbs/squeezes).
     let (
@@ -919,7 +914,6 @@ where
         _shorts,
         _u32s,
         _goldilocks,
-        _goldilocks_rejection,
         _tcch0,
         _tcch1,
         _surfaces_mul,
@@ -1053,15 +1047,13 @@ where
         log_kappa,
         nvars_cm,
         squeeze_field_op_offset,
-        0,
     )?;
     let mut wiring_abs = tiny::TinyCoinOpWiring::default();
     wiring_abs.short_squeeze_ops = wiring_rel.short_squeeze_ops.into_iter().map(|i| i + squeeze_field_op_offset).collect();
     wiring_abs.u32_squeeze_ops = wiring_rel.u32_squeeze_ops.into_iter().map(|i| i + squeeze_field_op_offset).collect();
     wiring_abs.u32_squeeze_ops.splice(0..0, prefix_u32_squeeze_ops.into_iter());
-    wiring_abs.goldilocks_squeeze_ops = Vec::new();
 
-    let (inst_pose, asg_pose, _shorts, _u32s, _goldilocks, _goldilocks_rejection, _tcch0, _tcch1, _surfaces_mul, _surfaces_sq, _pose_wiring) =
+    let (inst_pose, asg_pose, _shorts, _u32s, _goldilocks, _tcch0, _tcch1, _surfaces_mul, _surfaces_sq, _pose_wiring) =
         tiny::we_tiny_f257_build_cm_gate_from_trace_ops_with_extra_witness(
             None,
             &ops_f257,
@@ -6060,7 +6052,6 @@ mod tests {
             log_kappa,
             nvars_cm,
             squeeze_field_op_offset,
-            0,
         )
         .expect("infer_cm_coin_op_wiring_from_ops");
 
@@ -6078,9 +6069,8 @@ mod tests {
         wiring_abs
             .u32_squeeze_ops
             .splice(0..0, prefix_u32_squeeze_ops.into_iter());
-        wiring_abs.goldilocks_squeeze_ops = Vec::new();
 
-        let (inst, asg, _shorts, _u32s, _goldilocks, _goldilocks_rejection, _tcch0, _tcch1, _sm, _ssq, _w) =
+        let (inst, asg, _shorts, _u32s, _goldilocks, _tcch0, _tcch1, _sm, _ssq, _w) =
             tiny::we_tiny_f257_build_cm_gate_from_trace_ops(
                 None,
                 &ops_f257,

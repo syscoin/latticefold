@@ -868,58 +868,6 @@ fn mux_base128_10_ir(b: &mut IrBuilder<'_>, sel: VarRef, a: &[VarRef; LIMBS_U64]
     out
 }
 
-fn compute_u_from_8_digits_base257_in_base128_ir(b: &mut IrBuilder<'_>, digits: &[VarRef; DIGITS_PER_TRY]) -> [VarRef; LIMBS_U64] {
-    let mut u = [b.one(); LIMBS_U64];
-    for i in 0..LIMBS_U64 {
-        u[i] = const_zero_ir(b);
-    }
-    for i in (0..DIGITS_PER_TRY).rev() {
-        let shift = base128_shift1_10_ir(b, &u);
-        let two_shift = base128_mul2_10_ir(b, &shift);
-        let u257 = base128_add10_ir(b, &u, &two_shift);
-        let (l0, l1) = digit_to_base128_limbs_ir(b, digits[i]);
-        let mut d_ext = [b.one(); LIMBS_U64];
-        d_ext[0] = l0;
-        d_ext[1] = l1;
-        for j in 2..LIMBS_U64 {
-            d_ext[j] = const_zero_ir(b);
-        }
-        u = base128_add10_ir(b, &u257, &d_ext);
-    }
-    u
-}
-
-pub(crate) fn sample_goldilocks_coin_unrolled_rejection_8_digits_ir(
-    b: &mut IrBuilder<'_>,
-    digit_vars: &[VarRef], // length = tries*8
-    tries: usize,
-    p_digits: &[u8; LIMBS_U64],
-) -> ([VarRef; LIMBS_U64], VarRef /* found */) {
-    assert_eq!(digit_vars.len(), tries * DIGITS_PER_TRY);
-    let mut found = const_zero_ir(b);
-    let mut selected = [b.one(); LIMBS_U64];
-    for i in 0..LIMBS_U64 {
-        selected[i] = const_zero_ir(b);
-    }
-
-    for t in 0..tries {
-        let mut d = [b.one(); DIGITS_PER_TRY];
-        for i in 0..DIGITS_PER_TRY {
-            d[i] = digit_vars[t * DIGITS_PER_TRY + i];
-        }
-        let u = compute_u_from_8_digits_base257_in_base128_ir(b, &d);
-        let lt = base128_lt_const10_ir(b, &u, p_digits); // 1 iff u < p
-
-        let not_found = bool_not_ir(b, found);
-        let take = bool_and_ir(b, not_found, lt);
-
-        selected = mux_base128_10_ir(b, take, &selected, &u);
-        found = bool_or_ir(b, found, lt);
-    }
-
-    (selected, found)
-}
-
 /// Allocate a signed carry `c ∈ {-1,0,1}` using the vanishing polynomial over F257:
 /// \[
 ///   (c-1)\,c\,(c+1) = 0.

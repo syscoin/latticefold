@@ -21,7 +21,6 @@ use super::challenges::{
     select_first_ok_u32_try_digits, short_challenge_from_digits_128, squeeze_field_ranges_by_op_index,
     BoundedU32ChallengeWiring, GoldilocksChallengeWiring, ShortChallengeWiring, TinyCoinOpWiring,
 };
-use super::coins::{sample_goldilocks_coin_unrolled_rejection_8_digits, GoldilocksRejectionCoinWiring};
 use super::digits::{
     rebalance_prod12_to_prod13, rebalance_prod21_to_prod22, scale_short_coeffs_by_digits18,
     scale_short_coeffs_by_digits9, sum_bal16_vectors_fixed_len, sum_product_digits_bal16,
@@ -776,47 +775,6 @@ fn build_u32_and_goldilocks_blocks(
         });
     }
     Ok((u32_out, goldilocks_out))
-}
-
-fn build_goldilocks_rejection_coins(
-    glue: &mut GlueCtx,
-    pose_wiring: &PoseidonDr1csWiring,
-    goldilocks_ranges: &[(usize, usize)],
-) -> Result<Vec<GoldilocksRejectionCoinWiring>, String> {
-    let tries: usize = DEFAULT_REJECTION_TRIES;
-    if !goldilocks_ranges.is_empty() && (goldilocks_ranges.len() % tries != 0) {
-        return Err(format!(
-            "goldilocks_squeeze_ops length {} not divisible by tries={}",
-            goldilocks_ranges.len(),
-            tries
-        ));
-    }
-    let n_coins = if goldilocks_ranges.is_empty() { 0 } else { goldilocks_ranges.len() / tries };
-    let mut out: Vec<GoldilocksRejectionCoinWiring> = Vec::with_capacity(n_coins);
-    for coin_idx in 0..n_coins {
-        let mut digit_vars: Vec<usize> = Vec::with_capacity(tries * DIGITS_PER_TRY);
-        for t in 0..tries {
-            let (start, len) = goldilocks_ranges[coin_idx * tries + t];
-            if len != DIGITS_PER_TRY {
-                return Err(format!(
-                    "goldilocks squeeze len mismatch (got {len}, expected {DIGITS_PER_TRY})"
-                ));
-            }
-            for gv in &pose_wiring.squeeze_field_vars[start..start + len] {
-                digit_vars.push(glue.copy_digit(*gv));
-            }
-        }
-        let (coin_local, found_local) =
-            sample_goldilocks_coin_unrolled_rejection_8_digits(&mut glue.gb, &digit_vars, tries);
-        glue.gb.enforce_var_eq_const(found_local, F257::ONE);
-        out.push(GoldilocksRejectionCoinWiring {
-            digit_vars,
-            found_bit: found_local,
-            coin_limbs: coin_local.to_vec(),
-            tries,
-        });
-    }
-    Ok(out)
 }
 
 fn compute_tcch(
@@ -1809,7 +1767,6 @@ fn finalize(
     short_locals: Vec<ShortChallengeWiring>,
     u32_locals: Vec<BoundedU32ChallengeWiring>,
     goldilocks_locals: Vec<GoldilocksChallengeWiring>,
-    goldilocks_rejection_locals: Vec<GoldilocksRejectionCoinWiring>,
     tcch0_local: Vec<[usize; 8]>,
     tcch1_local: Vec<[usize; 8]>,
     surfaces_mul_local: Vec<CmDigitMulSurfaceWiring>,
@@ -1825,7 +1782,6 @@ fn finalize(
         Vec<ShortChallengeWiring>,
         Vec<BoundedU32ChallengeWiring>,
         Vec<GoldilocksChallengeWiring>,
-        Vec<GoldilocksRejectionCoinWiring>,
         Vec<[usize; 8]>,
         Vec<[usize; 8]>,
         Vec<CmDigitMulSurfaceWiring>,
@@ -2010,15 +1966,6 @@ fn finalize(
             res257: to_glue_global(w.res257),
         })
         .collect::<Vec<_>>();
-    let goldilocks_rejection_out = goldilocks_rejection_locals
-        .into_iter()
-        .map(|w| GoldilocksRejectionCoinWiring {
-            digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
-            found_bit: to_glue_global(w.found_bit),
-            coin_limbs: w.coin_limbs.into_iter().map(to_glue_global).collect(),
-            tries: w.tries,
-        })
-        .collect::<Vec<_>>();
 
     let all_sum_digits_global: Arc<Vec<usize>> =
         Arc::new(all_sum_digits.iter().copied().map(to_glue_global).collect());
@@ -2073,7 +2020,6 @@ fn finalize(
         shorts_out,
         u32s_out,
         goldilocks_out,
-        goldilocks_rejection_out,
         tcch0_local
             .into_iter()
             .map(|arr| {
@@ -2694,7 +2640,6 @@ pub(super) fn build(
         Vec<ShortChallengeWiring>,
         Vec<BoundedU32ChallengeWiring>,
         Vec<GoldilocksChallengeWiring>,
-        Vec<GoldilocksRejectionCoinWiring>,
         Vec<[usize; 8]>,
         Vec<[usize; 8]>,
         Vec<CmDigitMulSurfaceWiring>,
@@ -2713,7 +2658,6 @@ pub(super) fn build(
 
     let short_ranges = squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.short_squeeze_ops)?;
     let u32_ranges = squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.u32_squeeze_ops)?;
-    let goldilocks_ranges = squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.goldilocks_squeeze_ops)?;
     validate_pairs(pairs, short_ranges.len(), u32_ranges.len())?;
     validate_params_and_short_schedule(ring_dim, params, short_ranges.len())?;
 
@@ -3452,9 +3396,6 @@ pub(super) fn build(
         setchk_out_e_vars_for_cm = Some(out_e_vars);
         dcom_evals_for_cm = Some(dcom_evals_local);
     }
-
-    let goldilocks_rejection_locals = build_goldilocks_rejection_coins(&mut glue, &pose_wiring, &goldilocks_ranges)?;
-    lf_stage_log("build_goldilocks_rejection_coins", Some(&pose_inst), Some(&glue), &mut mem_prev);
     let (tcch0_local, tcch1_local) =
         compute_tcch(&mut glue, ops, &pose_wiring, ring_dim, params, wiring, &u32_locals)?;
     lf_stage_log("compute_tcch", Some(&pose_inst), Some(&glue), &mut mem_prev);
@@ -4002,7 +3943,6 @@ pub(super) fn build(
         short_locals,
         u32_locals,
         goldilocks_locals,
-        goldilocks_rejection_locals,
         tcch0_local,
         tcch1_local,
         surfaces_mul_local,
