@@ -11,11 +11,14 @@ use crate::we_gate_tiny::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U32, LIMBS_U64
 use super::challenges::bounded_u32_from_8_digits_base128;
 use super::digits::*;
 use super::goldilocks::{
-    goldilocks_add_mod_p_from_byte_vars, goldilocks_mul_mod_p_from_byte_vars, goldilocks_sub_mod_p_from_byte_vars,
-    goldilocks_mul_const_mod_p_from_byte_vars, goldilocks_u64_enforce_lt_p_from_byte_vars_and_limbs,
+    goldilocks_u64_enforce_lt_p_from_byte_vars_and_limbs,
     reduce_u64_mod_goldilocks_from_byte_vars,
 };
 use super::gadgets::alloc_byte;
+use super::cm_math::{
+    goldilocks_add_mod_p_digits, goldilocks_bytes_to_digits, goldilocks_digits_to_bytes_canonical,
+    goldilocks_mul_const_mod_p_digits, goldilocks_mul_mod_p_digits, goldilocks_sub_mod_p_digits,
+};
 
 use latticefold::transcript::Transcript;
 use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as GoldilocksRing;
@@ -189,7 +192,10 @@ fn test_goldilocks_mul_mod_p_from_bytes_matches_native() {
             b_bytes[i] = alloc_byte::<F257>(&mut b, v).byte;
         }
 
-        let r_bytes = goldilocks_mul_mod_p_from_byte_vars(&mut b, &a_bytes, &b_bytes);
+        let a_d = goldilocks_bytes_to_digits(&mut b, a_bytes);
+        let b_d = goldilocks_bytes_to_digits(&mut b, b_bytes);
+        let r_d = goldilocks_mul_mod_p_digits(&mut b, &a_d, &b_d);
+        let r_bytes = goldilocks_digits_to_bytes_canonical(&mut b, &r_d);
         let mut out = [0u8; 8];
         for i in 0..8 {
             out[i] = var_to_u8::<F257>(&b, r_bytes[i]);
@@ -224,8 +230,12 @@ fn test_goldilocks_add_sub_mod_p_from_bytes_matches_native() {
             c_bytes[i] = alloc_byte::<F257>(&mut b, v).byte;
         }
 
-        let add_r = goldilocks_add_mod_p_from_byte_vars(&mut b, &a_bytes, &c_bytes);
-        let sub_r = goldilocks_sub_mod_p_from_byte_vars(&mut b, &a_bytes, &c_bytes);
+        let a_d = goldilocks_bytes_to_digits(&mut b, a_bytes);
+        let c_d = goldilocks_bytes_to_digits(&mut b, c_bytes);
+        let add_d = goldilocks_add_mod_p_digits(&mut b, &a_d, &c_d);
+        let sub_d = goldilocks_sub_mod_p_digits(&mut b, &a_d, &c_d);
+        let add_r = goldilocks_digits_to_bytes_canonical(&mut b, &add_d);
+        let sub_r = goldilocks_digits_to_bytes_canonical(&mut b, &sub_d);
 
         let mut out_add = [0u8; 8];
         let mut out_sub = [0u8; 8];
@@ -258,7 +268,9 @@ fn test_goldilocks_mul_const_mod_p_from_bytes_matches_native() {
             x_bytes[i] = alloc_byte::<F257>(&mut b, v).byte;
         }
 
-        let r_bytes = goldilocks_mul_const_mod_p_from_byte_vars(&mut b, &x_bytes, c);
+        let x_d = goldilocks_bytes_to_digits(&mut b, x_bytes);
+        let r_d = goldilocks_mul_const_mod_p_digits(&mut b, &x_d, c);
+        let r_bytes = goldilocks_digits_to_bytes_canonical(&mut b, &r_d);
         let mut out = [0u8; 8];
         for i in 0..8 {
             out[i] = var_to_u8::<F257>(&b, r_bytes[i]);

@@ -5,12 +5,12 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 use rayon::prelude::*;
 
 use super::op_counts::tiny_cm_bump;
+use super::gadgets::alloc_byte;
+use super::digits::f257_to_i32_bal;
 use super::goldilocks::{
-    goldilocks_add_mod_p_from_byte_vars_assume_canonical, goldilocks_mul_mod_p_from_byte_vars_assume_canonical,
-    goldilocks_mul_const_mod_p_from_byte_vars_assume_canonical,
-    goldilocks_sub_mod_p_from_byte_vars_assume_canonical,
     goldilocks_scalar_from_u64_bytes_le_digits,
     goldilocks_p_bal16_digits_le_const, GoldilocksScalar,
+    goldilocks_u64_enforce_lt_p_from_byte_vars,
 };
 use super::cm_ir::{
     bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_ir, goldilocks_mul_const_mod_p_digits_bal4_ir,
@@ -50,147 +50,20 @@ pub(crate) fn alloc_const_goldilocks_u64(gb: &mut Dr1csBuilder<F257>, v: u64) ->
 }
 
 #[inline]
-pub(crate) fn ring_zero_bytes(gb: &mut Dr1csBuilder<F257>, d: usize) -> RingBytes {
-    let _prev = gb.profile_enter("cm_math::ring_zero_bytes");
-    let z = alloc_const_goldilocks_u64(gb, 0u64);
-    let out = vec![z; d];
-    gb.profile_exit(_prev);
-    out
-}
-
-#[inline]
-pub(crate) fn ring_eq_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, b: &RingBytes) {
-    let _prev = gb.profile_enter("cm_math::ring_eq_bytes");
-    tiny_cm_bump(|c| c.ring_eq += 1);
-    debug_assert_eq!(a.len(), b.len());
-    for (ai, bi) in a.iter().zip(b.iter()) {
-        for j in 0..8 {
-            gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, ai[j]), (-F257::ONE, bi[j])]);
+fn modinv_u64(p: u64, a: u64) -> u64 {
+    // Extended Euclid over i128 (p fits in u64).
+    fn egcd(a: i128, b: i128) -> (i128, i128, i128) {
+        if a == 0 {
+            return (b, 0, 1);
         }
+        let (g, x, y) = egcd(b % a, a);
+        (g, y - (b / a) * x, x)
     }
-    gb.profile_exit(_prev);
-}
-
-#[inline]
-pub(crate) fn ring_add_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, b: &RingBytes) -> RingBytes {
-    let _prev = gb.profile_enter("cm_math::ring_add_bytes");
-    tiny_cm_bump(|c| c.ring_add += 1);
-    debug_assert_eq!(a.len(), b.len());
-    let mut out = Vec::with_capacity(a.len());
-    for i in 0..a.len() {
-        out.push(goldilocks_add_mod_p_from_byte_vars_assume_canonical(gb, &a[i], &b[i]));
-    }
-    gb.profile_exit(_prev);
-    out
-}
-
-#[inline]
-pub(crate) fn ring_sub_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, b: &RingBytes) -> RingBytes {
-    let _prev = gb.profile_enter("cm_math::ring_sub_bytes");
-    tiny_cm_bump(|c| c.ring_sub += 1);
-    debug_assert_eq!(a.len(), b.len());
-    let mut out = Vec::with_capacity(a.len());
-    for i in 0..a.len() {
-        out.push(goldilocks_sub_mod_p_from_byte_vars_assume_canonical(gb, &a[i], &b[i]));
-    }
-    gb.profile_exit(_prev);
-    out
-}
-
-/// Scale a ring element by a base-field scalar (byte-encoded).
-///
-/// Since the scalar is in the base field, this is per-coefficient multiplication.
-#[inline]
-pub(crate) fn ring_scale_bytes(gb: &mut Dr1csBuilder<F257>, a: &RingBytes, s: &[usize; 8]) -> RingBytes {
-    let _prev = gb.profile_enter("cm_math::ring_scale_bytes");
-    tiny_cm_bump(|c| c.ring_scale += 1);
-    let mut out = Vec::with_capacity(a.len());
-    for i in 0..a.len() {
-        out.push(goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, &a[i], s));
-    }
-    gb.profile_exit(_prev);
-    out
-}
-
-/// Compute Lagrange basis coefficients (L0,L1,L2) for interpolation of degree-2 sumcheck message
-/// polynomials at points 0,1,2 evaluated at `r`.
-///
-/// This mirrors `we_gate_arith::lagrange_degree2` but over Goldilocks base field, with byte encodings.
-pub(crate) fn lagrange_degree2_goldilocks(
-    gb: &mut Dr1csBuilder<F257>,
-    r: &[usize; 8],
-    one: &[usize; 8],
-    two: &[usize; 8],
-) -> ([usize; 8], [usize; 8], [usize; 8]) {
-    let _prev = gb.profile_enter("cm_math::lagrange_degree2_goldilocks_bytes");
-    // 2 subs, 4 muls, plus one "mul by const" semantic (inv2) in the big-gate accounting.
-    // Here we count the higher-level helper call once.
-    tiny_cm_bump(|c| c.scalar_sub_const += 0);
-    // t1 = r - 1, t2 = r - 2
-    let t1 = goldilocks_sub_mod_p_from_byte_vars_assume_canonical(gb, r, one);
-    let t2 = goldilocks_sub_mod_p_from_byte_vars_assume_canonical(gb, r, two);
-
-    // L0 = (r-1)(r-2)/2
-    let p = goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, &t1, &t2);
-    let inv2_u64 = (crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P + 1) / 2;
-    let l0 = goldilocks_mul_const_mod_p_from_byte_vars_assume_canonical(gb, &p, inv2_u64);
-
-    // L1 = -r(r-2) = 0 - r(r-2)
-    let p = goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, r, &t2);
-    let zero = alloc_const_goldilocks_u64(gb, 0u64);
-    let l1 = goldilocks_sub_mod_p_from_byte_vars_assume_canonical(gb, &zero, &p);
-
-    // L2 = r(r-1)/2
-    let p = goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, r, &t1);
-    let l2 = goldilocks_mul_const_mod_p_from_byte_vars_assume_canonical(gb, &p, inv2_u64);
-
-    gb.profile_exit(_prev);
-    (l0, l1, l2)
-}
-
-/// Verify a degree-2 sumcheck over ring elements (byte-encoded coefficients) and return the final claim.
-///
-/// - `claimed_sum`: initial claim (ring)
-/// - `msgs`: per-round prover messages, each has 3 ring elements (g(0), g(1), g(2))
-/// - `rs`: per-round verifier challenges (base-field scalars), byte-encoded
-pub(crate) fn sumcheck_verify_degree2_ring_bytes(
-    gb: &mut Dr1csBuilder<F257>,
-    mut claimed_sum: RingBytes,
-    msgs: &[[RingBytes; 3]],
-    rs: &[[usize; 8]],
-) -> Result<RingBytes, String> {
-    if msgs.len() != rs.len() {
-        return Err("sumcheck_verify_degree2_ring_bytes: msgs/rs length mismatch".to_string());
-    }
-    let _prev = gb.profile_enter("cm_math::sumcheck_verify_degree2_ring_bytes");
-    let d = claimed_sum.len();
-
-    // Constants in Goldilocks field.
-    // inv2 is computed in host here as a fixed u64 constant; encoded as bytes.
-    // (Caller can reuse these across calls later.)
-    let one = alloc_const_goldilocks_u64(gb, 1u64);
-    let two = alloc_const_goldilocks_u64(gb, 2u64);
-
-    for (m, r) in msgs.iter().zip(rs.iter()) {
-        if m[0].len() != d || m[1].len() != d || m[2].len() != d {
-            gb.profile_exit(_prev);
-            return Err("sumcheck_verify_degree2_ring_bytes: ring dimension mismatch".to_string());
-        }
-
-        // Check g(0) + g(1) == claimed_sum (coefficient-wise).
-        let g01 = ring_add_bytes(gb, &m[0], &m[1]);
-        ring_eq_bytes(gb, &g01, &claimed_sum);
-
-        // Update claim = g(r) via Lagrange interpolation.
-        let (l0, l1, l2) = lagrange_degree2_goldilocks(gb, r, &one, &two);
-        let t0 = ring_scale_bytes(gb, &m[0], &l0);
-        let t1 = ring_scale_bytes(gb, &m[1], &l1);
-        let t2 = ring_scale_bytes(gb, &m[2], &l2);
-        let s01 = ring_add_bytes(gb, &t0, &t1);
-        claimed_sum = ring_add_bytes(gb, &s01, &t2);
-    }
-    gb.profile_exit(_prev);
-    Ok(claimed_sum)
+    let p_i = p as i128;
+    let (g, x, _y) = egcd(a as i128, p_i);
+    debug_assert!(g == 1 || g == -1);
+    let x = if g == -1 { -x } else { x };
+    x.rem_euclid(p_i) as u64
 }
 
 // -----------------------------------------------------------------------------
@@ -201,6 +74,48 @@ pub(crate) fn sumcheck_verify_degree2_ring_bytes(
 pub(crate) fn goldilocks_bytes_to_digits(gb: &mut Dr1csBuilder<F257>, bytes_le: [usize; 8]) -> GoldilocksScalar {
     let _prev = gb.profile_enter("cm_math::goldilocks_bytes_to_digits");
     let out = goldilocks_scalar_from_u64_bytes_le_digits(gb, bytes_le);
+    gb.profile_exit(_prev);
+    out
+}
+
+/// Boundary helper: convert a digit-encoded Goldilocks scalar to canonical 8-byte little-endian encoding.
+///
+/// This is used when we must export byte surfaces (e.g. `tcch0/tcch1`), but want all *math* to stay in digits.
+///
+/// Soundness:
+/// - Allocates byte vars from the witness implied by `x_digits`.
+/// - Enforces each byte is 8-bit, enforces `< p`, then re-parses the bytes back into digits and equates them to `x_digits`.
+pub(crate) fn goldilocks_digits_to_bytes_canonical(
+    gb: &mut Dr1csBuilder<F257>,
+    x_digits: &GoldilocksScalar,
+) -> [usize; 8] {
+    let _prev = gb.profile_enter("cm_math::goldilocks_digits_to_bytes_canonical");
+    let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+
+    // Witness compute: evaluate Σ d_i * 16^i in i128 then reduce mod p.
+    let mut acc: i128 = 0;
+    let mut pow: i128 = 1;
+    for i in 0..17 {
+        let di = f257_to_i32_bal(gb.assignment[x_digits[i]]) as i128;
+        acc += di * pow;
+        pow *= 16;
+    }
+    let v_u64 = acc.rem_euclid(p_u64 as i128) as u64;
+    let bs = v_u64.to_le_bytes();
+
+    // Allocate byte vars (with bit decompositions) for the canonical encoding.
+    let mut out = [0usize; 8];
+    for i in 0..8 {
+        out[i] = alloc_byte::<F257>(gb, bs[i]).byte;
+    }
+    goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(gb, &out);
+
+    // Re-parse bytes into digits and equate to the provided digits.
+    let d2 = goldilocks_bytes_to_digits(gb, out);
+    for i in 0..17 {
+        gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, d2[i]), (-F257::ONE, x_digits[i])]);
+    }
+
     gb.profile_exit(_prev);
     out
 }
@@ -378,7 +293,7 @@ pub(crate) fn ring_mul_negacyclic_digits_d64(
 // -----------------------------------------------------------------------------
 
 #[inline]
-fn goldilocks_add_mod_p_digits(
+pub(crate) fn goldilocks_add_mod_p_digits(
     gb: &mut Dr1csBuilder<F257>,
     a: &GoldilocksScalar,
     c: &GoldilocksScalar,
@@ -399,7 +314,7 @@ fn goldilocks_add_mod_p_digits(
 }
 
 #[inline]
-fn goldilocks_sub_mod_p_digits(
+pub(crate) fn goldilocks_sub_mod_p_digits(
     gb: &mut Dr1csBuilder<F257>,
     a: &GoldilocksScalar,
     c: &GoldilocksScalar,
@@ -420,7 +335,7 @@ fn goldilocks_sub_mod_p_digits(
 }
 
 #[inline]
-fn goldilocks_mul_mod_p_digits(
+pub(crate) fn goldilocks_mul_mod_p_digits(
     gb: &mut Dr1csBuilder<F257>,
     a: &GoldilocksScalar,
     c: &GoldilocksScalar,
@@ -441,7 +356,11 @@ fn goldilocks_mul_mod_p_digits(
 }
 
 #[inline]
-fn goldilocks_mul_const_mod_p_digits(gb: &mut Dr1csBuilder<F257>, a: &GoldilocksScalar, k: u64) -> GoldilocksScalar {
+pub(crate) fn goldilocks_mul_const_mod_p_digits(
+    gb: &mut Dr1csBuilder<F257>,
+    a: &GoldilocksScalar,
+    k: u64,
+) -> GoldilocksScalar {
     let _prev = gb.profile_enter("cm_math::scalar_mul_const_mod_p_digits");
     tiny_cm_bump(|cc| cc.scalar_mul_const += 1);
     let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
@@ -485,6 +404,91 @@ pub(crate) fn lagrange_degree2_goldilocks_digits(
     let l2 = goldilocks_mul_const_mod_p_digits(gb, &p, inv2_u64);
 
     (l0, l1, l2)
+}
+
+/// Degree-3 Lagrange basis in digit encoding.
+pub(crate) fn lagrange_degree3_goldilocks_digits(
+    gb: &mut Dr1csBuilder<F257>,
+    r: &GoldilocksScalar,
+    one: &GoldilocksScalar,
+    two: &GoldilocksScalar,
+    three: &GoldilocksScalar,
+) -> (GoldilocksScalar, GoldilocksScalar, GoldilocksScalar, GoldilocksScalar) {
+    let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+    let inv2_u64 = (p_u64 + 1) / 2;
+    let inv6_u64 = modinv_u64(p_u64, 6);
+
+    // t1 = r-1, t2 = r-2, t3 = r-3
+    let t1 = goldilocks_sub_mod_p_digits(gb, r, one);
+    let t2 = goldilocks_sub_mod_p_digits(gb, r, two);
+    let t3 = goldilocks_sub_mod_p_digits(gb, r, three);
+    let zero = goldilocks_const_u64_digits(gb, 0u64);
+
+    // L0 = -((r-1)(r-2)(r-3))/6
+    let p01 = goldilocks_mul_mod_p_digits(gb, &t1, &t2);
+    let p012 = goldilocks_mul_mod_p_digits(gb, &p01, &t3);
+    let p012_div6 = goldilocks_mul_const_mod_p_digits(gb, &p012, inv6_u64);
+    let l0 = goldilocks_sub_mod_p_digits(gb, &zero, &p012_div6);
+
+    // L1 = r(r-2)(r-3)/2
+    let p1 = goldilocks_mul_mod_p_digits(gb, r, &t2);
+    let p1 = goldilocks_mul_mod_p_digits(gb, &p1, &t3);
+    let l1 = goldilocks_mul_const_mod_p_digits(gb, &p1, inv2_u64);
+
+    // L2 = -r(r-1)(r-3)/2
+    let p2 = goldilocks_mul_mod_p_digits(gb, r, &t1);
+    let p2 = goldilocks_mul_mod_p_digits(gb, &p2, &t3);
+    let p2_div2 = goldilocks_mul_const_mod_p_digits(gb, &p2, inv2_u64);
+    let l2 = goldilocks_sub_mod_p_digits(gb, &zero, &p2_div2);
+
+    // L3 = r(r-1)(r-2)/6
+    let p3 = goldilocks_mul_mod_p_digits(gb, r, &t1);
+    let p3 = goldilocks_mul_mod_p_digits(gb, &p3, &t2);
+    let l3 = goldilocks_mul_const_mod_p_digits(gb, &p3, inv6_u64);
+
+    (l0, l1, l2, l3)
+}
+
+/// Verify a degree-3 sumcheck over ring elements (digit-encoded) and return the final claim.
+pub(crate) fn sumcheck_verify_degree3_ring_digits(
+    gb: &mut Dr1csBuilder<F257>,
+    mut claimed_sum: RingDigits,
+    msgs: &[[RingDigits; 4]],
+    rs: &[GoldilocksScalar],
+) -> Result<RingDigits, String> {
+    if msgs.len() != rs.len() {
+        return Err("sumcheck_verify_degree3_ring_digits: msgs/rs length mismatch".to_string());
+    }
+    let _prev = gb.profile_enter("cm_math::sumcheck_verify_degree3_ring_digits");
+    let d = claimed_sum.len();
+
+    let one = goldilocks_const_u64_digits(gb, 1u64);
+    let two = goldilocks_const_u64_digits(gb, 2u64);
+    let three = goldilocks_const_u64_digits(gb, 3u64);
+
+    for (m, r) in msgs.iter().zip(rs.iter()) {
+        if m[0].len() != d || m[1].len() != d || m[2].len() != d || m[3].len() != d {
+            gb.profile_exit(_prev);
+            return Err("sumcheck_verify_degree3_ring_digits: ring dimension mismatch".to_string());
+        }
+
+        // g(0) + g(1) == claim
+        let g01 = ring_add_digits(gb, &m[0], &m[1]);
+        ring_eq_digits(gb, &g01, &claimed_sum);
+
+        // claim = g(r)
+        let (l0, l1, l2, l3) = lagrange_degree3_goldilocks_digits(gb, r, &one, &two, &three);
+        let t0 = ring_scale_digits(gb, &m[0], &l0);
+        let t1 = ring_scale_digits(gb, &m[1], &l1);
+        let t2 = ring_scale_digits(gb, &m[2], &l2);
+        let t3 = ring_scale_digits(gb, &m[3], &l3);
+        let s01 = ring_add_digits(gb, &t0, &t1);
+        let s23 = ring_add_digits(gb, &t2, &t3);
+        claimed_sum = ring_add_digits(gb, &s01, &s23);
+    }
+
+    gb.profile_exit(_prev);
+    Ok(claimed_sum)
 }
 
 /// Verify a degree-2 sumcheck over ring elements (digit-encoded) and return the final claim.

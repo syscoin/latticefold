@@ -28,8 +28,6 @@ use super::digits::{
     Bal16Checked,
 };
 use super::goldilocks::{
-    goldilocks_add_mod_p_from_byte_vars_assume_canonical, goldilocks_mul_mod_p_from_byte_vars_assume_canonical,
-    goldilocks_sub_mod_p_from_byte_vars_assume_canonical,
     goldilocks_u64_enforce_lt_p_from_byte_vars,
     reduce_u64_mod_goldilocks_from_byte_vars,
     GoldilocksScalar,
@@ -41,8 +39,9 @@ use super::surfaces::{CmDigitMulSqSurfaceWiring, CmDigitMulSurfaceWiring};
 
 use super::cm_math::{
     eq_eval_goldilocks_digits, eval_t_z_optimized_ring_digits_pair, goldilocks_bytes_to_digits, goldilocks_pow_table_digits,
-    ring_add_bytes, ring_add_digits, ring_bytes_to_digits, ring_eq_digits,
-    ring_scale_digits, ring_zero_bytes, sumcheck_verify_degree2_ring_bytes,
+    goldilocks_digits_to_bytes_canonical,
+    ring_add_digits, ring_bytes_to_digits, ring_eq_digits,
+    ring_scale_digits,
     tensor_goldilocks_ringconst_digits, tensor_goldilocks_scalars_digits, RingBytes, RingDigits,
 };
 use super::op_counts::{tiny_cm_counts_reset, tiny_cm_counts_take};
@@ -707,17 +706,6 @@ fn compute_tcch(
     }
 
     #[inline]
-    fn alloc_const_goldilocks_u64(gb: &mut Dr1csBuilder<F257>, v: u64) -> [usize; 8] {
-        let bs = v.to_le_bytes();
-        let mut out = [0usize; 8];
-        for i in 0..8 {
-            out[i] = alloc_const_byte(gb, bs[i]);
-        }
-        goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(gb, &out);
-        out
-    }
-
-    #[inline]
     fn goldilocks_bytes_from_u32_le_bytes(gb: &mut Dr1csBuilder<F257>, u32_le: &[usize; 4]) -> [usize; 8] {
         let mut out = [0usize; 8];
         out[0..4].copy_from_slice(u32_le);
@@ -850,66 +838,48 @@ fn compute_tcch(
                                 ));
                             }
 
-                            #[inline]
-                            fn tensor_goldilocks_bytes(gb: &mut Dr1csBuilder<F257>, c: &[[usize; 8]]) -> Vec<[usize; 8]> {
-                                let one = alloc_const_goldilocks_u64(gb, 1u64);
-                                let mut acc: Vec<[usize; 8]> = vec![one];
-                                for ci in c {
-                                    let one_minus = goldilocks_sub_mod_p_from_byte_vars_assume_canonical(gb, &one, ci);
-                                    let mut next: Vec<[usize; 8]> = Vec::with_capacity(acc.len() * 2);
-                                    for t in &acc {
-                                        next.push(goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, t, &one_minus));
-                                        next.push(goldilocks_mul_mod_p_from_byte_vars_assume_canonical(gb, t, ci));
-                                    }
-                                    acc = next;
-                                }
-                                acc
+                            // Move to digits as early as possible:
+                            // - c0/c1 from u32s → canonical bytes → digits
+                            // - comh ring elements bytes → digits
+                            // Then do all math in digit domain, and only convert back to bytes
+                            // for the exported coefficient-0 surfaces.
+
+                            let c0_digits: Vec<GoldilocksScalar> =
+                                c0_bytes.iter().copied().map(|b| goldilocks_bytes_to_digits(&mut glue.gb, b)).collect();
+                            let c1_digits: Vec<GoldilocksScalar> =
+                                c1_bytes.iter().copied().map(|b| goldilocks_bytes_to_digits(&mut glue.gb, b)).collect();
+                            let tensor_c0 = tensor_goldilocks_scalars_digits(&mut glue.gb, &c0_digits);
+                            let tensor_c1 = tensor_goldilocks_scalars_digits(&mut glue.gb, &c1_digits);
+
+                            // Convert all `comh[l][j]` to digit-encoded rings once.
+                            let mut comh_all_coeff_digits: Vec<RingDigits> = Vec::with_capacity(comh_all_coeff_bytes.len());
+                            for ch in &comh_all_coeff_bytes {
+                                comh_all_coeff_digits.push(ring_bytes_to_digits(&mut glue.gb, ch));
                             }
 
-                            let tensor_c0 = tensor_goldilocks_bytes(&mut glue.gb, &c0_bytes);
-                            let tensor_c1 = tensor_goldilocks_bytes(&mut glue.gb, &c1_bytes);
-
-                            // Compute full-ring tcch0/tcch1 (as in `CmProof::verify_with_mlen`):
-                            //
-                            //   tcch{0,1}[l] = Σ_j tensor_c{0,1}[j] * comh[l][j]
-                            //
-                            // Multiplying a ring element by a base-field scalar is coefficient-wise scaling.
-                            let zero = alloc_const_goldilocks_u64(&mut glue.gb, 0u64);
-                            let mut tcch0_ring: Vec<Vec<[usize; 8]>> = Vec::with_capacity(l_instances);
-                            let mut tcch1_ring: Vec<Vec<[usize; 8]>> = Vec::with_capacity(l_instances);
+                            let mut tcch0_ring: Vec<RingDigits> = Vec::with_capacity(l_instances);
+                            let mut tcch1_ring: Vec<RingDigits> = Vec::with_capacity(l_instances);
                             for l in 0..l_instances {
                                 let base = l * kappa;
-                                let mut acc0: Vec<[usize; 8]> = vec![zero; ring_dim];
-                                let mut acc1: Vec<[usize; 8]> = vec![zero; ring_dim];
+                                let mut acc0 = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+                                let mut acc1 = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
                                 for j in 0..kappa {
-                                    let ch = &comh_all_coeff_bytes[base + j];
-                                    for coeff in 0..ring_dim {
-                                        let m0 = goldilocks_mul_mod_p_from_byte_vars_assume_canonical(
-                                            &mut glue.gb,
-                                            &tensor_c0[j],
-                                            &ch[coeff],
-                                        );
-                                        let m1 = goldilocks_mul_mod_p_from_byte_vars_assume_canonical(
-                                            &mut glue.gb,
-                                            &tensor_c1[j],
-                                            &ch[coeff],
-                                        );
-                                        acc0[coeff] =
-                                            goldilocks_add_mod_p_from_byte_vars_assume_canonical(&mut glue.gb, &acc0[coeff], &m0);
-                                        acc1[coeff] =
-                                            goldilocks_add_mod_p_from_byte_vars_assume_canonical(&mut glue.gb, &acc1[coeff], &m1);
-                                    }
+                                    let ch = &comh_all_coeff_digits[base + j];
+                                    let m0 = ring_scale_digits(&mut glue.gb, ch, &tensor_c0[j]);
+                                    let m1 = ring_scale_digits(&mut glue.gb, ch, &tensor_c1[j]);
+                                    acc0 = ring_add_digits(&mut glue.gb, &acc0, &m0);
+                                    acc1 = ring_add_digits(&mut glue.gb, &acc1, &m1);
                                 }
                                 tcch0_ring.push(acc0);
                                 tcch1_ring.push(acc1);
                             }
 
-                            // Current API exports only coefficient-0 (base-field) as 8 LE bytes per instance.
+                            // Export only coefficient-0 as canonical bytes.
                             tcch0_local.reserve(l_instances);
                             tcch1_local.reserve(l_instances);
                             for l in 0..l_instances {
-                                tcch0_local.push(tcch0_ring[l][0]);
-                                tcch1_local.push(tcch1_ring[l][0]);
+                                tcch0_local.push(goldilocks_digits_to_bytes_canonical(&mut glue.gb, &tcch0_ring[l][0]));
+                                tcch1_local.push(goldilocks_digits_to_bytes_canonical(&mut glue.gb, &tcch1_ring[l][0]));
                             }
                         }
                     }
@@ -1935,6 +1905,7 @@ fn build_cm_glue_for_which(
         let z = glue.gb.new_var(F257::ZERO);
         glue.gb.enforce_var_eq_const(z, F257::ZERO);
         let c128 = super::cm_math::alloc_const_goldilocks_u64(&mut glue.gb, 128u64);
+        let c128_d = goldilocks_bytes_to_digits(&mut glue.gb, c128);
         let mut sflat: Vec<RingDigits> = Vec::with_capacity(need_sprime);
         for blk in 0..need_sprime {
             let sb = &short_locals[3 + blk];
@@ -1949,10 +1920,10 @@ fn build_cm_glue_for_which(
                 for i in 1..8 {
                     bbytes[i] = z;
                 }
-                // Centered coefficient = (byte - 128) mod p (canonical).
-                let centered =
-                    goldilocks_sub_mod_p_from_byte_vars_assume_canonical(&mut glue.gb, &bbytes, &c128);
-                re.push(goldilocks_bytes_to_digits(&mut glue.gb, centered));
+                // Centered coefficient = (byte - 128) mod p, in digit domain.
+                let bd = goldilocks_bytes_to_digits(&mut glue.gb, bbytes);
+                let centered = super::cm_math::goldilocks_sub_mod_p_digits(&mut glue.gb, &bd, &c128_d);
+                re.push(centered);
             }
             sflat.push(re);
         }
@@ -2012,8 +1983,9 @@ fn build_cm_glue_for_which(
         u32_idx += 1;
     }
 
-    // Parse sumcheck msg absorbs into ring bytes: each round has 3 ring elements.
-    let mut msgs: Vec<[RingBytes; 3]> = Vec::with_capacity(nvars_cm);
+    // Parse sumcheck msg absorbs as ring-bytes (transcript IO), then immediately convert to digits.
+    // This keeps the heavy sumcheck arithmetic in the digit domain.
+    let mut msgs_digits: Vec<[RingDigits; 3]> = Vec::with_capacity(nvars_cm);
     if sc_msg_absorbs.len() != nvars_cm * 3 {
         return Err("tiny gate: sumcheck msg absorb count mismatch".to_string());
     }
@@ -2021,19 +1993,24 @@ fn build_cm_glue_for_which(
         let (s0, l0) = sc_msg_absorbs[round * 3 + 0];
         let (s1, l1) = sc_msg_absorbs[round * 3 + 1];
         let (s2, l2) = sc_msg_absorbs[round * 3 + 2];
-        let e0 = parse_ring_elem_absorb_as_ringbytes(&mut glue, pose_wiring, ring_dim, s0, l0)?;
-        let e1 = parse_ring_elem_absorb_as_ringbytes(&mut glue, pose_wiring, ring_dim, s1, l1)?;
-        let e2 = parse_ring_elem_absorb_as_ringbytes(&mut glue, pose_wiring, ring_dim, s2, l2)?;
-        msgs.push([e0, e1, e2]);
+        let e0b = parse_ring_elem_absorb_as_ringbytes(&mut glue, pose_wiring, ring_dim, s0, l0)?;
+        let e1b = parse_ring_elem_absorb_as_ringbytes(&mut glue, pose_wiring, ring_dim, s1, l1)?;
+        let e2b = parse_ring_elem_absorb_as_ringbytes(&mut glue, pose_wiring, ring_dim, s2, l2)?;
+        let e0 = ring_bytes_to_digits(&mut glue.gb, &e0b);
+        let e1 = ring_bytes_to_digits(&mut glue.gb, &e1b);
+        let e2 = ring_bytes_to_digits(&mut glue.gb, &e2b);
+        msgs_digits.push([e0, e1, e2]);
     }
 
     // Placeholder claimed sum (keeps constraints satisfiable until full claimed-sum wiring lands).
     let claimed0 = if nvars_cm == 0 {
-        ring_zero_bytes(&mut glue.gb, ring_dim)
+        super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim)
     } else {
-        ring_add_bytes(&mut glue.gb, &msgs[0][0], &msgs[0][1])
+        ring_add_digits(&mut glue.gb, &msgs_digits[0][0], &msgs_digits[0][1])
     };
-    let final_claim_bytes = sumcheck_verify_degree2_ring_bytes(&mut glue.gb, claimed0, &msgs, &rs)?;
+    let rs_digits: Vec<GoldilocksScalar> =
+        rs.iter().copied().map(|b| goldilocks_bytes_to_digits(&mut glue.gb, b)).collect();
+    let subclaim_eval = super::cm_math::sumcheck_verify_degree2_ring_digits(&mut glue.gb, claimed0, &msgs_digits, &rs_digits)?;
 
     // Eval table absorbs sanity.
     let rows_total = l_instances_expected * (1 + params.mlen as usize);
@@ -2049,10 +2026,6 @@ fn build_cm_glue_for_which(
         dpp_ring.as_ref(),
         r_point_digits.as_ref(),
     ) {
-        let rs_digits: Vec<GoldilocksScalar> =
-            rs.iter().copied().map(|b| goldilocks_bytes_to_digits(&mut glue.gb, b)).collect();
-        let subclaim_eval = ring_bytes_to_digits(&mut glue.gb, &final_claim_bytes);
-
         // rc powers (need up to z_idx+1).
         let z_idx = l_instances_expected * (4 + 4 * (params.mlen as usize));
         let max_pow = z_idx + 1;
