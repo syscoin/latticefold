@@ -171,45 +171,84 @@ pub fn merge_sparse_dr1cs_share_one<F: PrimeField>(
     let mut merged_b_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_b);
     let mut merged_c_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_c);
 
-    for (mut inst, asg) in parts.drain(..) {
+    // Validate parts and precompute all offsets (so we can remap in parallel).
+    let mut var_offsets: Vec<usize> = Vec::with_capacity(parts.len());
+    let mut a_bases: Vec<usize> = Vec::with_capacity(parts.len());
+    let mut b_bases: Vec<usize> = Vec::with_capacity(parts.len());
+    let mut c_bases: Vec<usize> = Vec::with_capacity(parts.len());
+
+    let mut cur_vars: usize = 0;
+    let mut cur_a: usize = 0;
+    let mut cur_b: usize = 0;
+    let mut cur_c: usize = 0;
+    for (inst, asg) in parts.iter() {
         if asg.is_empty() || asg[0] != F::ONE {
             return Err("merge_sparse_dr1cs_share_one: each part must have assignment[0]=1".to_string());
         }
         if inst.nvars != asg.len() {
             return Err("merge_sparse_dr1cs_share_one: inst/assignment length mismatch".to_string());
         }
+        var_offsets.push(cur_vars);
+        a_bases.push(cur_a);
+        b_bases.push(cur_b);
+        c_bases.push(cur_c);
 
-        // Map part var0 -> merged var0, and shift the rest by current offset.
-        let offset = merged_assignment.len() - 1;
-        if offset != 0 {
-            for (_c, idx) in inst.a_terms.iter_mut() {
-                if *idx != 0 {
-                    *idx += offset;
-                }
-            }
-            for (_c, idx) in inst.b_terms.iter_mut() {
-                if *idx != 0 {
-                    *idx += offset;
-                }
-            }
-            for (_c, idx) in inst.c_terms.iter_mut() {
-                if *idx != 0 {
-                    *idx += offset;
-                }
-            }
-        }
+        cur_vars = cur_vars
+            .checked_add(asg.len().saturating_sub(1))
+            .ok_or_else(|| "merge_sparse_dr1cs_share_one: var offset overflow".to_string())?;
+        cur_a = cur_a
+            .checked_add(inst.a_terms.len())
+            .ok_or_else(|| "merge_sparse_dr1cs_share_one: a_terms offset overflow".to_string())?;
+        cur_b = cur_b
+            .checked_add(inst.b_terms.len())
+            .ok_or_else(|| "merge_sparse_dr1cs_share_one: b_terms offset overflow".to_string())?;
+        cur_c = cur_c
+            .checked_add(inst.c_terms.len())
+            .ok_or_else(|| "merge_sparse_dr1cs_share_one: c_terms offset overflow".to_string())?;
+    }
 
-        let a_base = merged_a_terms.len();
-        let b_base = merged_b_terms.len();
-        let c_base = merged_c_terms.len();
-        merged_a_terms.extend(inst.a_terms.drain(..));
-        merged_b_terms.extend(inst.b_terms.drain(..));
-        merged_c_terms.extend(inst.c_terms.drain(..));
-        merged_constraints.extend(inst.constraints.drain(..).map(|row| Constraint {
-            a: (a_base + row.a.start)..(a_base + row.a.end),
-            b: (b_base + row.b.start)..(b_base + row.b.end),
-            c: (c_base + row.c.start)..(c_base + row.c.end),
-        }));
+    // Remap term indices and constraint ranges in parallel.
+    parts
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(i, (inst, _asg))| {
+            let vo = var_offsets[i];
+            if vo != 0 {
+                for (_c, idx) in inst.a_terms.iter_mut() {
+                    if *idx != 0 {
+                        *idx += vo;
+                    }
+                }
+                for (_c, idx) in inst.b_terms.iter_mut() {
+                    if *idx != 0 {
+                        *idx += vo;
+                    }
+                }
+                for (_c, idx) in inst.c_terms.iter_mut() {
+                    if *idx != 0 {
+                        *idx += vo;
+                    }
+                }
+            }
+
+            let ab = a_bases[i];
+            let bb = b_bases[i];
+            let cb = c_bases[i];
+            if ab != 0 || bb != 0 || cb != 0 {
+                for row in inst.constraints.iter_mut() {
+                    row.a = (ab + row.a.start)..(ab + row.a.end);
+                    row.b = (bb + row.b.start)..(bb + row.b.end);
+                    row.c = (cb + row.c.start)..(cb + row.c.end);
+                }
+            }
+        });
+
+    // Concatenate sequentially (bulk append; remapping already done).
+    for (mut inst, asg) in parts.drain(..) {
+        merged_a_terms.append(&mut inst.a_terms);
+        merged_b_terms.append(&mut inst.b_terms);
+        merged_c_terms.append(&mut inst.c_terms);
+        merged_constraints.append(&mut inst.constraints);
         merged_assignment.extend_from_slice(&asg[1..]);
     }
 
