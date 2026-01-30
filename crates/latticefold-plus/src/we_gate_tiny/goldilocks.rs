@@ -3,7 +3,6 @@ use ark_ff::{BigInteger, PrimeField};
 use latticefold::transcript::poseidon::F257;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 
-use super::coins::goldilocks_p_base128_digits_le;
 use super::digits::u64_bytes_to_bal16_digits;
 use super::gadgets::{alloc_bool, decompose_existing_byte_var_to_bits};
 use super::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
@@ -13,6 +12,17 @@ use super::params::{LIMB_BASE_U64, LIMB_BITS, LIMBS_U64};
 ///
 /// This is NTT-friendly (large 2-adicity), unlike the Goldilocks prime used elsewhere in this module.
 pub(crate) const GOLDILOCKS_P: u64 = 0xFFFF_FFFF_0000_0001;
+
+#[inline]
+fn goldilocks_p_base128_digits_le() -> [u8; LIMBS_U64] {
+    let mut out = [0u8; LIMBS_U64];
+    let mut t = GOLDILOCKS_P;
+    for i in 0..LIMBS_U64 {
+        out[i] = (t & (LIMB_BASE_U64 - 1)) as u8;
+        t >>= LIMB_BITS;
+    }
+    out
+}
 
 // NOTE: We intentionally do not provide a "fast but potentially wrapping" mode here.
 // The pm128 fused carry-chain style relations are not injective over the integers in F257

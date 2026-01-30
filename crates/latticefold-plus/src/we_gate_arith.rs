@@ -7332,7 +7332,6 @@ mod tests {
                 log_kappa,
                 nvars_cm,
                 squeeze_field_op_offset,
-                0,
             )
             .expect("infer cm coin wiring (tiny)");
             let mut wiring_abs = tiny::TinyCoinOpWiring::default();
@@ -7349,9 +7348,8 @@ mod tests {
             wiring_abs
                 .u32_squeeze_ops
                 .splice(0..0, prefix_u32_squeeze_ops.into_iter());
-            wiring_abs.goldilocks_squeeze_ops = Vec::new();
 
-            let (tiny_inst, tiny_asg, _shorts, _u32s, _gold, _gold_rej, _tcch0, _tcch1, _sm, _ssq, _pose_wiring) =
+            let (tiny_inst, tiny_asg, _shorts, _u32s, _gold, _tcch0, _tcch1, _sm, _ssq, _pose_wiring) =
                 tiny::we_tiny_f257_build_cm_gate_from_trace_ops_with_extra_witness(
                     None,
                     &ops_f257,
