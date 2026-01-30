@@ -63,6 +63,12 @@ pub(crate) enum VarRef {
     Local(usize),
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Bal4ConstMulPrecomp {
+    k4_const: [i8; 33],
+    carry_bounds: [i32; 66],
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct IrConstraint {
     pub(crate) a: Range<usize>,
@@ -361,12 +367,19 @@ pub(crate) struct IrBuilder<'a> {
     pub(crate) ir: CmIr,
     // Cache for expensive representation conversions used in hot paths.
     bal16_to_bal4_cache: HashMap<[VarRef; 17], [VarRef; 33]>,
+    // Cache for constant-mul carry schedules (NTT twiddles repeat a lot).
+    bal4_const_mul_cache: HashMap<u64, Bal4ConstMulPrecomp>,
 }
 
 impl<'a> IrBuilder<'a> {
     #[inline]
     pub(crate) fn new(base_asg: &'a [F257]) -> Self {
-        Self { base_asg, ir: CmIr::new(), bal16_to_bal4_cache: HashMap::new() }
+        Self {
+            base_asg,
+            ir: CmIr::new(),
+            bal16_to_bal4_cache: HashMap::new(),
+            bal4_const_mul_cache: HashMap::new(),
+        }
     }
 
     /// Read the witness value for a var ref.
@@ -430,6 +443,36 @@ impl<'a> IrBuilder<'a> {
         let out = bal16_to_bal4_digits_ir(self, x16);
         self.bal16_to_bal4_cache.insert(key, out);
         out
+    }
+
+    #[inline]
+    fn bal4_const_mul_precomp(&mut self, k: u64) -> Bal4ConstMulPrecomp {
+        if let Some(p) = self.bal4_const_mul_cache.get(&k) {
+            return *p;
+        }
+        let k4_const = u64_to_bal4_digits_le_const(k);
+        let abs_k: [i32; 33] = core::array::from_fn(|i| (k4_const[i] as i32).abs());
+        let mut pref: [i32; 34] = [0; 34];
+        for i in 0..33 {
+            pref[i + 1] = pref[i] + abs_k[i];
+        }
+        let mut carry_bounds: [i32; 66] = [31; 66];
+        let mut carry_bound_raw: i32 = 0;
+        for kk in 0..66 {
+            let s = if kk <= 32 {
+                pref[kk + 1]
+            } else {
+                let lo = kk - 32;
+                pref[33] - pref[lo]
+            };
+            let m_k = 2 * s;
+            let sum_bound = carry_bound_raw + m_k + 8;
+            carry_bound_raw = (sum_bound + 3) / 4;
+            carry_bounds[kk] = carry_bound_raw;
+        }
+        let p = Bal4ConstMulPrecomp { k4_const, carry_bounds };
+        self.bal4_const_mul_cache.insert(k, p);
+        p
     }
 }
 
@@ -1517,6 +1560,31 @@ pub(crate) fn alloc_bal16_digit_ir(b: &mut IrBuilder<'_>, d: i8) -> VarRef {
     out
 }
 
+/// Allocate a balanced base-4 digit `d ∈ {-2,-1,0,1}` with a 2-bit membership check.
+///
+/// Encoding:
+///   d = b0 + 2*b1 - 2, where b0,b1 ∈ {0,1}.
+///
+/// This is the minimal cheap "digit is in the intended set" constraint. It is important for
+/// soundness when digits are used as multiplicands: otherwise the carry-chain equalities can
+/// admit alternative solutions with digits shifted by multiples of 4.
+#[inline]
+fn alloc_bal4_digit_ir(b: &mut IrBuilder<'_>, d: i32) -> VarRef {
+    debug_assert!((-2..=1).contains(&d));
+    let enc: u8 = (d + 2) as u8; // in 0..=3
+    let b0 = alloc_bool_ir(b, (enc & 1) == 1);
+    let b1 = alloc_bool_ir(b, (enc & 2) == 2);
+    let dvar = b.new_var(i32_to_f257(d));
+    // d - b0 - 2*b1 + 2 = 0  => d = b0 + 2*b1 - 2
+    b.enforce_lc_eq_zero(vec![
+        (F257::ONE, dvar),
+        (-F257::ONE, b0),
+        (-F257::from(2u64), b1),
+        (F257::from(2u64), b.one()),
+    ]);
+    dvar
+}
+
 // -----------------------------------------------------------------------------
 // Balanced base-4 digits (sound mul check: avoids 16^2+1 bubble)
 // -----------------------------------------------------------------------------
@@ -1552,6 +1620,24 @@ fn alloc_u64_as_bal4_digits_raw_ir(b: &mut IrBuilder<'_>, x: u64) -> [VarRef; 33
     let mut out: [VarRef; 33] = [VarRef::Base(0); 33];
     for i in 0..32 {
         out[i] = b.new_var(i32_to_f257(ds[i] as i32));
+    }
+    out[32] = alloc_bool_ir(b, ds[32] == 1);
+    out
+}
+
+/// Allocate u64 as balanced base-4 digits with explicit digit membership checks.
+///
+/// This is more expensive than `_raw_` but closes a soundness hole: without digit membership
+/// constraints, a carry-chain equation can admit alternative solutions with digits shifted by
+/// multiples of 4 while keeping bounded carries, and those digits may later be used as
+/// multiplicands.
+#[inline]
+fn alloc_u64_as_bal4_digits_checked_ir(b: &mut IrBuilder<'_>, x: u64) -> [VarRef; 33] {
+    let ds = u64_to_bal4_digits_le_const(x);
+    debug_assert!(ds[32] == 0 || ds[32] == 1);
+    let mut out: [VarRef; 33] = [VarRef::Base(0); 33];
+    for i in 0..32 {
+        out[i] = alloc_bal4_digit_ir(b, ds[i] as i32);
     }
     out[32] = alloc_bool_ir(b, ds[32] == 1);
     out
@@ -1674,9 +1760,10 @@ fn bal16_to_bal4_digits_ir(b: &mut IrBuilder<'_>, x16: &[VarRef; 17]) -> [VarRef
             debug_assert!((-1..=1).contains(&carry_next));
         }
 
-        // Digit is linked by the carry chain; we do not need bit-backed digit checks here.
-        // See NOTE above: carries are tightly bounded (<64 window), preventing the 257 bubble.
-        let dvar = b.new_var(i32_to_f257(digit));
+        // IMPORTANT (soundness): digits are used as multiplicands later (NTT + pointwise mul).
+        // Without an explicit membership check, the carry-chain equation admits alternative
+        // solutions where `digit` is shifted by multiples of 4 while keeping carries in range.
+        let dvar = alloc_bal4_digit_ir(b, digit);
         let cnext = if (k & 1) == 0 {
             alloc_carry_pm2_ir(b, carry_next)
         } else {
@@ -2651,7 +2738,11 @@ fn goldilocks_add_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[VarRef; 33],
         b.ir.enforce_var_eq_const(z, F257::ZERO);
         z
     };
-    let r4 = alloc_u64_as_bal4_digits_raw_ir(b, r_u);
+    // IMPORTANT (soundness): `r4[k]` are the "digit variables" of the base-4 carry chain.
+    // Without explicit membership checks `r4[k] ∈ {-2,-1,0,1}`, the carry-chain equation admits
+    // alternative integer solutions (e.g. shifting `r4[k]` by ±4 and compensating carry), and
+    // those digits later flow into multiplication gadgets in the NTT pipeline.
+    let r4 = alloc_u64_as_bal4_digits_checked_ir(b, r_u);
     enforce_add_mod_p_relation_bal4_ir(b, a4, c4, &r4, q, q_u8);
     r4
 }
@@ -2672,7 +2763,7 @@ fn goldilocks_sub_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[VarRef; 33],
         b.ir.enforce_var_eq_const(z, F257::ZERO);
         z
     };
-    let r4 = alloc_u64_as_bal4_digits_raw_ir(b, r_u);
+    let r4 = alloc_u64_as_bal4_digits_checked_ir(b, r_u);
     enforce_sub_mod_p_relation_bal4_ir(b, a4, c4, &r4, q, q_u8);
     r4
 }
@@ -2683,57 +2774,12 @@ pub(crate) fn goldilocks_mul_const_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, x
     let prod: u128 = (x_u as u128) * (k as u128);
     let q_u: u64 = (prod / (p_u64 as u128)) as u64;
     let r_u: u64 = (prod % (p_u64 as u128)) as u64;
+    // `q4` only appears linearly in the carry chain; keep it raw to save constraints.
     let q4 = alloc_u64_as_bal4_digits_raw_ir(b, q_u);
-    let r4 = alloc_u64_as_bal4_digits_raw_ir(b, r_u);
-    let k4_const = u64_to_bal4_digits_le_const(k);
-    // Choose a carry bound derived purely from constant digits (statement-only), using a
-    // per-position convolution magnitude bound (tighter than a global L1 bound).
-    //
-    // For each k, the constant-weighted convolution term is:
-    //   Σ_i x_i * k_{k-i}
-    // with |x_i| <= 2 and |k_j| <= 2, so magnitude is bounded by:
-    //   M_k = 2 * Σ_{j in window(k)} |k_j|
-    // where window(k) is [0..k] for k<=32 else [k-32..32].
-    //
-    // Add a conservative +8 for q*p (<=6) and r (<=2).
-    let abs_k: [i32; 33] = core::array::from_fn(|i| (k4_const[i] as i32).abs());
-    let mut pref: [i32; 34] = [0; 34];
-    for i in 0..33 {
-        pref[i + 1] = pref[i] + abs_k[i];
-    }
-    let mut carry_bound_raw: i32 = 0;
-    let mut carry_bound_max: i32 = 0;
-    for k in 0..66 {
-        let s = if k <= 32 {
-            pref[k + 1]
-        } else {
-            let lo = k - 32;
-            pref[33] - pref[lo]
-        };
-        let m_k = 2 * s;
-        let sum_bound = carry_bound_raw + m_k + 8;
-        carry_bound_raw = (sum_bound + 3) / 4;
-        if carry_bound_raw > carry_bound_max {
-            carry_bound_max = carry_bound_raw;
-        }
-    }
-    // Build a per-step carry bound schedule (statement-only), then allocate carries using the
-    // smallest admissible range per step (pm8/pm16/pm32).
-    let mut carry_bounds: [i32; 66] = [31; 66];
-    let mut carry_bound_raw: i32 = 0;
-    for k in 0..66 {
-        let s = if k <= 32 {
-            pref[k + 1]
-        } else {
-            let lo = k - 32;
-            pref[33] - pref[lo]
-        };
-        let m_k = 2 * s;
-        let sum_bound = carry_bound_raw + m_k + 8;
-        carry_bound_raw = (sum_bound + 3) / 4;
-        carry_bounds[k] = carry_bound_raw;
-    }
-    enforce_prod_const_eq_qp_plus_r_bal4_ir_with_carry_schedule(b, x4, &k4_const, &q4, &r4, &carry_bounds);
+    // `r4` are digit variables; enforce membership to keep the carry chain injective.
+    let r4 = alloc_u64_as_bal4_digits_checked_ir(b, r_u);
+    let pre = b.bal4_const_mul_precomp(k);
+    enforce_prod_const_eq_qp_plus_r_bal4_ir_with_carry_schedule(b, x4, &pre.k4_const, &q4, &r4, &pre.carry_bounds);
     r4
 }
 
@@ -2745,7 +2791,7 @@ fn goldilocks_mul_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[VarRef; 33],
     let q_u: u64 = (prod_u / (p_u64 as u128)) as u64;
     let r_u: u64 = (prod_u % (p_u64 as u128)) as u64;
     let q4 = alloc_u64_as_bal4_digits_raw_ir(b, q_u);
-    let r4 = alloc_u64_as_bal4_digits_raw_ir(b, r_u);
+    let r4 = alloc_u64_as_bal4_digits_checked_ir(b, r_u);
     enforce_prod_var_eq_qp_plus_r_bal4_ir(b, a4, c4, &q4, &r4);
     r4
 }
@@ -2769,7 +2815,7 @@ pub(crate) fn goldilocks_mul_mod_p_digits_ir(
     let a4 = b.bal16_to_bal4_digits_cached(a);
     let c4 = b.bal16_to_bal4_digits_cached(c);
     let q4 = alloc_u64_as_bal4_digits_raw_ir(b, q_u);
-    let r4 = alloc_u64_as_bal4_digits_raw_ir(b, r_u);
+    let r4 = alloc_u64_as_bal4_digits_checked_ir(b, r_u);
     enforce_prod_var_eq_qp_plus_r_bal4_ir(b, &a4, &c4, &q4, &r4);
     bal4_to_bal16_digits_ir(b, &r4)
 }
