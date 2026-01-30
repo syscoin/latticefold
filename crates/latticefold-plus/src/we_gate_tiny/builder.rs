@@ -2500,7 +2500,6 @@ fn build_cm_glue_for_which(
                             }
                             u_l
                         };
-                        }
 
                         // a0 term (scalar -> const-coeff ring)
                         let a0pow = goldilocks_mul_mod_p_digits(&mut glue.gb, &eval_a[0], &rc_pows[l_idx]);
