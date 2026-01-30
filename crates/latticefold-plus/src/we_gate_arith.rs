@@ -465,12 +465,29 @@ where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + PrimeField,
 {
+    let public_inputs = vec![BF::<R>::ZERO; public_inputs_len];
+    poseidon_trace_schedule_for_plus_with_public_inputs::<R>(&public_inputs, params, n_lin_proofs, mlen_mats)
+}
+
+/// Schedule generator with explicit public inputs.
+///
+/// This is useful for tests that want to validate *statement binding* (public inputs absorbed into
+/// the transcript prefix). The returned trace is self-consistent: all squeeze outputs match the
+/// sponge state induced by the chosen absorbs.
+#[cfg(feature = "we_gate")]
+fn poseidon_trace_schedule_for_plus_with_public_inputs<R>(
+    public_inputs: &[BF<R>],
+    params: &WeParams,
+    n_lin_proofs: usize,
+    mlen_mats: usize,
+) -> Result<PoseidonTranscriptTrace<BF<R>>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + PrimeField,
+{
     // IMPORTANT: We must return a *self-consistent* transcript trace whose squeeze outputs match
     // the sponge state evolution induced by the absorbs. This is required now that the tiny gate
     // enforces Fiat–Shamir chaining (`get_challenge` re-absorbs its squeeze output).
-    //
-    // We still use all-zero inputs for this schedule generator (shape-only), but we run the real
-    // transcript logic so the recorded `SqueezeField` outputs are consistent.
     use crate::recording_transcript::TracePoseidonTranscript;
     use latticefold::transcript::Transcript;
 
@@ -478,8 +495,8 @@ where
     let mut tr = TracePoseidonTranscript::<R>::empty::<()>();
 
     // Public inputs absorbed as base-field scalars.
-    for _ in 0..public_inputs_len {
-        tr.absorb_field_element(&BF::<R>::ZERO);
+    for pi in public_inputs {
+        tr.absorb_field_element(pi);
     }
 
     // Π_lin proofs (ComR1CSProof::verify schedule).
@@ -6797,6 +6814,7 @@ mod tests {
     fn test_we_plus_tiny_public_input_digest_unsat_on_flip() {
         use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as RR;
         use stark_rings::PolyRing;
+        type BF0 = <<RR as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
 
         // Keep this small: we only need to cover "public input is bound into transcript absorbs".
         let ring_dim = RR::dimension() as u64;
@@ -6818,13 +6836,26 @@ mod tests {
             mlen: mlen_mats as u64,
         };
 
-        // Build a self-consistent schedule trace (stand-in for a real verifier run).
-        let trace =
-            poseidon_trace_schedule_for_plus::<RR>(public_inputs_len, &params, n_lin_proofs, mlen_mats)
-                .expect("poseidon_trace_schedule_for_plus");
+        // Choose a nontrivial public input pattern (digest-like bits).
         let public_inputs: Vec<F257> = (0..public_inputs_len)
             .map(|i| if (i % 3) == 0 { F257::ONE } else { F257::ZERO })
             .collect();
+        let public_inputs_bf: Vec<BF0> = public_inputs
+            .iter()
+            .map(|x| {
+                let d = x.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u64;
+                BF0::from(d)
+            })
+            .collect();
+
+        // Build a self-consistent schedule trace whose initial absorbs match `public_inputs`.
+        let trace = poseidon_trace_schedule_for_plus_with_public_inputs::<RR>(
+            &public_inputs_bf,
+            &params,
+            n_lin_proofs,
+            mlen_mats,
+        )
+        .expect("poseidon_trace_schedule_for_plus_with_public_inputs");
 
         let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
             &params,
