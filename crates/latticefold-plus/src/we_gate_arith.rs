@@ -950,6 +950,141 @@ where
     Ok(asg)
 }
 
+/// Witness-time builder for the tiny gate, **hooked to a real proof**.
+///
+/// This is analogous to `build_we_dr1cs_for_plus_proof_witness(...)` in the full gate: it takes a
+/// real `PlusProof` and uses it to populate the extra non-transcript witness values needed by the
+/// tiny gate (e.g. `dcom.evals[*].b/v` and decomp/LinB2X recomposition surfaces).
+///
+/// NOTE: This does **not** change the arming/shape; it only affects witness assignment.
+#[cfg(feature = "we_gate")]
+pub fn build_we_dr1cs_for_plus_proof_witness_tiny_from_proof<R>(
+    trace: &PoseidonTranscriptTrace<BF<R>>,
+    params: &WeParams,
+    public_inputs: &[F257],
+    proof: &crate::plus::PlusProof<R, crate::r1cs::ComR1CSProof<R>>,
+    mlen_mats: usize,
+    pairs: &[(usize, usize)],
+) -> Result<Vec<F257>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + Field + PrimeField,
+{
+    let ring_dim = R::dimension();
+    if ring_dim != 64 {
+        return Err("build_we_dr1cs_for_plus_proof_witness_tiny_from_proof: only ring_dim=64 supported".to_string());
+    }
+    let kappa = params.kappa as usize;
+    let eval_len = 1usize + mlen_mats;
+
+    #[inline]
+    fn base_to_u64<BR: PrimeField>(x: BR) -> u64 {
+        x.into_bigint().as_ref().get(0).copied().unwrap_or(0)
+    }
+    #[inline]
+    fn ring_to_u64_coeffs<Rr: PolyRing>(r: &Rr) -> Vec<u64>
+    where
+        Rr::BaseRing: PrimeField,
+    {
+        r.coeffs().iter().copied().map(base_to_u64::<Rr::BaseRing>).collect()
+    }
+
+    // Build the extra witness payload from the real proof.
+    let mut dcom_eval_b: Vec<Vec<Vec<u64>>> = Vec::new();
+    let mut dcom_eval_v: Vec<Vec<u64>> = Vec::new();
+    for ev in &proof.cmproof.dcom.evals {
+        if ev.b.len() != eval_len {
+            return Err("tiny witness: dcom.evals[*].b length mismatch".to_string());
+        }
+        if ev.v.len() != ring_dim {
+            return Err("tiny witness: dcom.evals[*].v length mismatch".to_string());
+        }
+        dcom_eval_b.push(ev.b.iter().map(|r| ring_to_u64_coeffs::<R>(r)).collect());
+        dcom_eval_v.push(ev.v.iter().copied().map(base_to_u64::<R::BaseRing>).collect());
+    }
+
+    // Decomp proof.
+    if proof.dproof.C.0.len() != kappa || proof.dproof.C.1.len() != kappa {
+        return Err("tiny witness: dproof.C length mismatch".to_string());
+    }
+    let vlen = 1usize + mlen_mats;
+    if proof.dproof.v.0.len() != vlen || proof.dproof.v.1.len() != vlen {
+        return Err("tiny witness: dproof.v length mismatch".to_string());
+    }
+    if proof.linb2x.cm_g.len() != kappa {
+        return Err("tiny witness: linb2x.cm_g length mismatch".to_string());
+    }
+    if proof.linb2x.vo.len() != vlen {
+        return Err("tiny witness: linb2x.vo length mismatch".to_string());
+    }
+
+    let extra = tiny::TinyExtraWitness {
+        dcom_eval_b,
+        dcom_eval_v,
+
+        decomp_c0: proof.dproof.C.0.iter().map(|r| ring_to_u64_coeffs::<R>(r)).collect(),
+        decomp_c1: proof.dproof.C.1.iter().map(|r| ring_to_u64_coeffs::<R>(r)).collect(),
+        decomp_v0a: proof.dproof.v.0.iter().map(|(a, _)| ring_to_u64_coeffs::<R>(a)).collect(),
+        decomp_v0b: proof.dproof.v.0.iter().map(|(_, b)| ring_to_u64_coeffs::<R>(b)).collect(),
+        decomp_v1a: proof.dproof.v.1.iter().map(|(a, _)| ring_to_u64_coeffs::<R>(a)).collect(),
+        decomp_v1b: proof.dproof.v.1.iter().map(|(_, b)| ring_to_u64_coeffs::<R>(b)).collect(),
+
+        linb2x_cm_g: proof.linb2x.cm_g.iter().map(|r| ring_to_u64_coeffs::<R>(r)).collect(),
+        linb2x_vo_a: proof.linb2x.vo.iter().map(|(a, _)| ring_to_u64_coeffs::<R>(a)).collect(),
+        linb2x_vo_b: proof.linb2x.vo.iter().map(|(_, b)| ring_to_u64_coeffs::<R>(b)).collect(),
+    };
+
+    // Lift the recorded trace ops to F257.
+    let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<R>>(&trace.ops)?;
+
+    let k = params.k as usize;
+    let log_kappa = ark_std::log2((params.kappa as usize).next_power_of_two()) as usize;
+    let nvars_cm = params.nvars_cm as usize;
+    let squeeze_field_op_offset = first_squeeze_field_op_index_of_len(&ops_f257, ring_dim)?;
+    let prefix_u32_squeeze_ops =
+        collect_get_challenge_squeeze_field_indices(&ops_f257, 0, squeeze_field_op_offset);
+
+    let wiring_rel = tiny::infer_cm_coin_op_wiring_from_ops(
+        &ops_f257,
+        ring_dim,
+        k,
+        log_kappa,
+        nvars_cm,
+        squeeze_field_op_offset,
+        0,
+    )?;
+    let mut wiring_abs = tiny::TinyCoinOpWiring::default();
+    wiring_abs.short_squeeze_ops = wiring_rel.short_squeeze_ops.into_iter().map(|i| i + squeeze_field_op_offset).collect();
+    wiring_abs.u32_squeeze_ops = wiring_rel.u32_squeeze_ops.into_iter().map(|i| i + squeeze_field_op_offset).collect();
+    wiring_abs.u32_squeeze_ops.splice(0..0, prefix_u32_squeeze_ops.into_iter());
+    wiring_abs.goldilocks_squeeze_ops = Vec::new();
+
+    let (inst_pose, asg_pose, _shorts, _u32s, _goldilocks, _goldilocks_rejection, _tcch0, _tcch1, _surfaces_mul, _surfaces_sq, _pose_wiring) =
+        tiny::we_tiny_f257_build_cm_gate_from_trace_ops_with_extra_witness(
+            None,
+            &ops_f257,
+            ring_dim,
+            params,
+            &wiring_abs,
+            pairs,
+            Some(&extra),
+        )?;
+
+    // Public statement prefix: [ONE] || [10×WeParams] || [public_inputs...]
+    let mut b_params = Dr1csBuilder::<F257>::new();
+    b_params.enforce_var_eq_const(b_params.one(), F257::from(1u64));
+    for &x in &params.to_field_vec::<F257>() {
+        b_params.new_var(x);
+    }
+    for &pi in public_inputs {
+        b_params.new_var(pi);
+    }
+    let (params_inst, params_asg) = b_params.into_instance();
+    let parts = vec![(params_inst, params_asg), (inst_pose, asg_pose)];
+    let (_inst, asg) = merge_sparse_dr1cs_share_one(parts).map_err(|e| e.to_string())?;
+    Ok(asg)
+}
+
 fn lf_ops_to_symphony_ops<F: PrimeField>(ops: &[LfPoseidonTraceOp<F>]) -> Vec<symphony::transcript::PoseidonTraceOp<F>> {
     ops.iter()
         .map(|op| match op {

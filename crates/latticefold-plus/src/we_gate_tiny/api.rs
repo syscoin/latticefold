@@ -13,6 +13,7 @@ pub use super::challenges::{infer_cm_coin_op_wiring_from_ops, BoundedU32Challeng
 pub use super::lift::lift_recording_trace_ops_to_f257;
 pub use super::poseidon::poseidon_f257_arithmetize;
 pub use super::surfaces::{CmDigitMulSqSurfaceWiring, CmDigitMulSurfaceWiring};
+pub(crate) use super::builder::TinyExtraWitness;
 
 /// Build Poseidon(F257) + CM coin surface + digit-mul surfaces (and optional rejection-sampled Goldilocks coins).
 ///
@@ -41,6 +42,35 @@ pub fn we_tiny_f257_build_cm_gate_from_trace_ops(
     ),
     String,
 > {
-    builder::build(cfg, ops, ring_dim, params, wiring, pairs)
+    builder::build(cfg, ops, ring_dim, params, wiring, pairs, None)
+}
+
+/// Same as `we_tiny_f257_build_cm_gate_from_trace_ops`, but allows providing extra non-transcript witness values
+/// (needed to satisfy algebraic checks like decomp recomposition when building from a real proof).
+pub(crate) fn we_tiny_f257_build_cm_gate_from_trace_ops_with_extra_witness(
+    cfg: Option<&PoseidonConfig<F257>>,
+    ops: &[PoseidonTraceOp<F257>],
+    ring_dim: usize,
+    params: &WeParams,
+    wiring: &TinyCoinOpWiring,
+    pairs: &[(usize, usize)],
+    extra_witness: Option<&TinyExtraWitness>,
+) -> Result<
+    (
+        SparseDr1csInstance<F257>,
+        Vec<F257>,
+        Vec<ShortChallengeWiring>,
+        Vec<BoundedU32ChallengeWiring>,
+        Vec<GoldilocksChallengeWiring>,
+        Vec<GoldilocksRejectionCoinWiring>,
+        Vec<[usize; 8]>,
+        Vec<[usize; 8]>,
+        Vec<CmDigitMulSurfaceWiring>,
+        Vec<CmDigitMulSqSurfaceWiring>,
+        PoseidonDr1csWiring,
+    ),
+    String,
+> {
+    builder::build(cfg, ops, ring_dim, params, wiring, pairs, extra_witness)
 }
 

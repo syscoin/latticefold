@@ -59,6 +59,33 @@ struct DcomEvalDigits {
     v: Vec<GoldilocksScalar>,
 }
 
+/// Extra (non-transcript) witness values needed to make the tiny gate satisfiable for a **real** proof.
+///
+/// This covers objects that the real verifier checks algebraically but does not absorb (or does not fully absorb)
+/// into the transcript in the tiny gate arithmetization, e.g.:
+/// - `dcom.evals[*].b` and `dcom.evals[*].v`
+/// - decomp proof pieces and LinB2X surfaces
+///
+/// Coefficients are Goldilocks field elements, stored as canonical `u64` reps mod `p`.
+#[derive(Clone, Debug)]
+pub(crate) struct TinyExtraWitness {
+    pub(crate) dcom_eval_b: Vec<Vec<Vec<u64>>>, // [l][eval_len][ring_dim]
+    pub(crate) dcom_eval_v: Vec<Vec<u64>>,      // [l][ring_dim]
+
+    // DecompProof
+    pub(crate) decomp_c0: Vec<Vec<u64>>, // [kappa][ring_dim]
+    pub(crate) decomp_c1: Vec<Vec<u64>>, // [kappa][ring_dim]
+    pub(crate) decomp_v0a: Vec<Vec<u64>>, // [vlen][ring_dim]
+    pub(crate) decomp_v0b: Vec<Vec<u64>>, // [vlen][ring_dim]
+    pub(crate) decomp_v1a: Vec<Vec<u64>>, // [vlen][ring_dim]
+    pub(crate) decomp_v1b: Vec<Vec<u64>>, // [vlen][ring_dim]
+
+    // LinB2X
+    pub(crate) linb2x_cm_g: Vec<Vec<u64>>, // [kappa][ring_dim]
+    pub(crate) linb2x_vo_a: Vec<Vec<u64>>, // [vlen][ring_dim]
+    pub(crate) linb2x_vo_b: Vec<Vec<u64>>, // [vlen][ring_dim]
+}
+
 #[inline]
 fn tiny_opmix_on() -> bool {
     std::env::var("LFP_WE_GATE_OPMIX").is_ok()
@@ -380,6 +407,9 @@ struct GlueCtx {
     gb: Dr1csBuilder<F257>,
     pose_asg: Arc<Vec<F257>>,
     local_map: BTreeMap<usize, usize>,
+    // Cache for imported base-glue vars so we don't allocate redundant copies.
+    // Key: base-glue var index, Value: local var index in this module.
+    base_map: BTreeMap<usize, usize>,
     // Extra "glue" equalities between this module's vars and the *base glue* module's vars.
     // Each entry is (base_var, local_var) in their respective local index spaces.
     base_eqs: Vec<(usize, usize)>,
@@ -389,7 +419,13 @@ impl GlueCtx {
     fn new(pose_asg: Arc<Vec<F257>>) -> Self {
         let mut gb = Dr1csBuilder::<F257>::new();
         gb.enforce_var_eq_const(gb.one(), F257::ONE);
-        Self { gb, pose_asg, local_map: BTreeMap::new(), base_eqs: Vec::new() }
+        Self {
+            gb,
+            pose_asg,
+            local_map: BTreeMap::new(),
+            base_map: BTreeMap::new(),
+            base_eqs: Vec::new(),
+        }
     }
 
     #[inline]
@@ -407,7 +443,11 @@ impl GlueCtx {
         if base_var == 0 {
             return 0;
         }
+        if let Some(&lv) = self.base_map.get(&base_var) {
+            return lv;
+        }
         let lv = self.gb.new_var(base_asg[base_var]);
+        self.base_map.insert(base_var, lv);
         self.base_eqs.push((base_var, lv));
         lv
     }
@@ -1745,7 +1785,7 @@ fn finalize(
     String,
 > {
     // Convert glue builders to instances; keep per-part local maps so we can add explicit equality constraints.
-    let GlueCtx { gb, pose_asg, local_map: base_local_map, base_eqs: base_base_eqs } = glue;
+    let GlueCtx { gb, pose_asg, local_map: base_local_map, base_eqs: base_base_eqs, .. } = glue;
     let (base_inst, base_asg) = gb.into_instance();
     debug_assert!(base_base_eqs.is_empty(), "base glue should not contain base_eqs");
 
@@ -1753,7 +1793,7 @@ fn finalize(
     let mut extra_maps: Vec<BTreeMap<usize, usize>> = Vec::with_capacity(extra_glues.len());
     let mut extra_base_eqs: Vec<Vec<(usize, usize)>> = Vec::with_capacity(extra_glues.len());
     for g in extra_glues {
-        let GlueCtx { gb, pose_asg: _pa, local_map, base_eqs } = g;
+        let GlueCtx { gb, pose_asg: _pa, local_map, base_eqs, .. } = g;
         let (inst, asg) = gb.into_instance();
         extra_insts.push((inst, asg));
         extra_maps.push(local_map);
@@ -2255,9 +2295,36 @@ fn build_cm_glue_for_which(
                         // Compute u_l for each ni (length rows_per_l).
                         let mut u_l: Vec<RingDigits> = Vec::with_capacity(rows_per_l);
                         for ni in 0..rows_per_l {
-                            let mut acc = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
-                            for blk in 0..k_decomp {
-                                for col in 0..ring_dim {
+                            // NOTE: this is a huge independent workload (k*d negacyclic ring-muls per row).
+                            // Build the ring-muls as IR shards in parallel, then lower sequentially in batches.
+                            {
+                                use super::cm_ir::{
+                                    lower_ir_into_builder, ring_mul_negacyclic_ntt_goldilocks_d64_ir, IrBuilder,
+                                    VarRef as IrVarRef,
+                                };
+
+                                #[inline]
+                                fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
+                                    if a.len() != 64 {
+                                        return Err("tiny gate: expected ring_dim=64 for IR ring-mul".to_string());
+                                    }
+                                    Ok(core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j]))))
+                                }
+
+                                #[inline]
+                                fn map_ring_out(out_ir: &[[IrVarRef; 17]; 64], lowered: &super::cm_ir::LoweredIr) -> RingDigits {
+                                    let out: [GoldilocksScalar; 64] = core::array::from_fn(|i| {
+                                        core::array::from_fn(|j| lowered.map_var(out_ir[i][j]))
+                                    });
+                                    out.into_iter().collect()
+                                }
+
+                                let mut acc = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+
+                                // Collect/import the `uij` rings we need for this (l, ni) slice.
+                                // We keep `sij` by index into `sp_ring` to avoid cloning it.
+                                let mut terms: Vec<(RingDigits, usize)> = Vec::with_capacity(k_decomp * ring_dim);
+                                for blk in 0..k_decomp {
                                     let idx = l
                                         .checked_mul(k_decomp)
                                         .and_then(|x| x.checked_add(blk))
@@ -2265,15 +2332,48 @@ fn build_cm_glue_for_which(
                                     if idx >= out_e_base[ni].len() {
                                         return Err("tiny gate: out.e too short for CM u computation".to_string());
                                     }
-                                    let uij = &out_e_base[ni][idx][col];
-                                    // Import uij ring from base glue.
-                                    let uij_local = import_ring(&mut glue, base_asg, uij);
-                                    let sij = &sp_ring[blk * ring_dim + col];
-                                    let prod = super::cm_math::ring_mul_negacyclic_digits_d64(&mut glue.gb, &uij_local, sij)?;
-                                    acc = ring_add_digits(&mut glue.gb, &acc, &prod);
+                                    for col in 0..ring_dim {
+                                        let uij = &out_e_base[ni][idx][col];
+                                        // Import uij ring from base glue.
+                                        let uij_local = import_ring(&mut glue, base_asg, uij);
+                                        let sp_idx = blk * ring_dim + col;
+                                        terms.push((uij_local, sp_idx));
+                                    }
                                 }
+
+                                // Batch size for IR shards (controls peak memory).
+                                let batch_size: usize = std::env::var("LFP_TINY_U_IR_BATCH")
+                                    .ok()
+                                    .and_then(|s| s.parse::<usize>().ok())
+                                    .unwrap_or(32)
+                                    .max(1);
+
+                                for chunk in terms.chunks(batch_size) {
+                                    // Build IR fragments in parallel (no access to glue.gb mutably).
+                                    let base_asg_ir: &[F257] = &glue.gb.assignment;
+                                    let frags: Vec<(_, [[IrVarRef; 17]; 64])> = chunk
+                                        .par_iter()
+                                        .map(|(uij_local, sp_idx)| -> Result<_, String> {
+                                            let u_ir = ringdigits64_to_ir(uij_local)?;
+                                            let s_ir = ringdigits64_to_ir(&sp_ring[*sp_idx])?;
+                                            let mut ib = IrBuilder::new(base_asg_ir);
+                                            let out_ir = ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &u_ir, &s_ir);
+                                            // Keep op-mix accounting consistent even when ring-muls are built via IR shards.
+                                            super::op_counts::tiny_cm_bump(|c| c.ring_mul_negacyclic += 1);
+                                            Ok((ib.ir, out_ir))
+                                        })
+                                        .collect::<Result<Vec<_>, _>>()?;
+
+                                    // Lower sequentially and accumulate.
+                                    for (ir, out_ir) in frags {
+                                        let lowered = lower_ir_into_builder(&mut glue.gb, ir);
+                                        let prod = map_ring_out(&out_ir, &lowered);
+                                        acc = ring_add_digits(&mut glue.gb, &acc, &prod);
+                                    }
+                                }
+
+                                u_l.push(acc);
                             }
-                            u_l.push(acc);
                         }
 
                         // a0 term (scalar -> const-coeff ring)
@@ -2461,6 +2561,7 @@ pub(super) fn build(
     params: &WeParams,
     wiring: &TinyCoinOpWiring,
     pairs: &[(usize, usize)],
+    extra_witness: Option<&TinyExtraWitness>,
 ) -> Result<
     (
         SparseDr1csInstance<F257>,
@@ -3138,6 +3239,24 @@ pub(super) fn build(
                 eval_v.push(alloc_witness_goldilocks_u64_digits(&mut glue.gb, 0u64));
             }
 
+            // If provided, overwrite the placeholder witness with real proof values.
+            if let Some(w) = extra_witness {
+                if let (Some(b_l), Some(v_l)) = (w.dcom_eval_b.get(l), w.dcom_eval_v.get(l)) {
+                    if b_l.len() == eval_b.len() && v_l.len() == ring_dim {
+                        for (i, b_i) in b_l.iter().enumerate() {
+                            if b_i.len() == ring_dim {
+                                for k in 0..ring_dim {
+                                    eval_b[i][k] = alloc_witness_goldilocks_u64_digits(&mut glue.gb, b_i[k]);
+                                }
+                            }
+                        }
+                        for k in 0..ring_dim {
+                            eval_v[k] = alloc_witness_goldilocks_u64_digits(&mut glue.gb, v_l[k]);
+                        }
+                    }
+                }
+            }
+
             // Check 1: ct(psi * eval.b[i]) == eval.a[i] for each i.
             for i in 0..eval_a.len() {
                 let ct = ct_psi_mul_ring_digits_d64(&mut glue.gb, &eval_b[i])?;
@@ -3337,6 +3456,23 @@ pub(super) fn build(
             }
             r
         }
+        #[inline]
+        fn alloc_witness_ring_digits_from_u64s(
+            gb: &mut Dr1csBuilder<F257>,
+            ring_dim: usize,
+            coeffs: Option<&[u64]>,
+        ) -> RingDigits {
+            if let Some(c) = coeffs {
+                if c.len() == ring_dim {
+                    let mut r: RingDigits = Vec::with_capacity(ring_dim);
+                    for k in 0..ring_dim {
+                        r.push(alloc_witness_goldilocks_u64_digits(gb, c[k]));
+                    }
+                    return r;
+                }
+            }
+            alloc_witness_ring_digits(gb, ring_dim)
+        }
 
         #[inline]
         fn ring_recompose_base_b(
@@ -3384,6 +3520,47 @@ pub(super) fn build(
         for _ in 0..vlen {
             va.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
             vb.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
+        }
+
+        // If provided, allocate from the real proof coefficients.
+        if let Some(w) = extra_witness {
+            if w.decomp_c0.len() == kappa && w.decomp_c1.len() == kappa && w.linb2x_cm_g.len() == kappa {
+                dcomp_c0 = (0..kappa)
+                    .map(|i| alloc_witness_ring_digits_from_u64s(&mut glue.gb, ring_dim, Some(&w.decomp_c0[i])))
+                    .collect();
+                dcomp_c1 = (0..kappa)
+                    .map(|i| alloc_witness_ring_digits_from_u64s(&mut glue.gb, ring_dim, Some(&w.decomp_c1[i])))
+                    .collect();
+                cm_g = (0..kappa)
+                    .map(|i| alloc_witness_ring_digits_from_u64s(&mut glue.gb, ring_dim, Some(&w.linb2x_cm_g[i])))
+                    .collect();
+            }
+            if w.decomp_v0a.len() == vlen
+                && w.decomp_v0b.len() == vlen
+                && w.decomp_v1a.len() == vlen
+                && w.decomp_v1b.len() == vlen
+                && w.linb2x_vo_a.len() == vlen
+                && w.linb2x_vo_b.len() == vlen
+            {
+                v0a = (0..vlen)
+                    .map(|i| alloc_witness_ring_digits_from_u64s(&mut glue.gb, ring_dim, Some(&w.decomp_v0a[i])))
+                    .collect();
+                v0b = (0..vlen)
+                    .map(|i| alloc_witness_ring_digits_from_u64s(&mut glue.gb, ring_dim, Some(&w.decomp_v0b[i])))
+                    .collect();
+                v1a = (0..vlen)
+                    .map(|i| alloc_witness_ring_digits_from_u64s(&mut glue.gb, ring_dim, Some(&w.decomp_v1a[i])))
+                    .collect();
+                v1b = (0..vlen)
+                    .map(|i| alloc_witness_ring_digits_from_u64s(&mut glue.gb, ring_dim, Some(&w.decomp_v1b[i])))
+                    .collect();
+                va = (0..vlen)
+                    .map(|i| alloc_witness_ring_digits_from_u64s(&mut glue.gb, ring_dim, Some(&w.linb2x_vo_a[i])))
+                    .collect();
+                vb = (0..vlen)
+                    .map(|i| alloc_witness_ring_digits_from_u64s(&mut glue.gb, ring_dim, Some(&w.linb2x_vo_b[i])))
+                    .collect();
+            }
         }
 
         // Enforce recomposition equalities.
