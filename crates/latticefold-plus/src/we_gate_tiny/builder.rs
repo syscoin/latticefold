@@ -45,6 +45,7 @@ use super::cm_math::{
     eq_eval_goldilocks_digits, eval_t_z_optimized_ring_digits_pair, goldilocks_bytes_to_digits, goldilocks_pow_table_digits,
     goldilocks_digits_to_bytes_canonical,
     goldilocks_add_mod_p_digits, goldilocks_mul_const_mod_p_digits, goldilocks_mul_mod_p_digits, goldilocks_sub_mod_p_digits,
+    ct_psi_mul_ring_digits_d64,
     ring_eval_at_scalar_digits,
     ring_add_digits, ring_bytes_to_digits, ring_eq_digits,
     ring_const_coeff_digits,
@@ -2984,6 +2985,146 @@ pub(super) fn build(
 
         let ver_ring = ring_const_coeff_digits(&mut glue.gb, &ver, ring_dim);
         ring_eq_digits(&mut glue.gb, &ver_ring, &v_sc);
+
+        // ------------------------------------------------------------
+        // rgchk::Dcom::verify checks + absorb(dcom.evals)
+        // ------------------------------------------------------------
+        //
+        // This is the critical “binding” that ties the setchk outputs `out.e/out.b` to
+        // the rest of the CM/Dcom verifier transcript. Mirrors `we_gate_arith.rs` (linear checks).
+        //
+        // Transcript schedule (see `poseidon_trace_schedule_for_plus_with_public_inputs`):
+        // for each eval instance:
+        // - absorb eval.a as base-ring scalars (8 bytes each), length = 1+mlen
+        // - absorb eval.c as ring elements, length = 1+mlen
+        //
+        // We infer how many `eval` instances are present from the remaining prefix payload.
+        let dcom_eval_vec_len = 1usize + (params.mlen as usize);
+        let rem = prefix_payload.len().saturating_sub(cur);
+        let per_eval = 2usize
+            .checked_mul(dcom_eval_vec_len)
+            .ok_or_else(|| "tiny gate: dcom evals per-eval overflow".to_string())?;
+        if per_eval == 0 || (rem % per_eval) != 0 {
+            return Err("tiny gate: prefix tail not aligned for dcom eval absorbs".to_string());
+        }
+        let l_evals = rem / per_eval;
+        if l_evals == 0 {
+            return Err("tiny gate: expected at least one dcom eval instance".to_string());
+        }
+
+        // dppow_const[i] = (decomp_b)^i in Goldilocks (digit encoding).
+        let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+        let mut dppow: Vec<GoldilocksScalar> = Vec::with_capacity(k_rg);
+        let mut pow_acc: u64 = 1;
+        for _ in 0..k_rg {
+            let bs = alloc_const_goldilocks_u64(&mut glue.gb, pow_acc);
+            dppow.push(goldilocks_bytes_to_digits(&mut glue.gb, bs));
+            pow_acc = ((pow_acc as u128) * (params.decomp_b as u128) % (p_u64 as u128)) as u64;
+        }
+
+        // Helper: parse an absorbed 8-byte scalar into a Goldilocks digit scalar.
+        #[inline]
+        fn parse_absorbed_scalar_as_goldilocks_digits(
+            glue: &mut GlueCtx,
+            pose_wiring: &PoseidonDr1csWiring,
+            ab_start: usize,
+        ) -> GoldilocksScalar {
+            let mut bytes = [0usize; 8];
+            for i in 0..8 {
+                let gv = pose_wiring.absorb_vars[ab_start + i];
+                bytes[i] = glue.copy_digit(gv);
+            }
+            goldilocks_bytes_to_digits(&mut glue.gb, bytes)
+        }
+
+        for l in 0..l_evals {
+            // eval.a absorbs (scalars)
+            let mut eval_a: Vec<GoldilocksScalar> = Vec::with_capacity(dcom_eval_vec_len);
+            for _ in 0..dcom_eval_vec_len {
+                let (st, ln) = *prefix_payload
+                    .get(cur)
+                    .ok_or("tiny gate: dcom eval.a absorb oob")?;
+                cur += 1;
+                if ln != 8 {
+                    return Err("tiny gate: expected 8-byte absorb for dcom eval.a".to_string());
+                }
+                eval_a.push(parse_absorbed_scalar_as_goldilocks_digits(&mut glue, &pose_wiring, st));
+            }
+            // eval.c absorbs (ring elements)
+            let mut eval_c: Vec<RingDigits> = Vec::with_capacity(dcom_eval_vec_len);
+            for _ in 0..dcom_eval_vec_len {
+                let (st, ln) = *prefix_payload
+                    .get(cur)
+                    .ok_or("tiny gate: dcom eval.c absorb oob")?;
+                cur += 1;
+                if ln != ring_elem_bytes {
+                    return Err("tiny gate: expected ring-elem absorb for dcom eval.c".to_string());
+                }
+                let rb = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, st, ln)?;
+                eval_c.push(ring_bytes_to_digits(&mut glue.gb, &rb));
+            }
+
+            // Allocate witness eval.b ring elements (not absorbed) and eval.v scalars (not absorbed).
+            let mut eval_b: Vec<RingDigits> = Vec::with_capacity(eval_a.len());
+            for _ in 0..eval_a.len() {
+                let mut r: RingDigits = Vec::with_capacity(ring_dim);
+                for _ in 0..ring_dim {
+                    r.push(alloc_witness_goldilocks_u64_digits(&mut glue.gb, 0u64));
+                }
+                eval_b.push(r);
+            }
+            let mut eval_v: Vec<GoldilocksScalar> = Vec::with_capacity(ring_dim);
+            for _ in 0..ring_dim {
+                eval_v.push(alloc_witness_goldilocks_u64_digits(&mut glue.gb, 0u64));
+            }
+
+            // Check 1: ct(psi * eval.b[i]) == eval.a[i] for each i.
+            for i in 0..eval_a.len() {
+                let ct = ct_psi_mul_ring_digits_d64(&mut glue.gb, &eval_b[i])?;
+                for di in 0..17 {
+                    glue.gb.enforce_lc_times_one_eq_const(vec![
+                        (F257::ONE, ct[di]),
+                        (-F257::ONE, eval_a[i][di]),
+                    ]);
+                }
+            }
+
+            // Check 2: for each block ni and column col, ct(psi * Σ_i dppow[i] * out.e[ni][base+i][col]) == expected.
+            let base = l
+                .checked_mul(k_rg)
+                .ok_or_else(|| "tiny gate: rgchk base overflow".to_string())?;
+            for ni in 0..out_e_blocks {
+                for col in 0..ring_dim {
+                    let mut acc_ring = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+                    for i in 0..k_rg {
+                        let idx = base + i;
+                        if idx >= out_e_vars[ni].len() {
+                            return Err("tiny gate: out.e length too short for rgchk".to_string());
+                        }
+                        let ui_col = &out_e_vars[ni][idx][col];
+                        let t = ring_scale_digits(&mut glue.gb, ui_col, &dppow[i]);
+                        acc_ring = ring_add_digits(&mut glue.gb, &acc_ring, &t);
+                    }
+                    let ct = ct_psi_mul_ring_digits_d64(&mut glue.gb, &acc_ring)?;
+                    let expected = if ni == 0 {
+                        eval_v[col]
+                    } else {
+                        // eval.c[ni] is a ring; take coefficient `col`.
+                        *eval_c
+                            .get(ni)
+                            .ok_or("tiny gate: eval.c length mismatch (rgchk)")?
+                            .get(col)
+                            .ok_or("tiny gate: eval.c coeff index oob (rgchk)")?
+                    };
+                    for di in 0..17 {
+                        glue.gb.enforce_lc_times_one_eq_const(vec![
+                            (F257::ONE, ct[di]),
+                            (-F257::ONE, expected[di]),
+                        ]);
+                    }
+                }
+            }
+        }
     }
 
     let goldilocks_rejection_locals = build_goldilocks_rejection_coins(&mut glue, &pose_wiring, &goldilocks_ranges)?;

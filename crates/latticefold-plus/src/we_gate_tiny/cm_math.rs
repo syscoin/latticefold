@@ -1,4 +1,4 @@
-use ark_ff::Field;
+use ark_ff::{Field, PrimeField};
 use latticefold::transcript::poseidon::F257;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 
@@ -17,6 +17,8 @@ use super::cm_ir::{
     goldilocks_mul_mod_p_digits_ir, goldilocks_sub_mod_p_digits_ir, lower_ir_into_builder,
     ring_mul_negacyclic_ntt_goldilocks_d64_ir, IrBuilder, VarRef as IrVarRef,
 };
+use cyclotomic_rings::rings::GoldilocksRing64 as GR64;
+use stark_rings::{psi, unit_monomial, CoeffRing};
 
 /// A ring element whose coefficients are Goldilocks base-field scalars encoded as canonical 8-byte little-endian limbs.
 ///
@@ -400,6 +402,37 @@ pub(crate) fn ring_eval_at_scalar_digits(
         let t = goldilocks_mul_mod_p_digits(gb, c, &pow);
         acc = goldilocks_add_mod_p_digits(gb, &acc, &t);
         pow = goldilocks_mul_mod_p_digits(gb, &pow, x);
+    }
+    gb.profile_exit(_prev);
+    Ok(acc)
+}
+
+/// Compute `ct(psi * x)` as a Goldilocks scalar (digit encoding), for ring_dim=64.
+///
+/// This is the digit-domain analog of `we_gate_arith::ct_psi_mul_ring`, and is used by the rgchk checks.
+pub(crate) fn ct_psi_mul_ring_digits_d64(
+    gb: &mut Dr1csBuilder<F257>,
+    x: &RingDigits,
+) -> Result<GoldilocksScalar, String> {
+    if x.len() != 64 {
+        return Err("ct_psi_mul_ring_digits_d64: expected ring_dim=64".to_string());
+    }
+    let _prev = gb.profile_enter("cm_math::ct_psi_mul_ring_digits_d64");
+    tiny_cm_bump(|cc| cc.ct_psi_mul_ring += 1);
+
+    let psi_r = psi::<GR64>();
+    let zero_bytes = alloc_const_goldilocks_u64(gb, 0u64);
+    let zero = goldilocks_bytes_to_digits(gb, zero_bytes);
+    let mut acc = zero;
+    for j in 0..64 {
+        let basis = unit_monomial::<GR64>(j);
+        let w_br = (psi_r * basis).ct();
+        let w_u64 = w_br.into_bigint().as_ref().get(0).copied().unwrap_or(0);
+        if w_u64 == 0 {
+            continue;
+        }
+        let t = goldilocks_mul_const_mod_p_digits(gb, &x[j], w_u64);
+        acc = goldilocks_add_mod_p_digits(gb, &acc, &t);
     }
     gb.profile_exit(_prev);
     Ok(acc)
