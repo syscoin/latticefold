@@ -45,6 +45,7 @@ use super::cm_math::{
     eq_eval_goldilocks_digits, eval_t_z_optimized_ring_digits_pair, goldilocks_bytes_to_digits, goldilocks_pow_table_digits,
     goldilocks_digits_to_bytes_canonical,
     goldilocks_add_mod_p_digits, goldilocks_mul_const_mod_p_digits, goldilocks_mul_mod_p_digits, goldilocks_sub_mod_p_digits,
+    ring_eval_at_scalar_digits,
     ring_add_digits, ring_bytes_to_digits, ring_eq_digits,
     ring_const_coeff_digits,
     ring_scale_digits,
@@ -2826,8 +2827,8 @@ pub(super) fn build(
         // Allocate witness out.e / out.b (digits)
         // ---------------------------------------
         //
-        // In the const-coeff regime, each ring element is determined by its coefficient-0 scalar.
-        // We allocate those scalars as witness values (defaulting to 0 in the synthetic schedule).
+        // Do NOT assume const-coeff. The Ajtai digest binds full ring elements.
+        // Allocate ring-valued witness vars for out.e/out.b (defaulting to 0 in the synthetic schedule).
         let out_e_blocks = 1usize + (params.mlen as usize);
         let lane_len = ring_dim;
         let n_out_agg = out_e0_len
@@ -2836,18 +2837,50 @@ pub(super) fn build(
             .and_then(|x| x.checked_add(out_b_len))
             .ok_or_else(|| "tiny gate: n_out_agg overflow (setchk)".to_string())?;
 
-        // flat scalars s_j = ct(out_flat[j]) in setchk.rs fixed order: claim -> block -> lane, then b.
-        let mut flat_scalars: Vec<GoldilocksScalar> = Vec::with_capacity(n_out_agg);
-        for _ in 0..n_out_agg {
-            flat_scalars.push(alloc_witness_goldilocks_u64_digits(&mut glue.gb, 0u64));
+        // Full ring elements in the same flatten order as `setchk::absorb_evaluations_digest`:
+        // claim index -> block -> lane, then out.b.
+        let mut out_e_vars: Vec<Vec<Vec<RingDigits>>> = vec![vec![Vec::new(); out_e0_len]; out_e_blocks];
+        for blk in 0..out_e_blocks {
+            for i in 0..out_e0_len {
+                out_e_vars[blk][i] = Vec::with_capacity(lane_len);
+                for _lane in 0..lane_len {
+                    let mut r: RingDigits = Vec::with_capacity(ring_dim);
+                    for _ in 0..ring_dim {
+                        r.push(alloc_witness_goldilocks_u64_digits(&mut glue.gb, 0u64));
+                    }
+                    out_e_vars[blk][i].push(r);
+                }
+            }
         }
+        let mut out_b_vars: Vec<RingDigits> = Vec::with_capacity(out_b_len);
+        for _ in 0..out_b_len {
+            let mut r: RingDigits = Vec::with_capacity(ring_dim);
+            for _ in 0..ring_dim {
+                r.push(alloc_witness_goldilocks_u64_digits(&mut glue.gb, 0u64));
+            }
+            out_b_vars.push(r);
+        }
+
+        let mut out_flat_vars: Vec<RingDigits> = Vec::with_capacity(n_out_agg);
+        for i in 0..out_e0_len {
+            for blk in 0..out_e_blocks {
+                for lane in 0..lane_len {
+                    out_flat_vars.push(out_e_vars[blk][i][lane].clone());
+                }
+            }
+        }
+        for i in 0..out_b_len {
+            out_flat_vars.push(out_b_vars[i].clone());
+        }
+        debug_assert_eq!(out_flat_vars.len(), n_out_agg);
 
         // ----------------------------
         // Ajtai opening constraints
         // ----------------------------
         //
-        // Using const-coeff inputs: commit(flat) = Σ_j (col_j * s_j), i.e. each output coefficient is
-        // Σ_j a_ij_coeff[k] * s_j (mod p), where a_ij_coeff are constants from the seeded scheme.
+        // Ajtai opening constraints (general case):
+        // commit(flat) = A * flat, where A entries are public seeded ring elements.
+        // Enforce coefficient-wise negacyclic convolution using only scalar (mod p) digit ops.
         let agg_scheme = AjtaiCommitmentScheme::<GR64>::seeded(b"setchk_out_e_agg", OUT_E_AGG_SEED, kappa, n_out_agg);
         let mut cols: Vec<Vec<GR64>> = Vec::with_capacity(n_out_agg);
         for j in 0..n_out_agg {
@@ -2862,44 +2895,44 @@ pub(super) fn build(
         let zero_bytes = alloc_const_goldilocks_u64(&mut glue.gb, 0u64);
         let zero = goldilocks_bytes_to_digits(&mut glue.gb, zero_bytes);
         for i in 0..kappa {
-            let mut recomputed: RingDigits = Vec::with_capacity(ring_dim);
             for k_out in 0..ring_dim {
                 let mut acc = zero;
-                for (j, sj) in flat_scalars.iter().enumerate() {
-                    let aij = cols[j][i].coeffs()[k_out];
-                    let a_u64 = goldilocks_u64_from_base_ring(aij);
-                    if a_u64 == 0 {
-                        continue;
+                for j in 0..n_out_agg {
+                    let aij = &cols[j][i];
+                    let a_coeffs = aij.coeffs();
+                    // Convolution over input ring coefficients v.
+                    for v in 0..ring_dim {
+                        let (u, sign_is_plus) = if k_out >= v {
+                            (k_out - v, true)
+                        } else {
+                            (k_out + ring_dim - v, false)
+                        };
+                        let a_u64 = goldilocks_u64_from_base_ring(a_coeffs[u]);
+                        if a_u64 == 0 {
+                            continue;
+                        }
+                        let t = goldilocks_mul_const_mod_p_digits(&mut glue.gb, &out_flat_vars[j][v], a_u64);
+                        acc = if sign_is_plus {
+                            goldilocks_add_mod_p_digits(&mut glue.gb, &acc, &t)
+                        } else {
+                            goldilocks_sub_mod_p_digits(&mut glue.gb, &acc, &t)
+                        };
                     }
-                    let t = goldilocks_mul_const_mod_p_digits(&mut glue.gb, sj, a_u64);
-                    acc = goldilocks_add_mod_p_digits(&mut glue.gb, &acc, &t);
                 }
-                recomputed.push(acc);
+                // Enforce computed coefficient equals absorbed commitment coefficient.
+                for di in 0..17 {
+                    glue.gb.enforce_lc_times_one_eq_const(vec![
+                        (F257::ONE, acc[di]),
+                        (-F257::ONE, out_e_agg_abs[i][k_out][di]),
+                    ]);
+                }
             }
-            ring_eq_digits(&mut glue.gb, &recomputed, &out_e_agg_abs[i]);
         }
 
         // ----------------------------
         // SetChk recombination check
         // ----------------------------
         //
-        // Interpret flat_scalars back as out.e[0][i][lane] (block 0 only) and out.b[0].
-        // NOTE: digest binds all blocks, but the algebraic verification uses only block 0.
-        let mut out_e0: Vec<Vec<GoldilocksScalar>> = vec![vec![zero; lane_len]; out_e0_len];
-        let mut idx = 0usize;
-        for i_claim in 0..out_e0_len {
-            // blk=0 lanes
-            for lane in 0..lane_len {
-                out_e0[i_claim][lane] = flat_scalars[idx];
-                idx += 1;
-            }
-            // skip remaining blocks for this claim
-            idx += (out_e_blocks - 1) * lane_len;
-        }
-        let out_b0 = *flat_scalars
-            .get(out_e0_len * out_e_blocks * lane_len)
-            .ok_or("tiny gate: out_b0 idx oob")?;
-
         let one_bytes = alloc_const_goldilocks_u64(&mut glue.gb, 1u64);
         let one = goldilocks_bytes_to_digits(&mut glue.gb, one_bytes);
         let rc_base = rc_opt.unwrap_or(one);
@@ -2910,17 +2943,22 @@ pub(super) fn build(
             let eq = eq_eval_goldilocks_digits(&mut glue.gb, &c_vars[i], &rs_digits)?;
             let beta = beta_vars[i];
             let alpha = alpha_vars[i];
-            // beta2 is unused in const-coeff regime (ev2 == ev1), but keep the variable for readability.
-            let _beta2 = goldilocks_mul_mod_p_digits(&mut glue.gb, &beta, &beta);
+            let beta2 = goldilocks_mul_mod_p_digits(&mut glue.gb, &beta, &beta);
             let alpha_pows = goldilocks_pow_table_digits(&mut glue.gb, &alpha, lane_len.saturating_sub(1));
 
             let mut e_sum = zero;
-            for lane in 0..lane_len {
-                let s = out_e0[i][lane];
-                let s_sq = goldilocks_mul_mod_p_digits(&mut glue.gb, &s, &s);
-                let diff = goldilocks_sub_mod_p_digits(&mut glue.gb, &s_sq, &s);
-                let term = goldilocks_mul_mod_p_digits(&mut glue.gb, &diff, &alpha_pows[lane]);
-                e_sum = goldilocks_add_mod_p_digits(&mut glue.gb, &e_sum, &term);
+            for blk in 0..out_e_blocks {
+                for lane in 0..lane_len {
+                    let ejv = &out_e_vars[blk][i][lane];
+                    let ev1 = ring_eval_at_scalar_digits(&mut glue.gb, ejv, &beta)?;
+                    let ev2 = ring_eval_at_scalar_digits(&mut glue.gb, ejv, &beta2)?;
+                    if blk == 0 {
+                        let ev1_sq = goldilocks_mul_mod_p_digits(&mut glue.gb, &ev1, &ev1);
+                        let diff = goldilocks_sub_mod_p_digits(&mut glue.gb, &ev1_sq, &ev2);
+                        let term = goldilocks_mul_mod_p_digits(&mut glue.gb, &diff, &alpha_pows[lane]);
+                        e_sum = goldilocks_add_mod_p_digits(&mut glue.gb, &e_sum, &term);
+                    }
+                }
             }
             let t = goldilocks_mul_mod_p_digits(&mut glue.gb, &eq, &e_sum);
             let t = goldilocks_mul_mod_p_digits(&mut glue.gb, &t, &rc_pows[i]);
@@ -2932,10 +2970,12 @@ pub(super) fn build(
             let eq = eq_eval_goldilocks_digits(&mut glue.gb, &c_vars[idx2], &rs_digits)?;
             let alpha = alpha_vars[idx2];
             let beta = beta_vars[idx2];
-            let _beta2 = goldilocks_mul_mod_p_digits(&mut glue.gb, &beta, &beta);
-            let b_s = out_b0;
-            let ev1_sq = goldilocks_mul_mod_p_digits(&mut glue.gb, &b_s, &b_s);
-            let b_claim = goldilocks_sub_mod_p_digits(&mut glue.gb, &ev1_sq, &b_s);
+            let beta2 = goldilocks_mul_mod_p_digits(&mut glue.gb, &beta, &beta);
+            let b_ring = &out_b_vars[bi];
+            let ev1 = ring_eval_at_scalar_digits(&mut glue.gb, b_ring, &beta)?;
+            let ev2 = ring_eval_at_scalar_digits(&mut glue.gb, b_ring, &beta2)?;
+            let ev1_sq = goldilocks_mul_mod_p_digits(&mut glue.gb, &ev1, &ev1);
+            let b_claim = goldilocks_sub_mod_p_digits(&mut glue.gb, &ev1_sq, &ev2);
             let t = goldilocks_mul_mod_p_digits(&mut glue.gb, &eq, &alpha);
             let t = goldilocks_mul_mod_p_digits(&mut glue.gb, &t, &b_claim);
             let t = goldilocks_mul_mod_p_digits(&mut glue.gb, &t, &rc_pows[idx2]);

@@ -377,6 +377,34 @@ pub(crate) fn goldilocks_mul_const_mod_p_digits(
     out
 }
 
+/// Evaluate a ring element (coefficient vector) at a base-field scalar point `x`.
+///
+/// This matches `setchk::ev` and `we_gate_arith::ring_eval_at_scalar`:
+/// \(\sum_{t=0}^{d-1} coeff[t] \cdot x^t\).
+pub(crate) fn ring_eval_at_scalar_digits(
+    gb: &mut Dr1csBuilder<F257>,
+    coeffs: &RingDigits,
+    x: &GoldilocksScalar,
+) -> Result<GoldilocksScalar, String> {
+    if coeffs.is_empty() {
+        return Err("ring_eval_at_scalar_digits: empty ring element".to_string());
+    }
+    let _prev = gb.profile_enter("cm_math::ring_eval_at_scalar_digits");
+    let zero_bytes = alloc_const_goldilocks_u64(gb, 0u64);
+    let one_bytes = alloc_const_goldilocks_u64(gb, 1u64);
+    let zero = goldilocks_bytes_to_digits(gb, zero_bytes);
+    let one = goldilocks_bytes_to_digits(gb, one_bytes);
+    let mut acc = zero;
+    let mut pow = one;
+    for c in coeffs {
+        let t = goldilocks_mul_mod_p_digits(gb, c, &pow);
+        acc = goldilocks_add_mod_p_digits(gb, &acc, &t);
+        pow = goldilocks_mul_mod_p_digits(gb, &pow, x);
+    }
+    gb.profile_exit(_prev);
+    Ok(acc)
+}
+
 /// Degree-2 Lagrange basis in digit encoding.
 pub(crate) fn lagrange_degree2_goldilocks_digits(
     gb: &mut Dr1csBuilder<F257>,
