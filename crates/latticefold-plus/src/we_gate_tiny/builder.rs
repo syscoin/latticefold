@@ -476,6 +476,104 @@ fn validate_cm_u32_schedule(params: &WeParams, wiring: &TinyCoinOpWiring) -> Res
     Ok(())
 }
 
+fn collect_nonreabsorb_absorbs_before_squeeze_field_op(
+    ops: &[PoseidonTraceOp<F257>],
+    pose_wiring: &PoseidonDr1csWiring,
+    stop_before_squeeze_field_op_idx: usize,
+) -> Result<Vec<(usize, usize)>, String> {
+    let mut absorb_idx = 0usize;
+    let mut squeeze_field_op_idx = 0usize;
+    let mut payload: Vec<(usize, usize)> = Vec::new();
+    let mut last_squeeze_len: Option<usize> = None;
+    let mut last_squeeze_is_get_challenge_try = false;
+
+    for op in ops {
+        match op {
+            PoseidonTraceOp::SqueezeField(v) => {
+                if squeeze_field_op_idx >= stop_before_squeeze_field_op_idx {
+                    break;
+                }
+                squeeze_field_op_idx += 1;
+                last_squeeze_len = Some(v.len());
+                last_squeeze_is_get_challenge_try = v.len() == DIGITS_PER_TRY;
+            }
+            PoseidonTraceOp::Absorb(_v) => {
+                let (ab_start, ab_len) = *pose_wiring
+                    .absorb_ranges
+                    .get(absorb_idx)
+                    .ok_or("tiny gate: pose_wiring.absorb_ranges oob (prefix absorbs)")?;
+                absorb_idx += 1;
+                let is_reabsorb = last_squeeze_is_get_challenge_try && last_squeeze_len == Some(ab_len);
+                last_squeeze_len = None;
+                last_squeeze_is_get_challenge_try = false;
+                if !is_reabsorb {
+                    payload.push((ab_start, ab_len));
+                }
+            }
+            PoseidonTraceOp::SqueezeBytes { .. } => {
+                last_squeeze_len = None;
+                last_squeeze_is_get_challenge_try = false;
+            }
+        }
+    }
+    Ok(payload)
+}
+
+#[inline]
+fn infer_ring_elem_bytes_from_wiring(ring_dim: usize, pose_wiring: &PoseidonDr1csWiring) -> Result<usize, String> {
+    if ring_dim == 0 {
+        return Ok(0);
+    }
+    let mut ring_elem_bytes: Option<usize> = None;
+    for &(_st, ln) in &pose_wiring.absorb_ranges {
+        if ln % ring_dim == 0 && ln > ring_dim {
+            ring_elem_bytes = Some(match ring_elem_bytes {
+                None => ln,
+                Some(cur) => cur.min(ln),
+            });
+        }
+    }
+    ring_elem_bytes.ok_or_else(|| "tiny gate: could not infer ring_elem_bytes".to_string())
+}
+
+fn find_setchk_sumcheck_block_start(
+    prefix_payload: &[(usize, usize)],
+    ring_elem_bytes: usize,
+    nvars_setchk: usize,
+) -> Option<usize> {
+    // Pattern (lengths only):
+    //  - 2 scalar absorbs (8 bytes each): (nvars_setchk, degree=3)
+    //  - nvars rounds: 4 ring absorbs + 1 scalar absorb (r_i as 8 bytes)
+    for start in 0..prefix_payload.len() {
+        if prefix_payload.get(start)?.1 != 8 || prefix_payload.get(start + 1)?.1 != 8 {
+            continue;
+        }
+        let mut cur = start + 2;
+        let mut ok = true;
+        for _ in 0..nvars_setchk {
+            for _ in 0..4 {
+                if prefix_payload.get(cur).map(|x| x.1) != Some(ring_elem_bytes) {
+                    ok = false;
+                    break;
+                }
+                cur += 1;
+            }
+            if !ok {
+                break;
+            }
+            if prefix_payload.get(cur).map(|x| x.1) != Some(8) {
+                ok = false;
+                break;
+            }
+            cur += 1;
+        }
+        if ok {
+            return Some(start);
+        }
+    }
+    None
+}
+
 fn count_comh_ring_elements(
     ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
@@ -1145,6 +1243,15 @@ fn parse_ring_elem_absorb_as_ringbytes(
         out.push(cbytes);
     }
     Ok(out)
+}
+
+fn enforce_absorbed_u64_const(glue: &mut GlueCtx, pose_wiring: &PoseidonDr1csWiring, ab_start: usize, val: u64) {
+    let bs = val.to_le_bytes();
+    for i in 0..8 {
+        let gv = pose_wiring.absorb_vars[ab_start + i];
+        let lv = glue.copy_digit(gv);
+        glue.gb.enforce_var_eq_const(lv, F257::from(bs[i] as u64));
+    }
 }
 
 struct SurfaceLocal<const RAW: usize, const NORM: usize> {
@@ -2248,6 +2355,118 @@ pub(super) fn build(
     let (u32_locals, goldilocks_locals) =
         build_u32_and_goldilocks_blocks(&mut glue, &pose_wiring, &wiring.u32_squeeze_ops)?;
     lf_stage_log("build_u32_and_goldilocks_blocks", Some(&pose_inst), Some(&glue), &mut mem_prev);
+
+    // ------------------------------------------------------------------------
+    // Start arithmetizing Π_lin / SetChk verifier math: SetChk sumcheck (degree-3)
+    // ------------------------------------------------------------------------
+    //
+    // This binds:
+    // - the SetChk sumcheck header absorbs (nvars, degree=3)
+    // - the per-round prover message ring elements (4 evals)
+    // - the per-round verifier challenges r_i (both as absorbed bytes and as u32 coins)
+    //
+    // Full SetChk recombination + digest binding is wired later; this is the “first swap-in”
+    // of the real verifier arithmetic.
+    if ring_dim > 0 && !wiring.short_squeeze_ops.is_empty() {
+        let first_short_op = *wiring
+            .short_squeeze_ops
+            .iter()
+            .min()
+            .expect("non-empty short_squeeze_ops");
+
+        // Collect prefix (pre-CM-short) non-reabsorb absorbs and locate the SetChk sumcheck block.
+        let prefix_payload =
+            collect_nonreabsorb_absorbs_before_squeeze_field_op(ops, &pose_wiring, first_short_op)?;
+        let ring_elem_bytes = infer_ring_elem_bytes_from_wiring(ring_dim, &pose_wiring)?;
+        let nvars_setchk = params.nvars_setchk as usize;
+        let start = find_setchk_sumcheck_block_start(&prefix_payload, ring_elem_bytes, nvars_setchk)
+            .ok_or_else(|| "tiny gate: could not locate SetChk sumcheck block in prefix absorbs".to_string())?;
+
+        // Header absorbs: (nvars_setchk, degree=3).
+        enforce_absorbed_u64_const(&mut glue, &pose_wiring, prefix_payload[start + 0].0, nvars_setchk as u64);
+        enforce_absorbed_u64_const(&mut glue, &pose_wiring, prefix_payload[start + 1].0, 3u64);
+
+        // Recover the SetChk verifier challenge point r from the u32 coin schedule.
+        //
+        // Mirrors the indexing used by the CM recombination gadget (eq(r, ro)).
+        let n_lin_proofs = l_instances_expected;
+        let lin_chals = n_lin_proofs
+            .checked_mul(2usize.saturating_mul(nvars_setchk))
+            .ok_or_else(|| "tiny gate: lin_chals overflow (setchk)".to_string())?;
+        let k_decomp = params.k as usize;
+        let nclaims = k_decomp
+            .checked_add(1)
+            .ok_or_else(|| "tiny gate: nclaims overflow (setchk)".to_string())?;
+        let out_coin_total = nclaims
+            .checked_mul(nvars_setchk + 2)
+            .and_then(|x| x.checked_add(if k_decomp > 1 { 1 } else { 0 }))
+            .ok_or_else(|| "tiny gate: out_coin_total overflow (setchk)".to_string())?;
+        let r_start = lin_chals
+            .checked_add(out_coin_total)
+            .ok_or_else(|| "tiny gate: r_start overflow (setchk)".to_string())?;
+        let r_end = r_start
+            .checked_add(nvars_setchk)
+            .ok_or_else(|| "tiny gate: r_end overflow (setchk)".to_string())?;
+        if u32_locals.len() < r_end {
+            return Err("tiny gate: not enough u32 challenges to recover setchk r-point".to_string());
+        }
+
+        // Parse the sumcheck prover messages as ring-bytes -> ring-digits.
+        // Also bind each absorbed r_i scalar (8 bytes) to the corresponding u32 coin bytes.
+        let mut msgs_digits: Vec<[RingDigits; 4]> = Vec::with_capacity(nvars_setchk);
+        let mut rs_digits: Vec<GoldilocksScalar> = Vec::with_capacity(nvars_setchk);
+        let z = glue.gb.new_var(F257::ZERO);
+        glue.gb.enforce_var_eq_const(z, F257::ZERO);
+
+        let mut cur = start + 2;
+        for round in 0..nvars_setchk {
+            // 4 ring element absorbs (degree-3 evals)
+            let (s0, l0) = prefix_payload[cur + 0];
+            let (s1, l1) = prefix_payload[cur + 1];
+            let (s2, l2) = prefix_payload[cur + 2];
+            let (s3, l3) = prefix_payload[cur + 3];
+            cur += 4;
+            let e0b = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s0, l0)?;
+            let e1b = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s1, l1)?;
+            let e2b = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s2, l2)?;
+            let e3b = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s3, l3)?;
+            let e0 = ring_bytes_to_digits(&mut glue.gb, &e0b);
+            let e1 = ring_bytes_to_digits(&mut glue.gb, &e1b);
+            let e2 = ring_bytes_to_digits(&mut glue.gb, &e2b);
+            let e3 = ring_bytes_to_digits(&mut glue.gb, &e3b);
+            msgs_digits.push([e0, e1, e2, e3]);
+
+            // Absorbed r_i scalar (8 bytes) must match the u32 coin bytes (low 4) and zero padding (high 4).
+            let (rst, rln) = prefix_payload[cur];
+            cur += 1;
+            if rln != 8 {
+                return Err("tiny gate: expected 8-byte absorb for SetChk r_i".to_string());
+            }
+            let u = &u32_locals[r_start + round];
+            for i in 0..4 {
+                let gv = pose_wiring.absorb_vars[rst + i];
+                let lv = glue.copy_digit(gv);
+                glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, lv), (-F257::ONE, u.byte_vars[i])]);
+            }
+            for i in 4..8 {
+                let gv = pose_wiring.absorb_vars[rst + i];
+                let lv = glue.copy_digit(gv);
+                glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, lv), (-F257::ONE, z)]);
+            }
+
+            // r_i as Goldilocks scalar digits (embed u32 into 8-byte Goldilocks encoding).
+            let b0 = u.byte_vars[0];
+            let b1 = u.byte_vars[1];
+            let b2 = u.byte_vars[2];
+            let b3 = u.byte_vars[3];
+            let bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &[b0, b1, b2, b3]);
+            rs_digits.push(goldilocks_bytes_to_digits(&mut glue.gb, bytes));
+        }
+
+        let claimed0 = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+        let _v_sc = super::cm_math::sumcheck_verify_degree3_ring_digits(&mut glue.gb, claimed0, &msgs_digits, &rs_digits)?;
+    }
+
     let goldilocks_rejection_locals = build_goldilocks_rejection_coins(&mut glue, &pose_wiring, &goldilocks_ranges)?;
     lf_stage_log("build_goldilocks_rejection_coins", Some(&pose_inst), Some(&glue), &mut mem_prev);
     let (tcch0_local, tcch1_local) =
