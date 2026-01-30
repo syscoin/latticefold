@@ -1638,6 +1638,10 @@ fn enforce_fiat_shamir_reabsorb_semantics(
     ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
 ) -> Result<(), String> {
+    // Collect all reabsorb equalities first, then bulk-append constraints/terms.
+    // This keeps finalize-time overhead low for large instances.
+    let mut eqs: Vec<(usize, usize)> = Vec::new(); // (v_ab, v_sq)
+
     let mut absorb_idx = 0usize;
     let mut squeeze_idx = 0usize;
     for (i, op) in ops.iter().enumerate() {
@@ -1671,21 +1675,45 @@ fn enforce_fiat_shamir_reabsorb_semantics(
                     for j in 0..sq_len {
                         let v_sq = pose_wiring.squeeze_field_vars[sq_start + j];
                         let v_ab = pose_wiring.absorb_vars[ab_start + j];
-                        let a0 = inst.a_terms.len();
-                        inst.a_terms.extend_from_slice(&[(F257::ONE, v_ab), (-F257::ONE, v_sq)]);
-                        let a1 = inst.a_terms.len();
-                        let b0 = inst.b_terms.len();
-                        inst.b_terms.push((F257::ONE, 0));
-                        let b1 = inst.b_terms.len();
-                        let c0 = inst.c_terms.len();
-                        inst.c_terms.push((F257::ZERO, 0));
-                        let c1 = inst.c_terms.len();
-                        inst.constraints.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
+                        eqs.push((v_ab, v_sq));
                     }
                 }
             }
             PoseidonTraceOp::SqueezeBytes { .. } => {}
         }
+    }
+
+    if eqs.is_empty() {
+        return Ok(());
+    }
+
+    // Each equality adds:
+    // - A: 2 terms (v_ab - v_sq)
+    // - B: 1 term (ONE * var0)
+    // - C: 1 term (ZERO * var0)
+    // - 1 constraint referencing these ranges
+    let n = eqs.len();
+    inst.a_terms.reserve(n * 2);
+    inst.b_terms.reserve(n);
+    inst.c_terms.reserve(n);
+    inst.constraints.reserve(n);
+
+    let mut a0 = inst.a_terms.len();
+    let mut b0 = inst.b_terms.len();
+    let mut c0 = inst.c_terms.len();
+    for (v_ab, v_sq) in eqs {
+        inst.a_terms.push((F257::ONE, v_ab));
+        inst.a_terms.push((-F257::ONE, v_sq));
+        inst.b_terms.push((F257::ONE, 0));
+        inst.c_terms.push((F257::ZERO, 0));
+        inst.constraints.push(Constraint {
+            a: a0..(a0 + 2),
+            b: b0..(b0 + 1),
+            c: c0..(c0 + 1),
+        });
+        a0 += 2;
+        b0 += 1;
+        c0 += 1;
     }
     Ok(())
 }
@@ -1855,26 +1883,45 @@ fn finalize(
 
     // Add explicit equality constraints: pose var == each module's local copy.
     let t_eqs = Instant::now();
+    let mut eq_pairs: Vec<(usize, usize)> = Vec::with_capacity(glue_eq_constraints);
     for (&gv, &lv) in base_local_map.iter() {
-        let gp = remap(0, gv, &offsets);
-        let gg = remap(1, lv, &offsets);
-        enforce_var_eq::<F257>(&mut inst, gp, gg);
+        eq_pairs.push((remap(0, gv, &offsets), remap(1, lv, &offsets)));
     }
     for (i, m) in extra_maps.iter().enumerate() {
         let part = 2 + i;
         for (&gv, &lv) in m.iter() {
-            let gp = remap(0, gv, &offsets);
-            let gg = remap(part, lv, &offsets);
-            enforce_var_eq::<F257>(&mut inst, gp, gg);
+            eq_pairs.push((remap(0, gv, &offsets), remap(part, lv, &offsets)));
         }
     }
     for (i, v) in extra_base_eqs.iter().enumerate() {
         let part = 2 + i;
         for &(base_var, local_var) in v {
-            let gb = remap(1, base_var, &offsets);
-            let gl = remap(part, local_var, &offsets);
-            enforce_var_eq::<F257>(&mut inst, gb, gl);
+            eq_pairs.push((remap(1, base_var, &offsets), remap(part, local_var, &offsets)));
         }
+    }
+    debug_assert_eq!(eq_pairs.len(), glue_eq_constraints);
+
+    // Bulk-append equality constraints (faster than calling `enforce_var_eq` in a tight loop).
+    // Each equality adds 1 constraint with:
+    // - A: (x - y)
+    // - B: (ONE * var0)
+    // - C: (ZERO * var0)
+    inst.a_terms.reserve(eq_pairs.len() * 2);
+    inst.b_terms.reserve(eq_pairs.len());
+    inst.c_terms.reserve(eq_pairs.len());
+    inst.constraints.reserve(eq_pairs.len());
+    let mut a0 = inst.a_terms.len();
+    let mut b0 = inst.b_terms.len();
+    let mut c0 = inst.c_terms.len();
+    for (x, y) in eq_pairs {
+        inst.a_terms.push((F257::ONE, x));
+        inst.a_terms.push((-F257::ONE, y));
+        inst.b_terms.push((F257::ONE, 0));
+        inst.c_terms.push((F257::ZERO, 0));
+        inst.constraints.push(Constraint { a: a0..(a0 + 2), b: b0..(b0 + 1), c: c0..(c0 + 1) });
+        a0 += 2;
+        b0 += 1;
+        c0 += 1;
     }
     let c_after_glue_eq = inst.constraints.len();
     let dt_eqs = t_eqs.elapsed();
