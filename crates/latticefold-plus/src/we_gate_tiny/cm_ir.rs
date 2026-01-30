@@ -2781,8 +2781,8 @@ pub(crate) fn goldilocks_mul_const_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, x
     let prod: u128 = (x_u as u128) * (k as u128);
     let q_u: u64 = (prod / (p_u64 as u128)) as u64;
     let r_u: u64 = (prod % (p_u64 as u128)) as u64;
-    // `q4` only appears linearly in the carry chain; keep it raw to save constraints.
-    let q4 = alloc_u64_as_bal4_digits_raw_ir(b, q_u);
+    // Soundness: constrain quotient digits too (they participate in the carry chain).
+    let q4 = alloc_u64_as_bal4_digits_checked_ir(b, q_u);
     // `r4` are digit variables; enforce membership to keep the carry chain injective.
     let r4 = alloc_u64_as_bal4_digits_checked_ir(b, r_u);
     let pre = b.bal4_const_mul_precomp(k);
@@ -2797,7 +2797,7 @@ fn goldilocks_mul_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[VarRef; 33],
     let prod_u: u128 = (a_u as u128) * (c_u as u128);
     let q_u: u64 = (prod_u / (p_u64 as u128)) as u64;
     let r_u: u64 = (prod_u % (p_u64 as u128)) as u64;
-    let q4 = alloc_u64_as_bal4_digits_raw_ir(b, q_u);
+    let q4 = alloc_u64_as_bal4_digits_checked_ir(b, q_u);
     let r4 = alloc_u64_as_bal4_digits_checked_ir(b, r_u);
     enforce_prod_var_eq_qp_plus_r_bal4_ir(b, a4, c4, &q4, &r4);
     r4
@@ -2821,7 +2821,7 @@ pub(crate) fn goldilocks_mul_mod_p_digits_ir(
     // Enforce multiplication via a balanced base-4 carry chain (pm32 window),
     let a4 = b.bal16_to_bal4_digits_cached(a);
     let c4 = b.bal16_to_bal4_digits_cached(c);
-    let q4 = alloc_u64_as_bal4_digits_raw_ir(b, q_u);
+    let q4 = alloc_u64_as_bal4_digits_checked_ir(b, q_u);
     let r4 = alloc_u64_as_bal4_digits_checked_ir(b, r_u);
     enforce_prod_var_eq_qp_plus_r_bal4_ir(b, &a4, &c4, &q4, &r4);
     bal4_to_bal16_digits_ir(b, &r4)
