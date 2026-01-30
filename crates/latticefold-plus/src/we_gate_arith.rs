@@ -406,6 +406,7 @@ fn absorb_take() -> AbsorbBreakdown {
 #[inline] fn absorb_dcom_setchk_msgs(n: usize) { ABSORB_DCOM_SETCHK_MSGS.fetch_add(n as u64, Ordering::Relaxed); }
 #[inline] fn absorb_dcom_setchk_r(n: usize) { ABSORB_DCOM_SETCHK_R.fetch_add(n as u64, Ordering::Relaxed); }
 #[inline] fn absorb_dcom_out_e(n: usize) { ABSORB_DCOM_OUT_E.fetch_add(n as u64, Ordering::Relaxed); }
+#[inline] fn absorb_dcom_out_b(n: usize) { ABSORB_DCOM_OUT_B.fetch_add(n as u64, Ordering::Relaxed); }
 #[inline] fn absorb_cm_comh(n: usize) { ABSORB_CM_COMH.fetch_add(n as u64, Ordering::Relaxed); }
 #[inline] fn absorb_cm_sumcheck_params(n: usize) { ABSORB_CM_SC_PARAMS.fetch_add(n as u64, Ordering::Relaxed); }
 #[inline] fn absorb_cm_sumcheck_msgs(n: usize) { ABSORB_CM_SC_MSGS.fetch_add(n as u64, Ordering::Relaxed); }
@@ -1567,6 +1568,31 @@ fn toom4_vandermonde_inv<F: PrimeField>() -> ([[F; 7]; 7], [F; 7]) {
     (inv, pts)
 }
 
+#[inline]
+fn toom4_points_distinct<F: PrimeField>() -> bool {
+    // Must avoid degenerate points in small characteristic (e.g. char=2 or 3).
+    if F::from(720u64).inverse().is_none() {
+        return false;
+    }
+    let pts = [
+        F::from(0u64),
+        F::from(1u64),
+        -F::from(1u64),
+        F::from(2u64),
+        -F::from(2u64),
+        F::from(3u64),
+        -F::from(3u64),
+    ];
+    for i in 0..pts.len() {
+        for j in (i + 1)..pts.len() {
+            if pts[i] == pts[j] {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 // -------------------------------------------------------------------------
 // Toom-4 build-time scratch (no math change).
 //
@@ -2571,6 +2597,7 @@ where
     R::BaseRing: Zq + Field + PrimeField,
 {
     use latticefold::utils::sumcheck::Proof as ScProof;
+    let d = R::dimension();
 
     let l_instances = proof.evals.0.len();
     let ell = proof.dcom.dparams.l;
@@ -2602,7 +2629,7 @@ where
     let prefix_squeezes =
         count_squeezed_field_elems_before_first_short_squeeze::<BF<R>>(
             &trace.ops[ops_offset..],
-            R::dimension(),
+            d,
         );
     if prefix_squeezes != expected_squeeze_elems {
         return Err(format!(
