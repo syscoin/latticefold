@@ -60,9 +60,10 @@ impl<BF: PrimeField> PoseidonTranscriptTrace<BF> {
                     'tries: for cand in buf.drain(..) {
                         let mut bs = [0u8; 4];
                         for i in 0..4 {
+                            // BF digit in 0..=256; read full limb so we can detect 256.
                             let du16 = cand[i]
                                 .into_bigint()
-                                .to_bytes_le()
+                                .as_ref()
                                 .get(0)
                                 .copied()
                                 .unwrap_or(0) as u16;
@@ -220,9 +221,10 @@ where
             let mut ok = true;
             let mut bs = [0u8; 4];
             for i in 0..4 {
+                // F257 digit in 0..=256; read full limb so we can detect 256.
                 let d = c[i]
                     .into_bigint()
-                    .to_bytes_le()
+                    .as_ref()
                     .get(0)
                     .copied()
                     .unwrap_or(0) as u16;
@@ -260,7 +262,8 @@ where
         let out = elems
             .iter()
             .map(|e| {
-                let d = e.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u16;
+                // Read full limb so 256 is represented as 256 (then map to 0).
+                let d = e.into_bigint().as_ref().get(0).copied().unwrap_or(0) as u16;
                 debug_assert!(d < 257u16);
                 if d == 256 { 0u8 } else { d as u8 }
             })

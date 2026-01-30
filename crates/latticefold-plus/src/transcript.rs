@@ -2,7 +2,7 @@ use ark_crypto_primitives::sponge::{
     poseidon::{PoseidonConfig, PoseidonSponge},
     CryptographicSponge,
 };
-use ark_ff::{BigInteger, PrimeField};
+use ark_ff::PrimeField;
 use ark_std::marker::PhantomData;
 use latticefold::transcript::Transcript;
 use latticefold::transcript::bytes::{prime_field_to_bytes_le_fixed, ring_to_bytes_le_fixed};
@@ -140,9 +140,11 @@ where
             let mut ok = true;
             let mut bs = [0u8; 4];
             for i in 0..4 {
+                // F257 digit in 0..=256; read full limb (NOT just the low byte),
+                // so we can correctly detect the special value 256.
                 let d = elems[i]
                     .into_bigint()
-                    .to_bytes_le()
+                    .as_ref()
                     .get(0)
                     .copied()
                     .unwrap_or(0) as u16;
@@ -174,7 +176,8 @@ where
         elems
             .iter()
             .map(|e| {
-                let d = e.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u16;
+                // Read full limb so 256 is represented as 256 (then map to 0).
+                let d = e.into_bigint().as_ref().get(0).copied().unwrap_or(0) as u16;
                 debug_assert!(d < 257u16);
                 if d == 256 { 0u8 } else { d as u8 }
             })
