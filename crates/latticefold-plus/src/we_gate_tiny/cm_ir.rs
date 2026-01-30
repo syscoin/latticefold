@@ -3075,5 +3075,384 @@ mod soundness_regression_tests {
             "bounded base-4 carry gadget should reject bubble mutation"
         );
     }
+
+    /// "Anti-cheat" fuzz test: build a tiny (size-16) Goldilocks NTT fragment in the bal4 domain,
+    /// with fixed (constant) inputs and fixed expected outputs, then try to find alternate
+    /// satisfying witnesses by perturbing internal variables.
+    ///
+    /// This is designed to catch "looks fine, passes tests, but underconstrained" failures.
+    #[test]
+    fn test_anticheat_fuzzer_tiny_ntt16_rejects_internal_mutations() {
+        use rand::{RngCore, SeedableRng};
+        use rand::rngs::OsRng;
+        use std::collections::BTreeSet;
+
+        let p: u64 = gl_ntt64::GOLDILOCKS_P_U64;
+
+        // Randomize seeds on every run (as requested). We print them for reproducibility.
+        let seed_inputs: u64 = OsRng.next_u64();
+        let seed_fuzz: u64 = OsRng.next_u64();
+        eprintln!(
+            "NTT16 anticheat seeds: inputs=0x{seed_inputs:016x} fuzz=0x{seed_fuzz:016x}"
+        );
+
+        // Inputs.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed_inputs);
+        let mut a_u: [u64; 16] = [0u64; 16];
+        for i in 0..16 {
+            a_u[i] = rng.next_u64() % p;
+        }
+
+        // Host-side expected output for the 16-point NTT using the same stage twiddle tables.
+        fn bitrev16(i: usize) -> usize {
+            let mut x = i;
+            let mut r = 0usize;
+            for _ in 0..4 {
+                r = (r << 1) | (x & 1);
+                x >>= 1;
+            }
+            r
+        }
+        #[inline]
+        fn add_mod_p(p: u64, a: u64, b: u64) -> u64 {
+            (((a as u128) + (b as u128)) % (p as u128)) as u64
+        }
+        #[inline]
+        fn sub_mod_p(p: u64, a: u64, b: u64) -> u64 {
+            ((a as i128 - b as i128).rem_euclid(p as i128)) as u64
+        }
+        #[inline]
+        fn mul_const_mod_p(p: u64, a: u64, k: u64) -> u64 {
+            (((a as u128) * (k as u128)) % (p as u128)) as u64
+        }
+        fn ntt16_in_place_u64(a: &mut [u64; 16], p: u64) {
+            // Bit-reversal permutation.
+            let mut tmp = *a;
+            for i in 0..16 {
+                tmp[bitrev16(i)] = a[i];
+            }
+            *a = tmp;
+
+            // Cooley–Tukey using the shared schedule tables.
+            let mut len = 2usize;
+            while len <= 16 {
+                let half = len / 2;
+                for start in (0..16).step_by(len) {
+                    for j in 0..half {
+                        let w: u64 = match len {
+                            2 => gl_ntt64::W_POWS_LEN_2[j],
+                            4 => gl_ntt64::W_POWS_LEN_4[j],
+                            8 => gl_ntt64::W_POWS_LEN_8[j],
+                            16 => gl_ntt64::W_POWS_LEN_16[j],
+                            _ => unreachable!(),
+                        };
+                        let u = a[start + j];
+                        let v0 = a[start + j + half];
+                        let v = if w == 1 { v0 } else { mul_const_mod_p(p, v0, w) };
+                        a[start + j] = add_mod_p(p, u, v);
+                        a[start + j + half] = sub_mod_p(p, u, v);
+                    }
+                }
+                len *= 2;
+            }
+        }
+
+        let mut exp_u = a_u;
+        ntt16_in_place_u64(&mut exp_u, p);
+
+        // Circuit: build the same 16-point NTT in bal4 digits via IR, with IO fixed by constants.
+        let mut b = Dr1csBuilder::<F257>::new();
+        b.enforce_var_eq_const(b.one(), F257::ONE);
+        let base_asg: Vec<F257> = b.assignment.clone();
+        let mut ib = IrBuilder::new(&base_asg);
+
+        let zero_digit = alloc_zero_const_ir(&mut ib);
+        let zero_scalar4: [VarRef; 33] = [zero_digit; 33];
+
+        // Allocate input scalars as checked bal4 digits, and FIX them to constants.
+        let mut a4: [[VarRef; 33]; 16] = [[zero_digit; 33]; 16];
+        let mut a4_in: [[VarRef; 33]; 16] = [[zero_digit; 33]; 16];
+        for i in 0..16 {
+            let d = u64_to_bal4_digits_le_const(a_u[i]);
+            a4[i] = alloc_u64_as_bal4_digits_checked_ir(&mut ib, a_u[i]);
+            for k in 0..33 {
+                ib.ir.enforce_var_eq_const(a4[i][k], i32_to_f257(d[k] as i32));
+            }
+            a4_in[i] = a4[i];
+        }
+
+        // NTT in-place for size 16 in bal4 digits.
+        fn ntt16_in_place_bal4_ir(
+            b: &mut IrBuilder<'_>,
+            a: &mut [[VarRef; 33]; 16],
+            p_u64: u64,
+            zero: &[VarRef; 33],
+        ) {
+            // Bit-reversal permutation (purely structural).
+            let mut tmp = *a;
+            for i in 0..16 {
+                let mut x = i;
+                let mut r = 0usize;
+                for _ in 0..4 {
+                    r = (r << 1) | (x & 1);
+                    x >>= 1;
+                }
+                tmp[r] = a[i];
+            }
+            *a = tmp;
+
+            let mut len = 2usize;
+            while len <= 16 {
+                let half = len / 2;
+                for start in (0..16).step_by(len) {
+                    for j in 0..half {
+                        let w: u64 = match len {
+                            2 => gl_ntt64::W_POWS_LEN_2[j],
+                            4 => gl_ntt64::W_POWS_LEN_4[j],
+                            8 => gl_ntt64::W_POWS_LEN_8[j],
+                            16 => gl_ntt64::W_POWS_LEN_16[j],
+                            _ => unreachable!(),
+                        };
+                        let u = a[start + j];
+                        let v = if w == 1 {
+                            a[start + j + half]
+                        } else if w == p_u64 - 1 {
+                            goldilocks_sub_mod_p_digits_bal4_ir(b, zero, &a[start + j + half], p_u64)
+                        } else {
+                            goldilocks_mul_const_mod_p_digits_bal4_ir(b, &a[start + j + half], w, p_u64)
+                        };
+                        a[start + j] = goldilocks_add_mod_p_digits_bal4_ir(b, &u, &v, p_u64);
+                        a[start + j + half] = goldilocks_sub_mod_p_digits_bal4_ir(b, &u, &v, p_u64);
+                    }
+                }
+                len *= 2;
+            }
+        }
+        ntt16_in_place_bal4_ir(&mut ib, &mut a4, p, &zero_scalar4);
+
+        // Allocate expected output digits and FIX them to constants.
+        let mut exp4: [[VarRef; 33]; 16] = [[zero_digit; 33]; 16];
+        for i in 0..16 {
+            let d = u64_to_bal4_digits_le_const(exp_u[i]);
+            exp4[i] = alloc_u64_as_bal4_digits_checked_ir(&mut ib, exp_u[i]);
+            for k in 0..33 {
+                ib.ir.enforce_var_eq_const(exp4[i][k], i32_to_f257(d[k] as i32));
+            }
+        }
+
+        // Constrain computed output == expected output (digitwise).
+        for i in 0..16 {
+            for k in 0..33 {
+                ib.enforce_lc_eq_zero(vec![(F257::ONE, a4[i][k]), (-F257::ONE, exp4[i][k])]);
+            }
+        }
+
+        // Lower IR and check the original witness satisfies.
+        let lowered = lower_ir_into_builder(&mut b, ib.ir);
+        let (inst, asg) = b.into_instance();
+        inst.check(&asg).expect("baseline NTT16 witness should satisfy");
+
+        // Identify indices we consider "public IO": inputs + outputs + expected outputs.
+        let mut io: BTreeSet<usize> = BTreeSet::new();
+        io.insert(0); // builder's ONE
+        for i in 0..16 {
+            for k in 0..33 {
+                io.insert(lowered.map_var(a4_in[i][k]));
+                io.insert(lowered.map_var(a4[i][k]));
+                io.insert(lowered.map_var(exp4[i][k]));
+            }
+        }
+
+        // Heuristic classification: detect boolean vars by the exact constraint shape emitted by
+        // `alloc_bool_ir`: x * (1 - x) = 0.
+        let mut is_bool: Vec<bool> = vec![false; inst.nvars];
+        for row in inst.constraints.iter() {
+            let a = &inst.a_terms[row.a.clone()];
+            let b = &inst.b_terms[row.b.clone()];
+            let c = &inst.c_terms[row.c.clone()];
+            if a.len() == 1
+                && a[0].0 == F257::ONE
+                && b.len() == 2
+                && b[0].0 == F257::ONE
+                && b[0].1 == 0
+                && b[1].0 == -F257::ONE
+                && b[1].1 == a[0].1
+                && c.len() == 1
+                && c[0].1 == 0
+                && c[0].0 == F257::ZERO
+            {
+                let idx = a[0].1;
+                if idx < is_bool.len() {
+                    is_bool[idx] = true;
+                }
+            }
+        }
+
+        #[inline]
+        fn can_mutate(io: &BTreeSet<usize>, is_bool: &[bool], idx: usize) -> bool {
+            idx != 0 && !io.contains(&idx) && !is_bool.get(idx).copied().unwrap_or(false)
+        }
+
+        // "Linear repair" attempt:
+        // After a random perturbation, try to satisfy any linear constraints that have exactly ONE
+        // mutable variable by solving for that variable (Gauss-Seidel style).
+        //
+        // If the system is underconstrained, this kind of cheap repair can sometimes find an
+        // alternate satisfying witness.
+        fn linear_repair(
+            inst: &symphony::dpp_poseidon::SparseDr1csInstance<F257>,
+            io: &BTreeSet<usize>,
+            is_bool: &[bool],
+            pinned: &BTreeSet<usize>,
+            asg: &mut [F257],
+            max_passes: usize,
+        ) {
+            for _pass in 0..max_passes {
+                let mut changed = false;
+                for row in inst.constraints.iter() {
+                    // Recognize linear constraints of the form: (A(z)) * 1 = c,
+                    // i.e. B is exactly (1, one) and C is a constant term on (1, one).
+                    let b = &inst.b_terms[row.b.clone()];
+                    if b.len() != 1 || b[0].0 != F257::ONE || b[0].1 != 0 {
+                        continue;
+                    }
+                    let c = &inst.c_terms[row.c.clone()];
+                    if c.len() != 1 || c[0].1 != 0 {
+                        continue;
+                    }
+                    let target = c[0].0;
+                    let a = &inst.a_terms[row.a.clone()];
+
+                    let mut unknown: Option<(usize, F257)> = None;
+                    let mut sum_known: F257 = F257::ZERO;
+                    for (coeff, idx) in a.iter().copied() {
+                        if can_mutate(io, is_bool, idx) && !pinned.contains(&idx) {
+                            if unknown.is_some() {
+                                // More than one mutable var: skip (we're not doing full elimination).
+                                unknown = None;
+                                break;
+                            }
+                            unknown = Some((idx, coeff));
+                        } else {
+                            sum_known += coeff * asg[idx];
+                        }
+                    }
+                    let Some((u_idx, u_coeff)) = unknown else { continue };
+                    if u_coeff == F257::ZERO {
+                        continue;
+                    }
+                    let rhs = target - sum_known;
+                    let inv = u_coeff.inverse().unwrap();
+                    let new_val = rhs * inv;
+                    if asg[u_idx] != new_val {
+                        asg[u_idx] = new_val;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+
+        // Fuzz: perturb non-IO variables and assert constraints reject.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed_fuzz);
+        let deltas: [u64; 8] = [1, 2, 3, 4, 8, 16, 64, 128];
+        let n_trials: usize = 2000;
+        for _ in 0..n_trials {
+            // 1-var perturbation.
+            let mut asg2 = asg.clone();
+            let mut idx = (rng.next_u64() as usize) % asg2.len();
+            for _ in 0..64 {
+                if can_mutate(&io, &is_bool, idx) {
+                    break;
+                }
+                idx = (idx + 1) % asg2.len();
+            }
+            if !can_mutate(&io, &is_bool, idx) {
+                continue;
+            }
+            let d = deltas[(rng.next_u64() as usize) % deltas.len()];
+            asg2[idx] += F257::from(d);
+            if inst.check(&asg2).is_ok() {
+                panic!(
+                    "found alternate satisfying witness in NTT16 fuzz: mutated idx={} by +{} (mod 257)",
+                    idx, d
+                );
+            }
+
+            // 2-var perturbation (helps catch low-dimensional DOF).
+            let mut asg3 = asg.clone();
+            let mut idx2 = (rng.next_u64() as usize) % asg3.len();
+            for _ in 0..64 {
+                if can_mutate(&io, &is_bool, idx2) && idx2 != idx {
+                    break;
+                }
+                idx2 = (idx2 + 1) % asg3.len();
+            }
+            if !can_mutate(&io, &is_bool, idx2) || idx2 == idx {
+                continue;
+            }
+            let d1 = deltas[(rng.next_u64() as usize) % deltas.len()];
+            let d2 = deltas[(rng.next_u64() as usize) % deltas.len()];
+            asg3[idx] += F257::from(d1);
+            asg3[idx2] += F257::from(d2);
+            if inst.check(&asg3).is_ok() {
+                panic!(
+                    "found alternate satisfying witness in NTT16 fuzz: mutated idx={} by +{}, idx2={} by +{} (mod 257)",
+                    idx, d1, idx2, d2
+                );
+            }
+        }
+
+        // Extra: "repair-assisted" fuzzing. This is more solver-like: after perturbing a handful
+        // of internal vars, try to repair single-unknown linear constraints.
+        let n_trials_repair: usize = 250;
+        for _ in 0..n_trials_repair {
+            let mut asg4 = asg.clone();
+            let mut pinned: BTreeSet<usize> = BTreeSet::new();
+            // Apply a few random perturbations first.
+            for _k in 0..6 {
+                let mut idx = (rng.next_u64() as usize) % asg4.len();
+                for _ in 0..64 {
+                    if can_mutate(&io, &is_bool, idx) {
+                        break;
+                    }
+                    idx = (idx + 1) % asg4.len();
+                }
+                if !can_mutate(&io, &is_bool, idx) {
+                    continue;
+                }
+                let d = deltas[(rng.next_u64() as usize) % deltas.len()];
+                asg4[idx] += F257::from(d);
+                pinned.insert(idx);
+            }
+
+            // Attempt linear repair while keeping the perturbations pinned.
+            // If it ever becomes satisfying, we've found a real alternate witness.
+            linear_repair(&inst, &io, &is_bool, &pinned, &mut asg4, 4);
+            if inst.check(&asg4).is_ok() {
+                // Double-check it's not identical to baseline (should be impossible if pinned is non-empty,
+                // but keep this robust).
+                let mut diff_non_io: usize = 0;
+                for i in 0..asg4.len() {
+                    if io.contains(&i) {
+                        continue;
+                    }
+                    if asg4[i] != asg[i] {
+                        diff_non_io += 1;
+                        if diff_non_io > 8 {
+                            break;
+                        }
+                    }
+                }
+                panic!(
+                    "found alternate satisfying witness in NTT16 fuzz via linear_repair(): pinned_mutations={} diff_non_io~={}",
+                    pinned.len(),
+                    diff_non_io
+                );
+            }
+        }
+    }
 }
 
