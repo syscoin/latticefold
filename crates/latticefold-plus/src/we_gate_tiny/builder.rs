@@ -6,13 +6,16 @@ use crate::transcript::DEFAULT_REJECTION_TRIES;
 use rayon::join;
 use rayon::prelude::*;
 
-use ark_ff::Field;
+use ark_ff::{Field, PrimeField};
 use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
 use latticefold::transcript::poseidon::{f257_poseidon_config, F257};
+use latticefold::commitment::AjtaiCommitmentScheme;
 use symphony::dpp_poseidon::{merge_sparse_dr1cs_share_one, Constraint, PoseidonDr1csWiring, SparseDr1csInstance};
 use symphony::dpp_sumcheck::Dr1csBuilder;
 use symphony::transcript::PoseidonTraceOp;
+use stark_rings::PolyRing;
 
+use crate::setchk::OUT_E_AGG_SEED;
 use crate::we_statement::WeParams;
 
 use super::challenges::{
@@ -41,7 +44,7 @@ use super::cm_math::{
     alloc_const_goldilocks_u64,
     eq_eval_goldilocks_digits, eval_t_z_optimized_ring_digits_pair, goldilocks_bytes_to_digits, goldilocks_pow_table_digits,
     goldilocks_digits_to_bytes_canonical,
-    goldilocks_add_mod_p_digits, goldilocks_mul_mod_p_digits, goldilocks_sub_mod_p_digits,
+    goldilocks_add_mod_p_digits, goldilocks_mul_const_mod_p_digits, goldilocks_mul_mod_p_digits, goldilocks_sub_mod_p_digits,
     ct_psi_mul_ring_digits_d64,
     ring_eval_at_scalar_digits,
     ring_add_digits, ring_bytes_to_digits, ring_eq_digits,
@@ -50,6 +53,8 @@ use super::cm_math::{
     tensor_goldilocks_ringconst_digits, tensor_goldilocks_scalars_digits, RingBytes, RingDigits,
 };
 use super::op_counts::{tiny_cm_counts_reset, tiny_cm_counts_take};
+
+use cyclotomic_rings::rings::GoldilocksRing64 as GR64;
 
 #[inline]
 fn tiny_opmix_on() -> bool {
@@ -1256,6 +1261,12 @@ fn enforce_absorbed_u64_const(glue: &mut GlueCtx, pose_wiring: &PoseidonDr1csWir
         let lv = glue.copy_digit(gv);
         glue.gb.enforce_var_eq_const(lv, F257::from(bs[i] as u64));
     }
+}
+
+#[inline]
+fn goldilocks_u64_from_base_ring(x: <GR64 as PolyRing>::BaseRing) -> u64 {
+    // Goldilocks modulus fits in u64, so the canonical representative fits in one limb.
+    x.into_bigint().as_ref().get(0).copied().unwrap_or(0)
 }
 
 #[inline]
@@ -2720,14 +2731,24 @@ pub(super) fn build(
         let v_sc = super::cm_math::sumcheck_verify_degree3_ring_digits(&mut glue.gb, claimed0, &msgs_digits, &rs_digits)?;
 
         // --------------------------------------------------------------------
-        // absorb(out.e, out.b): full binding via transcript absorption
+        // absorb_evaluations_digest(out.e, out.b): Ajtai aggregate commitment (kappa ring elems).
         // --------------------------------------------------------------------
         //
-        // For the tiny-field gate we bind SetChk outputs by absorbing the full flattened vector
-        // `flat(out.e,out.b)` into the transcript, instead of using Ajtai digest binding.
+        // In the real verifier, `out.e/out.b` are NOT absorbed; instead we digest-bind them via
+        // a seeded Ajtai aggregate commitment and absorb only the commitment ring elements.
         //
-        // This is chosen because Ajtai opening verification is cheap over the native base field,
-        // but becomes extremely expensive when arithmetized inside F257 (digit-domain mod p mul-by-const).
+        // Here we:
+        // - parse the absorbed commitment ring elements (out_e_agg),
+        // - allocate witness vars for the const-coeff setchk outputs (out.e/out.b),
+        // - enforce Ajtai(opening) == absorbed digest in Goldilocks digit encoding,
+        // - run SetChk recombination and enforce ver == v_sc.
+        //
+        // This mirrors the structure in `we_gate_arith.rs` / `setchk.rs`, but we exploit the
+        // const-coefficient regime (SP1 path) to keep constraints manageable.
+        let kappa = params.kappa as usize;
+        if kappa == 0 {
+            return Err("tiny gate: setchk kappa=0 not supported".to_string());
+        }
         if ring_dim != 64 {
             return Err("tiny gate: setchk digest/recomb currently wired only for ring_dim=64".to_string());
         }
@@ -2740,6 +2761,23 @@ pub(super) fn build(
         let out_b_len = 1usize;
         let nclaims_setchk = out_e0_len + out_b_len;
         let has_rc_setchk = out_e0_len > 1;
+
+        // Parse `kappa` absorbed ring elements: the Ajtai commitment digest.
+        if cur + kappa > prefix_payload.len() {
+            return Err("tiny gate: prefix too short for setchk out_e_agg digest absorbs".to_string());
+        }
+        let mut out_e_agg_abs: Vec<RingDigits> = Vec::with_capacity(kappa);
+        for _ in 0..kappa {
+            let (st, ln) = *prefix_payload
+                .get(cur)
+                .ok_or("tiny gate: out_e_agg absorb oob")?;
+            cur += 1;
+            if ln != ring_elem_bytes {
+                return Err("tiny gate: out_e_agg ring absorb len mismatch".to_string());
+            }
+            let rb = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, st, ln)?;
+            out_e_agg_abs.push(ring_bytes_to_digits(&mut glue.gb, &rb));
+        }
 
         // -----------------------
         // Out::verify coin wiring
@@ -2787,47 +2825,110 @@ pub(super) fn build(
         };
 
         // ---------------------------------------
-        // Parse absorbed out.e / out.b as ring-digits
+        // Allocate witness out.e / out.b (digits)
         // ---------------------------------------
+        //
+        // Do NOT assume const-coeff. The Ajtai digest binds full ring elements.
+        // Allocate ring-valued witness vars for out.e/out.b (defaulting to 0 in the synthetic schedule).
         let out_e_blocks = 1usize + (params.mlen as usize);
         let lane_len = ring_dim;
-        let n_out_flat = out_e_blocks
-            .checked_mul(out_e0_len)
+        let n_out_agg = out_e0_len
+            .checked_mul(out_e_blocks)
             .and_then(|x| x.checked_mul(lane_len))
             .and_then(|x| x.checked_add(out_b_len))
-            .ok_or_else(|| "tiny gate: n_out_flat overflow (setchk)".to_string())?;
-        if cur + n_out_flat > prefix_payload.len() {
-            return Err("tiny gate: prefix too short for absorbed out.e/out.b".to_string());
-        }
+            .ok_or_else(|| "tiny gate: n_out_agg overflow (setchk)".to_string())?;
+
+        // Full ring elements in the same flatten order as `setchk::absorb_evaluations_digest`:
+        // claim index -> block -> lane, then out.b.
         let mut out_e_vars: Vec<Vec<Vec<RingDigits>>> = vec![vec![Vec::new(); out_e0_len]; out_e_blocks];
-        for i in 0..out_e0_len {
-            for blk in 0..out_e_blocks {
+        for blk in 0..out_e_blocks {
+            for i in 0..out_e0_len {
                 out_e_vars[blk][i] = Vec::with_capacity(lane_len);
                 for _lane in 0..lane_len {
-                    let (st, ln) = prefix_payload[cur];
-                    cur += 1;
-                    if ln != ring_elem_bytes {
-                        return Err("tiny gate: out.e ring absorb len mismatch".to_string());
+                    let mut r: RingDigits = Vec::with_capacity(ring_dim);
+                    for _ in 0..ring_dim {
+                        r.push(alloc_witness_goldilocks_u64_digits(&mut glue.gb, 0u64));
                     }
-                    let rb = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, st, ln)?;
-                    out_e_vars[blk][i].push(ring_bytes_to_digits(&mut glue.gb, &rb));
+                    out_e_vars[blk][i].push(r);
                 }
             }
         }
         let mut out_b_vars: Vec<RingDigits> = Vec::with_capacity(out_b_len);
         for _ in 0..out_b_len {
-            let (st, ln) = prefix_payload[cur];
-            cur += 1;
-            if ln != ring_elem_bytes {
-                return Err("tiny gate: out.b ring absorb len mismatch".to_string());
+            let mut r: RingDigits = Vec::with_capacity(ring_dim);
+            for _ in 0..ring_dim {
+                r.push(alloc_witness_goldilocks_u64_digits(&mut glue.gb, 0u64));
             }
-            let rb = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, st, ln)?;
-            out_b_vars.push(ring_bytes_to_digits(&mut glue.gb, &rb));
+            out_b_vars.push(r);
         }
 
-        // Constants used below.
+        let mut out_flat_vars: Vec<RingDigits> = Vec::with_capacity(n_out_agg);
+        for i in 0..out_e0_len {
+            for blk in 0..out_e_blocks {
+                for lane in 0..lane_len {
+                    out_flat_vars.push(out_e_vars[blk][i][lane].clone());
+                }
+            }
+        }
+        for i in 0..out_b_len {
+            out_flat_vars.push(out_b_vars[i].clone());
+        }
+        debug_assert_eq!(out_flat_vars.len(), n_out_agg);
+
+        // ----------------------------
+        // Ajtai opening constraints
+        // ----------------------------
+        //
+        // Ajtai opening constraints (general case):
+        // commit(flat) = A * flat, where A entries are public seeded ring elements.
+        // Enforce coefficient-wise negacyclic convolution using only scalar (mod p) digit ops.
+        let agg_scheme = AjtaiCommitmentScheme::<GR64>::seeded(b"setchk_out_e_agg", OUT_E_AGG_SEED, kappa, n_out_agg);
+        let mut cols: Vec<Vec<GR64>> = Vec::with_capacity(n_out_agg);
+        for j in 0..n_out_agg {
+            let mut basis = vec![<GR64 as stark_rings::Ring>::ZERO; n_out_agg];
+            basis[j] = <GR64 as stark_rings::Ring>::ONE;
+            let col = agg_scheme
+                .commit(&basis)
+                .map_err(|e| format!("tiny gate: out_e_agg basis commit failed: {e:?}"))?;
+            cols.push(col.as_ref().to_vec());
+        }
+        // Constants 0/1 in digit form (Goldilocks).
         let zero_bytes = alloc_const_goldilocks_u64(&mut glue.gb, 0u64);
         let zero = goldilocks_bytes_to_digits(&mut glue.gb, zero_bytes);
+        for i in 0..kappa {
+            for k_out in 0..ring_dim {
+                let mut acc = zero;
+                for j in 0..n_out_agg {
+                    let aij = &cols[j][i];
+                    let a_coeffs = aij.coeffs();
+                    // Convolution over input ring coefficients v.
+                    for v in 0..ring_dim {
+                        let (u, sign_is_plus) = if k_out >= v {
+                            (k_out - v, true)
+                        } else {
+                            (k_out + ring_dim - v, false)
+                        };
+                        let a_u64 = goldilocks_u64_from_base_ring(a_coeffs[u]);
+                        if a_u64 == 0 {
+                            continue;
+                        }
+                        let t = goldilocks_mul_const_mod_p_digits(&mut glue.gb, &out_flat_vars[j][v], a_u64);
+                        acc = if sign_is_plus {
+                            goldilocks_add_mod_p_digits(&mut glue.gb, &acc, &t)
+                        } else {
+                            goldilocks_sub_mod_p_digits(&mut glue.gb, &acc, &t)
+                        };
+                    }
+                }
+                // Enforce computed coefficient equals absorbed commitment coefficient.
+                for di in 0..17 {
+                    glue.gb.enforce_lc_times_one_eq_const(vec![
+                        (F257::ONE, acc[di]),
+                        (-F257::ONE, out_e_agg_abs[i][k_out][di]),
+                    ]);
+                }
+            }
+        }
 
         // ----------------------------
         // SetChk recombination check
