@@ -1147,11 +1147,24 @@ fn parse_and_enforce_cm_after_short(
                 let gv = pose_wiring.absorb_vars[st + i];
                 let lv = glue.copy_digit(gv);
                 glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, lv), (-F257::ONE, u.byte_vars[i])]);
+                if glue.gb.assignment[lv] != glue.gb.assignment[u.byte_vars[i]] {
+                    return Err(format!(
+                        "tiny gate: CM sumcheck r_i byte mismatch (which={which} round={_round} byte={i}): absorb={:?} u32_byte={:?}",
+                        glue.gb.assignment[lv],
+                        glue.gb.assignment[u.byte_vars[i]]
+                    ));
+                }
             }
             for i in 4..8 {
                 let gv = pose_wiring.absorb_vars[st + i];
                 let lv = glue.copy_digit(gv);
                 glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, lv), (-F257::ONE, z)]);
+                if glue.gb.assignment[lv] != F257::ZERO {
+                    return Err(format!(
+                        "tiny gate: CM sumcheck r_i high byte nonzero (which={which} round={_round} byte={i}): absorb={:?}",
+                        glue.gb.assignment[lv]
+                    ));
+                }
             }
         }
 
@@ -2503,11 +2516,24 @@ pub(super) fn build(
                         let gv = pose_wiring.absorb_vars[rst + i];
                         let lv = glue.copy_digit(gv);
                         glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, lv), (-F257::ONE, u.byte_vars[i])]);
+                        if glue.gb.assignment[lv] != glue.gb.assignment[u.byte_vars[i]] {
+                            return Err(format!(
+                                "tiny gate: Π_lin r_i byte mismatch (lp={lp} round={round} byte={i}): absorb={:?} u32_byte={:?}",
+                                glue.gb.assignment[lv],
+                                glue.gb.assignment[u.byte_vars[i]]
+                            ));
+                        }
                     }
                     for i in 4..8 {
                         let gv = pose_wiring.absorb_vars[rst + i];
                         let lv = glue.copy_digit(gv);
                         glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, lv), (-F257::ONE, z)]);
+                        if glue.gb.assignment[lv] != F257::ZERO {
+                            return Err(format!(
+                                "tiny gate: Π_lin r_i high byte nonzero (lp={lp} round={round} byte={i}): absorb={:?}",
+                                glue.gb.assignment[lv]
+                            ));
+                        }
                     }
                     let b0 = u.byte_vars[0];
                     let b1 = u.byte_vars[1];
@@ -2641,11 +2667,24 @@ pub(super) fn build(
                 let gv = pose_wiring.absorb_vars[rst + i];
                 let lv = glue.copy_digit(gv);
                 glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, lv), (-F257::ONE, u.byte_vars[i])]);
+                if glue.gb.assignment[lv] != glue.gb.assignment[u.byte_vars[i]] {
+                    return Err(format!(
+                        "tiny gate: SetChk r_i byte mismatch (round={round} byte={i}): absorb={:?} u32_byte={:?}",
+                        glue.gb.assignment[lv],
+                        glue.gb.assignment[u.byte_vars[i]]
+                    ));
+                }
             }
             for i in 4..8 {
                 let gv = pose_wiring.absorb_vars[rst + i];
                 let lv = glue.copy_digit(gv);
                 glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, lv), (-F257::ONE, z)]);
+                if glue.gb.assignment[lv] != F257::ZERO {
+                    return Err(format!(
+                        "tiny gate: SetChk r_i high byte nonzero (round={round} byte={i}): absorb={:?}",
+                        glue.gb.assignment[lv]
+                    ));
+                }
             }
             let b0 = u.byte_vars[0];
             let b1 = u.byte_vars[1];
