@@ -2881,19 +2881,7 @@ pub(super) fn build(
         //
         // Ajtai opening constraints (general case):
         // commit(flat) = A * flat, where A entries are public seeded ring elements.
-        //
-        // IMPORTANT:
-        // In `we_gate_arith.rs`, this is enforced via *linear* constraints over the base field,
-        // because multiplication by a fixed ring element is a fixed linear map on coefficient vectors.
-        //
-        // In the tiny-field gate, coefficients live in Goldilocks but are represented as bal16 digits in F257.
-        // Naively enforcing the coefficient-wise negacyclic convolution would require:
-        //   O(kappa * d * n_out_agg * d)
-        // calls to `goldilocks_mul_const_mod_p_digits`, which is catastrophically expensive.
-        //
-        // Instead, we compute the same commitment using the existing NTT-based ringmul gadget:
-        //   C_i = Σ_j (a_ij * flat[j])   in the negacyclic d=64 ring over Goldilocks,
-        // and then equate `C_i` to the absorbed commitment coefficients in digit form.
+        // Enforce coefficient-wise negacyclic convolution using only scalar (mod p) digit ops.
         let agg_scheme = AjtaiCommitmentScheme::<GR64>::seeded(b"setchk_out_e_agg", OUT_E_AGG_SEED, kappa, n_out_agg);
         let mut cols: Vec<Vec<GR64>> = Vec::with_capacity(n_out_agg);
         for j in 0..n_out_agg {
@@ -2904,41 +2892,38 @@ pub(super) fn build(
                 .map_err(|e| format!("tiny gate: out_e_agg basis commit failed: {e:?}"))?;
             cols.push(col.as_ref().to_vec());
         }
-
-        // Convert Ajtai matrix columns to digit-domain ring constants once:
-        // aij_digits[j][i] is the ring element a_ij (dimension 64), represented as Goldilocks digits in F257.
-        #[inline]
-        fn gr64_to_ringdigits_const(gb: &mut Dr1csBuilder<F257>, a: &GR64) -> RingDigits {
-            let mut out: RingDigits = Vec::with_capacity(64);
-            let coeffs = a.coeffs();
-            debug_assert_eq!(coeffs.len(), 64);
-            for lane in 0..64 {
-                let u = goldilocks_u64_from_base_ring(coeffs[lane]);
-                let bytes = alloc_const_goldilocks_u64(gb, u);
-                out.push(goldilocks_bytes_to_digits(gb, bytes));
-            }
-            out
-        }
-
-        let mut aij_digits: Vec<Vec<RingDigits>> = vec![vec![Vec::new(); kappa]; n_out_agg];
-        for j in 0..n_out_agg {
-            for i in 0..kappa {
-                aij_digits[j][i] = gr64_to_ringdigits_const(&mut glue.gb, &cols[j][i]);
-            }
-        }
-
+        // Constants 0/1 in digit form (Goldilocks).
+        let zero_bytes = alloc_const_goldilocks_u64(&mut glue.gb, 0u64);
+        let zero = goldilocks_bytes_to_digits(&mut glue.gb, zero_bytes);
         for i in 0..kappa {
-            let mut acc_ring = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
-            for j in 0..n_out_agg {
-                let prod = super::cm_math::ring_mul_negacyclic_digits_d64(&mut glue.gb, &aij_digits[j][i], &out_flat_vars[j])
-                    .map_err(|e| format!("tiny gate: out_e_agg ringmul failed (i={i} j={j}): {e}"))?;
-                acc_ring = ring_add_digits(&mut glue.gb, &acc_ring, &prod);
-            }
-            // Enforce computed commitment equals absorbed digest ring element.
             for k_out in 0..ring_dim {
+                let mut acc = zero;
+                for j in 0..n_out_agg {
+                    let aij = &cols[j][i];
+                    let a_coeffs = aij.coeffs();
+                    // Convolution over input ring coefficients v.
+                    for v in 0..ring_dim {
+                        let (u, sign_is_plus) = if k_out >= v {
+                            (k_out - v, true)
+                        } else {
+                            (k_out + ring_dim - v, false)
+                        };
+                        let a_u64 = goldilocks_u64_from_base_ring(a_coeffs[u]);
+                        if a_u64 == 0 {
+                            continue;
+                        }
+                        let t = goldilocks_mul_const_mod_p_digits(&mut glue.gb, &out_flat_vars[j][v], a_u64);
+                        acc = if sign_is_plus {
+                            goldilocks_add_mod_p_digits(&mut glue.gb, &acc, &t)
+                        } else {
+                            goldilocks_sub_mod_p_digits(&mut glue.gb, &acc, &t)
+                        };
+                    }
+                }
+                // Enforce computed coefficient equals absorbed commitment coefficient.
                 for di in 0..17 {
                     glue.gb.enforce_lc_times_one_eq_const(vec![
-                        (F257::ONE, acc_ring[k_out][di]),
+                        (F257::ONE, acc[di]),
                         (-F257::ONE, out_e_agg_abs[i][k_out][di]),
                     ]);
                 }
@@ -2949,11 +2934,8 @@ pub(super) fn build(
         // SetChk recombination check
         // ----------------------------
         //
-        // Constants 0/1 in digit form (Goldilocks).
         let one_bytes = alloc_const_goldilocks_u64(&mut glue.gb, 1u64);
         let one = goldilocks_bytes_to_digits(&mut glue.gb, one_bytes);
-        let zero_bytes = alloc_const_goldilocks_u64(&mut glue.gb, 0u64);
-        let zero = goldilocks_bytes_to_digits(&mut glue.gb, zero_bytes);
         let rc_base = rc_opt.unwrap_or(one);
         let rc_pows = goldilocks_pow_table_digits(&mut glue.gb, &rc_base, nclaims_setchk.saturating_sub(1));
 
