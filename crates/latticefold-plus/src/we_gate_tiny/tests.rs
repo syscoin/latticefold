@@ -18,6 +18,7 @@ use super::gadgets::alloc_byte;
 use super::cm_math::{
     goldilocks_add_mod_p_digits, goldilocks_bytes_to_digits, goldilocks_digits_to_bytes_canonical,
     goldilocks_mul_const_mod_p_digits, goldilocks_mul_mod_p_digits, goldilocks_sub_mod_p_digits,
+    ct_psi_mul_ring_digits_d64, ring_eval_at_scalar_digits,
 };
 
 use latticefold::transcript::Transcript;
@@ -287,7 +288,6 @@ fn test_goldilocks_mul_const_mod_p_from_bytes_matches_native() {
 #[test]
 fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
     use rand::{RngCore, SeedableRng};
-    use std::time::Instant;
     let mut rng = rand::rngs::StdRng::seed_from_u64(123456789);
 
     let p = super::goldilocks::GOLDILOCKS_P;
@@ -320,7 +320,6 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
     }
 
     // Circuit: boundary conversion bytes->digits only (stand-in for external IO).
-    let t0 = Instant::now();
     let mut b = Dr1csBuilder::<F257>::new();
     b.enforce_var_eq_const(b.one(), F257::ONE);
     let mut a_bytes = [[0usize; 8]; 64];
@@ -333,8 +332,6 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
             c_bytes[i][j] = alloc_byte::<F257>(&mut b, v).byte;
         }
     }
-    let t_after_alloc_bytes = Instant::now();
-
     let a_d: [super::goldilocks::GoldilocksScalar; 64] = core::array::from_fn(|i| {
         let v = u64_bytes_to_bal16_digits(&mut b, a_bytes[i]);
         v.try_into().expect("u64 bytes -> 17 digits")
@@ -343,8 +340,6 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
         let v = u64_bytes_to_bal16_digits(&mut b, c_bytes[i]);
         v.try_into().expect("u64 bytes -> 17 digits")
     });
-    let t_after_bytes_to_digits = Instant::now();
-
     // Use the IR implementation (the old non-IR gadget has been removed).
     // Clone assignment so we can later mutably borrow `b` to lower IR.
     let base_asg: Vec<F257> = b.assignment.clone();
@@ -354,23 +349,7 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
     let c_ir: [[super::cm_ir::VarRef; 17]; 64] =
         core::array::from_fn(|i| core::array::from_fn(|j| super::cm_ir::VarRef::Base(c_d[i][j])));
     let out_ir = super::cm_ir::ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &a_ir, &c_ir);
-    let t_after_build_ir = Instant::now();
-    let ir_stats = ib.ir.stats;
-    eprintln!(
-        "== ringmul IR stats: linear={} mul={} other_non_linear={} total={} | terms(a,b,c)=({},{},{}) max(a,b,c)=({},{},{}) ==",
-        ir_stats.linear_constraints,
-        ir_stats.mul_constraints,
-        ir_stats.other_non_linear_constraints,
-        ir_stats.linear_constraints + ir_stats.mul_constraints + ir_stats.other_non_linear_constraints,
-        ir_stats.total_terms_a,
-        ir_stats.total_terms_b,
-        ir_stats.total_terms_c,
-        ir_stats.max_terms_a,
-        ir_stats.max_terms_b,
-        ir_stats.max_terms_c,
-    );
     let lowered = super::cm_ir::lower_ir_into_builder(&mut b, ib.ir);
-    let t_after_lower_ir = Instant::now();
     let out: [super::goldilocks::GoldilocksScalar; 64] = core::array::from_fn(|i| {
         core::array::from_fn(|j| lowered.map_var(out_ir[i][j]))
     });
@@ -385,101 +364,99 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
         }
         assert_eq!(acc as u64, exp[k]);
     }
-    let t_after_decode_check = Instant::now();
-
-    eprintln!(
-        "== dR1CS dump: ring_mul_negacyclic_ntt_goldilocks_d64_ir | nvars={} nconstraints={} ==",
-        b.assignment.len(),
-        b.rows.len()
-    );
-    if std::env::var("LF_PROFILE_DR1CS").ok().as_deref() == Some("1") {
-        eprintln!("{}", b.profile_report(40));
-    }
 
     let (inst, asg) = b.into_instance();
-    let t_after_into_instance = Instant::now();
     inst.check(&asg).expect("ring mul (goldilocks ntt, IR) constraints satisfied");
-    let t_after_check = Instant::now();
-
-    eprintln!(
-        "== ringmul timings (release): total={:?} alloc_bytes={:?} bytes_to_digits={:?} build_ir={:?} lower_ir={:?} decode_check={:?} into_instance={:?} check={:?} ==",
-        t_after_check.duration_since(t0),
-        t_after_alloc_bytes.duration_since(t0),
-        t_after_bytes_to_digits.duration_since(t_after_alloc_bytes),
-        t_after_build_ir.duration_since(t_after_bytes_to_digits),
-        t_after_lower_ir.duration_since(t_after_build_ir),
-        t_after_decode_check.duration_since(t_after_lower_ir),
-        t_after_into_instance.duration_since(t_after_decode_check),
-        t_after_check.duration_since(t_after_into_instance),
-    );
 }
 
 #[test]
-fn test_scalar_mul_mod_p_ir_constraint_delta_smoke() {
-    use std::time::Instant;
+fn test_ring_eval_at_scalar_digits_matches_native_one_case() {
+    use rand::{RngCore, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0xEVAL_7E57u64);
+    let p = GOLDILOCKS_P;
 
-    // This is a micro-benchmark style smoke test: it prints the incremental constraint/var
-    // cost of a digit-domain Goldilocks mul mod p, without building the full tiny gate.
-    //
-    // Run with `-- --nocapture` to see the numbers.
-    let p_u64 = super::goldilocks::GOLDILOCKS_P;
-    let p_d = super::goldilocks::goldilocks_p_bal16_digits_le_const();
+    // Random ring element and scalar x.
+    let mut coeffs_u = [0u64; 64];
+    for i in 0..64 {
+        coeffs_u[i] = rng.next_u64() % p;
+    }
+    let x_u = rng.next_u64() % p;
+
+    // Native evaluation in u128 mod p.
+    let mut exp: u64 = 0;
+    let mut pow: u64 = 1;
+    for i in 0..64 {
+        exp = ((exp as u128 + (coeffs_u[i] as u128) * (pow as u128)) % (p as u128)) as u64;
+        pow = ((pow as u128) * (x_u as u128) % (p as u128)) as u64;
+    }
 
     let mut b = Dr1csBuilder::<F257>::new();
     b.enforce_var_eq_const(b.one(), F257::ONE);
-
-    // Fixed inputs (avoid randomness in tests).
-    let a_u: u64 = 123456789u64 % p_u64;
-    let c_u: u64 = 987654321u64 % p_u64;
-    let a_bytes = super::cm_math::alloc_const_goldilocks_u64(&mut b, a_u);
-    let c_bytes = super::cm_math::alloc_const_goldilocks_u64(&mut b, c_u);
-    let a = super::cm_math::goldilocks_bytes_to_digits(&mut b, a_bytes);
-    let c = super::cm_math::goldilocks_bytes_to_digits(&mut b, c_bytes);
-
-    let n_iters: usize = 200;
-    let t0 = Instant::now();
-    let rows0 = b.rows.len();
-    let vars0 = b.assignment.len();
-
-    for _ in 0..n_iters {
-        let base_asg: Vec<F257> = b.assignment.clone();
-        let mut ib = super::cm_ir::IrBuilder::new(&base_asg);
-        let a_ir: [super::cm_ir::VarRef; 17] = core::array::from_fn(|j| super::cm_ir::VarRef::Base(a[j]));
-        let c_ir: [super::cm_ir::VarRef; 17] = core::array::from_fn(|j| super::cm_ir::VarRef::Base(c[j]));
-        let out_ir = super::cm_ir::goldilocks_mul_mod_p_digits_ir(&mut ib, &a_ir, &c_ir, p_u64, &p_d);
-        let lowered = super::cm_ir::lower_ir_into_builder(&mut b, ib.ir);
-        let _out: [usize; 17] = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
+    let mut coeffs: RingDigits = Vec::with_capacity(64);
+    for i in 0..64 {
+        let mut bytes = [0usize; 8];
+        for (j, v) in coeffs_u[i].to_le_bytes().into_iter().enumerate() {
+            bytes[j] = alloc_byte::<F257>(&mut b, v).byte;
+        }
+        coeffs.push(goldilocks_bytes_to_digits(&mut b, bytes));
     }
-
-    let dt = t0.elapsed();
-    let rows1 = b.rows.len();
-    let vars1 = b.assignment.len();
-    eprintln!(
-        "== micro scalar_mul_mod_p: iters={} delta_constraints={} (~{:.1}/iter) delta_vars={} (~{:.1}/iter) elapsed={:?} ==",
-        n_iters,
-        rows1 - rows0,
-        (rows1 - rows0) as f64 / (n_iters as f64),
-        vars1 - vars0,
-        (vars1 - vars0) as f64 / (n_iters as f64),
-        dt
-    );
-
-    // Basic sanity: output witness should decode to the native product.
-    let exp: u64 = ((a_u as u128) * (c_u as u128) % (p_u64 as u128)) as u64;
-    let base_asg: Vec<F257> = b.assignment.clone();
-    let mut ib = super::cm_ir::IrBuilder::new(&base_asg);
-    let a_ir: [super::cm_ir::VarRef; 17] = core::array::from_fn(|j| super::cm_ir::VarRef::Base(a[j]));
-    let c_ir: [super::cm_ir::VarRef; 17] = core::array::from_fn(|j| super::cm_ir::VarRef::Base(c[j]));
-    let out_ir = super::cm_ir::goldilocks_mul_mod_p_digits_ir(&mut ib, &a_ir, &c_ir, p_u64, &p_d);
-    let lowered = super::cm_ir::lower_ir_into_builder(&mut b, ib.ir);
-    let out: [usize; 17] = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
-    let mut acc: i128 = 0;
-    let mut pow: i128 = 1;
-    for j in 0..17 {
-        acc += (f257_to_i32_bal(b.assignment[out[j]]) as i128) * pow;
-        pow *= 16;
+    let mut x_bytes = [0usize; 8];
+    for (j, v) in x_u.to_le_bytes().into_iter().enumerate() {
+        x_bytes[j] = alloc_byte::<F257>(&mut b, v).byte;
     }
-    assert_eq!(acc as u64, exp);
+    let x = goldilocks_bytes_to_digits(&mut b, x_bytes);
+
+    let got_d = ring_eval_at_scalar_digits(&mut b, &coeffs, &x).expect("ring_eval_at_scalar_digits");
+    let got_bytes = goldilocks_digits_to_bytes_canonical(&mut b, &got_d);
+    let mut out = [0u8; 8];
+    for i in 0..8 {
+        out[i] = var_to_u8::<F257>(&b, got_bytes[i]);
+    }
+    assert_eq!(u64::from_le_bytes(out), exp);
+
+    let (inst, asg) = b.into_instance();
+    inst.check(&asg).expect("ring_eval_at_scalar_digits satisfied");
+}
+
+#[test]
+fn test_ct_psi_mul_ring_digits_d64_matches_native_one_case() {
+    use rand::{RngCore, SeedableRng};
+    use stark_rings::{psi, CoeffRing};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0xC7_psi_u64);
+    let p = GOLDILOCKS_P;
+
+    // Random ring element in GoldilocksRing64.
+    let mut x_u = [0u64; 64];
+    for i in 0..64 {
+        x_u[i] = rng.next_u64() % p;
+    }
+    let mut x_ring = cyclotomic_rings::rings::GoldilocksRing64::ZERO;
+    for i in 0..64 {
+        x_ring.coeffs_mut()[i] = <cyclotomic_rings::rings::GoldilocksRing64 as stark_rings::PolyRing>::BaseRing::from(x_u[i]);
+    }
+    let exp_u64 = (psi::<cyclotomic_rings::rings::GoldilocksRing64>() * x_ring).ct()
+        .into_bigint().as_ref().get(0).copied().unwrap_or(0);
+
+    let mut b = Dr1csBuilder::<F257>::new();
+    b.enforce_var_eq_const(b.one(), F257::ONE);
+    let mut x_digits: RingDigits = Vec::with_capacity(64);
+    for i in 0..64 {
+        let mut bytes = [0usize; 8];
+        for (j, v) in x_u[i].to_le_bytes().into_iter().enumerate() {
+            bytes[j] = alloc_byte::<F257>(&mut b, v).byte;
+        }
+        x_digits.push(goldilocks_bytes_to_digits(&mut b, bytes));
+    }
+    let got_d = ct_psi_mul_ring_digits_d64(&mut b, &x_digits).expect("ct_psi_mul_ring_digits_d64");
+    let got_bytes = goldilocks_digits_to_bytes_canonical(&mut b, &got_d);
+    let mut out = [0u8; 8];
+    for i in 0..8 {
+        out[i] = var_to_u8::<F257>(&b, got_bytes[i]);
+    }
+    assert_eq!(u64::from_le_bytes(out), exp_u64);
+
+    let (inst, asg) = b.into_instance();
+    inst.check(&asg).expect("ct_psi_mul_ring_digits_d64 satisfied");
 }
 
 #[test]
