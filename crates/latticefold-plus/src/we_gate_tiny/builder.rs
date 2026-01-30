@@ -985,7 +985,6 @@ fn parse_and_enforce_cm_after_short(
         return Ok((Vec::new(), vec![Vec::new(), Vec::new()], vec![Vec::new(), Vec::new()]));
     }
     let kappa = params.kappa as usize;
-    let nvars_cm = params.nvars_cm as usize;
     let mlen_mats = params.mlen as usize;
     let last_short_op = *wiring
         .short_squeeze_ops
@@ -2413,32 +2412,147 @@ pub(super) fn build(
 
         let n_lin_proofs = l_instances_expected;
         let mut cur = n_public_inputs;
-        // Skip Π_lin transcript absorbs deterministically (matches schedule in `we_gate_arith.rs`).
-        for _ in 0..n_lin_proofs {
-            // header: (nvars, degree=3) as scalars
-            if prefix_payload.get(cur).map(|x| x.1) != Some(8) || prefix_payload.get(cur + 1).map(|x| x.1) != Some(8) {
-                return Err("tiny gate: Π_lin header absorbs missing/mismatched".to_string());
+        // Π_lin verifier math (degree-3 sumcheck + e*(va*vb-vc) == subclaim), deterministic cursor.
+        //
+        // NOTE: we only enforce the final ring-mul check when `ring_dim==64`, since the tiny backend
+        // currently has an optimized NTT IR gadget only for that regime. For other ring dims we still
+        // parse/bind the transcript schedule (sound transcript binding), but skip the ring-mul check.
+        {
+            use super::cm_ir::{lower_ir_into_builder, ring_mul_negacyclic_ntt_goldilocks_d64_ir, IrBuilder, VarRef as IrVarRef};
+
+            #[inline]
+            fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
+                if a.len() != 64 {
+                    return Err("tiny gate: expected ring_dim=64 for Π_lin ring-mul".to_string());
+                }
+                Ok(core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j]))))
             }
-            cur += 2;
-            // rounds: 4 ring elems + scalar absorb (r_i)
-            for _ in 0..nvars_setchk {
-                for _ in 0..4 {
-                    if prefix_payload.get(cur).map(|x| x.1) != Some(ring_elem_bytes) {
-                        return Err("tiny gate: Π_lin round ring absorb len mismatch".to_string());
+
+            #[inline]
+            fn map_ring_out(out_ir: &[[IrVarRef; 17]; 64], lowered: &super::cm_ir::LoweredIr) -> RingDigits {
+                let out: [GoldilocksScalar; 64] =
+                    core::array::from_fn(|i| core::array::from_fn(|j| lowered.map_var(out_ir[i][j])));
+                out.into_iter().collect()
+            }
+
+            for lp in 0..n_lin_proofs {
+                // Header absorbs must equal (nvars, degree=3).
+                let (st_nv, ln_nv) = *prefix_payload.get(cur).ok_or("tiny gate: Π_lin header oob")?;
+                let (st_deg, ln_deg) = *prefix_payload.get(cur + 1).ok_or("tiny gate: Π_lin header oob")?;
+                if ln_nv != 8 || ln_deg != 8 {
+                    return Err("tiny gate: Π_lin header absorb len mismatch".to_string());
+                }
+                enforce_absorbed_u64_const(&mut glue, &pose_wiring, st_nv, nvars_setchk as u64);
+                enforce_absorbed_u64_const(&mut glue, &pose_wiring, st_deg, 3u64);
+                cur += 2;
+
+                // r_pre (nvars) then r_sc (nvars) from u32 challenge schedule.
+                let base = lp
+                    .checked_mul(2usize.saturating_mul(nvars_setchk))
+                    .ok_or_else(|| "tiny gate: Π_lin u32 base overflow".to_string())?;
+                let r_pre_u32 = u32_locals
+                    .get(base..base + nvars_setchk)
+                    .ok_or_else(|| "tiny gate: Π_lin r_pre u32 slice oob".to_string())?;
+                let r_sc_u32 = u32_locals
+                    .get(base + nvars_setchk..base + 2 * nvars_setchk)
+                    .ok_or_else(|| "tiny gate: Π_lin r_sc u32 slice oob".to_string())?;
+
+                let mut r_pre_digits: Vec<GoldilocksScalar> = Vec::with_capacity(nvars_setchk);
+                for u in r_pre_u32 {
+                    let b0 = u.byte_vars[0];
+                    let b1 = u.byte_vars[1];
+                    let b2 = u.byte_vars[2];
+                    let b3 = u.byte_vars[3];
+                    let bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &[b0, b1, b2, b3]);
+                    r_pre_digits.push(goldilocks_bytes_to_digits(&mut glue.gb, bytes));
+                }
+
+                // Parse sumcheck msgs + bind absorbed r_i to r_sc u32 bytes.
+                let mut msgs_digits: Vec<[RingDigits; 4]> = Vec::with_capacity(nvars_setchk);
+                let mut rs_digits: Vec<GoldilocksScalar> = Vec::with_capacity(nvars_setchk);
+                let z = glue.gb.new_var(F257::ZERO);
+                glue.gb.enforce_var_eq_const(z, F257::ZERO);
+
+                for round in 0..nvars_setchk {
+                    let (s0, l0) = *prefix_payload.get(cur + 0).ok_or("tiny gate: Π_lin msg oob")?;
+                    let (s1, l1) = *prefix_payload.get(cur + 1).ok_or("tiny gate: Π_lin msg oob")?;
+                    let (s2, l2) = *prefix_payload.get(cur + 2).ok_or("tiny gate: Π_lin msg oob")?;
+                    let (s3, l3) = *prefix_payload.get(cur + 3).ok_or("tiny gate: Π_lin msg oob")?;
+                    cur += 4;
+                    if l0 != ring_elem_bytes || l1 != ring_elem_bytes || l2 != ring_elem_bytes || l3 != ring_elem_bytes {
+                        return Err("tiny gate: Π_lin msg ring absorb len mismatch".to_string());
                     }
+                    let e0b = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s0, l0)?;
+                    let e1b = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s1, l1)?;
+                    let e2b = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s2, l2)?;
+                    let e3b = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, s3, l3)?;
+                    let e0 = ring_bytes_to_digits(&mut glue.gb, &e0b);
+                    let e1 = ring_bytes_to_digits(&mut glue.gb, &e1b);
+                    let e2 = ring_bytes_to_digits(&mut glue.gb, &e2b);
+                    let e3 = ring_bytes_to_digits(&mut glue.gb, &e3b);
+                    msgs_digits.push([e0, e1, e2, e3]);
+
+                    // Explicit absorb of r_i (8 bytes) must equal r_sc_u32 bytes || 0^4.
+                    let (rst, rln) = *prefix_payload.get(cur).ok_or("tiny gate: Π_lin r_i absorb oob")?;
                     cur += 1;
+                    if rln != 8 {
+                        return Err("tiny gate: Π_lin r_i absorb len mismatch".to_string());
+                    }
+                    let u = &r_sc_u32[round];
+                    for i in 0..4 {
+                        let gv = pose_wiring.absorb_vars[rst + i];
+                        let lv = glue.copy_digit(gv);
+                        glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, lv), (-F257::ONE, u.byte_vars[i])]);
+                    }
+                    for i in 4..8 {
+                        let gv = pose_wiring.absorb_vars[rst + i];
+                        let lv = glue.copy_digit(gv);
+                        glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, lv), (-F257::ONE, z)]);
+                    }
+                    let b0 = u.byte_vars[0];
+                    let b1 = u.byte_vars[1];
+                    let b2 = u.byte_vars[2];
+                    let b3 = u.byte_vars[3];
+                    let bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &[b0, b1, b2, b3]);
+                    rs_digits.push(goldilocks_bytes_to_digits(&mut glue.gb, bytes));
                 }
-                if prefix_payload.get(cur).map(|x| x.1) != Some(8) {
-                    return Err("tiny gate: Π_lin round scalar absorb len mismatch".to_string());
+
+                let claimed0 = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+                let subclaim_eval =
+                    super::cm_math::sumcheck_verify_degree3_ring_digits(&mut glue.gb, claimed0, &msgs_digits, &rs_digits)?;
+
+                // Tail absorbs: (v,va,vb,vc) as ring elems.
+                let mut tail: Vec<RingDigits> = Vec::with_capacity(4);
+                for _ in 0..4 {
+                    let (st, ln) = *prefix_payload.get(cur).ok_or("tiny gate: Π_lin tail oob")?;
+                    cur += 1;
+                    if ln != ring_elem_bytes {
+                        return Err("tiny gate: Π_lin tail ring absorb len mismatch".to_string());
+                    }
+                    let rb = parse_ring_elem_absorb_as_ringbytes(&mut glue, &pose_wiring, ring_dim, st, ln)?;
+                    tail.push(ring_bytes_to_digits(&mut glue.gb, &rb));
                 }
-                cur += 1;
-            }
-            // tail: absorb (v,va,vb,vc) as ring elems
-            for _ in 0..4 {
-                if prefix_payload.get(cur).map(|x| x.1) != Some(ring_elem_bytes) {
-                    return Err("tiny gate: Π_lin tail ring absorb len mismatch".to_string());
+                let va = &tail[1];
+                let vb = &tail[2];
+                let vc = &tail[3];
+
+                if ring_dim == 64 {
+                    // e = eq_eval(r_pre, r_sc)
+                    let e = super::cm_math::eq_eval_goldilocks_digits(&mut glue.gb, &r_pre_digits, &rs_digits)?;
+                    // lhs = e*(va*vb - vc)
+                    // Snapshot assignment to avoid borrow conflicts with lowering.
+                    let base_asg: Vec<F257> = glue.gb.assignment.clone();
+                    let mut ib = IrBuilder::new(&base_asg);
+                    let va_ir = ringdigits64_to_ir(va)?;
+                    let vb_ir = ringdigits64_to_ir(vb)?;
+                    let prod_ir = ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &va_ir, &vb_ir);
+                    super::op_counts::tiny_cm_bump(|c| c.ring_mul_negacyclic += 1);
+                    let lowered = lower_ir_into_builder(&mut glue.gb, ib.ir);
+                    let vab = map_ring_out(&prod_ir, &lowered);
+                    let diff = super::cm_math::ring_sub_digits(&mut glue.gb, &vab, vc);
+                    let lhs = ring_scale_digits(&mut glue.gb, &diff, &e);
+                    ring_eq_digits(&mut glue.gb, &lhs, &subclaim_eval);
                 }
-                cur += 1;
             }
         }
 
