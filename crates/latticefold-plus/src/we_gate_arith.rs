@@ -3584,10 +3584,9 @@ fn absorb_field_elem_as_ring<R>(
     R: PolyRing,
     R::BaseRing: PrimeField,
 {
-    // Coefficient-level transcript binding (cheap):
-    // absorb the scalar directly as a single base-field element.
-    let _ = b; // keep signature uniform with other helpers
-    absorb_flat.push(x0);
+    // Match transcript encoding: scalar -> fixed-width LE bytes, each absorbed as one F257 element.
+    let bytes = prime_field_to_bytes_le_fixed_vars::<BF<R>>(b, x0);
+    absorb_flat.extend_from_slice(&bytes);
 }
 
 fn absorb_ringvars_as_bytes<R>(
@@ -3598,10 +3597,10 @@ fn absorb_ringvars_as_bytes<R>(
     R: PolyRing,
     R::BaseRing: PrimeField,
 {
-    // Coefficient-level transcript binding (cheap):
-    // absorb ring elements by appending their coefficients in order.
-    let _ = b; // keep signature uniform with other helpers
-    absorb_flat.extend_from_slice(&rv.coeffs);
+    for &c in &rv.coeffs {
+        let bytes = prime_field_to_bytes_le_fixed_vars::<BF<R>>(b, c);
+        absorb_flat.extend_from_slice(&bytes);
+    }
 }
 
 #[cfg(feature = "we_gate")]
