@@ -41,7 +41,7 @@ use super::cm_math::{
     alloc_const_goldilocks_u64,
     eq_eval_goldilocks_digits, eval_t_z_optimized_ring_digits_pair, goldilocks_bytes_to_digits, goldilocks_pow_table_digits,
     goldilocks_digits_to_bytes_canonical,
-    goldilocks_add_mod_p_digits, goldilocks_mul_mod_p_digits, goldilocks_sub_mod_p_digits,
+    goldilocks_add_mod_p_digits, goldilocks_mul_const_mod_p_digits, goldilocks_mul_mod_p_digits, goldilocks_sub_mod_p_digits,
     ct_psi_mul_ring_digits_d64,
     ring_eval_at_scalar_digits,
     ring_add_digits, ring_bytes_to_digits, ring_eq_digits,
@@ -2179,7 +2179,7 @@ fn build_cm_glue_for_which(
     // satisfiable (but underconstrained).
     let mut claimed_sum_opt: Option<RingDigits> = None;
     if let (Some(out_e_base), Some(dcom_evals_base)) = (setchk_out_e_vars_base.as_ref(), dcom_evals_base.as_ref()) {
-        if let (Some(t0_ring), Some(t1_ring), Some(sp_ring), Some(dpp), Some(rpt)) = (
+        if let (Some(t0_ring), Some(t1_ring), Some(sp_ring), Some(_dpp), Some(_rpt)) = (
             tensor_c0_ring.as_ref(),
             tensor_c1_ring.as_ref(),
             s_prime_flat_ring.as_ref(),
@@ -3311,6 +3311,93 @@ pub(super) fn build(
         } else {
             Vec::new()
         };
+
+    // ------------------------------------------------------------------------
+    // Decomp verifier math (LinB2X + DecompProof)
+    // ------------------------------------------------------------------------
+    //
+    // Mirrors `we_gate_arith.rs::decomp_verifier_math_dr1cs`:
+    // - C0 + B*C1 == cm_g
+    // - v0a + B*v1a == va, v0b + B*v1b == vb
+    //
+    // Note: this part does not interact with the transcript; these are pure algebraic checks over the ring.
+    // In the tiny gate shape harness we allocate witness values as zeros (satisfiable); in the real
+    // large-trace path the witness assignment must supply actual proof values.
+    if ring_dim == 64 {
+        let kappa = params.kappa as usize;
+        let vlen = 1usize + (params.mlen as usize); // matches `we_gate_arith.rs` dummy proof shape
+        let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+        let b_u64: u64 = ((params.decomp_b as u128) % (p_u64 as u128)) as u64;
+
+        #[inline]
+        fn alloc_witness_ring_digits(gb: &mut Dr1csBuilder<F257>, ring_dim: usize) -> RingDigits {
+            let mut r: RingDigits = Vec::with_capacity(ring_dim);
+            for _ in 0..ring_dim {
+                r.push(alloc_witness_goldilocks_u64_digits(gb, 0u64));
+            }
+            r
+        }
+
+        #[inline]
+        fn ring_recompose_base_b(
+            gb: &mut Dr1csBuilder<F257>,
+            r0: &RingDigits,
+            r1: &RingDigits,
+            b_u64: u64,
+        ) -> RingDigits {
+            debug_assert_eq!(r0.len(), 64);
+            debug_assert_eq!(r1.len(), 64);
+            let mut out: RingDigits = Vec::with_capacity(64);
+            for j in 0..64 {
+                let t = goldilocks_mul_const_mod_p_digits(gb, &r1[j], b_u64);
+                let s = goldilocks_add_mod_p_digits(gb, &r0[j], &t);
+                out.push(s);
+            }
+            out
+        }
+
+        // Allocate DecompProof witnesses: C0,C1 (kappa each), v0/v1 (vlen pairs each).
+        let mut dcomp_c0: Vec<RingDigits> = Vec::with_capacity(kappa);
+        let mut dcomp_c1: Vec<RingDigits> = Vec::with_capacity(kappa);
+        for _ in 0..kappa {
+            dcomp_c0.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
+            dcomp_c1.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
+        }
+        let mut v0a: Vec<RingDigits> = Vec::with_capacity(vlen);
+        let mut v0b: Vec<RingDigits> = Vec::with_capacity(vlen);
+        let mut v1a: Vec<RingDigits> = Vec::with_capacity(vlen);
+        let mut v1b: Vec<RingDigits> = Vec::with_capacity(vlen);
+        for _ in 0..vlen {
+            v0a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
+            v0b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
+            v1a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
+            v1b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
+        }
+
+        // Allocate LinB2X witnesses: cm_g (kappa), vo (vlen pairs).
+        let mut cm_g: Vec<RingDigits> = Vec::with_capacity(kappa);
+        for _ in 0..kappa {
+            cm_g.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
+        }
+        let mut va: Vec<RingDigits> = Vec::with_capacity(vlen);
+        let mut vb: Vec<RingDigits> = Vec::with_capacity(vlen);
+        for _ in 0..vlen {
+            va.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
+            vb.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
+        }
+
+        // Enforce recomposition equalities.
+        for i in 0..kappa {
+            let rec = ring_recompose_base_b(&mut glue.gb, &dcomp_c0[i], &dcomp_c1[i], b_u64);
+            ring_eq_digits(&mut glue.gb, &rec, &cm_g[i]);
+        }
+        for i in 0..vlen {
+            let rec_a = ring_recompose_base_b(&mut glue.gb, &v0a[i], &v1a[i], b_u64);
+            let rec_b = ring_recompose_base_b(&mut glue.gb, &v0b[i], &v1b[i], b_u64);
+            ring_eq_digits(&mut glue.gb, &rec_a, &va[i]);
+            ring_eq_digits(&mut glue.gb, &rec_b, &vb[i]);
+        }
+    }
 
     let (mut surfaces_mul_local, all_sum_digits, all_sum_coeffwise) =
         build_mul_surfaces(&mut glue, ring_dim, pairs, &short_locals, &u32_locals)?;
