@@ -972,6 +972,7 @@ fn parse_and_enforce_cm_after_short(
     params: &WeParams,
     wiring: &TinyCoinOpWiring,
     l_instances: usize,
+    u32_locals: &[BoundedU32ChallengeWiring],
 ) -> Result<
     (
         Vec<(usize, usize)>, // comh ring absorbs (start,len)
@@ -1085,6 +1086,13 @@ fn parse_and_enforce_cm_after_short(
         }
     }
 
+    // We also bind the per-round “explicit absorb of r_i” to the same u32 coins that were sampled
+    // by `get_challenge()`. This mirrors the real verifier transcript schedule.
+    let cm_u32_start = cm_u32_start_idx(wiring);
+    let kappa = params.kappa as usize;
+    let log_kappa = ark_std::log2(kappa.next_power_of_two()) as usize;
+    let nvars_cm = params.nvars_cm as usize;
+
     for which in 0..2 {
         // Sumcheck header: absorb nvars, absorb degree (both as base-field scalars -> 8 bytes)
         {
@@ -1108,7 +1116,7 @@ fn parse_and_enforce_cm_after_short(
             enforce_absorbed_u64_const(glue, pose_wiring, st, 2u64);
         }
 
-        // Rounds: 3 ring absorbs (msg evals), then one 8-byte scalar marker absorb.
+        // Rounds: 3 ring absorbs (msg evals), then one 8-byte scalar absorb of sampled r_i.
         for _round in 0..nvars_cm {
             for _m in 0..3 {
                 let (st, ln) = *payload_after_short
@@ -1120,7 +1128,7 @@ fn parse_and_enforce_cm_after_short(
                 }
                 sc_msg_absorbs[which].push((st, ln));
             }
-            // Marker absorb (schedule generator uses 0).
+            // Explicit absorb of sampled r_i.
             let (st, ln) = *payload_after_short
                 .get(cur)
                 .ok_or("tiny gate: payload_after_short too short (sc marker)")?;
@@ -1128,7 +1136,24 @@ fn parse_and_enforce_cm_after_short(
             if ln != 8 {
                 return Err("tiny gate: expected 8-byte absorb for sumcheck marker".to_string());
             }
-            enforce_absorbed_u64_const(glue, pose_wiring, st, 0u64);
+            // Bind absorbed bytes = u32 coin bytes (low 4) and zero padding (high 4).
+            let u32_idx = cm_u32_start + 2 * log_kappa + which * (1 + nvars_cm) + 1 + _round;
+            if u32_idx >= u32_locals.len() {
+                return Err("tiny gate: u32_locals too short for CM sumcheck r_i binding".to_string());
+            }
+            let u = &u32_locals[u32_idx];
+            let z = glue.gb.new_var(F257::ZERO);
+            glue.gb.enforce_var_eq_const(z, F257::ZERO);
+            for i in 0..4 {
+                let gv = pose_wiring.absorb_vars[st + i];
+                let lv = glue.copy_digit(gv);
+                glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, lv), (-F257::ONE, u.byte_vars[i])]);
+            }
+            for i in 4..8 {
+                let gv = pose_wiring.absorb_vars[st + i];
+                let lv = glue.copy_digit(gv);
+                glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, lv), (-F257::ONE, z)]);
+            }
         }
 
         // Eval tables: L × (1+mlen_mats) rows × 4 ring elements.
@@ -1917,7 +1942,6 @@ fn build_cm_glue_for_which(
     base_asg: &[F257],
     short_locals: &[ShortChallengeWiring],
     u32_locals: &[BoundedU32ChallengeWiring],
-    goldilocks_locals: &[GoldilocksChallengeWiring],
 ) -> Result<GlueCtx, String> {
     let mut glue = GlueCtx::new(pose_asg);
     if ring_dim == 0 || l_instances_expected == 0 {
@@ -2042,12 +2066,16 @@ fn build_cm_glue_for_which(
         let r_end = r_start
             .checked_add(nvars_lin)
             .ok_or_else(|| "tiny gate: r_end overflow".to_string())?;
-        if goldilocks_locals.len() < r_end {
-            return Err("tiny gate: not enough Goldilocks challenges to recover setchk r-point".to_string());
+        if u32_locals.len() < r_end {
+            return Err("tiny gate: not enough u32 challenges to recover setchk r-point".to_string());
         }
         let mut rdig: Vec<GoldilocksScalar> = Vec::with_capacity(nvars_lin);
-        for g in &goldilocks_locals[r_start..r_end] {
-            let bytes: [usize; 8] = core::array::from_fn(|i| glue.import_base_var(base_asg, g.byte_vars[i]));
+        for u in &u32_locals[r_start..r_end] {
+            let b0 = glue.import_base_var(base_asg, u.byte_vars[0]);
+            let b1 = glue.import_base_var(base_asg, u.byte_vars[1]);
+            let b2 = glue.import_base_var(base_asg, u.byte_vars[2]);
+            let b3 = glue.import_base_var(base_asg, u.byte_vars[3]);
+            let bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &[b0, b1, b2, b3]);
             rdig.push(goldilocks_bytes_to_digits(&mut glue.gb, bytes));
         }
         r_point_digits = Some(rdig);
@@ -2438,7 +2466,7 @@ pub(super) fn build(
         enforce_absorbed_u64_const(&mut glue, &pose_wiring, prefix_payload[start + 0].0, nvars_setchk as u64);
         enforce_absorbed_u64_const(&mut glue, &pose_wiring, prefix_payload[start + 1].0, 3u64);
 
-        // Recover the SetChk verifier challenge point r from the transcript coin schedule.
+        // Recover the SetChk verifier challenge point r from the u32 coin schedule.
         //
         // Mirrors the indexing used by the CM recombination gadget (eq(r, ro)).
         let n_lin_proofs = l_instances_expected;
@@ -2459,14 +2487,16 @@ pub(super) fn build(
         let r_end = r_start
             .checked_add(nvars_setchk)
             .ok_or_else(|| "tiny gate: r_end overflow (setchk)".to_string())?;
-        if goldilocks_locals.len() < r_end {
-            return Err("tiny gate: not enough Goldilocks challenges to recover setchk r-point".to_string());
+        if u32_locals.len() < r_end {
+            return Err("tiny gate: not enough u32 challenges to recover setchk r-point".to_string());
         }
 
         // Parse the sumcheck prover messages as ring-bytes -> ring-digits.
         // Also bind each absorbed r_i scalar (8 bytes) to the corresponding u32 coin bytes.
         let mut msgs_digits: Vec<[RingDigits; 4]> = Vec::with_capacity(nvars_setchk);
         let mut rs_digits: Vec<GoldilocksScalar> = Vec::with_capacity(nvars_setchk);
+        let z = glue.gb.new_var(F257::ZERO);
+        glue.gb.enforce_var_eq_const(z, F257::ZERO);
 
         let mut cur = start + 2;
         for round in 0..nvars_setchk {
@@ -2486,19 +2516,28 @@ pub(super) fn build(
             let e3 = ring_bytes_to_digits(&mut glue.gb, &e3b);
             msgs_digits.push([e0, e1, e2, e3]);
 
-            // Absorbed r_i scalar (8 bytes) must match the transcript coin bytes (full 8 bytes).
+            // Absorbed r_i scalar (8 bytes) must match the u32 coin bytes (low 4) and zero padding (high 4).
             let (rst, rln) = prefix_payload[cur];
             cur += 1;
             if rln != 8 {
                 return Err("tiny gate: expected 8-byte absorb for SetChk r_i".to_string());
             }
-            let g = &goldilocks_locals[r_start + round];
-            for i in 0..8 {
+            let u = &u32_locals[r_start + round];
+            for i in 0..4 {
                 let gv = pose_wiring.absorb_vars[rst + i];
                 let lv = glue.copy_digit(gv);
-                glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, lv), (-F257::ONE, g.byte_vars[i])]);
+                glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, lv), (-F257::ONE, u.byte_vars[i])]);
             }
-            let bytes: [usize; 8] = g.byte_vars;
+            for i in 4..8 {
+                let gv = pose_wiring.absorb_vars[rst + i];
+                let lv = glue.copy_digit(gv);
+                glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, lv), (-F257::ONE, z)]);
+            }
+            let b0 = u.byte_vars[0];
+            let b1 = u.byte_vars[1];
+            let b2 = u.byte_vars[2];
+            let b3 = u.byte_vars[3];
+            let bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &[b0, b1, b2, b3]);
             rs_digits.push(goldilocks_bytes_to_digits(&mut glue.gb, bytes));
         }
 
@@ -2527,6 +2566,7 @@ pub(super) fn build(
         params,
         wiring,
         l_instances_expected,
+        &u32_locals,
     )?;
     lf_stage_log("parse_and_enforce_cm_after_short", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
@@ -2582,7 +2622,6 @@ pub(super) fn build(
                         base_asg,
                         &short_locals,
                         &u32_locals,
-                        &goldilocks_locals,
                     )
                 },
                 || {
@@ -2601,7 +2640,6 @@ pub(super) fn build(
                         base_asg,
                         &short_locals,
                         &u32_locals,
-                        &goldilocks_locals,
                     )
                 },
             );
