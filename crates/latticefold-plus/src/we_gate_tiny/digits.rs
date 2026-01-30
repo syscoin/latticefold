@@ -7,7 +7,6 @@ use super::gadgets::decompose_existing_byte_var_to_bits;
 use super::cm_ir::{
     alloc_bal16_digit_ir, alloc_carry_pm2_ir, lower_ir_into_builder, IrBuilder as CmIrBuilder,
     add_bal16_loose_same_len_ir, add_bal16_same_len_ir, mul_bal16_small_ir, neg_bal16_digits_ir, rebalance_tail_pm11_to_pm2_ir,
-    sub_bal16_same_len_ir,
     u32_bytes_to_bal16_digits_from_bits_ir, u64_bytes_to_bal16_digits_from_bits_ir, VarRef as CmVarRef,
     Bal16CheckedIr as CmBal16CheckedIr,
     Bal16LooseIr as CmBal16LooseIr,
@@ -239,26 +238,6 @@ pub(crate) fn neg_bal16_digits(
         let mut ib = CmIrBuilder::new(base_asg);
         let x_ir = CmBal16CheckedIr(x.as_slice().iter().copied().map(CmVarRef::Base).collect());
         let (out_ir, carry_ir) = neg_bal16_digits_ir(&mut ib, &x_ir);
-        (ib.ir, out_ir, carry_ir)
-    };
-    let lowered = lower_ir_into_builder(b, ir);
-    let out: Vec<usize> = out_ir.0.into_iter().map(|v| lowered.map_var(v)).collect();
-    let carry = lowered.map_var(carry_ir);
-    (Bal16Checked(out), carry)
-}
-
-/// Subtract two balanced base-16 digit vectors of the same length: `a - c`.
-pub(crate) fn sub_bal16_same_len(
-    b: &mut Dr1csBuilder<F257>,
-    a: &Bal16Checked,
-    c: &Bal16Checked,
-) -> (Bal16Checked, usize /* carry_out */) {
-    let (ir, out_ir, carry_ir) = {
-        let base_asg: &[F257] = &b.assignment;
-        let mut ib = CmIrBuilder::new(base_asg);
-        let a_ir = CmBal16CheckedIr(a.as_slice().iter().copied().map(CmVarRef::Base).collect());
-        let c_ir = CmBal16CheckedIr(c.as_slice().iter().copied().map(CmVarRef::Base).collect());
-        let (out_ir, carry_ir) = sub_bal16_same_len_ir(&mut ib, &a_ir, &c_ir);
         (ib.ir, out_ir, carry_ir)
     };
     let lowered = lower_ir_into_builder(b, ir);
@@ -607,122 +586,6 @@ pub(crate) fn mul_u32ish9_to_fixed_bal16(
         enforce_var_eq_const_ir(b, dv, F257::ZERO);
     }
     raw[..out_len].to_vec()
-}
-
-pub(crate) fn mul_bal16_long_by_u32ish9(b: &mut Dr1csBuilder<F257>, a: &[usize], b9: &[usize]) -> Vec<usize> {
-    assert_eq!(b9.len(), 9);
-    if a.is_empty() {
-        return vec![bal16_zero(b)];
-    }
-    let zero = bal16_zero(b);
-    let blocks = (a.len() + 2) / 3;
-    let target_len = 3 * blocks + 13 + 1;
-    let mut acc = Bal16Checked(vec![zero; target_len]);
-
-    for blk in 0..blocks {
-        let start = blk * 3;
-        let end = core::cmp::min(start + 3, a.len());
-        let mut coeff3 = [zero; 3];
-        for j in 0..(end - start) {
-            coeff3[j] = a[start + j];
-        }
-        let raw = mul_bal16_small(b, &coeff3, b9);
-        let reb = rebalance_tail_pm11_to_pm2(b, &raw);
-        let shifted = shift_pad_bal16(&reb, blk * 3, target_len, zero);
-        let (new_acc, carry) = add_bal16_same_len(b, &acc, &shifted);
-        acc = new_acc;
-        let top = acc[target_len - 1];
-        let (top_sum, top_carry) = add_bal16_same_len(b, &Bal16Checked(vec![top]), &Bal16Checked(vec![carry]));
-        acc.0[target_len - 1] = top_sum[0];
-        enforce_var_eq_const_ir(b, top_carry, F257::ZERO);
-    }
-    acc.into_vec()
-}
-
-pub(crate) fn mul_bal16_long_by_long(b: &mut Dr1csBuilder<F257>, a: &[usize], bb: &[usize]) -> Vec<usize> {
-    let _prev = b.profile_enter("digits::mul_bal16_long_by_long");
-    if a.is_empty() || bb.is_empty() {
-        let out = vec![bal16_zero(b)];
-        b.profile_exit(_prev);
-        return out;
-    }
-    if a.len().min(bb.len()) <= 3 {
-        let raw = mul_bal16_small(b, a, bb);
-        let out = rebalance_tail_pm11_to_pm2(b, &raw);
-        b.profile_exit(_prev);
-        return out;
-    }
-
-    // -------------------------------------------------------------------------
-    // Fox #1 (SOUND): Use loose digit accumulation when bounds permit.
-    //
-    // This path is sound because:
-    // 1. mul_bal16_small handles blocks of size 3×n, where sums stay under 257
-    // 2. Loose accumulation uses pure linear constraints (no ambiguity)
-    // 3. Final normalization has bound < 128, ensuring no F257 wrap-around
-    //
-    // We check this FIRST (before the streaming path) because it's provably sound
-    // for all operand sizes where the bound check passes.
-    // -------------------------------------------------------------------------
-    let (short, long) = if a.len() <= bb.len() { (a, bb) } else { (bb, a) };
-    let zero = bal16_zero(b);
-    let blocks = (short.len() + 2) / 3;
-    let per_block_len = long.len() + 5;
-    let target_len = per_block_len + 3 * (blocks - 1) + 2;
-
-    if long.len() <= 19 && short.len() <= 19 {
-        let per_term_bound: i32 = 10; // conservative: digits in [-8,7] plus small tail carry
-        let acc_bound: i32 = (blocks as i32) * per_term_bound;
-        if acc_bound < 128 {
-            let mut acc = Bal16Loose { digits: vec![zero; target_len], abs_bound: acc_bound };
-            for blk in 0..blocks {
-                let start = blk * 3;
-                let end = core::cmp::min(start + 3, short.len());
-                let mut coeff3 = [zero; 3];
-                for j in 0..(end - start) {
-                    coeff3[j] = short[start + j];
-                }
-                let raw = mul_bal16_small(b, &coeff3, long);
-                let reb = rebalance_tail_pm11_to_pm2(b, &raw);
-                let shifted = shift_pad_bal16(&reb, blk * 3, target_len, zero);
-                add_bal16_loose_in_place(b, &mut acc, &shifted);
-            }
-            let (norm, carry) = normalize_bal16_loose_same_len_with_bound(b, &acc);
-            enforce_var_eq_const_ir(b, carry, F257::ZERO);
-            b.profile_exit(_prev);
-            return norm.into_vec();
-        }
-    }
-
-    // Fallback: original carry-normalizing accumulation.
-    // This path is used when neither Fox #1 nor streaming applies.
-    let zero = bal16_zero(b);
-    let blocks = (short.len() + 2) / 3;
-    let per_block_len = long.len() + 5;
-    let target_len = per_block_len + 3 * (blocks - 1) + 2;
-    let mut acc = Bal16Checked(vec![zero; target_len]);
-    for blk in 0..blocks {
-        let start = blk * 3;
-        let end = core::cmp::min(start + 3, short.len());
-        let mut coeff3 = [zero; 3];
-        for j in 0..(end - start) {
-            coeff3[j] = short[start + j];
-        }
-        let raw = mul_bal16_small(b, &coeff3, long);
-        let reb = rebalance_tail_pm11_to_pm2(b, &raw);
-        let shifted = shift_pad_bal16(&reb, blk * 3, target_len, zero);
-        let (new_acc, carry) = add_bal16_same_len(b, &acc, &shifted);
-        acc = new_acc;
-        let top = acc[target_len - 1];
-        let (top_sum, top_carry) =
-            add_bal16_same_len(b, &Bal16Checked(vec![top]), &Bal16Checked(vec![carry]));
-        acc.0[target_len - 1] = top_sum[0];
-        enforce_var_eq_const_ir(b, top_carry, F257::ZERO);
-    }
-
-    let out = acc.into_vec();
-    b.profile_exit(_prev);
-    out
 }
 
 /// Multiply two balanced base-16 digit vectors (little-endian), specialized for min(len)<=3.
