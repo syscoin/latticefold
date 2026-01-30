@@ -2220,7 +2220,7 @@ fn build_cm_glue_for_which(
                         for j in 0..kappa {
                             let (st, ln) = comh_absorbs[idx];
                             idx += 1;
-                            let rb = parse_ring_elem_absorb_as_ringbytes(glue, pose_wiring, ring_dim, st, ln)?;
+                            let rb = parse_ring_elem_absorb_as_ringbytes(&mut glue, pose_wiring, ring_dim, st, ln)?;
                             let comh_j = ring_bytes_to_digits(&mut glue.gb, &rb);
                             let s0 = tensor_c0_scalars[j];
                             let s1 = tensor_c1_scalars[j];
