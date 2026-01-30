@@ -6152,7 +6152,60 @@ mod tests {
             .expect("we_tiny_f257_build_cm_gate_from_trace_ops");
 
         assert!(!inst.constraints.is_empty());
-        inst.check(&asg).expect("dr1cs check");
+        // If satisfiability fails, dump the failing constraint so we can pinpoint whether
+        // this is a Poseidon/glue mismatch or an actual verifier-math bug.
+        if let Err(e) = inst.check(&asg) {
+            fn parse_failed_constraint_idx(msg: &str) -> Option<usize> {
+                // Expected format (from symphony): "constraint N failed"
+                let needle = "constraint ";
+                let i = msg.find(needle)? + needle.len();
+                let rest = &msg[i..];
+                let j = rest.find(' ')?;
+                rest[..j].parse::<usize>().ok()
+            }
+            fn dot<F: PrimeField>(a: &[(F, usize)], z: &[F]) -> F {
+                let mut acc = F::ZERO;
+                for (c, idx) in a {
+                    let v = if *idx == 0 { F::ONE } else { z[*idx] };
+                    acc += *c * v;
+                }
+                acc
+            }
+            eprintln!("[tiny_gate/goldilocks] DR1CS unsat: {e}");
+            if let Some(ci) = parse_failed_constraint_idx(&e) {
+                if let Some(con) = inst.constraints.get(ci) {
+                    let av = dot(&inst.a_terms[con.a.clone()], &asg);
+                    let bv = dot(&inst.b_terms[con.b.clone()], &asg);
+                    let cv = dot(&inst.c_terms[con.c.clone()], &asg);
+                    let res = av * bv - cv;
+                    eprintln!(
+                        "[tiny_gate/goldilocks] failing constraint idx={ci}  (A·z)={av:?} (B·z)={bv:?} (C·z)={cv:?}  residual=A·B-C={res:?}"
+                    );
+                    eprintln!(
+                        "[tiny_gate/goldilocks] constraint a-len={} b-len={} c-len={}",
+                        con.a.len(),
+                        con.b.len(),
+                        con.c.len()
+                    );
+                    let show = |name: &str, terms: &[(F257, usize)]| {
+                        let k = terms.len().min(12);
+                        eprintln!("[tiny_gate/goldilocks] {name} first {k} terms: {:?}", &terms[..k]);
+                    };
+                    // NOTE: `Constraint` here is over `F257` in this test.
+                    show("A", &inst.a_terms[con.a.clone()]);
+                    show("B", &inst.b_terms[con.b.clone()]);
+                    show("C", &inst.c_terms[con.c.clone()]);
+                } else {
+                    eprintln!(
+                        "[tiny_gate/goldilocks] failing constraint idx={ci} out of range (constraints={})",
+                        inst.constraints.len()
+                    );
+                }
+            } else {
+                eprintln!("[tiny_gate/goldilocks] could not parse failing constraint index from error");
+            }
+            panic!("dr1cs check failed: {e}");
+        }
     }
     #[test]
     #[ignore = "very slow in debug: runs full DPP prove+decap; run with `--release`"]
