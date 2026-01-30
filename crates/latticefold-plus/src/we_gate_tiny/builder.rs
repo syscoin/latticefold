@@ -536,10 +536,6 @@ fn infer_ring_elem_bytes_from_wiring(ring_dim: usize, pose_wiring: &PoseidonDr1c
     ring_elem_bytes.ok_or_else(|| "tiny gate: could not infer ring_elem_bytes".to_string())
 }
 
-fn first_absorb_with_len(prefix_payload: &[(usize, usize)], len: usize) -> Option<usize> {
-    prefix_payload.iter().position(|&(_st, ln)| ln == len)
-}
-
 fn count_comh_ring_elements(
     ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
@@ -1218,6 +1214,19 @@ fn enforce_absorbed_u64_const(glue: &mut GlueCtx, pose_wiring: &PoseidonDr1csWir
         let lv = glue.copy_digit(gv);
         glue.gb.enforce_var_eq_const(lv, F257::from(bs[i] as u64));
     }
+}
+
+fn count_initial_scalar_absorbs(prefix_payload: &[(usize, usize)]) -> usize {
+    // In the LF+ schedule prefix, statement params + public inputs are absorbed as 8-byte scalars
+    // before any ring-element absorbs begin.
+    let mut n = 0usize;
+    for &(_st, ln) in prefix_payload {
+        if ln != 8 {
+            break;
+        }
+        n += 1;
+    }
+    n
 }
 
 struct SurfaceLocal<const RAW: usize, const NORM: usize> {
@@ -2345,19 +2354,36 @@ pub(super) fn build(
             collect_nonreabsorb_absorbs_before_squeeze_field_op(ops, &pose_wiring, first_short_op)?;
         let ring_elem_bytes = infer_ring_elem_bytes_from_wiring(ring_dim, &pose_wiring)?;
         let nvars_setchk = params.nvars_setchk as usize;
-        // Deterministic cursor (no “find sumcheck” by pattern):
-        // prefix = [public inputs (8-byte scalars)] ++ [dcom commitments (ring elems)] ++ [setchk params + sumcheck ...]
-        // We anchor at the first ring-element absorb, then skip exactly 3 * L * kappa ring elements:
-        //   cm_f (L*kappa), C_Mf (L*kappa), cm_mtau (L*kappa)
-        let first_ring = first_absorb_with_len(&prefix_payload, ring_elem_bytes)
-            .ok_or_else(|| "tiny gate: could not find first ring-elem absorb in prefix".to_string())?;
+        // Deterministic cursor (no searching):
+        //
+        // Match the LF+ verifier schedule (same assumption as `we_gate_arith.rs`):
+        // prefix_absorbs =
+        //   [ statement params (10 scalars, 8 bytes each) ]
+        //   [ public inputs (public_inputs_len scalars, 8 bytes each) ]
+        //   [ dcom commitments: cm_f, C_Mf, cm_mtau (ring elems) ]
+        //   [ setchk sumcheck header + rounds ... ]
+        //
+        // We do NOT try to infer `public_inputs_len` by matching patterns; instead we use the
+        // schedule fact that all initial non-reabsorb absorbs are 8-byte scalars until the first
+        // ring-element absorb begins.
+        let n_scalar_prefix = count_initial_scalar_absorbs(&prefix_payload);
+        if n_scalar_prefix < 10 {
+            return Err("tiny gate: prefix too short for params scalar absorbs (need >=10)".to_string());
+        }
+        if n_scalar_prefix >= prefix_payload.len() {
+            return Err("tiny gate: prefix has no ring-element absorbs".to_string());
+        }
+        if prefix_payload[n_scalar_prefix].1 != ring_elem_bytes {
+            return Err("tiny gate: expected ring-element absorbs immediately after scalar prefix".to_string());
+        }
+
         let kappa = params.kappa as usize;
         let l_instances = l_instances_expected;
         let n_commit_ring_absorbs = 3usize
             .checked_mul(l_instances)
             .and_then(|x| x.checked_mul(kappa))
             .ok_or_else(|| "tiny gate: commitment absorb count overflow (setchk)".to_string())?;
-        let start = first_ring
+        let start = n_scalar_prefix
             .checked_add(n_commit_ring_absorbs)
             .ok_or_else(|| "tiny gate: start overflow (setchk)".to_string())?;
         if start + 2 > prefix_payload.len() {
