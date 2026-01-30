@@ -6403,9 +6403,11 @@ mod tests {
                 let mut ok = true;
                 let mut bs = [0u8; 4];
                 for i in 0..4 {
+                    // IMPORTANT: digits are base-257 elements in 0..=256. Do NOT read only the low
+                    // byte (256 would appear as 0x00); read the full limb so we can detect 256.
                     let du16 = c[i]
                         .into_bigint()
-                        .to_bytes_le()
+                        .as_ref()
                         .get(0)
                         .copied()
                         .unwrap_or(0) as u16;
@@ -6436,7 +6438,8 @@ mod tests {
                     assert_eq!(v.len(), n, "replay squeeze_bytes n mismatch");
                     v.iter()
                         .map(|e| {
-                            let d = e.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u16;
+                            // Read full limb so 256 is represented as 256 (then map to 0).
+                            let d = e.into_bigint().as_ref().get(0).copied().unwrap_or(0) as u16;
                             debug_assert!(d < 257u16);
                             if d == 256 { 0u8 } else { d as u8 }
                         })
