@@ -536,42 +536,8 @@ fn infer_ring_elem_bytes_from_wiring(ring_dim: usize, pose_wiring: &PoseidonDr1c
     ring_elem_bytes.ok_or_else(|| "tiny gate: could not infer ring_elem_bytes".to_string())
 }
 
-fn find_setchk_sumcheck_block_start(
-    prefix_payload: &[(usize, usize)],
-    ring_elem_bytes: usize,
-    nvars_setchk: usize,
-) -> Option<usize> {
-    // Pattern (lengths only):
-    //  - 2 scalar absorbs (8 bytes each): (nvars_setchk, degree=3)
-    //  - nvars rounds: 4 ring absorbs + 1 scalar absorb (r_i as 8 bytes)
-    for start in 0..prefix_payload.len() {
-        if prefix_payload.get(start)?.1 != 8 || prefix_payload.get(start + 1)?.1 != 8 {
-            continue;
-        }
-        let mut cur = start + 2;
-        let mut ok = true;
-        for _ in 0..nvars_setchk {
-            for _ in 0..4 {
-                if prefix_payload.get(cur).map(|x| x.1) != Some(ring_elem_bytes) {
-                    ok = false;
-                    break;
-                }
-                cur += 1;
-            }
-            if !ok {
-                break;
-            }
-            if prefix_payload.get(cur).map(|x| x.1) != Some(8) {
-                ok = false;
-                break;
-            }
-            cur += 1;
-        }
-        if ok {
-            return Some(start);
-        }
-    }
-    None
+fn first_absorb_with_len(prefix_payload: &[(usize, usize)], len: usize) -> Option<usize> {
+    prefix_payload.iter().position(|&(_st, ln)| ln == len)
 }
 
 fn count_comh_ring_elements(
@@ -2379,8 +2345,24 @@ pub(super) fn build(
             collect_nonreabsorb_absorbs_before_squeeze_field_op(ops, &pose_wiring, first_short_op)?;
         let ring_elem_bytes = infer_ring_elem_bytes_from_wiring(ring_dim, &pose_wiring)?;
         let nvars_setchk = params.nvars_setchk as usize;
-        let start = find_setchk_sumcheck_block_start(&prefix_payload, ring_elem_bytes, nvars_setchk)
-            .ok_or_else(|| "tiny gate: could not locate SetChk sumcheck block in prefix absorbs".to_string())?;
+        // Deterministic cursor (no “find sumcheck” by pattern):
+        // prefix = [public inputs (8-byte scalars)] ++ [dcom commitments (ring elems)] ++ [setchk params + sumcheck ...]
+        // We anchor at the first ring-element absorb, then skip exactly 3 * L * kappa ring elements:
+        //   cm_f (L*kappa), C_Mf (L*kappa), cm_mtau (L*kappa)
+        let first_ring = first_absorb_with_len(&prefix_payload, ring_elem_bytes)
+            .ok_or_else(|| "tiny gate: could not find first ring-elem absorb in prefix".to_string())?;
+        let kappa = params.kappa as usize;
+        let l_instances = l_instances_expected;
+        let n_commit_ring_absorbs = 3usize
+            .checked_mul(l_instances)
+            .and_then(|x| x.checked_mul(kappa))
+            .ok_or_else(|| "tiny gate: commitment absorb count overflow (setchk)".to_string())?;
+        let start = first_ring
+            .checked_add(n_commit_ring_absorbs)
+            .ok_or_else(|| "tiny gate: start overflow (setchk)".to_string())?;
+        if start + 2 > prefix_payload.len() {
+            return Err("tiny gate: prefix too short for SetChk header".to_string());
+        }
 
         // Header absorbs: (nvars_setchk, degree=3).
         enforce_absorbed_u64_const(&mut glue, &pose_wiring, prefix_payload[start + 0].0, nvars_setchk as u64);
