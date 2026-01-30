@@ -228,24 +228,6 @@ fn normalize_bal16_loose_same_len_with_bound(
     (Bal16Checked(out), carry)
 }
 
-/// Negate a balanced base-16 digit vector (little-endian), producing digits in [-8,7].
-pub(crate) fn neg_bal16_digits(
-    b: &mut Dr1csBuilder<F257>,
-    x: &Bal16Checked,
-) -> (Bal16Checked, usize /* carry_out */) {
-    let (ir, out_ir, carry_ir) = {
-        let base_asg: &[F257] = &b.assignment;
-        let mut ib = CmIrBuilder::new(base_asg);
-        let x_ir = CmBal16CheckedIr(x.as_slice().iter().copied().map(CmVarRef::Base).collect());
-        let (out_ir, carry_ir) = neg_bal16_digits_ir(&mut ib, &x_ir);
-        (ib.ir, out_ir, carry_ir)
-    };
-    let lowered = lower_ir_into_builder(b, ir);
-    let out: Vec<usize> = out_ir.0.into_iter().map(|v| lowered.map_var(v)).collect();
-    let carry = lowered.map_var(carry_ir);
-    (Bal16Checked(out), carry)
-}
-
 #[inline]
 pub(crate) fn mul_bal16_3_by_digits9(
     b: &mut Dr1csBuilder<F257>,

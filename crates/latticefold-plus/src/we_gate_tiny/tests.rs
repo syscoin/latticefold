@@ -799,18 +799,27 @@ fn test_neg_and_sub_bal16_roundtrip() {
         let xvars = Bal16Checked(xd.iter().map(|&d| alloc_bal16_digit(&mut b, d)).collect());
         let yvars = Bal16Checked(yd.iter().map(|&d| alloc_bal16_digit(&mut b, d)).collect());
 
-        let (nx, c0) = neg_bal16_digits(&mut b, &xvars);
-        let (diff, c1) = {
-            use super::cm_ir::{lower_ir_into_builder, sub_bal16_same_len_ir, Bal16CheckedIr, IrBuilder, VarRef};
-            let base_asg: &[F257] = &b.assignment;
-            let mut ib = IrBuilder::new(base_asg);
+        let (nx, c0, diff, c1) = {
+            use super::cm_ir::{
+                add_bal16_same_len_ir, lower_ir_into_builder, neg_bal16_digits_ir, Bal16CheckedIr, IrBuilder, VarRef,
+            };
+            // Snapshot the current assignment so we can build IR without borrowing `b` immutably
+            // across the subsequent `lower_ir_into_builder(&mut b, ..)` call.
+            let base_asg: Vec<F257> = b.assignment.clone();
+            let mut ib = IrBuilder::new(&base_asg);
             let x_ir = Bal16CheckedIr(xvars.as_slice().iter().copied().map(VarRef::Base).collect());
             let y_ir = Bal16CheckedIr(yvars.as_slice().iter().copied().map(VarRef::Base).collect());
-            let (out_ir, carry_ir) = sub_bal16_same_len_ir(&mut ib, &x_ir, &y_ir);
+
+            let (nx_ir, c0_ir) = neg_bal16_digits_ir(&mut ib, &x_ir);
+            let (neg_y_ir, _carry_neg_y) = neg_bal16_digits_ir(&mut ib, &y_ir);
+            let (diff_ir, c1_ir) = add_bal16_same_len_ir(&mut ib, &x_ir, &neg_y_ir);
+
             let lowered = lower_ir_into_builder(&mut b, ib.ir);
-            let out: Vec<usize> = out_ir.0.into_iter().map(|v| lowered.map_var(v)).collect();
-            let carry = lowered.map_var(carry_ir);
-            (Bal16Checked(out), carry)
+            let nx: Vec<usize> = nx_ir.0.into_iter().map(|v| lowered.map_var(v)).collect();
+            let c0 = lowered.map_var(c0_ir);
+            let diff: Vec<usize> = diff_ir.0.into_iter().map(|v| lowered.map_var(v)).collect();
+            let c1 = lowered.map_var(c1_ir);
+            (Bal16Checked(nx), c0, Bal16Checked(diff), c1)
         };
 
         // For fixed-width 9-digit inputs, enforce no overflow.

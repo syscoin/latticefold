@@ -1373,13 +1373,6 @@ pub(crate) fn neg_bal16_digits_ir(b: &mut IrBuilder<'_>, x: &Bal16CheckedIr) -> 
     (Bal16CheckedIr(out), carry.expect("neg_bal16_digits_ir: non-empty input must produce carry var"))
 }
 
-/// Subtract two balanced base-16 digit vectors of the same length: `a - c`.
-pub(crate) fn sub_bal16_same_len_ir(b: &mut IrBuilder<'_>, a: &Bal16CheckedIr, c: &Bal16CheckedIr) -> (Bal16CheckedIr, VarRef) {
-    assert_eq!(a.len(), c.len());
-    let (neg_c, _carry_neg) = neg_bal16_digits_ir(b, c);
-    add_bal16_same_len_ir(b, a, &neg_c)
-}
-
 /// Compute the balanced-digit carry-out bit for a nibble.
 ///
 /// Inputs are boolean vars:
