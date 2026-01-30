@@ -506,16 +506,17 @@ where
         for _ in 0..nvars_lin {
             let _ = tr.get_challenge();
         }
-        // absorb (nvars, degree=3) as scalars
-        tr.absorb_field_element(&BF::<R>::ZERO);
-        tr.absorb_field_element(&BF::<R>::ZERO);
+        // absorb (nvars, degree=3) as scalars (matches MLSumcheck::verify_as_subprotocol header)
+        tr.absorb_field_element(&BF::<R>::from(nvars_lin as u64));
+        tr.absorb_field_element(&BF::<R>::from(3u64));
         // rounds: 4 ring evals + challenge + explicit absorb
         for _ in 0..nvars_lin {
             for _ in 0..4 {
                 tr.absorb(&R::ZERO);
             }
-            let _ = tr.get_challenge();
-            tr.absorb_field_element(&BF::<R>::ZERO);
+            let ri = tr.get_challenge();
+            // Verifier explicitly absorbs the sampled challenge as a scalar.
+            tr.absorb_field_element(&ri);
         }
         // absorb (v,va,vb,vc) (ring, len=d each)
         for _ in 0..4 {
@@ -568,14 +569,14 @@ where
     }
 
     // MLSumcheck::verify_as_subprotocol header (nvars, degree=3) as scalars.
-    tr.absorb_field_element(&BF::<R>::ZERO);
-    tr.absorb_field_element(&BF::<R>::ZERO);
+    tr.absorb_field_element(&BF::<R>::from(out_nvars as u64));
+    tr.absorb_field_element(&BF::<R>::from(3u64));
     for _ in 0..out_nvars {
         for _ in 0..4 {
             tr.absorb(&R::ZERO);
         }
-        let _ = tr.get_challenge();
-        tr.absorb_field_element(&BF::<R>::ZERO);
+        let ri = tr.get_challenge();
+        tr.absorb_field_element(&ri);
     }
 
     // absorb_evaluations_digest(out.e, out.b): Ajtai aggregate commitment (kappa ring elems).
@@ -622,8 +623,8 @@ where
             for _ in 0..3 {
                 tr.absorb(&R::ZERO);
             }
-            let _ = tr.get_challenge();
-            tr.absorb_field_element(&BF::<R>::ZERO);
+            let ri = tr.get_challenge();
+            tr.absorb_field_element(&ri);
         }
         // CM eval tables: L instances, with (1+mlen_mats) rows each, each row has 4 ring elems.
         for _ in 0..l_instances {
