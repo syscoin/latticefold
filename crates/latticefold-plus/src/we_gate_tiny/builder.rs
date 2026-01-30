@@ -33,7 +33,7 @@ use super::goldilocks::{
     reduce_u64_mod_goldilocks_from_byte_vars,
     GoldilocksScalar,
 };
-use super::gadgets::{alloc_byte, decompose_existing_byte_var_to_bits, enforce_var_eq};
+use super::gadgets::{alloc_byte, decompose_existing_byte_var_to_bits};
 use super::params::DIGITS_PER_TRY;
 use super::poseidon::poseidon_f257_arithmetize;
 use super::surfaces::{CmDigitMulSqSurfaceWiring, CmDigitMulSurfaceWiring};

@@ -1786,29 +1786,6 @@ fn ring_mul_negacyclic_toom4<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVar
     RingVars::new(out)
 }
 
-#[inline]
-fn toom4_points_distinct<F: PrimeField>() -> bool {
-    // Toom-4 uses points {0, ±1, ±2, ±3}. In small-characteristic prime fields (notably p∈{2,3,5})
-    // these collide (e.g. 3 == -2 mod 5), making the Vandermonde singular.
-    let pts = [
-        F::from(0u64),
-        F::from(1u64),
-        -F::from(1u64),
-        F::from(2u64),
-        -F::from(2u64),
-        F::from(3u64),
-        -F::from(3u64),
-    ];
-    for i in 0..7 {
-        for j in (i + 1)..7 {
-            if pts[i] == pts[j] {
-                return false;
-            }
-        }
-    }
-    true
-}
-
 fn ring_mul_negacyclic<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: &RingVars) -> RingVars {
     cm_bump(|c| c.ring_mul_negacyclic += 1);
     let d = x.d();
@@ -7220,176 +7197,187 @@ mod tests {
             };
             let poseidon_cfg = PCF::get_poseidon_config();
 
-            let t2 = std::time::Instant::now();
-            let shape = build_we_dr1cs_for_plus_proof_shape::<RR>(
-                &poseidon_cfg,
-                &params,
-                sp1_digest_bits.len(),
-                proof.lproof.len(),
-                m0.len(),
-            )
-            .expect("build we dr1cs shape");
-            let assignment = build_we_dr1cs_for_plus_proof_witness::<RR>(
-                &poseidon_cfg,
-                &trace,
-                &params,
-                sp1_digest_bits,
-                &proof,
-                m0.len(),
-                b_bound,
-            )
-            .expect("build we dr1cs witness");
-            shape.inst.check(&assignment).expect("dr1cs sat");
-            eprintln!(
-                "[test_large_trace] build_we_dr1cs: {:?} (nvars={}, constraints={})",
-                t2.elapsed(),
-                shape.inst.nvars,
-                shape.inst.constraints.len()
-            );
+            // NOTE: this benchmark is now tiny-gate focused; we intentionally skip building the
+            // large-field WE gate here.
 
-            // DPP verification (single query).
-            let t3 = std::time::Instant::now();
-            // Avoid cloning multi-million sparse rows: consume the constraints and move (a,b,c) out.
-            let (inst, assignment, public_len) = (shape.inst, assignment, shape.public_len);
-            let symphony::dpp_poseidon::SparseDr1csInstance {
-                nvars: n,
-                constraints,
-                a_terms,
-                b_terms,
-                c_terms,
-            } = inst;
-            let mut a = Vec::with_capacity(constraints.len());
-            let mut b = Vec::with_capacity(constraints.len());
-            let mut c = Vec::with_capacity(constraints.len());
-            for row in constraints {
-                a.push(SparseVec::new(a_terms[row.a.clone()].to_vec()));
-                b.push(SparseVec::new(b_terms[row.b.clone()].to_vec()));
-                c.push(SparseVec::new(c_terms[row.c.clone()].to_vec()));
-            }
-            let inst_sparse = DppInst::<FSmall> { n, a, b, c };
-            eprintln!("[test_large_trace] dr1cs->sparse: {:?}", t3.elapsed());
-            let k_rows = inst_sparse.k();
-            let ell_rs = 2 * k_rows;
-            let l_public = public_len;
-            let flpcp = dpp::dr1cs_flpcp::RsDr1csNpFlpcpSparse::<FSmall>::new(inst_sparse, l_public, ell_rs);
-
-            // Build the packed DPP verifier object (parameters + decoding), which is armer-time
-            // public information. This does not require the witness.
-            let t6 = std::time::Instant::now();
-            let dppv = build_rev2_dpp_sparse_boolean_auto::<FSmall, FBig, _>(
-                flpcp.clone(),
-                dpp::EmbeddingParams { gamma: 2, assume_boolean_proof: true, k_prime: 0 },
-            )
-            .expect("build dpp");
-            eprintln!("[test_large_trace] build_rev2_dpp: {:?}", t6.elapsed());
-
-            // ---------------------------------------------------------------------
-            // Armer-time: derive the query "coin" from statement-bound randomness.
-            // ---------------------------------------------------------------------
-            let vk_hash = [1u8; 32];
-            let r1cs_digest = [2u8; 32];
-            let stmt_digest = we_statement_hash_lf_plus::<RR>(
-                vk_hash,
-                r1cs_digest,
-                LFP_WE_GATE_DIGEST_V1,
-                &params,
-                sp1_digest_bits,
-            );
-            const ARMER_SEED: [u8; 32] = *b"LFP_ARMER_SEED_V1_00000000000000";
-            let lock_j: u64 = 0;
-            let coin_seed: [u8; 32] = {
-                let mut h = Sha256::new();
-                h.update(b"LFP_LOCK_COIN_V1");
-                h.update(&ARMER_SEED);
-                h.update(&stmt_digest);
-                h.update(&lock_j.to_le_bytes());
-                h.finalize().into()
-            };
-            let mut rng = StdRng::from_seed(coin_seed);
-            // NOTE: `dppv.sample_query()` expands to a huge packed query vector and can be
-            // O(|constraints|) for RS-FLPCP instances (k = #rows). For SP1-scale k this is not viable.
+            // -------------------------------------------------------------
+            // Tiny gate (Poseidon(F257) + digit-domain verifier math)
+            // -------------------------------------------------------------
             //
-            // Instead: sample coins (idx, λ) + packing weights, answer the 3 RS-FLPCP queries in coin
-            // form (by indexing cached codewords), then pack/decode.
-            let t7 = std::time::Instant::now();
-            let b = dppv.flpcp.bounds_b();
-            let w = sample_packing_weights::<FBig>(&mut rng, dppv.params.ell, &b).expect("sample_packing_weights");
-            let pred = FlpcpPredicate::MulEqModP {
-                p_small: num_bigint::BigInt::from_bytes_le(
-                    num_bigint::Sign::Plus,
-                    &FSmall::MODULUS.to_bytes_le(),
-                ),
-            };
-            let idx = (rng.next_u64() as usize) % ell_rs;
-            let lambda_small = FSmall::from(rng.next_u64());
-            eprintln!(
-                "[test_large_trace] lock coins: idx={idx} (ell_rs={ell_rs}, k_rows={k_rows})"
-            );
-
-            let t4 = std::time::Instant::now();
-            let x_small = assignment[..l_public].to_vec();
-            let z_w_small = assignment[l_public..].to_vec();
-            eprintln!(
-                "[test_large_trace] sizes: l_public={} witness_len={} assignment_len={}",
-                l_public,
-                z_w_small.len(),
-                assignment.len()
-            );
-            let (pi_field, cw) = flpcp.prove_with_codewords(&x_small, &z_w_small);
-            eprintln!(
-                "[test_large_trace] flpcp.prove_with_codewords: {:?} (pi_field_len={})",
-                t4.elapsed(),
-                pi_field.len()
-            );
-            let t5 = std::time::Instant::now();
-            let boolized = dpp::BooleanProofFlpcpSparse::<FSmall, _>::new(flpcp.clone());
-            // Keep proof bits bitpacked to avoid multi-GB allocations.
-            let pi_bits_packed = boolized.encode_proof_bits_packed(&pi_field);
-            eprintln!(
-                "[test_large_trace] booleanize(pi)_packed: {:?} (pi_bits_len={}, packed_bytes={})",
-                t5.elapsed(),
-                boolized.m_bits(),
-                pi_bits_packed.len()
-            );
-
-            let t_xbig = std::time::Instant::now();
-            drop(x_small.iter().copied().map(lift_to_big::<FSmall>).collect::<Vec<_>>());
-            eprintln!("[test_large_trace] lift x_small->x_big: {:?}", t_xbig.elapsed());
-
-            let (a_small, b_small, c_small) = if idx < k_rows {
-                let a = cw.y_a[idx];
-                let b0 = cw.y_b[idx];
-                let wv = cw.w[idx];
-                let cx_minus = cw.y_c[idx] - wv;
-                let c = wv + lambda_small * cx_minus;
-                (a, b0, c)
-            } else {
-                let j = idx - k_rows;
-                let a = cw.y_a_tail[j];
-                let b0 = cw.y_b_tail[j];
-                let wv = cw.w[idx];
-                // Tail-half: the C-part is unused in q3; answer is just w(α)=a*b.
-                let c = wv;
-                (a, b0, c)
-            };
-
-            let ans_field: [FBig; 3] = [
-                lift_to_big::<FSmall>(a_small),
-                lift_to_big::<FSmall>(b_small),
-                lift_to_big::<FSmall>(c_small),
-            ];
-
-            // Pack into one integer a_int = Σ w_i * [ans_i]_centered, then reduce to field.
-            let mut a_int = num_bigint::BigInt::from(0);
-            for (wi, ai) in w.iter().zip(ans_field.iter()) {
-                let ai_int = field_to_centered_bigint::<FBig>(ai);
-                a_int += wi * ai_int;
+            // Build the full tiny gate from the **real proof trace** and check satisfaction.
+            // This gives the closest estimate of the eventual F257 verifier-gate size.
+            let t_tiny = std::time::Instant::now();
+            let ring_dim = RR::dimension();
+            if ring_dim != 64 {
+                panic!("test_large_trace: tiny gate only supports ring_dim=64");
             }
-            let a = centered_bigint_to_field::<FBig>(&a_int);
+            let pairs: Vec<(usize, usize)> = vec![(0, 0)]; // minimal surface exercise
 
-            let q_meta = PackedDppQuerySparse::<FBig> { q: dpp::sparse::SparseVec::default(), w, b, pred };
-            let ok = dppv.verify_packed_answer(&a, &q_meta).expect("verify_packed_answer");
-            eprintln!("[test_large_trace] dpp lock_check(coin-form): {:?} ok={ok}", t7.elapsed());
+            #[inline]
+            fn base_to_u64<BR: PrimeField>(x: BR) -> u64 {
+                x.into_bigint().as_ref().get(0).copied().unwrap_or(0)
+            }
+            #[inline]
+            fn ring_to_u64_coeffs<Rr: PolyRing>(r: &Rr) -> Vec<u64>
+            where
+                Rr::BaseRing: PrimeField,
+            {
+                r.coeffs()
+                    .iter()
+                    .copied()
+                    .map(base_to_u64::<Rr::BaseRing>)
+                    .collect()
+            }
+
+            let kappa_usize = params.kappa as usize;
+            let eval_len = 1usize + m0.len();
+            let vlen = eval_len;
+
+            let mut dcom_eval_b: Vec<Vec<Vec<u64>>> = Vec::new();
+            let mut dcom_eval_v: Vec<Vec<u64>> = Vec::new();
+            for ev in &proof.cmproof.dcom.evals {
+                if ev.b.len() != eval_len {
+                    panic!("test_large_trace: tiny gate dcom.evals[*].b length mismatch");
+                }
+                if ev.v.len() != ring_dim {
+                    panic!("test_large_trace: tiny gate dcom.evals[*].v length mismatch");
+                }
+                dcom_eval_b.push(ev.b.iter().map(|r| ring_to_u64_coeffs::<RR>(r)).collect());
+                dcom_eval_v.push(ev.v.iter().copied().map(base_to_u64::<BR>).collect());
+            }
+            if proof.dproof.C.0.len() != kappa_usize || proof.dproof.C.1.len() != kappa_usize {
+                panic!("test_large_trace: tiny gate dproof.C length mismatch with kappa");
+            }
+            if proof.dproof.v.0.len() != vlen || proof.dproof.v.1.len() != vlen {
+                panic!("test_large_trace: tiny gate dproof.v length mismatch with vlen");
+            }
+            if proof.linb2x.cm_g.len() != kappa_usize {
+                panic!("test_large_trace: tiny gate linb2x.cm_g length mismatch with kappa");
+            }
+            if proof.linb2x.vo.len() != vlen {
+                panic!("test_large_trace: tiny gate linb2x.vo length mismatch with vlen");
+            }
+
+            let extra = tiny::TinyExtraWitness {
+                dcom_eval_b,
+                dcom_eval_v,
+                decomp_c0: proof
+                    .dproof
+                    .C
+                    .0
+                    .iter()
+                    .map(|r| ring_to_u64_coeffs::<RR>(r))
+                    .collect(),
+                decomp_c1: proof
+                    .dproof
+                    .C
+                    .1
+                    .iter()
+                    .map(|r| ring_to_u64_coeffs::<RR>(r))
+                    .collect(),
+                decomp_v0a: proof
+                    .dproof
+                    .v
+                    .0
+                    .iter()
+                    .map(|(a, _)| ring_to_u64_coeffs::<RR>(a))
+                    .collect(),
+                decomp_v0b: proof
+                    .dproof
+                    .v
+                    .0
+                    .iter()
+                    .map(|(_, b)| ring_to_u64_coeffs::<RR>(b))
+                    .collect(),
+                decomp_v1a: proof
+                    .dproof
+                    .v
+                    .1
+                    .iter()
+                    .map(|(a, _)| ring_to_u64_coeffs::<RR>(a))
+                    .collect(),
+                decomp_v1b: proof
+                    .dproof
+                    .v
+                    .1
+                    .iter()
+                    .map(|(_, b)| ring_to_u64_coeffs::<RR>(b))
+                    .collect(),
+                linb2x_cm_g: proof
+                    .linb2x
+                    .cm_g
+                    .iter()
+                    .map(|r| ring_to_u64_coeffs::<RR>(r))
+                    .collect(),
+                linb2x_vo_a: proof
+                    .linb2x
+                    .vo
+                    .iter()
+                    .map(|(a, _)| ring_to_u64_coeffs::<RR>(a))
+                    .collect(),
+                linb2x_vo_b: proof
+                    .linb2x
+                    .vo
+                    .iter()
+                    .map(|(_, b)| ring_to_u64_coeffs::<RR>(b))
+                    .collect(),
+            };
+
+            let ops_f257 =
+                tiny::lift_recording_trace_ops_to_f257::<BF<RR>>(&trace.ops).expect("lift ops to F257");
+            let squeeze_field_op_offset =
+                first_squeeze_field_op_index_of_len(&ops_f257, ring_dim).expect("first short squeeze exists");
+            let prefix_u32_squeeze_ops =
+                collect_get_challenge_squeeze_field_indices(&ops_f257, 0, squeeze_field_op_offset);
+            let k = params.k as usize;
+            let log_kappa = ark_std::log2((params.kappa as usize).next_power_of_two()) as usize;
+            let nvars_cm = params.nvars_cm as usize;
+            let wiring_rel = tiny::infer_cm_coin_op_wiring_from_ops(
+                &ops_f257,
+                ring_dim,
+                k,
+                log_kappa,
+                nvars_cm,
+                squeeze_field_op_offset,
+                0,
+            )
+            .expect("infer cm coin wiring (tiny)");
+            let mut wiring_abs = tiny::TinyCoinOpWiring::default();
+            wiring_abs.short_squeeze_ops = wiring_rel
+                .short_squeeze_ops
+                .into_iter()
+                .map(|i| i + squeeze_field_op_offset)
+                .collect();
+            wiring_abs.u32_squeeze_ops = wiring_rel
+                .u32_squeeze_ops
+                .into_iter()
+                .map(|i| i + squeeze_field_op_offset)
+                .collect();
+            wiring_abs
+                .u32_squeeze_ops
+                .splice(0..0, prefix_u32_squeeze_ops.into_iter());
+            wiring_abs.goldilocks_squeeze_ops = Vec::new();
+
+            let (tiny_inst, tiny_asg, _shorts, _u32s, _gold, _gold_rej, _tcch0, _tcch1, _sm, _ssq, _pose_wiring) =
+                tiny::we_tiny_f257_build_cm_gate_from_trace_ops_with_extra_witness(
+                    None,
+                    &ops_f257,
+                    ring_dim,
+                    &params,
+                    &wiring_abs,
+                    &pairs,
+                    Some(&extra),
+                )
+                .expect("build tiny gate from real trace");
+            tiny_inst.check(&tiny_asg).expect("tiny gate dr1cs sat");
+            eprintln!(
+                "[test_large_trace] build_we_tiny_gate: {:?} (nvars={}, constraints={})",
+                t_tiny.elapsed(),
+                tiny_inst.nvars,
+                tiny_inst.constraints.len()
+            );
+            // NOTE: We also intentionally skip the DPP pipeline here; it depends on building the
+            // large-field WE gate and is orthogonal to validating the tiny gate.
         };
 
         run_one("sha256->bits", &sp1_digest_bits);
