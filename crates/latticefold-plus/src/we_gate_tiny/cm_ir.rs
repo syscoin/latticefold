@@ -1609,22 +1609,6 @@ fn u64_to_bal4_digits_le_const(x: u64) -> [i8; 33] {
     out
 }
 
-/// Allocate u64 as balanced base-4 digits **without bit-backed digit checks**.
-///
-/// This relies on subsequent carry-chain constraints (with bounded carries) for injectivity;
-/// we keep the top carry as a boolean since it is semantically a bit.
-#[inline]
-fn alloc_u64_as_bal4_digits_raw_ir(b: &mut IrBuilder<'_>, x: u64) -> [VarRef; 33] {
-    let ds = u64_to_bal4_digits_le_const(x);
-    debug_assert!(ds[32] == 0 || ds[32] == 1);
-    let mut out: [VarRef; 33] = [VarRef::Base(0); 33];
-    for i in 0..32 {
-        out[i] = b.new_var(i32_to_f257(ds[i] as i32));
-    }
-    out[32] = alloc_bool_ir(b, ds[32] == 1);
-    out
-}
-
 /// Allocate u64 as balanced base-4 digits with explicit digit membership checks.
 ///
 /// This is more expensive than `_raw_` but closes a soundness hole: without digit membership
@@ -3000,12 +2984,12 @@ mod soundness_regression_tests {
             let base_asg = [F257::ONE];
             let mut ib = IrBuilder::new(&base_asg);
 
-            let x4 = alloc_u64_as_bal4_digits_raw_ir(&mut ib, x);
+            let x4 = alloc_u64_as_bal4_digits_checked_ir(&mut ib, x);
             let prod: u128 = (x as u128) * (k as u128);
             let q_u: u64 = (prod / (p as u128)) as u64;
             let r_u: u64 = (prod % (p as u128)) as u64;
-            let q4 = alloc_u64_as_bal4_digits_raw_ir(&mut ib, q_u);
-            let r4 = alloc_u64_as_bal4_digits_raw_ir(&mut ib, r_u);
+            let q4 = alloc_u64_as_bal4_digits_checked_ir(&mut ib, q_u);
+            let r4 = alloc_u64_as_bal4_digits_checked_ir(&mut ib, r_u);
             let k4 = u64_to_bal4_digits_le_const(k);
 
             // Use a simple bounded-carry chain (pm32 everywhere is enough to reject the bubble).
