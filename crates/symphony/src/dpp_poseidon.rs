@@ -226,32 +226,37 @@ pub fn merge_sparse_dr1cs_share_one<F: PrimeField + Copy + Send + Sync>(
     // Rayon requires captured state to be `Sync`; raw pointers are not `Sync` by default.
     // We wrap them and assert (by construction) that each thread writes to disjoint ranges.
     #[derive(Copy, Clone)]
+    struct SyncPtr<T>(*mut T);
+    unsafe impl<T> Send for SyncPtr<T> {}
+    unsafe impl<T> Sync for SyncPtr<T> {}
+
+    #[derive(Copy, Clone)]
     struct OutPtrs<F> {
-        asg: *mut F,
-        rows: *mut Constraint,
-        a: *mut (F, usize),
-        b: *mut (F, usize),
-        c: *mut (F, usize),
+        asg: SyncPtr<F>,
+        rows: SyncPtr<Constraint>,
+        a: SyncPtr<(F, usize)>,
+        b: SyncPtr<(F, usize)>,
+        c: SyncPtr<(F, usize)>,
     }
     unsafe impl<F> Send for OutPtrs<F> {}
     unsafe impl<F> Sync for OutPtrs<F> {}
 
     let out = OutPtrs {
-        asg: merged_assignment.as_mut_ptr(),
-        rows: merged_constraints.as_mut_ptr(),
-        a: merged_a_terms.as_mut_ptr(),
-        b: merged_b_terms.as_mut_ptr(),
-        c: merged_c_terms.as_mut_ptr(),
+        asg: SyncPtr(merged_assignment.as_mut_ptr()),
+        rows: SyncPtr(merged_constraints.as_mut_ptr()),
+        a: SyncPtr(merged_a_terms.as_mut_ptr()),
+        b: SyncPtr(merged_b_terms.as_mut_ptr()),
+        c: SyncPtr(merged_c_terms.as_mut_ptr()),
     };
 
     // Fill all output buffers in parallel, one part per task.
     parts
         .into_par_iter()
         .enumerate()
-        .for_each(|(i, (inst, asg))| unsafe {
+        .for_each(move |(i, (inst, asg))| unsafe {
             // Assignment tail copy.
             let vo = var_offsets[i];
-            let out_asg = out.asg.add(1 + vo);
+            let out_asg = out.asg.0.add(1 + vo);
             core::ptr::copy_nonoverlapping(asg.as_ptr().add(1), out_asg, asg.len().saturating_sub(1));
 
             // Terms with var-index remap.
@@ -261,7 +266,7 @@ pub fn merge_sparse_dr1cs_share_one<F: PrimeField + Copy + Send + Sync>(
                 if new_idx != 0 {
                     new_idx += vo;
                 }
-                *out.a.add(ao + j) = (coeff, new_idx);
+                *out.a.0.add(ao + j) = (coeff, new_idx);
             }
             let bo = b_offsets[i];
             for (j, (coeff, idx)) in inst.b_terms.iter().copied().enumerate() {
@@ -269,7 +274,7 @@ pub fn merge_sparse_dr1cs_share_one<F: PrimeField + Copy + Send + Sync>(
                 if new_idx != 0 {
                     new_idx += vo;
                 }
-                *out.b.add(bo + j) = (coeff, new_idx);
+                *out.b.0.add(bo + j) = (coeff, new_idx);
             }
             let co = c_offsets[i];
             for (j, (coeff, idx)) in inst.c_terms.iter().copied().enumerate() {
@@ -277,13 +282,13 @@ pub fn merge_sparse_dr1cs_share_one<F: PrimeField + Copy + Send + Sync>(
                 if new_idx != 0 {
                     new_idx += vo;
                 }
-                *out.c.add(co + j) = (coeff, new_idx);
+                *out.c.0.add(co + j) = (coeff, new_idx);
             }
 
             // Constraints with term-range remap.
             let ro = row_offsets[i];
             for (j, row) in inst.constraints.iter().enumerate() {
-                *out.rows.add(ro + j) = Constraint {
+                *out.rows.0.add(ro + j) = Constraint {
                     a: (ao + row.a.start)..(ao + row.a.end),
                     b: (bo + row.b.start)..(bo + row.b.end),
                     c: (co + row.c.start)..(co + row.c.end),
