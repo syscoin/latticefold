@@ -2656,7 +2656,17 @@ pub(super) fn build(
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or_else(|| (n_threads * 2).min(256).max(1))
+        .unwrap_or_else(|| {
+            // Heuristic: pick a chunk count that keeps per-chunk work non-trivial to avoid
+            // creating hundreds of tiny glue modules (which makes `merge_sparse_dr1cs_share_one`
+            // dominate wall-time).
+            //
+            // For small traces, aim for ~256 absorb-ranges per chunk; for huge traces, cap to
+            // ~2x threads (and 256 overall) for good parallelism without exploding merge parts.
+            let target_chunk_ranges: usize = 256;
+            let by_work = (canonical_ranges.len() + target_chunk_ranges - 1) / target_chunk_ranges;
+            by_work.max(1).min((n_threads * 2).min(256).max(1))
+        })
         .min(canonical_ranges.len().max(1));
     let chunk_size = (canonical_ranges.len() + n_chunks - 1) / n_chunks;
     if lf_mem_on() || tiny_opmix_on() {
