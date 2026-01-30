@@ -777,208 +777,82 @@ fn build_u32_and_goldilocks_blocks(
     Ok((u32_out, goldilocks_out))
 }
 
-fn compute_tcch(
+fn compute_tcch_from_comh_absorbs(
     glue: &mut GlueCtx,
-    ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
     ring_dim: usize,
     params: &WeParams,
     wiring: &TinyCoinOpWiring,
     u32_locals: &[BoundedU32ChallengeWiring],
+    comh_absorbs: &[(usize, usize)],
+    l_instances_expected: usize,
 ) -> Result<(Vec<[usize; 8]>, Vec<[usize; 8]>), String> {
-    // Preserves exact existing behavior; only moved out for readability/audit.
-    let mut tcch0_local: Vec<[usize; 8]> = Vec::new();
-    let mut tcch1_local: Vec<[usize; 8]> = Vec::new();
-
-    #[inline]
-    fn alloc_const_byte(gb: &mut Dr1csBuilder<F257>, v: u8) -> usize {
-        let x = gb.new_var(F257::from(v as u64));
-        gb.enforce_var_eq_const(x, F257::from(v as u64));
-        let _ = decompose_existing_byte_var_to_bits::<F257>(gb, x);
-        x
+    // Compute exported coefficient-0 surfaces:
+    //   tcch{0,1}[l] = Σ_j comh[l][j] * tensor_c{0,1}[j]
+    // where tensor_c{0,1} are derived from the CM c0/c1 u32 challenges.
+    //
+    // IMPORTANT: only use the *parsed* `comh_absorbs` ranges (L*kappa ring elements) to avoid
+    // accidentally sweeping in the CM sumcheck prover messages / eval tables.
+    let kappa = params.kappa as usize;
+    if ring_dim == 0 || l_instances_expected == 0 || kappa == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if !kappa.is_power_of_two() {
+        return Err("tiny gate: params.kappa must be a power of two".to_string());
+    }
+    if comh_absorbs.len() != l_instances_expected * kappa {
+        return Err("tiny gate: comh_absorbs length mismatch while computing tcch".to_string());
     }
 
-    #[inline]
-    fn goldilocks_bytes_from_u32_le_bytes(gb: &mut Dr1csBuilder<F257>, u32_le: &[usize; 4]) -> [usize; 8] {
-        let mut out = [0usize; 8];
-        out[0..4].copy_from_slice(u32_le);
-        for i in 4..8 {
-            out[i] = alloc_const_byte(gb, 0u8);
-        }
-        goldilocks_u64_enforce_lt_p_from_byte_vars::<F257>(gb, &out);
-        out
+    let log_kappa = ark_std::log2(kappa.next_power_of_two()) as usize;
+    let cm_u32_start = cm_u32_start_idx(wiring);
+    let c0_start = cm_u32_start;
+    let c1_start = cm_u32_start + log_kappa;
+    if c1_start + log_kappa > u32_locals.len() {
+        return Err("tiny gate: u32_locals too short for tcch c0/c1".to_string());
     }
 
-    if ring_dim > 0 && !wiring.short_squeeze_ops.is_empty() && !wiring.u32_squeeze_ops.is_empty() {
-        let mut ring_elem_bytes: Option<usize> = None;
-        for &(_st, ln) in &pose_wiring.absorb_ranges {
-            if ln % ring_dim == 0 && ln > ring_dim {
-                ring_elem_bytes = Some(match ring_elem_bytes {
-                    None => ln,
-                    Some(cur) => cur.min(ln),
-                });
-            }
+    // c0/c1 challenges are bounded-u32 embedded in Goldilocks; represent them as canonical Goldilocks bytes
+    // by padding with 4 zeros (value < 2^32 < p).
+    let mut c0_bytes: Vec<[usize; 8]> = Vec::with_capacity(log_kappa);
+    let mut c1_bytes: Vec<[usize; 8]> = Vec::with_capacity(log_kappa);
+    for i in 0..log_kappa {
+        c0_bytes.push(goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &u32_locals[c0_start + i].byte_vars));
+        c1_bytes.push(goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &u32_locals[c1_start + i].byte_vars));
+    }
+
+    let c0_digits: Vec<GoldilocksScalar> = c0_bytes
+        .iter()
+        .copied()
+        .map(|b| goldilocks_bytes_to_digits(&mut glue.gb, b))
+        .collect();
+    let c1_digits: Vec<GoldilocksScalar> = c1_bytes
+        .iter()
+        .copied()
+        .map(|b| goldilocks_bytes_to_digits(&mut glue.gb, b))
+        .collect();
+    let tensor_c0 = tensor_goldilocks_scalars_digits(&mut glue.gb, &c0_digits);
+    let tensor_c1 = tensor_goldilocks_scalars_digits(&mut glue.gb, &c1_digits);
+
+    let mut tcch0_local: Vec<[usize; 8]> = Vec::with_capacity(l_instances_expected);
+    let mut tcch1_local: Vec<[usize; 8]> = Vec::with_capacity(l_instances_expected);
+
+    let mut idx = 0usize;
+    for _l in 0..l_instances_expected {
+        let mut acc0 = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+        let mut acc1 = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+        for j in 0..kappa {
+            let (st, ln) = comh_absorbs[idx];
+            idx += 1;
+            let rb = parse_ring_elem_absorb_as_ringbytes(glue, pose_wiring, ring_dim, st, ln)?;
+            let ch = ring_bytes_to_digits(&mut glue.gb, &rb);
+            let m0 = ring_scale_digits(&mut glue.gb, &ch, &tensor_c0[j]);
+            let m1 = ring_scale_digits(&mut glue.gb, &ch, &tensor_c1[j]);
+            acc0 = ring_add_digits(&mut glue.gb, &acc0, &m0);
+            acc1 = ring_add_digits(&mut glue.gb, &acc1, &m1);
         }
-        if let Some(reb) = ring_elem_bytes {
-            let coeff_bytes = reb / ring_dim;
-            if coeff_bytes > 0 {
-                let last_short_op = *wiring
-                    .short_squeeze_ops
-                    .iter()
-                    .max()
-                    .expect("non-empty short_squeeze_ops");
-                let first_short_op = *wiring
-                    .short_squeeze_ops
-                    .iter()
-                    .min()
-                    .expect("non-empty short_squeeze_ops");
-
-                let cm_u32_start = wiring
-                    .u32_squeeze_ops
-                    .iter()
-                    .filter(|&&idx| idx < first_short_op)
-                    .count();
-                if cm_u32_start < wiring.u32_squeeze_ops.len() {
-                    let first_cm_u32_op = wiring.u32_squeeze_ops[cm_u32_start];
-
-                    let mut absorb_idx = 0usize;
-                    let mut squeeze_field_op_idx = 0usize;
-                    let mut after_short = false;
-                    let mut comh_absorb_ranges: Vec<(usize, usize)> = Vec::new();
-                    for op in ops {
-                        match op {
-                            PoseidonTraceOp::Absorb(_v) => {
-                                let (ab_start, ab_len) = *pose_wiring
-                                    .absorb_ranges
-                                    .get(absorb_idx)
-                                    .ok_or("tiny gate: pose_wiring.absorb_ranges oob")?;
-                                absorb_idx += 1;
-                                if after_short && squeeze_field_op_idx <= first_cm_u32_op {
-                                    comh_absorb_ranges.push((ab_start, ab_len));
-                                }
-                            }
-                            PoseidonTraceOp::SqueezeField(_v) => {
-                                if squeeze_field_op_idx == last_short_op {
-                                    after_short = true;
-                                }
-                                squeeze_field_op_idx += 1;
-                            }
-                            PoseidonTraceOp::SqueezeBytes { .. } => {}
-                        }
-                    }
-
-                    let mut coh0_bytes: Vec<[usize; 8]> = Vec::new();
-                    let mut comh_all_coeff_bytes: Vec<Vec<[usize; 8]>> = Vec::new();
-                    for &(ab_start, ab_len) in &comh_absorb_ranges {
-                        if ab_len < reb || (ab_len % reb) != 0 {
-                            continue;
-                        }
-                        let n_blocks = ab_len / reb;
-                        for blk in 0..n_blocks {
-                            let blk_start = ab_start + blk * reb;
-                            // Each ring element is encoded as `ring_dim` coefficients, each coefficient as
-                            // `coeff_bytes` bytes (little-endian, canonical for Goldilocks base field).
-                            if coeff_bytes != 8 {
-                                return Err(format!(
-                                    "tiny gate: expected Goldilocks base-field coeff_bytes=8 for CM verifier, got {coeff_bytes}"
-                                ));
-                            }
-
-                            let mut coeffs: Vec<[usize; 8]> = vec![[0usize; 8]; ring_dim];
-                            for coeff in 0..ring_dim {
-                                let coeff_start = blk_start + coeff * coeff_bytes;
-                                for i in 0..8 {
-                                    let gv = pose_wiring.absorb_vars[coeff_start + i];
-                                    let lv = glue.copy_digit(gv);
-                                    coeffs[coeff][i] = lv;
-                                }
-                            }
-                            coh0_bytes.push(coeffs[0]);
-                            comh_all_coeff_bytes.push(coeffs);
-                        }
-                    }
-
-                    let n_comh_elems = coh0_bytes.len();
-                    if n_comh_elems > 0 {
-                        let kappa = params.kappa as usize;
-                        if kappa == 0 || !kappa.is_power_of_two() {
-                            return Err("tiny gate: params.kappa must be a power of two".to_string());
-                        }
-                        if (n_comh_elems % kappa) != 0 {
-                            return Err("tiny gate: comh length not divisible by kappa".to_string());
-                        }
-                        let lg = usize::BITS as usize - 1 - kappa.leading_zeros() as usize;
-                        let l_instances = n_comh_elems / kappa;
-
-                        let c0_start = cm_u32_start;
-                        let c1_start = cm_u32_start + lg;
-                        if c1_start + lg <= u32_locals.len() {
-                            // Challenges c0/c1 are transcript `get_challenge()` outputs: bounded u32 embedded
-                            // into the Goldilocks base field. Represent them as canonical Goldilocks bytes by padding the
-                            // 4-byte u32 with 4 zero bytes (so value < 2^32 < p).
-                            let mut c0_bytes: Vec<[usize; 8]> = Vec::with_capacity(lg);
-                            let mut c1_bytes: Vec<[usize; 8]> = Vec::with_capacity(lg);
-                            for i in 0..lg {
-                                c0_bytes.push(goldilocks_bytes_from_u32_le_bytes(
-                                    &mut glue.gb,
-                                    &u32_locals[c0_start + i].byte_vars,
-                                ));
-                            }
-                            for i in 0..lg {
-                                c1_bytes.push(goldilocks_bytes_from_u32_le_bytes(
-                                    &mut glue.gb,
-                                    &u32_locals[c1_start + i].byte_vars,
-                                ));
-                            }
-
-                            // Move to digits as early as possible:
-                            // - c0/c1 from u32s → canonical bytes → digits
-                            // - comh ring elements bytes → digits
-                            // Then do all math in digit domain, and only convert back to bytes
-                            // for the exported coefficient-0 surfaces.
-
-                            let c0_digits: Vec<GoldilocksScalar> =
-                                c0_bytes.iter().copied().map(|b| goldilocks_bytes_to_digits(&mut glue.gb, b)).collect();
-                            let c1_digits: Vec<GoldilocksScalar> =
-                                c1_bytes.iter().copied().map(|b| goldilocks_bytes_to_digits(&mut glue.gb, b)).collect();
-                            let tensor_c0 = tensor_goldilocks_scalars_digits(&mut glue.gb, &c0_digits);
-                            let tensor_c1 = tensor_goldilocks_scalars_digits(&mut glue.gb, &c1_digits);
-
-                            // Convert all `comh[l][j]` to digit-encoded rings once.
-                            let mut comh_all_coeff_digits: Vec<RingDigits> = Vec::with_capacity(comh_all_coeff_bytes.len());
-                            for ch in &comh_all_coeff_bytes {
-                                comh_all_coeff_digits.push(ring_bytes_to_digits(&mut glue.gb, ch));
-                            }
-
-                            let mut tcch0_ring: Vec<RingDigits> = Vec::with_capacity(l_instances);
-                            let mut tcch1_ring: Vec<RingDigits> = Vec::with_capacity(l_instances);
-                            for l in 0..l_instances {
-                                let base = l * kappa;
-                                let mut acc0 = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
-                                let mut acc1 = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
-                                for j in 0..kappa {
-                                    let ch = &comh_all_coeff_digits[base + j];
-                                    let m0 = ring_scale_digits(&mut glue.gb, ch, &tensor_c0[j]);
-                                    let m1 = ring_scale_digits(&mut glue.gb, ch, &tensor_c1[j]);
-                                    acc0 = ring_add_digits(&mut glue.gb, &acc0, &m0);
-                                    acc1 = ring_add_digits(&mut glue.gb, &acc1, &m1);
-                                }
-                                tcch0_ring.push(acc0);
-                                tcch1_ring.push(acc1);
-                            }
-
-                            // Export only coefficient-0 as canonical bytes.
-                            tcch0_local.reserve(l_instances);
-                            tcch1_local.reserve(l_instances);
-                            for l in 0..l_instances {
-                                tcch0_local.push(goldilocks_digits_to_bytes_canonical(&mut glue.gb, &tcch0_ring[l][0]));
-                                tcch1_local.push(goldilocks_digits_to_bytes_canonical(&mut glue.gb, &tcch1_ring[l][0]));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        tcch0_local.push(goldilocks_digits_to_bytes_canonical(&mut glue.gb, &acc0[0]));
+        tcch1_local.push(goldilocks_digits_to_bytes_canonical(&mut glue.gb, &acc1[0]));
     }
 
     Ok((tcch0_local, tcch1_local))
@@ -3396,16 +3270,6 @@ pub(super) fn build(
         setchk_out_e_vars_for_cm = Some(out_e_vars);
         dcom_evals_for_cm = Some(dcom_evals_local);
     }
-    let (tcch0_local, tcch1_local) =
-        compute_tcch(&mut glue, ops, &pose_wiring, ring_dim, params, wiring, &u32_locals)?;
-    lf_stage_log("compute_tcch", Some(&pose_inst), Some(&glue), &mut mem_prev);
-    if l_instances_expected != 0 && tcch0_local.len() != l_instances_expected {
-        return Err("tiny gate: tcch0 length mismatch with inferred L".to_string());
-    }
-    if l_instances_expected != 0 && tcch1_local.len() != l_instances_expected {
-        return Err("tiny gate: tcch1 length mismatch with inferred L".to_string());
-    }
-
     // Parse and constrain the CM segment after short challenges (sumcheck headers, etc.).
     let (comh_absorbs, sc_msg_absorbs, eval_absorbs) = parse_and_enforce_cm_after_short(
         &mut glue,
@@ -3418,6 +3282,25 @@ pub(super) fn build(
         &u32_locals,
     )?;
     lf_stage_log("parse_and_enforce_cm_after_short", Some(&pose_inst), Some(&glue), &mut mem_prev);
+
+    // Export coefficient-0 surfaces tcch0/tcch1 from the parsed `comh` block.
+    let (tcch0_local, tcch1_local) = compute_tcch_from_comh_absorbs(
+        &mut glue,
+        &pose_wiring,
+        ring_dim,
+        params,
+        wiring,
+        &u32_locals,
+        &comh_absorbs,
+        l_instances_expected,
+    )?;
+    lf_stage_log("compute_tcch", Some(&pose_inst), Some(&glue), &mut mem_prev);
+    if l_instances_expected != 0 && tcch0_local.len() != l_instances_expected {
+        return Err("tiny gate: tcch0 length mismatch with inferred L".to_string());
+    }
+    if l_instances_expected != 0 && tcch1_local.len() != l_instances_expected {
+        return Err("tiny gate: tcch1 length mismatch with inferred L".to_string());
+    }
 
     // Capture a lightweight absorb breakdown summary for optional op-mix reporting.
     let absorb_counts = TinyAbsorbBreakdownCounts {
