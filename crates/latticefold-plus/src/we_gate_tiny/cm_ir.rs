@@ -1760,10 +1760,17 @@ fn bal16_to_bal4_digits_ir(b: &mut IrBuilder<'_>, x16: &[VarRef; 17]) -> [VarRef
             debug_assert!((-1..=1).contains(&carry_next));
         }
 
-        // IMPORTANT (soundness): digits are used as multiplicands later (NTT + pointwise mul).
-        // Without an explicit membership check, the carry-chain equation admits alternative
-        // solutions where `digit` is shifted by multiples of 4 while keeping carries in range.
-        let dvar = alloc_bal4_digit_ir(b, digit);
+        // IMPORTANT (soundness):
+        // - For k < 32: digits are used as multiplicands later (NTT + pointwise mul), so enforce
+        //   membership `digit ∈ {-2,-1,0,1}` via `alloc_bal4_digit_ir`.
+        // - For k == 32: this digit is the 2^64 "top bit" in the base-4 view used by
+        //   `digits4_to_u64_witness_ir`, so it MUST be boolean (0/1), not just in {-2,-1,0,1}.
+        let dvar = if k == 32 {
+            debug_assert!(digit == 0 || digit == 1, "bal16_to_bal4_digits_ir: top digit must be 0/1");
+            alloc_bool_ir(b, digit == 1)
+        } else {
+            alloc_bal4_digit_ir(b, digit)
+        };
         let cnext = if (k & 1) == 0 {
             alloc_carry_pm2_ir(b, carry_next)
         } else {
