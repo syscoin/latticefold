@@ -579,8 +579,14 @@ where
         tr.absorb_field_element(&ri);
     }
 
-    // absorb_evaluations_digest(out.e, out.b): Ajtai aggregate commitment (kappa ring elems).
-    for _ in 0..kappa {
+    // Tiny-field variant note:
+    // Instead of digest-binding `out.e/out.b` via Ajtai (which is cheap over the native base field
+    // but expensive when arithmetized inside F257), we absorb the full `flat(out.e,out.b)` vector.
+    //
+    // Flatten order matches `setchk::absorb_evaluations_digest`: claim index -> block -> lane, then out.b.
+    let out_e_blocks = 1usize + mlen_mats;
+    let n_out_flat = out_e_blocks * out_e0_len * d + out_b_len;
+    for _ in 0..n_out_flat {
         tr.absorb(&R::ZERO);
     }
 
