@@ -6733,143 +6733,204 @@ mod tests {
         inst.check(&asg).unwrap();
     }
 
+    // Legacy 2-field split WE-gate tests have been removed.
+
+    // -----------------------------------------------------------------------------
+    // Tiny-field (F257) equivalents for legacy 2-field WE-gate coverage.
+    //
+    // The legacy tests above target the historical "2-field split" arithmetization. The production
+    // path is now the Theorem 4.3 tiny-field gate, which:
+    // - builds its instance from a recorded verifier transcript schedule, and
+    // - includes `[ONE] || [WeParams] || [public_inputs]` as the public prefix.
+    //
+    // These tests cover the same *properties* (statement binding + UNSAT on flips) on the tiny
+    // gate. They are ignored because even small schedules are expensive in debug; run in release.
+    // -----------------------------------------------------------------------------
+
     #[test]
-    #[ignore = "legacy Goldilocks-based WE-gate (2-field split); Theorem 4.3 tiny-field path selected"]
-    fn test_we_cm_proof_param_binding_mlen_unsat() {
-        // Small-ish instance.
-        type PCF = cyclotomic_rings::rings::GoldilocksPoseidonConfig;
-        use cyclotomic_rings::rings::GetPoseidonParams;
-        use ark_ff::Zero;
+    #[ignore = "tiny-field gate coverage; run with `--release -- --ignored`"]
+    fn test_we_plus_tiny_param_binding_mlen_changes_shape() {
         use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as RR;
         use stark_rings::PolyRing;
 
-        let k = 1usize;
-        let kappa = 1usize;
-        let ell = 32usize;
-        let b = 2u128;
-        let d = RR::dimension();
-        let tau_unpadded_len = kappa * (k * d) * ell * d;
-        let n = tau_unpadded_len.next_power_of_two();
-        let nvars = ark_std::log2(n) as usize;
+        // Choose params so the schedule meaningfully depends on `mlen` (mlen_mats).
+        let ring_dim = RR::dimension() as u64;
+        let pairs: Vec<(usize, usize)> = vec![(0, 0)];
+        let public_inputs_len = 0usize;
+        let n_lin_proofs = 1usize;
 
-        let dparams = DecompParameters { b, k, l: ell };
-        let public_inputs = vec![<BF<RR> as ark_ff::Field>::ONE];
-        let mut f = vec![RR::from(<RR as PolyRing>::BaseRing::zero()); n];
-        f[0] = RR::from(public_inputs[0]);
-        let mut A = Matrix::<RR>::zero(kappa, n);
-        A.vals[0][0] = RR::from(<RR as PolyRing>::BaseRing::ONE);
-        let inst = RgInstance::from_f(f, &A, &dparams);
-        let rg = Rg { nvars, instances: vec![inst], dparams: dparams.clone() };
-        let cm = Cm { rg };
-        let M: Vec<std::sync::Arc<SparseMatrix<RR>>> = vec![std::sync::Arc::new(SparseMatrix::identity(n))];
-
-        // Build proof + trace, with a statement public input absorbed first.
-        let mut ts = crate::transcript::PoseidonTranscript::empty::<PCF>();
-        let (_com, proof) = cm.prove(&M, &public_inputs, &mut ts);
-        let mut rec = TracePoseidonTranscript::<RR>::empty::<PCF>();
-        for b in &public_inputs {
-            rec.absorb_field_element(b);
-        }
-        proof.verify(&M, &mut rec).expect("cm verify");
-        let trace = rec.trace().clone();
-
-        let params = WeParams {
-            nvars_setchk: nvars as u64,
+        let base = WeParams {
+            nvars_setchk: 1,
             degree_setchk: 3,
-            nvars_cm: nvars as u64,
+            nvars_cm: 1,
             degree_cm: 2,
-            kappa: kappa as u64,
-            ring_dim_d: RR::dimension() as u64,
-            decomp_b: b as u64,
-            k: k as u64,
-            l: ell as u64,
-            mlen: M.len() as u64,
+            kappa: 1,
+            ring_dim_d: ring_dim,
+            decomp_b: 16,
+            k: 1,
+            l: 1,
+            mlen: 0,
         };
-        let poseidon_cfg = PCF::get_poseidon_config();
+        let mut alt = base.clone();
+        alt.mlen = 1;
 
-        let out = build_we_dr1cs_for_cm_proof::<RR>(&poseidon_cfg, &trace, &params, &public_inputs, &proof, M.len())
-                .expect("build we dr1cs");
-        out.inst.check(&out.assignment).expect("should satisfy");
-
-        // Mutate the public `mlen` parameter only.
-        // Public layout for WE is: [ONE] || [10×WeParams] || [public_inputs...]
-        let mlen_global = 1usize + 9usize;
-        let mut bad = out.assignment.clone();
-        bad[mlen_global] += <BF<RR> as ark_ff::Field>::ONE;
-        assert!(out.inst.check(&bad).is_err(), "mlen mutation should break satisfaction");
+        // Arm-time binding: changing `mlen` should change the arm-time circuit shape.
+        let s0 = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(&base, public_inputs_len, n_lin_proofs, 0, &pairs)
+            .expect("shape(base)");
+        let s1 = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(&alt, public_inputs_len, n_lin_proofs, 1, &pairs)
+            .expect("shape(alt)");
+        assert_ne!(s0.public_len, 0);
+        assert_ne!(s1.public_len, 0);
+        // We don't require a specific delta, but `mlen` should affect at least one size metric.
+        assert!(
+            s0.inst.nvars != s1.inst.nvars
+                || s0.inst.constraints.len() != s1.inst.constraints.len()
+                || s0.inst.a_terms.len() != s1.inst.a_terms.len()
+                || s0.inst.b_terms.len() != s1.inst.b_terms.len()
+                || s0.inst.c_terms.len() != s1.inst.c_terms.len(),
+            "expected mlen change to alter tiny gate shape metrics"
+        );
     }
 
     #[test]
-    #[ignore = "legacy Goldilocks-based WE-gate (2-field split); Theorem 4.3 tiny-field path selected"]
-    fn test_we_cm_proof_unsat_on_constraint_var_flip() {
-        // Reuse the same construction as the param-binding test, but flip a variable that is
-        // guaranteed to appear in some constraint.
-        type PCF = cyclotomic_rings::rings::GoldilocksPoseidonConfig;
-        use cyclotomic_rings::rings::GetPoseidonParams;
-        use ark_ff::Zero;
+    #[ignore = "tiny-field gate coverage; run with `--release -- --ignored`"]
+    fn test_we_plus_tiny_public_input_digest_unsat_on_flip() {
         use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as RR;
         use stark_rings::PolyRing;
 
-        let k = 1usize;
-        let kappa = 1usize;
-        let ell = 32usize;
-        let b = 2u128;
-        let d = RR::dimension();
-        let tau_unpadded_len = kappa * (k * d) * ell * d;
-        let n = tau_unpadded_len.next_power_of_two();
-        let nvars = ark_std::log2(n) as usize;
-
-        let dparams = DecompParameters { b, k, l: ell };
-        let public_inputs = vec![<BF<RR> as ark_ff::Field>::ONE];
-        let mut f = vec![RR::from(<RR as PolyRing>::BaseRing::zero()); n];
-        f[0] = RR::from(public_inputs[0]);
-        let mut A = Matrix::<RR>::zero(kappa, n);
-        A.vals[0][0] = RR::from(<RR as PolyRing>::BaseRing::ONE);
-        let inst = RgInstance::from_f(f, &A, &dparams);
-        let rg = Rg { nvars, instances: vec![inst], dparams: dparams.clone() };
-        let cm = Cm { rg };
-        let M: Vec<std::sync::Arc<SparseMatrix<RR>>> = vec![std::sync::Arc::new(SparseMatrix::identity(n))];
-
-        let mut ts = crate::transcript::PoseidonTranscript::empty::<PCF>();
-        let (_com, proof) = cm.prove(&M, &public_inputs, &mut ts);
-        let mut rec = TracePoseidonTranscript::<RR>::empty::<PCF>();
-        for b in &public_inputs {
-            rec.absorb_field_element(b);
-        }
-        proof.verify(&M, &mut rec).expect("cm verify");
-        let trace = rec.trace().clone();
+        // Keep this small: we only need to cover "public input is bound into transcript absorbs".
+        let ring_dim = RR::dimension() as u64;
+        let public_inputs_len = 32usize; // lighter than 256-bit SP1 digest, but covers the binding mechanism
+        let n_lin_proofs = 1usize;
+        let mlen_mats = 0usize;
+        let pairs: Vec<(usize, usize)> = vec![(0, 0)];
 
         let params = WeParams {
-            nvars_setchk: nvars as u64,
+            nvars_setchk: 1,
             degree_setchk: 3,
-            nvars_cm: nvars as u64,
+            nvars_cm: 1,
             degree_cm: 2,
-            kappa: kappa as u64,
-            ring_dim_d: RR::dimension() as u64,
-            decomp_b: b as u64,
-            k: k as u64,
-            l: ell as u64,
-            mlen: M.len() as u64,
+            kappa: 1,
+            ring_dim_d: ring_dim,
+            decomp_b: 16,
+            k: 1,
+            l: 1,
+            mlen: mlen_mats as u64,
         };
-        let poseidon_cfg = PCF::get_poseidon_config();
 
-        let out = build_we_dr1cs_for_cm_proof::<RR>(&poseidon_cfg, &trace, &params, &public_inputs, &proof, M.len())
-                .expect("build we dr1cs");
-        out.inst.check(&out.assignment).expect("should satisfy");
+        // Build a self-consistent schedule trace (stand-in for a real verifier run).
+        let trace =
+            poseidon_trace_schedule_for_plus::<RR>(public_inputs_len, &params, n_lin_proofs, mlen_mats)
+                .expect("poseidon_trace_schedule_for_plus");
+        let public_inputs: Vec<F257> = (0..public_inputs_len)
+            .map(|i| if (i % 3) == 0 { F257::ONE } else { F257::ZERO })
+            .collect();
 
-        // Pick a var index that appears in the first constraint (and is not the shared ONE=0).
-        let c0 = &out.inst.constraints[0];
-        let pick = |terms: &[(BF<RR>, usize)]| -> Option<usize> {
-            terms.iter().map(|(_, v)| *v).find(|&v| v != 0)
+        let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
+            &params,
+            public_inputs_len,
+            n_lin_proofs,
+            mlen_mats,
+            &pairs,
+        )
+        .expect("shape tiny");
+        let asg = build_we_dr1cs_for_plus_proof_witness_tiny::<RR>(
+            &trace,
+            &params,
+            &public_inputs,
+            n_lin_proofs,
+            mlen_mats,
+            &pairs,
+        )
+        .expect("witness tiny");
+        shape.inst.check(&asg).expect("baseline should satisfy");
+
+        // Flip the first public input. Public prefix layout:
+        // [ONE] || [10×WeParams] || [public_inputs...]
+        let mut bad = asg.clone();
+        let first_pi = 1usize + 10usize;
+        bad[first_pi] += F257::ONE;
+        assert!(
+            shape.inst.check(&bad).is_err(),
+            "public input flip should break satisfaction (bound into transcript absorbs)"
+        );
+    }
+
+    #[test]
+    #[ignore = "tiny-field gate coverage; run with `--release -- --ignored`"]
+    fn test_we_plus_tiny_unsat_on_constraint_var_flip() {
+        use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as RR;
+        use stark_rings::PolyRing;
+
+        let ring_dim = RR::dimension() as u64;
+        let public_inputs_len = 0usize;
+        let n_lin_proofs = 1usize;
+        let mlen_mats = 0usize;
+        let pairs: Vec<(usize, usize)> = vec![(0, 0)];
+
+        let params = WeParams {
+            nvars_setchk: 1,
+            degree_setchk: 3,
+            nvars_cm: 1,
+            degree_cm: 2,
+            kappa: 1,
+            ring_dim_d: ring_dim,
+            decomp_b: 16,
+            k: 1,
+            l: 1,
+            mlen: mlen_mats as u64,
         };
-        let v = pick(&out.inst.a_terms[c0.a.clone()])
-            .or_else(|| pick(&out.inst.b_terms[c0.b.clone()]))
-            .or_else(|| pick(&out.inst.c_terms[c0.c.clone()]))
-            .expect("constraint should mention some non-one variable");
 
-        let mut bad = out.assignment.clone();
-        bad[v] += <BF<RR> as ark_ff::Field>::ONE;
-        assert!(out.inst.check(&bad).is_err(), "flipping constrained var should break satisfaction");
+        let trace =
+            poseidon_trace_schedule_for_plus::<RR>(public_inputs_len, &params, n_lin_proofs, mlen_mats)
+                .expect("poseidon_trace_schedule_for_plus");
+        let public_inputs: Vec<F257> = Vec::new();
+
+        let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
+            &params,
+            public_inputs_len,
+            n_lin_proofs,
+            mlen_mats,
+            &pairs,
+        )
+        .expect("shape tiny");
+        let asg = build_we_dr1cs_for_plus_proof_witness_tiny::<RR>(
+            &trace,
+            &params,
+            &public_inputs,
+            n_lin_proofs,
+            mlen_mats,
+            &pairs,
+        )
+        .expect("witness tiny");
+        shape.inst.check(&asg).expect("baseline should satisfy");
+
+        // Find a non-public variable index that appears in some constraint.
+        let pub_len = shape.public_len;
+        let pick = |terms: &[(F257, usize)], pub_len: usize| -> Option<usize> {
+            terms
+                .iter()
+                .map(|(_, v)| *v)
+                .find(|&v| v != 0 && v >= pub_len)
+        };
+        let mut v: Option<usize> = None;
+        for con in &shape.inst.constraints {
+            v = pick(&shape.inst.a_terms[con.a.clone()], pub_len)
+                .or_else(|| pick(&shape.inst.b_terms[con.b.clone()], pub_len))
+                .or_else(|| pick(&shape.inst.c_terms[con.c.clone()], pub_len));
+            if v.is_some() {
+                break;
+            }
+        }
+        let v = v.expect("expected to find a constrained, non-public variable");
+        assert!(v < asg.len());
+
+        let mut bad = asg.clone();
+        bad[v] += F257::ONE;
+        assert!(
+            shape.inst.check(&bad).is_err(),
+            "flipping constrained non-public var should break satisfaction"
+        );
     }
 
     #[test]
@@ -6945,90 +7006,6 @@ mod tests {
         let (inst, asg, _wiring, _byte_wiring) =
             crate::we_gate_tiny::poseidon_f257_arithmetize(None, &ops_f257).expect("poseidon f257");
         inst.check(&asg).expect("poseidon f257 schedule satisfiable");
-    }
-
-    #[test]
-    #[ignore = "legacy Goldilocks-based WE-gate (2-field split); Theorem 4.3 tiny-field path selected"]
-    fn test_we_cm_proof_public_input_digest_unsat_on_flip() {
-        // SP1-style: include exactly one public input digest, absorb it before proving/verifying,
-        // and ensure flipping it in `public_x` breaks dR1CS satisfaction.
-        type PCF = cyclotomic_rings::rings::GoldilocksPoseidonConfig;
-        use ark_ff::Zero;
-        use cyclotomic_rings::rings::GetPoseidonParams;
-        use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as RR;
-        use stark_rings::PolyRing;
-        use sha2::{Digest, Sha256};
-
-        let k = 1usize;
-        let kappa = 1usize;
-        let ell = 32usize;
-        let b = 2u128;
-        let d = RR::dimension();
-        let tau_unpadded_len = kappa * (k * d) * ell * d;
-        let n = tau_unpadded_len.next_power_of_two();
-        let nvars = ark_std::log2(n) as usize;
-
-        // Statement-defined SP1 public input digest as 256 boolean bits (collision-robust and DPP-friendly).
-        type BF0 = <<RR as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
-        let sp1_digest_bits: Vec<BF0> = {
-            let d: [u8; 32] = Sha256::digest(b"LFP_SP1_PUBLIC_INPUT_DIGEST_V1").into();
-            crate::we_statement::digest32_to_bits_field::<BF0>(d)
-        };
-
-        let dparams = DecompParameters { b, k, l: ell };
-        let mut f = vec![RR::from(<RR as PolyRing>::BaseRing::zero()); n];
-        // Bind the first digest bit to the exposed commitment prefix.
-        f[0] = RR::from(sp1_digest_bits[0]);
-        let mut A = Matrix::<RR>::zero(kappa, n);
-        A.vals[0][0] = RR::from(<RR as PolyRing>::BaseRing::ONE);
-        let inst = RgInstance::from_f(f, &A, &dparams);
-        let rg = Rg { nvars, instances: vec![inst], dparams: dparams.clone() };
-        let cm = Cm { rg };
-        let M: Vec<std::sync::Arc<SparseMatrix<RR>>> = vec![std::sync::Arc::new(SparseMatrix::identity(n))];
-
-        // Prove with digest absorbed before proving.
-        let mut ts = crate::transcript::PoseidonTranscript::empty::<PCF>();
-        let (_com, proof) = cm.prove(&M, &sp1_digest_bits, &mut ts);
-
-        // Record verifier trace with the same digest absorbed before verify.
-        let mut rec = TracePoseidonTranscript::<RR>::empty::<PCF>();
-        for b in &sp1_digest_bits {
-            rec.absorb_field_element(b);
-        }
-        proof.verify(&M, &mut rec).expect("cm verify");
-        let trace = rec.trace().clone();
-
-        let params = WeParams {
-            nvars_setchk: nvars as u64,
-            degree_setchk: 3,
-            nvars_cm: nvars as u64,
-            degree_cm: 2,
-            kappa: kappa as u64,
-            ring_dim_d: RR::dimension() as u64,
-            decomp_b: b as u64,
-            k: k as u64,
-            l: ell as u64,
-            mlen: M.len() as u64,
-        };
-        let poseidon_cfg = PCF::get_poseidon_config();
-
-        let out = build_we_dr1cs_for_cm_proof::<RR>(
-            &poseidon_cfg,
-            &trace,
-            &params,
-            &sp1_digest_bits,
-            &proof,
-            M.len(),
-        )
-        .expect("build we dr1cs");
-        out.inst.check(&out.assignment).expect("should satisfy");
-
-        // Flip the SP1 digest in the public inputs only.
-        // Public layout for WE is: [ONE] || [10×WeParams] || [public_inputs...]
-        let digest_global = 1usize + 10usize; // first digest bit
-        let mut bad = out.assignment.clone();
-        bad[digest_global] += <BF<RR> as ark_ff::Field>::ONE;
-        assert!(out.inst.check(&bad).is_err(), "digest flip should break satisfaction");
     }
 
     // Large-scale (n=2^20) end-to-end WE->DPP sanity + digest "before/after" metric.
@@ -7423,212 +7400,6 @@ mod tests {
         run_one("sha256->bits", &sp1_digest_bits);
     }
 
-    #[test]
-    #[ignore = "legacy Goldilocks-based WE-gate (2-field split); Theorem 4.3 tiny-field path selected"]
-    fn test_we_plus_prover_sparse_base_small_mock_sat() {
-        init_rayon_stack();
-        // A small end-to-end test for the **production** SP1-style path:
-        // - ComR1CSBase (A/B/C over base ring + const-coeff witness)
-        // - PlusProverSparseBase::prove_sparse_base
-        // - record verifier trace
-        // - build WE dR1CS for the PlusProof and check satisfaction
-        //
-        // This is intended to reproduce any "WE gate dr1cs satisfied: constraint ... failed"
-        // regressions at a tiny scale (seconds, not minutes).
-        type PCF = cyclotomic_rings::rings::GoldilocksPoseidonConfig;
-        use cyclotomic_rings::rings::GetPoseidonParams;
-        use sha2::{Digest, Sha256};
-
-        // Use the same ring type as the SP1 oneproof harness (`examples/lf_plus_sp1_oneproof.rs`)
-        // to ensure Π_decomp (2-digit) assumptions match production.
-        use cyclotomic_rings::rings::GoldilocksRing64 as RR;
-        use stark_rings::PolyRing;
-        use stark_rings_linalg::SparseMatrix;
-        use std::sync::Arc;
-
-        use crate::plus::{PlusParameters, PlusProverSparseBase};
-        use crate::r1cs::ComR1CSBase;
-        use crate::rgchk::DecompParameters;
-        use crate::transcript::PoseidonTranscript;
-        use crate::we_statement::digest32_to_bits_field;
-        use latticefold::arith::r1cs::R1CS;
-        use latticefold::commitment::AjtaiCommitmentScheme;
-
-        type BR = <RR as PolyRing>::BaseRing;
-
-        // Choose small-but-valid parameters for the internal range-check/CM machinery.
-        //
-        // IMPORTANT: `rgchk` digit decomposition will panic if `k` is too small for the chosen base,
-        // so we use the production-style choice `decomp_b = d/2`.
-        //
-        // For statement binding coverage in this small test, we enable Ajtai prefix exposure:
-        // require kappa >= 8. To keep `n` small, we pick a small ℓ (still power-of-two).
-        let kappa = 8usize; // 8 exposed rows (identity block)
-        let k = 1usize;
-        let d = RR::dimension();
-        let d_prime = d / 2;
-        // Small, power-of-two ℓ to keep the test fast (and >=4 to avoid decomposition panics).
-        let ell = 4usize;
-
-        let tau_unpadded_len = kappa * (k * d) * ell * d;
-        let n = tau_unpadded_len.next_power_of_two();
-        let nvars = ark_std::log2(n) as usize;
-        assert!(n <= (1 << 17), "keep this test small");
-
-        // SP1-style public inputs: 256 digest bits.
-        type BF0 = <<RR as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
-        let public_inputs: Vec<BF0> = {
-            let d: [u8; 32] = Sha256::digest(b"LFP_WE_PLUS_SPARSE_BASE_SMALL_V1").into();
-            digest32_to_bits_field::<BF0>(d)
-        };
-
-        // Seeded Ajtai scheme (deterministic system parameter) with prefix exposure.
-        const AJTAI_SEED: [u8; 32] = *b"LFP_SP1_AJTAI_SEED_V1_0000000000";
-        let ajtai = AjtaiCommitmentScheme::<RR>::seeded_with_exposed_prefix(
-            b"lf_plus_ajtai",
-            AJTAI_SEED,
-            kappa,
-            n,
-            8,
-            1, // expose witness cols 1..=8 (col0 is ONE)
-        );
-
-        // Trivial satisfiable R1CS: A=B=C=0, so (Az)*(Bz) - Cz = 0 for any witness.
-        let zero_rows: Vec<Vec<(BR, usize)>> = vec![Vec::new(); n];
-        let a = SparseMatrix::<BR> { nrows: n, ncols: n, coeffs: zero_rows.clone() };
-        let b = SparseMatrix::<BR> { nrows: n, ncols: n, coeffs: zero_rows.clone() };
-        let c = SparseMatrix::<BR> { nrows: n, ncols: n, coeffs: zero_rows };
-        let r1cs = R1CS::<BR> { l: 0, A: a, B: b, C: c };
-
-        // Constant-coeff witness prefix, with the exposed coordinates matching the statement prefix.
-        let bind_prefix: &[BF0] = public_inputs
-            .get(0..8)
-            .expect("need at least 8 public inputs for prefix binding");
-        let f0: Arc<Vec<BR>> = Arc::new(
-            (0..n)
-                .map(|i| {
-                    if i == 0 {
-                        BR::ONE
-                    } else if (1..=8).contains(&i) {
-                        bind_prefix[i - 1]
-                    } else {
-                        BR::ZERO
-                    }
-                })
-                .collect(),
-        );
-
-        let cr1cs = ComR1CSBase::<RR>::from_f0_seeded_base(r1cs, f0, 0, &ajtai);
-        let m0 = cr1cs.x.matrices_arc_base();
-
-        // Range-check decomposition parameters (used inside CM/RG machinery).
-        let dparams = DecompParameters { b: d_prime as u128, k, l: ell };
-        let lin_params = crate::lin::LinParameters { kappa, decomp: dparams.clone() };
-
-        // Π_decomp base B:
-        // Compute a portable conservative power-of-two bound from the base field modulus so that
-        // every base-field coefficient fits in exactly 2 digits (balanced) for Π_decomp.
-        //
-        // We avoid relying on `MODULUS.0[0]` limb layout (platform-dependent) by using bytes.
-        let b_decomp: u128 = {
-            use ark_ff::BigInteger;
-            let m = <BR as ark_ff::PrimeField>::MODULUS;
-            let bytes = m.to_bytes_le();
-            let mut last = None;
-            for (i, &b) in bytes.iter().enumerate().rev() {
-                if b != 0 {
-                    last = Some((i, b));
-                    break;
-                }
-            }
-            let bitlen: u32 = match last {
-                None => 0,
-                Some((i, b)) => {
-                    // msb position in this byte (1..=8)
-                    let msb = 8u32 - (b.leading_zeros() as u32);
-                    (i as u32) * 8 + msb
-                }
-            };
-            // Choose B >= 2^{ceil(bitlen/2)+1} to ensure B^2 > modulus (with slack).
-            let shift = ((bitlen + 1) / 2 + 1) as u32;
-            let shift = shift.min(126); // keep within u128 shift range
-            let mut b = 1u128 << shift;
-            if b % 2 == 1 {
-                b += 1;
-            }
-            b
-        };
-
-        let pparams = PlusParameters { lin: lin_params, B: b_decomp };
-
-        // Prove (SP1-style: absorb public inputs before proving).
-        let mut prover = PlusProverSparseBase::init_seeded_base(
-            ajtai.clone(),
-            m0.clone(),
-            1,
-            pparams.clone(),
-            PoseidonTranscript::empty::<PCF>(),
-        );
-        let proof = prover.prove_sparse_base(std::slice::from_ref(&cr1cs), &public_inputs);
-
-        // Record verifier trace (mirror the SP1 oneproof harness).
-        let poseidon_cfg = PCF::get_poseidon_config();
-        let mut rec = crate::recording_transcript::TracePoseidonTranscript::<RR>::empty::<PCF>();
-        for b in &public_inputs {
-            rec.absorb_field_element(b);
-        }
-        for lp in &proof.lproof {
-            lp.verify(&mut rec);
-        }
-        proof
-            .cmproof
-            .verify_with_mlen(
-                m0.len(),
-                &mut rec,
-                bind_prefix,
-            )
-            .expect("cm verify (record)");
-        let trace = rec.trace().clone();
-
-        let params = WeParams {
-            nvars_setchk: nvars as u64,
-            degree_setchk: 3,
-            nvars_cm: nvars as u64,
-            degree_cm: 2,
-            kappa: kappa as u64,
-            ring_dim_d: RR::dimension() as u64,
-            decomp_b: dparams.b as u64,
-            k: dparams.k as u64,
-            l: dparams.l as u64,
-            mlen: m0.len() as u64,
-        };
-
-        // Arm-before-proof split:
-        // 1) arm/shape: instance depends only on params + shapes
-        let shape = build_we_dr1cs_for_plus_proof_shape::<RR>(
-            &poseidon_cfg,
-            &params,
-            public_inputs.len(),
-            proof.lproof.len(),
-            m0.len(),
-        )
-        .expect("build_we_dr1cs_for_plus_proof_shape");
-
-        // 2) witness: fill assignment from the real proof+trace
-        let assignment = build_we_dr1cs_for_plus_proof_witness::<RR>(
-            &poseidon_cfg,
-            &trace,
-            &params,
-            &public_inputs,
-            &proof,
-            m0.len(),
-            b_decomp,
-        )
-        .expect("build_we_dr1cs_for_plus_proof_witness");
-        shape
-            .inst
-            .check(&assignment)
-            .expect("we gate dr1cs satisfied");
-    }
+    // NOTE: legacy 2-field split WE-gate tests removed (including old Π_plus end-to-end harness).
 }
 
