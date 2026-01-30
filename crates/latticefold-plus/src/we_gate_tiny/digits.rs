@@ -6,7 +6,7 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 use super::gadgets::decompose_existing_byte_var_to_bits;
 use super::cm_ir::{
     alloc_bal16_digit_ir, alloc_carry_pm2_ir, lower_ir_into_builder, IrBuilder as CmIrBuilder,
-    add_bal16_loose_same_len_ir, add_bal16_same_len_ir, mul_bal16_small_ir, neg_bal16_digits_ir, rebalance_tail_pm11_to_pm2_ir,
+    add_bal16_loose_same_len_ir, add_bal16_same_len_ir, mul_bal16_small_ir, rebalance_tail_pm11_to_pm2_ir,
     u32_bytes_to_bal16_digits_from_bits_ir, u64_bytes_to_bal16_digits_from_bits_ir, VarRef as CmVarRef,
     Bal16CheckedIr as CmBal16CheckedIr,
     Bal16LooseIr as CmBal16LooseIr,
