@@ -63,9 +63,6 @@ pub struct Cm<R: PolyRing> {
 pub struct InstanceEvals<R>(Vec<[R; 4]>);
 
 impl<R> InstanceEvals<R> {
-    pub fn new(rows: Vec<[R; 4]>) -> Self {
-        Self(rows)
-    }
 
     pub(crate) fn rows(&self) -> &[[R; 4]] {
         &self.0
