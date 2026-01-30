@@ -19,6 +19,7 @@ use super::cm_math::{
     goldilocks_add_mod_p_digits, goldilocks_bytes_to_digits, goldilocks_digits_to_bytes_canonical,
     goldilocks_mul_const_mod_p_digits, goldilocks_mul_mod_p_digits, goldilocks_sub_mod_p_digits,
     ct_psi_mul_ring_digits_d64, ring_eval_at_scalar_digits,
+    RingDigits,
 };
 
 use latticefold::transcript::Transcript;
@@ -372,7 +373,7 @@ fn test_ring_mul_negacyclic_ntt_goldilocks_d64_matches_native_one_case() {
 #[test]
 fn test_ring_eval_at_scalar_digits_matches_native_one_case() {
     use rand::{RngCore, SeedableRng};
-    let mut rng = rand::rngs::StdRng::seed_from_u64(0xEVAL_7E57u64);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0xEAD7_E57u64);
     let p = GOLDILOCKS_P;
 
     // Random ring element and scalar x.
@@ -421,8 +422,8 @@ fn test_ring_eval_at_scalar_digits_matches_native_one_case() {
 #[test]
 fn test_ct_psi_mul_ring_digits_d64_matches_native_one_case() {
     use rand::{RngCore, SeedableRng};
-    use stark_rings::{psi, CoeffRing};
-    let mut rng = rand::rngs::StdRng::seed_from_u64(0xC7_psi_u64);
+    use stark_rings::{psi, CoeffRing, PolyRing};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0xC7_51_0001u64);
     let p = GOLDILOCKS_P;
 
     // Random ring element in GoldilocksRing64.
@@ -430,7 +431,7 @@ fn test_ct_psi_mul_ring_digits_d64_matches_native_one_case() {
     for i in 0..64 {
         x_u[i] = rng.next_u64() % p;
     }
-    let mut x_ring = cyclotomic_rings::rings::GoldilocksRing64::ZERO;
+    let mut x_ring = <cyclotomic_rings::rings::GoldilocksRing64 as stark_rings::Ring>::ZERO;
     for i in 0..64 {
         x_ring.coeffs_mut()[i] = <cyclotomic_rings::rings::GoldilocksRing64 as stark_rings::PolyRing>::BaseRing::from(x_u[i]);
     }
