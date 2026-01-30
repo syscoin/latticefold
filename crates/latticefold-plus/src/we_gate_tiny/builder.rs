@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::transcript::DEFAULT_REJECTION_TRIES;
 
@@ -1784,6 +1785,9 @@ fn finalize(
     ),
     String,
 > {
+    // Use the same single switch as op-mix printing.
+    let timing_merge = tiny_opmix_on();
+
     // Convert glue builders to instances; keep per-part local maps so we can add explicit equality constraints.
     let GlueCtx { gb, pose_asg, local_map: base_local_map, base_eqs: base_base_eqs, .. } = glue;
     let (base_inst, base_asg) = gb.into_instance();
@@ -1838,14 +1842,19 @@ fn finalize(
     parts.push((pose_inst, pose_asg));
     parts.push((base_inst, base_asg));
     parts.extend(extra_insts);
+    let t_merge = Instant::now();
     let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(parts)
         .map_err(|e| format!("merge poseidon+tiny-glue parts failed: {e}"))?;
+    let dt_merge = t_merge.elapsed();
 
     let c_after_merge = inst.constraints.len();
+    let t_reabsorb = Instant::now();
     enforce_fiat_shamir_reabsorb_semantics(&mut inst, ops, &pose_wiring)?;
+    let dt_reabsorb = t_reabsorb.elapsed();
     let c_after_reabsorb = inst.constraints.len();
 
     // Add explicit equality constraints: pose var == each module's local copy.
+    let t_eqs = Instant::now();
     for (&gv, &lv) in base_local_map.iter() {
         let gp = remap(0, gv, &offsets);
         let gg = remap(1, lv, &offsets);
@@ -1868,6 +1877,20 @@ fn finalize(
         }
     }
     let c_after_glue_eq = inst.constraints.len();
+    let dt_eqs = t_eqs.elapsed();
+
+    if timing_merge {
+        eprintln!(
+            "tiny_gate: finalize timing: merge={:?} reabsorb={:?} glue_eqs={:?} parts={} constraints_after_merge={} constraints_after_reabsorb={} constraints_after_eqs={}",
+            dt_merge,
+            dt_reabsorb,
+            dt_eqs,
+            offsets.len(),
+            c_after_merge,
+            c_after_reabsorb,
+            c_after_glue_eq,
+        );
+    }
 
     if tiny_opmix_on() {
         eprintln!(
@@ -2275,6 +2298,12 @@ fn build_cm_glue_for_which(
                 }
 
                 if tcch0.len() == l_instances_expected && tcch1.len() == l_instances_expected {
+                    // Use the same single switch as op-mix printing.
+                    let timing_u = tiny_opmix_on();
+                    let mut u_ir_build_time = Duration::ZERO;
+                    let mut u_lower_time = Duration::ZERO;
+                    let mut u_frag_count: usize = 0;
+
                     // rc powers for claimed_sum
                     let z_idx = l_instances_expected * (4 + 4 * (params.mlen as usize));
                     let max_pow = z_idx + 1;
@@ -2342,15 +2371,13 @@ fn build_cm_glue_for_which(
                                 }
 
                                 // Batch size for IR shards (controls peak memory).
-                                let batch_size: usize = std::env::var("LFP_TINY_U_IR_BATCH")
-                                    .ok()
-                                    .and_then(|s| s.parse::<usize>().ok())
-                                    .unwrap_or(32)
-                                    .max(1);
+                                // Keep this fixed to avoid introducing more env vars.
+                                let batch_size: usize = 64;
 
                                 for chunk in terms.chunks(batch_size) {
                                     // Build IR fragments in parallel (no access to glue.gb mutably).
                                     let base_asg_ir: &[F257] = &glue.gb.assignment;
+                                    let t_build = Instant::now();
                                     let frags: Vec<(_, [[IrVarRef; 17]; 64])> = chunk
                                         .par_iter()
                                         .map(|(uij_local, sp_idx)| -> Result<_, String> {
@@ -2363,13 +2390,17 @@ fn build_cm_glue_for_which(
                                             Ok((ib.ir, out_ir))
                                         })
                                         .collect::<Result<Vec<_>, _>>()?;
+                                    u_ir_build_time = u_ir_build_time.saturating_add(t_build.elapsed());
+                                    u_frag_count = u_frag_count.saturating_add(frags.len());
 
                                     // Lower sequentially and accumulate.
+                                    let t_lower = Instant::now();
                                     for (ir, out_ir) in frags {
                                         let lowered = lower_ir_into_builder(&mut glue.gb, ir);
                                         let prod = map_ring_out(&out_ir, &lowered);
                                         acc = ring_add_digits(&mut glue.gb, &acc, &prod);
                                     }
+                                    u_lower_time = u_lower_time.saturating_add(t_lower.elapsed());
                                 }
 
                                 u_l.push(acc);
@@ -2408,6 +2439,22 @@ fn build_cm_glue_for_which(
                         let tc1 = ring_scale_digits(&mut glue.gb, &tcch1[l], &rc_pows[z_idx + 1]);
                         claimed_sum = ring_add_digits(&mut glue.gb, &claimed_sum, &tc0);
                         claimed_sum = ring_add_digits(&mut glue.gb, &claimed_sum, &tc1);
+                    }
+
+                    if timing_u {
+                        let muls_per_row = k_decomp.saturating_mul(ring_dim);
+                        let total_rows = l_instances_expected.saturating_mul(rows_per_l);
+                        let expected_muls = total_rows.saturating_mul(muls_per_row);
+                        eprintln!(
+                            "tiny_gate: CM u timing (which={}): ir_build={:?} lower+acc={:?} frags={} expected_muls={} batch={} threads={}",
+                            which,
+                            u_ir_build_time,
+                            u_lower_time,
+                            u_frag_count,
+                            expected_muls,
+                            batch_size,
+                            rayon::current_num_threads().max(1),
+                        );
                     }
 
                     claimed_sum_opt = Some(claimed_sum);
