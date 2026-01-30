@@ -51,6 +51,14 @@ use super::cm_math::{
 };
 use super::op_counts::{tiny_cm_counts_reset, tiny_cm_counts_take};
 
+#[derive(Clone, Debug)]
+struct DcomEvalDigits {
+    a: Vec<GoldilocksScalar>,
+    b: Vec<RingDigits>,
+    c: Vec<RingDigits>,
+    v: Vec<GoldilocksScalar>,
+}
+
 #[inline]
 fn tiny_opmix_on() -> bool {
     std::env::var("LFP_WE_GATE_OPMIX").is_ok()
@@ -1969,8 +1977,13 @@ fn build_cm_glue_for_which(
     params: &WeParams,
     wiring: &TinyCoinOpWiring,
     l_instances_expected: usize,
+    comh_absorbs: &[(usize, usize)],
     sc_msg_absorbs: &[(usize, usize)],
     eval_absorbs: &[(usize, usize)],
+    // Shared SetChk/Dcom values (allocated in the base glue module) that the CM verifier math needs.
+    // These are passed as base-glue variable indices; this CM module will `import_base_var` them.
+    setchk_out_e_vars_base: Option<Arc<Vec<Vec<Vec<RingDigits>>>>>,
+    dcom_evals_base: Option<Arc<Vec<DcomEvalDigits>>>,
     which: usize,
     pose_asg: Arc<Vec<F257>>,
     base_asg: &[F257],
@@ -2154,15 +2167,157 @@ fn build_cm_glue_for_which(
         msgs_digits.push([e0, e1, e2]);
     }
 
-    // Placeholder claimed sum (keeps constraints satisfiable until full claimed-sum wiring lands).
-    let claimed0 = if nvars_cm == 0 {
-        super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim)
-    } else {
-        ring_add_digits(&mut glue.gb, &msgs_digits[0][0], &msgs_digits[0][1])
-    };
     let rs_digits: Vec<GoldilocksScalar> =
         rs.iter().copied().map(|b| goldilocks_bytes_to_digits(&mut glue.gb, b)).collect();
-    let subclaim_eval = super::cm_math::sumcheck_verify_degree2_ring_digits(&mut glue.gb, claimed0, &msgs_digits, &rs_digits)?;
+
+    // --------------------------------------------------------------------
+    // CM claimed_sum wiring (matches `we_gate_arith.rs::cm_verifier_math_dr1cs`)
+    // --------------------------------------------------------------------
+    //
+    // If we have the shared SetChk/Dcom values, compute the true claimed_sum and feed it into the
+    // degree-2 sumcheck verifier. Otherwise, fall back to a placeholder to keep "shape-only" runs
+    // satisfiable (but underconstrained).
+    let mut claimed_sum_opt: Option<RingDigits> = None;
+    if let (Some(out_e_base), Some(dcom_evals_base)) = (setchk_out_e_vars_base.as_ref(), dcom_evals_base.as_ref()) {
+        if let (Some(t0_ring), Some(t1_ring), Some(sp_ring), Some(dpp), Some(rpt)) = (
+            tensor_c0_ring.as_ref(),
+            tensor_c1_ring.as_ref(),
+            s_prime_flat_ring.as_ref(),
+            dpp_ring.as_ref(),
+            r_point_digits.as_ref(),
+        ) {
+            // Only implement the pow2 fast path (same assumptions as `eval_t_z_optimized_ring_digits_pair`).
+            let out_e_blocks = 1usize + (params.mlen as usize);
+            let rows_per_l = 1usize + (params.mlen as usize);
+            if dcom_evals_base.len() == l_instances_expected
+                && out_e_base.len() == out_e_blocks
+                && ring_dim == 64
+            {
+                #[inline]
+                fn import_scalar(glue: &mut GlueCtx, base_asg: &[F257], s: &GoldilocksScalar) -> GoldilocksScalar {
+                    core::array::from_fn(|i| glue.import_base_var(base_asg, s[i]))
+                }
+                #[inline]
+                fn import_ring(glue: &mut GlueCtx, base_asg: &[F257], r: &RingDigits) -> RingDigits {
+                    r.iter().map(|s| import_scalar(glue, base_asg, s)).collect()
+                }
+
+                // Parse `comh` absorbs and compute tcch0/tcch1:
+                // tcch{0,1}[l] = Σ_j comh[l][j] * tensor_c{0,1}[j] (scalar scaling).
+                let mut tcch0: Vec<RingDigits> = Vec::with_capacity(l_instances_expected);
+                let mut tcch1: Vec<RingDigits> = Vec::with_capacity(l_instances_expected);
+                if comh_absorbs.len() == l_instances_expected * kappa {
+                    // tensor_c{0,1} are constant-coeff rings; coefficient-0 holds the scalar digits.
+                    let tensor_c0_scalars: Vec<GoldilocksScalar> =
+                        t0_ring.iter().map(|r| r[0]).collect();
+                    let tensor_c1_scalars: Vec<GoldilocksScalar> =
+                        t1_ring.iter().map(|r| r[0]).collect();
+
+                    let mut idx = 0usize;
+                    for _l in 0..l_instances_expected {
+                        let mut acc0 = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+                        let mut acc1 = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+                        for j in 0..kappa {
+                            let (st, ln) = comh_absorbs[idx];
+                            idx += 1;
+                            let rb = parse_ring_elem_absorb_as_ringbytes(glue, pose_wiring, ring_dim, st, ln)?;
+                            let comh_j = ring_bytes_to_digits(&mut glue.gb, &rb);
+                            let s0 = tensor_c0_scalars[j];
+                            let s1 = tensor_c1_scalars[j];
+                            let t0j = ring_scale_digits(&mut glue.gb, &comh_j, &s0);
+                            let t1j = ring_scale_digits(&mut glue.gb, &comh_j, &s1);
+                            acc0 = ring_add_digits(&mut glue.gb, &acc0, &t0j);
+                            acc1 = ring_add_digits(&mut glue.gb, &acc1, &t1j);
+                        }
+                        tcch0.push(acc0);
+                        tcch1.push(acc1);
+                    }
+                }
+
+                if tcch0.len() == l_instances_expected && tcch1.len() == l_instances_expected {
+                    // rc powers for claimed_sum
+                    let z_idx = l_instances_expected * (4 + 4 * (params.mlen as usize));
+                    let max_pow = z_idx + 1;
+                    let rc_d = goldilocks_bytes_to_digits(&mut glue.gb, rc_bytes);
+                    let rc_pows = goldilocks_pow_table_digits(&mut glue.gb, &rc_d, max_pow);
+
+                    // Compute u[l][ni] = Σ_{blk,col} out.e[ni][l*k+blk][col] * s_prime_flat[blk*d + col]
+                    // (negacyclic ringmul), then build claimed_sum over all l.
+                    let mut claimed_sum = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+                    for (l, ev) in dcom_evals_base.iter().enumerate() {
+                        let l_idx = l * (4 + 4 * (params.mlen as usize));
+
+                        // Import eval vectors from base glue vars.
+                        let eval_a: Vec<GoldilocksScalar> = ev.a.iter().map(|s| import_scalar(&mut glue, base_asg, s)).collect();
+                        let eval_b: Vec<RingDigits> = ev.b.iter().map(|r| import_ring(&mut glue, base_asg, r)).collect();
+                        let eval_c: Vec<RingDigits> = ev.c.iter().map(|r| import_ring(&mut glue, base_asg, r)).collect();
+
+                        // Compute u_l for each ni (length rows_per_l).
+                        let mut u_l: Vec<RingDigits> = Vec::with_capacity(rows_per_l);
+                        for ni in 0..rows_per_l {
+                            let mut acc = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+                            for blk in 0..k_decomp {
+                                for col in 0..ring_dim {
+                                    let idx = l
+                                        .checked_mul(k_decomp)
+                                        .and_then(|x| x.checked_add(blk))
+                                        .ok_or_else(|| "tiny gate: u index overflow (cm)".to_string())?;
+                                    if idx >= out_e_base[ni].len() {
+                                        return Err("tiny gate: out.e too short for CM u computation".to_string());
+                                    }
+                                    let uij = &out_e_base[ni][idx][col];
+                                    // Import uij ring from base glue.
+                                    let uij_local = import_ring(&mut glue, base_asg, uij);
+                                    let sij = &sp_ring[blk * ring_dim + col];
+                                    let prod = super::cm_math::ring_mul_negacyclic_digits_d64(&mut glue.gb, &uij_local, sij)?;
+                                    acc = ring_add_digits(&mut glue.gb, &acc, &prod);
+                                }
+                            }
+                            u_l.push(acc);
+                        }
+
+                        // a0 term (scalar -> const-coeff ring)
+                        let a0pow = goldilocks_mul_mod_p_digits(&mut glue.gb, &eval_a[0], &rc_pows[l_idx]);
+                        let a0r = ring_const_coeff_digits(&mut glue.gb, &a0pow, ring_dim);
+                        claimed_sum = ring_add_digits(&mut glue.gb, &claimed_sum, &a0r);
+
+                        // b0/c0/u0 terms (ring scaled)
+                        let b0 = ring_scale_digits(&mut glue.gb, &eval_b[0], &rc_pows[l_idx + 1]);
+                        let c0 = ring_scale_digits(&mut glue.gb, &eval_c[0], &rc_pows[l_idx + 2]);
+                        let u0 = ring_scale_digits(&mut glue.gb, &u_l[0], &rc_pows[l_idx + 3]);
+                        claimed_sum = ring_add_digits(&mut glue.gb, &claimed_sum, &b0);
+                        claimed_sum = ring_add_digits(&mut glue.gb, &claimed_sum, &c0);
+                        claimed_sum = ring_add_digits(&mut glue.gb, &claimed_sum, &u0);
+
+                        for i in 0..(params.mlen as usize) {
+                            let idx = l_idx + 4 + i * 4;
+                            let aipow = goldilocks_mul_mod_p_digits(&mut glue.gb, &eval_a[1 + i], &rc_pows[idx]);
+                            let air = ring_const_coeff_digits(&mut glue.gb, &aipow, ring_dim);
+                            claimed_sum = ring_add_digits(&mut glue.gb, &claimed_sum, &air);
+
+                            let bi = ring_scale_digits(&mut glue.gb, &eval_b[1 + i], &rc_pows[idx + 1]);
+                            let ci = ring_scale_digits(&mut glue.gb, &eval_c[1 + i], &rc_pows[idx + 2]);
+                            let ui = ring_scale_digits(&mut glue.gb, &u_l[1 + i], &rc_pows[idx + 3]);
+                            claimed_sum = ring_add_digits(&mut glue.gb, &claimed_sum, &bi);
+                            claimed_sum = ring_add_digits(&mut glue.gb, &claimed_sum, &ci);
+                            claimed_sum = ring_add_digits(&mut glue.gb, &claimed_sum, &ui);
+                        }
+
+                        // tcch0/tcch1 terms
+                        let tc0 = ring_scale_digits(&mut glue.gb, &tcch0[l], &rc_pows[z_idx]);
+                        let tc1 = ring_scale_digits(&mut glue.gb, &tcch1[l], &rc_pows[z_idx + 1]);
+                        claimed_sum = ring_add_digits(&mut glue.gb, &claimed_sum, &tc0);
+                        claimed_sum = ring_add_digits(&mut glue.gb, &claimed_sum, &tc1);
+                    }
+
+                    claimed_sum_opt = Some(claimed_sum);
+                }
+            }
+        }
+    }
+
+    let claimed_sum = claimed_sum_opt.unwrap_or_else(|| super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim));
+    let subclaim_eval = super::cm_math::sumcheck_verify_degree2_ring_digits(&mut glue.gb, claimed_sum, &msgs_digits, &rs_digits)?;
 
     // Eval table absorbs sanity.
     let rows_total = l_instances_expected * (1 + params.mlen as usize);
@@ -2400,6 +2555,11 @@ pub(super) fn build(
     let (u32_locals, goldilocks_locals) =
         build_u32_and_goldilocks_blocks(&mut glue, &pose_wiring, &wiring.u32_squeeze_ops)?;
     lf_stage_log("build_u32_and_goldilocks_blocks", Some(&pose_inst), Some(&glue), &mut mem_prev);
+
+    // Values parsed/allocated during SetChk/RgChk that the CM verifier math needs later.
+    // Stored as base-glue vars and passed (by Arc) into CM submodules for import/glue.
+    let mut setchk_out_e_vars_for_cm: Option<Vec<Vec<Vec<RingDigits>>>> = None;
+    let mut dcom_evals_for_cm: Option<Vec<DcomEvalDigits>> = None;
 
     // ------------------------------------------------------------------------
     // Start arithmetizing Π_lin / SetChk verifier math: SetChk sumcheck (degree-3)
@@ -2936,6 +3096,7 @@ pub(super) fn build(
             goldilocks_bytes_to_digits(&mut glue.gb, bytes)
         }
 
+        let mut dcom_evals_local: Vec<DcomEvalDigits> = Vec::with_capacity(l_evals);
         for l in 0..l_evals {
             // eval.a absorbs (scalars)
             let mut eval_a: Vec<GoldilocksScalar> = Vec::with_capacity(dcom_eval_vec_len);
@@ -3023,7 +3184,19 @@ pub(super) fn build(
                     }
                 }
             }
+
+            // Save the Dcom eval vectors for later CM claimed-sum wiring.
+            dcom_evals_local.push(DcomEvalDigits {
+                a: eval_a,
+                b: eval_b,
+                c: eval_c,
+                v: eval_v,
+            });
         }
+
+        // Export SetChk outputs and Dcom evals for the CM verifier math stage.
+        setchk_out_e_vars_for_cm = Some(out_e_vars);
+        dcom_evals_for_cm = Some(dcom_evals_local);
     }
 
     let goldilocks_rejection_locals = build_goldilocks_rejection_coins(&mut glue, &pose_wiring, &goldilocks_ranges)?;
@@ -3071,6 +3244,10 @@ pub(super) fn build(
     //
     // Claimed sums and recombination will be wired once Dcom prefix verifier math is integrated.
 
+    // Convert shared SetChk/Dcom values into Arc containers for parallel CM modules.
+    let setchk_out_e_vars_for_cm = setchk_out_e_vars_for_cm.map(Arc::new);
+    let dcom_evals_for_cm = dcom_evals_for_cm.map(Arc::new);
+
     // Build the CM verifier math in parallel modules (one per sumcheck), then merge by explicitly
     // gluing their local copies to Poseidon vars.
     let cm_extra_glues: Vec<GlueCtx> =
@@ -3096,8 +3273,11 @@ pub(super) fn build(
                         params,
                         wiring,
                         l_instances_expected,
+                        &comh_absorbs,
                         &sc_msg_absorbs[0],
                         &eval_absorbs[0],
+                        setchk_out_e_vars_for_cm.clone(),
+                        dcom_evals_for_cm.clone(),
                         0,
                         pose_asg.clone(),
                         base_asg,
@@ -3114,8 +3294,11 @@ pub(super) fn build(
                         params,
                         wiring,
                         l_instances_expected,
+                        &comh_absorbs,
                         &sc_msg_absorbs[1],
                         &eval_absorbs[1],
+                        setchk_out_e_vars_for_cm.clone(),
+                        dcom_evals_for_cm.clone(),
                         1,
                         pose_asg.clone(),
                         base_asg,
