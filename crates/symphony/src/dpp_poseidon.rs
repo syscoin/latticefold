@@ -151,36 +151,26 @@ impl<F: PrimeField> SparseDr1csInstance<F> {
 /// Each part is assumed to have `assignment[0] = 1`. In the merged instance:
 /// - var 0 is shared across all parts
 /// - all other variables are appended, and constraints are re-indexed accordingly
-pub fn merge_sparse_dr1cs_share_one<F: PrimeField>(
+pub fn merge_sparse_dr1cs_share_one<F: PrimeField + Copy + Send + Sync>(
     mut parts: Vec<(SparseDr1csInstance<F>, Vec<F>)>,
 ) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {
     if parts.is_empty() {
         return Err("merge_sparse_dr1cs_share_one: empty parts".to_string());
     }
 
-    let total_constraints: usize = parts.iter().map(|(inst, _)| inst.constraints.len()).sum();
-    let total_assignment_len: usize = parts.iter().map(|(_, asg)| asg.len()).sum();
-    let total_terms_a: usize = parts.iter().map(|(inst, _)| inst.a_terms.len()).sum();
-    let total_terms_b: usize = parts.iter().map(|(inst, _)| inst.b_terms.len()).sum();
-    let total_terms_c: usize = parts.iter().map(|(inst, _)| inst.c_terms.len()).sum();
+    // First pass: validate parts + compute prefix offsets (so we can fill in parallel).
+    let mut total_constraints: usize = 0;
+    let mut total_assignment_tail: usize = 0; // excludes the shared var0
+    let mut total_terms_a: usize = 0;
+    let mut total_terms_b: usize = 0;
+    let mut total_terms_c: usize = 0;
 
-    let mut merged_assignment: Vec<F> = Vec::with_capacity(total_assignment_len.saturating_sub(parts.len()) + 1);
-    merged_assignment.push(F::ONE);
-    let mut merged_constraints: Vec<Constraint> = Vec::with_capacity(total_constraints);
-    let mut merged_a_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_a);
-    let mut merged_b_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_b);
-    let mut merged_c_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_c);
-
-    // Validate parts and precompute all offsets (so we can remap in parallel).
     let mut var_offsets: Vec<usize> = Vec::with_capacity(parts.len());
-    let mut a_bases: Vec<usize> = Vec::with_capacity(parts.len());
-    let mut b_bases: Vec<usize> = Vec::with_capacity(parts.len());
-    let mut c_bases: Vec<usize> = Vec::with_capacity(parts.len());
+    let mut a_offsets: Vec<usize> = Vec::with_capacity(parts.len());
+    let mut b_offsets: Vec<usize> = Vec::with_capacity(parts.len());
+    let mut c_offsets: Vec<usize> = Vec::with_capacity(parts.len());
+    let mut row_offsets: Vec<usize> = Vec::with_capacity(parts.len());
 
-    let mut cur_vars: usize = 0;
-    let mut cur_a: usize = 0;
-    let mut cur_b: usize = 0;
-    let mut cur_c: usize = 0;
     for (inst, asg) in parts.iter() {
         if asg.is_empty() || asg[0] != F::ONE {
             return Err("merge_sparse_dr1cs_share_one: each part must have assignment[0]=1".to_string());
@@ -188,73 +178,106 @@ pub fn merge_sparse_dr1cs_share_one<F: PrimeField>(
         if inst.nvars != asg.len() {
             return Err("merge_sparse_dr1cs_share_one: inst/assignment length mismatch".to_string());
         }
-        var_offsets.push(cur_vars);
-        a_bases.push(cur_a);
-        b_bases.push(cur_b);
-        c_bases.push(cur_c);
 
-        cur_vars = cur_vars
+        var_offsets.push(total_assignment_tail);
+        a_offsets.push(total_terms_a);
+        b_offsets.push(total_terms_b);
+        c_offsets.push(total_terms_c);
+        row_offsets.push(total_constraints);
+
+        total_constraints = total_constraints
+            .checked_add(inst.constraints.len())
+            .ok_or_else(|| "merge_sparse_dr1cs_share_one: constraint count overflow".to_string())?;
+        total_assignment_tail = total_assignment_tail
             .checked_add(asg.len().saturating_sub(1))
-            .ok_or_else(|| "merge_sparse_dr1cs_share_one: var offset overflow".to_string())?;
-        cur_a = cur_a
+            .ok_or_else(|| "merge_sparse_dr1cs_share_one: assignment size overflow".to_string())?;
+        total_terms_a = total_terms_a
             .checked_add(inst.a_terms.len())
-            .ok_or_else(|| "merge_sparse_dr1cs_share_one: a_terms offset overflow".to_string())?;
-        cur_b = cur_b
+            .ok_or_else(|| "merge_sparse_dr1cs_share_one: a_terms size overflow".to_string())?;
+        total_terms_b = total_terms_b
             .checked_add(inst.b_terms.len())
-            .ok_or_else(|| "merge_sparse_dr1cs_share_one: b_terms offset overflow".to_string())?;
-        cur_c = cur_c
+            .ok_or_else(|| "merge_sparse_dr1cs_share_one: b_terms size overflow".to_string())?;
+        total_terms_c = total_terms_c
             .checked_add(inst.c_terms.len())
-            .ok_or_else(|| "merge_sparse_dr1cs_share_one: c_terms offset overflow".to_string())?;
+            .ok_or_else(|| "merge_sparse_dr1cs_share_one: c_terms size overflow".to_string())?;
     }
 
-    // Remap term indices and constraint ranges in parallel.
+    let merged_nvars = 1usize
+        .checked_add(total_assignment_tail)
+        .ok_or_else(|| "merge_sparse_dr1cs_share_one: merged_nvars overflow".to_string())?;
+
+    // Allocate output buffers without initializing (we will write all entries).
+    let mut merged_assignment: Vec<F> = Vec::with_capacity(merged_nvars);
+    let mut merged_constraints: Vec<Constraint> = Vec::with_capacity(total_constraints);
+    let mut merged_a_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_a);
+    let mut merged_b_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_b);
+    let mut merged_c_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_c);
+    unsafe {
+        merged_assignment.set_len(merged_nvars);
+        merged_constraints.set_len(total_constraints);
+        merged_a_terms.set_len(total_terms_a);
+        merged_b_terms.set_len(total_terms_b);
+        merged_c_terms.set_len(total_terms_c);
+    }
+    merged_assignment[0] = F::ONE;
+
+    // Raw pointers for parallel, disjoint writes.
+    let asg_ptr = merged_assignment.as_mut_ptr();
+    let rows_ptr = merged_constraints.as_mut_ptr();
+    let a_ptr = merged_a_terms.as_mut_ptr();
+    let b_ptr = merged_b_terms.as_mut_ptr();
+    let c_ptr = merged_c_terms.as_mut_ptr();
+
+    // Fill all output buffers in parallel, one part per task.
     parts
-        .par_iter_mut()
+        .into_par_iter()
         .enumerate()
-        .for_each(|(i, (inst, _asg))| {
+        .for_each(|(i, (inst, asg))| unsafe {
+            // Assignment tail copy.
             let vo = var_offsets[i];
-            if vo != 0 {
-                for (_c, idx) in inst.a_terms.iter_mut() {
-                    if *idx != 0 {
-                        *idx += vo;
-                    }
+            let out_asg = asg_ptr.add(1 + vo);
+            core::ptr::copy_nonoverlapping(asg.as_ptr().add(1), out_asg, asg.len().saturating_sub(1));
+
+            // Terms with var-index remap.
+            let ao = a_offsets[i];
+            for (j, (coeff, idx)) in inst.a_terms.iter().copied().enumerate() {
+                let mut new_idx = idx;
+                if new_idx != 0 {
+                    new_idx += vo;
                 }
-                for (_c, idx) in inst.b_terms.iter_mut() {
-                    if *idx != 0 {
-                        *idx += vo;
-                    }
+                *a_ptr.add(ao + j) = (coeff, new_idx);
+            }
+            let bo = b_offsets[i];
+            for (j, (coeff, idx)) in inst.b_terms.iter().copied().enumerate() {
+                let mut new_idx = idx;
+                if new_idx != 0 {
+                    new_idx += vo;
                 }
-                for (_c, idx) in inst.c_terms.iter_mut() {
-                    if *idx != 0 {
-                        *idx += vo;
-                    }
+                *b_ptr.add(bo + j) = (coeff, new_idx);
+            }
+            let co = c_offsets[i];
+            for (j, (coeff, idx)) in inst.c_terms.iter().copied().enumerate() {
+                let mut new_idx = idx;
+                if new_idx != 0 {
+                    new_idx += vo;
                 }
+                *c_ptr.add(co + j) = (coeff, new_idx);
             }
 
-            let ab = a_bases[i];
-            let bb = b_bases[i];
-            let cb = c_bases[i];
-            if ab != 0 || bb != 0 || cb != 0 {
-                for row in inst.constraints.iter_mut() {
-                    row.a = (ab + row.a.start)..(ab + row.a.end);
-                    row.b = (bb + row.b.start)..(bb + row.b.end);
-                    row.c = (cb + row.c.start)..(cb + row.c.end);
-                }
+            // Constraints with term-range remap.
+            let ro = row_offsets[i];
+            for (j, row) in inst.constraints.iter().enumerate() {
+                *rows_ptr.add(ro + j) = Constraint {
+                    a: (ao + row.a.start)..(ao + row.a.end),
+                    b: (bo + row.b.start)..(bo + row.b.end),
+                    c: (co + row.c.start)..(co + row.c.end),
+                };
             }
         });
 
-    // Concatenate sequentially (bulk append; remapping already done).
-    for (mut inst, asg) in parts.drain(..) {
-        merged_a_terms.append(&mut inst.a_terms);
-        merged_b_terms.append(&mut inst.b_terms);
-        merged_c_terms.append(&mut inst.c_terms);
-        merged_constraints.append(&mut inst.constraints);
-        merged_assignment.extend_from_slice(&asg[1..]);
-    }
-
     Ok((
         SparseDr1csInstance {
-            nvars: merged_assignment.len(),
+            nvars: merged_nvars,
             constraints: merged_constraints,
             a_terms: merged_a_terms,
             b_terms: merged_b_terms,
