@@ -44,11 +44,10 @@ use super::surfaces::{CmDigitMulSqSurfaceWiring, CmDigitMulSurfaceWiring};
 use super::cm_math::{
     alloc_const_goldilocks_u64,
     eq_eval_goldilocks_digits, eval_t_z_optimized_ring_digits_pair, goldilocks_bytes_to_digits, goldilocks_pow_table_digits,
-    goldilocks_digits_to_bytes_canonical,
     goldilocks_add_mod_p_digits, goldilocks_mul_const_mod_p_digits, goldilocks_mul_mod_p_digits, goldilocks_sub_mod_p_digits,
     ct_psi_mul_ring_digits_d64,
     ring_eval_at_scalar_digits,
-    ring_add_digits, ring_bytes_to_digits, ring_eq_digits,
+    ring_add_digits, ring_bytes_to_digits, ring_eq_digits, ring_scale_digits,
     ring_const_coeff_digits,
     tensor_goldilocks_ringconst_digits, tensor_goldilocks_scalars_digits, RingBytes, RingDigits,
 };
@@ -4303,8 +4302,6 @@ pub(super) fn build(
         Vec<ShortChallengeWiring>,
         Vec<BoundedU32ChallengeWiring>,
         Vec<GoldilocksChallengeWiring>,
-        Vec<[usize; 8]>,
-        Vec<[usize; 8]>,
         Vec<CmDigitMulSurfaceWiring>,
         Vec<CmDigitMulSqSurfaceWiring>,
         PoseidonDr1csWiring,
