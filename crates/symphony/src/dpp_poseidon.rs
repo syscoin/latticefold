@@ -1157,14 +1157,21 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed<F: Prime
     let out_dir = out_dir.as_ref();
     let n_threads = rayon::current_num_threads().max(1);
     if n_threads > 1 {
-        // Deterministic sharding granularity. This is the main knob for parallelism vs merge overhead.
-        // (No env flags.)
-        const SHARD_PERMUTES: usize = 1024;
+        // Sharding is the only practical parallelization strategy for Poseidon arith.
+        //
+        // Important: too-small shards create many parts and the *merge rewrites the entire DR1CS
+        // multiple times*, which can easily reach 100GB+ of IO. Therefore pick shard size so the
+        // number of shards is small (≈ O(threads), not O(permutes)).
+        let total_permutes = crate::poseidon_trace::count_permutes_for_ops(cfg, ops);
+        let target_shards = n_threads.min(16).max(2);
+        let shard_permutes = (total_permutes + target_shards - 1) / target_shards;
+        // Keep shards reasonably coarse to avoid merge blow-ups on large traces.
+        let shard_permutes = shard_permutes.max(4096);
         return poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded(
             cfg,
             ops,
             out_dir,
-            SHARD_PERMUTES,
+            shard_permutes,
         );
     }
 
@@ -1431,12 +1438,12 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
     }
 
     let mut groups: Vec<Group<F>> = shard_outs
-        .iter()
+        .into_iter()
         .map(|s| Group {
-            inst: s.inst.clone(),
-            asg: s.asg.clone(),
-            init_state_vars: s.init_state_vars.clone(),
-            final_state_vars: s.final_state_vars.clone(),
+            inst: s.inst,
+            asg: s.asg,
+            init_state_vars: s.init_state_vars,
+            final_state_vars: s.final_state_vars,
         })
         .collect();
 
@@ -1452,91 +1459,84 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
         create_dir_all(&round_dir)
             .map_err(|e| ReplayErr::Invalid(format!("create merge dir failed: {e}")))?;
 
-        let pairs: Vec<(usize, usize)> = (0..groups.len())
-            .step_by(2)
-            .filter_map(|i| if i + 1 < groups.len() { Some((i, i + 1)) } else { None })
-            .collect();
-        eprintln!("[poseidon_arith] merge_round={} pairs={}", round, pairs.len());
+        // Move groups into owned pairs so merges don't clone huge assignments/instances.
+        let mut pairs_owned: Vec<(Group<F>, Group<F>)> = Vec::with_capacity(groups.len() / 2);
+        let mut it = groups.into_iter();
+        while let Some(left) = it.next() {
+            if let Some(right) = it.next() {
+                pairs_owned.push((left, right));
+            } else {
+                // odd tail
+                groups = vec![left];
+                break;
+            }
+        }
+        if !pairs_owned.is_empty() {
+            eprintln!("[poseidon_arith] merge_round={} pairs={}", round, pairs_owned.len());
+            let merged: Vec<Group<F>> = pairs_owned
+                .into_par_iter()
+                .enumerate()
+                .map(|(pair_idx, (left, right))| -> Result<Group<F>, ReplayErr> {
+                    let t_pair = Instant::now();
 
-        let merged_pairs: Vec<(usize, Group<F>)> = pairs
-            .par_iter()
-            .enumerate()
-            .map(|(pair_idx, (li, ri))| -> Result<(usize, Group<F>), ReplayErr> {
-                let t_pair = Instant::now();
-                let left = &groups[*li];
-                let right = &groups[*ri];
+                    // Map local -> merged indices for this 2-way merge.
+                    let left_tail = left.asg.len().saturating_sub(1) as u64;
+                    #[inline]
+                    fn map_left(idx: usize) -> usize {
+                        idx
+                    }
+                    #[inline]
+                    fn map_right(idx: usize, left_tail: u64) -> usize {
+                        if idx == 0 { 0 } else { (idx as u64 + left_tail) as usize }
+                    }
 
-                // Map local -> merged indices for this 2-way merge.
-                let left_tail = left.asg.len().saturating_sub(1) as u64;
-                #[inline]
-                fn map_left(idx: usize) -> usize {
-                    idx
-                }
-                #[inline]
-                fn map_right(idx: usize, left_tail: u64) -> usize {
-                    if idx == 0 { 0 } else { (idx as u64 + left_tail) as usize }
-                }
+                    let mut eqs: Vec<(usize, usize)> = Vec::with_capacity(left.final_state_vars.len());
+                    for (x, y) in left.final_state_vars.iter().zip(right.init_state_vars.iter()) {
+                        eqs.push((map_left(*x), map_right(*y, left_tail)));
+                    }
 
-                let mut eqs: Vec<(usize, usize)> = Vec::with_capacity(left.final_state_vars.len());
-                for (x, y) in left.final_state_vars.iter().zip(right.init_state_vars.iter()) {
-                    eqs.push((map_left(*x), map_right(*y, left_tail)));
-                }
+                    let out = round_dir.join(format!("merge_{pair_idx:04}"));
+                    create_dir_all(&out).map_err(|e| ReplayErr::Invalid(format!("create pair dir failed: {e}")))?;
+                    let (inst, asg) = merge_file_backed_sparse_dr1cs_share_one::<F>(
+                        vec![(left.inst, left.asg), (right.inst, right.asg)],
+                        &out,
+                        &eqs,
+                    )
+                    .map_err(ReplayErr::Invalid)?;
 
-                let out = round_dir.join(format!("merge_{pair_idx:04}"));
-                create_dir_all(&out).map_err(|e| ReplayErr::Invalid(format!("create pair dir failed: {e}")))?;
-                let (inst, asg) = merge_file_backed_sparse_dr1cs_share_one::<F>(
-                    vec![(left.inst.clone(), left.asg.clone()), (right.inst.clone(), right.asg.clone())],
-                    &out,
-                    &eqs,
-                )
-                .map_err(ReplayErr::Invalid)?;
+                    let init_state_vars = left.init_state_vars;
+                    let final_state_vars = right
+                        .final_state_vars
+                        .into_iter()
+                        .map(|idx| map_right(idx, left_tail))
+                        .collect();
 
-                let init_state_vars = left.init_state_vars.clone();
-                let final_state_vars = right
-                    .final_state_vars
-                    .iter()
-                    .map(|&idx| map_right(idx, left_tail))
-                    .collect();
-
-                Ok((
-                    *li,
-                    Group {
-                        inst,
-                        asg,
-                        init_state_vars,
-                        final_state_vars,
-                    },
-                ))
-                .map(|x| {
                     eprintln!(
                         "[poseidon_arith] merge_round={} pair={:04} done in {:.2?}",
                         round,
                         pair_idx,
                         t_pair.elapsed()
                     );
-                    x
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
 
-        // Build next-level groups, preserving order.
-        let mut next: Vec<Group<F>> = Vec::with_capacity((groups.len() + 1) / 2);
-        let mut i = 0usize;
-        let mut merged_map = std::collections::HashMap::<usize, Group<F>>::new();
-        for (k, g) in merged_pairs {
-            merged_map.insert(k, g);
-        }
-        while i < groups.len() {
-            if let Some(g) = merged_map.remove(&i) {
-                next.push(g);
-                i += 2;
+                    Ok(Group {
+                        inst,
+                        asg,
+                        init_state_vars,
+                        final_state_vars,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            // If there was an odd tail carried above, `groups` already has it.
+            if groups.is_empty() {
+                groups = merged;
             } else {
-                // Odd tail group passes through.
-                next.push(groups[i].clone());
-                i += 1;
+                // Preserve order: merged pairs first, then tail.
+                let mut next = merged;
+                next.extend(groups);
+                groups = next;
             }
         }
-        groups = next;
         round += 1;
     }
 
