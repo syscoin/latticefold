@@ -47,7 +47,7 @@ use super::cm_math::{
     goldilocks_add_mod_p_digits, goldilocks_mul_const_mod_p_digits, goldilocks_mul_mod_p_digits, goldilocks_sub_mod_p_digits,
     ct_psi_mul_ring_digits_d64,
     ring_eval_at_scalar_digits,
-    ring_add_digits, ring_bytes_to_digits, ring_eq_digits, ring_scale_digits,
+    ring_add_digits, ring_bytes_to_digits, ring_eq_digits,
     ring_const_coeff_digits,
     tensor_goldilocks_ringconst_digits, tensor_goldilocks_scalars_digits, RingBytes, RingDigits,
 };
@@ -3958,51 +3958,142 @@ fn build_cm_glue_for_which(
                         }));
                         }
 
-                    // Build this batch's claimed_sum contributions using the **reference** digit-domain
-                    // implementation (mirrors `we_gate_arith.rs::cm_verifier_math_dr1cs` term-for-term).
+                    // Build this batch's claimed_sum contributions as bal4 IR shards in parallel,
+                    // then lower sequentially and accumulate in digit domain.
                     //
-                    // This is slower than the bal4-IR shard path, but is simpler and is the baseline for correctness.
-                    for (l, data) in per_l {
-                        debug_assert_eq!(data.l_idx, l * (4 + 4 * (params.mlen as usize)));
+                    // This matches the LF+ verifier math term-for-term; the only difference is
+                    // performing the per-term scaling/multiplication in bal4 and converting once.
+                    {
+                        use super::cm_ir::{
+                            bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir, goldilocks_mul_mod_p_digits_bal4_ir,
+                            lower_ir_into_builder, IrBuilder, VarRef as IrVarRef,
+                        };
+                        let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
 
-                        let mut acc = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+                        // Snapshot assignment via raw pointer to avoid clone and to avoid holding an immutable borrow
+                        // across lowering. Safety: we do not mutate `glue.gb.assignment` while building `frags`
+                        // (lowering happens after `collect` completes).
+                        let base_asg_addr: usize = glue.gb.assignment.as_ptr() as usize;
+                        let base_asg_len: usize = glue.gb.assignment.len();
 
-                        // a0 term: scalar -> ring const, scaled by rc^l_idx.
-                        let a0pow = goldilocks_mul_mod_p_digits(&mut glue.gb, &data.eval_a[0], &rc_pows[data.l_idx]);
-                        let a0t = ring_const_coeff_digits(&mut glue.gb, &a0pow, ring_dim);
-                        acc = ring_add_digits(&mut glue.gb, &acc, &a0t);
-
-                        // b0/c0/u0 terms (ring scaled by rc powers).
-                        let t_b0 = ring_scale_digits(&mut glue.gb, &data.eval_b[0], &rc_pows[data.l_idx + 1]);
-                        let t_c0 = ring_scale_digits(&mut glue.gb, &data.eval_c[0], &rc_pows[data.l_idx + 2]);
-                        let t_u0 = ring_scale_digits(&mut glue.gb, &data.u_l[0], &rc_pows[data.l_idx + 3]);
-                        acc = ring_add_digits(&mut glue.gb, &acc, &t_b0);
-                        acc = ring_add_digits(&mut glue.gb, &acc, &t_c0);
-                        acc = ring_add_digits(&mut glue.gb, &acc, &t_u0);
-
-                        // M rows.
-                        for i in 0..(params.mlen as usize) {
-                            let idx = data.l_idx + 4 + i * 4;
-
-                            let aipow = goldilocks_mul_mod_p_digits(&mut glue.gb, &data.eval_a[1 + i], &rc_pows[idx]);
-                            let ai_t = ring_const_coeff_digits(&mut glue.gb, &aipow, ring_dim);
-                            acc = ring_add_digits(&mut glue.gb, &acc, &ai_t);
-
-                            let t_bi = ring_scale_digits(&mut glue.gb, &data.eval_b[1 + i], &rc_pows[idx + 1]);
-                            let t_ci = ring_scale_digits(&mut glue.gb, &data.eval_c[1 + i], &rc_pows[idx + 2]);
-                            let t_ui = ring_scale_digits(&mut glue.gb, &data.u_l[1 + i], &rc_pows[idx + 3]);
-                            acc = ring_add_digits(&mut glue.gb, &acc, &t_bi);
-                            acc = ring_add_digits(&mut glue.gb, &acc, &t_ci);
-                            acc = ring_add_digits(&mut glue.gb, &acc, &t_ui);
+                        #[inline]
+                        fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
+                            if a.len() != 64 {
+                                return Err("tiny gate: expected ring_dim=64 for claimed_sum bal4 shards".to_string());
+                            }
+                            Ok(core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j]))))
                         }
 
-                        // tcch0/tcch1 terms (same z_idx across all l).
-                        let t_tcch0 = ring_scale_digits(&mut glue.gb, &tcch0[l], &rc_pows[z_idx]);
-                        let t_tcch1 = ring_scale_digits(&mut glue.gb, &tcch1[l], &rc_pows[z_idx + 1]);
-                        acc = ring_add_digits(&mut glue.gb, &acc, &t_tcch0);
-                        acc = ring_add_digits(&mut glue.gb, &acc, &t_tcch1);
+                        let frags: Vec<(_, [[IrVarRef; 17]; 64])> = per_l
+                            .par_iter()
+                            .map(|(l, data)| -> Result<_, String> {
+                                let l = *l;
+                                debug_assert_eq!(data.l_idx, l * (4 + 4 * (params.mlen as usize)));
 
-                        claimed_sum = ring_add_digits(&mut glue.gb, &claimed_sum, &acc);
+                                let base_asg_ptr: *const F257 = base_asg_addr as *const F257;
+                                let base_asg_ir: &[F257] = unsafe { core::slice::from_raw_parts(base_asg_ptr, base_asg_len) };
+                                let mut ib = IrBuilder::new(base_asg_ir);
+
+                                // Zero digits in bal4: fixed const-0 var replicated.
+                                let z = ib.new_var(F257::ZERO);
+                                ib.ir.enforce_var_eq_const(z, F257::ZERO);
+                                let mut acc4: [[IrVarRef; 33]; 64] = [[z; 33]; 64];
+
+                                #[inline]
+                                fn scalar16_to_ir(x: &GoldilocksScalar) -> [IrVarRef; 17] {
+                                    core::array::from_fn(|j| IrVarRef::Base(x[j]))
+                                }
+
+                                // Helper: add (ring16 * scalar16) into acc4 (bal4) coefficientwise.
+                                #[inline]
+                                fn add_scaled_ring_into_acc4(
+                                    ib: &mut IrBuilder<'_>,
+                                    acc4: &mut [[IrVarRef; 33]; 64],
+                                    ring16: &RingDigits,
+                                    scalar16: &[IrVarRef; 17],
+                                    p_u64: u64,
+                                ) -> Result<(), String> {
+                                    let ring16_ir = ringdigits64_to_ir(ring16)?;
+                                    let s4 = ib.bal16_to_bal4_digits_cached(scalar16);
+                                    for i in 0..64 {
+                                        let r4 = ib.bal16_to_bal4_digits_cached(&ring16_ir[i]);
+                                        let prod4 = goldilocks_mul_mod_p_digits_bal4_ir(ib, &r4, &s4, p_u64);
+                                        acc4[i] = goldilocks_add_mod_p_digits_bal4_ir(ib, &acc4[i], &prod4, p_u64);
+                                    }
+                                    Ok(())
+                                }
+
+                                // a0 term: (eval_a[0] * rc^l_idx) goes into coefficient 0 only.
+                                let a0_16 = scalar16_to_ir(&data.eval_a[0]);
+                                let rc0_16: [IrVarRef; 17] =
+                                    core::array::from_fn(|k| IrVarRef::Base(rc_pows[data.l_idx][k]));
+                                let a0_4 = ib.bal16_to_bal4_digits_cached(&a0_16);
+                                let rc0_4 = ib.bal16_to_bal4_digits_cached(&rc0_16);
+                                let a0pow4 = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &a0_4, &rc0_4, p_u64);
+                                acc4[0] = goldilocks_add_mod_p_digits_bal4_ir(&mut ib, &acc4[0], &a0pow4, p_u64);
+
+                                // b0/c0/u0 terms.
+                                let s_b0: [IrVarRef; 17] =
+                                    core::array::from_fn(|k| IrVarRef::Base(rc_pows[data.l_idx + 1][k]));
+                                let s_c0: [IrVarRef; 17] =
+                                    core::array::from_fn(|k| IrVarRef::Base(rc_pows[data.l_idx + 2][k]));
+                                let s_u0: [IrVarRef; 17] =
+                                    core::array::from_fn(|k| IrVarRef::Base(rc_pows[data.l_idx + 3][k]));
+                                add_scaled_ring_into_acc4(&mut ib, &mut acc4, &data.eval_b[0], &s_b0, p_u64)?;
+                                add_scaled_ring_into_acc4(&mut ib, &mut acc4, &data.eval_c[0], &s_c0, p_u64)?;
+                                add_scaled_ring_into_acc4(&mut ib, &mut acc4, &data.u_l[0], &s_u0, p_u64)?;
+
+                                // M rows.
+                                for i in 0..(params.mlen as usize) {
+                                    let idx = data.l_idx + 4 + i * 4;
+
+                                    // ai term: scalar into coeff 0 only.
+                                    let ai_16 = scalar16_to_ir(&data.eval_a[1 + i]);
+                                    let rci_16: [IrVarRef; 17] =
+                                        core::array::from_fn(|k| IrVarRef::Base(rc_pows[idx][k]));
+                                    let ai_4 = ib.bal16_to_bal4_digits_cached(&ai_16);
+                                    let rci_4 = ib.bal16_to_bal4_digits_cached(&rci_16);
+                                    let aipow4 = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &ai_4, &rci_4, p_u64);
+                                    acc4[0] = goldilocks_add_mod_p_digits_bal4_ir(&mut ib, &acc4[0], &aipow4, p_u64);
+
+                                    let s_bi: [IrVarRef; 17] =
+                                        core::array::from_fn(|k| IrVarRef::Base(rc_pows[idx + 1][k]));
+                                    let s_ci: [IrVarRef; 17] =
+                                        core::array::from_fn(|k| IrVarRef::Base(rc_pows[idx + 2][k]));
+                                    let s_ui: [IrVarRef; 17] =
+                                        core::array::from_fn(|k| IrVarRef::Base(rc_pows[idx + 3][k]));
+                                    add_scaled_ring_into_acc4(&mut ib, &mut acc4, &data.eval_b[1 + i], &s_bi, p_u64)?;
+                                    add_scaled_ring_into_acc4(&mut ib, &mut acc4, &data.eval_c[1 + i], &s_ci, p_u64)?;
+                                    add_scaled_ring_into_acc4(&mut ib, &mut acc4, &data.u_l[1 + i], &s_ui, p_u64)?;
+                                }
+
+                                // tcch0/tcch1 terms (same z_idx across all l).
+                                let s_tc0: [IrVarRef; 17] =
+                                    core::array::from_fn(|k| IrVarRef::Base(rc_pows[z_idx][k]));
+                                let s_tc1: [IrVarRef; 17] =
+                                    core::array::from_fn(|k| IrVarRef::Base(rc_pows[z_idx + 1][k]));
+                                add_scaled_ring_into_acc4(&mut ib, &mut acc4, &tcch0[l], &s_tc0, p_u64)?;
+                                add_scaled_ring_into_acc4(&mut ib, &mut acc4, &tcch1[l], &s_tc1, p_u64)?;
+
+                                // Convert to bal16 once.
+                                let mut out16: [[IrVarRef; 17]; 64] = [[IrVarRef::Base(0); 17]; 64];
+                                for i in 0..64 {
+                                    out16[i] = bal4_to_bal16_digits_ir(&mut ib, &acc4[i]);
+                                }
+                                Ok((ib.ir, out16))
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+
+                        for (ir, out_ir) in frags {
+                            let lowered = lower_ir_into_builder(&mut glue.gb, ir);
+                            let out: RingDigits = {
+                                let out: [GoldilocksScalar; 64] = core::array::from_fn(|i| {
+                                    core::array::from_fn(|j| lowered.map_var(out_ir[i][j]))
+                                });
+                                out.into_iter().collect()
+                            };
+                            claimed_sum = ring_add_digits(&mut glue.gb, &claimed_sum, &out);
+                        }
                     }
                     } // end l-batch loop
 
