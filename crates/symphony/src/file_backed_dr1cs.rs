@@ -725,10 +725,13 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
     // Validate and compute merged assignment.
     // This can be a huge memory copy (hundreds of millions of field elements), so parallelize it
     // when Rayon has >1 thread available.
+    //
+    // Logging: reuse existing knobs (no new env vars).
     let timing = match std::env::var("LF_PROFILE_DR1CS") {
         Ok(v) => v != "0",
         Err(_) => false,
     };
+    let verbose = timing || std::env::var("LFP_WE_GATE_OPMIX").is_ok();
     let t_asg = std::time::Instant::now();
     let mut tail_lens: Vec<usize> = Vec::with_capacity(parts.len());
     let mut total_tail: usize = 0;
@@ -860,7 +863,7 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                 .ok_or("var_tail_off overflow")?;
         }
 
-        if timing {
+        if verbose {
             eprintln!("file_backed_merge: part ranges (vars/terms/rows):");
             for (pi, (inst, asg)) in parts.iter().enumerate() {
                 let v_tail = var_tail_off[pi];
