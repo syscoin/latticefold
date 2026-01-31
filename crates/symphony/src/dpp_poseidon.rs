@@ -10,10 +10,12 @@ use core::ops::Range;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::poseidon_trace::{permute_with_round_trace, PoseidonReplayError};
+use crate::poseidon_trace::{permute_in_place, permute_with_round_trace, PoseidonReplayError};
 use crate::poseidon_trace::{replay_ops, PoseidonReplayError as ReplayErr, PoseidonSpongeReplayResult};
 use crate::transcript::PoseidonTraceOp;
-use crate::file_backed_dr1cs::{FileBackedSparseDr1csInstance, SparseDr1csFileWriter};
+use crate::file_backed_dr1cs::{
+    merge_file_backed_sparse_dr1cs_share_one, FileBackedSparseDr1csInstance, SparseDr1csFileWriter,
+};
 
 #[derive(Debug)]
 enum PoseidonInstance<F: PrimeField> {
@@ -1122,6 +1124,21 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed<F: Prime
     ),
     ReplayErr,
 > {
+    // Optional sharding for parallel Poseidon arithmetization.
+    // Enable with `LFP_POSEIDON_SHARD_PERMUTES=<N>` (e.g. 1024).
+    if let Ok(v) = std::env::var("LFP_POSEIDON_SHARD_PERMUTES") {
+        if let Ok(n) = v.parse::<usize>() {
+            if n > 0 {
+                return poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded(
+                    cfg,
+                    ops,
+                    out_dir,
+                    n,
+                );
+            }
+        }
+    }
+
     let (inst_any, asg, replay, bytes, wiring, bw) = poseidon_sponge_dr1cs_from_trace_impl_any(
         cfg,
         ops,
@@ -1135,6 +1152,410 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed<F: Prime
             "expected file-backed instance, got in-memory".to_string(),
         )),
     }
+}
+
+fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: PrimeField + CanonicalSerialize>(
+    cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+    ops: &[PoseidonTraceOp<F>],
+    out_dir: impl AsRef<Path>,
+    shard_permutes: usize,
+) -> Result<
+    (
+        FileBackedSparseDr1csInstance<F>,
+        Vec<F>,
+        PoseidonSpongeReplayResult<F>,
+        Vec<ByteSqueezeWitness>,
+        PoseidonDr1csWiring,
+        PoseidonByteWiring,
+    ),
+    ReplayErr,
+> {
+    use ark_crypto_primitives::sponge::DuplexSpongeMode;
+    use std::fs::create_dir_all;
+
+    let out_dir = out_dir.as_ref();
+    create_dir_all(out_dir).map_err(|e| ReplayErr::Invalid(format!("create_dir_all failed: {e}")))?;
+
+    let t = cfg.rate + cfg.capacity;
+    if t == 0 {
+        return Err(ReplayErr::Invalid("invalid poseidon t=0".to_string()));
+    }
+    if shard_permutes == 0 {
+        return Err(ReplayErr::Invalid("shard_permutes must be >0".to_string()));
+    }
+
+    #[derive(Clone)]
+    struct ShardPlan<F: PrimeField> {
+        start: usize,
+        end: usize,
+        init_state: Vec<F>,
+        init_mode: DuplexSpongeMode,
+        constrain_init: bool,
+    }
+
+    // ---------------------------------------------------------------------
+    // Pass 0 (cheap): simulate sponge schedule to pick shard boundaries and
+    // compute the correct initial state/mode for each shard.
+    // ---------------------------------------------------------------------
+    let mut plans: Vec<ShardPlan<F>> = Vec::new();
+    let mut state: Vec<F> = vec![F::ZERO; t];
+    let mut mode: DuplexSpongeMode = DuplexSpongeMode::Absorbing { next_absorb_index: 0 };
+    let mut permutes_since_start: usize = 0;
+
+    // initial shard begins from the fixed zero state; constrain it.
+    plans.push(ShardPlan {
+        start: 0,
+        end: 0, // filled later
+        init_state: state.clone(),
+        init_mode: mode.clone(),
+        constrain_init: true,
+    });
+
+    #[inline]
+    fn permute_counted<F: PrimeField>(
+        cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+        state: &mut [F],
+        permutes_since_start: &mut usize,
+    ) {
+        permute_in_place(cfg, state);
+        *permutes_since_start = permutes_since_start.saturating_add(1);
+    }
+
+    // Arkworks squeeze-bytes uses: take (MODULUS_BIT_SIZE-1)/8 bytes from each squeezed field element.
+    let usable_bytes = ((F::MODULUS_BIT_SIZE - 1) / 8) as usize;
+
+    for (op_idx, op) in ops.iter().enumerate() {
+        match op {
+            PoseidonTraceOp::Absorb(elems) => {
+                for &e in elems {
+                    let mut absorb_index = match mode {
+                        DuplexSpongeMode::Absorbing { next_absorb_index } => next_absorb_index,
+                        DuplexSpongeMode::Squeezing { .. } => {
+                            permute_counted(cfg, &mut state, &mut permutes_since_start);
+                            0
+                        }
+                    };
+                    if absorb_index == cfg.rate {
+                        permute_counted(cfg, &mut state, &mut permutes_since_start);
+                        absorb_index = 0;
+                    }
+                    // state[cap + absorb_index] += e
+                    let pos = cfg.capacity + absorb_index;
+                    state[pos] += e;
+                    mode = DuplexSpongeMode::Absorbing {
+                        next_absorb_index: absorb_index + 1,
+                    };
+                }
+            }
+            PoseidonTraceOp::SqueezeField(out) => {
+                if out.is_empty() {
+                    // no-op for mode; keep consistent with arithmetizer.
+                } else {
+                    let mut squeeze_index = match mode {
+                        DuplexSpongeMode::Absorbing { .. } => {
+                            permute_counted(cfg, &mut state, &mut permutes_since_start);
+                            0
+                        }
+                        DuplexSpongeMode::Squeezing { next_squeeze_index } => next_squeeze_index,
+                    };
+                    if squeeze_index == cfg.rate {
+                        permute_counted(cfg, &mut state, &mut permutes_since_start);
+                        squeeze_index = 0;
+                    }
+                    let mut produced = 0usize;
+                    while produced < out.len() {
+                        let take = core::cmp::min(cfg.rate - squeeze_index, out.len() - produced);
+                        produced += take;
+                        squeeze_index += take;
+                        if produced < out.len() && squeeze_index == cfg.rate {
+                            permute_counted(cfg, &mut state, &mut permutes_since_start);
+                            squeeze_index = 0;
+                        }
+                    }
+                    mode = DuplexSpongeMode::Squeezing {
+                        next_squeeze_index: squeeze_index,
+                    };
+                }
+            }
+            PoseidonTraceOp::SqueezeBytes { n, .. } => {
+                if usable_bytes == 0 {
+                    return Err(ReplayErr::Invalid("usable_bytes computed as 0".to_string()));
+                }
+                let num_elements = (*n + usable_bytes - 1) / usable_bytes;
+                if num_elements == 0 {
+                    // leave mode unchanged
+                } else {
+                    let mut squeeze_index = match mode {
+                        DuplexSpongeMode::Absorbing { .. } => {
+                            permute_counted(cfg, &mut state, &mut permutes_since_start);
+                            0
+                        }
+                        DuplexSpongeMode::Squeezing { next_squeeze_index } => next_squeeze_index,
+                    };
+                    if squeeze_index == cfg.rate {
+                        permute_counted(cfg, &mut state, &mut permutes_since_start);
+                        squeeze_index = 0;
+                    }
+                    let mut produced = 0usize;
+                    while produced < num_elements {
+                        let take = core::cmp::min(cfg.rate - squeeze_index, num_elements - produced);
+                        produced += take;
+                        squeeze_index += take;
+                        if produced < num_elements && squeeze_index == cfg.rate {
+                            permute_counted(cfg, &mut state, &mut permutes_since_start);
+                            squeeze_index = 0;
+                        }
+                    }
+                    mode = DuplexSpongeMode::Squeezing {
+                        next_squeeze_index: squeeze_index,
+                    };
+                }
+            }
+        }
+
+        // Cut shards on permute count boundaries (after finishing this op).
+        if permutes_since_start >= shard_permutes && op_idx + 1 < ops.len() {
+            let next_start = op_idx + 1;
+            // Close current plan.
+            if let Some(last) = plans.last_mut() {
+                last.end = next_start;
+            }
+            permutes_since_start = 0;
+            plans.push(ShardPlan {
+                start: next_start,
+                end: 0, // filled later
+                init_state: state.clone(),
+                init_mode: mode.clone(),
+                constrain_init: false,
+            });
+        }
+    }
+    // Close final plan.
+    if let Some(last) = plans.last_mut() {
+        last.end = ops.len();
+    }
+
+    // ---------------------------------------------------------------------
+    // Pass 1 (heavy): build each shard independently in parallel.
+    // We stitch shards together by adding equality constraints on boundary state vars.
+    // ---------------------------------------------------------------------
+    #[derive(Clone)]
+    struct ShardOut<F: PrimeField> {
+        inst: FileBackedSparseDr1csInstance<F>,
+        asg: Vec<F>,
+        wiring: PoseidonDr1csWiring,
+        bw: PoseidonByteWiring,
+        bytes: Vec<ByteSqueezeWitness>,
+        init_state_vars: Vec<usize>,
+        final_state_vars: Vec<usize>,
+    }
+
+    let shard_outs: Vec<ShardOut<F>> = plans
+        .par_iter()
+        .enumerate()
+        .map(|(shard_idx, p)| -> Result<ShardOut<F>, ReplayErr> {
+            let shard_dir = out_dir.join(format!("poseidon_shard_{shard_idx:04}"));
+            create_dir_all(&shard_dir)
+                .map_err(|e| ReplayErr::Invalid(format!("create shard dir failed: {e}")))?;
+            let slice = &ops[p.start..p.end];
+            let (inst_any, asg, _replay, bytes, wiring, bw, init_state_vars, final_state_vars) =
+                poseidon_sponge_dr1cs_from_trace_impl_any_internal(
+                    cfg,
+                    slice,
+                    true,
+                    PoseidonArithMode::WeWitness,
+                    Some(&shard_dir),
+                    &p.init_state,
+                    p.init_mode.clone(),
+                    p.constrain_init,
+                )?;
+            match inst_any {
+                PoseidonInstance::FileBacked(inst) => Ok(ShardOut {
+                    inst,
+                    asg,
+                    wiring,
+                    bw,
+                    bytes,
+                    init_state_vars,
+                    final_state_vars,
+                }),
+                PoseidonInstance::InMemory(_) => Err(ReplayErr::Invalid(
+                    "expected file-backed shard instance, got in-memory".to_string(),
+                )),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // ---------------------------------------------------------------------
+    // Pass 2: merge shards (tree merge), adding boundary equalities at merge time.
+    // ---------------------------------------------------------------------
+    #[derive(Clone)]
+    struct Group<F: PrimeField> {
+        inst: FileBackedSparseDr1csInstance<F>,
+        asg: Vec<F>,
+        init_state_vars: Vec<usize>,
+        final_state_vars: Vec<usize>,
+    }
+
+    let mut groups: Vec<Group<F>> = shard_outs
+        .iter()
+        .map(|s| Group {
+            inst: s.inst.clone(),
+            asg: s.asg.clone(),
+            init_state_vars: s.init_state_vars.clone(),
+            final_state_vars: s.final_state_vars.clone(),
+        })
+        .collect();
+
+    let mut round: usize = 0;
+    while groups.len() > 1 {
+        let round_dir = out_dir.join(format!("poseidon_merge_round_{round:02}"));
+        create_dir_all(&round_dir)
+            .map_err(|e| ReplayErr::Invalid(format!("create merge dir failed: {e}")))?;
+
+        let pairs: Vec<(usize, usize)> = (0..groups.len())
+            .step_by(2)
+            .filter_map(|i| if i + 1 < groups.len() { Some((i, i + 1)) } else { None })
+            .collect();
+
+        let merged_pairs: Vec<(usize, Group<F>)> = pairs
+            .par_iter()
+            .enumerate()
+            .map(|(pair_idx, (li, ri))| -> Result<(usize, Group<F>), ReplayErr> {
+                let left = &groups[*li];
+                let right = &groups[*ri];
+
+                // Map local -> merged indices for this 2-way merge.
+                let left_tail = left.asg.len().saturating_sub(1) as u64;
+                #[inline]
+                fn map_left(idx: usize) -> usize {
+                    idx
+                }
+                #[inline]
+                fn map_right(idx: usize, left_tail: u64) -> usize {
+                    if idx == 0 { 0 } else { (idx as u64 + left_tail) as usize }
+                }
+
+                let mut eqs: Vec<(usize, usize)> = Vec::with_capacity(left.final_state_vars.len());
+                for (x, y) in left.final_state_vars.iter().zip(right.init_state_vars.iter()) {
+                    eqs.push((map_left(*x), map_right(*y, left_tail)));
+                }
+
+                let out = round_dir.join(format!("merge_{pair_idx:04}"));
+                create_dir_all(&out).map_err(|e| ReplayErr::Invalid(format!("create pair dir failed: {e}")))?;
+                let (inst, asg) = merge_file_backed_sparse_dr1cs_share_one::<F>(
+                    vec![(left.inst.clone(), left.asg.clone()), (right.inst.clone(), right.asg.clone())],
+                    &out,
+                    &eqs,
+                )
+                .map_err(ReplayErr::Invalid)?;
+
+                let init_state_vars = left.init_state_vars.clone();
+                let final_state_vars = right
+                    .final_state_vars
+                    .iter()
+                    .map(|&idx| map_right(idx, left_tail))
+                    .collect();
+
+                Ok((
+                    *li,
+                    Group {
+                        inst,
+                        asg,
+                        init_state_vars,
+                        final_state_vars,
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Build next-level groups, preserving order.
+        let mut next: Vec<Group<F>> = Vec::with_capacity((groups.len() + 1) / 2);
+        let mut i = 0usize;
+        let mut merged_map = std::collections::HashMap::<usize, Group<F>>::new();
+        for (k, g) in merged_pairs {
+            merged_map.insert(k, g);
+        }
+        while i < groups.len() {
+            if let Some(g) = merged_map.remove(&i) {
+                next.push(g);
+                i += 2;
+            } else {
+                // Odd tail group passes through.
+                next.push(groups[i].clone());
+                i += 1;
+            }
+        }
+        groups = next;
+        round += 1;
+    }
+
+    let final_group = groups
+        .pop()
+        .ok_or_else(|| ReplayErr::Invalid("poseidon shard merge produced empty result".to_string()))?;
+
+    // ---------------------------------------------------------------------
+    // Stitch global wiring/byte wiring by offsetting per-shard var indices.
+    // ---------------------------------------------------------------------
+    let mut wiring = PoseidonDr1csWiring::default();
+    let mut bw = PoseidonByteWiring::default();
+    let mut bytes_all: Vec<ByteSqueezeWitness> = Vec::new();
+
+    let mut var_tail_off: usize = 0; // excludes var0
+    let mut absorb_off: usize = 0;
+    let mut squeeze_off: usize = 0;
+    let mut squeeze_byte_off: usize = 0;
+
+    for s in shard_outs.iter() {
+        // var mapping for this shard in the final merged instance.
+        let map_var = |idx: usize| -> usize {
+            if idx == 0 { 0 } else { idx + var_tail_off }
+        };
+
+        for &v in &s.wiring.absorb_vars {
+            wiring.absorb_vars.push(map_var(v));
+        }
+        for &(st, ln) in &s.wiring.absorb_ranges {
+            wiring.absorb_ranges.push((absorb_off + st, ln));
+        }
+        absorb_off += s.wiring.absorb_vars.len();
+
+        for &v in &s.wiring.squeeze_field_vars {
+            wiring.squeeze_field_vars.push(map_var(v));
+        }
+        for &(st, ln) in &s.wiring.squeeze_field_ranges {
+            wiring.squeeze_field_ranges.push((squeeze_off + st, ln));
+        }
+        squeeze_off += s.wiring.squeeze_field_vars.len();
+
+        for &v in &s.bw.squeeze_byte_vars {
+            bw.squeeze_byte_vars.push(map_var(v));
+        }
+        for &(st, ln) in &s.bw.squeeze_byte_ranges {
+            bw.squeeze_byte_ranges.push((squeeze_byte_off + st, ln));
+        }
+        squeeze_byte_off += s.bw.squeeze_byte_vars.len();
+
+        for w in &s.bytes {
+            let src_elems = w.src_elems.iter().copied().map(map_var).collect();
+            bytes_all.push(ByteSqueezeWitness {
+                n: w.n,
+                usable_bytes: w.usable_bytes,
+                src_elems,
+                out: w.out.clone(),
+            });
+        }
+
+        var_tail_off = var_tail_off.saturating_add(s.asg.len().saturating_sub(1));
+    }
+
+    // WE mode: replay is not used; keep a minimal placeholder.
+    let replay = PoseidonSpongeReplayResult {
+        final_state: vec![F::ZERO; cfg.rate + cfg.capacity],
+        permutes: Vec::new(),
+    };
+
+    Ok((final_group.inst, final_group.asg, replay, bytes_all, wiring, bw))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1160,6 +1581,47 @@ fn poseidon_sponge_dr1cs_from_trace_impl_any<F: PrimeField + CanonicalSerialize>
         Vec<ByteSqueezeWitness>,
         PoseidonDr1csWiring,
         PoseidonByteWiring,
+    ),
+    ReplayErr,
+> {
+    let t = cfg.rate + cfg.capacity;
+    let init_state = vec![F::ZERO; t];
+    let init_mode = ark_crypto_primitives::sponge::DuplexSpongeMode::Absorbing {
+        next_absorb_index: 0,
+    };
+    let (inst, asg, replay, bytes, wiring, bw, _init_state_vars, _final_state_vars) =
+        poseidon_sponge_dr1cs_from_trace_impl_any_internal(
+            cfg,
+            ops,
+            with_bytes,
+            arith_mode,
+            out_dir,
+            &init_state,
+            init_mode,
+            true,
+        )?;
+    Ok((inst, asg, replay, bytes, wiring, bw))
+}
+
+fn poseidon_sponge_dr1cs_from_trace_impl_any_internal<F: PrimeField + CanonicalSerialize>(
+    cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+    ops: &[PoseidonTraceOp<F>],
+    with_bytes: bool,
+    arith_mode: PoseidonArithMode,
+    out_dir: Option<&Path>,
+    init_state: &[F],
+    init_mode: ark_crypto_primitives::sponge::DuplexSpongeMode,
+    constrain_init: bool,
+) -> Result<
+    (
+        PoseidonInstance<F>,
+        Vec<F>,
+        PoseidonSpongeReplayResult<F>,
+        Vec<ByteSqueezeWitness>,
+        PoseidonDr1csWiring,
+        PoseidonByteWiring,
+        Vec<usize>,
+        Vec<usize>,
     ),
     ReplayErr,
 > {
@@ -1191,6 +1653,12 @@ fn poseidon_sponge_dr1cs_from_trace_impl_any<F: PrimeField + CanonicalSerialize>
     };
 
     let t = cfg.rate + cfg.capacity;
+    if init_state.len() != t {
+        return Err(ReplayErr::Invalid(format!(
+            "init_state length mismatch: expected {t}, got {}",
+            init_state.len()
+        )));
+    }
     let mut b = if let Some(dir) = out_dir {
         Dr1csBuilder::<F>::new_file_backed(dir).map_err(ReplayErr::Invalid)?
     } else {
@@ -1198,17 +1666,18 @@ fn poseidon_sponge_dr1cs_from_trace_impl_any<F: PrimeField + CanonicalSerialize>
     };
     let one = b.one();
 
-    // Initial state is all zeros.
+    // Initial state: either fixed zeros (single-shard) or carried-in witness state (sharded mode).
     let mut state_vars = Vec::with_capacity(t);
-    for _ in 0..t {
-        let v = b.new_var(F::ZERO);
-        b.enforce_var_eq_const(v, F::ZERO);
+    for i in 0..t {
+        let v = b.new_var(init_state[i]);
+        if constrain_init {
+            b.enforce_var_eq_const(v, init_state[i]);
+        }
         state_vars.push(v);
     }
+    let init_state_vars = state_vars.clone();
 
-    let mut mode = ark_crypto_primitives::sponge::DuplexSpongeMode::Absorbing {
-        next_absorb_index: 0,
-    };
+    let mut mode = init_mode;
 
     let mut byte_witnesses: Vec<ByteSqueezeWitness> = Vec::new();
     let mut wiring = PoseidonDr1csWiring::default();
@@ -1885,7 +2354,17 @@ fn poseidon_sponge_dr1cs_from_trace_impl_any<F: PrimeField + CanonicalSerialize>
         let (inst, asg) = b.into_sparse_instance();
         (PoseidonInstance::InMemory(inst), asg)
     };
-    Ok((inst_any, assignment, replay, byte_witnesses, wiring, byte_wiring))
+    let final_state_vars = state_vars;
+    Ok((
+        inst_any,
+        assignment,
+        replay,
+        byte_witnesses,
+        wiring,
+        byte_wiring,
+        init_state_vars,
+        final_state_vars,
+    ))
 }
 
 fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField + CanonicalSerialize>(

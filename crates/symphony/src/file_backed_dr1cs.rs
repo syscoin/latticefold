@@ -57,13 +57,32 @@ fn meta_path(dir: &Path) -> PathBuf {
 }
 
 fn serialize_fixed<F: CanonicalSerialize>(x: &F, out: &mut [u8]) -> Result<(), SerializationError> {
-    // CanonicalSerialize writes to a std::io::Write; use a Vec and copy.
-    let mut v = Vec::with_capacity(out.len());
-    x.serialize_with_mode(&mut v, Compress::Yes)?;
-    if v.len() != out.len() {
+    // CanonicalSerialize writes to a std::io::Write. Avoid allocating a Vec per coefficient:
+    // write directly into the fixed-size output buffer.
+    struct SliceWriter<'a> {
+        buf: &'a mut [u8],
+        pos: usize,
+    }
+    impl<'a> IoWrite for SliceWriter<'a> {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            let rem = self.buf.len().saturating_sub(self.pos);
+            if data.len() > rem {
+                return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "SliceWriter overflow"));
+            }
+            self.buf[self.pos..self.pos + data.len()].copy_from_slice(data);
+            self.pos += data.len();
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut w = SliceWriter { buf: out, pos: 0 };
+    x.serialize_with_mode(&mut w, Compress::Yes)?;
+    if w.pos != out.len() {
         return Err(SerializationError::InvalidData);
     }
-    out.copy_from_slice(&v);
     Ok(())
 }
 
@@ -108,16 +127,47 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             return Err("invalid coeff_size=0".to_string());
         }
 
+        // Buffered IO is critical: file-backed Poseidon emits huge volumes of small-ish records.
+        // Use a large BufWriter capacity by default, configurable via env var.
+        #[inline]
+        fn buf_bytes() -> usize {
+            let mb: usize = std::env::var("LFP_FILE_BACKED_BUF_MB")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(64);
+            mb.saturating_mul(1024 * 1024).max(1024 * 1024)
+        }
+        let cap = buf_bytes();
+
         let (pa_c, pa_i) = term_paths(dir, "a");
         let (pb_c, pb_i) = term_paths(dir, "b");
         let (pc_c, pc_i) = term_paths(dir, "c");
-        let fc_a = BufWriter::new(File::create(pa_c).map_err(|e| format!("create a_coeffs failed: {e}"))?);
-        let fi_a = BufWriter::new(File::create(pa_i).map_err(|e| format!("create a_idx failed: {e}"))?);
-        let fc_b = BufWriter::new(File::create(pb_c).map_err(|e| format!("create b_coeffs failed: {e}"))?);
-        let fi_b = BufWriter::new(File::create(pb_i).map_err(|e| format!("create b_idx failed: {e}"))?);
-        let fc_c = BufWriter::new(File::create(pc_c).map_err(|e| format!("create c_coeffs failed: {e}"))?);
-        let fi_c = BufWriter::new(File::create(pc_i).map_err(|e| format!("create c_idx failed: {e}"))?);
-        let f_rows = BufWriter::new(
+        let fc_a = BufWriter::with_capacity(
+            cap,
+            File::create(pa_c).map_err(|e| format!("create a_coeffs failed: {e}"))?,
+        );
+        let fi_a = BufWriter::with_capacity(
+            cap,
+            File::create(pa_i).map_err(|e| format!("create a_idx failed: {e}"))?,
+        );
+        let fc_b = BufWriter::with_capacity(
+            cap,
+            File::create(pb_c).map_err(|e| format!("create b_coeffs failed: {e}"))?,
+        );
+        let fi_b = BufWriter::with_capacity(
+            cap,
+            File::create(pb_i).map_err(|e| format!("create b_idx failed: {e}"))?,
+        );
+        let fc_c = BufWriter::with_capacity(
+            cap,
+            File::create(pc_c).map_err(|e| format!("create c_coeffs failed: {e}"))?,
+        );
+        let fi_c = BufWriter::with_capacity(
+            cap,
+            File::create(pc_i).map_err(|e| format!("create c_idx failed: {e}"))?,
+        );
+        let f_rows = BufWriter::with_capacity(
+            cap,
             File::create(constraints_path(dir)).map_err(|e| format!("create constraints failed: {e}"))?,
         );
         Ok(Self {

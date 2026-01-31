@@ -527,7 +527,7 @@ fn permute_in_place_with_record<F: PrimeField>(
     permutes.push(PoseidonPermutationTrace { before, after });
 }
 
-fn permute_in_place<F: PrimeField>(cfg: &PoseidonConfig<F>, state: &mut [F]) {
+pub(crate) fn permute_in_place<F: PrimeField>(cfg: &PoseidonConfig<F>, state: &mut [F]) {
     let full_rounds_over_2 = cfg.full_rounds / 2;
 
     for i in 0..full_rounds_over_2 {

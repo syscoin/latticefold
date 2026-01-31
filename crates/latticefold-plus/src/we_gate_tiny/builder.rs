@@ -4377,6 +4377,12 @@ pub(super) fn build_file_backed(
         &u32_locals,
         &setchk_out_e_vars_for_cm,
     )?;
+    lf_stage_log(
+        "cm_shared_precomp_base_done",
+        Some(&pose_inst),
+        Some(&glue),
+        &mut mem_prev,
+    );
     let cm_extra_glues = build_cm_shards_file_backed(
         cfg,
         ops,
@@ -4397,6 +4403,12 @@ pub(super) fn build_file_backed(
         &u32_locals,
         &dirs,
     )?;
+    lf_stage_log(
+        "cm_shards_file_backed_done",
+        Some(&pose_inst),
+        Some(&glue),
+        &mut mem_prev,
+    );
 
     // Surfaces (same as `build()`; these are comparatively small vs Poseidon/CM).
     let (
