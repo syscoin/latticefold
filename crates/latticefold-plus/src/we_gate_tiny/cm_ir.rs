@@ -7,6 +7,7 @@ use cyclotomic_rings::rings::goldilocks_ntt64 as gl_ntt64;
 
 use std::collections::HashMap;
 use core::ops::Range;
+use rayon::prelude::*;
 
 use super::digits::{f257_to_i32_bal, i32_to_f257};
 use super::params::{DIGITS_PER_TRY, LIMB_BITS, LIMBS_U32};
@@ -325,28 +326,134 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
 
     let lowered = LoweredIr { base_nvars, local_to_var };
 
-    // Stream lowering directly into the destination (pooled term storage).
-    // We still avoid `gb.add_constraint` overhead by batching the profile counter update.
+    // Lower constraints/terms.
+    //
+    // Vars must be allocated sequentially (builder is append-only), but the remap+copy of the
+    // IR's pooled term arrays into the builder can be parallelized.
+    //
+    // This is the dominant wall-time for large IR fragments (e.g. NTT ringmul shards).
     let do_profile = gb.profile_enabled;
     let key = gb.profile_current.unwrap_or("unlabeled");
     let n_new = constraints.len() as u64;
-    for ic in constraints {
-        let a0 = gb.a_terms.len();
-        for &(coef, v) in &a_terms[ic.a.clone()] {
-            gb.a_terms.push((coef, lowered.map_var(v)));
+
+    // Threshold: below this, the sequential loop is faster than prefix-sums + Rayon overhead.
+    let use_parallel = constraints.len() >= 50_000 && rayon::current_num_threads() > 1;
+    if !use_parallel {
+        for ic in constraints {
+            let a0 = gb.a_terms.len();
+            for &(coef, v) in &a_terms[ic.a.clone()] {
+                gb.a_terms.push((coef, lowered.map_var(v)));
+            }
+            let a1 = gb.a_terms.len();
+            let b0 = gb.b_terms.len();
+            for &(coef, v) in &b_terms[ic.b.clone()] {
+                gb.b_terms.push((coef, lowered.map_var(v)));
+            }
+            let b1 = gb.b_terms.len();
+            let c0 = gb.c_terms.len();
+            for &(coef, v) in &c_terms[ic.c.clone()] {
+                gb.c_terms.push((coef, lowered.map_var(v)));
+            }
+            let c1 = gb.c_terms.len();
+            gb.rows.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
         }
-        let a1 = gb.a_terms.len();
-        let b0 = gb.b_terms.len();
-        for &(coef, v) in &b_terms[ic.b.clone()] {
-            gb.b_terms.push((coef, lowered.map_var(v)));
+    } else {
+        let n = constraints.len();
+        let mut a_counts: Vec<usize> = Vec::with_capacity(n);
+        let mut b_counts: Vec<usize> = Vec::with_capacity(n);
+        let mut c_counts: Vec<usize> = Vec::with_capacity(n);
+        for ic in &constraints {
+            a_counts.push(ic.a.end - ic.a.start);
+            b_counts.push(ic.b.end - ic.b.start);
+            c_counts.push(ic.c.end - ic.c.start);
         }
-        let b1 = gb.b_terms.len();
-        let c0 = gb.c_terms.len();
-        for &(coef, v) in &c_terms[ic.c.clone()] {
-            gb.c_terms.push((coef, lowered.map_var(v)));
+        let mut a_offs: Vec<usize> = Vec::with_capacity(n + 1);
+        let mut b_offs: Vec<usize> = Vec::with_capacity(n + 1);
+        let mut c_offs: Vec<usize> = Vec::with_capacity(n + 1);
+        a_offs.push(0);
+        b_offs.push(0);
+        c_offs.push(0);
+        for i in 0..n {
+            a_offs.push(a_offs[i] + a_counts[i]);
+            b_offs.push(b_offs[i] + b_counts[i]);
+            c_offs.push(c_offs[i] + c_counts[i]);
         }
-        let c1 = gb.c_terms.len();
-        gb.rows.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
+        let total_a = *a_offs.last().unwrap_or(&0);
+        let total_b = *b_offs.last().unwrap_or(&0);
+        let total_c = *c_offs.last().unwrap_or(&0);
+
+        // Append space in destination vectors (we will fill in parallel with disjoint writes).
+        let a_base = gb.a_terms.len();
+        let b_base = gb.b_terms.len();
+        let c_base = gb.c_terms.len();
+        let row_base = gb.rows.len();
+        gb.a_terms.reserve(total_a);
+        gb.b_terms.reserve(total_b);
+        gb.c_terms.reserve(total_c);
+        gb.rows.reserve(n);
+        unsafe {
+            gb.a_terms.set_len(a_base + total_a);
+            gb.b_terms.set_len(b_base + total_b);
+            gb.c_terms.set_len(c_base + total_c);
+            gb.rows.set_len(row_base + n);
+        }
+
+        // Raw pointers for parallel writes (each thread writes disjoint ranges by construction).
+        #[derive(Copy, Clone)]
+        struct SyncPtr<T>(*mut T);
+        unsafe impl<T> Send for SyncPtr<T> {}
+        unsafe impl<T> Sync for SyncPtr<T> {}
+        impl<T> SyncPtr<T> {
+            #[inline]
+            unsafe fn write(&self, off: usize, v: T) {
+                core::ptr::write(self.0.add(off), v);
+            }
+        }
+        let out_a: SyncPtr<(F257, usize)> = SyncPtr(gb.a_terms.as_mut_ptr());
+        let out_b: SyncPtr<(F257, usize)> = SyncPtr(gb.b_terms.as_mut_ptr());
+        let out_c: SyncPtr<(F257, usize)> = SyncPtr(gb.c_terms.as_mut_ptr());
+        let out_rows: SyncPtr<Constraint> = SyncPtr(gb.rows.as_mut_ptr());
+
+        // Capture mapping pieces for cheap remap in the hot loop.
+        let base_nvars_local = lowered.base_nvars;
+        let local_to_var = &lowered.local_to_var;
+        #[inline]
+        fn map_var_fast(base_nvars: usize, local_to_var: &[usize], v: VarRef) -> usize {
+            match v {
+                VarRef::Base(i) => i,
+                VarRef::Local(j) => {
+                    debug_assert!(j > 0);
+                    debug_assert_eq!(local_to_var[j], base_nvars + (j - 1));
+                    local_to_var[j]
+                }
+            }
+        }
+
+        constraints
+            .par_iter()
+            .enumerate()
+            .for_each(|(i, ic)| unsafe {
+                // Fill A terms.
+                let a_dst0 = a_base + a_offs[i];
+                for (k, &(coef, v)) in a_terms[ic.a.clone()].iter().enumerate() {
+                    out_a.write(a_dst0 + k, (coef, map_var_fast(base_nvars_local, local_to_var, v)));
+                }
+                // Fill B terms.
+                let b_dst0 = b_base + b_offs[i];
+                for (k, &(coef, v)) in b_terms[ic.b.clone()].iter().enumerate() {
+                    out_b.write(b_dst0 + k, (coef, map_var_fast(base_nvars_local, local_to_var, v)));
+                }
+                // Fill C terms.
+                let c_dst0 = c_base + c_offs[i];
+                for (k, &(coef, v)) in c_terms[ic.c.clone()].iter().enumerate() {
+                    out_c.write(c_dst0 + k, (coef, map_var_fast(base_nvars_local, local_to_var, v)));
+                }
+                // Row ranges.
+                let a_rng = (a_dst0)..(a_dst0 + a_counts[i]);
+                let b_rng = (b_dst0)..(b_dst0 + b_counts[i]);
+                let c_rng = (c_dst0)..(c_dst0 + c_counts[i]);
+                out_rows.write(row_base + i, Constraint { a: a_rng, b: b_rng, c: c_rng });
+            });
     }
     if do_profile {
         gb.profile.entry(key).or_default().constraints += n_new;
