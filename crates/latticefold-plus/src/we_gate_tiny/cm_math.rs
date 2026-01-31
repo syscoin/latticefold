@@ -614,29 +614,50 @@ pub(crate) fn sumcheck_verify_degree2_ring_digits(
             // Pre-check: if the witness is already inconsistent, print where it first differs.
             // This is specifically to localize failures like the file-backed `ring_eq_digits` mismatch.
             let asg = &gb.assignment;
-            'outer: for (coeff_idx, (ai, bi)) in g01.iter().zip(claimed_sum.iter()).enumerate() {
+            let mut n: usize = 0;
+            for (coeff_idx, (ai, bi)) in g01.iter().zip(claimed_sum.iter()).enumerate() {
                 for j in 0..17 {
                     let va = asg[ai[j]];
                     let vb = asg[bi[j]];
-                    if va != vb {
-                        let da = f257_to_i32_bal(va);
-                        let db = f257_to_i32_bal(vb);
-                        eprintln!(
-                            "[LF_DEBUG_RING_EQ_MISMATCH] degree2 round={} coeff={} digit={} a_var={} a_val={}({}) b_var={} b_val={}({}) diff={}",
-                            round_idx,
-                            coeff_idx,
-                            j,
-                            ai[j],
-                            va,
-                            da,
-                            bi[j],
-                            vb,
-                            db,
-                            f257_to_i32_bal(va - vb)
-                        );
-                        break 'outer;
+                    if va == vb {
+                        continue;
+                    }
+                    // Also print the underlying message digits that produced g01 at this location.
+                    let m0v = asg[m[0][coeff_idx][j]];
+                    let m1v = asg[m[1][coeff_idx][j]];
+                    eprintln!(
+                        "[LF_DEBUG_RING_EQ_MISMATCH] degree2 round={} coeff={} digit={} \
+                         g01_var={} g01_val={}({}) \
+                         claim_var={} claim_val={}({}) diff={} \
+                         m0_var={} m0_val={}({}) m1_var={} m1_val={}({})",
+                        round_idx,
+                        coeff_idx,
+                        j,
+                        ai[j],
+                        va,
+                        f257_to_i32_bal(va),
+                        bi[j],
+                        vb,
+                        f257_to_i32_bal(vb),
+                        f257_to_i32_bal(va - vb),
+                        m[0][coeff_idx][j],
+                        m0v,
+                        f257_to_i32_bal(m0v),
+                        m[1][coeff_idx][j],
+                        m1v,
+                        f257_to_i32_bal(m1v),
+                    );
+                    n += 1;
+                    if n >= 8 {
+                        break;
                     }
                 }
+                if n >= 8 {
+                    break;
+                }
+            }
+            if n == 0 {
+                eprintln!("[LF_DEBUG_RING_EQ_MISMATCH] degree2 round={} g01==claim (no mismatches)", round_idx);
             }
         }
 

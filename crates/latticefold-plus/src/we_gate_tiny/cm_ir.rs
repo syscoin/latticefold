@@ -2720,163 +2720,8 @@ pub(crate) fn ring_eval_at_scalar_digits_d64_ir(
 ///
 /// Mirrors `goldilocks::ring_mul_negacyclic_ntt_goldilocks_d64`, but is `Dr1csBuilder`-free:
 /// it only allocates local vars + constraints in `CmIr`.
-pub(crate) fn ring_mul_negacyclic_ntt_goldilocks_d64_ir(
-    b: &mut IrBuilder<'_>,
-    a: &[[VarRef; 17]; 64],
-    c: &[[VarRef; 17]; 64],
-) -> [[VarRef; 17]; 64] {
-    // Shared schedule constants from `cyclotomic-rings` (keeps host + gate in sync).
-    let p: u64 = gl_ntt64::GOLDILOCKS_P_U64;
-    let omega: u64 = gl_ntt64::OMEGA_U64;
-    let omega_inv: u64 = gl_ntt64::OMEGA_INV_U64;
-    let inv_n: u64 = gl_ntt64::INV_N_U64;
-
-    let zero_digit = alloc_zero_const_ir(b);
-    let zero_scalar4: [VarRef; 33] = [zero_digit; 33];
-
-    // Convert inputs once: bal16 -> bal4.
-    let mut a4 = [[zero_digit; 33]; 64];
-    let mut c4 = [[zero_digit; 33]; 64];
-    for i in 0..64 {
-        a4[i] = b.bal16_to_bal4_digits_cached(&a[i]);
-        c4[i] = b.bal16_to_bal4_digits_cached(&c[i]);
-    }
-
-    fn ntt_in_place_bal4(
-        b: &mut IrBuilder<'_>,
-        a: &mut [[VarRef; 33]; 64],
-        omega: u64,
-        p_u64: u64,
-        zero: &[VarRef; 33],
-    ) {
-        // Bit-reversal permutation (purely structural).
-        let mut tmp = *a;
-        for i in 0..64 {
-            tmp[gl_ntt64::BITREV_64[i]] = a[i];
-        }
-        *a = tmp;
-
-        // Iterative Cooley–Tukey.
-        let mut len = 2usize;
-        while len <= 64 {
-            let half = len / 2;
-            for start in (0..64).step_by(len) {
-                for j in 0..half {
-                    let w: u64 = if omega == gl_ntt64::OMEGA_U64 {
-                        match len {
-                            2 => gl_ntt64::W_POWS_LEN_2[j],
-                            4 => gl_ntt64::W_POWS_LEN_4[j],
-                            8 => gl_ntt64::W_POWS_LEN_8[j],
-                            16 => gl_ntt64::W_POWS_LEN_16[j],
-                            32 => gl_ntt64::W_POWS_LEN_32[j],
-                            64 => gl_ntt64::W_POWS_LEN_64[j],
-                            _ => unreachable!(),
-                        }
-                    } else {
-                        debug_assert_eq!(omega, gl_ntt64::OMEGA_INV_U64);
-                        match len {
-                            2 => gl_ntt64::IW_POWS_LEN_2[j],
-                            4 => gl_ntt64::IW_POWS_LEN_4[j],
-                            8 => gl_ntt64::IW_POWS_LEN_8[j],
-                            16 => gl_ntt64::IW_POWS_LEN_16[j],
-                            32 => gl_ntt64::IW_POWS_LEN_32[j],
-                            64 => gl_ntt64::IW_POWS_LEN_64[j],
-                            _ => unreachable!(),
-                        }
-                    };
-
-                    let u = a[start + j];
-                    let v = if w == 1 {
-                        a[start + j + half]
-                    } else if w == p_u64 - 1 {
-                        // v = -x mod p = 0 - x
-                        goldilocks_sub_mod_p_digits_bal4_ir(b, zero, &a[start + j + half], p_u64)
-                    } else {
-                        goldilocks_mul_const_mod_p_digits_bal4_ir(b, &a[start + j + half], w, p_u64)
-                    };
-                    a[start + j] = goldilocks_add_mod_p_digits_bal4_ir(b, &u, &v, p_u64);
-                    a[start + j + half] = goldilocks_sub_mod_p_digits_bal4_ir(b, &u, &v, p_u64);
-                }
-            }
-            len *= 2;
-        }
-    }
-
-    fn intt_in_place_bal4(
-        b: &mut IrBuilder<'_>,
-        a: &mut [[VarRef; 33]; 64],
-        omega_inv: u64,
-        inv_n: u64,
-        p_u64: u64,
-        zero: &[VarRef; 33],
-    ) {
-        ntt_in_place_bal4(b, a, omega_inv, p_u64, zero);
-        // scale by n^{-1}
-        for i in 0..64 {
-            a[i] = if inv_n == 1 {
-                a[i]
-            } else if inv_n == p_u64 - 1 {
-                goldilocks_sub_mod_p_digits_bal4_ir(b, zero, &a[i], p_u64)
-            } else {
-                goldilocks_mul_const_mod_p_digits_bal4_ir(b, &a[i], inv_n, p_u64)
-            };
-        }
-    }
-
-    // Negacyclic via twist by ψ^i (ψ is primitive 128th root).
-    let mut a_tw = [[zero_digit; 33]; 64];
-    let mut c_tw = [[zero_digit; 33]; 64];
-    for i in 0..64 {
-        let psi_pow: u64 = gl_ntt64::PSI_POWS_64[i];
-        if psi_pow == 1 {
-            a_tw[i] = a4[i];
-            c_tw[i] = c4[i];
-        } else if psi_pow == p - 1 {
-            a_tw[i] = goldilocks_sub_mod_p_digits_bal4_ir(b, &zero_scalar4, &a4[i], p);
-            c_tw[i] = goldilocks_sub_mod_p_digits_bal4_ir(b, &zero_scalar4, &c4[i], p);
-        } else {
-            a_tw[i] = goldilocks_mul_const_mod_p_digits_bal4_ir(b, &a4[i], psi_pow, p);
-            c_tw[i] = goldilocks_mul_const_mod_p_digits_bal4_ir(b, &c4[i], psi_pow, p);
-        }
-    }
-
-    ntt_in_place_bal4(b, &mut a_tw, omega, p, &zero_scalar4);
-    ntt_in_place_bal4(b, &mut c_tw, omega, p, &zero_scalar4);
-
-    // Pointwise multiply.
-    for i in 0..64 {
-        a_tw[i] = goldilocks_mul_mod_p_digits_bal4_ir(b, &a_tw[i], &c_tw[i], p);
-    }
-
-    intt_in_place_bal4(b, &mut a_tw, omega_inv, inv_n, p, &zero_scalar4);
-
-    // Untwist by ψ^{-i}.
-    let mut out4 = [[zero_digit; 33]; 64];
-    for i in 0..64 {
-        let psi_inv_pow: u64 = gl_ntt64::PSI_INV_POWS_64[i];
-        out4[i] = if psi_inv_pow == 1 {
-            a_tw[i]
-        } else if psi_inv_pow == p - 1 {
-            goldilocks_sub_mod_p_digits_bal4_ir(b, &zero_scalar4, &a_tw[i], p)
-        } else {
-            goldilocks_mul_const_mod_p_digits_bal4_ir(b, &a_tw[i], psi_inv_pow, p)
-        };
-    }
-
-    // Convert outputs once: bal4 -> bal16.
-    let mut out = [[zero_digit; 17]; 64];
-    for i in 0..64 {
-        out[i] = bal4_to_bal16_digits_ir(b, &out4[i]);
-    }
-    out
-}
-
-/// Negacyclic ring multiplication for `d=64` over Goldilocks using an NTT-based method, emitting IR,
-/// with inputs/outputs in **checked bal4** digits.
-///
-/// This enables bal4 end-to-end pipelines that want to avoid repeated bal16<->bal4 conversions
-/// around subsequent scaling/addition.
-pub(crate) fn ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir(
+#[inline]
+fn ring_mul_negacyclic_ntt_goldilocks_d64_bal4_core_ir(
     b: &mut IrBuilder<'_>,
     a4_in: &[[VarRef; 33]; 64],
     c4_in: &[[VarRef; 33]; 64],
@@ -3012,6 +2857,43 @@ pub(crate) fn ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir(
     }
 
     out4
+}
+
+pub(crate) fn ring_mul_negacyclic_ntt_goldilocks_d64_ir(
+    b: &mut IrBuilder<'_>,
+    a: &[[VarRef; 17]; 64],
+    c: &[[VarRef; 17]; 64],
+) -> [[VarRef; 17]; 64] {
+    let zero_digit = alloc_zero_const_ir(b);
+
+    // Convert inputs once: bal16 -> bal4.
+    let mut a4 = [[zero_digit; 33]; 64];
+    let mut c4 = [[zero_digit; 33]; 64];
+    for i in 0..64 {
+        a4[i] = b.bal16_to_bal4_digits_cached(&a[i]);
+        c4[i] = b.bal16_to_bal4_digits_cached(&c[i]);
+    }
+    let out4 = ring_mul_negacyclic_ntt_goldilocks_d64_bal4_core_ir(b, &a4, &c4);
+
+    // Convert outputs once: bal4 -> bal16.
+    let mut out = [[zero_digit; 17]; 64];
+    for i in 0..64 {
+        out[i] = bal4_to_bal16_digits_ir(b, &out4[i]);
+    }
+    out
+}
+
+/// Negacyclic ring multiplication for `d=64` over Goldilocks using an NTT-based method, emitting IR,
+/// with inputs/outputs in **checked bal4** digits.
+///
+/// This enables bal4 end-to-end pipelines that want to avoid repeated bal16<->bal4 conversions
+/// around subsequent scaling/addition.
+pub(crate) fn ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir(
+    b: &mut IrBuilder<'_>,
+    a4_in: &[[VarRef; 33]; 64],
+    c4_in: &[[VarRef; 33]; 64],
+) -> [[VarRef; 33]; 64] {
+    ring_mul_negacyclic_ntt_goldilocks_d64_bal4_core_ir(b, a4_in, c4_in)
 }
 
 #[cfg(test)]
