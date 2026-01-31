@@ -2093,7 +2093,8 @@ fn build_u32_and_goldilocks_blocks(
 /// It also enforces that the sumcheck header absorbs match statement-bound constants:
 /// - absorbed `nvars_cm`
 /// - absorbed `degree_cm == 2`
-/// and that the per-round "marker" scalar absorbs are zero (as in the schedule generator).
+/// and that the per-round "marker" scalar absorbs match the sampled `r_i` bytes (as in the
+/// transcript schedule: sample `r_i` via `get_challenge()`, then explicitly absorb `r_i`).
 fn parse_and_enforce_cm_after_short(
     glue: &mut GlueCtx,
     ops: &[PoseidonTraceOp<F257>],
@@ -2102,7 +2103,7 @@ fn parse_and_enforce_cm_after_short(
     params: &WeParams,
     wiring: &TinyCoinOpWiring,
     l_instances: usize,
-    u32_locals: &[BoundedU32ChallengeWiring],
+    goldilocks_locals: &[GoldilocksChallengeWiring],
 ) -> Result<
     (
         Vec<(usize, usize)>, // comh ring absorbs (start,len)
@@ -4540,7 +4541,7 @@ pub(super) fn build(
         params,
         wiring,
         l_instances_expected,
-        &u32_locals,
+        &goldilocks_locals,
     )?;
     lf_stage_log("parse_and_enforce_cm_after_short", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
@@ -4948,7 +4949,7 @@ pub(super) fn build_file_backed(
         params,
         wiring,
         l_instances_expected,
-        &u32_locals,
+        &goldilocks_locals,
     )?;
 
     // Capture a lightweight absorb breakdown summary for optional op-mix reporting.
