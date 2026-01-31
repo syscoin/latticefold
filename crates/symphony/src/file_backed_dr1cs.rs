@@ -13,6 +13,7 @@ use std::fs::{create_dir_all, File};
 use std::io::{BufReader, BufWriter, Read as IoRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::io::Seek;
+use std::collections::HashMap;
 
 use ark_ff::PrimeField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, SerializationError};
@@ -79,7 +80,8 @@ fn serialize_fixed<F: CanonicalSerialize>(x: &F, out: &mut [u8]) -> Result<(), S
     }
 
     let mut w = SliceWriter { buf: out, pos: 0 };
-    x.serialize_with_mode(&mut w, Compress::Yes)?;
+    // Use uncompressed encoding for speed (bigger files, fewer bit-level operations).
+    x.serialize_with_mode(&mut w, Compress::No)?;
     if w.pos != out.len() {
         return Err(SerializationError::InvalidData);
     }
@@ -88,7 +90,8 @@ fn serialize_fixed<F: CanonicalSerialize>(x: &F, out: &mut [u8]) -> Result<(), S
 
 fn deserialize_fixed<F: CanonicalDeserialize>(buf: &[u8]) -> Result<F, SerializationError> {
     let mut r = BufReader::new(buf);
-    F::deserialize_with_mode(&mut r, Compress::Yes, ark_serialize::Validate::Yes)
+    // Skip validation for speed (inputs are self-produced file-backed artifacts).
+    F::deserialize_with_mode(&mut r, Compress::No, ark_serialize::Validate::No)
 }
 
 #[derive(Debug)]
@@ -109,7 +112,32 @@ pub struct SparseDr1csFileWriter<F> {
     c_terms: u64,
     // Reusable coefficient buffer.
     coeff_buf: Vec<u8>,
+    // Cache of canonical serialized coefficients keyed by a fast hash of BigInt limbs.
+    // This avoids repeatedly running arkworks serialization on hot constant coefficients.
+    coeff_cache: HashMap<u64, Vec<CoeffCacheEntry>>,
     _pd: core::marker::PhantomData<F>,
+}
+
+#[derive(Clone, Debug)]
+struct CoeffCacheEntry {
+    limbs: Vec<u64>,
+    bytes: Vec<u8>,
+}
+
+#[inline]
+fn hash_u64s(limbs: &[u64]) -> u64 {
+    // Simple mixing hash (deterministic, fast). Collisions are handled by verifying limbs.
+    let mut h: u64 = 0x9E37_79B9_7F4A_7C15;
+    for &x in limbs {
+        // splitmix64-like mix
+        let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        h ^= z;
+        h = h.rotate_left(13).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    h
 }
 
 impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
@@ -120,7 +148,7 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
         // Determine fixed coeff size.
         let mut tmp = Vec::new();
         F::ONE
-            .serialize_with_mode(&mut tmp, Compress::Yes)
+            .serialize_with_mode(&mut tmp, Compress::No)
             .map_err(|e| format!("serialize ONE failed: {e}"))?;
         let coeff_size = tmp.len();
         if coeff_size == 0 {
@@ -187,6 +215,7 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             b_terms: 0,
             c_terms: 0,
             coeff_buf: vec![0u8; coeff_size],
+            coeff_cache: HashMap::new(),
             _pd: core::marker::PhantomData,
         })
     }
@@ -203,7 +232,7 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
 
     #[inline]
     pub fn push_a_term(&mut self, coef: &F, idx: u64) -> Result<(), String> {
-        serialize_fixed(coef, &mut self.coeff_buf).map_err(|e| format!("serialize coeff failed: {e}"))?;
+        self.write_coeff_cached(coef)?;
         self.fc_a.write_all(&self.coeff_buf).map_err(|e| e.to_string())?;
         write_u64(&mut self.fi_a, idx).map_err(|e| e.to_string())?;
         self.a_terms += 1;
@@ -219,7 +248,7 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
     }
     #[inline]
     pub fn push_b_term(&mut self, coef: &F, idx: u64) -> Result<(), String> {
-        serialize_fixed(coef, &mut self.coeff_buf).map_err(|e| format!("serialize coeff failed: {e}"))?;
+        self.write_coeff_cached(coef)?;
         self.fc_b.write_all(&self.coeff_buf).map_err(|e| e.to_string())?;
         write_u64(&mut self.fi_b, idx).map_err(|e| e.to_string())?;
         self.b_terms += 1;
@@ -235,10 +264,35 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
     }
     #[inline]
     pub fn push_c_term(&mut self, coef: &F, idx: u64) -> Result<(), String> {
-        serialize_fixed(coef, &mut self.coeff_buf).map_err(|e| format!("serialize coeff failed: {e}"))?;
+        self.write_coeff_cached(coef)?;
         self.fc_c.write_all(&self.coeff_buf).map_err(|e| e.to_string())?;
         write_u64(&mut self.fi_c, idx).map_err(|e| e.to_string())?;
         self.c_terms += 1;
+        Ok(())
+    }
+
+    #[inline]
+    fn write_coeff_cached(&mut self, coef: &F) -> Result<(), String> {
+        let big = coef.into_bigint();
+        let limbs = big.as_ref();
+        let key = hash_u64s(limbs);
+        if let Some(bucket) = self.coeff_cache.get(&key) {
+            for ent in bucket {
+                if ent.limbs.as_slice() == limbs {
+                    self.coeff_buf.copy_from_slice(&ent.bytes);
+                    return Ok(());
+                }
+            }
+        }
+
+        // Cache miss: serialize once.
+        serialize_fixed(coef, &mut self.coeff_buf).map_err(|e| format!("serialize coeff failed: {e}"))?;
+        let bytes = self.coeff_buf.clone();
+        let ent = CoeffCacheEntry {
+            limbs: limbs.to_vec(),
+            bytes,
+        };
+        self.coeff_cache.entry(key).or_default().push(ent);
         Ok(())
     }
     #[inline]
