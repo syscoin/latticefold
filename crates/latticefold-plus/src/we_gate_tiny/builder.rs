@@ -3391,18 +3391,31 @@ fn build_cm_glue_for_which(
 
     // Attach a top-level profiling scope for any constraints not already labeled by inner gadgets.
     // This helps turn the big "unlabeled" bucket into something actionable, per shard.
+    //
+    // IMPORTANT: this must *not* hold `&mut glue.gb` for the whole function, since we also need
+    // `&mut glue` later (e.g. to parse transcript absorbs). Use a raw pointer for Drop-time exit.
     struct ProfileGuard<'a, F: ark_ff::PrimeField> {
-        gb: &'a mut symphony::dpp_sumcheck::Dr1csBuilder<F>,
+        gb: *mut symphony::dpp_sumcheck::Dr1csBuilder<F>,
         prev: Option<&'static str>,
+        _pd: core::marker::PhantomData<&'a mut symphony::dpp_sumcheck::Dr1csBuilder<F>>,
     }
     impl<'a, F: ark_ff::PrimeField> Drop for ProfileGuard<'a, F> {
         fn drop(&mut self) {
-            self.gb.profile_exit(self.prev);
+            // Safety: `gb` points to `glue.gb` which outlives this guard (same stack frame),
+            // and we only use it to call `profile_exit` when the guard is being dropped.
+            unsafe {
+                (*self.gb).profile_exit(self.prev);
+            }
         }
     }
     let _prof = if glue.gb.profile_enabled {
         let label: &'static str = if which == 0 { "cm0_total" } else { "cm1_total" };
-        Some(ProfileGuard { prev: glue.gb.profile_enter(label), gb: &mut glue.gb })
+        let prev = glue.gb.profile_enter(label);
+        Some(ProfileGuard {
+            gb: &mut glue.gb as *mut _,
+            prev,
+            _pd: core::marker::PhantomData,
+        })
     } else {
         None
     };
