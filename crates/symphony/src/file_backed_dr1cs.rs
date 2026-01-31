@@ -134,8 +134,10 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             let mb: usize = std::env::var("LFP_FILE_BACKED_BUF_MB")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(64);
-            mb.saturating_mul(1024 * 1024).max(1024 * 1024)
+                // Default: large buffers to reduce syscall overhead on huge traces.
+                .unwrap_or(256);
+            // Keep buffers meaningfully large even if configured smaller.
+            mb.saturating_mul(1024 * 1024).max(32 * 1024 * 1024)
         }
         let cap = buf_bytes();
 
@@ -520,7 +522,8 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
 
     // IMPORTANT: merge is dominated by streaming IO. The default `BufReader` capacity (8KiB)
     // causes excessive syscalls on huge instances. Use a large fixed buffer here.
-    const MERGE_BUF_BYTES: usize = 64 * 1024 * 1024;
+    // Large read buffers significantly reduce syscall overhead during merges.
+    const MERGE_BUF_BYTES: usize = 256 * 1024 * 1024;
 
     // Running offsets in the *output* term pools.
     let mut out_a: u64 = 0;
