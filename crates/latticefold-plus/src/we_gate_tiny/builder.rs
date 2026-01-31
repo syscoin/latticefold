@@ -8,13 +8,13 @@ use crate::transcript::DEFAULT_REJECTION_TRIES;
 use rayon::join;
 use rayon::prelude::*;
 
-use ark_ff::Field;
+use ark_ff::{Field, PrimeField};
 use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
 use latticefold::transcript::poseidon::{f257_poseidon_config, F257};
 use symphony::dpp_poseidon::{merge_sparse_dr1cs_share_one, Constraint, PoseidonDr1csWiring, SparseDr1csInstance};
 use symphony::dpp_sumcheck::Dr1csBuilder;
 use symphony::file_backed_dr1cs::{
-    dump_sparse_to_dir, merge_file_backed_sparse_dr1cs_share_one, FileBackedSparseDr1csInstance,
+    merge_file_backed_sparse_dr1cs_share_one, FileBackedSparseDr1csInstance,
 };
 use symphony::transcript::PoseidonTraceOp;
 
@@ -50,7 +50,6 @@ use super::cm_math::{
     ring_eval_at_scalar_digits,
     ring_add_digits, ring_bytes_to_digits, ring_eq_digits,
     ring_const_coeff_digits,
-    ring_scale_digits,
     tensor_goldilocks_ringconst_digits, tensor_goldilocks_scalars_digits, RingBytes, RingDigits,
 };
 use super::op_counts::{tiny_cm_counts_reset, tiny_cm_counts_take};
@@ -969,8 +968,31 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                 let lowered = lower_ir_into_builder(&mut glue.gb, ir);
                 let vab = map_ring_out(&prod_ir, &lowered);
                 let diff = super::cm_math::ring_sub_digits(&mut glue.gb, &vab, vc);
-                let lhs = ring_scale_digits(&mut glue.gb, &diff, &e);
-                ring_eq_digits(&mut glue.gb, &lhs, &subclaim_eval);
+                // Enforce `diff * e == subclaim_eval` in the **bal4** domain to avoid allocating
+                // the scaled ring as bal16 digits (which would require a bal4->bal16 carry-chain conversion
+                // per coefficient).
+                //
+                // This is sound: we convert the existing checked bal16 digits into checked bal4 digits
+                // via a carry chain, do a checked bal4 multiplication mod p, then equate bal4 digits.
+                {
+                    use super::cm_ir::{goldilocks_mul_mod_p_digits_bal4_ir, IrBuilder, VarRef as IrVarRef};
+                    let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+                    let base_asg: &[F257] = glue.gb.assignment.as_slice();
+                    let mut ib = IrBuilder::new(base_asg);
+                    let e16: [IrVarRef; 17] = core::array::from_fn(|k| IrVarRef::Base(e[k]));
+                    let e4 = ib.bal16_to_bal4_digits_cached(&e16);
+                    let diff_ir = ringdigits64_to_ir(&diff)?;
+                    let sub_ir = ringdigits64_to_ir(&subclaim_eval)?;
+                    for i in 0..64 {
+                        let d4 = ib.bal16_to_bal4_digits_cached(&diff_ir[i]);
+                        let prod4 = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &d4, &e4, p_u64);
+                        let sub4 = ib.bal16_to_bal4_digits_cached(&sub_ir[i]);
+                        for k in 0..33 {
+                            ib.enforce_lc_eq_zero(vec![(F257::ONE, prod4[k]), (-F257::ONE, sub4[k])]);
+                        }
+                    }
+                    let _lowered = super::cm_ir::lower_ir_into_builder(&mut glue.gb, ib.ir);
+                }
             }
         }
     }
@@ -1386,7 +1408,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                 // This removes the repeated bal16<->bal4 conversions inside `ring_scale_digits` and
                 // inside `ct_psi_mul_ring_digits_d64` for each intermediate ring value.
                 use super::cm_ir::{
-                    bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir, goldilocks_mul_const_mod_p_digits_bal4_ir,
+                    bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir, goldilocks_sub_mod_p_digits_bal4_ir, goldilocks_mul_const_mod_p_digits_bal4_ir,
                     goldilocks_mul_mod_p_digits_bal4_ir, lower_ir_into_builder, IrBuilder, VarRef as IrVarRef,
                 };
                 let dppow4_base = dppow4_base.as_ref().ok_or("tiny gate: missing dppow4_base")?;
@@ -1472,35 +1494,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                     }
                 }
             } else {
-                // Fallback: generic ring_dim path (legacy).
-                for col in 0..ring_dim {
-                    let mut acc_ring = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
-                    for i in 0..k_rg {
-                        let idx = base + i;
-                        if idx >= out_e_vars[ni].len() {
-                            return Err("tiny gate: out.e length too short for rgchk".to_string());
-                        }
-                        let ui_col = &out_e_vars[ni][idx][col];
-                        let t = ring_scale_digits(&mut glue.gb, ui_col, &dppow[i]);
-                        acc_ring = ring_add_digits(&mut glue.gb, &acc_ring, &t);
-                    }
-                    let ct = ct_psi_mul_ring_digits_d64(&mut glue.gb, &acc_ring)?;
-                    let expected = if ni == 0 {
-                        eval_v[col]
-                    } else {
-                        *eval_c
-                            .get(ni)
-                            .ok_or("tiny gate: eval.c length mismatch (rgchk)")?
-                            .get(col)
-                            .ok_or("tiny gate: eval.c coeff index oob (rgchk)")?
-                    };
-                    for di in 0..17 {
-                        glue.gb.enforce_lc_times_one_eq_const(vec![
-                            (F257::ONE, ct[di]),
-                            (-F257::ONE, expected[di]),
-                        ]);
-                    }
-                }
+                return Err("tiny gate: rgchk optimized path requires ring_dim=64".to_string());
             }
         }
 
@@ -4357,29 +4351,7 @@ fn build_cm_glue_for_which(
                 }
             }
         } else {
-            // Fallback: generic ring_dim path (no bal4 batching).
-            for l0 in (0..l_instances_expected).step_by(l_batch) {
-                let l1 = (l0 + l_batch).min(l_instances_expected);
-                for l in l0..l1 {
-                    let l_idx = l * (4 + 4 * (params.mlen as usize));
-                    let mut inner = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
-                    for row in 0..rows_per_l {
-                        let flat = l * rows_per_l + row;
-                        for j in 0..4 {
-                            let (st, ln) = eval_absorbs[flat * 4 + j];
-                            let rb = parse_ring_elem_absorb_as_ringbytes(&mut glue, pose_wiring, ring_dim, st, ln)?;
-                            let rd = ring_bytes_to_digits(&mut glue.gb, &rb);
-                            if row == 0 && j == 0 {
-                                e00s.push(rd.clone());
-                            }
-                            let t = ring_scale_digits(&mut glue.gb, &rd, &rc_pows[l_idx + row * 4 + j]);
-                            inner = ring_add_digits(&mut glue.gb, &inner, &t);
-                        }
-                    }
-                    let eq_inner = ring_scale_digits(&mut glue.gb, &inner, &eq);
-                    eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &eq_inner);
-                }
-            }
+            return Err("tiny gate: recombination check requires ring_dim=64".to_string());
         }
 
         // t(z) terms: for each l, add t0(ro)*e00(l)*rc^z + t1(ro)*e00(l)*rc^{z+1}.
@@ -4408,7 +4380,9 @@ fn build_cm_glue_for_which(
             }
 
             // Precompute shared inputs in bal4 once (t0/t1 + rc^z scalars).
-            let base_asg: &[F257] = &glue.gb.assignment;
+            // Avoid borrowing `glue.gb.assignment` across `lower_ir_into_builder(&mut glue.gb, ...)`.
+            let base_asg_vec: Vec<F257> = glue.gb.assignment.clone();
+            let base_asg: &[F257] = base_asg_vec.as_slice();
             let (t0_4_base, t1_4_base, rcz4_base, rcz14_base): ([[usize; 33]; 64], [[usize; 33]; 64], [usize; 33], [usize; 33]) = {
                 let t0_16 = ringdigits64_to_ir(&t0)?;
                 let t1_16 = ringdigits64_to_ir(&t1)?;
