@@ -2559,6 +2559,30 @@ pub(crate) fn goldilocks_mul_mod_p_digits_ir(
     bal4_to_bal16_digits_ir(b, &r4)
 }
 
+/// Evaluate a ring element (length 64) at a scalar point `x` (Goldilocks digits),
+/// emitting IR for the full evaluation.
+///
+/// This matches `setchk::ev` / `cm_math::ring_eval_at_scalar_digits`:
+/// \(\sum_{t=0}^{63} coeff[t] \cdot x^t\) mod p.
+pub(crate) fn ring_eval_at_scalar_digits_d64_ir(
+    b: &mut IrBuilder<'_>,
+    coeffs: &[[VarRef; 17]; 64],
+    x: &[VarRef; 17],
+    p_u64: u64,
+    p_d_const: &[i8; 17],
+) -> [VarRef; 17] {
+    let zero = alloc_u64_as_bal16_digits_witness_ir(b, 0u64);
+    let one = alloc_u64_as_bal16_digits_witness_ir(b, 1u64);
+    let mut acc = zero;
+    let mut pow = one;
+    for c in coeffs {
+        let t = goldilocks_mul_mod_p_digits_ir(b, c, &pow, p_u64, p_d_const);
+        acc = goldilocks_add_mod_p_digits_ir(b, &acc, &t, p_u64, p_d_const);
+        pow = goldilocks_mul_mod_p_digits_ir(b, &pow, x, p_u64, p_d_const);
+    }
+    acc
+}
+
 /// Negacyclic ring multiplication for `d=64` over Goldilocks using an NTT-based method, emitting IR.
 ///
 /// Mirrors `goldilocks::ring_mul_negacyclic_ntt_goldilocks_d64`, but is `Dr1csBuilder`-free:

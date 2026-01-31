@@ -6,6 +6,7 @@
 use ark_ff::{BigInteger, PrimeField};
 use rayon::prelude::*;
 use core::ops::Range;
+use std::time::{Duration, Instant};
 
 use crate::poseidon_trace::{permute_with_round_trace, PoseidonReplayError};
 use crate::poseidon_trace::{replay_ops, PoseidonReplayError as ReplayErr, PoseidonSpongeReplayResult};
@@ -1048,6 +1049,22 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
     ),
     ReplayErr,
 > {
+    // Progress logging: use the existing `LF_MEM` switch (do not introduce new env vars).
+    //
+    // This intentionally avoids platform-specific RSS queries; we print structural counters
+    // (ops/permutes/vars/constraints) plus elapsed time so long Poseidon builds aren't silent.
+    #[inline]
+    fn lf_mem_on() -> bool {
+        match std::env::var("LF_MEM") {
+            Ok(v) => v != "0",
+            Err(_) => false,
+        }
+    }
+    let progress_on = lf_mem_on();
+    let t_start = Instant::now();
+    let mut last_log = Instant::now();
+    let mut last_logged_permutes: usize = 0;
+
     // In WE mode we must not require replay consistency (arming has no concrete trace yet),
     // and we must not bake recorded trace outputs into constraints.
     let replay = if arith_mode == PoseidonArithMode::ReplayFixed {
@@ -1078,6 +1095,19 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
     let mut byte_witnesses: Vec<ByteSqueezeWitness> = Vec::new();
     let mut wiring = PoseidonDr1csWiring::default();
     let mut byte_wiring = PoseidonByteWiring::default();
+
+    if progress_on {
+        let t = cfg.rate + cfg.capacity;
+        eprintln!(
+            "[poseidon_arith] start: ops={} t={} rate={} cap={} with_bytes={} mode={:?}",
+            ops.len(),
+            t,
+            cfg.rate,
+            cfg.capacity,
+            with_bytes,
+            arith_mode
+        );
+    }
 
     // Helper: apply a Poseidon permutation to the current `state_vars`.
     let mut permute_ptr: usize = 0;
@@ -1275,6 +1305,22 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
             }
         }
         permute_ptr += 1;
+
+        if progress_on {
+            // Log at most once every ~2 seconds, and also on large permute milestones.
+            let milestone = permute_ptr / 1024;
+            if milestone != (last_logged_permutes / 1024) || last_log.elapsed() >= Duration::from_secs(2) {
+                last_logged_permutes = permute_ptr;
+                last_log = Instant::now();
+                eprintln!(
+                    "[poseidon_arith] permute={} vars={} constraints={} elapsed={:.2?}",
+                    permute_ptr,
+                    b.assignment.len(),
+                    b.rows.len(),
+                    t_start.elapsed()
+                );
+            }
+        }
         Ok(())
     };
 

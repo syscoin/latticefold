@@ -3061,17 +3061,68 @@ pub(super) fn build(
             let alpha_pows = goldilocks_pow_table_digits(&mut glue.gb, &alpha, lane_len.saturating_sub(1));
 
             let mut e_sum = zero;
-            for blk in 0..out_e_blocks {
-                for lane in 0..lane_len {
-                    let ejv = &out_e_vars[blk][i][lane];
-                    let ev1 = ring_eval_at_scalar_digits(&mut glue.gb, ejv, &beta)?;
-                    let ev2 = ring_eval_at_scalar_digits(&mut glue.gb, ejv, &beta2)?;
-                    if blk == 0 {
-                        let ev1_sq = goldilocks_mul_mod_p_digits(&mut glue.gb, &ev1, &ev1);
-                        let diff = goldilocks_sub_mod_p_digits(&mut glue.gb, &ev1_sq, &ev2);
-                        let term = goldilocks_mul_mod_p_digits(&mut glue.gb, &diff, &alpha_pows[lane]);
-                        e_sum = goldilocks_add_mod_p_digits(&mut glue.gb, &e_sum, &term);
-                    }
+            // LF+ `setchk::Out::verify` uses only `self.e[0]` for the matrix-output claims.
+            // The transcript still absorbs all `out.e` blocks, but the verifier does not evaluate
+            // them here; avoid doing wasted `ring_eval_at_scalar_digits` work for `blk>0`.
+            {
+                // IR-sharded evaluation: build partial sums in parallel, then lower sequentially.
+                //
+                // This targets build-time parallelism (IR construction) while keeping peak memory bounded.
+                use super::cm_ir::{
+                    goldilocks_add_mod_p_digits_ir, goldilocks_mul_mod_p_digits_ir, goldilocks_sub_mod_p_digits_ir,
+                    lower_ir_into_builder, ring_eval_at_scalar_digits_d64_ir, IrBuilder, VarRef as IrVarRef,
+                    u64_to_bal16_digits_le_const,
+                };
+                let p_u64: u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+                let p_d_const: [i8; 17] = u64_to_bal16_digits_le_const(p_u64);
+                let beta_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(beta[j]));
+                let beta2_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(beta2[j]));
+
+                // Tune: number of lanes per IR shard.
+                let lane_batch: usize = 8;
+                let lane_chunks: Vec<std::ops::Range<usize>> = (0..lane_len)
+                    .step_by(lane_batch)
+                    .map(|s| s..(s + lane_batch).min(lane_len))
+                    .collect();
+
+                let base_asg_ir: &[F257] = &glue.gb.assignment;
+                let frags = lane_chunks
+                    .par_iter()
+                    .map(|r| -> Result<_, String> {
+                        let mut ib = IrBuilder::new(base_asg_ir);
+                        // partial = Σ_{lane in r} (ev1^2 - ev2) * alpha^lane
+                        let mut partial = {
+                            let z = ib.new_var(F257::ZERO);
+                            ib.ir.enforce_var_eq_const(z, F257::ZERO);
+                            // allocate digits for zero
+                            core::array::from_fn(|_| z)
+                        };
+                        for lane in r.clone() {
+                            let ejv = &out_e_vars[0][i][lane];
+                            if ejv.len() != 64 {
+                                return Err("tiny gate: expected ring_dim=64 for setchk ev IR".to_string());
+                            }
+                            let coeffs_ir: [[IrVarRef; 17]; 64] = core::array::from_fn(|t| {
+                                core::array::from_fn(|j| IrVarRef::Base(ejv[t][j]))
+                            });
+                            let alpha_ir: [IrVarRef; 17] =
+                                core::array::from_fn(|j| IrVarRef::Base(alpha_pows[lane][j]));
+                            let ev1 = ring_eval_at_scalar_digits_d64_ir(&mut ib, &coeffs_ir, &beta_ir, p_u64, &p_d_const);
+                            let ev2 = ring_eval_at_scalar_digits_d64_ir(&mut ib, &coeffs_ir, &beta2_ir, p_u64, &p_d_const);
+                            let ev1_sq = goldilocks_mul_mod_p_digits_ir(&mut ib, &ev1, &ev1, p_u64, &p_d_const);
+                            let diff = goldilocks_sub_mod_p_digits_ir(&mut ib, &ev1_sq, &ev2, p_u64, &p_d_const);
+                            let term = goldilocks_mul_mod_p_digits_ir(&mut ib, &diff, &alpha_ir, p_u64, &p_d_const);
+                            partial = goldilocks_add_mod_p_digits_ir(&mut ib, &partial, &term, p_u64, &p_d_const);
+                        }
+                        Ok((ib.ir, partial))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                // Lower each partial sum and accumulate in the main builder.
+                for (ir, partial_ir) in frags {
+                    let lowered = lower_ir_into_builder(&mut glue.gb, ir);
+                    let partial_d: GoldilocksScalar = core::array::from_fn(|j| lowered.map_var(partial_ir[j]));
+                    e_sum = goldilocks_add_mod_p_digits(&mut glue.gb, &e_sum, &partial_d);
                 }
             }
             let t = goldilocks_mul_mod_p_digits(&mut glue.gb, &eq, &e_sum);
