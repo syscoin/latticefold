@@ -3966,7 +3966,7 @@ fn build_cm_glue_for_which(
                     // keep the parallel IR-shard construction for performance/memory reasons.
                     {
                         use super::cm_ir::{
-                            goldilocks_add_mod_p_digits_ir, goldilocks_mul_mod_p_digits_ir, lower_ir_into_builder, IrBuilder,
+                            goldilocks_add_mod_p_digits_ir, u64_to_bal16_digits_le_const, goldilocks_mul_mod_p_digits_ir, lower_ir_into_builder, IrBuilder,
                             VarRef as IrVarRef,
                         };
                         let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
