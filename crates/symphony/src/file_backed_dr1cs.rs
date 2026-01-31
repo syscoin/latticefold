@@ -816,10 +816,11 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
         let out_dir = out_dir.as_ref().to_path_buf();
         let _ = std::fs::remove_dir_all(&out_dir);
         create_dir_all(&out_dir).map_err(|e| format!("create_dir_all failed: {e}"))?;
-        if timing {
+        if verbose {
             eprintln!(
-                "file_backed_merge: parallel start parts={} threads={} out_dir={}",
+                "file_backed_merge: parallel start parts={} eqs={} threads={} out_dir={}",
                 parts.len(),
+                extra_eqs.len(),
                 n_threads,
                 out_dir.display()
             );

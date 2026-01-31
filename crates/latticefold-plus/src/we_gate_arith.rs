@@ -7384,6 +7384,85 @@ mod tests {
                 eprintln!("[test_large_trace] tiny gate file-backed check failed: {e}");
                 if let Some(ci) = parse_failed_constraint_idx(&e) {
                     let _ = tiny_inst.debug_constraint(&tiny_asg, ci, 8);
+
+                    // Also try to localize which part produced this constraint (pre-merge),
+                    // and evaluate it against that part's local files using the corresponding
+                    // slice of the merged assignment.
+                    //
+                    // This tells us whether the bug is in:
+                    // - per-part construction (part itself unsat), or
+                    // - merge remapping (part sat but merged unsat).
+                    use symphony::file_backed_dr1cs::{FileBackedLayout, FileBackedSparseDr1csInstance};
+                    use std::path::PathBuf;
+
+                    fn try_open_part<F: ark_ff::PrimeField + ark_serialize::CanonicalDeserialize + ark_serialize::CanonicalSerialize>(
+                        dir: &std::path::Path,
+                    ) -> Option<FileBackedSparseDr1csInstance<F>> {
+                        let layout = FileBackedLayout {
+                            dir: dir.to_path_buf(),
+                            coeff_size: 0,
+                            nconstraints: 0,
+                            a_terms: 0,
+                            b_terms: 0,
+                            c_terms: 0,
+                        };
+                        FileBackedSparseDr1csInstance::<F>::open(layout).ok()
+                    }
+
+                    // Merge order in finalize_file_backed: poseidon_merged, base_glue, canon_*..., cm0, cm1.
+                    let mut part_dirs: Vec<PathBuf> = Vec::new();
+                    let pose_merged = out_dir.join("poseidon").join("poseidon_merged");
+                    if pose_merged.exists() {
+                        part_dirs.push(pose_merged);
+                    }
+                    let base_glue = out_dir.join("base_glue");
+                    if base_glue.exists() {
+                        part_dirs.push(base_glue);
+                    }
+                    for i in 0..64usize {
+                        let p = out_dir.join(format!("canon_{i}"));
+                        if p.exists() {
+                            part_dirs.push(p);
+                        } else {
+                            break;
+                        }
+                    }
+                    let cm0 = out_dir.join("cm0");
+                    if cm0.exists() {
+                        part_dirs.push(cm0);
+                    }
+                    let cm1 = out_dir.join("cm1");
+                    if cm1.exists() {
+                        part_dirs.push(cm1);
+                    }
+
+                    let mut row_base: u64 = 0;
+                    let mut v_off: usize = 0;
+                    for (pi, pdir) in part_dirs.iter().enumerate() {
+                        let Some(pinst) = try_open_part::<F257>(pdir.as_path()) else {
+                            continue;
+                        };
+                        let nrows = pinst.layout.nconstraints;
+                        let nvars = pinst.nvars;
+                        if ci < row_base.saturating_add(nrows) {
+                            let local_ci = ci - row_base;
+                            // Build local assignment by slicing the merged assignment.
+                            let mut local_asg: Vec<F257> = vec![F257::ZERO; nvars];
+                            local_asg[0] = F257::ONE;
+                            for i in 1..nvars {
+                                let gi = v_off + i;
+                                local_asg[i] = tiny_asg[gi];
+                            }
+                            eprintln!(
+                                "[test_large_trace] failing constraint belongs to part[{pi}] dir={}  local_ci={local_ci}  v_off={v_off} nvars={nvars} nrows={nrows}",
+                                pdir.display()
+                            );
+                            let _ = pinst.debug_constraint(&local_asg, local_ci, 8);
+                            break;
+                        }
+                        row_base = row_base.saturating_add(nrows);
+                        v_off = v_off.saturating_add(nvars.saturating_sub(1));
+                    }
                 }
                 panic!("tiny gate dr1cs sat (file-backed check): {e}");
             }
