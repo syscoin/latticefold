@@ -232,27 +232,22 @@ pub(crate) fn ring_scale_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, s: 
     tiny_cm_bump(|c| c.scalar_mul += a.len() as u64);
     let base_asg: &[F257] = &gb.assignment;
     let s_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(s[j]));
-    let frags: Vec<(_, [IrVarRef; 17])> = (0..a.len())
-        .into_par_iter()
-        .map(|i| {
-            let mut ib = IrBuilder::new(base_asg);
-            let ai: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(a[i][j]));
-            let out = goldilocks_mul_mod_p_digits_ir(
-                &mut ib,
-                &ai,
-                &s_ir,
-                crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P,
-                &goldilocks_p_bal16_digits_le_const(),
-            );
-            Ok::<_, String>((ib.ir, out))
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .expect("ring_scale_digits IR emit should be infallible");
+    // Build a single IR fragment for the whole ring-scaling, so the IR-side caches (notably
+    // `bal16_to_bal4_digits_cached`) can reuse the scalar `s` decomposition across all coefficients.
+    let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+    let p_d = goldilocks_p_bal16_digits_le_const();
+    let mut ib = IrBuilder::new(base_asg);
+    let mut out_ir: Vec<[IrVarRef; 17]> = Vec::with_capacity(a.len());
+    for i in 0..a.len() {
+        let ai: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(a[i][j]));
+        let oi = goldilocks_mul_mod_p_digits_ir(&mut ib, &ai, &s_ir, p_u64, &p_d);
+        out_ir.push(oi);
+    }
 
+    let lowered = lower_ir_into_builder(gb, ib.ir);
     let mut out: RingDigits = Vec::with_capacity(a.len());
-    for (ir, out_ir) in frags {
-        let lowered = lower_ir_into_builder(gb, ir);
-        let digits: GoldilocksScalar = core::array::from_fn(|j| lowered.map_var(out_ir[j]));
+    for oi in out_ir {
+        let digits: GoldilocksScalar = core::array::from_fn(|j| lowered.map_var(oi[j]));
         out.push(digits);
     }
     gb.profile_exit(_prev);
