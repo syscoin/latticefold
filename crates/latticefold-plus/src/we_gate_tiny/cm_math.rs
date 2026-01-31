@@ -614,6 +614,27 @@ pub(crate) fn sumcheck_verify_degree2_ring_digits(
             // Pre-check: if the witness is already inconsistent, print where it first differs.
             // This is specifically to localize failures like the file-backed `ring_eq_digits` mismatch.
             let asg = &gb.assignment;
+            #[inline]
+            fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
+                // Interpret balanced base-16 digits as an integer in [0,2^64),
+                // then reduce mod p (Goldilocks).
+                let mut acc: i128 = 0;
+                let mut pow: i128 = 1;
+                for j in 0..17 {
+                    let dj = f257_to_i32_bal(asg[s[j]]) as i128;
+                    acc += dj * pow;
+                    pow *= 16;
+                }
+                // Bring into canonical u64 (acc should already be in-range for canonical digits).
+                let mut x: i128 = acc;
+                if x < 0 {
+                    // Should not happen for canonical encoding, but keep debug robust.
+                    x = x.rem_euclid(1i128 << 64);
+                }
+                let xu: u64 = x as u64;
+                let p: u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+                (xu as u128 % (p as u128)) as u64
+            }
             let mut n: usize = 0;
             for (coeff_idx, (ai, bi)) in g01.iter().zip(claimed_sum.iter()).enumerate() {
                 for j in 0..17 {
@@ -647,6 +668,19 @@ pub(crate) fn sumcheck_verify_degree2_ring_digits(
                         m1v,
                         f257_to_i32_bal(m1v),
                     );
+                    if j == 0 {
+                        // Also print the full scalar values at this coefficient for fast triage.
+                        let g01_u = scalar_digits_to_u64_mod_p(asg, ai);
+                        let cl_u = scalar_digits_to_u64_mod_p(asg, bi);
+                        eprintln!(
+                            "  [LF_DEBUG_RING_EQ_MISMATCH_SCALAR] degree2 round={} coeff={} g01_u64={} claim_u64={} delta_u64={}",
+                            round_idx,
+                            coeff_idx,
+                            g01_u,
+                            cl_u,
+                            ((g01_u as i128 - cl_u as i128).rem_euclid(crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128)) as u64
+                        );
+                    }
                     n += 1;
                     if n >= 8 {
                         break;
