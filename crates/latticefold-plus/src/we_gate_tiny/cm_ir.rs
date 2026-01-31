@@ -3020,6 +3020,132 @@ mod soundness_regression_tests {
     use symphony::dpp_sumcheck::Dr1csBuilder;
 
     #[test]
+    fn test_bal4_to_bal16_roundtrip_preserves_u64() {
+        use rand::{RngCore, SeedableRng};
+        let p: u64 = gl_ntt64::GOLDILOCKS_P_U64;
+
+        let base_asg = [F257::ONE];
+        let mut ib = IrBuilder::new(&base_asg);
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5a77_1eaf_1b01_91d3);
+        for _ in 0..10_000 {
+            let x: u64 = rng.next_u64() % p;
+            let x16 = alloc_u64_as_bal16_digits_witness_ir(&mut ib, x);
+            let x4 = ib.bal16_to_bal4_digits_cached(&x16);
+            let y16 = bal4_to_bal16_digits_ir(&mut ib, &x4);
+
+            let y: u64 = digits_to_u64_witness_ir(&ib, &y16);
+            assert_eq!(y, x, "bal16->bal4->bal16 drift for x={x}");
+        }
+    }
+
+    #[test]
+    fn test_bal4_add_mul_mod_p_agree_with_bal16_and_u64() {
+        use rand::{RngCore, SeedableRng};
+        let p: u64 = gl_ntt64::GOLDILOCKS_P_U64;
+        let p_d_const: [i8; 17] = u64_to_bal16_digits_le_const(p);
+
+        let base_asg = [F257::ONE];
+        let mut ib = IrBuilder::new(&base_asg);
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x0d2e_9b7c_4c8a_aa51);
+        for _ in 0..2_000 {
+            let a: u64 = rng.next_u64() % p;
+            let b: u64 = rng.next_u64() % p;
+
+            let a16 = alloc_u64_as_bal16_digits_witness_ir(&mut ib, a);
+            let b16 = alloc_u64_as_bal16_digits_witness_ir(&mut ib, b);
+
+            // bal16 reference
+            let sum16 = goldilocks_add_mod_p_digits_ir(&mut ib, &a16, &b16, p, &p_d_const);
+            let prod16 = goldilocks_mul_mod_p_digits_ir(&mut ib, &a16, &b16, p, &p_d_const);
+            let sum16_u = digits_to_u64_witness_ir(&ib, &sum16);
+            let prod16_u = digits_to_u64_witness_ir(&ib, &prod16);
+
+            // bal4 path + convert
+            let a4 = ib.bal16_to_bal4_digits_cached(&a16);
+            let b4 = ib.bal16_to_bal4_digits_cached(&b16);
+            let sum4 = goldilocks_add_mod_p_digits_bal4_ir(&mut ib, &a4, &b4, p);
+            let prod4 = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &a4, &b4, p);
+            let sum4_u = digits4_to_u64_witness_ir(&ib, &sum4);
+            let prod4_u = digits4_to_u64_witness_ir(&ib, &prod4);
+            let sum4_to_16 = bal4_to_bal16_digits_ir(&mut ib, &sum4);
+            let prod4_to_16 = bal4_to_bal16_digits_ir(&mut ib, &prod4);
+            let sum4_to_16_u = digits_to_u64_witness_ir(&ib, &sum4_to_16);
+            let prod4_to_16_u = digits_to_u64_witness_ir(&ib, &prod4_to_16);
+
+            // host expected
+            let exp_sum = ((a as u128 + b as u128) % (p as u128)) as u64;
+            let exp_prod = ((a as u128 * b as u128) % (p as u128)) as u64;
+
+            assert_eq!(sum16_u, exp_sum, "bal16 add mismatch: a={a} b={b}");
+            assert_eq!(prod16_u, exp_prod, "bal16 mul mismatch: a={a} b={b}");
+
+            assert_eq!(sum4_u, exp_sum, "bal4 add mismatch: a={a} b={b}");
+            assert_eq!(prod4_u, exp_prod, "bal4 mul mismatch: a={a} b={b}");
+
+            assert_eq!(
+                sum4_to_16_u, sum16_u,
+                "bal4->bal16 add drift vs bal16: a={a} b={b}"
+            );
+            assert_eq!(
+                prod4_to_16_u, prod16_u,
+                "bal4->bal16 mul drift vs bal16: a={a} b={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bal4_add_mul_mod_p_constraints_agree_with_bal16() {
+        use rand::{RngCore, SeedableRng};
+        let p: u64 = gl_ntt64::GOLDILOCKS_P_U64;
+        let p_d_const: [i8; 17] = u64_to_bal16_digits_le_const(p);
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x9f66_d6c1_0f26_4b2a);
+        for _case in 0..200 {
+            let a: u64 = rng.next_u64() % p;
+            let b_u: u64 = rng.next_u64() % p;
+
+            let mut b = Dr1csBuilder::<F257>::new();
+            b.enforce_var_eq_const(b.one(), F257::ONE);
+            let base_asg: Vec<F257> = b.assignment.clone();
+            let mut ib = IrBuilder::new(&base_asg);
+
+            let a16 = alloc_u64_as_bal16_digits_witness_ir(&mut ib, a);
+            let b16 = alloc_u64_as_bal16_digits_witness_ir(&mut ib, b_u);
+
+            // bal16 reference
+            let sum16 = goldilocks_add_mod_p_digits_ir(&mut ib, &a16, &b16, p, &p_d_const);
+            let prod16 = goldilocks_mul_mod_p_digits_ir(&mut ib, &a16, &b16, p, &p_d_const);
+
+            // bal4 path + convert
+            let a4 = ib.bal16_to_bal4_digits_cached(&a16);
+            let b4 = ib.bal16_to_bal4_digits_cached(&b16);
+            let sum4 = goldilocks_add_mod_p_digits_bal4_ir(&mut ib, &a4, &b4, p);
+            let prod4 = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &a4, &b4, p);
+            let sum4_16 = bal4_to_bal16_digits_ir(&mut ib, &sum4);
+            let prod4_16 = bal4_to_bal16_digits_ir(&mut ib, &prod4);
+
+            // Enforce digitwise equality between the two constructions.
+            for j in 0..17 {
+                ib.enforce_lc_eq_zero(vec![
+                    (F257::ONE, sum16[j]),
+                    (-F257::ONE, sum4_16[j]),
+                ]);
+                ib.enforce_lc_eq_zero(vec![
+                    (F257::ONE, prod16[j]),
+                    (-F257::ONE, prod4_16[j]),
+                ]);
+            }
+
+            let _lowered = lower_ir_into_builder(&mut b, ib.ir);
+            let (inst, asg) = b.into_instance();
+            inst.check(&asg)
+                .unwrap_or_else(|e| panic!("constraints mismatch for a={a} b={b_u}: {e}"));
+        }
+    }
+
+    #[test]
     fn test_good_bal4_carry_bounds_reject_bubble_mutation() {
         let p: u64 = gl_ntt64::GOLDILOCKS_P_U64;
         let k: u64 = gl_ntt64::W_POWS_LEN_64[3];

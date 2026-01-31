@@ -592,7 +592,16 @@ pub(crate) fn sumcheck_verify_degree2_ring_digits(
     let one = goldilocks_bytes_to_digits(gb, one_bytes);
     let two = goldilocks_bytes_to_digits(gb, two_bytes);
 
-    for (m, r) in msgs.iter().zip(rs.iter()) {
+    #[inline]
+    fn dbg_ring_eq_mismatch_on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| match std::env::var("LFP_WE_GATE_OPMIX") {
+            Ok(v) => v != "0",
+            Err(_) => false,
+        })
+    }
+
+    for (round_idx, (m, r)) in msgs.iter().zip(rs.iter()).enumerate() {
         if m[0].len() != d || m[1].len() != d || m[2].len() != d {
             gb.profile_exit(_prev);
             return Err("sumcheck_verify_degree2_ring_digits: ring dimension mismatch".to_string());
@@ -600,6 +609,37 @@ pub(crate) fn sumcheck_verify_degree2_ring_digits(
 
         // g(0) + g(1) == claim
         let g01 = ring_add_digits(gb, &m[0], &m[1]);
+
+        if dbg_ring_eq_mismatch_on() {
+            // Pre-check: if the witness is already inconsistent, print where it first differs.
+            // This is specifically to localize failures like the file-backed `ring_eq_digits` mismatch.
+            let asg = &gb.assignment;
+            'outer: for (coeff_idx, (ai, bi)) in g01.iter().zip(claimed_sum.iter()).enumerate() {
+                for j in 0..17 {
+                    let va = asg[ai[j]];
+                    let vb = asg[bi[j]];
+                    if va != vb {
+                        let da = f257_to_i32_bal(va);
+                        let db = f257_to_i32_bal(vb);
+                        eprintln!(
+                            "[LF_DEBUG_RING_EQ_MISMATCH] degree2 round={} coeff={} digit={} a_var={} a_val={}({}) b_var={} b_val={}({}) diff={}",
+                            round_idx,
+                            coeff_idx,
+                            j,
+                            ai[j],
+                            va,
+                            da,
+                            bi[j],
+                            vb,
+                            db,
+                            f257_to_i32_bal(va - vb)
+                        );
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
         ring_eq_digits(gb, &g01, &claimed_sum);
 
         // claim = g(r)
