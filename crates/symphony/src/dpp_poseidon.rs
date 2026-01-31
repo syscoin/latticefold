@@ -1378,20 +1378,30 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
     // We stitch shards together by adding equality constraints on boundary state vars.
     // ---------------------------------------------------------------------
     #[derive(Clone)]
-    struct ShardOut<F: PrimeField> {
-        inst: FileBackedSparseDr1csInstance<F>,
-        asg: Vec<F>,
+    struct ShardMeta {
         wiring: PoseidonDr1csWiring,
         bw: PoseidonByteWiring,
         bytes: Vec<ByteSqueezeWitness>,
+        nvars: usize,
+    }
+
+    #[derive(Clone)]
+    struct Group<F: PrimeField> {
+        inst: FileBackedSparseDr1csInstance<F>,
+        asg: Vec<F>,
         init_state_vars: Vec<usize>,
         final_state_vars: Vec<usize>,
     }
 
-    let shard_outs: Vec<ShardOut<F>> = plans
+    struct ShardBuilt<F: PrimeField> {
+        group: Group<F>,
+        meta: ShardMeta,
+    }
+
+    let shard_built: Vec<ShardBuilt<F>> = plans
         .par_iter()
         .enumerate()
-        .map(|(shard_idx, p)| -> Result<ShardOut<F>, ReplayErr> {
+        .map(|(shard_idx, p)| -> Result<ShardBuilt<F>, ReplayErr> {
             let shard_dir = out_dir.join(format!("poseidon_shard_{shard_idx:04}"));
             create_dir_all(&shard_dir)
                 .map_err(|e| ReplayErr::Invalid(format!("create shard dir failed: {e}")))?;
@@ -1410,15 +1420,18 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
                     )
                 })?;
             match inst_any {
-                PoseidonInstance::FileBacked(inst) => Ok(ShardOut {
-                    inst,
-                    asg,
-                    wiring,
-                    bw,
-                    bytes,
-                    init_state_vars,
-                    final_state_vars,
-                }),
+                PoseidonInstance::FileBacked(inst) => {
+                    let nvars = asg.len();
+                    Ok(ShardBuilt {
+                        group: Group {
+                            inst,
+                            asg,
+                            init_state_vars,
+                            final_state_vars,
+                        },
+                        meta: ShardMeta { wiring, bw, bytes, nvars },
+                    })
+                }
                 PoseidonInstance::InMemory(_) => Err(ReplayErr::Invalid(
                     "expected file-backed shard instance, got in-memory".to_string(),
                 )),
@@ -1429,23 +1442,12 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
     // ---------------------------------------------------------------------
     // Pass 2: merge shards (tree merge), adding boundary equalities at merge time.
     // ---------------------------------------------------------------------
-    #[derive(Clone)]
-    struct Group<F: PrimeField> {
-        inst: FileBackedSparseDr1csInstance<F>,
-        asg: Vec<F>,
-        init_state_vars: Vec<usize>,
-        final_state_vars: Vec<usize>,
+    let mut shard_metas: Vec<ShardMeta> = Vec::with_capacity(shard_built.len());
+    let mut groups: Vec<Group<F>> = Vec::with_capacity(shard_built.len());
+    for sb in shard_built {
+        groups.push(sb.group);
+        shard_metas.push(sb.meta);
     }
-
-    let mut groups: Vec<Group<F>> = shard_outs
-        .into_iter()
-        .map(|s| Group {
-            inst: s.inst,
-            asg: s.asg,
-            init_state_vars: s.init_state_vars,
-            final_state_vars: s.final_state_vars,
-        })
-        .collect();
 
     let mut round: usize = 0;
     while groups.len() > 1 {
@@ -1460,14 +1462,16 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
             .map_err(|e| ReplayErr::Invalid(format!("create merge dir failed: {e}")))?;
 
         // Move groups into owned pairs so merges don't clone huge assignments/instances.
-        let mut pairs_owned: Vec<(Group<F>, Group<F>)> = Vec::with_capacity(groups.len() / 2);
-        let mut it = groups.into_iter();
+        let cur_groups = core::mem::take(&mut groups);
+        let mut pairs_owned: Vec<(Group<F>, Group<F>)> = Vec::with_capacity(cur_groups.len() / 2);
+        let mut it = cur_groups.into_iter();
+        let mut tail: Option<Group<F>> = None;
         while let Some(left) = it.next() {
             if let Some(right) = it.next() {
                 pairs_owned.push((left, right));
             } else {
                 // odd tail
-                groups = vec![left];
+                tail = Some(left);
                 break;
             }
         }
@@ -1527,15 +1531,12 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
-            // If there was an odd tail carried above, `groups` already has it.
-            if groups.is_empty() {
-                groups = merged;
-            } else {
-                // Preserve order: merged pairs first, then tail.
-                let mut next = merged;
-                next.extend(groups);
-                groups = next;
+            groups = merged;
+            if let Some(t) = tail.take() {
+                groups.push(t);
             }
+        } else if let Some(t) = tail.take() {
+            groups = vec![t];
         }
         round += 1;
     }
@@ -1556,7 +1557,7 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
     let mut squeeze_off: usize = 0;
     let mut squeeze_byte_off: usize = 0;
 
-    for s in shard_outs.iter() {
+    for s in shard_metas.iter() {
         // var mapping for this shard in the final merged instance.
         let map_var = |idx: usize| -> usize {
             if idx == 0 { 0 } else { idx + var_tail_off }
@@ -1596,7 +1597,7 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
             });
         }
 
-        var_tail_off = var_tail_off.saturating_add(s.asg.len().saturating_sub(1));
+        var_tail_off = var_tail_off.saturating_add(s.nvars.saturating_sub(1));
     }
 
     // WE mode: replay is not used; keep a minimal placeholder.
