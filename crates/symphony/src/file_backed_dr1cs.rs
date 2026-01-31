@@ -474,33 +474,14 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
         Ok(Self { nvars, layout, _pd: core::marker::PhantomData })
     }
 
-    fn read_term(
-        &self,
-        which: &str,
-        term_idx: u64,
-    ) -> Result<(F, usize), String> {
-        let (p_coeffs, p_idx) = term_paths(&self.layout.dir, which);
-        let mut fc = File::open(p_coeffs).map_err(|e| format!("open {which}_coeffs failed: {e}"))?;
-        let mut fi = File::open(p_idx).map_err(|e| format!("open {which}_idx failed: {e}"))?;
-
-        let off_c = (term_idx as u64)
-            .checked_mul(self.layout.coeff_size as u64)
-            .ok_or("term coeff offset overflow")?;
-        fc.seek(std::io::SeekFrom::Start(off_c))
-            .map_err(|e| format!("seek coeff failed: {e}"))?;
-        fi.seek(std::io::SeekFrom::Start(term_idx * 8))
-            .map_err(|e| format!("seek idx failed: {e}"))?;
-
-        let mut buf = vec![0u8; self.layout.coeff_size];
-        fc.read_exact(&mut buf).map_err(|e| format!("read coeff failed: {e}"))?;
-        let idx = read_u64(&mut fi).map_err(|e| format!("read idx failed: {e}"))? as usize;
-        let coef = deserialize_fixed::<F>(&buf).map_err(|e| format!("deserialize coeff failed: {e}"))?;
-        Ok((coef, idx))
-    }
-
     /// Prototype checker: replays all constraints by reading term pools from disk.
     ///
-    /// This is **slow** and intended only for correctness validation of the on-disk format.
+    /// This is intended only for correctness validation of the on-disk format.
+    ///
+    /// NOTE: This can be extremely expensive for huge instances. It is implemented as a streaming
+    /// scan over the constraint rows and term pools (and uses Rayon to parallelize across disjoint
+    /// ranges of constraints when available), so it should at least saturate cores instead of
+    /// doing pathological per-term open/seek IO.
     pub fn check(&self, assignment: &[F]) -> Result<(), String> {
         if assignment.len() != self.nvars {
             return Err(format!(
@@ -509,41 +490,134 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                 assignment.len()
             ));
         }
-        // Iterate constraints in order.
-        let mut f = BufReader::new(
-            File::open(constraints_path(&self.layout.dir))
-                .map_err(|e| format!("open constraints failed: {e}"))?,
-        );
-        let mut i: u64 = 0;
-        loop {
-            // Attempt to read next row; EOF => done.
-            let a0 = match read_u64(&mut f) {
-                Ok(v) => v,
-                Err(_) => break,
-            };
-            let a1 = read_u64(&mut f).map_err(|e| e.to_string())?;
-            let b0 = read_u64(&mut f).map_err(|e| e.to_string())?;
-            let b1 = read_u64(&mut f).map_err(|e| e.to_string())?;
-            let c0 = read_u64(&mut f).map_err(|e| e.to_string())?;
-            let c1 = read_u64(&mut f).map_err(|e| e.to_string())?;
 
-            let eval_lc = |which: &str, start: u64, end: u64| -> Result<F, String> {
+        // If the writer recorded the number of constraints, use it to avoid relying on EOF.
+        let nconstraints = self.layout.nconstraints;
+        if nconstraints == 0 {
+            return Ok(());
+        }
+
+        // Per-thread streaming term reader (sequential reads, rare seeks).
+        struct TermStream<F: PrimeField + CanonicalDeserialize> {
+            coeff_size: usize,
+            fc: BufReader<File>,
+            fi: BufReader<File>,
+            cur: u64,
+            coeff_buf: Vec<u8>,
+            _pd: core::marker::PhantomData<F>,
+        }
+        impl<F: PrimeField + CanonicalDeserialize> TermStream<F> {
+            fn open(dir: &Path, which: &str, coeff_size: usize, start_term: u64) -> Result<Self, String> {
+                let (p_coeffs, p_idx) = term_paths(dir, which);
+                let mut fc = File::open(p_coeffs).map_err(|e| format!("open {which}_coeffs failed: {e}"))?;
+                let mut fi = File::open(p_idx).map_err(|e| format!("open {which}_idx failed: {e}"))?;
+                let off_c = (start_term as u128)
+                    .saturating_mul(coeff_size as u128)
+                    .min(u64::MAX as u128) as u64;
+                fc.seek(std::io::SeekFrom::Start(off_c))
+                    .map_err(|e| format!("seek {which}_coeffs failed: {e}"))?;
+                fi.seek(std::io::SeekFrom::Start(start_term.saturating_mul(8)))
+                    .map_err(|e| format!("seek {which}_idx failed: {e}"))?;
+                Ok(Self {
+                    coeff_size,
+                    fc: BufReader::with_capacity(8 * 1024 * 1024, fc),
+                    fi: BufReader::with_capacity(8 * 1024 * 1024, fi),
+                    cur: start_term,
+                    coeff_buf: vec![0u8; coeff_size],
+                    _pd: core::marker::PhantomData,
+                })
+            }
+
+            #[inline]
+            fn seek_term(&mut self, which: &str, term: u64) -> Result<(), String> {
+                if self.cur == term {
+                    return Ok(());
+                }
+                let off_c = (term as u128)
+                    .saturating_mul(self.coeff_size as u128)
+                    .min(u64::MAX as u128) as u64;
+                self.fc
+                    .seek(std::io::SeekFrom::Start(off_c))
+                    .map_err(|e| format!("seek {which}_coeffs failed: {e}"))?;
+                self.fi
+                    .seek(std::io::SeekFrom::Start(term.saturating_mul(8)))
+                    .map_err(|e| format!("seek {which}_idx failed: {e}"))?;
+                self.cur = term;
+                Ok(())
+            }
+
+            #[inline]
+            fn eval_range(&mut self, which: &str, start: u64, end: u64, assignment: &[F]) -> Result<F, String> {
+                self.seek_term(which, start)?;
                 let mut acc = F::ZERO;
-                for t in start..end {
-                    let (coef, idx) = self.read_term(which, t)?;
+                for _ in start..end {
+                    self.fc
+                        .read_exact(&mut self.coeff_buf)
+                        .map_err(|e| format!("read {which}_coeffs failed: {e}"))?;
+                    let idx = read_u64(&mut self.fi).map_err(|e| format!("read {which}_idx failed: {e}"))? as usize;
+                    let coef =
+                        deserialize_fixed::<F>(&self.coeff_buf).map_err(|e| format!("deserialize {which}_coeff failed: {e}"))?;
                     acc += coef * assignment[idx];
+                    self.cur = self.cur.saturating_add(1);
                 }
                 Ok(acc)
-            };
-            let a = eval_lc("a", a0, a1)?;
-            let b = eval_lc("b", b0, b1)?;
-            let c = eval_lc("c", c0, c1)?;
-            if a * b != c {
-                return Err(format!("constraint {i} failed"));
             }
-            i += 1;
         }
-        Ok(())
+
+        let coeff_size = self.layout.coeff_size;
+        let dir = self.layout.dir.clone();
+
+        // Split constraints into disjoint ranges and check them in parallel.
+        let n_threads = rayon::current_num_threads().max(1) as u64;
+        let chunk = (nconstraints / (n_threads.saturating_mul(4))).max(1_000_000);
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        let mut s = 0u64;
+        while s < nconstraints {
+            let e = (s + chunk).min(nconstraints);
+            ranges.push((s, e));
+            s = e;
+        }
+
+        use rayon::prelude::*;
+        ranges
+            .into_par_iter()
+            .try_for_each(|(c_start, c_end)| -> Result<(), String> {
+                // Open constraints and seek to start row.
+                let mut fr = File::open(constraints_path(&dir)).map_err(|e| format!("open constraints failed: {e}"))?;
+                fr.seek(std::io::SeekFrom::Start(c_start.saturating_mul(48)))
+                    .map_err(|e| format!("seek constraints failed: {e}"))?;
+                let mut rows = BufReader::with_capacity(8 * 1024 * 1024, fr);
+
+                // Read first row to get starting term pointers.
+                let mut first = true;
+                let mut ts_a: Option<TermStream<F>> = None;
+                let mut ts_b: Option<TermStream<F>> = None;
+                let mut ts_c: Option<TermStream<F>> = None;
+
+                for ci in c_start..c_end {
+                    let a0 = read_u64(&mut rows).map_err(|e| format!("read constraint row failed: {e}"))?;
+                    let a1 = read_u64(&mut rows).map_err(|e| format!("read constraint row failed: {e}"))?;
+                    let b0 = read_u64(&mut rows).map_err(|e| format!("read constraint row failed: {e}"))?;
+                    let b1 = read_u64(&mut rows).map_err(|e| format!("read constraint row failed: {e}"))?;
+                    let c0 = read_u64(&mut rows).map_err(|e| format!("read constraint row failed: {e}"))?;
+                    let c1 = read_u64(&mut rows).map_err(|e| format!("read constraint row failed: {e}"))?;
+
+                    if first {
+                        ts_a = Some(TermStream::<F>::open(&dir, "a", coeff_size, a0)?);
+                        ts_b = Some(TermStream::<F>::open(&dir, "b", coeff_size, b0)?);
+                        ts_c = Some(TermStream::<F>::open(&dir, "c", coeff_size, c0)?);
+                        first = false;
+                    }
+
+                    let a = ts_a.as_mut().unwrap().eval_range("a", a0, a1, assignment)?;
+                    let b = ts_b.as_mut().unwrap().eval_range("b", b0, b1, assignment)?;
+                    let c = ts_c.as_mut().unwrap().eval_range("c", c0, c1, assignment)?;
+                    if a * b != c {
+                        return Err(format!("constraint {ci} failed"));
+                    }
+                }
+                Ok(())
+            })
     }
 }
 
