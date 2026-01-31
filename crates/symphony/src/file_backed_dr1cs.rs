@@ -687,6 +687,7 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
         let (av, a_shown) = eval_range("a", a0, a1)?;
         let (bv, b_shown) = eval_range("b", b0, b1)?;
         let (cv, c_shown) = eval_range("c", c0, c1)?;
+        let residual = av * bv - cv;
 
         eprintln!(
             "[file_backed_debug] constraint {} ranges: A=[{},{})(len={}) B=[{},{})(len={}) C=[{},{})(len={})",
@@ -695,7 +696,9 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
             b0, b1, b1.saturating_sub(b0),
             c0, c1, c1.saturating_sub(c0),
         );
-        eprintln!("[file_backed_debug] values: (A·z)={av:?} (B·z)={bv:?} (C·z)={cv:?}  residual=A·B-C={(av * bv - cv):?}");
+        eprintln!(
+            "[file_backed_debug] values: (A·z)={av:?} (B·z)={bv:?} (C·z)={cv:?}  residual=A·B-C={residual:?}"
+        );
         if show_terms > 0 {
             eprintln!("[file_backed_debug] A first {} terms: {:?}", a_shown.len(), a_shown);
             eprintln!("[file_backed_debug] B first {} terms: {:?}", b_shown.len(), b_shown);
