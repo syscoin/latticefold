@@ -717,7 +717,29 @@ fn build_cm_shards_file_backed(
             )
         },
     );
-    Ok(vec![g0?, g1?])
+    let g0 = g0?;
+    let g1 = g1?;
+
+    // If dR1CS profiling is enabled, print per-shard scope summaries too (helps localize bugs
+    // inside cm0/cm1 rather than only seeing the base glue profile).
+    if g0.gb.profile_enabled {
+        eprintln!(
+            "== dR1CS profile: cm0 shard (vars={} constraints={}) ==",
+            g0.gb.assignment.len().saturating_sub(1),
+            g0.gb.nconstraints()
+        );
+        eprintln!("{}", g0.gb.profile_report(30));
+    }
+    if g1.gb.profile_enabled {
+        eprintln!(
+            "== dR1CS profile: cm1 shard (vars={} constraints={}) ==",
+            g1.gb.assignment.len().saturating_sub(1),
+            g1.gb.nconstraints()
+        );
+        eprintln!("{}", g1.gb.profile_report(30));
+    }
+
+    Ok(vec![g0, g1])
 }
 
 fn build_surfaces_with_shared_arcs(
