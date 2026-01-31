@@ -703,6 +703,15 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
             eprintln!("[file_backed_debug] A first {} terms: {:?}", a_shown.len(), a_shown);
             eprintln!("[file_backed_debug] B first {} terms: {:?}", b_shown.len(), b_shown);
             eprintln!("[file_backed_debug] C first {} terms: {:?}", c_shown.len(), c_shown);
+            let show_vals = |name: &str, terms: &[(F, usize)]| {
+                for (c, idx) in terms {
+                    let v = assignment[*idx];
+                    eprintln!("[file_backed_debug] {name} term: coeff={c:?} idx={idx} value={v:?}");
+                }
+            };
+            show_vals("A", &a_shown);
+            show_vals("B", &b_shown);
+            show_vals("C", &c_shown);
         }
         Ok(())
     }
