@@ -141,8 +141,6 @@ where
         _shorts,
         _u32s,
         _goldilocks,
-        _tcch0,
-        _tcch1,
         _surfaces_mul,
         _surfaces_sq,
         pose_wiring,
@@ -914,8 +912,6 @@ where
         _shorts,
         _u32s,
         _goldilocks,
-        _tcch0,
-        _tcch1,
         _surfaces_mul,
         _surfaces_sq,
         _pose_wiring,
@@ -1053,7 +1049,7 @@ where
     wiring_abs.u32_squeeze_ops = wiring_rel.u32_squeeze_ops.into_iter().map(|i| i + squeeze_field_op_offset).collect();
     wiring_abs.u32_squeeze_ops.splice(0..0, prefix_u32_squeeze_ops.into_iter());
 
-    let (inst_pose, asg_pose, _shorts, _u32s, _goldilocks, _tcch0, _tcch1, _surfaces_mul, _surfaces_sq, _pose_wiring) =
+    let (inst_pose, asg_pose, _shorts, _u32s, _goldilocks, _surfaces_mul, _surfaces_sq, _pose_wiring) =
         tiny::we_tiny_f257_build_cm_gate_from_trace_ops_with_extra_witness(
             None,
             &ops_f257,
@@ -6070,7 +6066,7 @@ mod tests {
             .u32_squeeze_ops
             .splice(0..0, prefix_u32_squeeze_ops.into_iter());
 
-        let (inst, asg, _shorts, _u32s, _goldilocks, _tcch0, _tcch1, _sm, _ssq, _w) =
+        let (inst, asg, _shorts, _u32s, _goldilocks, _sm, _ssq, _w) =
             tiny::we_tiny_f257_build_cm_gate_from_trace_ops(
                 None,
                 &ops_f257,
@@ -6154,7 +6150,7 @@ mod tests {
             p
         };
 
-        let (inst, asg, _shorts, _u32s, _goldilocks, _tcch0, _tcch1, _sm, _ssq, _w) =
+        let (inst, asg, _shorts, _u32s, _goldilocks, _sm, _ssq, _w) =
             tiny::we_tiny_f257_build_cm_gate_from_trace_ops_file_backed_with_extra_witness(
                 None,
                 &ops_f257,
@@ -7446,7 +7442,7 @@ mod tests {
                 std::fs::create_dir_all(&p).expect("create temp out_dir");
                 p
             };
-            let (tiny_inst, tiny_asg, _shorts, _u32s, _gold, _tcch0, _tcch1, _sm, _ssq, _pose_wiring) =
+            let (tiny_inst, tiny_asg, _shorts, _u32s, _gold, _sm, _ssq, _pose_wiring) =
                 tiny::we_tiny_f257_build_cm_gate_from_trace_ops_file_backed_with_extra_witness(
                     None,
                     &ops_f257,

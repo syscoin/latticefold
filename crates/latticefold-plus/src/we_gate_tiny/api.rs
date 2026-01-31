@@ -33,8 +33,6 @@ pub fn we_tiny_f257_build_cm_gate_from_trace_ops(
         Vec<ShortChallengeWiring>,
         Vec<BoundedU32ChallengeWiring>,
         Vec<GoldilocksChallengeWiring>,
-        Vec<[usize; 8]>, // tcch0 (Goldilocks base-field, 8 LE bytes) per instance
-        Vec<[usize; 8]>, // tcch1 (Goldilocks base-field, 8 LE bytes) per instance
         Vec<CmDigitMulSurfaceWiring>,
         Vec<CmDigitMulSqSurfaceWiring>,
         PoseidonDr1csWiring,
@@ -63,8 +61,6 @@ pub fn we_tiny_f257_build_cm_gate_from_trace_ops_file_backed(
         Vec<ShortChallengeWiring>,
         Vec<BoundedU32ChallengeWiring>,
         Vec<GoldilocksChallengeWiring>,
-        Vec<[usize; 8]>, // tcch0 bytes per instance
-        Vec<[usize; 8]>, // tcch1 bytes per instance
         Vec<CmDigitMulSurfaceWiring>,
         Vec<CmDigitMulSqSurfaceWiring>,
         PoseidonDr1csWiring,
@@ -91,8 +87,6 @@ pub(crate) fn we_tiny_f257_build_cm_gate_from_trace_ops_file_backed_with_extra_w
         Vec<ShortChallengeWiring>,
         Vec<BoundedU32ChallengeWiring>,
         Vec<GoldilocksChallengeWiring>,
-        Vec<[usize; 8]>,
-        Vec<[usize; 8]>,
         Vec<CmDigitMulSurfaceWiring>,
         Vec<CmDigitMulSqSurfaceWiring>,
         PoseidonDr1csWiring,
@@ -119,8 +113,6 @@ pub(crate) fn we_tiny_f257_build_cm_gate_from_trace_ops_with_extra_witness(
         Vec<ShortChallengeWiring>,
         Vec<BoundedU32ChallengeWiring>,
         Vec<GoldilocksChallengeWiring>,
-        Vec<[usize; 8]>,
-        Vec<[usize; 8]>,
         Vec<CmDigitMulSurfaceWiring>,
         Vec<CmDigitMulSqSurfaceWiring>,
         PoseidonDr1csWiring,

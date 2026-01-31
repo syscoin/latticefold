@@ -2079,109 +2079,6 @@ fn build_u32_and_goldilocks_blocks(
     Ok((u32_out, goldilocks_out))
 }
 
-fn compute_tcch_from_comh_absorbs(
-    glue: &mut GlueCtx,
-    pose_wiring: &PoseidonDr1csWiring,
-    ring_dim: usize,
-    params: &WeParams,
-    wiring: &TinyCoinOpWiring,
-    u32_locals: &[BoundedU32ChallengeWiring],
-    comh_absorbs: &[(usize, usize)],
-    l_instances_expected: usize,
-) -> Result<(Vec<[usize; 8]>, Vec<[usize; 8]>), String> {
-    // Compute exported coefficient-0 surfaces:
-    //   tcch{0,1}[l] = Σ_j comh[l][j] * tensor_c{0,1}[j]
-    // where tensor_c{0,1} are derived from the CM c0/c1 u32 challenges.
-    //
-    // IMPORTANT: only use the *parsed* `comh_absorbs` ranges (L*kappa ring elements) to avoid
-    // accidentally sweeping in the CM sumcheck prover messages / eval tables.
-    let kappa = params.kappa as usize;
-    if ring_dim == 0 || l_instances_expected == 0 || kappa == 0 {
-        return Ok((Vec::new(), Vec::new()));
-    }
-    if !kappa.is_power_of_two() {
-        return Err("tiny gate: params.kappa must be a power of two".to_string());
-    }
-    if comh_absorbs.len() != l_instances_expected * kappa {
-        return Err("tiny gate: comh_absorbs length mismatch while computing tcch".to_string());
-    }
-
-    let log_kappa = ark_std::log2(kappa.next_power_of_two()) as usize;
-    let cm_u32_start = cm_u32_start_idx(wiring);
-    let c0_start = cm_u32_start;
-    let c1_start = cm_u32_start + log_kappa;
-    if c1_start + log_kappa > u32_locals.len() {
-        return Err("tiny gate: u32_locals too short for tcch c0/c1".to_string());
-    }
-
-    // c0/c1 challenges are bounded-u32 embedded in Goldilocks; represent them as canonical Goldilocks bytes
-    // by padding with 4 zeros (value < 2^32 < p).
-    let mut c0_bytes: Vec<[usize; 8]> = Vec::with_capacity(log_kappa);
-    let mut c1_bytes: Vec<[usize; 8]> = Vec::with_capacity(log_kappa);
-    for i in 0..log_kappa {
-        c0_bytes.push(goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &u32_locals[c0_start + i].byte_vars));
-        c1_bytes.push(goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &u32_locals[c1_start + i].byte_vars));
-    }
-
-    let c0_digits: Vec<GoldilocksScalar> = c0_bytes
-        .iter()
-        .copied()
-        .map(|b| goldilocks_bytes_to_digits(&mut glue.gb, b))
-        .collect();
-    let c1_digits: Vec<GoldilocksScalar> = c1_bytes
-        .iter()
-        .copied()
-        .map(|b| goldilocks_bytes_to_digits(&mut glue.gb, b))
-        .collect();
-    let tensor_c0 = tensor_goldilocks_scalars_digits(&mut glue.gb, &c0_digits);
-    let tensor_c1 = tensor_goldilocks_scalars_digits(&mut glue.gb, &c1_digits);
-
-    let mut tcch0_local: Vec<[usize; 8]> = Vec::with_capacity(l_instances_expected);
-    let mut tcch1_local: Vec<[usize; 8]> = Vec::with_capacity(l_instances_expected);
-
-    // IMPORTANT (constraint + time):
-    // This function exports only the coefficient-0 surfaces `tcch{0,1}[l]` as Goldilocks scalars.
-    // The legacy implementation built full ring elements and only then took `[0]`.
-    // We can compute the same result by extracting only coefficient 0 of each absorbed ring element,
-    // and doing scalar arithmetic:
-    //   tcch0[l] = Σ_j coeff0(comh[l][j]) * tensor_c0[j]  (mod p)
-    //   tcch1[l] = Σ_j coeff0(comh[l][j]) * tensor_c1[j]  (mod p)
-    //
-    // This avoids allocating/constraining the other `ring_dim-1` coefficients entirely.
-
-    let zero_bytes = alloc_const_goldilocks_u64(&mut glue.gb, 0u64);
-    let zero = goldilocks_bytes_to_digits(&mut glue.gb, zero_bytes);
-
-    let mut idx = 0usize;
-    for _l in 0..l_instances_expected {
-        let mut acc0 = zero;
-        let mut acc1 = zero;
-        for j in 0..kappa {
-            let (st, ln) = comh_absorbs[idx];
-            idx += 1;
-            if ln != 8 * ring_dim {
-                return Err("tiny gate: expected 8-byte coeff encoding for RingBytes (tcch)".to_string());
-            }
-            // Copy only coefficient-0 bytes (the first 8 bytes).
-            let mut cbytes = [0usize; 8];
-            for i in 0..8 {
-                let gv = pose_wiring.absorb_vars[st + i];
-                cbytes[i] = glue.copy_digit(gv);
-            }
-            let ch0 = goldilocks_bytes_to_digits(&mut glue.gb, cbytes);
-
-            let t0 = goldilocks_mul_mod_p_digits(&mut glue.gb, &ch0, &tensor_c0[j]);
-            let t1 = goldilocks_mul_mod_p_digits(&mut glue.gb, &ch0, &tensor_c1[j]);
-            acc0 = goldilocks_add_mod_p_digits(&mut glue.gb, &acc0, &t0);
-            acc1 = goldilocks_add_mod_p_digits(&mut glue.gb, &acc1, &t1);
-        }
-        tcch0_local.push(goldilocks_digits_to_bytes_canonical(&mut glue.gb, &acc0));
-        tcch1_local.push(goldilocks_digits_to_bytes_canonical(&mut glue.gb, &acc1));
-    }
-
-    Ok((tcch0_local, tcch1_local))
-}
-
 /// Parse (and lightly constrain) the CM segment that occurs after short-challenge squeezes.
 ///
 /// This is a *schedule* parser: it follows the transcript op ordering implied by
@@ -2976,8 +2873,6 @@ fn finalize(
     short_locals: Vec<ShortChallengeWiring>,
     u32_locals: Vec<BoundedU32ChallengeWiring>,
     goldilocks_locals: Vec<GoldilocksChallengeWiring>,
-    tcch0_local: Vec<[usize; 8]>,
-    tcch1_local: Vec<[usize; 8]>,
     surfaces_mul_local: Vec<CmDigitMulSurfaceWiring>,
     surfaces_sq_local: Vec<CmDigitMulSqSurfaceWiring>,
     all_sum_digits: Arc<Vec<usize>>,
@@ -2991,8 +2886,6 @@ fn finalize(
         Vec<ShortChallengeWiring>,
         Vec<BoundedU32ChallengeWiring>,
         Vec<GoldilocksChallengeWiring>,
-        Vec<[usize; 8]>,
-        Vec<[usize; 8]>,
         Vec<CmDigitMulSurfaceWiring>,
         Vec<CmDigitMulSqSurfaceWiring>,
         PoseidonDr1csWiring,
@@ -3236,31 +3129,14 @@ fn finalize(
         shorts_out,
         u32s_out,
         goldilocks_out,
-        tcch0_local
-            .into_iter()
-            .map(|arr| {
-                let mut out = [0usize; 8];
-                for i in 0..8 {
-                    out[i] = to_glue_global(arr[i]);
-                }
-                out
-            })
-            .collect(),
-        tcch1_local
-            .into_iter()
-            .map(|arr| {
-                let mut out = [0usize; 8];
-                for i in 0..8 {
-                    out[i] = to_glue_global(arr[i]);
-                }
-                out
-            })
-            .collect(),
         surfaces_out,
         surfaces_sq_out,
         pose_wiring,
     ))
 }
+
+// NOTE: The LF+ verifier computes `tcch0/tcch1` internally and uses them in `claimed_sum`, but does not
+// export them. The tiny gate follows that model: we do not export `tcch0/tcch1` surfaces.
 
 #[allow(clippy::too_many_arguments)]
 fn finalize_file_backed(
@@ -3272,8 +3148,6 @@ fn finalize_file_backed(
     short_locals: Vec<ShortChallengeWiring>,
     u32_locals: Vec<BoundedU32ChallengeWiring>,
     goldilocks_locals: Vec<GoldilocksChallengeWiring>,
-    tcch0_local: Vec<[usize; 8]>,
-    tcch1_local: Vec<[usize; 8]>,
     surfaces_mul_local: Vec<CmDigitMulSurfaceWiring>,
     surfaces_sq_local: Vec<CmDigitMulSqSurfaceWiring>,
     all_sum_digits: Arc<Vec<usize>>,
@@ -3288,8 +3162,6 @@ fn finalize_file_backed(
         Vec<ShortChallengeWiring>,
         Vec<BoundedU32ChallengeWiring>,
         Vec<GoldilocksChallengeWiring>,
-        Vec<[usize; 8]>,
-        Vec<[usize; 8]>,
         Vec<CmDigitMulSurfaceWiring>,
         Vec<CmDigitMulSqSurfaceWiring>,
         PoseidonDr1csWiring,
@@ -3491,26 +3363,6 @@ fn finalize_file_backed(
         shorts_out,
         u32s_out,
         goldilocks_out,
-        tcch0_local
-            .into_iter()
-            .map(|arr| {
-                let mut out = [0usize; 8];
-                for i in 0..8 {
-                    out[i] = to_glue_global(arr[i]);
-                }
-                out
-            })
-            .collect(),
-        tcch1_local
-            .into_iter()
-            .map(|arr| {
-                let mut out = [0usize; 8];
-                for i in 0..8 {
-                    out[i] = to_glue_global(arr[i]);
-                }
-                out
-            })
-            .collect(),
         surfaces_out,
         surfaces_sq_out,
         pose_wiring,
@@ -4578,25 +4430,6 @@ pub(super) fn build(
     )?;
     lf_stage_log("parse_and_enforce_cm_after_short", Some(&pose_inst), Some(&glue), &mut mem_prev);
 
-    // Export coefficient-0 surfaces tcch0/tcch1 from the parsed `comh` block.
-    let (tcch0_local, tcch1_local) = compute_tcch_from_comh_absorbs(
-        &mut glue,
-        &pose_wiring,
-        ring_dim,
-        params,
-        wiring,
-        &u32_locals,
-        &comh_absorbs,
-        l_instances_expected,
-    )?;
-    lf_stage_log("compute_tcch", Some(&pose_inst), Some(&glue), &mut mem_prev);
-    if l_instances_expected != 0 && tcch0_local.len() != l_instances_expected {
-        return Err("tiny gate: tcch0 length mismatch with inferred L".to_string());
-    }
-    if l_instances_expected != 0 && tcch1_local.len() != l_instances_expected {
-        return Err("tiny gate: tcch1 length mismatch with inferred L".to_string());
-    }
-
     // Capture a lightweight absorb breakdown summary for optional op-mix reporting.
     let absorb_counts = TinyAbsorbBreakdownCounts {
         comh_ops: comh_absorbs.len(),
@@ -4902,8 +4735,6 @@ pub(super) fn build(
         short_locals,
         u32_locals,
         goldilocks_locals,
-        tcch0_local,
-        tcch1_local,
         surfaces_mul_local,
         surfaces_sq_local,
         all_sum_digits,
@@ -4931,8 +4762,6 @@ pub(super) fn build_file_backed(
         Vec<ShortChallengeWiring>,
         Vec<BoundedU32ChallengeWiring>,
         Vec<GoldilocksChallengeWiring>,
-        Vec<[usize; 8]>,
-        Vec<[usize; 8]>,
         Vec<CmDigitMulSurfaceWiring>,
         Vec<CmDigitMulSqSurfaceWiring>,
         PoseidonDr1csWiring,
@@ -5019,17 +4848,6 @@ pub(super) fn build_file_backed(
         eval_ops_1: eval_absorbs.get(1).map(|v| v.len()).unwrap_or(0),
         eval_bytes_total_1: eval_absorbs.get(1).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
     };
-
-    let (tcch0_local, tcch1_local) = compute_tcch_from_comh_absorbs(
-        &mut glue,
-        &pose_wiring,
-        ring_dim,
-        params,
-        wiring,
-        &u32_locals,
-        &comh_absorbs,
-        l_instances_expected,
-    )?;
 
     // CM modules: build as file-backed glue shards.
     let setchk_out_e_vars_for_cm = setchk_out_e_vars_for_cm.map(Arc::new);
@@ -5122,8 +4940,6 @@ pub(super) fn build_file_backed(
         short_locals,
         u32_locals,
         goldilocks_locals,
-        tcch0_local,
-        tcch1_local,
         surfaces_mul_local,
         surfaces_sq_local,
         all_sum_digits,
