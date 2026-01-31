@@ -745,25 +745,38 @@ pub(crate) fn eval_small_mle_ring_digits(
     debug_assert!(table.len().is_power_of_two());
     debug_assert_eq!(table.len(), 1usize << r.len());
 
-    let mut cur: Vec<RingDigits> = table.to_vec();
+    // Important performance/memory optimization:
+    // avoid cloning the entire `table` up-front (each entry is a full ring element).
+    //
+    // Instead, do the first combine directly from references into `table`, producing `table.len()/2`
+    // fresh ring elements, and then proceed level-by-level on the shrinking owned vector.
+    if r.is_empty() {
+        let out = table[0].clone();
+        gb.profile_exit(_prev);
+        return out;
+    }
+
+    let mut cur_refs: Vec<&RingDigits> = table.iter().collect();
+    let mut cur_owned: Vec<RingDigits> = Vec::new();
     for ri in r.iter() {
-        let mut next: Vec<RingDigits> = Vec::with_capacity(cur.len() / 2);
-        for j in 0..(cur.len() / 2) {
+        let mut next: Vec<RingDigits> = Vec::with_capacity(cur_refs.len() / 2);
+        for j in 0..(cur_refs.len() / 2) {
             // Standard multilinear combine:
             // out = a*(1-ri) + b*ri
             //
             // Optimize to use ONE scalar multiplication instead of two:
             // out = a + (b - a) * ri
-            let a = &cur[2 * j];
-            let b = &cur[2 * j + 1];
+            let a = cur_refs[2 * j];
+            let b = cur_refs[2 * j + 1];
             let diff = ring_sub_digits(gb, b, a);
             let t = ring_scale_digits(gb, &diff, ri);
             next.push(ring_add_digits(gb, a, &t));
         }
-        cur = next;
+        cur_owned = next;
+        cur_refs = cur_owned.iter().collect();
     }
-    debug_assert_eq!(cur.len(), 1);
-    let out = cur.pop().unwrap();
+    debug_assert_eq!(cur_owned.len(), 1);
+    let out = cur_owned.pop().unwrap();
     gb.profile_exit(_prev);
     out
 }
