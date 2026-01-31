@@ -7349,9 +7349,18 @@ mod tests {
                 .u32_squeeze_ops
                 .splice(0..0, prefix_u32_squeeze_ops.into_iter());
 
+            // Deterministic-ish temp dir name (no RNG): pid + process-local counter.
+            // Also wipe before/after so repeated runs don't accumulate disk usage.
             let out_dir = {
+                static OUT_DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let seq = OUT_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut p = std::env::temp_dir();
-                p.push(format!("lfplus_tiny_gate_file_backed_{}", rng.next_u64()));
+                p.push(format!(
+                    "lfplus_tiny_gate_file_backed_pid{}_{}",
+                    std::process::id(),
+                    seq
+                ));
+                let _ = std::fs::remove_dir_all(&p);
                 std::fs::create_dir_all(&p).expect("create temp out_dir");
                 p
             };
@@ -7374,6 +7383,7 @@ mod tests {
                 tiny_inst.nvars,
                 tiny_inst.layout.nconstraints
             );
+            let _ = std::fs::remove_dir_all(&out_dir);
             // NOTE: We also intentionally skip the DPP pipeline here; it depends on building the
             // large-field WE gate and is orthogonal to validating the tiny gate.
         };

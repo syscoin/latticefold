@@ -231,6 +231,62 @@ fn lf_stage_log(
     *prev = Some(cur);
 }
 
+fn lf_stage_log_file_backed(
+    stage: &str,
+    pose_inst: Option<&FileBackedSparseDr1csInstance<F257>>,
+    glue: Option<&GlueCtx>,
+    prev: &mut Option<LfStageCounts>,
+) {
+    if !lf_mem_on() {
+        return;
+    }
+    let mem = lf_mem_sample();
+    let cur = LfStageCounts {
+        pose_constraints: pose_inst
+            .map(|p| core::cmp::min(p.layout.nconstraints, usize::MAX as u64) as usize)
+            .unwrap_or(0),
+        pose_vars: pose_inst.map(|p| p.nvars).unwrap_or(0),
+        glue_constraints: glue.map(|g| g.gb.rows.len()).unwrap_or(0),
+        glue_vars: glue.map(|g| g.gb.assignment.len()).unwrap_or(0),
+    };
+    let (d_pose_c, d_pose_v, d_glue_c, d_glue_v) = match prev {
+        Some(p) => (
+            cur.pose_constraints.saturating_sub(p.pose_constraints),
+            cur.pose_vars.saturating_sub(p.pose_vars),
+            cur.glue_constraints.saturating_sub(p.glue_constraints),
+            cur.glue_vars.saturating_sub(p.glue_vars),
+        ),
+        None => (0, 0, 0, 0),
+    };
+    let caches = glue.map(|g| {
+        format!(
+            " local_map={} byte_bits_cache={} u64_bal16_cache={} u32_bal16_cache={}",
+            g.local_map.len(),
+            g.gb.byte_bits_cache.len(),
+            g.gb.u64_bal16_cache.len(),
+            g.gb.u32_bal16_cache.len()
+        )
+    });
+
+    eprintln!(
+        "[LF_MEM] stage={} rss={} hwm={} vmsize={} | pose(c={},v={},Δc={},Δv={}) glue(c={},v={},Δc={},Δv={}){}",
+        stage,
+        fmt_mib(mem.rss_bytes),
+        fmt_mib(mem.hwm_bytes),
+        fmt_mib(mem.vmsize_bytes),
+        cur.pose_constraints,
+        cur.pose_vars,
+        d_pose_c,
+        d_pose_v,
+        cur.glue_constraints,
+        cur.glue_vars,
+        d_glue_c,
+        d_glue_v,
+        caches.as_deref().unwrap_or(""),
+    );
+    *prev = Some(cur);
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct TinyAbsorbBreakdownCounts {
     comh_ops: usize,
@@ -4287,6 +4343,7 @@ pub(super) fn build_file_backed(
     String,
 > {
     let dirs = file_backed_dirs(out_dir);
+    let mut mem_prev: Option<LfStageCounts> = None;
 
     // Build Poseidon as a file-backed instance + assignment (deterministic from ops schedule).
     let (pose_inst, pose_asg, pose_wiring) = build_poseidon_file_backed(cfg, ops, &dirs)?;
@@ -4377,7 +4434,7 @@ pub(super) fn build_file_backed(
         &u32_locals,
         &setchk_out_e_vars_for_cm,
     )?;
-    lf_stage_log(
+    lf_stage_log_file_backed(
         "cm_shared_precomp_base_done",
         Some(&pose_inst),
         Some(&glue),
@@ -4403,7 +4460,7 @@ pub(super) fn build_file_backed(
         &u32_locals,
         &dirs,
     )?;
-    lf_stage_log(
+    lf_stage_log_file_backed(
         "cm_shards_file_backed_done",
         Some(&pose_inst),
         Some(&glue),
