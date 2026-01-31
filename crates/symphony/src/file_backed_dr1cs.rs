@@ -860,6 +860,50 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                 .ok_or("var_tail_off overflow")?;
         }
 
+        if timing {
+            eprintln!("file_backed_merge: part ranges (vars/terms/rows):");
+            for (pi, (inst, asg)) in parts.iter().enumerate() {
+                let v_tail = var_tail_off[pi];
+                let v_start = 1u64.saturating_add(v_tail);
+                let v_end = v_start.saturating_add(asg.len().saturating_sub(1) as u64);
+                let a0 = a_off[pi];
+                let b0 = b_off[pi];
+                let c0 = c_off[pi];
+                let r0 = row_off[pi];
+                eprintln!(
+                    "  part[{pi}]: nvars={} (tail [{}..{}))  A[{}..{}) B[{}..{}) C[{}..{}) rows[{}..{}) dir={}",
+                    asg.len(),
+                    v_start,
+                    v_end,
+                    a0,
+                    a0.saturating_add(inst.layout.a_terms),
+                    b0,
+                    b0.saturating_add(inst.layout.b_terms),
+                    c0,
+                    c0.saturating_add(inst.layout.c_terms),
+                    r0,
+                    r0.saturating_add(inst.layout.nconstraints),
+                    inst.layout.dir.display()
+                );
+            }
+            eprintln!(
+                "file_backed_merge: totals pre-eqs: nvars={} A={} B={} C={} rows={}",
+                new_assignment.len(),
+                cur_a,
+                cur_b,
+                cur_c,
+                cur_rows
+            );
+            eprintln!(
+                "file_backed_merge: appended-eqs: eqs={} => final A={} B={} C={} rows={}",
+                extra_eqs.len(),
+                cur_a.saturating_add((extra_eqs.len() as u64).saturating_mul(2)),
+                cur_b.saturating_add(extra_eqs.len() as u64),
+                cur_c.saturating_add(extra_eqs.len() as u64),
+                cur_rows.saturating_add(extra_eqs.len() as u64),
+            );
+        }
+
         // Helper: map local var index to global.
         #[inline]
         fn map_var(idx: u64, var_tail_off: u64) -> u64 {
