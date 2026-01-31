@@ -3389,6 +3389,24 @@ fn build_cm_glue_for_which(
         return Ok(glue);
     }
 
+    // Attach a top-level profiling scope for any constraints not already labeled by inner gadgets.
+    // This helps turn the big "unlabeled" bucket into something actionable, per shard.
+    struct ProfileGuard<'a, F: ark_ff::PrimeField> {
+        gb: &'a mut symphony::dpp_sumcheck::Dr1csBuilder<F>,
+        prev: Option<&'static str>,
+    }
+    impl<'a, F: ark_ff::PrimeField> Drop for ProfileGuard<'a, F> {
+        fn drop(&mut self) {
+            self.gb.profile_exit(self.prev);
+        }
+    }
+    let _prof = if glue.gb.profile_enabled {
+        let label: &'static str = if which == 0 { "cm0_total" } else { "cm1_total" };
+        Some(ProfileGuard { prev: glue.gb.profile_enter(label), gb: &mut glue.gb })
+    } else {
+        None
+    };
+
     // The CM segment begins at the last short squeeze, but the absorb ranges were already parsed
     // by the base glue module (and statement-bound there). Here we just consume the ranges.
     let cm_u32_start = cm_u32_start_idx(wiring);
