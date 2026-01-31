@@ -485,6 +485,177 @@ fn maybe_print_tiny_opmix(
     eprintln!("==============================================================");
 }
 
+#[allow(clippy::too_many_arguments)]
+fn maybe_print_tiny_opmix_file_backed(
+    cfg: Option<&PoseidonConfig<F257>>,
+    ops: &[PoseidonTraceOp<F257>],
+    pose_inst: &FileBackedSparseDr1csInstance<F257>,
+    glue: &GlueCtx,
+    absorb_counts: &TinyAbsorbBreakdownCounts,
+    pairs_len: usize,
+    mul_surfaces_len: usize,
+    sq_surfaces_len: usize,
+    sum_all_pairs_digits_len: usize,
+    sum_all_pairs_coeffwise_len: usize,
+    sq_sum_all_pairs_digits_len: usize,
+    sq_sum_all_pairs_coeffwise_len: usize,
+) {
+    if !tiny_opmix_on() {
+        return;
+    }
+
+    let default_cfg;
+    let poseidon_cfg = match cfg {
+        Some(c) => c,
+        None => {
+            default_cfg = f257_poseidon_config();
+            &default_cfg
+        }
+    };
+
+    // Poseidon schedule permutes (for cost estimates).
+    let pose_permutes_total = symphony::poseidon_trace::count_permutes_for_ops(poseidon_cfg, ops);
+    let last_short_sq = ops.iter().rposition(|op| match op {
+        PoseidonTraceOp::SqueezeField(v) => v.len() == DIGITS_PER_TRY,
+        _ => false,
+    });
+    let pose_permutes_before_cm = last_short_sq
+        .map(|i| symphony::poseidon_trace::count_permutes_for_ops(poseidon_cfg, &ops[..=i]))
+        .unwrap_or(0);
+    let pose_permutes_after_cm = pose_permutes_total.saturating_sub(pose_permutes_before_cm);
+
+    // Poseidon trace op mix.
+    let mut n_absorb = 0usize;
+    let mut absorb_elems = 0usize;
+    let mut n_sq_field = 0usize;
+    let mut sq_field_elems = 0usize;
+    let mut n_sq_bytes = 0usize;
+    let mut sq_bytes = 0usize;
+    let mut absorb_by_len: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut squeeze_field_by_len: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut squeeze_bytes_by_len: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut n_get_challenge_reabsorbs = 0usize;
+    for op in ops {
+        match op {
+            PoseidonTraceOp::Absorb(v) => {
+                n_absorb += 1;
+                absorb_elems += v.len();
+                *absorb_by_len.entry(v.len()).or_insert(0) += 1;
+            }
+            PoseidonTraceOp::SqueezeField(v) => {
+                n_sq_field += 1;
+                sq_field_elems += v.len();
+                *squeeze_field_by_len.entry(v.len()).or_insert(0) += 1;
+            }
+            PoseidonTraceOp::SqueezeBytes { n, .. } => {
+                n_sq_bytes += 1;
+                sq_bytes += *n;
+                *squeeze_bytes_by_len.entry(*n).or_insert(0) += 1;
+            }
+        }
+    }
+    // Count `get_challenge()` reabsorbs: SqueezeField(8) immediately followed by Absorb(8).
+    for win in ops.windows(2) {
+        if let [PoseidonTraceOp::SqueezeField(v), PoseidonTraceOp::Absorb(w)] = win {
+            if v.len() == DIGITS_PER_TRY && w.len() == DIGITS_PER_TRY {
+                n_get_challenge_reabsorbs += 1;
+            }
+        }
+    }
+
+    // Constraint mix (file-backed pose, file-backed glue).
+    let c_pose = pose_inst.layout.nconstraints as usize;
+    let c_pose_no_bytes = c_pose;
+    let c_glue = glue.gb.nconstraints() as usize;
+
+    eprintln!("==============================================================");
+    eprintln!("LF+ WE tiny gate op-mix (Poseidon(F257) + tiny CM gadgets) [file-backed]");
+    eprintln!(
+        "  poseidon trace: permutes={} absorb_ops={} absorb_elems={} squeeze_field_ops={} squeeze_field_elems={} squeeze_bytes_ops={} squeeze_bytes_total={}",
+        pose_permutes_total,
+        n_absorb,
+        absorb_elems,
+        n_sq_field,
+        sq_field_elems,
+        n_sq_bytes,
+        sq_bytes
+    );
+    eprintln!(
+        "  poseidon permutes split: before_cm={} after_cm={}",
+        pose_permutes_before_cm, pose_permutes_after_cm
+    );
+    eprintln!(
+        "  poseidon op lens: absorb_by_len={:?} squeeze_field_by_len={:?} squeeze_bytes_by_len={:?} get_challenge_reabsorbs={}",
+        absorb_by_len,
+        squeeze_field_by_len,
+        squeeze_bytes_by_len,
+        n_get_challenge_reabsorbs
+    );
+    eprintln!("  dr1cs constraints by part: poseidon={} glue={}", c_pose, c_glue);
+    eprintln!(
+        "  poseidon constraints(no_bytes)={} delta_squeeze_bytes={}",
+        c_pose_no_bytes,
+        c_pose.saturating_sub(c_pose_no_bytes)
+    );
+    let cm_counts = tiny_cm_counts_take();
+    eprintln!(
+        "  cm_math op counts: ring_add={} ring_sub={} ring_scale={} ring_mul={} ring_eq={} lc_to_var={} scalar_add={} scalar_sub={} scalar_mul={} scalar_mul_const={} scalar_sub_const={} scalar_pow_table={} eq_eval_vars={} short_chal_from_bytes={} ct_psi_mul_ring={}",
+        cm_counts.ring_add,
+        cm_counts.ring_sub,
+        cm_counts.ring_scale,
+        cm_counts.ring_mul_negacyclic,
+        cm_counts.ring_eq,
+        cm_counts.lc_to_var,
+        cm_counts.scalar_add,
+        cm_counts.scalar_sub,
+        cm_counts.scalar_mul,
+        cm_counts.scalar_mul_const,
+        cm_counts.scalar_sub_const,
+        cm_counts.scalar_pow_table,
+        cm_counts.eq_eval_vars,
+        cm_counts.short_challenge_from_bytes,
+        cm_counts.ct_psi_mul_ring
+    );
+    eprintln!(
+        "  absorb(non-reabsorb) breakdown: cm(comh_ops={} comh_bytes={} sc_msgs_ops=[{},{}] sc_msgs_bytes=[{},{}] eval_ops=[{},{}] eval_bytes=[{},{}])",
+        absorb_counts.comh_ops,
+        absorb_counts.comh_bytes_total,
+        absorb_counts.sc_msgs_ops_0,
+        absorb_counts.sc_msgs_ops_1,
+        absorb_counts.sc_msgs_bytes_total_0,
+        absorb_counts.sc_msgs_bytes_total_1,
+        absorb_counts.eval_ops_0,
+        absorb_counts.eval_ops_1,
+        absorb_counts.eval_bytes_total_0,
+        absorb_counts.eval_bytes_total_1,
+    );
+    eprintln!(
+        "  glue builder: nvars={} nconstraints={} local_map={} byte_bits_cache={} u64_bal16_cache={} u32_bal16_cache={}",
+        glue.gb.assignment.len(),
+        glue.gb.nconstraints(),
+        glue.local_map.len(),
+        glue.gb.byte_bits_cache.len(),
+        glue.gb.u64_bal16_cache.len(),
+        glue.gb.u32_bal16_cache.len(),
+    );
+    eprintln!(
+        "  surfaces: pairs={} mul_surfaces={} sq_surfaces={} sum_all_pairs_digits={} sum_all_pairs_coeffwise={} sq_sum_all_pairs_digits={} sq_sum_all_pairs_coeffwise={}",
+        pairs_len,
+        mul_surfaces_len,
+        sq_surfaces_len,
+        sum_all_pairs_digits_len,
+        sum_all_pairs_coeffwise_len,
+        sq_sum_all_pairs_digits_len,
+        sq_sum_all_pairs_coeffwise_len,
+    );
+    if glue.gb.profile_enabled {
+        eprintln!("{}", glue.gb.profile_report(40));
+    } else {
+        eprintln!("  (dr1cs scope profile disabled; set LF_PROFILE_DR1CS=1 for top scopes)");
+    }
+    eprintln!("==============================================================");
+}
+
 struct GlueCtx {
     gb: Dr1csBuilder<F257>,
     pose_asg: Arc<Vec<F257>>,
@@ -4457,6 +4628,20 @@ pub(super) fn build_file_backed(
         &u32_locals,
     )?;
 
+    // Capture a lightweight absorb breakdown summary for optional op-mix reporting.
+    let absorb_counts = TinyAbsorbBreakdownCounts {
+        comh_ops: comh_absorbs.len(),
+        comh_bytes_total: sum_absorb_bytes(&comh_absorbs),
+        sc_msgs_ops_0: sc_msg_absorbs.get(0).map(|v| v.len()).unwrap_or(0),
+        sc_msgs_bytes_total_0: sc_msg_absorbs.get(0).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
+        sc_msgs_ops_1: sc_msg_absorbs.get(1).map(|v| v.len()).unwrap_or(0),
+        sc_msgs_bytes_total_1: sc_msg_absorbs.get(1).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
+        eval_ops_0: eval_absorbs.get(0).map(|v| v.len()).unwrap_or(0),
+        eval_bytes_total_0: eval_absorbs.get(0).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
+        eval_ops_1: eval_absorbs.get(1).map(|v| v.len()).unwrap_or(0),
+        eval_bytes_total_1: eval_absorbs.get(1).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
+    };
+
     let (tcch0_local, tcch1_local) = compute_tcch_from_comh_absorbs(
         &mut glue,
         &pose_wiring,
@@ -4524,6 +4709,24 @@ pub(super) fn build_file_backed(
         all_sq_sum_digits,
         all_sq_sum_coeffwise,
     ) = build_surfaces_with_shared_arcs(&mut glue, ring_dim, pairs, &short_locals, &u32_locals)?;
+
+    // Optional: print an op-mix breakdown for tiny-field porting estimates (file-backed build).
+    //
+    // Enable with: `LFP_WE_GATE_OPMIX=1 ...`
+    maybe_print_tiny_opmix_file_backed(
+        cfg,
+        ops,
+        &pose_inst,
+        &glue,
+        &absorb_counts,
+        pairs.len(),
+        surfaces_mul_local.len(),
+        surfaces_sq_local.len(),
+        all_sum_digits.len(),
+        all_sum_coeffwise.len(),
+        all_sq_sum_digits.len(),
+        all_sq_sum_coeffwise.len(),
+    );
 
     drop(pose_asg);
     finalize_file_backed(
