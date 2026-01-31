@@ -14,8 +14,8 @@ use super::goldilocks::{
 };
 use super::cm_ir::{
     bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_ir, goldilocks_mul_const_mod_p_digits_bal4_ir,
-    goldilocks_mul_mod_p_digits_ir, goldilocks_sub_mod_p_digits_ir, lower_ir_into_builder,
-    ring_mul_negacyclic_ntt_goldilocks_d64_ir, IrBuilder, VarRef as IrVarRef,
+    goldilocks_mul_mod_p_digits_bal4_ir, goldilocks_mul_mod_p_digits_ir, goldilocks_sub_mod_p_digits_ir, lower_ir_into_builder,
+    ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir, ring_mul_negacyclic_ntt_goldilocks_d64_ir, IrBuilder, VarRef as IrVarRef,
 };
 use cyclotomic_rings::rings::GoldilocksRing64 as GR64;
 use stark_rings::{psi, unit_monomial, CoeffRing};
@@ -783,7 +783,7 @@ pub(crate) fn eval_t_z_optimized_ring_digits_pair(
     dpp: &[RingDigits],
     ring_dim: usize,
     r: &[GoldilocksScalar],
-) -> Result<(RingDigits, RingDigits), String> {
+) -> Result<([[usize; 33]; 64], [[usize; 33]; 64]), String> {
     let sizes = [ring_dim, dpp.len(), s_prime_flat.len(), tensor_c0_ring.len(), tensor_c1_ring.len()];
     if sizes.iter().any(|&s| s == 0 || !s.is_power_of_two()) {
         return Err("eval_t_z_optimized_ring_digits_pair: expected power-of-two non-empty factor sizes".to_string());
@@ -795,6 +795,9 @@ pub(crate) fn eval_t_z_optimized_ring_digits_pair(
     let tensor_vars = vars4.iter().sum::<usize>();
     if r.len() < tensor_vars {
         return Err("eval_t_z_optimized_ring_digits_pair: r too short".to_string());
+    }
+    if ring_dim != 64 {
+        return Err("eval_t_z_optimized_ring_digits_pair: expected ring_dim=64".to_string());
     }
     let _prev = gb.profile_enter("cm_math::eval_t_z_optimized_ring_digits_pair");
     let r4 = &r[0..vars4[0]];
@@ -812,40 +815,9 @@ pub(crate) fn eval_t_z_optimized_ring_digits_pair(
         }
     };
 
-    // Common product u = v2*v3*v4.
-    let mut u = match ring_mul_negacyclic_digits_d64(gb, &v2, &v3) {
-        Ok(v) => v,
-        Err(e) => {
-            gb.profile_exit(_prev);
-            return Err(e);
-        }
-    };
-    u = match ring_mul_negacyclic_digits_d64(gb, &u, &v4) {
-        Ok(v) => v,
-        Err(e) => {
-            gb.profile_exit(_prev);
-            return Err(e);
-        }
-    };
-
     // v1 differs between t0/t1.
     let v10 = eval_small_mle_ring_digits(gb, tensor_c0_ring, r1);
     let v11 = eval_small_mle_ring_digits(gb, tensor_c1_ring, r1);
-
-    let mut res0 = match ring_mul_negacyclic_digits_d64(gb, &v10, &u) {
-        Ok(v) => v,
-        Err(e) => {
-            gb.profile_exit(_prev);
-            return Err(e);
-        }
-    };
-    let mut res1 = match ring_mul_negacyclic_digits_d64(gb, &v11, &u) {
-        Ok(v) => v,
-        Err(e) => {
-            gb.profile_exit(_prev);
-            return Err(e);
-        }
-    };
 
     // Shared padding factor.
     let mut pad = goldilocks_const_u64_digits(gb, 1u64);
@@ -853,9 +825,69 @@ pub(crate) fn eval_t_z_optimized_ring_digits_pair(
         let om = goldilocks_one_minus_digits(gb, rj);
         pad = goldilocks_mul_mod_p_digits(gb, &pad, &om);
     }
-    res0 = ring_scale_digits(gb, &res0, &pad);
-    res1 = ring_scale_digits(gb, &res1, &pad);
-    let out = Ok((res0, res1));
+
+    // Big optimization: keep the heavy ring multiplications + pad scaling in the bal4 domain end-to-end.
+    // This avoids materializing `t0(ro)`/`t1(ro)` as bal16 only to immediately convert them back to bal4
+    // at the callsite (t(z) terms).
+    //
+    // This builds a single IR fragment:
+    //   u  = v2*v3*v4
+    //   t0 = v10*u*pad
+    //   t1 = v11*u*pad
+    // and returns the resulting ring elements as bal4 base vars.
+    let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+    let (ir, out0_4, out1_4) = {
+        #[inline]
+        fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
+            if a.len() != 64 {
+                return Err("eval_t_z_optimized_ring_digits_pair: expected ring_dim=64".to_string());
+            }
+            Ok(core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j]))))
+        }
+
+        let v2_16 = ringdigits64_to_ir(&v2)?;
+        let v3_16 = ringdigits64_to_ir(&v3)?;
+        let v4_16 = ringdigits64_to_ir(&v4)?;
+        let v10_16 = ringdigits64_to_ir(&v10)?;
+        let v11_16 = ringdigits64_to_ir(&v11)?;
+        let pad16: [IrVarRef; 17] = core::array::from_fn(|k| IrVarRef::Base(pad[k]));
+
+        let mut ib = IrBuilder::new(gb.assignment.as_slice());
+
+        let v2_4: [[IrVarRef; 33]; 64] = core::array::from_fn(|i| ib.bal16_to_bal4_digits_cached(&v2_16[i]));
+        let v3_4: [[IrVarRef; 33]; 64] = core::array::from_fn(|i| ib.bal16_to_bal4_digits_cached(&v3_16[i]));
+        let v4_4: [[IrVarRef; 33]; 64] = core::array::from_fn(|i| ib.bal16_to_bal4_digits_cached(&v4_16[i]));
+        let v10_4: [[IrVarRef; 33]; 64] = core::array::from_fn(|i| ib.bal16_to_bal4_digits_cached(&v10_16[i]));
+        let v11_4: [[IrVarRef; 33]; 64] = core::array::from_fn(|i| ib.bal16_to_bal4_digits_cached(&v11_16[i]));
+        let pad4: [IrVarRef; 33] = ib.bal16_to_bal4_digits_cached(&pad16);
+
+        let u_4 = ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir(&mut ib, &v2_4, &v3_4);
+        let u_4 = ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir(&mut ib, &u_4, &v4_4);
+
+        let t0_4 = ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir(&mut ib, &v10_4, &u_4);
+        let t1_4 = ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir(&mut ib, &v11_4, &u_4);
+
+        let mut out0_4: [[IrVarRef; 33]; 64] = [[IrVarRef::Base(0); 33]; 64];
+        let mut out1_4: [[IrVarRef; 33]; 64] = [[IrVarRef::Base(0); 33]; 64];
+        for i in 0..64 {
+            out0_4[i] = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &t0_4[i], &pad4, p_u64);
+            out1_4[i] = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &t1_4[i], &pad4, p_u64);
+        }
+
+        // Keep op-mix accounting consistent with the old formulation (4 ring-muls + 2 ring-scales).
+        tiny_cm_bump(|c| {
+            c.ring_mul_negacyclic += 4;
+            c.ring_scale += 2;
+            c.scalar_mul += (2 * 64) as u64;
+        });
+
+        (ib.ir, out0_4, out1_4)
+    };
+    let lowered = lower_ir_into_builder(gb, ir);
+    let out0_base: [[usize; 33]; 64] = core::array::from_fn(|i| core::array::from_fn(|k| lowered.map_var(out0_4[i][k])));
+    let out1_base: [[usize; 33]; 64] = core::array::from_fn(|i| core::array::from_fn(|k| lowered.map_var(out1_4[i][k])));
+
+    let out = Ok((out0_base, out1_base));
     gb.profile_exit(_prev);
     out
 }

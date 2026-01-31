@@ -4215,8 +4215,8 @@ fn build_cm_glue_for_which(
         // eq(r, ro) where r is the transcript-derived SetChk point (recovered above).
         let eq = eq_eval_goldilocks_digits(&mut glue.gb, rpt, &rs_digits)?;
 
-        // Evaluate t0(ro), t1(ro).
-        let (t0, t1) = eval_t_z_optimized_ring_digits_pair(
+        // Evaluate t0(ro), t1(ro) directly as **bal4** digits (avoids bal16->bal4 conversion later).
+        let (t0_4_base, t1_4_base) = eval_t_z_optimized_ring_digits_pair(
             &mut glue.gb,
             tc0_ring,
             tc1_ring,
@@ -4385,27 +4385,24 @@ fn build_cm_glue_for_which(
                 out.into_iter().collect()
             }
 
-            // Precompute shared inputs in bal4 once (t0/t1 + rc^z scalars).
+            // Precompute rc^z scalars in bal4 once.
             // Avoid borrowing `glue.gb.assignment` across `lower_ir_into_builder(&mut glue.gb, ...)`.
             // IMPORTANT: after lowering this precompute IR, we must take a *fresh* snapshot for the
             // per-`l` shards, since they will read witness values of the newly allocated base vars.
-            let (t0_4_base, t1_4_base, rcz4_base, rcz14_base): ([[usize; 33]; 64], [[usize; 33]; 64], [usize; 33], [usize; 33]) = {
-                let t0_16 = ringdigits64_to_ir(&t0)?;
-                let t1_16 = ringdigits64_to_ir(&t1)?;
+            let (rcz4_base, rcz14_base): ([usize; 33], [usize; 33]) = {
                 let rcz16: [IrVarRef; 17] = core::array::from_fn(|k| IrVarRef::Base(rc_pows[z_idx][k]));
                 let rcz116: [IrVarRef; 17] = core::array::from_fn(|k| IrVarRef::Base(rc_pows[z_idx + 1][k]));
-                let base_asg_vec0: Vec<F257> = glue.gb.assignment.clone();
-                let mut ib = IrBuilder::new(base_asg_vec0.as_slice());
-                let t0_4: [[IrVarRef; 33]; 64] = core::array::from_fn(|i| ib.bal16_to_bal4_digits_cached(&t0_16[i]));
-                let t1_4: [[IrVarRef; 33]; 64] = core::array::from_fn(|i| ib.bal16_to_bal4_digits_cached(&t1_16[i]));
-                let rcz4: [IrVarRef; 33] = ib.bal16_to_bal4_digits_cached(&rcz16);
-                let rcz14: [IrVarRef; 33] = ib.bal16_to_bal4_digits_cached(&rcz116);
-                let lowered = lower_ir_into_builder(&mut glue.gb, ib.ir);
-                let t0_4_base: [[usize; 33]; 64] = core::array::from_fn(|i| core::array::from_fn(|k| lowered.map_var(t0_4[i][k])));
-                let t1_4_base: [[usize; 33]; 64] = core::array::from_fn(|i| core::array::from_fn(|k| lowered.map_var(t1_4[i][k])));
-                let rcz4_base: [usize; 33] = core::array::from_fn(|k| lowered.map_var(rcz4[k]));
-                let rcz14_base: [usize; 33] = core::array::from_fn(|k| lowered.map_var(rcz14[k]));
-                (t0_4_base, t1_4_base, rcz4_base, rcz14_base)
+                let (ir, rcz4_ir, rcz14_ir) = {
+                    let base_asg = glue.gb.assignment.as_slice();
+                    let mut ib = IrBuilder::new(base_asg);
+                    let rcz4 = ib.bal16_to_bal4_digits_cached(&rcz16);
+                    let rcz14 = ib.bal16_to_bal4_digits_cached(&rcz116);
+                    (ib.ir, rcz4, rcz14)
+                };
+                let lowered = lower_ir_into_builder(&mut glue.gb, ir);
+                let rcz4_base: [usize; 33] = core::array::from_fn(|k| lowered.map_var(rcz4_ir[k]));
+                let rcz14_base: [usize; 33] = core::array::from_fn(|k| lowered.map_var(rcz14_ir[k]));
+                (rcz4_base, rcz14_base)
             };
 
             let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
