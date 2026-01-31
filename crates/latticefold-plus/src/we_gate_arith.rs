@@ -7349,8 +7349,14 @@ mod tests {
                 .u32_squeeze_ops
                 .splice(0..0, prefix_u32_squeeze_ops.into_iter());
 
+            let out_dir = {
+                let mut p = std::env::temp_dir();
+                p.push(format!("lfplus_tiny_gate_file_backed_{}", rng.next_u64()));
+                std::fs::create_dir_all(&p).expect("create temp out_dir");
+                p
+            };
             let (tiny_inst, tiny_asg, _shorts, _u32s, _gold, _tcch0, _tcch1, _sm, _ssq, _pose_wiring) =
-                tiny::we_tiny_f257_build_cm_gate_from_trace_ops_with_extra_witness(
+                tiny::we_tiny_f257_build_cm_gate_from_trace_ops_file_backed_with_extra_witness(
                     None,
                     &ops_f257,
                     ring_dim,
@@ -7358,14 +7364,15 @@ mod tests {
                     &wiring_abs,
                     &pairs,
                     Some(&extra),
+                    &out_dir,
                 )
-                .expect("build tiny gate from real trace");
-            tiny_inst.check(&tiny_asg).expect("tiny gate dr1cs sat");
+                .expect("build tiny gate (file-backed) from real trace");
+            tiny_inst.check(&tiny_asg).expect("tiny gate dr1cs sat (file-backed check)");
             eprintln!(
                 "[test_large_trace] build_we_tiny_gate: {:?} (nvars={}, constraints={})",
                 t_tiny.elapsed(),
                 tiny_inst.nvars,
-                tiny_inst.constraints.len()
+                tiny_inst.layout.nconstraints
             );
             // NOTE: We also intentionally skip the DPP pipeline here; it depends on building the
             // large-field WE gate and is orthogonal to validating the tiny gate.

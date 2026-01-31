@@ -11,11 +11,13 @@
 //! recomputation, Step-5). Those are the next layer on top of the verified subclaims.
 
 use ark_ff::PrimeField;
+use ark_serialize::CanonicalSerialize;
 
 use std::collections::BTreeMap;
 use core::ops::Range;
 
 use crate::dpp_poseidon::{Constraint, SparseDr1csInstance};
+use crate::file_backed_dr1cs::{FileBackedSparseDr1csInstance, SparseDr1csFileWriter};
 
 #[derive(Clone, Debug, Default)]
 pub struct Dr1csProfileCounts {
@@ -23,13 +25,21 @@ pub struct Dr1csProfileCounts {
     pub constraints: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Dr1csBuilder<F: PrimeField> {
     pub assignment: Vec<F>,
     pub rows: Vec<Constraint>,
     pub a_terms: Vec<(F, usize)>,
     pub b_terms: Vec<(F, usize)>,
     pub c_terms: Vec<(F, usize)>,
+    /// Optional file-backed sink for constraints/term pools.
+    ///
+    /// When present, `rows/a_terms/b_terms/c_terms` are not populated (to avoid giant Vec pools).
+    file_sink: Option<SparseDr1csFileWriter<F>>,
+    file_rows: u64,
+    file_a_terms: u64,
+    file_b_terms: u64,
+    file_c_terms: u64,
     /// Cache for reusing a byte var's bit-decomposition across gadgets.
     ///
     /// Key: byte variable index. Value: 8 boolean bit variable indices (little-endian).
@@ -58,7 +68,7 @@ pub struct Dr1csBuilder<F: PrimeField> {
     pub profile: BTreeMap<&'static str, Dr1csProfileCounts>,
 }
 
-impl<F: PrimeField> Dr1csBuilder<F> {
+impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
     pub fn new() -> Self {
         let profile_enabled = match std::env::var("LF_PROFILE_DR1CS") {
             Ok(v) => v != "0",
@@ -70,6 +80,11 @@ impl<F: PrimeField> Dr1csBuilder<F> {
             a_terms: Vec::new(),
             b_terms: Vec::new(),
             c_terms: Vec::new(),
+            file_sink: None,
+            file_rows: 0,
+            file_a_terms: 0,
+            file_b_terms: 0,
+            file_c_terms: 0,
             byte_bits_cache: BTreeMap::new(),
             u64_bal16_cache: BTreeMap::new(),
             u32_bal16_cache: BTreeMap::new(),
@@ -77,6 +92,29 @@ impl<F: PrimeField> Dr1csBuilder<F> {
             profile_enabled,
             profile_current: None,
             profile: BTreeMap::new(),
+        }
+    }
+    /// Create a builder that streams constraints/terms to `dir` instead of storing giant Vec pools.
+    pub fn new_file_backed(dir: impl AsRef<std::path::Path>) -> Result<Self, String>
+    where
+        F: CanonicalSerialize,
+    {
+        let mut b = Self::new();
+        b.file_sink = Some(SparseDr1csFileWriter::<F>::create(dir)?);
+        Ok(b)
+    }
+
+    #[inline]
+    pub fn is_file_backed(&self) -> bool {
+        self.file_sink.is_some()
+    }
+
+    #[inline]
+    pub fn nconstraints(&self) -> u64 {
+        if self.file_sink.is_some() {
+            self.file_rows
+        } else {
+            self.rows.len() as u64
         }
     }
     pub fn one(&self) -> usize { 0 }
@@ -105,12 +143,105 @@ impl<F: PrimeField> Dr1csBuilder<F> {
         }
     }
 
+    /// Add a constraint without materializing term vectors (stream-friendly).
+    ///
+    /// This is used by file-backed lowering paths to avoid allocating a `Vec` per constraint.
+    #[inline]
+    pub fn add_constraint_terms_iter<IA, IB, IC>(&mut self, a: IA, b: IB, c: IC)
+    where
+        IA: IntoIterator<Item = (F, usize)>,
+        IB: IntoIterator<Item = (F, usize)>,
+        IC: IntoIterator<Item = (F, usize)>,
+    {
+        if let Some(sink) = self.file_sink.as_mut() {
+            let a0 = self.file_a_terms;
+            let mut a_n: u64 = 0;
+            for (coef, idx) in a.into_iter() {
+                sink.push_a_term(&coef, idx as u64)
+                    .expect("file-backed dr1cs write failed (a_term)");
+                a_n += 1;
+            }
+            let a1 = a0 + a_n;
+            self.file_a_terms = a1;
+
+            let b0 = self.file_b_terms;
+            let mut b_n: u64 = 0;
+            for (coef, idx) in b.into_iter() {
+                sink.push_b_term(&coef, idx as u64)
+                    .expect("file-backed dr1cs write failed (b_term)");
+                b_n += 1;
+            }
+            let b1 = b0 + b_n;
+            self.file_b_terms = b1;
+
+            let c0 = self.file_c_terms;
+            let mut c_n: u64 = 0;
+            for (coef, idx) in c.into_iter() {
+                sink.push_c_term(&coef, idx as u64)
+                    .expect("file-backed dr1cs write failed (c_term)");
+                c_n += 1;
+            }
+            let c1 = c0 + c_n;
+            self.file_c_terms = c1;
+
+            sink.push_constraint_row(a0, a1, b0, b1, c0, c1)
+                .expect("file-backed dr1cs write failed (constraint)");
+            self.file_rows += 1;
+        } else {
+            let a0 = self.a_terms.len();
+            self.a_terms.extend(a);
+            let a1 = self.a_terms.len();
+            let b0 = self.b_terms.len();
+            self.b_terms.extend(b);
+            let b1 = self.b_terms.len();
+            let c0 = self.c_terms.len();
+            self.c_terms.extend(c);
+            let c1 = self.c_terms.len();
+            self.rows.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
+        }
+        if self.profile_enabled {
+            let key = self.profile_current.unwrap_or("unlabeled");
+            self.profile.entry(key).or_default().constraints += 1;
+        }
+    }
+
     #[inline]
     pub fn add_constraint_slices(&mut self, a: &[(F, usize)], b: &[(F, usize)], c: &[(F, usize)]) {
-        let ar = Self::push_terms(&mut self.a_terms, a);
-        let br = Self::push_terms(&mut self.b_terms, b);
-        let cr = Self::push_terms(&mut self.c_terms, c);
-        self.rows.push(Constraint { a: ar, b: br, c: cr });
+        if let Some(sink) = self.file_sink.as_mut() {
+            // Stream to disk.
+            let a0 = self.file_a_terms;
+            for (coef, idx) in a.iter() {
+                sink.push_a_term(coef, *idx as u64)
+                    .expect("file-backed dr1cs write failed (a_term)");
+            }
+            let a1 = self.file_a_terms + (a.len() as u64);
+            self.file_a_terms = a1;
+
+            let b0 = self.file_b_terms;
+            for (coef, idx) in b.iter() {
+                sink.push_b_term(coef, *idx as u64)
+                    .expect("file-backed dr1cs write failed (b_term)");
+            }
+            let b1 = self.file_b_terms + (b.len() as u64);
+            self.file_b_terms = b1;
+
+            let c0 = self.file_c_terms;
+            for (coef, idx) in c.iter() {
+                sink.push_c_term(coef, *idx as u64)
+                    .expect("file-backed dr1cs write failed (c_term)");
+            }
+            let c1 = self.file_c_terms + (c.len() as u64);
+            self.file_c_terms = c1;
+
+            sink.push_constraint_row(a0, a1, b0, b1, c0, c1)
+                .expect("file-backed dr1cs write failed (constraint)");
+            self.file_rows += 1;
+        } else {
+            let ar = Self::push_terms(&mut self.a_terms, a);
+            let br = Self::push_terms(&mut self.b_terms, b);
+            let cr = Self::push_terms(&mut self.c_terms, c);
+            self.rows.push(Constraint { a: ar, b: br, c: cr });
+        }
     }
     pub fn enforce_lc_times_one_eq_const(&mut self, lc: Vec<(F, usize)>) {
         let one = self.one();
@@ -147,6 +278,9 @@ impl<F: PrimeField> Dr1csBuilder<F> {
         v
     }
     pub fn into_instance(self) -> (SparseDr1csInstance<F>, Vec<F>) {
+        if self.file_sink.is_some() {
+            panic!("into_instance called on file-backed Dr1csBuilder; use into_file_backed_instance");
+        }
         let inst = SparseDr1csInstance {
             nvars: self.assignment.len(),
             constraints: self.rows,
@@ -155,6 +289,19 @@ impl<F: PrimeField> Dr1csBuilder<F> {
             c_terms: self.c_terms,
         };
         (inst, self.assignment)
+    }
+
+    pub fn into_file_backed_instance(self) -> Result<(FileBackedSparseDr1csInstance<F>, Vec<F>), String>
+    where
+        F: CanonicalSerialize,
+    {
+        let mut me = self;
+        let sink = me
+            .file_sink
+            .take()
+            .ok_or_else(|| "into_file_backed_instance called on in-memory Dr1csBuilder".to_string())?;
+        let inst = sink.finish(me.assignment.len())?;
+        Ok((inst, me.assignment))
     }
 
     /// Enter a profiling scope; returns the previous scope label.

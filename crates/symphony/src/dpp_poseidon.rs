@@ -4,13 +4,22 @@
 //! we first arithmetize the Poseidon permutation(s) used by the transcript.
 
 use ark_ff::{BigInteger, PrimeField};
+use ark_serialize::CanonicalSerialize;
 use rayon::prelude::*;
 use core::ops::Range;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::poseidon_trace::{permute_with_round_trace, PoseidonReplayError};
 use crate::poseidon_trace::{replay_ops, PoseidonReplayError as ReplayErr, PoseidonSpongeReplayResult};
 use crate::transcript::PoseidonTraceOp;
+use crate::file_backed_dr1cs::{FileBackedSparseDr1csInstance, SparseDr1csFileWriter};
+
+#[derive(Debug)]
+enum PoseidonInstance<F: PrimeField> {
+    InMemory(SparseDr1csInstance<F>),
+    FileBacked(FileBackedSparseDr1csInstance<F>),
+}
 
 fn escape_json_str(input: &str) -> String {
     input
@@ -153,7 +162,7 @@ impl<F: PrimeField> SparseDr1csInstance<F> {
 /// - var 0 is shared across all parts
 /// - all other variables are appended, and constraints are re-indexed accordingly
 pub fn merge_sparse_dr1cs_share_one<F: PrimeField + Copy + Send + Sync>(
-    mut parts: Vec<(SparseDr1csInstance<F>, Vec<F>)>,
+    parts: Vec<(SparseDr1csInstance<F>, Vec<F>)>,
 ) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {
     if parts.is_empty() {
         return Err("merge_sparse_dr1cs_share_one: empty parts".to_string());
@@ -624,16 +633,21 @@ fn merge_sparse_dr1cs_share_one_with_glue_impl<F: PrimeField>(
     ))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Dr1csBuilder<F: PrimeField> {
     assignment: Vec<F>,
     rows: Vec<Constraint>,
     a_terms: Vec<(F, usize)>,
     b_terms: Vec<(F, usize)>,
     c_terms: Vec<(F, usize)>,
+    file_sink: Option<SparseDr1csFileWriter<F>>,
+    file_rows: u64,
+    file_a_terms: u64,
+    file_b_terms: u64,
+    file_c_terms: u64,
 }
 
-impl<F: PrimeField> Dr1csBuilder<F> {
+impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
     fn new() -> Self {
         // var 0 is the constant-1 slot
         Self {
@@ -642,6 +656,31 @@ impl<F: PrimeField> Dr1csBuilder<F> {
             a_terms: Vec::new(),
             b_terms: Vec::new(),
             c_terms: Vec::new(),
+            file_sink: None,
+            file_rows: 0,
+            file_a_terms: 0,
+            file_b_terms: 0,
+            file_c_terms: 0,
+        }
+    }
+
+    fn new_file_backed(dir: impl AsRef<std::path::Path>) -> Result<Self, String> {
+        let mut b = Self::new();
+        b.file_sink = Some(SparseDr1csFileWriter::<F>::create(dir)?);
+        Ok(b)
+    }
+
+    #[inline]
+    fn is_file_backed(&self) -> bool {
+        self.file_sink.is_some()
+    }
+
+    #[inline]
+    fn nconstraints(&self) -> usize {
+        if self.file_sink.is_some() {
+            self.file_rows as usize
+        } else {
+            self.rows.len()
         }
     }
 
@@ -656,16 +695,46 @@ impl<F: PrimeField> Dr1csBuilder<F> {
     }
 
     fn add_constraint(&mut self, a: Vec<(F, usize)>, b: Vec<(F, usize)>, c: Vec<(F, usize)>) {
-        let a0 = self.a_terms.len();
-        self.a_terms.extend(a);
-        let a1 = self.a_terms.len();
-        let b0 = self.b_terms.len();
-        self.b_terms.extend(b);
-        let b1 = self.b_terms.len();
-        let c0 = self.c_terms.len();
-        self.c_terms.extend(c);
-        let c1 = self.c_terms.len();
-        self.rows.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
+        if let Some(sink) = self.file_sink.as_mut() {
+            let a0 = self.file_a_terms;
+            for (coef, idx) in a.iter() {
+                sink.push_a_term(coef, *idx as u64)
+                    .expect("file-backed dr1cs write failed (a_term)");
+            }
+            let a1 = a0 + (a.len() as u64);
+            self.file_a_terms = a1;
+
+            let b0 = self.file_b_terms;
+            for (coef, idx) in b.iter() {
+                sink.push_b_term(coef, *idx as u64)
+                    .expect("file-backed dr1cs write failed (b_term)");
+            }
+            let b1 = b0 + (b.len() as u64);
+            self.file_b_terms = b1;
+
+            let c0 = self.file_c_terms;
+            for (coef, idx) in c.iter() {
+                sink.push_c_term(coef, *idx as u64)
+                    .expect("file-backed dr1cs write failed (c_term)");
+            }
+            let c1 = c0 + (c.len() as u64);
+            self.file_c_terms = c1;
+
+            sink.push_constraint_row(a0, a1, b0, b1, c0, c1)
+                .expect("file-backed dr1cs write failed (constraint)");
+            self.file_rows += 1;
+        } else {
+            let a0 = self.a_terms.len();
+            self.a_terms.extend(a);
+            let a1 = self.a_terms.len();
+            let b0 = self.b_terms.len();
+            self.b_terms.extend(b);
+            let b1 = self.b_terms.len();
+            let c0 = self.c_terms.len();
+            self.c_terms.extend(c);
+            let c1 = self.c_terms.len();
+            self.rows.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
+        }
     }
 
     fn enforce_lc_times_one_eq_var(&mut self, lc: Vec<(F, usize)>, out: usize) {
@@ -775,6 +844,9 @@ impl<F: PrimeField> Dr1csBuilder<F> {
     }
 
     fn into_sparse_instance(self) -> (SparseDr1csInstance<F>, Vec<F>) {
+        if self.file_sink.is_some() {
+            panic!("into_sparse_instance called on file-backed Dr1csBuilder; use into_file_backed_instance");
+        }
         let nvars = self.assignment.len();
         let inst = SparseDr1csInstance {
             nvars,
@@ -785,12 +857,22 @@ impl<F: PrimeField> Dr1csBuilder<F> {
         };
         (inst, self.assignment)
     }
+
+    fn into_file_backed_instance(self) -> Result<(FileBackedSparseDr1csInstance<F>, Vec<F>), String> {
+        let mut me = self;
+        let sink = me
+            .file_sink
+            .take()
+            .ok_or_else(|| "into_file_backed_instance called on in-memory Dr1csBuilder".to_string())?;
+        let inst = sink.finish(me.assignment.len())?;
+        Ok((inst, me.assignment))
+    }
 }
 
 /// Build a sparse dR1CS instance for a single Poseidon permutation, given an input state.
 ///
 /// Returns `(instance, assignment, out_state_var_indices)`.
-pub fn poseidon_permutation_dr1cs<F: PrimeField>(
+pub fn poseidon_permutation_dr1cs<F: PrimeField + CanonicalSerialize>(
     cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
     before_state: &[F],
 ) -> Result<(SparseDr1csInstance<F>, Vec<F>, Vec<usize>), PoseidonReplayError> {
@@ -932,7 +1014,7 @@ pub struct PoseidonByteWiring {
 ///
 /// For `SqueezeBytes`, we constrain the squeezed **field elements** and return `ByteSqueezeWitness`
 /// entries so byte-decomposition constraints can be added in a later step.
-pub fn poseidon_sponge_dr1cs_from_trace<F: PrimeField>(
+pub fn poseidon_sponge_dr1cs_from_trace<F: PrimeField + CanonicalSerialize>(
     cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
     ops: &[PoseidonTraceOp<F>],
 ) -> Result<
@@ -950,7 +1032,7 @@ pub fn poseidon_sponge_dr1cs_from_trace<F: PrimeField>(
 
 /// Same as `poseidon_sponge_dr1cs_from_trace`, but also returns `PoseidonDr1csWiring` describing
 /// where each `SqueezeField` output element lives in the dR1CS assignment vector.
-pub fn poseidon_sponge_dr1cs_from_trace_with_wiring<F: PrimeField>(
+pub fn poseidon_sponge_dr1cs_from_trace_with_wiring<F: PrimeField + CanonicalSerialize>(
     cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
     ops: &[PoseidonTraceOp<F>],
 ) -> Result<
@@ -974,7 +1056,7 @@ pub fn poseidon_sponge_dr1cs_from_trace_with_wiring<F: PrimeField>(
 ///
 /// This makes the dR1CS instance depend only on the operation schedule (lengths) and Poseidon
 /// parameters, not on a specific transcript realization.
-pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes<F: PrimeField>(
+pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes<F: PrimeField + CanonicalSerialize>(
     cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
     ops: &[PoseidonTraceOp<F>],
 ) -> Result<
@@ -995,7 +1077,7 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes<F: PrimeField>(
 ///
 /// This is useful for estimating the marginal constraint cost of the `SqueezeBytes` byte
 /// canonicalization gadget (which can be large).
-pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes<F: PrimeField>(
+pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes<F: PrimeField + CanonicalSerialize>(
     cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
     ops: &[PoseidonTraceOp<F>],
 ) -> Result<(SparseDr1csInstance<F>, Vec<F>, PoseidonDr1csWiring), ReplayErr> {
@@ -1007,7 +1089,7 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes<F: PrimeField>(
 /// - allocates byte variables,
 /// - constrains each byte is 8-bit,
 /// - links bytes to the underlying squeezed field elements via radix-256 decomposition.
-pub fn poseidon_sponge_dr1cs_from_trace_with_wiring_and_bytes<F: PrimeField>(
+pub fn poseidon_sponge_dr1cs_from_trace_with_wiring_and_bytes<F: PrimeField + CanonicalSerialize>(
     cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
     ops: &[PoseidonTraceOp<F>],
 ) -> Result<
@@ -1024,6 +1106,37 @@ pub fn poseidon_sponge_dr1cs_from_trace_with_wiring_and_bytes<F: PrimeField>(
     poseidon_sponge_dr1cs_from_trace_impl(cfg, ops, true, PoseidonArithMode::ReplayFixed)
 }
 
+/// File-backed WE/arm-before-proof mode (with bytes): streams constraints/terms to `out_dir`.
+pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed<F: PrimeField + CanonicalSerialize>(
+    cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+    ops: &[PoseidonTraceOp<F>],
+    out_dir: impl AsRef<Path>,
+) -> Result<
+    (
+        FileBackedSparseDr1csInstance<F>,
+        Vec<F>,
+        PoseidonSpongeReplayResult<F>,
+        Vec<ByteSqueezeWitness>,
+        PoseidonDr1csWiring,
+        PoseidonByteWiring,
+    ),
+    ReplayErr,
+> {
+    let (inst_any, asg, replay, bytes, wiring, bw) = poseidon_sponge_dr1cs_from_trace_impl_any(
+        cfg,
+        ops,
+        true,
+        PoseidonArithMode::WeWitness,
+        Some(out_dir.as_ref()),
+    )?;
+    match inst_any {
+        PoseidonInstance::FileBacked(inst) => Ok((inst, asg, replay, bytes, wiring, bw)),
+        PoseidonInstance::InMemory(_) => Err(ReplayErr::Invalid(
+            "expected file-backed instance, got in-memory".to_string(),
+        )),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PoseidonArithMode {
     /// “Replay mode”: enforce Absorb/Squeeze outputs match the recorded trace values and run
@@ -1033,14 +1146,15 @@ enum PoseidonArithMode {
     WeWitness,
 }
 
-fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
+fn poseidon_sponge_dr1cs_from_trace_impl_any<F: PrimeField + CanonicalSerialize>(
     cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
     ops: &[PoseidonTraceOp<F>],
     with_bytes: bool,
     arith_mode: PoseidonArithMode,
+    out_dir: Option<&Path>,
 ) -> Result<
     (
-        SparseDr1csInstance<F>,
+        PoseidonInstance<F>,
         Vec<F>,
         PoseidonSpongeReplayResult<F>,
         Vec<ByteSqueezeWitness>,
@@ -1077,7 +1191,11 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
     };
 
     let t = cfg.rate + cfg.capacity;
-    let mut b = Dr1csBuilder::<F>::new();
+    let mut b = if let Some(dir) = out_dir {
+        Dr1csBuilder::<F>::new_file_backed(dir).map_err(ReplayErr::Invalid)?
+    } else {
+        Dr1csBuilder::<F>::new()
+    };
     let one = b.one();
 
     // Initial state is all zeros.
@@ -1316,7 +1434,7 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
                     "[poseidon_arith] permute={} vars={} constraints={} elapsed={:.2?}",
                     permute_ptr,
                     b.assignment.len(),
-                    b.rows.len(),
+                    b.nconstraints(),
                     t_start.elapsed()
                 );
             }
@@ -1760,8 +1878,40 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
         )));
     }
 
-    let (inst, assignment) = b.into_sparse_instance();
-    Ok((inst, assignment, replay, byte_witnesses, wiring, byte_wiring))
+    let (inst_any, assignment) = if b.is_file_backed() {
+        let (inst, asg) = b.into_file_backed_instance().map_err(ReplayErr::Invalid)?;
+        (PoseidonInstance::FileBacked(inst), asg)
+    } else {
+        let (inst, asg) = b.into_sparse_instance();
+        (PoseidonInstance::InMemory(inst), asg)
+    };
+    Ok((inst_any, assignment, replay, byte_witnesses, wiring, byte_wiring))
+}
+
+fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField + CanonicalSerialize>(
+    cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+    ops: &[PoseidonTraceOp<F>],
+    with_bytes: bool,
+    arith_mode: PoseidonArithMode,
+) -> Result<
+    (
+        SparseDr1csInstance<F>,
+        Vec<F>,
+        PoseidonSpongeReplayResult<F>,
+        Vec<ByteSqueezeWitness>,
+        PoseidonDr1csWiring,
+        PoseidonByteWiring,
+    ),
+    ReplayErr,
+> {
+    let (inst_any, asg, replay, bytes, wiring, bw) =
+        poseidon_sponge_dr1cs_from_trace_impl_any(cfg, ops, with_bytes, arith_mode, None)?;
+    match inst_any {
+        PoseidonInstance::InMemory(inst) => Ok((inst, asg, replay, bytes, wiring, bw)),
+        PoseidonInstance::FileBacked(_) => Err(ReplayErr::Invalid(
+            "expected in-memory instance, got file-backed".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]

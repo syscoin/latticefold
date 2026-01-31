@@ -312,6 +312,32 @@ impl LoweredIr {
 pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> LoweredIr {
     let CmIr { local_asg, constraints, a_terms, b_terms, c_terms, stats } = ir;
     let base_nvars = gb.assignment.len();
+    // File-backed builder path: stream constraints/terms instead of appending to giant Vec pools.
+    //
+    // This avoids the "term pool" RAM blow-ups at the cost of slower lowering (we can optimize
+    // streaming writes later).
+    if gb.is_file_backed() {
+        let mut local_to_var: Vec<usize> = Vec::with_capacity(local_asg.len());
+        local_to_var.push(0); // Local(0) unused
+        for &v in local_asg.iter().skip(1) {
+            local_to_var.push(gb.new_var(v));
+        }
+        let lowered = LoweredIr { base_nvars, local_to_var };
+        for ic in constraints {
+            gb.add_constraint_terms_iter(
+                a_terms[ic.a.clone()]
+                    .iter()
+                    .map(|(coef, v)| (*coef, lowered.map_var(*v))),
+                b_terms[ic.b.clone()]
+                    .iter()
+                    .map(|(coef, v)| (*coef, lowered.map_var(*v))),
+                c_terms[ic.c.clone()]
+                    .iter()
+                    .map(|(coef, v)| (*coef, lowered.map_var(*v))),
+            );
+        }
+        return lowered;
+    }
     // Big win for wall-time: avoid repeated reallocations during append.
     gb.assignment.reserve(local_asg.len().saturating_sub(1));
     gb.rows.reserve(constraints.len());
