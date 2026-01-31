@@ -6,6 +6,7 @@
 use ark_ff::{BigInteger, PrimeField};
 use ark_serialize::CanonicalSerialize;
 use rayon::prelude::*;
+use core::cell::RefCell;
 use core::ops::Range;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -21,6 +22,28 @@ use crate::file_backed_dr1cs::{
 enum PoseidonInstance<F: PrimeField> {
     InMemory(SparseDr1csInstance<F>),
     FileBacked(FileBackedSparseDr1csInstance<F>),
+}
+
+thread_local! {
+    // Optional prefix to disambiguate progress logs under parallelism (e.g. sharded Poseidon).
+    static POSEIDON_ARITH_LOG_PREFIX: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+#[inline]
+fn with_poseidon_arith_log_prefix<T>(prefix: String, f: impl FnOnce() -> T) -> T {
+    POSEIDON_ARITH_LOG_PREFIX.with(|p| {
+        let prev = p.replace(Some(prefix));
+        let out = f();
+        p.replace(prev);
+        out
+    })
+}
+
+#[inline]
+fn poseidon_arith_log_prefix() -> String {
+    POSEIDON_ARITH_LOG_PREFIX
+        .with(|p| p.borrow().clone())
+        .unwrap_or_default()
 }
 
 fn escape_json_str(input: &str) -> String {
@@ -1124,25 +1147,16 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed<F: Prime
     ),
     ReplayErr,
 > {
-    // Optional sharding for parallel Poseidon arithmetization.
-    // Enable with `LFP_POSEIDON_SHARD_PERMUTES=<N>` (e.g. 1024).
-    if let Ok(v) = std::env::var("LFP_POSEIDON_SHARD_PERMUTES") {
-        if let Ok(n) = v.parse::<usize>() {
-            if n > 0 {
-                return poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded(
-                    cfg,
-                    ops,
-                    out_dir,
-                    n,
-                );
-            }
-        }
-    }
-
+    // IMPORTANT:
+    // For the LF+ tiny-gate pipeline, we do NOT consume Poseidon's `SqueezeBytes` byte outputs.
+    // Arithmetizing the byte-canonicalization gadget is extremely expensive (constraints + IO).
+    //
+    // Therefore, in the canonical file-backed WE entrypoint we *do not* arithmetize `SqueezeBytes`.
+    // We still record `ByteSqueezeWitness` values, but `PoseidonByteWiring` will remain empty.
     let (inst_any, asg, replay, bytes, wiring, bw) = poseidon_sponge_dr1cs_from_trace_impl_any(
         cfg,
         ops,
-        true,
+        false,
         PoseidonArithMode::WeWitness,
         Some(out_dir.as_ref()),
     )?;
@@ -1359,16 +1373,18 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
                 .map_err(|e| ReplayErr::Invalid(format!("create shard dir failed: {e}")))?;
             let slice = &ops[p.start..p.end];
             let (inst_any, asg, _replay, bytes, wiring, bw, init_state_vars, final_state_vars) =
-                poseidon_sponge_dr1cs_from_trace_impl_any_internal(
-                    cfg,
-                    slice,
-                    true,
-                    PoseidonArithMode::WeWitness,
-                    Some(&shard_dir),
-                    &p.init_state,
-                    p.init_mode.clone(),
-                    p.constrain_init,
-                )?;
+                with_poseidon_arith_log_prefix(format!("[shard {:04}] ", shard_idx), || {
+                    poseidon_sponge_dr1cs_from_trace_impl_any_internal(
+                        cfg,
+                        slice,
+                        true,
+                        PoseidonArithMode::WeWitness,
+                        Some(&shard_dir),
+                        &p.init_state,
+                        p.init_mode.clone(),
+                        p.constrain_init,
+                    )
+                })?;
             match inst_any {
                 PoseidonInstance::FileBacked(inst) => Ok(ShardOut {
                     inst,
@@ -1636,7 +1652,8 @@ fn poseidon_sponge_dr1cs_from_trace_impl_any_internal<F: PrimeField + CanonicalS
             Err(_) => false,
         }
     }
-    let progress_on = lf_mem_on();
+    // Show progress logs for file-backed builds by default; otherwise gate on LF_MEM.
+    let progress_on = lf_mem_on() || out_dir.is_some();
     let t_start = Instant::now();
     let mut last_log = Instant::now();
     let mut last_logged_permutes: usize = 0;
@@ -1686,7 +1703,8 @@ fn poseidon_sponge_dr1cs_from_trace_impl_any_internal<F: PrimeField + CanonicalS
     if progress_on {
         let t = cfg.rate + cfg.capacity;
         eprintln!(
-            "[poseidon_arith] start: ops={} t={} rate={} cap={} with_bytes={} mode={:?}",
+            "[poseidon_arith] {}start: ops={} t={} rate={} cap={} with_bytes={} mode={:?}",
+            poseidon_arith_log_prefix(),
             ops.len(),
             t,
             cfg.rate,
@@ -1900,7 +1918,8 @@ fn poseidon_sponge_dr1cs_from_trace_impl_any_internal<F: PrimeField + CanonicalS
                 last_logged_permutes = permute_ptr;
                 last_log = Instant::now();
                 eprintln!(
-                    "[poseidon_arith] permute={} vars={} constraints={} elapsed={:.2?}",
+                    "[poseidon_arith] {}permute={} vars={} constraints={} elapsed={:.2?}",
+                    poseidon_arith_log_prefix(),
                     permute_ptr,
                     b.assignment.len(),
                     b.nconstraints(),
@@ -2007,6 +2026,17 @@ fn poseidon_sponge_dr1cs_from_trace_impl_any_internal<F: PrimeField + CanonicalS
                 let usable_bytes = ((F::MODULUS_BIT_SIZE - 1) / 8) as usize;
                 let num_elements = (*n + usable_bytes - 1) / usable_bytes;
 
+                if progress_on {
+                    eprintln!(
+                        "[poseidon_arith] {}squeeze_bytes: n={} usable_bytes={} num_elements={} (with_bytes={})",
+                        poseidon_arith_log_prefix(),
+                        n,
+                        usable_bytes,
+                        num_elements,
+                        with_bytes
+                    );
+                }
+
                 // Squeeze native field elements and constrain them (like SqueezeField),
                 // then check the bytes in Rust and return them for later constraints.
                 let mut squeeze_index = match mode {
@@ -2059,6 +2089,10 @@ fn poseidon_sponge_dr1cs_from_trace_impl_any_internal<F: PrimeField + CanonicalS
                 });
 
                 if with_bytes {
+                    // This gadget can dominate wall-time; emit progress even when the permute counter
+                    // is not advancing (so logs don't look "stuck at permute=1024").
+                    let mut last_bytes_log = Instant::now();
+
                     // Allocate and constrain byte vars + link to src elements.
                     //
                     // We allocate the **full** usable_bytes*num_elements bytes (even if n truncates
@@ -2128,6 +2162,19 @@ fn poseidon_sponge_dr1cs_from_trace_impl_any_internal<F: PrimeField + CanonicalS
                     let p_hi_f = F::from(p_hi_u16 as u64);
 
                     for e in 0..num_elements {
+                        if progress_on && last_bytes_log.elapsed() >= Duration::from_secs(2) {
+                            last_bytes_log = Instant::now();
+                            eprintln!(
+                                "[poseidon_arith] {}squeeze_bytes_progress: elem={}/{} vars={} constraints={} elapsed={:.2?}",
+                                poseidon_arith_log_prefix(),
+                                e,
+                                num_elements,
+                                b.assignment.len(),
+                                b.nconstraints(),
+                                t_start.elapsed()
+                            );
+                        }
+
                         // Allocate byte vars for this element.
                         let mut byte_vars: Vec<usize> = Vec::with_capacity(usable_bytes);
                         let mut byte_bits: Vec<[usize; 8]> = Vec::with_capacity(usable_bytes);
@@ -2355,6 +2402,20 @@ fn poseidon_sponge_dr1cs_from_trace_impl_any_internal<F: PrimeField + CanonicalS
         (PoseidonInstance::InMemory(inst), asg)
     };
     let final_state_vars = state_vars;
+
+    if progress_on {
+        eprintln!(
+            "[poseidon_arith] {}done: vars={} constraints={} elapsed={:.2?}",
+            poseidon_arith_log_prefix(),
+            assignment.len(),
+            match &inst_any {
+                PoseidonInstance::InMemory(inst) => inst.constraints.len(),
+                PoseidonInstance::FileBacked(inst) => inst.layout.nconstraints as usize,
+            },
+            t_start.elapsed()
+        );
+    }
+
     Ok((
         inst_any,
         assignment,
