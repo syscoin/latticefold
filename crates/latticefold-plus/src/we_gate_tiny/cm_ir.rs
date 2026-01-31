@@ -2597,7 +2597,7 @@ fn enforce_sub_mod_p_relation_bal4_ir(
 }
 
 #[inline]
-fn goldilocks_add_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[VarRef; 33], c4: &[VarRef; 33], p_u64: u64) -> [VarRef; 33] {
+pub(crate) fn goldilocks_add_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[VarRef; 33], c4: &[VarRef; 33], p_u64: u64) -> [VarRef; 33] {
     let a_u = digits4_to_u64_witness_ir(b, a4);
     let c_u = digits4_to_u64_witness_ir(b, c4);
     let sum = (a_u as u128) + (c_u as u128);
@@ -2620,7 +2620,7 @@ fn goldilocks_add_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[VarRef; 33],
 }
 
 #[inline]
-fn goldilocks_sub_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[VarRef; 33], c4: &[VarRef; 33], p_u64: u64) -> [VarRef; 33] {
+pub(crate) fn goldilocks_sub_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[VarRef; 33], c4: &[VarRef; 33], p_u64: u64) -> [VarRef; 33] {
     let a_u = digits4_to_u64_witness_ir(b, a4);
     let c_u = digits4_to_u64_witness_ir(b, c4);
     let (q_u8, r_u) = if a_u >= c_u {
@@ -2656,7 +2656,7 @@ pub(crate) fn goldilocks_mul_const_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, x
 }
 
 #[inline]
-fn goldilocks_mul_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[VarRef; 33], c4: &[VarRef; 33], p_u64: u64) -> [VarRef; 33] {
+pub(crate) fn goldilocks_mul_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[VarRef; 33], c4: &[VarRef; 33], p_u64: u64) -> [VarRef; 33] {
     let a_u = digits4_to_u64_witness_ir(b, a4);
     let c_u = digits4_to_u64_witness_ir(b, c4);
     let prod_u: u128 = (a_u as u128) * (c_u as u128);

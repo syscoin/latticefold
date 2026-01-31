@@ -3871,46 +3871,142 @@ fn build_cm_glue_for_which(
         )?;
 
         // Stream recombination.
+        //
+        // Big optimization: instead of `ring_scale_digits` (mul_mod_p + bal16<->bal4 conversions) per term,
+        // build one IR shard per `l` that:
+        // - converts each ring coefficient + scalar multiplier into bal4 once,
+        // - does all muls + sums in bal4,
+        // - converts to bal16 once at the end.
+        //
+        // This is also embarrassingly parallel across `l`.
         let rows_per_l = 1 + params.mlen as usize;
-        let mut eval_acc = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+
+        // First parse all eval absorbs into digit ring elements (sequential, needs `&mut glue`).
+        let mut per_l_terms: Vec<Vec<RingDigits>> = Vec::with_capacity(l_instances_expected);
         let mut e00s: Vec<RingDigits> = Vec::with_capacity(l_instances_expected);
         for l in 0..l_instances_expected {
-            let l_idx = l * (4 + 4 * (params.mlen as usize));
-            let mut inner = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+            let mut terms: Vec<RingDigits> = Vec::with_capacity(rows_per_l * 4);
             let mut e00_opt: Option<RingDigits> = None;
-
-            // First row (tau, m_tau, f, h)
-            let flat0 = l * rows_per_l + 0;
-            for j in 0..4 {
-                let (st, ln) = eval_absorbs[flat0 * 4 + j];
-                let rb = parse_ring_elem_absorb_as_ringbytes(&mut glue, pose_wiring, ring_dim, st, ln)?;
-                let rd = ring_bytes_to_digits(&mut glue.gb, &rb);
-                if j == 0 {
-                    e00_opt = Some(rd.clone());
-                }
-                let t = ring_scale_digits(&mut glue.gb, &rd, &rc_pows[l_idx + j]);
-                inner = ring_add_digits(&mut glue.gb, &inner, &t);
-            }
-
-            // M rows
-            for i in 0..(params.mlen as usize) {
-                let flat = l * rows_per_l + 1 + i;
-                let idx = l_idx + 4 + i * 4;
+            for row in 0..rows_per_l {
+                let flat = l * rows_per_l + row;
                 for j in 0..4 {
                     let (st, ln) = eval_absorbs[flat * 4 + j];
                     let rb = parse_ring_elem_absorb_as_ringbytes(&mut glue, pose_wiring, ring_dim, st, ln)?;
                     let rd = ring_bytes_to_digits(&mut glue.gb, &rb);
-                    let t = ring_scale_digits(&mut glue.gb, &rd, &rc_pows[idx + j]);
-                    inner = ring_add_digits(&mut glue.gb, &inner, &t);
+                    if row == 0 && j == 0 {
+                        e00_opt = Some(rd.clone());
+                    }
+                    terms.push(rd);
                 }
             }
-
-            let eq_inner = ring_scale_digits(&mut glue.gb, &inner, &eq);
-            eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &eq_inner);
-
-            // Save e00 for the t(z) terms; we'll build all the expensive ring-muls in parallel as IR shards.
             let e00 = e00_opt.ok_or_else(|| "tiny gate: missing e00 in recombination".to_string())?;
             e00s.push(e00);
+            per_l_terms.push(terms);
+        }
+
+        let mut eval_acc = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+
+        if ring_dim == 64 {
+            // Precompute `eq` in bal4 once (shared across all per-l shards).
+            let eq4_base: [usize; 33] = {
+                use super::cm_ir::{IrBuilder, VarRef as IrVarRef};
+                // Avoid borrowing `glue.gb.assignment` across lowering (which needs `&mut glue.gb`).
+                let base_asg_vec: Vec<F257> = glue.gb.assignment.clone();
+                let mut ib = IrBuilder::new(&base_asg_vec);
+                let eq16: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(eq[j]));
+                let eq4 = ib.bal16_to_bal4_digits_cached(&eq16);
+                let lowered = super::cm_ir::lower_ir_into_builder(&mut glue.gb, ib.ir);
+                core::array::from_fn(|k| lowered.map_var(eq4[k]))
+            };
+
+            // Build per-l recombination shards in parallel, then lower + accumulate.
+            let frags = {
+                use super::cm_ir::{
+                    bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir, goldilocks_mul_mod_p_digits_bal4_ir,
+                    IrBuilder, VarRef as IrVarRef,
+                };
+
+                #[inline]
+                fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
+                    if a.len() != 64 {
+                        return Err("tiny gate: expected ring_dim=64 for bal4 recombination".to_string());
+                    }
+                    Ok(core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j]))))
+                }
+
+                let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+                let base_asg: &[F257] = &glue.gb.assignment;
+                let eq4_ir: [IrVarRef; 33] = core::array::from_fn(|k| IrVarRef::Base(eq4_base[k]));
+
+                let frags: Vec<(super::cm_ir::CmIr, [[IrVarRef; 17]; 64])> = (0..l_instances_expected)
+                    .into_par_iter()
+                    .map(|l| -> Result<_, String> {
+                        let l_idx = l * (4 + 4 * (params.mlen as usize));
+                        let terms = &per_l_terms[l];
+                        debug_assert_eq!(terms.len(), rows_per_l * 4);
+
+                        let mut ib = IrBuilder::new(base_asg);
+                        // zero digits in bal4: fixed const-0 var replicated.
+                        let z = ib.new_var(F257::ZERO);
+                        ib.ir.enforce_var_eq_const(z, F257::ZERO);
+                        let mut inner4: [[IrVarRef; 33]; 64] = [[z; 33]; 64];
+
+                        for row in 0..rows_per_l {
+                            for j in 0..4 {
+                                let term_idx = row * 4 + j;
+                                let rd16 = ringdigits64_to_ir(&terms[term_idx])?;
+                                let s16: [IrVarRef; 17] =
+                                    core::array::from_fn(|k| IrVarRef::Base(rc_pows[l_idx + row * 4 + j][k]));
+                                let s4 = ib.bal16_to_bal4_digits_cached(&s16);
+                                for coeff in 0..64 {
+                                    let rd4 = ib.bal16_to_bal4_digits_cached(&rd16[coeff]);
+                                    let prod4 = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &rd4, &s4, p_u64);
+                                    inner4[coeff] =
+                                        goldilocks_add_mod_p_digits_bal4_ir(&mut ib, &inner4[coeff], &prod4, p_u64);
+                                }
+                            }
+                        }
+
+                        // Multiply by eq and convert to bal16 once.
+                        let mut out16: [[IrVarRef; 17]; 64] = [[IrVarRef::Base(0); 17]; 64];
+                        for coeff in 0..64 {
+                            let prod4 = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &inner4[coeff], &eq4_ir, p_u64);
+                            out16[coeff] = bal4_to_bal16_digits_ir(&mut ib, &prod4);
+                        }
+                        Ok((ib.ir, out16))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                frags
+            };
+
+            for (ir, out16_ir) in frags {
+                let lowered = super::cm_ir::lower_ir_into_builder(&mut glue.gb, ir);
+                // Map outputs into concrete vars and accumulate in bal16 (same as the legacy path).
+                let contrib: RingDigits = {
+                    let out: [GoldilocksScalar; 64] = core::array::from_fn(|i| {
+                        core::array::from_fn(|j| lowered.map_var(out16_ir[i][j]))
+                    });
+                    out.into_iter().collect()
+                };
+                eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &contrib);
+            }
+        } else {
+            // Fallback: generic ring_dim path (no bal4 batching).
+            for l in 0..l_instances_expected {
+                let l_idx = l * (4 + 4 * (params.mlen as usize));
+                let mut inner = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+                let terms = &per_l_terms[l];
+                debug_assert_eq!(terms.len(), rows_per_l * 4);
+                for row in 0..rows_per_l {
+                    for j in 0..4 {
+                        let rd = &terms[row * 4 + j];
+                        let t = ring_scale_digits(&mut glue.gb, rd, &rc_pows[l_idx + row * 4 + j]);
+                        inner = ring_add_digits(&mut glue.gb, &inner, &t);
+                    }
+                }
+                let eq_inner = ring_scale_digits(&mut glue.gb, &inner, &eq);
+                eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &eq_inner);
+            }
         }
 
         // t(z) terms: for each l, add t0(ro)*e00(l)*rc^z + t1(ro)*e00(l)*rc^{z+1}.
