@@ -3841,9 +3841,6 @@ fn build_cm_glue_for_which(
                         lower_ir_into_builder, IrBuilder, VarRef as IrVarRef,
                     };
                     let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
-                    // Avoid holding an immutable borrow of `glue.gb.assignment` across lowering.
-                    let base_asg_vec: Vec<F257> = glue.gb.assignment.clone();
-                    let base_asg_ir: &[F257] = base_asg_vec.as_slice();
 
                     #[inline]
                     fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
@@ -3869,6 +3866,11 @@ fn build_cm_glue_for_which(
                                 comh_terms.push(comh_j);
                             }
                         }
+
+                        // Take a snapshot AFTER allocating the batch's `comh_terms` vars (needed for witness reads).
+                        // Also avoids borrowing `glue.gb.assignment` across lowering.
+                        let base_asg_vec: Vec<F257> = glue.gb.assignment.clone();
+                        let base_asg_ir: &[F257] = base_asg_vec.as_slice();
 
                         // Build shards for this batch in parallel (indexed order preserved).
                         let frags: Vec<(_, [[IrVarRef; 17]; 64], [[IrVarRef; 17]; 64])> = (0..batch_len)
@@ -4385,14 +4387,15 @@ fn build_cm_glue_for_which(
 
             // Precompute shared inputs in bal4 once (t0/t1 + rc^z scalars).
             // Avoid borrowing `glue.gb.assignment` across `lower_ir_into_builder(&mut glue.gb, ...)`.
-            let base_asg_vec: Vec<F257> = glue.gb.assignment.clone();
-            let base_asg: &[F257] = base_asg_vec.as_slice();
+            // IMPORTANT: after lowering this precompute IR, we must take a *fresh* snapshot for the
+            // per-`l` shards, since they will read witness values of the newly allocated base vars.
             let (t0_4_base, t1_4_base, rcz4_base, rcz14_base): ([[usize; 33]; 64], [[usize; 33]; 64], [usize; 33], [usize; 33]) = {
                 let t0_16 = ringdigits64_to_ir(&t0)?;
                 let t1_16 = ringdigits64_to_ir(&t1)?;
                 let rcz16: [IrVarRef; 17] = core::array::from_fn(|k| IrVarRef::Base(rc_pows[z_idx][k]));
                 let rcz116: [IrVarRef; 17] = core::array::from_fn(|k| IrVarRef::Base(rc_pows[z_idx + 1][k]));
-                let mut ib = IrBuilder::new(base_asg);
+                let base_asg_vec0: Vec<F257> = glue.gb.assignment.clone();
+                let mut ib = IrBuilder::new(base_asg_vec0.as_slice());
                 let t0_4: [[IrVarRef; 33]; 64] = core::array::from_fn(|i| ib.bal16_to_bal4_digits_cached(&t0_16[i]));
                 let t1_4: [[IrVarRef; 33]; 64] = core::array::from_fn(|i| ib.bal16_to_bal4_digits_cached(&t1_16[i]));
                 let rcz4: [IrVarRef; 33] = ib.bal16_to_bal4_digits_cached(&rcz16);
@@ -4406,6 +4409,10 @@ fn build_cm_glue_for_which(
             };
 
             let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+
+            // Fresh snapshot including the precompute vars.
+            let base_asg_vec: Vec<F257> = glue.gb.assignment.clone();
+            let base_asg: &[F257] = base_asg_vec.as_slice();
 
             let frags: Vec<(_, [[IrVarRef; 17]; 64])> = e00s
                 .par_iter()
