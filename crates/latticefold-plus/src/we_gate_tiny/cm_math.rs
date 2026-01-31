@@ -19,6 +19,7 @@ use super::cm_ir::{
 };
 use cyclotomic_rings::rings::GoldilocksRing64 as GR64;
 use stark_rings::{psi, unit_monomial, CoeffRing};
+use std::sync::OnceLock;
 
 /// A ring element whose coefficients are Goldilocks base-field scalars encoded as canonical 8-byte little-endian limbs.
 ///
@@ -142,8 +143,30 @@ pub(crate) fn ring_zero_digits(gb: &mut Dr1csBuilder<F257>, d: usize) -> RingDig
 }
 
 #[inline]
+#[track_caller]
 pub(crate) fn ring_eq_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &RingDigits) {
-    let _prev = gb.profile_enter("cm_math::ring_eq_digits");
+    // Optional debug: include callsite in the scope label to localize failing equalities.
+    // Enable with `LFP_WE_GATE_OPMIX=1`.
+    #[inline]
+    fn dbg_ring_eq_caller_on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| match std::env::var("LFP_WE_GATE_OPMIX") {
+            Ok(v) => v != "0",
+            Err(_) => false,
+        })
+    }
+
+    let dbg = dbg_ring_eq_caller_on();
+    let prev_scope = if dbg {
+        let loc = std::panic::Location::caller();
+        let s = format!("cm_math::ring_eq_digits@{}:{}", loc.file(), loc.line());
+        let leaked: &'static str = Box::leak(s.into_boxed_str());
+        let prev = gb.profile_current;
+        gb.profile_current = Some(leaked);
+        prev
+    } else {
+        gb.profile_enter("cm_math::ring_eq_digits")
+    };
     tiny_cm_bump(|c| c.ring_eq += 1);
     debug_assert_eq!(a.len(), b.len());
     for (ai, bi) in a.iter().zip(b.iter()) {
@@ -151,7 +174,11 @@ pub(crate) fn ring_eq_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &Ri
             gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, ai[j]), (-F257::ONE, bi[j])]);
         }
     }
-    gb.profile_exit(_prev);
+    if dbg {
+        gb.profile_current = prev_scope;
+    } else {
+        gb.profile_exit(prev_scope);
+    }
 }
 
 #[inline]
