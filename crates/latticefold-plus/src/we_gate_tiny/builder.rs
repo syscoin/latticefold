@@ -977,8 +977,9 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                 {
                     use super::cm_ir::{goldilocks_mul_mod_p_digits_bal4_ir, IrBuilder, VarRef as IrVarRef};
                     let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
-                    let base_asg: &[F257] = glue.gb.assignment.as_slice();
-                    let mut ib = IrBuilder::new(base_asg);
+                    // Avoid borrowing `glue.gb.assignment` across lowering.
+                    let base_asg_vec: Vec<F257> = glue.gb.assignment.clone();
+                    let mut ib = IrBuilder::new(base_asg_vec.as_slice());
                     let e16: [IrVarRef; 17] = core::array::from_fn(|k| IrVarRef::Base(e[k]));
                     let e4 = ib.bal16_to_bal4_digits_cached(&e16);
                     let diff_ir = ringdigits64_to_ir(&diff)?;
@@ -3813,8 +3814,9 @@ fn build_cm_glue_for_which(
                     // Precompute tensor scalars in bal4 once (shared across all shards).
                     let (s0_4_base, s1_4_base): (Vec<[usize; 33]>, Vec<[usize; 33]>) = {
                         use super::cm_ir::{lower_ir_into_builder, IrBuilder, VarRef as IrVarRef};
-                        let base_asg_ir: &[F257] = &glue.gb.assignment;
-                        let mut ib = IrBuilder::new(base_asg_ir);
+                        // Avoid borrowing `glue.gb.assignment` across lowering.
+                        let base_asg_vec: Vec<F257> = glue.gb.assignment.clone();
+                        let mut ib = IrBuilder::new(base_asg_vec.as_slice());
                         let mut s0_4_ir: Vec<[IrVarRef; 33]> = Vec::with_capacity(kappa);
                         let mut s1_4_ir: Vec<[IrVarRef; 33]> = Vec::with_capacity(kappa);
                         for j in 0..kappa {
