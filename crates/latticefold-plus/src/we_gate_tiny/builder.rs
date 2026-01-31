@@ -662,6 +662,7 @@ fn build_cm_shards_file_backed(
     base_asg: &[F257],
     short_locals: &[ShortChallengeWiring],
     u32_locals: &[BoundedU32ChallengeWiring],
+    goldilocks_locals: &[GoldilocksChallengeWiring],
     dirs: &FileBackedDirs,
 ) -> Result<Vec<GlueCtx>, String> {
     if !(ring_dim > 0 && l_instances_expected > 0 && !comh_absorbs.is_empty()) {
@@ -688,6 +689,7 @@ fn build_cm_shards_file_backed(
                 base_asg,
                 short_locals,
                 u32_locals,
+                goldilocks_locals,
                 Some(dirs.cm0_dir.as_path()),
             )
         },
@@ -711,6 +713,7 @@ fn build_cm_shards_file_backed(
                 base_asg,
                 short_locals,
                 u32_locals,
+                goldilocks_locals,
                 Some(dirs.cm1_dir.as_path()),
             )
         },
@@ -2212,9 +2215,10 @@ fn parse_and_enforce_cm_after_short(
         }
     }
 
-    // We also bind the per-round “explicit absorb of r_i” to the same u32 coins that were sampled
-    // by `get_challenge()`. This mirrors the real verifier transcript schedule.
-    let cm_u32_start = cm_u32_start_idx(wiring);
+    // We also bind the per-round “explicit absorb of r_i” to the same coins that were sampled by
+    // `get_challenge()`. This mirrors the real verifier transcript schedule. These are full
+    // Goldilocks challenges (8 bytes), matching LF+.
+    let cm_coin_start = cm_u32_start_idx(wiring);
     let kappa = params.kappa as usize;
     let log_kappa = ark_std::log2(kappa.next_power_of_two()) as usize;
     let nvars_cm = params.nvars_cm as usize;
@@ -2262,34 +2266,24 @@ fn parse_and_enforce_cm_after_short(
             if ln != 8 {
                 return Err("tiny gate: expected 8-byte absorb for sumcheck marker".to_string());
             }
-            // Bind absorbed bytes = u32 coin bytes (low 4) and zero padding (high 4).
-            let u32_idx = cm_u32_start + 2 * log_kappa + which * (1 + nvars_cm) + 1 + _round;
-            if u32_idx >= u32_locals.len() {
-                return Err("tiny gate: u32_locals too short for CM sumcheck r_i binding".to_string());
+            // Bind absorbed bytes = sampled challenge bytes (all 8).
+            let chal_idx = cm_coin_start + 2 * log_kappa + which * (1 + nvars_cm) + 1 + _round;
+            if chal_idx >= goldilocks_locals.len() {
+                return Err("tiny gate: goldilocks_locals too short for CM sumcheck r_i binding".to_string());
             }
-            let u = &u32_locals[u32_idx];
-            let z = glue.gb.new_var(F257::ZERO);
-            glue.gb.enforce_var_eq_const(z, F257::ZERO);
-            for i in 0..4 {
+            let ch = &goldilocks_locals[chal_idx];
+            for i in 0..8 {
                 let gv = pose_wiring.absorb_vars[st + i];
                 let lv = glue.copy_digit(gv);
-                glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, lv), (-F257::ONE, u.byte_vars[i])]);
-                if glue.gb.assignment[lv] != glue.gb.assignment[u.byte_vars[i]] {
+                glue.gb.enforce_lc_times_one_eq_const(vec![
+                    (F257::ONE, lv),
+                    (-F257::ONE, ch.byte_vars[i]),
+                ]);
+                if glue.gb.assignment[lv] != glue.gb.assignment[ch.byte_vars[i]] {
                     return Err(format!(
-                        "tiny gate: CM sumcheck r_i byte mismatch (which={which} round={_round} byte={i}): absorb={:?} u32_byte={:?}",
+                        "tiny gate: CM sumcheck r_i byte mismatch (which={which} round={_round} byte={i}): absorb={:?} chal_byte={:?}",
                         glue.gb.assignment[lv],
-                        glue.gb.assignment[u.byte_vars[i]]
-                    ));
-                }
-            }
-            for i in 4..8 {
-                let gv = pose_wiring.absorb_vars[st + i];
-                let lv = glue.copy_digit(gv);
-                glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, lv), (-F257::ONE, z)]);
-                if glue.gb.assignment[lv] != F257::ZERO {
-                    return Err(format!(
-                        "tiny gate: CM sumcheck r_i high byte nonzero (which={which} round={_round} byte={i}): absorb={:?}",
-                        glue.gb.assignment[lv]
+                        glue.gb.assignment[ch.byte_vars[i]]
                     ));
                 }
             }
@@ -3390,6 +3384,7 @@ fn build_cm_glue_for_which(
     base_asg: &[F257],
     short_locals: &[ShortChallengeWiring],
     u32_locals: &[BoundedU32ChallengeWiring],
+    goldilocks_locals: &[GoldilocksChallengeWiring],
     out_dir: Option<&Path>,
 ) -> Result<GlueCtx, String> {
     let mut glue = if let Some(dir) = out_dir {
@@ -3434,7 +3429,9 @@ fn build_cm_glue_for_which(
 
     // The CM segment begins at the last short squeeze, but the absorb ranges were already parsed
     // by the base glue module (and statement-bound there). Here we just consume the ranges.
-    let cm_u32_start = cm_u32_start_idx(wiring);
+    // Index into the post-`absorb_comh` `get_challenge()` stream.
+    // We interpret these as full Goldilocks challenges (8 bytes), matching LF+.
+    let cm_coin_start = cm_u32_start_idx(wiring);
     let kappa = params.kappa as usize;
     let log_kappa = ark_std::log2(kappa.next_power_of_two()) as usize;
     let nvars_cm = params.nvars_cm as usize;
@@ -3442,8 +3439,9 @@ fn build_cm_glue_for_which(
     let ell = params.l as usize;
 
     // CM challenges after absorb_comh: c0/c1, then for each sumcheck: rc, r_sc[0..nvars_cm]
-    let c0_u32 = &u32_locals[cm_u32_start..cm_u32_start + log_kappa];
-    let c1_u32 = &u32_locals[cm_u32_start + log_kappa..cm_u32_start + 2 * log_kappa];
+    // These are transcript `get_challenge()` values in the Goldilocks base field (8 bytes).
+    let c0_gl = &goldilocks_locals[cm_coin_start..cm_coin_start + log_kappa];
+    let c1_gl = &goldilocks_locals[cm_coin_start + log_kappa..cm_coin_start + 2 * log_kappa];
 
     // Precompute the ring-constant tables needed for t(z) evaluation.
     //
@@ -3461,25 +3459,17 @@ fn build_cm_glue_for_which(
         && ell.is_power_of_two()
     {
         // c0/c1 as Goldilocks scalars (digit encoding), then tensor-expand.
-        let c0_digits: Vec<_> = c0_u32
+        let c0_digits: Vec<_> = c0_gl
             .iter()
             .map(|u| {
-                let b0 = glue.import_base_var(base_asg, u.byte_vars[0]);
-                let b1 = glue.import_base_var(base_asg, u.byte_vars[1]);
-                let b2 = glue.import_base_var(base_asg, u.byte_vars[2]);
-                let b3 = glue.import_base_var(base_asg, u.byte_vars[3]);
-                let bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &[b0, b1, b2, b3]);
+                let bytes: [usize; 8] = core::array::from_fn(|i| glue.import_base_var(base_asg, u.byte_vars[i]));
                 goldilocks_bytes_to_digits(&mut glue.gb, bytes)
             })
             .collect();
-        let c1_digits: Vec<_> = c1_u32
+        let c1_digits: Vec<_> = c1_gl
             .iter()
             .map(|u| {
-                let b0 = glue.import_base_var(base_asg, u.byte_vars[0]);
-                let b1 = glue.import_base_var(base_asg, u.byte_vars[1]);
-                let b2 = glue.import_base_var(base_asg, u.byte_vars[2]);
-                let b3 = glue.import_base_var(base_asg, u.byte_vars[3]);
-                let bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &[b0, b1, b2, b3]);
+                let bytes: [usize; 8] = core::array::from_fn(|i| glue.import_base_var(base_asg, u.byte_vars[i]));
                 goldilocks_bytes_to_digits(&mut glue.gb, bytes)
             })
             .collect();
@@ -3587,24 +3577,18 @@ fn build_cm_glue_for_which(
         r_point_digits = Some(shared.r_point_digits.iter().map(|s| import_scalar(&mut glue, base_asg, s)).collect());
     }
 
-    // Select the u32 window for this sumcheck.
-    let mut u32_idx = cm_u32_start + 2 * log_kappa + which * (1 + nvars_cm);
-    let u = &u32_locals[u32_idx];
-    let b0 = glue.import_base_var(base_asg, u.byte_vars[0]);
-    let b1 = glue.import_base_var(base_asg, u.byte_vars[1]);
-    let b2 = glue.import_base_var(base_asg, u.byte_vars[2]);
-    let b3 = glue.import_base_var(base_asg, u.byte_vars[3]);
-    let rc_bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &[b0, b1, b2, b3]);
-    u32_idx += 1;
+    // Select the Goldilocks `get_challenge()` window for this sumcheck:
+    // rc, then nvars_cm per-round r's.
+    let mut coin_idx = cm_coin_start + 2 * log_kappa + which * (1 + nvars_cm);
+    let rc_ch = &goldilocks_locals[coin_idx];
+    let rc_bytes: [usize; 8] = core::array::from_fn(|i| glue.import_base_var(base_asg, rc_ch.byte_vars[i]));
+    coin_idx += 1;
     let mut rs: Vec<[usize; 8]> = Vec::with_capacity(nvars_cm);
     for _ in 0..nvars_cm {
-        let u = &u32_locals[u32_idx];
-        let b0 = glue.import_base_var(base_asg, u.byte_vars[0]);
-        let b1 = glue.import_base_var(base_asg, u.byte_vars[1]);
-        let b2 = glue.import_base_var(base_asg, u.byte_vars[2]);
-        let b3 = glue.import_base_var(base_asg, u.byte_vars[3]);
-        rs.push(goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &[b0, b1, b2, b3]));
-        u32_idx += 1;
+        let ch = &goldilocks_locals[coin_idx];
+        let bytes: [usize; 8] = core::array::from_fn(|i| glue.import_base_var(base_asg, ch.byte_vars[i]));
+        rs.push(bytes);
+        coin_idx += 1;
     }
 
     // Parse sumcheck msg absorbs as ring-bytes (transcript IO), then immediately convert to digits.
@@ -4632,6 +4616,7 @@ pub(super) fn build(
                         base_asg,
                         &short_locals,
                         &u32_locals,
+                        &goldilocks_locals,
                         None,
                     )
                 },
@@ -4655,6 +4640,7 @@ pub(super) fn build(
                         base_asg,
                         &short_locals,
                         &u32_locals,
+                        &goldilocks_locals,
                         None,
                     )
                 },
@@ -5017,6 +5003,7 @@ pub(super) fn build_file_backed(
         glue.gb.assignment.as_slice(),
         &short_locals,
         &u32_locals,
+        &goldilocks_locals,
         &dirs,
     )?;
     lf_stage_log_file_backed(
