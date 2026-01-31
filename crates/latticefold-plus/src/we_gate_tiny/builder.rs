@@ -3266,9 +3266,9 @@ fn finalize_file_backed(
         .collect::<Vec<_>>();
         if tiny_opmix_on() {
             eprintln!(
-                "tiny_gate: finalize done: nvars={} constraints={} (returning instance + wiring)",
+                "tiny_gate: finalize_file_backed done: nvars={} constraints={} (returning instance + wiring)",
                 inst.nvars,
-                inst.constraints.len()
+                inst.layout.nconstraints
             );
         }
     Ok((
