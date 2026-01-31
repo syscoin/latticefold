@@ -494,6 +494,10 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
 
     let mut w = SparseDr1csFileWriter::<F>::create(out_dir)?;
 
+    // IMPORTANT: merge is dominated by streaming IO. The default `BufReader` capacity (8KiB)
+    // causes excessive syscalls on huge instances. Use a large fixed buffer here.
+    const MERGE_BUF_BYTES: usize = 64 * 1024 * 1024;
+
     // Running offsets in the *output* term pools.
     let mut out_a: u64 = 0;
     let mut out_b: u64 = 0;
@@ -519,8 +523,14 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
             ("c", inst.layout.c_terms, &mut out_c),
         ] {
             let (p_coeffs, p_idx) = term_paths(&inst.layout.dir, which);
-            let mut fc = BufReader::new(File::open(p_coeffs).map_err(|e| format!("open {which}_coeffs failed: {e}"))?);
-            let mut fi = BufReader::new(File::open(p_idx).map_err(|e| format!("open {which}_idx failed: {e}"))?);
+            let mut fc = BufReader::with_capacity(
+                MERGE_BUF_BYTES,
+                File::open(p_coeffs).map_err(|e| format!("open {which}_coeffs failed: {e}"))?,
+            );
+            let mut fi = BufReader::with_capacity(
+                MERGE_BUF_BYTES,
+                File::open(p_idx).map_err(|e| format!("open {which}_idx failed: {e}"))?,
+            );
             let mut buf = vec![0u8; inst.layout.coeff_size];
             for _ in 0..n_terms {
                 fc.read_exact(&mut buf).map_err(|e| format!("read {which}_coeffs failed: {e}"))?;
@@ -538,7 +548,8 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
         }
 
         // Copy constraints, offsetting term ranges by out_a/out_b/out_c *before* this part.
-        let mut fr = BufReader::new(
+        let mut fr = BufReader::with_capacity(
+            MERGE_BUF_BYTES,
             File::open(constraints_path(&inst.layout.dir))
                 .map_err(|e| format!("open constraints failed: {e}"))?,
         );
