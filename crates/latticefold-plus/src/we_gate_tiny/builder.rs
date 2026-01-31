@@ -3839,7 +3839,9 @@ fn build_cm_glue_for_which(
                         lower_ir_into_builder, IrBuilder, VarRef as IrVarRef,
                     };
                     let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
-                    let base_asg_ir: &[F257] = &glue.gb.assignment;
+                    // Avoid holding an immutable borrow of `glue.gb.assignment` across lowering.
+                    let base_asg_vec: Vec<F257> = glue.gb.assignment.clone();
+                    let base_asg_ir: &[F257] = base_asg_vec.as_slice();
 
                     #[inline]
                     fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
