@@ -1198,6 +1198,7 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
     let out_dir = out_dir.as_ref();
     create_dir_all(out_dir).map_err(|e| ReplayErr::Invalid(format!("create_dir_all failed: {e}")))?;
 
+    let n_threads = rayon::current_num_threads().max(1);
     let t = cfg.rate + cfg.capacity;
     if t == 0 {
         return Err(ReplayErr::Invalid("invalid poseidon t=0".to_string()));
@@ -1357,6 +1358,14 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
         last.end = ops.len();
     }
 
+    eprintln!(
+        "[poseidon_arith] sharded: ops={} shard_permutes={} shards={} threads={}",
+        ops.len(),
+        shard_permutes,
+        plans.len(),
+        n_threads
+    );
+
     // ---------------------------------------------------------------------
     // Pass 1 (heavy): build each shard independently in parallel.
     // We stitch shards together by adding equality constraints on boundary state vars.
@@ -1433,6 +1442,12 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
 
     let mut round: usize = 0;
     while groups.len() > 1 {
+        eprintln!(
+            "[poseidon_arith] merge_round={} groups={} threads={}",
+            round,
+            groups.len(),
+            n_threads
+        );
         let round_dir = out_dir.join(format!("poseidon_merge_round_{round:02}"));
         create_dir_all(&round_dir)
             .map_err(|e| ReplayErr::Invalid(format!("create merge dir failed: {e}")))?;
@@ -1441,11 +1456,13 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
             .step_by(2)
             .filter_map(|i| if i + 1 < groups.len() { Some((i, i + 1)) } else { None })
             .collect();
+        eprintln!("[poseidon_arith] merge_round={} pairs={}", round, pairs.len());
 
         let merged_pairs: Vec<(usize, Group<F>)> = pairs
             .par_iter()
             .enumerate()
             .map(|(pair_idx, (li, ri))| -> Result<(usize, Group<F>), ReplayErr> {
+                let t_pair = Instant::now();
                 let left = &groups[*li];
                 let right = &groups[*ri];
 
@@ -1490,6 +1507,15 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
                         final_state_vars,
                     },
                 ))
+                .map(|x| {
+                    eprintln!(
+                        "[poseidon_arith] merge_round={} pair={:04} done in {:.2?}",
+                        round,
+                        pair_idx,
+                        t_pair.elapsed()
+                    );
+                    x
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
 
