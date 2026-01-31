@@ -326,13 +326,14 @@ fn maybe_print_tiny_opmix(
 
     // Constraint mix.
     let c_pose = pose_inst.constraints.len();
-    let c_pose_no_bytes =
-        symphony::dpp_poseidon::poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes::<F257>(
-            poseidon_cfg,
-            ops,
-        )
-        .map(|(inst, _asg, _w)| inst.constraints.len())
-        .unwrap_or(0usize);
+    // IMPORTANT: do NOT re-arithmetize Poseidon here.
+    //
+    // Calling `poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes` builds a *second* full Poseidon dR1CS
+    // (with_bytes=false) just to estimate a marginal “byte gadget delta”. That is purely diagnostic and
+    // can take minutes and huge RAM on real traces.
+    //
+    // If you need this estimate, compute it in a separate, dedicated benchmark binary on small traces.
+    let c_pose_no_bytes = c_pose;
     let c_glue = glue.gb.rows.len();
 
     eprintln!("==============================================================");
