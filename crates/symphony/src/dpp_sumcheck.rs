@@ -15,6 +15,7 @@ use ark_serialize::CanonicalSerialize;
 
 use std::collections::BTreeMap;
 use core::ops::Range;
+use std::sync::OnceLock;
 
 use crate::dpp_poseidon::{Constraint, SparseDr1csInstance};
 use crate::file_backed_dr1cs::{FileBackedSparseDr1csInstance, SparseDr1csFileWriter};
@@ -66,6 +67,10 @@ pub struct Dr1csBuilder<F: PrimeField> {
     pub profile_enabled: bool,
     pub profile_current: Option<&'static str>,
     pub profile: BTreeMap<&'static str, Dr1csProfileCounts>,
+    /// Optional debug tag to filter constraint-level debugging (e.g. "cm0", "cm1", "base_glue").
+    ///
+    /// In file-backed mode this is derived from the output directory name.
+    debug_tag: Option<String>,
 }
 
 impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
@@ -92,6 +97,7 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             profile_enabled,
             profile_current: None,
             profile: BTreeMap::new(),
+            debug_tag: None,
         }
     }
     /// Create a builder that streams constraints/terms to `dir` instead of storing giant Vec pools.
@@ -100,6 +106,10 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         F: CanonicalSerialize,
     {
         let mut b = Self::new();
+        b.debug_tag = dir
+            .as_ref()
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string());
         b.file_sink = Some(SparseDr1csFileWriter::<F>::create(dir)?);
         Ok(b)
     }
@@ -147,13 +157,27 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
     ///
     /// This is used by file-backed lowering paths to avoid allocating a `Vec` per constraint.
     #[inline]
+    #[track_caller]
     pub fn add_constraint_terms_iter<IA, IB, IC>(&mut self, a: IA, b: IB, c: IC)
     where
         IA: IntoIterator<Item = (F, usize)>,
         IB: IntoIterator<Item = (F, usize)>,
         IC: IntoIterator<Item = (F, usize)>,
     {
-        if let Some(sink) = self.file_sink.as_mut() {
+        let dbg = self.debug_should_dump_next_constraint();
+        if self.file_sink.is_some() {
+            if dbg {
+                let a_v: Vec<(F, usize)> = a.into_iter().collect();
+                let b_v: Vec<(F, usize)> = b.into_iter().collect();
+                let c_v: Vec<(F, usize)> = c.into_iter().collect();
+                self.debug_dump_constraint_slices("add_constraint_terms_iter", &a_v, &b_v, &c_v);
+                return self.add_constraint_slices(&a_v, &b_v, &c_v);
+            }
+
+            let sink = self
+                .file_sink
+                .as_mut()
+                .expect("file-backed sink vanished unexpectedly");
             let a0 = self.file_a_terms;
             let mut a_n: u64 = 0;
             for (coef, idx) in a.into_iter() {
@@ -188,6 +212,13 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
                 .expect("file-backed dr1cs write failed (constraint)");
             self.file_rows += 1;
         } else {
+            if dbg {
+                let a_v: Vec<(F, usize)> = a.into_iter().collect();
+                let b_v: Vec<(F, usize)> = b.into_iter().collect();
+                let c_v: Vec<(F, usize)> = c.into_iter().collect();
+                self.debug_dump_constraint_slices("add_constraint_terms_iter(in-mem)", &a_v, &b_v, &c_v);
+                return self.add_constraint_slices(&a_v, &b_v, &c_v);
+            }
             let a0 = self.a_terms.len();
             self.a_terms.extend(a);
             let a1 = self.a_terms.len();
@@ -206,7 +237,11 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
     }
 
     #[inline]
+    #[track_caller]
     pub fn add_constraint_slices(&mut self, a: &[(F, usize)], b: &[(F, usize)], c: &[(F, usize)]) {
+        if self.debug_should_dump_next_constraint() {
+            self.debug_dump_constraint_slices("add_constraint_slices", a, b, c);
+        }
         if let Some(sink) = self.file_sink.as_mut() {
             // Stream to disk.
             let a0 = self.file_a_terms;
@@ -242,6 +277,71 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             let cr = Self::push_terms(&mut self.c_terms, c);
             self.rows.push(Constraint { a: ar, b: br, c: cr });
         }
+    }
+
+    fn debug_cfg_target_idx() -> Option<u64> {
+        static TARGET: OnceLock<Option<u64>> = OnceLock::new();
+        *TARGET.get_or_init(|| {
+            std::env::var("LF_DEBUG_CONSTRAINT_AT")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+        })
+    }
+
+    fn debug_cfg_tag() -> Option<&'static str> {
+        static TAG: OnceLock<Option<&'static str>> = OnceLock::new();
+        *TAG.get_or_init(|| {
+            std::env::var("LF_DEBUG_CONSTRAINT_TAG").ok().map(|s| {
+                let leaked: &'static mut str = Box::leak(s.into_boxed_str());
+                &*leaked
+            })
+        })
+    }
+
+    #[inline]
+    fn next_constraint_index(&self) -> u64 {
+        if self.file_sink.is_some() {
+            self.file_rows
+        } else {
+            self.rows.len() as u64
+        }
+    }
+
+    #[inline]
+    fn debug_should_dump_next_constraint(&self) -> bool {
+        let Some(tgt) = Self::debug_cfg_target_idx() else {
+            return false;
+        };
+        if self.next_constraint_index() != tgt {
+            return false;
+        }
+        let Some(tag) = Self::debug_cfg_tag() else {
+            return true;
+        };
+        let Some(my_tag) = self.debug_tag.as_deref() else {
+            return false;
+        };
+        my_tag == tag
+    }
+
+    fn debug_dump_constraint_slices(&self, where_: &str, a: &[(F, usize)], b: &[(F, usize)], c: &[(F, usize)]) {
+        let loc = std::panic::Location::caller();
+        let scope = self.profile_current.unwrap_or("unlabeled");
+        let idx = self.next_constraint_index();
+        let tag = self.debug_tag.as_deref().unwrap_or("<none>");
+        let show = |ts: &[(F, usize)]| -> Vec<(F, usize)> { ts.iter().take(8).cloned().collect() };
+        eprintln!(
+            "[LF_DEBUG_CONSTRAINT] tag={tag} idx={idx} scope={scope} where={where_} caller={}:{}:{} A(len={}, head={:?}) B(len={}, head={:?}) C(len={}, head={:?})",
+            loc.file(),
+            loc.line(),
+            loc.column(),
+            a.len(),
+            show(a),
+            b.len(),
+            show(b),
+            c.len(),
+            show(c),
+        );
     }
     pub fn enforce_lc_times_one_eq_const(&mut self, lc: Vec<(F, usize)>) {
         let one = self.one();
