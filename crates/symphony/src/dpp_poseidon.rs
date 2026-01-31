@@ -1163,10 +1163,13 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed<F: Prime
         // multiple times*, which can easily reach 100GB+ of IO. Therefore pick shard size so the
         // number of shards is small (≈ O(threads), not O(permutes)).
         let total_permutes = crate::poseidon_trace::count_permutes_for_ops(cfg, ops);
+        // More shards => more parallel merge pairs, but also more total IO during merge.
+        // Keep this bounded to avoid exploding rewrite volume on large traces.
         let target_shards = n_threads.min(16).max(2);
         let shard_permutes = (total_permutes + target_shards - 1) / target_shards;
-        // Keep shards reasonably coarse to avoid merge blow-ups on large traces.
-        let shard_permutes = shard_permutes.max(4096);
+        // Keep shards reasonably coarse, but allow more shards than the previous 4096-min policy.
+        // This trades some extra merge IO for better parallelism (especially during merge_round=0).
+        let shard_permutes = shard_permutes.max(1024);
         return poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded(
             cfg,
             ops,

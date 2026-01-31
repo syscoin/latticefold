@@ -7349,17 +7349,12 @@ mod tests {
                 .u32_squeeze_ops
                 .splice(0..0, prefix_u32_squeeze_ops.into_iter());
 
-            // Deterministic-ish temp dir name (no RNG): pid + process-local counter.
-            // Also wipe before/after so repeated runs don't accumulate disk usage.
+            // Fixed temp dir (no pid/seq). Best-effort cleanup before/after so users don't have to
+            // manually delete large file-backed artifacts.
             let out_dir = {
-                static OUT_DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let seq = OUT_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut p = std::env::temp_dir();
-                p.push(format!(
-                    "lfplus_tiny_gate_file_backed_pid{}_{}",
-                    std::process::id(),
-                    seq
-                ));
+                p.push("lfplus_tiny_gate_file_backed");
+                // If a previous run crashed or was interrupted, ensure a clean slate.
                 let _ = std::fs::remove_dir_all(&p);
                 std::fs::create_dir_all(&p).expect("create temp out_dir");
                 p
