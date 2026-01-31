@@ -561,29 +561,83 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
     if parts.is_empty() {
         return Err("merge_file_backed_sparse_dr1cs_share_one: empty parts".to_string());
     }
-    // Validate and compute assignment.
-    let mut new_assignment: Vec<F> = Vec::new();
-    new_assignment.push(F::ONE);
-    let mut tail_len: usize = 0;
+    // Validate and compute merged assignment.
+    // This can be a huge memory copy (hundreds of millions of field elements), so parallelize it
+    // when Rayon has >1 thread available.
+    let timing = match std::env::var("LF_PROFILE_DR1CS") {
+        Ok(v) => v != "0",
+        Err(_) => false,
+    };
+    let t_asg = std::time::Instant::now();
+    let mut tail_lens: Vec<usize> = Vec::with_capacity(parts.len());
+    let mut total_tail: usize = 0;
     for (_inst, asg) in parts.iter() {
         if asg.is_empty() || asg[0] != F::ONE {
             return Err("merge_file_backed_sparse_dr1cs_share_one: each part must have assignment[0]=1".to_string());
         }
-        new_assignment.extend_from_slice(&asg[1..]);
-        tail_len += asg.len().saturating_sub(1);
+        let tl = asg.len().saturating_sub(1);
+        tail_lens.push(tl);
+        total_tail = total_tail.saturating_add(tl);
     }
-    let _ = tail_len;
+    let total_len = 1usize.saturating_add(total_tail);
+    let mut new_assignment: Vec<F> = vec![F::ZERO; total_len];
+    new_assignment[0] = F::ONE;
+    // Prefix offsets into the tail region (starting at index 1).
+    let mut tail_off: Vec<usize> = Vec::with_capacity(parts.len());
+    {
+        let mut cur = 0usize;
+        for &tl in &tail_lens {
+            tail_off.push(cur);
+            cur = cur.saturating_add(tl);
+        }
+    }
+    let n_threads = rayon::current_num_threads().max(1);
+    if n_threads > 1 && parts.len() > 1 {
+        use rayon::prelude::*;
+        // SAFETY: each iteration writes to a disjoint slice of `new_assignment`.
+        // Use a `usize` address so the captured value is `Sync + Send` for Rayon.
+        let out_base = new_assignment.as_mut_ptr() as usize;
+        (0..parts.len())
+            .into_par_iter()
+            .try_for_each(|pi| -> Result<(), String> {
+                let tl = tail_lens[pi];
+                if tl == 0 {
+                    return Ok(());
+                }
+                let src = &parts[pi].1[1..];
+                let dst_start = 1usize
+                    .checked_add(tail_off[pi])
+                    .ok_or_else(|| "merge_file_backed_sparse_dr1cs_share_one: assignment offset overflow".to_string())?;
+                unsafe {
+                    let dst_ptr = (out_base as *mut F).add(dst_start);
+                    let dst = core::slice::from_raw_parts_mut(dst_ptr, tl);
+                    dst.copy_from_slice(src);
+                }
+                Ok(())
+            })?;
+    } else {
+        for (pi, (_inst, asg)) in parts.iter().enumerate() {
+            let tl = tail_lens[pi];
+            if tl == 0 {
+                continue;
+            }
+            let start = 1 + tail_off[pi];
+            new_assignment[start..start + tl].copy_from_slice(&asg[1..]);
+        }
+    }
+    if timing {
+        eprintln!(
+            "file_backed_merge: assignment concat done in {:?} (nvars={})",
+            t_asg.elapsed(),
+            new_assignment.len()
+        );
+    }
 
     // IMPORTANT: merge is dominated by streaming IO + index remapping.
     // Large buffers significantly reduce syscall overhead during merges.
     // Use a moderately large chunk size per worker to avoid over-allocating when many Rayon workers run.
     const MERGE_BUF_BYTES: usize = 256 * 1024 * 1024;
     const STREAM_CHUNK_BYTES: usize = 32 * 1024 * 1024;
-    // Reuse existing timing switch (no new env vars).
-    let timing = match std::env::var("LF_PROFILE_DR1CS") {
-        Ok(v) => v != "0",
-        Err(_) => false,
-    };
     let t_all = std::time::Instant::now();
 
     // If we have multiple Rayon threads available, do a parallel merge:
