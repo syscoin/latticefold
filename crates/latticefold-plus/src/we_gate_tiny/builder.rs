@@ -3958,17 +3958,19 @@ fn build_cm_glue_for_which(
                         }));
                         }
 
-                    // Build this batch's claimed_sum contributions as bal4 IR shards in parallel,
+                    // Build this batch's claimed_sum contributions as IR shards in parallel,
                     // then lower sequentially and accumulate in digit domain.
                     //
-                    // This matches the LF+ verifier math term-for-term; the only difference is
-                    // performing the per-term scaling/multiplication in bal4 and converting once.
+                    // This matches the LF+ verifier math term-for-term. We intentionally use the
+                    // same bal16 digit-domain mod-p add/mul gadgets as the known-correct path, but
+                    // keep the parallel IR-shard construction for performance/memory reasons.
                     {
                         use super::cm_ir::{
-                            bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir, goldilocks_mul_mod_p_digits_bal4_ir,
-                            lower_ir_into_builder, IrBuilder, VarRef as IrVarRef,
+                            goldilocks_add_mod_p_digits_ir, goldilocks_mul_mod_p_digits_ir, lower_ir_into_builder, IrBuilder,
+                            VarRef as IrVarRef,
                         };
                         let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+                        let p_d_const: [i8; 17] = u64_to_bal16_digits_le_const(p_u64);
 
                         // Snapshot assignment via raw pointer to avoid clone and to avoid holding an immutable borrow
                         // across lowering. Safety: we do not mutate `glue.gb.assignment` while building `frags`
@@ -3994,31 +3996,31 @@ fn build_cm_glue_for_which(
                                 let base_asg_ir: &[F257] = unsafe { core::slice::from_raw_parts(base_asg_ptr, base_asg_len) };
                                 let mut ib = IrBuilder::new(base_asg_ir);
 
-                                // Zero digits in bal4: fixed const-0 var replicated.
+                                // Zero digits: fixed const-0 var replicated.
                                 let z = ib.new_var(F257::ZERO);
                                 ib.ir.enforce_var_eq_const(z, F257::ZERO);
-                                let mut acc4: [[IrVarRef; 33]; 64] = [[z; 33]; 64];
+                                let mut acc16: [[IrVarRef; 17]; 64] = [[z; 17]; 64];
 
                                 #[inline]
                                 fn scalar16_to_ir(x: &GoldilocksScalar) -> [IrVarRef; 17] {
                                     core::array::from_fn(|j| IrVarRef::Base(x[j]))
                                 }
 
-                                // Helper: add (ring16 * scalar16) into acc4 (bal4) coefficientwise.
+                                // Helper: add (ring16 * scalar16) into acc16 coefficientwise.
                                 #[inline]
-                                fn add_scaled_ring_into_acc4(
+                                fn add_scaled_ring_into_acc16(
                                     ib: &mut IrBuilder<'_>,
-                                    acc4: &mut [[IrVarRef; 33]; 64],
+                                    acc16: &mut [[IrVarRef; 17]; 64],
                                     ring16: &RingDigits,
                                     scalar16: &[IrVarRef; 17],
                                     p_u64: u64,
+                                    p_d_const: &[i8; 17],
                                 ) -> Result<(), String> {
                                     let ring16_ir = ringdigits64_to_ir(ring16)?;
-                                    let s4 = ib.bal16_to_bal4_digits_cached(scalar16);
                                     for i in 0..64 {
-                                        let r4 = ib.bal16_to_bal4_digits_cached(&ring16_ir[i]);
-                                        let prod4 = goldilocks_mul_mod_p_digits_bal4_ir(ib, &r4, &s4, p_u64);
-                                        acc4[i] = goldilocks_add_mod_p_digits_bal4_ir(ib, &acc4[i], &prod4, p_u64);
+                                        let prod16 =
+                                            goldilocks_mul_mod_p_digits_ir(ib, &ring16_ir[i], scalar16, p_u64, p_d_const);
+                                        acc16[i] = goldilocks_add_mod_p_digits_ir(ib, &acc16[i], &prod16, p_u64, p_d_const);
                                     }
                                     Ok(())
                                 }
@@ -4027,10 +4029,9 @@ fn build_cm_glue_for_which(
                                 let a0_16 = scalar16_to_ir(&data.eval_a[0]);
                                 let rc0_16: [IrVarRef; 17] =
                                     core::array::from_fn(|k| IrVarRef::Base(rc_pows[data.l_idx][k]));
-                                let a0_4 = ib.bal16_to_bal4_digits_cached(&a0_16);
-                                let rc0_4 = ib.bal16_to_bal4_digits_cached(&rc0_16);
-                                let a0pow4 = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &a0_4, &rc0_4, p_u64);
-                                acc4[0] = goldilocks_add_mod_p_digits_bal4_ir(&mut ib, &acc4[0], &a0pow4, p_u64);
+                                let a0pow16 = goldilocks_mul_mod_p_digits_ir(&mut ib, &a0_16, &rc0_16, p_u64, &p_d_const);
+                                acc16[0] =
+                                    goldilocks_add_mod_p_digits_ir(&mut ib, &acc16[0], &a0pow16, p_u64, &p_d_const);
 
                                 // b0/c0/u0 terms.
                                 let s_b0: [IrVarRef; 17] =
@@ -4039,9 +4040,9 @@ fn build_cm_glue_for_which(
                                     core::array::from_fn(|k| IrVarRef::Base(rc_pows[data.l_idx + 2][k]));
                                 let s_u0: [IrVarRef; 17] =
                                     core::array::from_fn(|k| IrVarRef::Base(rc_pows[data.l_idx + 3][k]));
-                                add_scaled_ring_into_acc4(&mut ib, &mut acc4, &data.eval_b[0], &s_b0, p_u64)?;
-                                add_scaled_ring_into_acc4(&mut ib, &mut acc4, &data.eval_c[0], &s_c0, p_u64)?;
-                                add_scaled_ring_into_acc4(&mut ib, &mut acc4, &data.u_l[0], &s_u0, p_u64)?;
+                                add_scaled_ring_into_acc16(&mut ib, &mut acc16, &data.eval_b[0], &s_b0, p_u64, &p_d_const)?;
+                                add_scaled_ring_into_acc16(&mut ib, &mut acc16, &data.eval_c[0], &s_c0, p_u64, &p_d_const)?;
+                                add_scaled_ring_into_acc16(&mut ib, &mut acc16, &data.u_l[0], &s_u0, p_u64, &p_d_const)?;
 
                                 // M rows.
                                 for i in 0..(params.mlen as usize) {
@@ -4051,10 +4052,10 @@ fn build_cm_glue_for_which(
                                     let ai_16 = scalar16_to_ir(&data.eval_a[1 + i]);
                                     let rci_16: [IrVarRef; 17] =
                                         core::array::from_fn(|k| IrVarRef::Base(rc_pows[idx][k]));
-                                    let ai_4 = ib.bal16_to_bal4_digits_cached(&ai_16);
-                                    let rci_4 = ib.bal16_to_bal4_digits_cached(&rci_16);
-                                    let aipow4 = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &ai_4, &rci_4, p_u64);
-                                    acc4[0] = goldilocks_add_mod_p_digits_bal4_ir(&mut ib, &acc4[0], &aipow4, p_u64);
+                                    let aipow16 =
+                                        goldilocks_mul_mod_p_digits_ir(&mut ib, &ai_16, &rci_16, p_u64, &p_d_const);
+                                    acc16[0] =
+                                        goldilocks_add_mod_p_digits_ir(&mut ib, &acc16[0], &aipow16, p_u64, &p_d_const);
 
                                     let s_bi: [IrVarRef; 17] =
                                         core::array::from_fn(|k| IrVarRef::Base(rc_pows[idx + 1][k]));
@@ -4062,9 +4063,30 @@ fn build_cm_glue_for_which(
                                         core::array::from_fn(|k| IrVarRef::Base(rc_pows[idx + 2][k]));
                                     let s_ui: [IrVarRef; 17] =
                                         core::array::from_fn(|k| IrVarRef::Base(rc_pows[idx + 3][k]));
-                                    add_scaled_ring_into_acc4(&mut ib, &mut acc4, &data.eval_b[1 + i], &s_bi, p_u64)?;
-                                    add_scaled_ring_into_acc4(&mut ib, &mut acc4, &data.eval_c[1 + i], &s_ci, p_u64)?;
-                                    add_scaled_ring_into_acc4(&mut ib, &mut acc4, &data.u_l[1 + i], &s_ui, p_u64)?;
+                                    add_scaled_ring_into_acc16(
+                                        &mut ib,
+                                        &mut acc16,
+                                        &data.eval_b[1 + i],
+                                        &s_bi,
+                                        p_u64,
+                                        &p_d_const,
+                                    )?;
+                                    add_scaled_ring_into_acc16(
+                                        &mut ib,
+                                        &mut acc16,
+                                        &data.eval_c[1 + i],
+                                        &s_ci,
+                                        p_u64,
+                                        &p_d_const,
+                                    )?;
+                                    add_scaled_ring_into_acc16(
+                                        &mut ib,
+                                        &mut acc16,
+                                        &data.u_l[1 + i],
+                                        &s_ui,
+                                        p_u64,
+                                        &p_d_const,
+                                    )?;
                                 }
 
                                 // tcch0/tcch1 terms (same z_idx across all l).
@@ -4072,15 +4094,10 @@ fn build_cm_glue_for_which(
                                     core::array::from_fn(|k| IrVarRef::Base(rc_pows[z_idx][k]));
                                 let s_tc1: [IrVarRef; 17] =
                                     core::array::from_fn(|k| IrVarRef::Base(rc_pows[z_idx + 1][k]));
-                                add_scaled_ring_into_acc4(&mut ib, &mut acc4, &tcch0[l], &s_tc0, p_u64)?;
-                                add_scaled_ring_into_acc4(&mut ib, &mut acc4, &tcch1[l], &s_tc1, p_u64)?;
+                                add_scaled_ring_into_acc16(&mut ib, &mut acc16, &tcch0[l], &s_tc0, p_u64, &p_d_const)?;
+                                add_scaled_ring_into_acc16(&mut ib, &mut acc16, &tcch1[l], &s_tc1, p_u64, &p_d_const)?;
 
-                                // Convert to bal16 once.
-                                let mut out16: [[IrVarRef; 17]; 64] = [[IrVarRef::Base(0); 17]; 64];
-                                for i in 0..64 {
-                                    out16[i] = bal4_to_bal16_digits_ir(&mut ib, &acc4[i]);
-                                }
-                                Ok((ib.ir, out16))
+                                Ok((ib.ir, acc16))
                             })
                             .collect::<Result<Vec<_>, _>>()?;
 
