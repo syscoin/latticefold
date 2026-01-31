@@ -572,12 +572,312 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
     }
     let _ = tail_len;
 
-    let mut w = SparseDr1csFileWriter::<F>::create(out_dir)?;
-
-    // IMPORTANT: merge is dominated by streaming IO. The default `BufReader` capacity (8KiB)
-    // causes excessive syscalls on huge instances. Use a large fixed buffer here.
-    // Large read buffers significantly reduce syscall overhead during merges.
+    // IMPORTANT: merge is dominated by streaming IO + index remapping.
+    // Large buffers significantly reduce syscall overhead during merges.
     const MERGE_BUF_BYTES: usize = 256 * 1024 * 1024;
+
+    // If we have multiple Rayon threads available, do a parallel merge:
+    // 1) For each part, in parallel, create remapped chunk files (idx/constraints remapped).
+    // 2) Concatenate chunks in order into the final output files once.
+    //
+    // This avoids a single-threaded long-running remap loop on huge instances.
+    let n_threads = rayon::current_num_threads().max(1);
+    if n_threads > 1 && parts.len() > 1 {
+        use rayon::prelude::*;
+
+        let out_dir = out_dir.as_ref().to_path_buf();
+        let _ = std::fs::remove_dir_all(&out_dir);
+        create_dir_all(&out_dir).map_err(|e| format!("create_dir_all failed: {e}"))?;
+
+        // Validate layouts are compatible and precompute offsets.
+        let coeff_size = parts[0].0.layout.coeff_size;
+        for (inst, _asg) in parts.iter() {
+            if inst.layout.coeff_size != coeff_size {
+                return Err("merge_file_backed_sparse_dr1cs_share_one: coeff_size mismatch across parts".to_string());
+            }
+        }
+
+        // Prefix sums for output term offsets per part.
+        let mut a_off: Vec<u64> = Vec::with_capacity(parts.len());
+        let mut b_off: Vec<u64> = Vec::with_capacity(parts.len());
+        let mut c_off: Vec<u64> = Vec::with_capacity(parts.len());
+        let mut cur_a: u64 = 0;
+        let mut cur_b: u64 = 0;
+        let mut cur_c: u64 = 0;
+        for (inst, _asg) in parts.iter() {
+            a_off.push(cur_a);
+            b_off.push(cur_b);
+            c_off.push(cur_c);
+            cur_a = cur_a.saturating_add(inst.layout.a_terms);
+            cur_b = cur_b.saturating_add(inst.layout.b_terms);
+            cur_c = cur_c.saturating_add(inst.layout.c_terms);
+        }
+
+        // Prefix sums for variable tail offsets per part (excluding shared var0).
+        let mut var_tail_off: Vec<u64> = Vec::with_capacity(parts.len());
+        let mut cur_v: u64 = 0;
+        for (_inst, asg) in parts.iter() {
+            var_tail_off.push(cur_v);
+            cur_v = cur_v
+                .checked_add(asg.len().saturating_sub(1) as u64)
+                .ok_or("var_tail_off overflow")?;
+        }
+
+        // Helper: map local var index to global.
+        #[inline]
+        fn map_var(idx: u64, var_tail_off: u64) -> u64 {
+            if idx == 0 { 0 } else { idx + var_tail_off }
+        }
+
+        // Temp dir for chunks.
+        let tmp_dir = out_dir.join(".tmp_merge_parts");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        create_dir_all(&tmp_dir).map_err(|e| format!("create tmp_merge_parts failed: {e}"))?;
+
+        // Build remapped chunks in parallel.
+        (0..parts.len())
+            .into_par_iter()
+            .try_for_each(|pi| -> Result<(), String> {
+                let (inst, _asg) = &parts[pi];
+                let v_off = var_tail_off[pi];
+
+                // Remap idx files; coeff files can be copied verbatim.
+                for which in ["a", "b", "c"] {
+                    let (p_coeffs, p_idx) = term_paths(&inst.layout.dir, which);
+                    let coeff_out = tmp_dir.join(format!("{pi:04}_{which}_coeffs.bin"));
+                    let idx_out = tmp_dir.join(format!("{pi:04}_{which}_idx.bin"));
+
+                    // Copy coeff bytes verbatim.
+                    {
+                        let mut r = BufReader::with_capacity(
+                            MERGE_BUF_BYTES,
+                            File::open(p_coeffs).map_err(|e| format!("open {which}_coeffs failed: {e}"))?,
+                        );
+                        let mut w = BufWriter::with_capacity(
+                            MERGE_BUF_BYTES,
+                            File::create(&coeff_out).map_err(|e| format!("create {which}_coeffs chunk failed: {e}"))?,
+                        );
+                        std::io::copy(&mut r, &mut w).map_err(|e| format!("copy {which}_coeffs failed: {e}"))?;
+                        w.flush().ok();
+                    }
+
+                    // Remap indices.
+                    {
+                        let mut r = BufReader::with_capacity(
+                            MERGE_BUF_BYTES,
+                            File::open(p_idx).map_err(|e| format!("open {which}_idx failed: {e}"))?,
+                        );
+                        let mut w = BufWriter::with_capacity(
+                            MERGE_BUF_BYTES,
+                            File::create(&idx_out).map_err(|e| format!("create {which}_idx chunk failed: {e}"))?,
+                        );
+                        let n_terms = match which {
+                            "a" => inst.layout.a_terms,
+                            "b" => inst.layout.b_terms,
+                            "c" => inst.layout.c_terms,
+                            _ => unreachable!(),
+                        };
+                        for _ in 0..n_terms {
+                            let idx = read_u64(&mut r).map_err(|e| format!("read {which}_idx failed: {e}"))?;
+                            let mapped = map_var(idx, v_off);
+                            write_u64(&mut w, mapped).map_err(|e| format!("write {which}_idx failed: {e}"))?;
+                        }
+                        w.flush().ok();
+                    }
+                }
+
+                // Remap constraints (term ranges are offset by prefix sums, indices already global in output pools).
+                {
+                    let in_path = constraints_path(&inst.layout.dir);
+                    let out_path = tmp_dir.join(format!("{pi:04}_constraints.bin"));
+                    let mut r = BufReader::with_capacity(
+                        MERGE_BUF_BYTES,
+                        File::open(in_path).map_err(|e| format!("open constraints failed: {e}"))?,
+                    );
+                    let mut w = BufWriter::with_capacity(
+                        MERGE_BUF_BYTES,
+                        File::create(&out_path).map_err(|e| format!("create constraints chunk failed: {e}"))?,
+                    );
+                    let base_a = a_off[pi];
+                    let base_b = b_off[pi];
+                    let base_c = c_off[pi];
+                    for _ in 0..inst.layout.nconstraints {
+                        let a0 = read_u64(&mut r).map_err(|e| e.to_string())?;
+                        let a1 = read_u64(&mut r).map_err(|e| e.to_string())?;
+                        let b0 = read_u64(&mut r).map_err(|e| e.to_string())?;
+                        let b1 = read_u64(&mut r).map_err(|e| e.to_string())?;
+                        let c0 = read_u64(&mut r).map_err(|e| e.to_string())?;
+                        let c1 = read_u64(&mut r).map_err(|e| e.to_string())?;
+                        write_u64(&mut w, base_a + a0).map_err(|e| e.to_string())?;
+                        write_u64(&mut w, base_a + a1).map_err(|e| e.to_string())?;
+                        write_u64(&mut w, base_b + b0).map_err(|e| e.to_string())?;
+                        write_u64(&mut w, base_b + b1).map_err(|e| e.to_string())?;
+                        write_u64(&mut w, base_c + c0).map_err(|e| e.to_string())?;
+                        write_u64(&mut w, base_c + c1).map_err(|e| e.to_string())?;
+                    }
+                    w.flush().ok();
+                }
+
+                Ok(())
+            })?;
+
+        // Concatenate chunks deterministically into final files.
+        let mut out_fc_a = BufWriter::with_capacity(MERGE_BUF_BYTES, File::create(out_dir.join("a_coeffs.bin")).map_err(|e| e.to_string())?);
+        let mut out_fi_a = BufWriter::with_capacity(MERGE_BUF_BYTES, File::create(out_dir.join("a_idx.bin")).map_err(|e| e.to_string())?);
+        let mut out_fc_b = BufWriter::with_capacity(MERGE_BUF_BYTES, File::create(out_dir.join("b_coeffs.bin")).map_err(|e| e.to_string())?);
+        let mut out_fi_b = BufWriter::with_capacity(MERGE_BUF_BYTES, File::create(out_dir.join("b_idx.bin")).map_err(|e| e.to_string())?);
+        let mut out_fc_c = BufWriter::with_capacity(MERGE_BUF_BYTES, File::create(out_dir.join("c_coeffs.bin")).map_err(|e| e.to_string())?);
+        let mut out_fi_c = BufWriter::with_capacity(MERGE_BUF_BYTES, File::create(out_dir.join("c_idx.bin")).map_err(|e| e.to_string())?);
+        let mut out_rows = BufWriter::with_capacity(MERGE_BUF_BYTES, File::create(out_dir.join("constraints.bin")).map_err(|e| e.to_string())?);
+
+        for pi in 0..parts.len() {
+            for which in ["a", "b", "c"] {
+                let coeff_in = tmp_dir.join(format!("{pi:04}_{which}_coeffs.bin"));
+                let idx_in = tmp_dir.join(format!("{pi:04}_{which}_idx.bin"));
+                let mut rc = BufReader::with_capacity(MERGE_BUF_BYTES, File::open(coeff_in).map_err(|e| e.to_string())?);
+                let mut ri = BufReader::with_capacity(MERGE_BUF_BYTES, File::open(idx_in).map_err(|e| e.to_string())?);
+                match which {
+                    "a" => {
+                        std::io::copy(&mut rc, &mut out_fc_a).map_err(|e| e.to_string())?;
+                        std::io::copy(&mut ri, &mut out_fi_a).map_err(|e| e.to_string())?;
+                    }
+                    "b" => {
+                        std::io::copy(&mut rc, &mut out_fc_b).map_err(|e| e.to_string())?;
+                        std::io::copy(&mut ri, &mut out_fi_b).map_err(|e| e.to_string())?;
+                    }
+                    "c" => {
+                        std::io::copy(&mut rc, &mut out_fc_c).map_err(|e| e.to_string())?;
+                        std::io::copy(&mut ri, &mut out_fi_c).map_err(|e| e.to_string())?;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let cons_in = tmp_dir.join(format!("{pi:04}_constraints.bin"));
+            let mut rr = BufReader::with_capacity(MERGE_BUF_BYTES, File::open(cons_in).map_err(|e| e.to_string())?);
+            std::io::copy(&mut rr, &mut out_rows).map_err(|e| e.to_string())?;
+        }
+
+        // Append extra equality constraints by using the normal writer (small).
+        // Re-open append handles and write directly in the same binary formats.
+        if !extra_eqs.is_empty() {
+            // Serialize constants once.
+            let mut one_bytes = vec![0u8; coeff_size];
+            let mut neg_one_bytes = vec![0u8; coeff_size];
+            let mut zero_bytes = vec![0u8; coeff_size];
+            serialize_fixed::<F>(&F::ONE, &mut one_bytes).map_err(|e| e.to_string())?;
+            serialize_fixed::<F>(&(-F::ONE), &mut neg_one_bytes).map_err(|e| e.to_string())?;
+            serialize_fixed::<F>(&F::ZERO, &mut zero_bytes).map_err(|e| e.to_string())?;
+
+            // Current term counts (u64) after concatenation.
+            let mut a_terms = cur_a;
+            let mut b_terms = cur_b;
+            let mut c_terms = cur_c;
+            let mut nconstraints: u64 = parts.iter().map(|(i, _)| i.layout.nconstraints).sum::<u64>();
+
+            for &(x, y) in extra_eqs {
+                // A terms: +1*x, -1*y
+                out_fc_a.write_all(&one_bytes).map_err(|e| e.to_string())?;
+                write_u64(&mut out_fi_a, x as u64).map_err(|e| e.to_string())?;
+                a_terms += 1;
+                out_fc_a.write_all(&neg_one_bytes).map_err(|e| e.to_string())?;
+                write_u64(&mut out_fi_a, y as u64).map_err(|e| e.to_string())?;
+                a_terms += 1;
+
+                // B terms: +1*var0
+                out_fc_b.write_all(&one_bytes).map_err(|e| e.to_string())?;
+                write_u64(&mut out_fi_b, 0).map_err(|e| e.to_string())?;
+                b_terms += 1;
+
+                // C terms: 0*var0
+                out_fc_c.write_all(&zero_bytes).map_err(|e| e.to_string())?;
+                write_u64(&mut out_fi_c, 0).map_err(|e| e.to_string())?;
+                c_terms += 1;
+
+                // Constraint row points to the new tail terms.
+                let a0 = a_terms - 2;
+                let a1 = a_terms;
+                let b0 = b_terms - 1;
+                let b1 = b_terms;
+                let c0 = c_terms - 1;
+                let c1 = c_terms;
+                write_u64(&mut out_rows, a0).map_err(|e| e.to_string())?;
+                write_u64(&mut out_rows, a1).map_err(|e| e.to_string())?;
+                write_u64(&mut out_rows, b0).map_err(|e| e.to_string())?;
+                write_u64(&mut out_rows, b1).map_err(|e| e.to_string())?;
+                write_u64(&mut out_rows, c0).map_err(|e| e.to_string())?;
+                write_u64(&mut out_rows, c1).map_err(|e| e.to_string())?;
+                nconstraints += 1;
+            }
+
+            // Flush output writers before writing meta.
+            out_fc_a.flush().ok();
+            out_fi_a.flush().ok();
+            out_fc_b.flush().ok();
+            out_fi_b.flush().ok();
+            out_fc_c.flush().ok();
+            out_fi_c.flush().ok();
+            out_rows.flush().ok();
+
+            // Update totals.
+            cur_a = a_terms;
+            cur_b = b_terms;
+            cur_c = c_terms;
+            // nconstraints updated above; write meta below using updated totals.
+            {
+                let mut f = BufWriter::new(File::create(meta_path(&out_dir)).map_err(|e| format!("create meta failed: {e}"))?);
+                writeln!(f, "nvars={}", new_assignment.len()).ok();
+                writeln!(f, "constraints={}", nconstraints).ok();
+                writeln!(f, "a_terms={}", cur_a).ok();
+                writeln!(f, "b_terms={}", cur_b).ok();
+                writeln!(f, "c_terms={}", cur_c).ok();
+                writeln!(f, "coeff_size={}", coeff_size).ok();
+            }
+
+            let layout = FileBackedLayout {
+                dir: out_dir.clone(),
+                coeff_size,
+                nconstraints,
+                a_terms: cur_a,
+                b_terms: cur_b,
+                c_terms: cur_c,
+            };
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Ok((FileBackedSparseDr1csInstance { nvars: new_assignment.len(), layout, _pd: core::marker::PhantomData }, new_assignment));
+        }
+
+        // Flush output writers before writing meta.
+        out_fc_a.flush().ok();
+        out_fi_a.flush().ok();
+        out_fc_b.flush().ok();
+        out_fi_b.flush().ok();
+        out_fc_c.flush().ok();
+        out_fi_c.flush().ok();
+        out_rows.flush().ok();
+
+        let nconstraints: u64 = parts.iter().map(|(i, _)| i.layout.nconstraints).sum::<u64>();
+        {
+            let mut f = BufWriter::new(File::create(meta_path(&out_dir)).map_err(|e| format!("create meta failed: {e}"))?);
+            writeln!(f, "nvars={}", new_assignment.len()).ok();
+            writeln!(f, "constraints={}", nconstraints).ok();
+            writeln!(f, "a_terms={}", cur_a).ok();
+            writeln!(f, "b_terms={}", cur_b).ok();
+            writeln!(f, "c_terms={}", cur_c).ok();
+            writeln!(f, "coeff_size={}", coeff_size).ok();
+        }
+
+        let layout = FileBackedLayout {
+            dir: out_dir.clone(),
+            coeff_size,
+            nconstraints,
+            a_terms: cur_a,
+            b_terms: cur_b,
+            c_terms: cur_c,
+        };
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Ok((FileBackedSparseDr1csInstance { nvars: new_assignment.len(), layout, _pd: core::marker::PhantomData }, new_assignment));
+    }
+
+    let mut w = SparseDr1csFileWriter::<F>::create(out_dir)?;
 
     // Running offsets in the *output* term pools.
     let mut out_a: u64 = 0;

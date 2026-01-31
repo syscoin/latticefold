@@ -706,6 +706,14 @@ fn build_surfaces_with_shared_arcs(
     ),
     String,
 > {
+    let t_surfaces = Instant::now();
+    eprintln!(
+        "  cm surfaces(shared arcs): start (ring_dim={} pairs={} short_locals={} u32_locals={})",
+        ring_dim,
+        pairs.len(),
+        short_locals.len(),
+        u32_locals.len()
+    );
     let (mut surfaces_mul_local, all_sum_digits, all_sum_coeffwise) =
         build_mul_surfaces(glue, ring_dim, pairs, short_locals, u32_locals)?;
     let (mut surfaces_sq_local, all_sq_sum_digits, all_sq_sum_coeffwise) =
@@ -723,6 +731,12 @@ fn build_surfaces_with_shared_arcs(
         s.sum_all_pairs_digits = all_sq_sum_digits.clone();
         s.sum_all_pairs_coeffwise = all_sq_sum_coeffwise.clone();
     }
+    eprintln!(
+        "  cm surfaces(shared arcs): done in {:?} (mul_surfaces={} sq_surfaces={})",
+        t_surfaces.elapsed(),
+        surfaces_mul_local.len(),
+        surfaces_sq_local.len()
+    );
     Ok((
         surfaces_mul_local,
         surfaces_sq_local,

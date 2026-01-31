@@ -1167,9 +1167,9 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed<F: Prime
         // Keep this bounded to avoid exploding rewrite volume on large traces.
         let target_shards = n_threads.min(16).max(2);
         let shard_permutes = (total_permutes + target_shards - 1) / target_shards;
-        // Keep shards reasonably coarse, but allow more shards for better parallelism.
-        // This trades extra merge IO for more merge pairs.
-        let shard_permutes = shard_permutes.max(256);
+        // Keep shards reasonably coarse to avoid hammering the filesystem/page-cache.
+        // Empirically this keeps downstream CM phases faster than very small shards.
+        let shard_permutes = shard_permutes.max(1024);
         return poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded(
             cfg,
             ops,
