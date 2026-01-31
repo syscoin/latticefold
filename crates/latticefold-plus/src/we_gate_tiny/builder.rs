@@ -3674,6 +3674,31 @@ fn build_cm_glue_for_which(
                     let tensor_c0_scalars: Vec<GoldilocksScalar> = t0_ring.iter().map(|r| r[0]).collect();
                     let tensor_c1_scalars: Vec<GoldilocksScalar> = t1_ring.iter().map(|r| r[0]).collect();
 
+                    // Optional debug sanity: ensure tensor rings are truly constant-coeff (coeff>0 == 0),
+                    // so extracting `r[0]` is semantically valid.
+                    //
+                    // Enable with `LFP_WE_GATE_OPMIX=1`.
+                    if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1") {
+                        for (ti, (r0, r1)) in t0_ring.iter().zip(t1_ring.iter()).enumerate() {
+                            for coeff in 1..ring_dim.min(64) {
+                                for d in 0..17 {
+                                    let v0 = glue.gb.assignment[r0[coeff][d]];
+                                    let v1 = glue.gb.assignment[r1[coeff][d]];
+                                    assert!(
+                                        v0 == F257::ZERO,
+                                        "tensor_c0_ring[{ti}][{coeff}][{d}] nonzero: {:?}",
+                                        v0
+                                    );
+                                    assert!(
+                                        v1 == F257::ZERO,
+                                        "tensor_c1_ring[{ti}][{coeff}][{d}] nonzero: {:?}",
+                                        v1
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     // Keep op-mix accounting consistent (replaces 2 * l_instances_expected * kappa calls to ring_scale_digits).
                     super::op_counts::tiny_cm_bump(|c| {
                         c.ring_scale += (2 * l_instances_expected * kappa) as u64;
