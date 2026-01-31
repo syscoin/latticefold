@@ -7371,7 +7371,22 @@ mod tests {
                     &out_dir,
                 )
                 .expect("build tiny gate (file-backed) from real trace");
-            tiny_inst.check(&tiny_asg).expect("tiny gate dr1cs sat (file-backed check)");
+            if let Err(e) = tiny_inst.check(&tiny_asg) {
+                // Best-effort postmortem: parse failing constraint index and dump local info.
+                fn parse_failed_constraint_idx(msg: &str) -> Option<u64> {
+                    // Expected format: "constraint N failed"
+                    let needle = "constraint ";
+                    let i = msg.find(needle)? + needle.len();
+                    let rest = &msg[i..];
+                    let j = rest.find(' ')?;
+                    rest[..j].parse::<u64>().ok()
+                }
+                eprintln!("[test_large_trace] tiny gate file-backed check failed: {e}");
+                if let Some(ci) = parse_failed_constraint_idx(&e) {
+                    let _ = tiny_inst.debug_constraint(&tiny_asg, ci, 8);
+                }
+                panic!("tiny gate dr1cs sat (file-backed check): {e}");
+            }
             eprintln!(
                 "[test_large_trace] build_we_tiny_gate: {:?} (nvars={}, constraints={})",
                 t_tiny.elapsed(),

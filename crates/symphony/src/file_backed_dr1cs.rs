@@ -619,6 +619,90 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                 Ok(())
             })
     }
+
+    /// Debug helper: evaluate one constraint and return `(A·z, B·z, C·z)` along with ranges.
+    ///
+    /// Intended for postmortem debugging if `check()` reports a failing constraint index.
+    pub fn debug_constraint(
+        &self,
+        assignment: &[F],
+        constraint_idx: u64,
+        show_terms: usize,
+    ) -> Result<(), String> {
+        if assignment.len() != self.nvars {
+            return Err(format!(
+                "assignment length mismatch: expected {}, got {}",
+                self.nvars,
+                assignment.len()
+            ));
+        }
+        if constraint_idx >= self.layout.nconstraints {
+            return Err(format!(
+                "constraint_idx out of range: {} >= {}",
+                constraint_idx, self.layout.nconstraints
+            ));
+        }
+
+        // Read the constraint row.
+        let mut fr = File::open(constraints_path(&self.layout.dir))
+            .map_err(|e| format!("open constraints failed: {e}"))?;
+        fr.seek(std::io::SeekFrom::Start(constraint_idx.saturating_mul(48)))
+            .map_err(|e| format!("seek constraints failed: {e}"))?;
+        let mut r = BufReader::new(fr);
+        let a0 = read_u64(&mut r).map_err(|e| e.to_string())?;
+        let a1 = read_u64(&mut r).map_err(|e| e.to_string())?;
+        let b0 = read_u64(&mut r).map_err(|e| e.to_string())?;
+        let b1 = read_u64(&mut r).map_err(|e| e.to_string())?;
+        let c0 = read_u64(&mut r).map_err(|e| e.to_string())?;
+        let c1 = read_u64(&mut r).map_err(|e| e.to_string())?;
+
+        let eval_range = |which: &str, start: u64, end: u64| -> Result<(F, Vec<(F, usize)>), String> {
+            let (p_coeffs, p_idx) = term_paths(&self.layout.dir, which);
+            let mut fc = File::open(p_coeffs).map_err(|e| format!("open {which}_coeffs failed: {e}"))?;
+            let mut fi = File::open(p_idx).map_err(|e| format!("open {which}_idx failed: {e}"))?;
+            let off_c = (start as u128)
+                .saturating_mul(self.layout.coeff_size as u128)
+                .min(u64::MAX as u128) as u64;
+            fc.seek(std::io::SeekFrom::Start(off_c))
+                .map_err(|e| format!("seek {which}_coeffs failed: {e}"))?;
+            fi.seek(std::io::SeekFrom::Start(start.saturating_mul(8)))
+                .map_err(|e| format!("seek {which}_idx failed: {e}"))?;
+            let mut buf = vec![0u8; self.layout.coeff_size];
+            let mut acc = F::ZERO;
+            let mut shown: Vec<(F, usize)> = Vec::new();
+            let mut i = 0usize;
+            for _ in start..end {
+                fc.read_exact(&mut buf).map_err(|e| format!("read {which}_coeffs failed: {e}"))?;
+                let idx = read_u64(&mut fi).map_err(|e| format!("read {which}_idx failed: {e}"))? as usize;
+                let coef = deserialize_fixed::<F>(&buf).map_err(|e| format!("deserialize {which}_coeff failed: {e}"))?;
+                acc += coef * assignment[idx];
+                if i < show_terms {
+                    shown.push((coef, idx));
+                }
+                i += 1;
+            }
+            Ok((acc, shown))
+        };
+
+        let (av, a_shown) = eval_range("a", a0, a1)?;
+        let (bv, b_shown) = eval_range("b", b0, b1)?;
+        let (cv, c_shown) = eval_range("c", c0, c1)?;
+
+        eprintln!(
+            "[file_backed_debug] constraint {} ranges: A=[{},{})(len={}) B=[{},{})(len={}) C=[{},{})(len={})",
+            constraint_idx,
+            a0, a1, a1.saturating_sub(a0),
+            b0, b1, b1.saturating_sub(b0),
+            c0, c1, c1.saturating_sub(c0),
+        );
+        eprintln!("[file_backed_debug] values: (A·z)={av:?} (B·z)={bv:?} (C·z)={cv:?}  residual=A·B-C={(av * bv - cv):?}");
+        if show_terms > 0 {
+            eprintln!("[file_backed_debug] A first {} terms: {:?}", a_shown.len(), a_shown);
+            eprintln!("[file_backed_debug] B first {} terms: {:?}", b_shown.len(), b_shown);
+            eprintln!("[file_backed_debug] C first {} terms: {:?}", c_shown.len(), c_shown);
+        }
+        Ok(())
+    }
 }
 
 /// Merge multiple file-backed instances into one, sharing variable 0 as the constant-1 slot.

@@ -3264,7 +3264,13 @@ fn finalize_file_backed(
             sum_all_pairs_coeffwise: all_sq_sum_coeffwise_global.clone(),
         })
         .collect::<Vec<_>>();
-
+        if tiny_opmix_on() {
+            eprintln!(
+                "tiny_gate: finalize done: nvars={} constraints={} (returning instance + wiring)",
+                inst.nvars,
+                inst.constraints.len()
+            );
+        }
     Ok((
         inst,
         asg,
