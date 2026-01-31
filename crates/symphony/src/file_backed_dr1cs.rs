@@ -575,6 +575,12 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
     // IMPORTANT: merge is dominated by streaming IO + index remapping.
     // Large buffers significantly reduce syscall overhead during merges.
     const MERGE_BUF_BYTES: usize = 256 * 1024 * 1024;
+    // Reuse existing timing switch (no new env vars).
+    let timing = match std::env::var("LF_PROFILE_DR1CS") {
+        Ok(v) => v != "0",
+        Err(_) => false,
+    };
+    let t_all = std::time::Instant::now();
 
     // If we have multiple Rayon threads available, do a parallel merge:
     // 1) For each part, in parallel, create remapped chunk files (idx/constraints remapped).
@@ -588,6 +594,14 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
         let out_dir = out_dir.as_ref().to_path_buf();
         let _ = std::fs::remove_dir_all(&out_dir);
         create_dir_all(&out_dir).map_err(|e| format!("create_dir_all failed: {e}"))?;
+        if timing {
+            eprintln!(
+                "file_backed_merge: parallel start parts={} threads={} out_dir={}",
+                parts.len(),
+                n_threads,
+                out_dir.display()
+            );
+        }
 
         // Validate layouts are compatible and precompute offsets.
         let coeff_size = parts[0].0.layout.coeff_size;
@@ -635,6 +649,7 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
         create_dir_all(&tmp_dir).map_err(|e| format!("create tmp_merge_parts failed: {e}"))?;
 
         // Build remapped chunks in parallel.
+        let t_chunks = std::time::Instant::now();
         (0..parts.len())
             .into_par_iter()
             .try_for_each(|pi| -> Result<(), String> {
@@ -720,8 +735,12 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
 
                 Ok(())
             })?;
+        if timing {
+            eprintln!("file_backed_merge: chunks done in {:?}", t_chunks.elapsed());
+        }
 
         // Concatenate chunks deterministically into final files.
+        let t_concat = std::time::Instant::now();
         let mut out_fc_a = BufWriter::with_capacity(MERGE_BUF_BYTES, File::create(out_dir.join("a_coeffs.bin")).map_err(|e| e.to_string())?);
         let mut out_fi_a = BufWriter::with_capacity(MERGE_BUF_BYTES, File::create(out_dir.join("a_idx.bin")).map_err(|e| e.to_string())?);
         let mut out_fc_b = BufWriter::with_capacity(MERGE_BUF_BYTES, File::create(out_dir.join("b_coeffs.bin")).map_err(|e| e.to_string())?);
@@ -756,6 +775,9 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
             let mut rr = BufReader::with_capacity(MERGE_BUF_BYTES, File::open(cons_in).map_err(|e| e.to_string())?);
             std::io::copy(&mut rr, &mut out_rows).map_err(|e| e.to_string())?;
         }
+        if timing {
+            eprintln!("file_backed_merge: concat done in {:?}", t_concat.elapsed());
+        }
 
         // Append extra equality constraints by using the normal writer (small).
         // Re-open append handles and write directly in the same binary formats.
@@ -774,6 +796,7 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
             let mut c_terms = cur_c;
             let mut nconstraints: u64 = parts.iter().map(|(i, _)| i.layout.nconstraints).sum::<u64>();
 
+            let t_eq = std::time::Instant::now();
             for &(x, y) in extra_eqs {
                 // A terms: +1*x, -1*y
                 out_fc_a.write_all(&one_bytes).map_err(|e| e.to_string())?;
@@ -808,6 +831,13 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                 write_u64(&mut out_rows, c1).map_err(|e| e.to_string())?;
                 nconstraints += 1;
             }
+            if timing {
+                eprintln!(
+                    "file_backed_merge: appended eqs={} in {:?}",
+                    extra_eqs.len(),
+                    t_eq.elapsed()
+                );
+            }
 
             // Flush output writers before writing meta.
             out_fc_a.flush().ok();
@@ -841,7 +871,15 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                 b_terms: cur_b,
                 c_terms: cur_c,
             };
+            let t_cleanup = std::time::Instant::now();
             let _ = std::fs::remove_dir_all(&tmp_dir);
+            if timing {
+                eprintln!(
+                    "file_backed_merge: cleanup done in {:?} (total {:?})",
+                    t_cleanup.elapsed(),
+                    t_all.elapsed()
+                );
+            }
             return Ok((FileBackedSparseDr1csInstance { nvars: new_assignment.len(), layout, _pd: core::marker::PhantomData }, new_assignment));
         }
 
@@ -873,7 +911,15 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
             b_terms: cur_b,
             c_terms: cur_c,
         };
+        let t_cleanup = std::time::Instant::now();
         let _ = std::fs::remove_dir_all(&tmp_dir);
+        if timing {
+            eprintln!(
+                "file_backed_merge: cleanup done in {:?} (total {:?})",
+                t_cleanup.elapsed(),
+                t_all.elapsed()
+            );
+        }
         return Ok((FileBackedSparseDr1csInstance { nvars: new_assignment.len(), layout, _pd: core::marker::PhantomData }, new_assignment));
     }
 

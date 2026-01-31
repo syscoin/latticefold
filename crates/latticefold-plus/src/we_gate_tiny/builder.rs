@@ -3146,12 +3146,33 @@ fn finalize_file_backed(
     parts.push((pose_inst, pose_asg));
     parts.push((base_inst, base_asg));
     parts.extend(extra_insts);
+    let t_fb_merge = Instant::now();
+    if tiny_opmix_on() {
+        eprintln!(
+            "tiny_gate: file_backed merge start: parts={} eq_pairs={} threads={} out_dir={}",
+            parts.len(),
+            eq_pairs.len(),
+            rayon::current_num_threads(),
+            out_dir.as_ref().display()
+        );
+    }
     let (inst, asg) = merge_file_backed_sparse_dr1cs_share_one::<F257>(
         parts,
         out_dir.as_ref(),
         &eq_pairs,
     )
     .map_err(|e| format!("tiny gate: file-backed merge failed: {e}"))?;
+    if tiny_opmix_on() {
+        eprintln!(
+            "tiny_gate: file_backed merge done in {:?}: nvars={} constraints={} a_terms={} b_terms={} c_terms={}",
+            t_fb_merge.elapsed(),
+            inst.nvars,
+            inst.layout.nconstraints,
+            inst.layout.a_terms,
+            inst.layout.b_terms,
+            inst.layout.c_terms
+        );
+    }
 
     // All exported wiring is from the base glue module (part 1).
     let to_glue_global = |glue_local: usize| -> usize { remap(1, glue_local, &offsets) };
