@@ -1443,7 +1443,7 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
         .collect::<Result<Vec<_>, _>>()?;
 
     // ---------------------------------------------------------------------
-    // Pass 2: merge shards (tree merge), adding boundary equalities at merge time.
+    // Pass 2: merge shards (single pass), adding boundary equalities.
     // ---------------------------------------------------------------------
     let mut shard_metas: Vec<ShardMeta> = Vec::with_capacity(shard_built.len());
     let mut groups: Vec<Group<F>> = Vec::with_capacity(shard_built.len());
@@ -1451,102 +1451,53 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
         groups.push(sb.group);
         shard_metas.push(sb.meta);
     }
-
-    let mut round: usize = 0;
-    while groups.len() > 1 {
-        eprintln!(
-            "[poseidon_arith] merge_round={} groups={} threads={}",
-            round,
-            groups.len(),
-            n_threads
-        );
-        let round_dir = out_dir.join(format!("poseidon_merge_round_{round:02}"));
-        create_dir_all(&round_dir)
-            .map_err(|e| ReplayErr::Invalid(format!("create merge dir failed: {e}")))?;
-
-        // Move groups into owned pairs so merges don't clone huge assignments/instances.
-        let cur_groups = core::mem::take(&mut groups);
-        let mut pairs_owned: Vec<(Group<F>, Group<F>)> = Vec::with_capacity(cur_groups.len() / 2);
-        let mut it = cur_groups.into_iter();
-        let mut tail: Option<Group<F>> = None;
-        while let Some(left) = it.next() {
-            if let Some(right) = it.next() {
-                pairs_owned.push((left, right));
-            } else {
-                // odd tail
-                tail = Some(left);
-                break;
-            }
-        }
-        if !pairs_owned.is_empty() {
-            eprintln!("[poseidon_arith] merge_round={} pairs={}", round, pairs_owned.len());
-            let merged: Vec<Group<F>> = pairs_owned
-                .into_par_iter()
-                .enumerate()
-                .map(|(pair_idx, (left, right))| -> Result<Group<F>, ReplayErr> {
-                    let t_pair = Instant::now();
-
-                    // Map local -> merged indices for this 2-way merge.
-                    let left_tail = left.asg.len().saturating_sub(1) as u64;
-                    #[inline]
-                    fn map_left(idx: usize) -> usize {
-                        idx
-                    }
-                    #[inline]
-                    fn map_right(idx: usize, left_tail: u64) -> usize {
-                        if idx == 0 { 0 } else { (idx as u64 + left_tail) as usize }
-                    }
-
-                    let mut eqs: Vec<(usize, usize)> = Vec::with_capacity(left.final_state_vars.len());
-                    for (x, y) in left.final_state_vars.iter().zip(right.init_state_vars.iter()) {
-                        eqs.push((map_left(*x), map_right(*y, left_tail)));
-                    }
-
-                    let out = round_dir.join(format!("merge_{pair_idx:04}"));
-                    create_dir_all(&out).map_err(|e| ReplayErr::Invalid(format!("create pair dir failed: {e}")))?;
-                    let (inst, asg) = merge_file_backed_sparse_dr1cs_share_one::<F>(
-                        vec![(left.inst, left.asg), (right.inst, right.asg)],
-                        &out,
-                        &eqs,
-                    )
-                    .map_err(ReplayErr::Invalid)?;
-
-                    let init_state_vars = left.init_state_vars;
-                    let final_state_vars = right
-                        .final_state_vars
-                        .into_iter()
-                        .map(|idx| map_right(idx, left_tail))
-                        .collect();
-
-                    eprintln!(
-                        "[poseidon_arith] merge_round={} pair={:04} done in {:.2?}",
-                        round,
-                        pair_idx,
-                        t_pair.elapsed()
-                    );
-
-                    Ok(Group {
-                        inst,
-                        asg,
-                        init_state_vars,
-                        final_state_vars,
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            groups = merged;
-            if let Some(t) = tail.take() {
-                groups.push(t);
-            }
-        } else if let Some(t) = tail.take() {
-            groups = vec![t];
-        }
-        round += 1;
+    if groups.is_empty() {
+        return Err(ReplayErr::Invalid("poseidon shard merge produced empty result".to_string()));
     }
 
-    let final_group = groups
-        .pop()
-        .ok_or_else(|| ReplayErr::Invalid("poseidon shard merge produced empty result".to_string()))?;
+    // Compute part offsets (excluding shared var0) for mapping local shard vars to merged vars.
+    let mut offsets: Vec<usize> = Vec::with_capacity(groups.len());
+    let mut tail_off = 0usize;
+    for g in &groups {
+        offsets.push(tail_off);
+        tail_off = tail_off.saturating_add(g.asg.len().saturating_sub(1));
+    }
+    let map_var = |shard_idx: usize, local: usize| -> usize {
+        if local == 0 { 0 } else { local + offsets[shard_idx] }
+    };
+
+    // Boundary equalities: final_state(shard i) == init_state(shard i+1) (in merged space).
+    let mut boundary_eqs: Vec<(usize, usize)> = Vec::new();
+    for i in 0..groups.len().saturating_sub(1) {
+        let left = &groups[i];
+        let right = &groups[i + 1];
+        for (x, y) in left.final_state_vars.iter().zip(right.init_state_vars.iter()) {
+            boundary_eqs.push((map_var(i, *x), map_var(i + 1, *y)));
+        }
+    }
+
+    eprintln!(
+        "[poseidon_arith] merge_all: parts={} boundary_eqs={} threads={}",
+        groups.len(),
+        boundary_eqs.len(),
+        n_threads
+    );
+    let merged_dir = out_dir.join("poseidon_merged");
+    let _ = std::fs::remove_dir_all(&merged_dir);
+    create_dir_all(&merged_dir).map_err(|e| ReplayErr::Invalid(format!("create merged dir failed: {e}")))?;
+
+    let t_merge = Instant::now();
+    let parts: Vec<(FileBackedSparseDr1csInstance<F>, Vec<F>)> = groups
+        .into_iter()
+        .map(|g| (g.inst, g.asg))
+        .collect();
+    let (merged_inst, merged_asg) =
+        merge_file_backed_sparse_dr1cs_share_one::<F>(parts, &merged_dir, &boundary_eqs)
+            .map_err(ReplayErr::Invalid)?;
+    eprintln!(
+        "[poseidon_arith] merge_all done in {:.2?}",
+        t_merge.elapsed()
+    );
 
     // ---------------------------------------------------------------------
     // Stitch global wiring/byte wiring by offsetting per-shard var indices.
@@ -1609,7 +1560,7 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
         permutes: Vec::new(),
     };
 
-    Ok((final_group.inst, final_group.asg, replay, bytes_all, wiring, bw))
+    Ok((merged_inst, merged_asg, replay, bytes_all, wiring, bw))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

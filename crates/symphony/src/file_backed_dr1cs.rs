@@ -376,7 +376,7 @@ pub fn dump_sparse_to_dir<F: PrimeField + CanonicalSerialize>(
     // Determine fixed coeff size.
     let mut tmp = Vec::new();
     F::ONE
-        .serialize_with_mode(&mut tmp, Compress::Yes)
+        .serialize_with_mode(&mut tmp, Compress::No)
         .map_err(|e| format!("serialize ONE failed: {e}"))?;
     let coeff_size = tmp.len();
     if coeff_size == 0 {
