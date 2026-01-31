@@ -1147,24 +1147,32 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed<F: Prime
     ),
     ReplayErr,
 > {
-    // IMPORTANT:
-    // For the LF+ tiny-gate pipeline, we do NOT consume Poseidon's `SqueezeBytes` byte outputs.
-    // Arithmetizing the byte-canonicalization gadget is extremely expensive (constraints + IO).
+    // Canonical file-backed WE mode for LF+:
+    // - We want to use multiple cores (Poseidon arith is otherwise single-threaded).
+    // - For the LF+ tiny-gate pipeline, we do NOT consume Poseidon's `SqueezeBytes` byte outputs,
+    //   so we avoid arithmetizing the very large byte-canonicalization gadget.
     //
-    // Therefore, in the canonical file-backed WE entrypoint we *do not* arithmetize `SqueezeBytes`.
-    // We still record `ByteSqueezeWitness` values, but `PoseidonByteWiring` will remain empty.
-    let (inst_any, asg, replay, bytes, wiring, bw) = poseidon_sponge_dr1cs_from_trace_impl_any(
-        cfg,
-        ops,
-        false,
-        PoseidonArithMode::WeWitness,
-        Some(out_dir.as_ref()),
-    )?;
+    // Therefore: always use the sharded Poseidon builder when Rayon has >1 thread, and run it
+    // with `with_bytes=false` internally. `PoseidonByteWiring` will remain empty.
+    let out_dir = out_dir.as_ref();
+    let n_threads = rayon::current_num_threads().max(1);
+    if n_threads > 1 {
+        // Deterministic sharding granularity. This is the main knob for parallelism vs merge overhead.
+        // (No env flags.)
+        const SHARD_PERMUTES: usize = 1024;
+        return poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded(
+            cfg,
+            ops,
+            out_dir,
+            SHARD_PERMUTES,
+        );
+    }
+
+    let (inst_any, asg, replay, bytes, wiring, bw) =
+        poseidon_sponge_dr1cs_from_trace_impl_any(cfg, ops, false, PoseidonArithMode::WeWitness, Some(out_dir))?;
     match inst_any {
         PoseidonInstance::FileBacked(inst) => Ok((inst, asg, replay, bytes, wiring, bw)),
-        PoseidonInstance::InMemory(_) => Err(ReplayErr::Invalid(
-            "expected file-backed instance, got in-memory".to_string(),
-        )),
+        PoseidonInstance::InMemory(_) => Err(ReplayErr::Invalid("expected file-backed instance, got in-memory".to_string())),
     }
 }
 
@@ -1377,7 +1385,7 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
                     poseidon_sponge_dr1cs_from_trace_impl_any_internal(
                         cfg,
                         slice,
-                        true,
+                        false,
                         PoseidonArithMode::WeWitness,
                         Some(&shard_dir),
                         &p.init_state,

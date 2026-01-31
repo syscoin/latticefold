@@ -42,8 +42,12 @@ pub fn lift_recording_trace_ops_to_f257<BF: PrimeField>(
                 out.push(PoseidonTraceOp::SqueezeField(vv));
             }
             crate::recording_transcript::PoseidonTraceOp::SqueezeBytes { n, out: bytes } => {
-                // Legacy traces may include this op; map it directly.
-                out.push(PoseidonTraceOp::SqueezeBytes { n: *n, out: bytes.clone() });
+                // Tiny gate does not consume Poseidon's `SqueezeBytes` outputs; it derives all
+                // challenges/schedule from `SqueezeField` + `Absorb`. In our current LF+ trace
+                // transcript, `squeeze_bytes(n)` is already recorded as `SqueezeField(len=n)`.
+                //
+                // Therefore, treat `SqueezeBytes` as legacy/no-op here to avoid any downstream work.
+                let _ = (n, bytes);
             }
         }
     }
