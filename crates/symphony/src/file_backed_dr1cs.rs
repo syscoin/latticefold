@@ -208,6 +208,14 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
         Ok(())
     }
     #[inline]
+    pub fn push_a_term_raw(&mut self, coef_bytes: &[u8], idx: u64) -> Result<(), String> {
+        debug_assert_eq!(coef_bytes.len(), self.coeff_size);
+        self.fc_a.write_all(coef_bytes).map_err(|e| e.to_string())?;
+        write_u64(&mut self.fi_a, idx).map_err(|e| e.to_string())?;
+        self.a_terms += 1;
+        Ok(())
+    }
+    #[inline]
     pub fn push_b_term(&mut self, coef: &F, idx: u64) -> Result<(), String> {
         serialize_fixed(coef, &mut self.coeff_buf).map_err(|e| format!("serialize coeff failed: {e}"))?;
         self.fc_b.write_all(&self.coeff_buf).map_err(|e| e.to_string())?;
@@ -216,9 +224,25 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
         Ok(())
     }
     #[inline]
+    pub fn push_b_term_raw(&mut self, coef_bytes: &[u8], idx: u64) -> Result<(), String> {
+        debug_assert_eq!(coef_bytes.len(), self.coeff_size);
+        self.fc_b.write_all(coef_bytes).map_err(|e| e.to_string())?;
+        write_u64(&mut self.fi_b, idx).map_err(|e| e.to_string())?;
+        self.b_terms += 1;
+        Ok(())
+    }
+    #[inline]
     pub fn push_c_term(&mut self, coef: &F, idx: u64) -> Result<(), String> {
         serialize_fixed(coef, &mut self.coeff_buf).map_err(|e| format!("serialize coeff failed: {e}"))?;
         self.fc_c.write_all(&self.coeff_buf).map_err(|e| e.to_string())?;
+        write_u64(&mut self.fi_c, idx).map_err(|e| e.to_string())?;
+        self.c_terms += 1;
+        Ok(())
+    }
+    #[inline]
+    pub fn push_c_term_raw(&mut self, coef_bytes: &[u8], idx: u64) -> Result<(), String> {
+        debug_assert_eq!(coef_bytes.len(), self.coeff_size);
+        self.fc_c.write_all(coef_bytes).map_err(|e| e.to_string())?;
         write_u64(&mut self.fi_c, idx).map_err(|e| e.to_string())?;
         self.c_terms += 1;
         Ok(())
@@ -536,11 +560,10 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                 fc.read_exact(&mut buf).map_err(|e| format!("read {which}_coeffs failed: {e}"))?;
                 let idx = read_u64(&mut fi).map_err(|e| format!("read {which}_idx failed: {e}"))?;
                 let mapped = map_var(idx, var_tail_off);
-                let coef = deserialize_fixed::<F>(&buf).map_err(|e| format!("deserialize coeff failed: {e}"))?;
                 match which {
-                    "a" => w.push_a_term(&coef, mapped)?,
-                    "b" => w.push_b_term(&coef, mapped)?,
-                    "c" => w.push_c_term(&coef, mapped)?,
+                    "a" => w.push_a_term_raw(&buf, mapped)?,
+                    "b" => w.push_b_term_raw(&buf, mapped)?,
+                    "c" => w.push_c_term_raw(&buf, mapped)?,
                     _ => unreachable!(),
                 }
             }
