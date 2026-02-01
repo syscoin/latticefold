@@ -816,9 +816,6 @@ pub(crate) fn eval_x_powers_basis_mle_ring_digits(
             ((a as i128 - b as i128).rem_euclid(p as i128)) as u64
         }
 
-        let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
-        let asg = gb.assignment.as_slice();
-
         let r0 = r4[0];
         let r1 = r4[1];
         let om0 = goldilocks_one_minus_digits(gb, &r0);
@@ -838,6 +835,8 @@ pub(crate) fn eval_x_powers_basis_mle_ring_digits(
         let w2 = goldilocks_mul_mod_p_digits(gb, &om0, &r1);
         let w2 = goldilocks_mul_mod_p_digits(gb, &w2, &tail);
 
+        let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+        let asg = gb.assignment.as_slice();
         let w0_u = scalar_digits_to_u64_mod_p(asg, &weights[0]);
         let w1_u = scalar_digits_to_u64_mod_p(asg, &weights[1]);
         let w2_u = scalar_digits_to_u64_mod_p(asg, &weights[2]);

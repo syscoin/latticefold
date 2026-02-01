@@ -21,7 +21,7 @@ use symphony::transcript::PoseidonTraceOp;
 use crate::we_statement::WeParams;
 
 use super::challenges::{
-    bounded_u32_from_8_digits_base128, digit_to_byte_var, res257_from_u64_bytes_le,
+    bounded_u32_from_8_digits_base128, res257_from_u64_bytes_le,
     select_first_ok_u32_try_digits, short_challenge_from_digits_128, squeeze_field_ranges_by_op_index,
     BoundedU32ChallengeWiring, GoldilocksChallengeWiring, ShortChallengeWiring, TinyCoinOpWiring,
 };
@@ -4627,7 +4627,7 @@ fn build_cm_glue_for_which(
                             if row == 0 && j == 0 {
                                 e00_opt = Some(rd.clone());
                             }
-                            if let Some(total) = debug_eval_core_expected_u64.as_mut() {
+                            if debug_eval_core_expected_u64.is_some() {
                                 // coeff0(rd) * rc_pows[l_idx + row*4 + j]
                                 #[inline]
                                 fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
