@@ -3928,6 +3928,9 @@ fn build_cm_glue_for_which(
                     // Build claimed_sum in batches to bound peak memory.
                     let l_batch: usize = (4 * rayon::current_num_threads().max(1)).max(1);
                     let mut claimed_sum = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+                    let debug_expected_on =
+                        std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1");
+                    let mut expected_coeff0_total_u64: u64 = 0;
 
                     for l0 in (0..l_instances_expected).step_by(l_batch) {
                         let l1 = (l0 + l_batch).min(l_instances_expected);
@@ -4055,6 +4058,85 @@ fn build_cm_glue_for_which(
                             u_l,
                         }));
                         }
+
+                    // Debug: compute expected claimed_sum coeff0 from imported inputs (all l, all mlen).
+                    if debug_expected_on && ring_dim == 64 {
+                        #[inline]
+                        fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
+                            let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
+                            let mut acc: i128 = 0;
+                            let mut pow: i128 = 1;
+                            for i in 0..17 {
+                                let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
+                                acc += di * pow;
+                                pow *= 16;
+                            }
+                            acc.rem_euclid(p) as u64
+                        }
+                        #[inline]
+                        fn ring_coeff0_u64(asg: &[F257], r: &RingDigits) -> u64 {
+                            scalar_digits_to_u64_mod_p(asg, &r[0])
+                        }
+                        #[inline]
+                        fn mul_mod_p(a: u64, b: u64, p: u64) -> u64 {
+                            ((a as u128 * b as u128) % (p as u128)) as u64
+                        }
+                        #[inline]
+                        fn add_mod_p(a: u64, b: u64, p: u64) -> u64 {
+                            ((a as u128 + b as u128) % (p as u128)) as u64
+                        }
+
+                        let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+                        let asg = glue.gb.assignment.as_slice();
+                        for (l, data) in &per_l {
+                            let l = *l;
+                            let mut acc = 0u64;
+
+                            // a0
+                            let a0 = scalar_digits_to_u64_mod_p(asg, &data.eval_a[0]);
+                            let rc_l = scalar_digits_to_u64_mod_p(asg, &rc_pows[data.l_idx]);
+                            acc = add_mod_p(acc, mul_mod_p(a0, rc_l, p), p);
+
+                            // b0/c0/u0
+                            let b0 = ring_coeff0_u64(asg, &data.eval_b[0]);
+                            let c0 = ring_coeff0_u64(asg, &data.eval_c[0]);
+                            let u0 = ring_coeff0_u64(asg, &data.u_l[0]);
+                            let rc_b0 = scalar_digits_to_u64_mod_p(asg, &rc_pows[data.l_idx + 1]);
+                            let rc_c0 = scalar_digits_to_u64_mod_p(asg, &rc_pows[data.l_idx + 2]);
+                            let rc_u0 = scalar_digits_to_u64_mod_p(asg, &rc_pows[data.l_idx + 3]);
+                            acc = add_mod_p(acc, mul_mod_p(b0, rc_b0, p), p);
+                            acc = add_mod_p(acc, mul_mod_p(c0, rc_c0, p), p);
+                            acc = add_mod_p(acc, mul_mod_p(u0, rc_u0, p), p);
+
+                            // M rows
+                            for i in 0..(params.mlen as usize) {
+                                let idx = data.l_idx + 4 + i * 4;
+                                let ai = scalar_digits_to_u64_mod_p(asg, &data.eval_a[1 + i]);
+                                let rci = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx]);
+                                acc = add_mod_p(acc, mul_mod_p(ai, rci, p), p);
+
+                                let bi = ring_coeff0_u64(asg, &data.eval_b[1 + i]);
+                                let ci = ring_coeff0_u64(asg, &data.eval_c[1 + i]);
+                                let ui = ring_coeff0_u64(asg, &data.u_l[1 + i]);
+                                let rcb = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx + 1]);
+                                let rcc = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx + 2]);
+                                let rcu = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx + 3]);
+                                acc = add_mod_p(acc, mul_mod_p(bi, rcb, p), p);
+                                acc = add_mod_p(acc, mul_mod_p(ci, rcc, p), p);
+                                acc = add_mod_p(acc, mul_mod_p(ui, rcu, p), p);
+                            }
+
+                            // tcch terms
+                            let tc0 = ring_coeff0_u64(asg, &tcch0[l]);
+                            let tc1 = ring_coeff0_u64(asg, &tcch1[l]);
+                            let rcz = scalar_digits_to_u64_mod_p(asg, &rc_pows[z_idx]);
+                            let rcz1 = scalar_digits_to_u64_mod_p(asg, &rc_pows[z_idx + 1]);
+                            acc = add_mod_p(acc, mul_mod_p(tc0, rcz, p), p);
+                            acc = add_mod_p(acc, mul_mod_p(tc1, rcz1, p), p);
+
+                            expected_coeff0_total_u64 = add_mod_p(expected_coeff0_total_u64, acc, p);
+                        }
+                    }
 
                     // Debug: break down claimed_sum coeff0 for l=0 (local vars only).
                     if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1")
@@ -4322,6 +4404,34 @@ fn build_cm_glue_for_which(
                         }
                     }
                     } // end l-batch loop
+
+                    if debug_expected_on && ring_dim == 64 {
+                        #[inline]
+                        fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
+                            let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
+                            let mut acc: i128 = 0;
+                            let mut pow: i128 = 1;
+                            for i in 0..17 {
+                                let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
+                                acc += di * pow;
+                                pow *= 16;
+                            }
+                            acc.rem_euclid(p) as u64
+                        }
+                        #[inline]
+                        fn ring_coeff0_u64(asg: &[F257], r: &RingDigits) -> u64 {
+                            scalar_digits_to_u64_mod_p(asg, &r[0])
+                        }
+                        let asg = glue.gb.assignment.as_slice();
+                        let claim_coeff0_u64 = ring_coeff0_u64(asg, &claimed_sum);
+                        eprintln!(
+                            "[LF_DEBUG_CM_CLAIMED_SUM_EXPECTED] which={} expected_coeff0_u64={} claimed_coeff0_u64={} delta_u64={}",
+                            which,
+                            expected_coeff0_total_u64,
+                            claim_coeff0_u64,
+                            expected_coeff0_total_u64.wrapping_sub(claim_coeff0_u64),
+                        );
+                    }
 
                     claimed_sum_opt = Some(claimed_sum);
                 }
