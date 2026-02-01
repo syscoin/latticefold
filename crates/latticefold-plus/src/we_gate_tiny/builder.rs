@@ -43,7 +43,7 @@ use super::surfaces::{CmDigitMulSqSurfaceWiring, CmDigitMulSurfaceWiring};
 
 use super::cm_math::{
     alloc_const_goldilocks_u64,
-    eq_eval_goldilocks_digits, eval_t_z_optimized_ring_digits_pair_bal16, goldilocks_bytes_to_digits, goldilocks_pow_table_digits,
+    eq_eval_goldilocks_digits, eval_t_z_optimized_ring_digits_pair, goldilocks_bytes_to_digits, goldilocks_pow_table_digits,
     goldilocks_add_mod_p_digits, goldilocks_mul_const_mod_p_digits, goldilocks_mul_mod_p_digits, goldilocks_sub_mod_p_digits,
     ct_psi_mul_ring_digits_d64,
     ring_eval_at_scalar_digits,
@@ -80,6 +80,46 @@ struct CmSharedPrecompBase {
     r_point_digits: Vec<GoldilocksScalar>,
     // u[l][ni] (length L × (1+mlen))
     u: Vec<Vec<RingDigits>>,
+}
+
+#[inline]
+fn short_challenge_coeff_digits_from_byte_var_128(
+    gb: &mut Dr1csBuilder<F257>,
+    byte_var: usize,
+    exp: usize,
+    u: u64,
+    half_digits: &GoldilocksScalar,
+    zero_byte: usize,
+) -> GoldilocksScalar {
+    debug_assert!(u.is_power_of_two() && u <= 256);
+    debug_assert!(exp <= 8);
+
+    // low = byte % u (u is power-of-two): low is the low `exp` bits.
+    let bits = decompose_existing_byte_var_to_bits::<F257>(gb, byte_var);
+    let limb0: u64 = gb.assignment[byte_var]
+        .into_bigint()
+        .as_ref()
+        .get(0)
+        .copied()
+        .unwrap_or(0);
+    let byte0 = (limb0 & 0xFF) as u64;
+    let low_u64 = byte0 & (u - 1);
+    let low_var = gb.new_var(F257::from(low_u64));
+
+    // Enforce low_var = Σ_{i<exp} 2^i * bits[i]
+    let mut lc = vec![(F257::ONE, low_var)];
+    let mut p2 = F257::ONE;
+    for i in 0..exp {
+        lc.push((-p2, bits[i]));
+        p2 = p2.double();
+    }
+    gb.enforce_lc_times_one_eq_const(lc);
+
+    // Interpret low as a u64 and compute (low - half) mod Goldilocks p in digit domain.
+    let mut low_bytes = [zero_byte; 8];
+    low_bytes[0] = low_var;
+    let low_digits = goldilocks_bytes_to_digits(gb, low_bytes);
+    goldilocks_sub_mod_p_digits(gb, &low_digits, half_digits)
 }
 
 /// Extra (non-transcript) witness values needed to make the tiny gate satisfiable for a **real** proof.
@@ -1092,8 +1132,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
         );
         rs_digits.push(goldilocks_bytes_to_digits(&mut glue.gb, bytes));
     }
-    // Plumb the setchk verifier point `r` forward for CM `eq(r, ro)`, rather than recomputing
-    // coin offsets again in the CM module (more deterministic, less error-prone).
+    // Plumb the setchk verifier point `r` forward for CM `eq(r, ro)`.
     *setchk_r_point_for_cm = Some(rs_digits.clone());
     let claimed0 = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
     let v_sc = super::cm_math::sumcheck_verify_degree3_ring_digits(&mut glue.gb, claimed0, &msgs_digits, &rs_digits)?;
@@ -1355,32 +1394,21 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
 
     let mut dcom_evals_local: Vec<DcomEvalDigits> = Vec::with_capacity(l_evals);
     for l in 0..l_evals {
-        // Optional debug: show where we are in the prefix payload stream.
-        let dbg_on = std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1");
-        let dbg_cur_at_l = if dbg_on { Some(cur) } else { None };
         let mut eval_a: Vec<GoldilocksScalar> = Vec::with_capacity(dcom_eval_vec_len);
-        let mut dbg_a0_absorb: Option<(usize, usize)> = None;
         for _ in 0..dcom_eval_vec_len {
             let (st, ln) = *prefix_payload.get(cur).ok_or("tiny gate: dcom eval.a absorb oob")?;
             cur += 1;
             if ln != 8 {
                 return Err("tiny gate: expected 8-byte absorb for dcom eval.a".to_string());
             }
-            if dbg_on && dbg_a0_absorb.is_none() {
-                dbg_a0_absorb = Some((st, ln));
-            }
             eval_a.push(parse_absorbed_scalar_as_goldilocks_digits(glue, pose_wiring, st));
         }
         let mut eval_c: Vec<RingDigits> = Vec::with_capacity(dcom_eval_vec_len);
-        let mut dbg_c0_absorb: Option<(usize, usize)> = None;
         for _ in 0..dcom_eval_vec_len {
             let (st, ln) = *prefix_payload.get(cur).ok_or("tiny gate: dcom eval.c absorb oob")?;
             cur += 1;
             if ln != ring_elem_bytes {
                 return Err("tiny gate: expected ring-elem absorb for dcom eval.c".to_string());
-            }
-            if dbg_on && dbg_c0_absorb.is_none() {
-                dbg_c0_absorb = Some((st, ln));
             }
             let rb = parse_ring_elem_absorb_as_ringbytes(glue, pose_wiring, ring_dim, st, ln)?;
             eval_c.push(ring_bytes_to_digits(&mut glue.gb, &rb));
@@ -1413,67 +1441,6 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                         eval_v[k] = alloc_witness_goldilocks_u64_digits(&mut glue.gb, v_l[k]);
                     }
                 }
-            }
-        }
-
-        // Debug: dump the first dcom eval.a[0] and eval.c[0] (coeff0) so we can compare against the
-        // CM sumcheck's implied claim.
-        if dbg_on && l == 0 && ring_dim == 64 {
-            #[inline]
-            fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
-                let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
-                let mut acc: i128 = 0;
-                let mut pow: i128 = 1;
-                for i in 0..17 {
-                    let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
-                    acc += di * pow;
-                    pow *= 16;
-                }
-                acc.rem_euclid(p) as u64
-            }
-            let asg = glue.gb.assignment.as_slice();
-            let a0_u64 = eval_a.get(0).map(|s| scalar_digits_to_u64_mod_p(asg, s)).unwrap_or(0);
-            let c0_u64 = eval_c.get(0).map(|r| scalar_digits_to_u64_mod_p(asg, &r[0])).unwrap_or(0);
-            eprintln!(
-                "[LF_DEBUG_DCOM_EVAL0] l=0 cur_start={} a0_u64={} c0_coeff0_u64={} a0_absorb={:?} c0_absorb={:?}",
-                dbg_cur_at_l.unwrap_or(0),
-                a0_u64,
-                c0_u64,
-                dbg_a0_absorb,
-                dbg_c0_absorb
-            );
-        }
-
-        // Debug: sanity-check that `eval.b[0]` matches the setchk `out.b` ring element when present.
-        // (For the honest prover, `eval.b[0]` is exactly `out.b[l]` in LF+.)
-        if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1") {
-            if !out_b_vars.is_empty() && !eval_b.is_empty() && ring_dim == 64 {
-                #[inline]
-                fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
-                    let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
-                    let mut acc: i128 = 0;
-                    let mut pow: i128 = 1;
-                    for i in 0..17 {
-                        let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
-                        acc += di * pow;
-                        pow *= 16;
-                    }
-                    acc.rem_euclid(p) as u64
-                }
-                #[inline]
-                fn ring_coeff0_u64(asg: &[F257], r: &RingDigits) -> u64 {
-                    scalar_digits_to_u64_mod_p(asg, &r[0])
-                }
-                let asg = glue.gb.assignment.as_slice();
-                let outb0 = ring_coeff0_u64(asg, &out_b_vars[0]);
-                let eb0 = ring_coeff0_u64(asg, &eval_b[0]);
-                eprintln!(
-                    "[LF_DEBUG_DCOM_B0_VS_OUT_B] l={} out_b_coeff0_u64={} eval_b0_coeff0_u64={} delta_u64={}",
-                    l,
-                    outb0,
-                    eb0,
-                    outb0.wrapping_sub(eb0),
-                );
             }
         }
 
@@ -1621,6 +1588,7 @@ fn compute_cm_shared_precomp_base(
         && ((params.k as usize) * ring_dim).is_power_of_two()
         && (params.l as usize).is_power_of_two()
         && setchk_out_e_vars_for_cm.is_some()
+        && setchk_r_point_for_cm.is_some()
     {
         let kappa = params.kappa as usize;
         let log_kappa = ark_std::log2(kappa.next_power_of_two()) as usize;
@@ -1679,8 +1647,8 @@ fn compute_cm_shared_precomp_base(
             // derived via the short-challenge rule (byte % u) - (u/2), NOT a centered byte.
             let need_sprime = k_decomp * ring_dim;
             // short_challenge(128): u = 2^(128/d), u <= 256 since d >= 1 and we only use this path for d=64.
-            let exp = (128usize / ring_dim) as u32;
-            let u = 1u64 << exp;
+            let exp = (128usize / ring_dim) as usize;
+            let u = 1u64 << (exp as u32);
             debug_assert!(u.is_power_of_two() && u <= 256);
             let half = u / 2;
             let half_bytes = alloc_const_goldilocks_u64(&mut glue.gb, half);
@@ -1695,111 +1663,64 @@ fn compute_cm_shared_precomp_base(
                 }
                 let mut re: RingDigits = Vec::with_capacity(ring_dim);
                 for &bv in &sb.byte_vars {
-                    // low = byte % u (u is power-of-two): low is the low `exp` bits.
-                    let bits = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, bv);
-                    let limb0: u64 = glue
-                        .gb
-                        .assignment[bv]
-                        .into_bigint()
-                        .as_ref()
-                        .get(0)
-                        .copied()
-                        .unwrap_or(0);
-                    let byte0 = (limb0 & 0xFF) as u64;
-                    let low_u64 = byte0 & (u - 1);
-                    let low_var = glue.gb.new_var(F257::from(low_u64));
-                    // Enforce low_var = Σ_{i<exp} 2^i * bits[i]
-                    let mut lc = vec![(F257::ONE, low_var)];
-                    let mut p2 = F257::ONE;
-                    for i in 0..(exp as usize) {
-                        lc.push((-p2, bits[i]));
-                        p2 = p2.double();
-                    }
-                    glue.gb.enforce_lc_times_one_eq_const(lc);
-
-                    // Interpret low as a u64 and compute (low - half) mod Goldilocks p in digit domain.
-                    let mut low_bytes = [zero_byte; 8];
-                    low_bytes[0] = low_var;
-                    let low_digits = goldilocks_bytes_to_digits(&mut glue.gb, low_bytes);
-                    let coeff_digits = goldilocks_sub_mod_p_digits(&mut glue.gb, &low_digits, &half_digits);
-                    re.push(coeff_digits);
+                    re.push(short_challenge_coeff_digits_from_byte_var_128(
+                        &mut glue.gb,
+                        bv,
+                        exp,
+                        u,
+                        &half_digits,
+                        zero_byte,
+                    ));
                 }
                 sflat.push(re);
             }
 
             // SetChk verifier point `r` used in eq(r, ro).
             //
-            // Prefer the point computed (and transcript-bound) during the SetChk prefix arithmetization
-            // to avoid duplicating coin-offset arithmetic here.
-            let rdig: Vec<GoldilocksScalar> = if let Some(rp) = setchk_r_point_for_cm.as_ref() {
-                // Also compute the cursor/offset-derived r and enforce equality, so we never silently
-                // diverge from the transcript schedule.
-                let nvars_lin = params.nvars_setchk as usize;
-                let n_lin_proofs = l_instances_expected;
-                let lin_chals = n_lin_proofs
-                    .checked_mul(2usize.saturating_mul(nvars_lin))
-                    .ok_or_else(|| "tiny gate: lin_chals overflow".to_string())?;
-                let nclaims = k_decomp.checked_add(1).ok_or_else(|| "tiny gate: nclaims overflow".to_string())?;
-                let out_coin_total = nclaims
-                    .checked_mul(nvars_lin + 2)
-                    .and_then(|x| x.checked_add(if k_decomp > 1 { 1 } else { 0 }))
-                    .ok_or_else(|| "tiny gate: out_coin_total overflow".to_string())?;
-                let r_start = lin_chals
-                    .checked_add(out_coin_total)
-                    .ok_or_else(|| "tiny gate: r_start overflow".to_string())?;
-                let r_end = r_start
-                    .checked_add(nvars_lin)
-                    .ok_or_else(|| "tiny gate: r_end overflow".to_string())?;
-                if u32_locals.len() < r_end {
-                    return Ok(None);
+            // This is computed (and transcript-bound) during the SetChk prefix arithmetization.
+            // We still recompute the cursor/offset-derived `r` here and enforce equality, so we
+            // never silently diverge from the transcript schedule.
+            let rp = setchk_r_point_for_cm
+                .as_ref()
+                .expect("setchk_r_point_for_cm must be Some when setchk_out_e_vars_for_cm is Some");
+            let nvars_lin = params.nvars_setchk as usize;
+            let n_lin_proofs = l_instances_expected;
+            let lin_chals = n_lin_proofs
+                .checked_mul(2usize.saturating_mul(nvars_lin))
+                .ok_or_else(|| "tiny gate: lin_chals overflow".to_string())?;
+            let nclaims = k_decomp
+                .checked_add(1)
+                .ok_or_else(|| "tiny gate: nclaims overflow".to_string())?;
+            let out_coin_total = nclaims
+                .checked_mul(nvars_lin + 2)
+                .and_then(|x| x.checked_add(if k_decomp > 1 { 1 } else { 0 }))
+                .ok_or_else(|| "tiny gate: out_coin_total overflow".to_string())?;
+            let r_start = lin_chals
+                .checked_add(out_coin_total)
+                .ok_or_else(|| "tiny gate: r_start overflow".to_string())?;
+            let r_end = r_start
+                .checked_add(nvars_lin)
+                .ok_or_else(|| "tiny gate: r_end overflow".to_string())?;
+            if u32_locals.len() < r_end {
+                return Ok(None);
+            }
+            let mut rdig_cursor: Vec<GoldilocksScalar> = Vec::with_capacity(nvars_lin);
+            for u in &u32_locals[r_start..r_end] {
+                let bytes = goldilocks_bytes_from_u32_le_bytes(
+                    &mut glue.gb,
+                    &[u.byte_vars[0], u.byte_vars[1], u.byte_vars[2], u.byte_vars[3]],
+                );
+                rdig_cursor.push(goldilocks_bytes_to_digits(&mut glue.gb, bytes));
+            }
+            if rp.len() != rdig_cursor.len() {
+                return Ok(None);
+            }
+            for (a, b) in rp.iter().zip(rdig_cursor.iter()) {
+                for i in 0..17 {
+                    glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, a[i]), (-F257::ONE, b[i])]);
                 }
-                let mut rdig_cursor: Vec<GoldilocksScalar> = Vec::with_capacity(nvars_lin);
-                for u in &u32_locals[r_start..r_end] {
-                    let bytes = goldilocks_bytes_from_u32_le_bytes(
-                        &mut glue.gb,
-                        &[u.byte_vars[0], u.byte_vars[1], u.byte_vars[2], u.byte_vars[3]],
-                    );
-                    rdig_cursor.push(goldilocks_bytes_to_digits(&mut glue.gb, bytes));
-                }
-                if rp.len() != rdig_cursor.len() {
-                    return Ok(None);
-                }
-                for (a, b) in rp.iter().zip(rdig_cursor.iter()) {
-                    for i in 0..17 {
-                        glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, a[i]), (-F257::ONE, b[i])]);
-                    }
-                }
-                rp.as_ref().clone()
-            } else {
-                let nvars_lin = params.nvars_setchk as usize;
-                let n_lin_proofs = l_instances_expected;
-                let lin_chals = n_lin_proofs
-                    .checked_mul(2usize.saturating_mul(nvars_lin))
-                    .ok_or_else(|| "tiny gate: lin_chals overflow".to_string())?;
-                let nclaims = k_decomp.checked_add(1).ok_or_else(|| "tiny gate: nclaims overflow".to_string())?;
-                let out_coin_total = nclaims
-                    .checked_mul(nvars_lin + 2)
-                    .and_then(|x| x.checked_add(if k_decomp > 1 { 1 } else { 0 }))
-                    .ok_or_else(|| "tiny gate: out_coin_total overflow".to_string())?;
-                let r_start = lin_chals
-                    .checked_add(out_coin_total)
-                    .ok_or_else(|| "tiny gate: r_start overflow".to_string())?;
-                let r_end = r_start
-                    .checked_add(nvars_lin)
-                    .ok_or_else(|| "tiny gate: r_end overflow".to_string())?;
-                if u32_locals.len() < r_end {
-                    return Ok(None);
-                }
-                let mut rdig: Vec<GoldilocksScalar> = Vec::with_capacity(nvars_lin);
-                for u in &u32_locals[r_start..r_end] {
-                    let bytes = goldilocks_bytes_from_u32_le_bytes(
-                        &mut glue.gb,
-                        &[u.byte_vars[0], u.byte_vars[1], u.byte_vars[2], u.byte_vars[3]],
-                    );
-                    rdig.push(goldilocks_bytes_to_digits(&mut glue.gb, bytes));
-                }
-                rdig
-            };
+            }
+            let rdig: Vec<GoldilocksScalar> = rp.as_ref().clone();
 
             // Compute u[l][ni] once (heavy): Σ out.e * s_prime_flat.
             let out_e_base = setchk_out_e_vars_for_cm.as_ref().unwrap().as_ref();
@@ -3601,9 +3522,6 @@ fn build_cm_glue_for_which(
     let c1_gl = &goldilocks_locals[cm_coin_start + log_kappa..cm_coin_start + 2 * log_kappa];
 
     // Precompute the ring-constant tables needed for t(z) evaluation.
-    //
-    // In the current tiny gate design, these are computed once in the base glue module and
-    // imported by each per-`which` CM module. Keep a fallback path for legacy call sites.
     let mut tensor_c0_ring: Option<Vec<RingDigits>> = None;
     let mut tensor_c1_ring: Option<Vec<RingDigits>> = None;
     let mut s_prime_flat_ring: Option<Vec<RingDigits>> = None;
@@ -3658,8 +3576,8 @@ fn build_cm_glue_for_which(
         }
         let z = glue.gb.new_var(F257::ZERO);
         glue.gb.enforce_var_eq_const(z, F257::ZERO);
-        let exp = (128usize / ring_dim) as u32;
-        let u = 1u64 << exp;
+        let exp = (128usize / ring_dim) as usize;
+        let u = 1u64 << (exp as u32);
         debug_assert!(u.is_power_of_two() && u <= 256);
         let half = u / 2;
         let half_bytes = alloc_const_goldilocks_u64(&mut glue.gb, half);
@@ -3673,31 +3591,14 @@ fn build_cm_glue_for_which(
             let mut re: RingDigits = Vec::with_capacity(ring_dim);
             for &bv_base in &sb.byte_vars {
                 let bv = glue.import_base_var(base_asg, bv_base);
-                let bits = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, bv);
-                let limb0: u64 = glue
-                    .gb
-                    .assignment[bv]
-                    .into_bigint()
-                    .as_ref()
-                    .get(0)
-                    .copied()
-                    .unwrap_or(0);
-                let byte0 = (limb0 & 0xFF) as u64;
-                let low_u64 = byte0 & (u - 1);
-                let low_var = glue.gb.new_var(F257::from(low_u64));
-                let mut lc = vec![(F257::ONE, low_var)];
-                let mut p2 = F257::ONE;
-                for i in 0..(exp as usize) {
-                    lc.push((-p2, bits[i]));
-                    p2 = p2.double();
-                }
-                glue.gb.enforce_lc_times_one_eq_const(lc);
-
-                let mut low_bytes = [z; 8];
-                low_bytes[0] = low_var;
-                let low_digits = goldilocks_bytes_to_digits(&mut glue.gb, low_bytes);
-                let coeff_digits = goldilocks_sub_mod_p_digits(&mut glue.gb, &low_digits, &half_digits);
-                re.push(coeff_digits);
+                re.push(short_challenge_coeff_digits_from_byte_var_128(
+                    &mut glue.gb,
+                    bv,
+                    exp,
+                    u,
+                    &half_digits,
+                    z,
+                ));
             }
             sflat.push(re);
         }
@@ -4017,9 +3918,6 @@ fn build_cm_glue_for_which(
                     // Build claimed_sum in batches to bound peak memory.
                     let l_batch: usize = (4 * rayon::current_num_threads().max(1)).max(1);
                     let mut claimed_sum = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
-                    let debug_expected_on =
-                        std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1");
-                    let mut expected_coeff0_total_u64: u64 = 0;
 
                     for l0 in (0..l_instances_expected).step_by(l_batch) {
                         let l1 = (l0 + l_batch).min(l_instances_expected);
@@ -4147,194 +4045,6 @@ fn build_cm_glue_for_which(
                             u_l,
                         }));
                         }
-
-                    // Debug: compute expected claimed_sum coeff0 from imported inputs (all l, all mlen).
-                    if debug_expected_on && ring_dim == 64 {
-                        #[inline]
-                        fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
-                            let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
-                            let mut acc: i128 = 0;
-                            let mut pow: i128 = 1;
-                            for i in 0..17 {
-                                let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
-                                acc += di * pow;
-                                pow *= 16;
-                            }
-                            acc.rem_euclid(p) as u64
-                        }
-                        #[inline]
-                        fn ring_coeff0_u64(asg: &[F257], r: &RingDigits) -> u64 {
-                            scalar_digits_to_u64_mod_p(asg, &r[0])
-                        }
-                        #[inline]
-                        fn mul_mod_p(a: u64, b: u64, p: u64) -> u64 {
-                            ((a as u128 * b as u128) % (p as u128)) as u64
-                        }
-                        #[inline]
-                        fn add_mod_p(a: u64, b: u64, p: u64) -> u64 {
-                            ((a as u128 + b as u128) % (p as u128)) as u64
-                        }
-
-                        let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
-                        let asg = glue.gb.assignment.as_slice();
-                        for (l, data) in &per_l {
-                            let l = *l;
-                            let mut acc = 0u64;
-
-                            // a0
-                            let a0 = scalar_digits_to_u64_mod_p(asg, &data.eval_a[0]);
-                            let rc_l = scalar_digits_to_u64_mod_p(asg, &rc_pows[data.l_idx]);
-                            acc = add_mod_p(acc, mul_mod_p(a0, rc_l, p), p);
-
-                            // b0/c0/u0
-                            let b0 = ring_coeff0_u64(asg, &data.eval_b[0]);
-                            let c0 = ring_coeff0_u64(asg, &data.eval_c[0]);
-                            let u0 = ring_coeff0_u64(asg, &data.u_l[0]);
-                            let rc_b0 = scalar_digits_to_u64_mod_p(asg, &rc_pows[data.l_idx + 1]);
-                            let rc_c0 = scalar_digits_to_u64_mod_p(asg, &rc_pows[data.l_idx + 2]);
-                            let rc_u0 = scalar_digits_to_u64_mod_p(asg, &rc_pows[data.l_idx + 3]);
-                            acc = add_mod_p(acc, mul_mod_p(b0, rc_b0, p), p);
-                            acc = add_mod_p(acc, mul_mod_p(c0, rc_c0, p), p);
-                            acc = add_mod_p(acc, mul_mod_p(u0, rc_u0, p), p);
-
-                            // M rows
-                            for i in 0..(params.mlen as usize) {
-                                let idx = data.l_idx + 4 + i * 4;
-                                let ai = scalar_digits_to_u64_mod_p(asg, &data.eval_a[1 + i]);
-                                let rci = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx]);
-                                acc = add_mod_p(acc, mul_mod_p(ai, rci, p), p);
-
-                                let bi = ring_coeff0_u64(asg, &data.eval_b[1 + i]);
-                                let ci = ring_coeff0_u64(asg, &data.eval_c[1 + i]);
-                                let ui = ring_coeff0_u64(asg, &data.u_l[1 + i]);
-                                let rcb = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx + 1]);
-                                let rcc = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx + 2]);
-                                let rcu = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx + 3]);
-                                acc = add_mod_p(acc, mul_mod_p(bi, rcb, p), p);
-                                acc = add_mod_p(acc, mul_mod_p(ci, rcc, p), p);
-                                acc = add_mod_p(acc, mul_mod_p(ui, rcu, p), p);
-                            }
-
-                            // tcch terms
-                            let tc0 = ring_coeff0_u64(asg, &tcch0[l]);
-                            let tc1 = ring_coeff0_u64(asg, &tcch1[l]);
-                            let rcz = scalar_digits_to_u64_mod_p(asg, &rc_pows[z_idx]);
-                            let rcz1 = scalar_digits_to_u64_mod_p(asg, &rc_pows[z_idx + 1]);
-                            acc = add_mod_p(acc, mul_mod_p(tc0, rcz, p), p);
-                            acc = add_mod_p(acc, mul_mod_p(tc1, rcz1, p), p);
-
-                            expected_coeff0_total_u64 = add_mod_p(expected_coeff0_total_u64, acc, p);
-                        }
-                    }
-
-                    // Debug: break down claimed_sum coeff0 for l=0 (local vars only).
-                    if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1")
-                        && l0 == 0
-                        && !per_l.is_empty()
-                        && ring_dim == 64
-                    {
-                        #[inline]
-                        fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
-                            let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
-                            let mut acc: i128 = 0;
-                            let mut pow: i128 = 1;
-                            for i in 0..17 {
-                                let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
-                                acc += di * pow;
-                                pow *= 16;
-                            }
-                            acc.rem_euclid(p) as u64
-                        }
-                        #[inline]
-                        fn ring_coeff0_u64(asg: &[F257], r: &RingDigits) -> u64 {
-                            scalar_digits_to_u64_mod_p(asg, &r[0])
-                        }
-                        #[inline]
-                        fn mul_mod_p(a: u64, b: u64, p: u64) -> u64 {
-                            ((a as u128 * b as u128) % (p as u128)) as u64
-                        }
-                        #[inline]
-                        fn add_mod_p(a: u64, b: u64, p: u64) -> u64 {
-                            ((a as u128 + b as u128) % (p as u128)) as u64
-                        }
-
-                        let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
-                        let asg = glue.gb.assignment.as_slice();
-                        let (l, data) = &per_l[0];
-                        let l = *l;
-
-                        let mut acc = 0u64;
-                        let a0 = scalar_digits_to_u64_mod_p(asg, &data.eval_a[0]);
-                        let rc_l = scalar_digits_to_u64_mod_p(asg, &rc_pows[data.l_idx]);
-                        let t_a0 = mul_mod_p(a0, rc_l, p);
-                        acc = add_mod_p(acc, t_a0, p);
-
-                        let b0 = ring_coeff0_u64(asg, &data.eval_b[0]);
-                        let c0 = ring_coeff0_u64(asg, &data.eval_c[0]);
-                        let u0 = ring_coeff0_u64(asg, &data.u_l[0]);
-                        let rc_b0 = scalar_digits_to_u64_mod_p(asg, &rc_pows[data.l_idx + 1]);
-                        let rc_c0 = scalar_digits_to_u64_mod_p(asg, &rc_pows[data.l_idx + 2]);
-                        let rc_u0 = scalar_digits_to_u64_mod_p(asg, &rc_pows[data.l_idx + 3]);
-                        let t_b0 = mul_mod_p(b0, rc_b0, p);
-                        let t_c0 = mul_mod_p(c0, rc_c0, p);
-                        let t_u0 = mul_mod_p(u0, rc_u0, p);
-                        acc = add_mod_p(acc, t_b0, p);
-                        acc = add_mod_p(acc, t_c0, p);
-                        acc = add_mod_p(acc, t_u0, p);
-
-                        // First M row only (i=0) to keep output small.
-                        let mut t_ai = None;
-                        let mut t_bi = None;
-                        let mut t_ci = None;
-                        let mut t_ui = None;
-                        if (params.mlen as usize) > 0 {
-                            let idx = data.l_idx + 4;
-                            let ai = scalar_digits_to_u64_mod_p(asg, &data.eval_a[1]);
-                            let rci = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx]);
-                            let aip = mul_mod_p(ai, rci, p);
-                            acc = add_mod_p(acc, aip, p);
-                            t_ai = Some(aip);
-
-                            let bi = ring_coeff0_u64(asg, &data.eval_b[1]);
-                            let ci = ring_coeff0_u64(asg, &data.eval_c[1]);
-                            let ui = ring_coeff0_u64(asg, &data.u_l[1]);
-                            let rcb = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx + 1]);
-                            let rcc = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx + 2]);
-                            let rcu = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx + 3]);
-                            let bip = mul_mod_p(bi, rcb, p);
-                            let cip = mul_mod_p(ci, rcc, p);
-                            let uip = mul_mod_p(ui, rcu, p);
-                            acc = add_mod_p(acc, bip, p);
-                            acc = add_mod_p(acc, cip, p);
-                            acc = add_mod_p(acc, uip, p);
-                            t_bi = Some(bip);
-                            t_ci = Some(cip);
-                            t_ui = Some(uip);
-                        }
-
-                        let tc0 = ring_coeff0_u64(asg, &tcch0[l]);
-                        let tc1 = ring_coeff0_u64(asg, &tcch1[l]);
-                        let rcz = scalar_digits_to_u64_mod_p(asg, &rc_pows[z_idx]);
-                        let rcz1 = scalar_digits_to_u64_mod_p(asg, &rc_pows[z_idx + 1]);
-                        let t_tc0 = mul_mod_p(tc0, rcz, p);
-                        let t_tc1 = mul_mod_p(tc1, rcz1, p);
-                        acc = add_mod_p(acc, t_tc0, p);
-                        acc = add_mod_p(acc, t_tc1, p);
-
-                        eprintln!(
-                            "[LF_DEBUG_CM_CLAIMED_SUM_TERMS] which={} l={} coeff0 terms: a0={} b0={} c0={} u0={} m0(a,b,c,u)={:?} tc0={} tc1={} total={}",
-                            which,
-                            l,
-                            t_a0,
-                            t_b0,
-                            t_c0,
-                            t_u0,
-                            (t_ai, t_bi, t_ci, t_ui),
-                            t_tc0,
-                            t_tc1,
-                            acc
-                        );
-                    }
 
                     // Build this batch's claimed_sum contributions as IR shards in parallel,
                     // then lower sequentially and accumulate in digit domain.
@@ -4494,34 +4204,6 @@ fn build_cm_glue_for_which(
                     }
                     } // end l-batch loop
 
-                    if debug_expected_on && ring_dim == 64 {
-                        #[inline]
-                        fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
-                            let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
-                            let mut acc: i128 = 0;
-                            let mut pow: i128 = 1;
-                            for i in 0..17 {
-                                let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
-                                acc += di * pow;
-                                pow *= 16;
-                            }
-                            acc.rem_euclid(p) as u64
-                        }
-                        #[inline]
-                        fn ring_coeff0_u64(asg: &[F257], r: &RingDigits) -> u64 {
-                            scalar_digits_to_u64_mod_p(asg, &r[0])
-                        }
-                        let asg = glue.gb.assignment.as_slice();
-                        let claim_coeff0_u64 = ring_coeff0_u64(asg, &claimed_sum);
-                        eprintln!(
-                            "[LF_DEBUG_CM_CLAIMED_SUM_EXPECTED] which={} expected_coeff0_u64={} claimed_coeff0_u64={} delta_u64={}",
-                            which,
-                            expected_coeff0_total_u64,
-                            claim_coeff0_u64,
-                            expected_coeff0_total_u64.wrapping_sub(claim_coeff0_u64),
-                        );
-                    }
-
                     claimed_sum_opt = Some(claimed_sum);
                 }
             }
@@ -4529,55 +4211,6 @@ fn build_cm_glue_for_which(
     }
 
     let claimed_sum = claimed_sum_opt.unwrap_or_else(|| super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim));
-
-    // Debug: show claimed_sum vs round-0 g01 (coeff 0).
-    // NOTE: Keep this strictly local-variable-only (no base-glue var indices), so it can't panic.
-    if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1") {
-        #[inline]
-        fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
-            let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
-            let mut acc: i128 = 0;
-            let mut pow: i128 = 1;
-            for i in 0..17 {
-                let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
-                acc += di * pow;
-                pow *= 16;
-            }
-            acc.rem_euclid(p) as u64
-        }
-        #[inline]
-        fn ring_coeff0_u64(asg: &[F257], r: &RingDigits) -> u64 {
-            scalar_digits_to_u64_mod_p(asg, &r[0])
-        }
-        #[inline]
-        fn mul_mod_p(a: u64, b: u64, p: u64) -> u64 {
-            ((a as u128 * b as u128) % (p as u128)) as u64
-        }
-        #[inline]
-        fn add_mod_p(a: u64, b: u64, p: u64) -> u64 {
-            let s = a as u128 + b as u128;
-            (s % (p as u128)) as u64
-        }
-
-        let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
-        let asg = glue.gb.assignment.as_slice();
-
-        // g01 for round 0, coeff 0
-        if !msgs_digits.is_empty() {
-            let m0c0 = ring_coeff0_u64(asg, &msgs_digits[0][0]);
-            let m1c0 = ring_coeff0_u64(asg, &msgs_digits[0][1]);
-            let g01c0 = add_mod_p(m0c0, m1c0, p);
-            let claimc0 = ring_coeff0_u64(asg, &claimed_sum);
-            eprintln!(
-                "[LF_DEBUG_CM_CLAIMED_SUM_BREAKDOWN] which={} round0 g01_coeff0_u64={} claim_coeff0_u64={} delta_u64={}",
-                which,
-                g01c0,
-                claimc0,
-                g01c0.wrapping_sub(claimc0),
-            );
-        }
-    }
-
     let subclaim_eval = super::cm_math::sumcheck_verify_degree2_ring_digits(&mut glue.gb, claimed_sum, &msgs_digits, &rs_digits)?;
 
     // Eval table absorbs sanity.
@@ -4603,41 +4236,8 @@ fn build_cm_glue_for_which(
         // eq(r, ro) where r is the transcript-derived SetChk point (recovered above).
         let eq = eq_eval_goldilocks_digits(&mut glue.gb, rpt, &rs_digits)?;
 
-        // Optional debug for the recombination equality `subclaim_eval == eval_acc`.
-        // This is intentionally lightweight (prints only coeff 0 as a u64 mod p).
-        if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1") {
-            #[inline]
-            fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
-                let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
-                let mut acc: i128 = 0;
-                let mut pow: i128 = 1;
-                for i in 0..17 {
-                    let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
-                    acc += di * pow;
-                    pow *= 16;
-                }
-                acc.rem_euclid(p) as u64
-            }
-
-            #[inline]
-            fn ring_coeff0_to_u64_mod_p(asg: &[F257], r: &RingDigits) -> u64 {
-                // RingDigits is coeff-major, so coeff 0 is `r[0]`.
-                scalar_digits_to_u64_mod_p(asg, &r[0])
-            }
-
-            let asg = glue.gb.assignment.as_slice();
-            let eq_u64 = scalar_digits_to_u64_mod_p(asg, &eq);
-            let rp0 = rpt.get(0).map(|s| scalar_digits_to_u64_mod_p(asg, s)).unwrap_or(0);
-            let ro0 = rs_digits.get(0).map(|s| scalar_digits_to_u64_mod_p(asg, s)).unwrap_or(0);
-            eprintln!(
-                "[LF_DEBUG_CM_RECOMB_EQ_SCALAR] which={} eq_u64={} rpt0_u64={} ro0_u64={}",
-                which, eq_u64, rp0, ro0
-            );
-        }
-
-        // Evaluate t0(ro), t1(ro) conservatively in **bal16** digits.
-        // This avoids relying on the bal4 end-to-end fast path when debugging correctness.
-        let (t0_ro, t1_ro) = eval_t_z_optimized_ring_digits_pair_bal16(
+        // Evaluate t0(ro), t1(ro) directly as **bal4** digits (avoids bal16->bal4 conversion later).
+        let (t0_4_base, t1_4_base) = eval_t_z_optimized_ring_digits_pair(
             &mut glue.gb,
             tc0_ring,
             tc1_ring,
@@ -4662,22 +4262,11 @@ fn build_cm_glue_for_which(
         // We only need to keep `e00s` for the later t(z) terms.
         let mut e00s: Vec<RingDigits> = Vec::with_capacity(l_instances_expected);
         let mut eval_acc = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
-        let mut eval_acc_core_opt: Option<RingDigits> = None;
 
         // We'll batch over `l` so we don't materialize all eval table ring elements at once.
         let l_batch: usize = (8 * rayon::current_num_threads().max(1)).max(1);
 
         if ring_dim == 64 {
-            // Debug: recompute eval_core coeff0 as u64 mod p directly from parsed eval table + rc_pows + eq.
-            // This lets us distinguish:
-            // - eval-table parse/weighting bugs (expected_core != eval_core), vs
-            // - t(z) path bugs (core matches, but total still mismatches).
-            let mut debug_eval_core_expected_u64: Option<u64> = if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1") {
-                Some(0u64)
-            } else {
-                None
-            };
-
             // Precompute `eq` in bal4 once (shared across all per-l shards).
             let eq4_base: [usize; 33] = {
                 use super::cm_ir::{IrBuilder, VarRef as IrVarRef};
@@ -4703,8 +4292,6 @@ fn build_cm_glue_for_which(
                 for l in l0..l1 {
                     let mut terms: Vec<RingDigits> = Vec::with_capacity(rows_per_l * 4);
                     let mut e00_opt: Option<RingDigits> = None;
-                    // Debug: accumulate coeff0 contribution for this l (before multiplying by eq).
-                    let mut dbg_sum_l_u64: u64 = 0;
                     for row in 0..rows_per_l {
                         let flat = l * rows_per_l + row;
                         for j in 0..4 {
@@ -4714,67 +4301,12 @@ fn build_cm_glue_for_which(
                             if row == 0 && j == 0 {
                                 e00_opt = Some(rd.clone());
                             }
-                            if debug_eval_core_expected_u64.is_some() {
-                                // coeff0(rd) * rc_pows[l_idx + row*4 + j]
-                                #[inline]
-                                fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
-                                    let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
-                                    let mut acc: i128 = 0;
-                                    let mut pow: i128 = 1;
-                                    for i in 0..17 {
-                                        let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
-                                        acc += di * pow;
-                                        pow *= 16;
-                                    }
-                                    acc.rem_euclid(p) as u64
-                                }
-                                #[inline]
-                                fn mul_mod_p(a: u64, b: u64, p: u64) -> u64 {
-                                    ((a as u128 * b as u128) % (p as u128)) as u64
-                                }
-                                #[inline]
-                                fn add_mod_p(a: u64, b: u64, p: u64) -> u64 {
-                                    ((a as u128 + b as u128) % (p as u128)) as u64
-                                }
-                                let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
-                                let asg = glue.gb.assignment.as_slice();
-                                let term_u64 = scalar_digits_to_u64_mod_p(asg, &rd[0]);
-                                let idx = l * (4 + 4 * (params.mlen as usize)) + row * 4 + j;
-                                let rc_u64 = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx]);
-                                dbg_sum_l_u64 = add_mod_p(dbg_sum_l_u64, mul_mod_p(term_u64, rc_u64, p), p);
-                            }
                             terms.push(rd);
                         }
                     }
                     let e00 = e00_opt.ok_or_else(|| "tiny gate: missing e00 in recombination".to_string())?;
                     e00s.push(e00);
                     batch_terms.push(terms);
-                    if let Some(total) = debug_eval_core_expected_u64.as_mut() {
-                        #[inline]
-                        fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
-                            let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
-                            let mut acc: i128 = 0;
-                            let mut pow: i128 = 1;
-                            for i in 0..17 {
-                                let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
-                                acc += di * pow;
-                                pow *= 16;
-                            }
-                            acc.rem_euclid(p) as u64
-                        }
-                        #[inline]
-                        fn mul_mod_p(a: u64, b: u64, p: u64) -> u64 {
-                            ((a as u128 * b as u128) % (p as u128)) as u64
-                        }
-                        #[inline]
-                        fn add_mod_p(a: u64, b: u64, p: u64) -> u64 {
-                            ((a as u128 + b as u128) % (p as u128)) as u64
-                        }
-                        let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
-                        let asg = glue.gb.assignment.as_slice();
-                        let eq_u64 = scalar_digits_to_u64_mod_p(asg, &eq);
-                        *total = add_mod_p(*total, mul_mod_p(eq_u64, dbg_sum_l_u64, p), p);
-                    }
                 }
 
                 let frags = {
@@ -4848,160 +4380,102 @@ fn build_cm_glue_for_which(
                     eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &contrib);
                 }
             }
-
-            if let Some(expected_core_u64) = debug_eval_core_expected_u64 {
-                #[inline]
-                fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
-                    let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
-                    let mut acc: i128 = 0;
-                    let mut pow: i128 = 1;
-                    for i in 0..17 {
-                        let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
-                        acc += di * pow;
-                        pow *= 16;
-                    }
-                    acc.rem_euclid(p) as u64
-                }
-                #[inline]
-                fn ring_coeff0_u64(asg: &[F257], r: &RingDigits) -> u64 {
-                    scalar_digits_to_u64_mod_p(asg, &r[0])
-                }
-                let asg = glue.gb.assignment.as_slice();
-                let eval_core_u64 = ring_coeff0_u64(asg, &eval_acc);
-                eprintln!(
-                    "[LF_DEBUG_CM_RECOMB_CORE_EXPECTED] which={} expected_core_u64={} eval_core_u64={} delta_u64={}",
-                    which,
-                    expected_core_u64,
-                    eval_core_u64,
-                    expected_core_u64.wrapping_sub(eval_core_u64),
-                );
-            }
         } else {
             return Err("tiny gate: recombination check requires ring_dim=64".to_string());
         }
 
-        // Snapshot eval_acc *before* adding the t(z) terms, for debugging.
-        if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1") && ring_dim == 64 {
-            eval_acc_core_opt = Some(eval_acc.clone());
-        }
-
         // t(z) terms: for each l, add t0(ro)*e00(l)*rc^z + t1(ro)*e00(l)*rc^{z+1}.
-        // Conservative digit-domain path (bal16): avoids the bal4 end-to-end pipeline.
+        //
+        // These ring-muls are independent across l, so we build them as IR fragments in parallel,
+        // then lower sequentially into this module's builder.
         {
-            let rcz = &rc_pows[z_idx];
-            let rcz1 = &rc_pows[z_idx + 1];
-            for e00 in &e00s {
-                let out0 = super::cm_math::ring_mul_negacyclic_digits_d64(&mut glue.gb, &t0_ro, e00)?;
-                let out1 = super::cm_math::ring_mul_negacyclic_digits_d64(&mut glue.gb, &t1_ro, e00)?;
-                let s0 = super::cm_math::ring_scale_digits(&mut glue.gb, &out0, rcz);
-                let s1 = super::cm_math::ring_scale_digits(&mut glue.gb, &out1, rcz1);
-                let sum = super::cm_math::ring_add_digits(&mut glue.gb, &s0, &s1);
-                eval_acc = super::cm_math::ring_add_digits(&mut glue.gb, &eval_acc, &sum);
-            }
-        }
+            use super::cm_ir::{
+                bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir, goldilocks_mul_mod_p_digits_bal4_ir,
+                lower_ir_into_builder, ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir, IrBuilder, VarRef as IrVarRef,
+            };
 
-        // Optional debug: show coeff0 breakdown for recombination accumulator.
-        if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1") && ring_dim == 64 {
             #[inline]
-            fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
-                let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
-                let mut acc: i128 = 0;
-                let mut pow: i128 = 1;
-                for i in 0..17 {
-                    let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
-                    acc += di * pow;
-                    pow *= 16;
+            fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
+                if a.len() != 64 {
+                    return Err("tiny gate: expected ring_dim=64 for IR ring-mul".to_string());
                 }
-                acc.rem_euclid(p) as u64
+                Ok(core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j]))))
             }
-            #[inline]
-            fn ring_coeff0_u64(asg: &[F257], r: &RingDigits) -> u64 {
-                scalar_digits_to_u64_mod_p(asg, &r[0])
-            }
-            #[inline]
-            fn sub_mod_p(a: u64, b: u64, p: u64) -> u64 {
-                ((a as i128 - b as i128).rem_euclid(p as i128)) as u64
-            }
-            let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
-            let asg = glue.gb.assignment.as_slice();
-            let sub_u64 = ring_coeff0_u64(asg, &subclaim_eval);
-            let acc_total_u64 = ring_coeff0_u64(asg, &eval_acc);
-            let acc_core_u64 = eval_acc_core_opt
-                .as_ref()
-                .map(|r| ring_coeff0_u64(asg, r))
-                .unwrap_or(0);
-            let t_u64 = sub_mod_p(acc_total_u64, acc_core_u64, p);
-            eprintln!(
-                "[LF_DEBUG_CM_RECOMB_BREAKDOWN] which={} sub_u64={} eval_core_u64={} t_u64={} eval_total_u64={} delta_u64={}",
-                which,
-                sub_u64,
-                acc_core_u64,
-                t_u64,
-                acc_total_u64,
-                sub_u64.wrapping_sub(acc_total_u64),
-            );
-        }
 
-        // Optional debug: localize the recombination equality failure
-        // `subclaim_eval == eval_acc` (this is the failing `cm0` constraint you tagged).
-        if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1") {
-            let asg = glue.gb.assignment.as_slice();
             #[inline]
-            fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
-                let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
-                let mut acc: i128 = 0;
-                let mut pow: i128 = 1;
-                for i in 0..17 {
-                    let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
-                    acc += di * pow;
-                    pow *= 16;
-                }
-                acc.rem_euclid(p) as u64
+            fn map_ring_out(out_ir: &[[IrVarRef; 17]; 64], lowered: &super::cm_ir::LoweredIr) -> RingDigits {
+                let out: [GoldilocksScalar; 64] =
+                    core::array::from_fn(|i| core::array::from_fn(|j| lowered.map_var(out_ir[i][j])));
+                out.into_iter().collect()
             }
-            let mut n: usize = 0;
-            for (coeff, (a, b)) in subclaim_eval.iter().zip(eval_acc.iter()).enumerate() {
-                for d in 0..17 {
-                    let va = asg[a[d]];
-                    let vb = asg[b[d]];
-                    if va == vb {
-                        continue;
+
+            // Precompute rc^z scalars in bal4 once.
+            // Avoid borrowing `glue.gb.assignment` across `lower_ir_into_builder(&mut glue.gb, ...)`.
+            // IMPORTANT: after lowering this precompute IR, we must take a *fresh* snapshot for the
+            // per-`l` shards, since they will read witness values of the newly allocated base vars.
+            let (rcz4_base, rcz14_base): ([usize; 33], [usize; 33]) = {
+                let rcz16: [IrVarRef; 17] = core::array::from_fn(|k| IrVarRef::Base(rc_pows[z_idx][k]));
+                let rcz116: [IrVarRef; 17] = core::array::from_fn(|k| IrVarRef::Base(rc_pows[z_idx + 1][k]));
+                let (ir, rcz4_ir, rcz14_ir) = {
+                    let base_asg = glue.gb.assignment.as_slice();
+                    let mut ib = IrBuilder::new(base_asg);
+                    let rcz4 = ib.bal16_to_bal4_digits_cached(&rcz16);
+                    let rcz14 = ib.bal16_to_bal4_digits_cached(&rcz116);
+                    (ib.ir, rcz4, rcz14)
+                };
+                let lowered = lower_ir_into_builder(&mut glue.gb, ir);
+                let rcz4_base: [usize; 33] = core::array::from_fn(|k| lowered.map_var(rcz4_ir[k]));
+                let rcz14_base: [usize; 33] = core::array::from_fn(|k| lowered.map_var(rcz14_ir[k]));
+                (rcz4_base, rcz14_base)
+            };
+
+            let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+
+            // Fresh snapshot including the precompute vars (no clone, and no borrow held across lowering).
+            // Safety: `glue.gb.assignment` is not mutated while building `frags` (lowering happens after `collect`).
+            // NOTE: use `usize` address so it is `Sync` for rayon closures.
+            let base_asg_addr: usize = glue.gb.assignment.as_ptr() as usize;
+            let base_asg_len: usize = glue.gb.assignment.len();
+
+            let frags: Vec<(_, [[IrVarRef; 17]; 64])> = e00s
+                .par_iter()
+                .map(|e00| -> Result<_, String> {
+                    // Build one shard that does:
+                    //  - ring-mul in bal4
+                    //  - scale in bal4 by rc^z / rc^{z+1}
+                    //  - add in bal4, then convert once to bal16 for accumulation
+                    let e00_16 = ringdigits64_to_ir(e00)?;
+                    let t0_4: [[IrVarRef; 33]; 64] =
+                        core::array::from_fn(|i| core::array::from_fn(|k| IrVarRef::Base(t0_4_base[i][k])));
+                    let t1_4: [[IrVarRef; 33]; 64] =
+                        core::array::from_fn(|i| core::array::from_fn(|k| IrVarRef::Base(t1_4_base[i][k])));
+                    let rcz4: [IrVarRef; 33] = core::array::from_fn(|k| IrVarRef::Base(rcz4_base[k]));
+                    let rcz14: [IrVarRef; 33] = core::array::from_fn(|k| IrVarRef::Base(rcz14_base[k]));
+
+                    let base_asg_ptr: *const F257 = base_asg_addr as *const F257;
+                    let base_asg: &[F257] = unsafe { core::slice::from_raw_parts(base_asg_ptr, base_asg_len) };
+                    let mut ib = IrBuilder::new(base_asg);
+                    let e00_4: [[IrVarRef; 33]; 64] = core::array::from_fn(|i| ib.bal16_to_bal4_digits_cached(&e00_16[i]));
+
+                    let out0_4 = ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir(&mut ib, &t0_4, &e00_4);
+                    let out1_4 = ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir(&mut ib, &t1_4, &e00_4);
+                    super::op_counts::tiny_cm_bump(|c| c.ring_mul_negacyclic += 2);
+
+                    let mut out16: [[IrVarRef; 17]; 64] = [[IrVarRef::Base(0); 17]; 64];
+                    for i in 0..64 {
+                        let s0 = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &out0_4[i], &rcz4, p_u64);
+                        let s1 = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &out1_4[i], &rcz14, p_u64);
+                        let sum4 = goldilocks_add_mod_p_digits_bal4_ir(&mut ib, &s0, &s1, p_u64);
+                        out16[i] = bal4_to_bal16_digits_ir(&mut ib, &sum4);
                     }
-                    eprintln!(
-                        "[LF_DEBUG_CM_RECOMB_EQ_MISMATCH] which={} coeff={} digit={} \
-                         sub_var={} sub_val={}({}) eval_var={} eval_val={}({}) diff={}",
-                        which,
-                        coeff,
-                        d,
-                        a[d],
-                        va,
-                        super::digits::f257_to_i32_bal(va),
-                        b[d],
-                        vb,
-                        super::digits::f257_to_i32_bal(vb),
-                        super::digits::f257_to_i32_bal(va - vb),
-                    );
-                    if coeff == 0 && d == 0 {
-                        let su = scalar_digits_to_u64_mod_p(asg, a);
-                        let eu = scalar_digits_to_u64_mod_p(asg, b);
-                        eprintln!(
-                            "  [LF_DEBUG_CM_RECOMB_EQ_MISMATCH_SCALAR] which={} coeff=0 sub_u64={} eval_u64={} delta_u64={}",
-                            which,
-                            su,
-                            eu,
-                            su.wrapping_sub(eu),
-                        );
-                    }
-                    n += 1;
-                    if n >= 8 {
-                        break;
-                    }
-                }
-                if n >= 8 {
-                    break;
-                }
-            }
-            if n == 0 {
-                eprintln!("[LF_DEBUG_CM_RECOMB_EQ_MISMATCH] which={} subclaim_eval==eval_acc (no mismatches)", which);
+                    Ok((ib.ir, out16))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            for (ir, out_ir) in frags {
+                let lowered = lower_ir_into_builder(&mut glue.gb, ir);
+                let contrib = map_ring_out(&out_ir, &lowered);
+                eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &contrib);
             }
         }
 
