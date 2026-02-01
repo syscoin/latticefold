@@ -1398,6 +1398,39 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
             }
         }
 
+        // Debug: sanity-check that `eval.b[0]` matches the setchk `out.b` ring element when present.
+        // (For the honest prover, `eval.b[0]` is exactly `out.b[l]` in LF+.)
+        if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1") {
+            if !out_b_vars.is_empty() && !eval_b.is_empty() && ring_dim == 64 {
+                #[inline]
+                fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
+                    let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
+                    let mut acc: i128 = 0;
+                    let mut pow: i128 = 1;
+                    for i in 0..17 {
+                        let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
+                        acc += di * pow;
+                        pow *= 16;
+                    }
+                    acc.rem_euclid(p) as u64
+                }
+                #[inline]
+                fn ring_coeff0_u64(asg: &[F257], r: &RingDigits) -> u64 {
+                    scalar_digits_to_u64_mod_p(asg, &r[0])
+                }
+                let asg = glue.gb.assignment.as_slice();
+                let outb0 = ring_coeff0_u64(asg, &out_b_vars[0]);
+                let eb0 = ring_coeff0_u64(asg, &eval_b[0]);
+                eprintln!(
+                    "[LF_DEBUG_DCOM_B0_VS_OUT_B] l={} out_b_coeff0_u64={} eval_b0_coeff0_u64={} delta_u64={}",
+                    l,
+                    outb0,
+                    eb0,
+                    outb0.wrapping_sub(eb0),
+                );
+            }
+        }
+
         for i in 0..eval_a.len() {
             let ct = ct_psi_mul_ring_digits_d64(&mut glue.gb, &eval_b[i])?;
             for di in 0..17 {
