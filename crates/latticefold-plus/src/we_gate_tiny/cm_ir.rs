@@ -317,25 +317,237 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
     // This avoids the "term pool" RAM blow-ups at the cost of slower lowering (we can optimize
     // streaming writes later).
     if gb.is_file_backed() {
+        // If constraint debugging is enabled, preserve the original per-constraint streaming path
+        // so `LF_DEBUG_CONSTRAINT_AT` can target a specific next constraint deterministically.
+        let debug_on = std::env::var("LF_DEBUG_CONSTRAINT_AT").ok().is_some();
+
         let mut local_to_var: Vec<usize> = Vec::with_capacity(local_asg.len());
         local_to_var.push(0); // Local(0) unused
         for &v in local_asg.iter().skip(1) {
             local_to_var.push(gb.new_var(v));
         }
         let lowered = LoweredIr { base_nvars, local_to_var };
-        for ic in constraints {
-            gb.add_constraint_terms_iter(
-                a_terms[ic.a.clone()]
-                    .iter()
-                    .map(|(coef, v)| (*coef, lowered.map_var(*v))),
-                b_terms[ic.b.clone()]
-                    .iter()
-                    .map(|(coef, v)| (*coef, lowered.map_var(*v))),
-                c_terms[ic.c.clone()]
-                    .iter()
-                    .map(|(coef, v)| (*coef, lowered.map_var(*v))),
-            );
+
+        if debug_on || constraints.is_empty() {
+            for ic in constraints {
+                gb.add_constraint_terms_iter(
+                    a_terms[ic.a.clone()]
+                        .iter()
+                        .map(|(coef, v)| (*coef, lowered.map_var(*v))),
+                    b_terms[ic.b.clone()]
+                        .iter()
+                        .map(|(coef, v)| (*coef, lowered.map_var(*v))),
+                    c_terms[ic.c.clone()]
+                        .iter()
+                        .map(|(coef, v)| (*coef, lowered.map_var(*v))),
+                );
+            }
+            return lowered;
         }
+
+        // Performance path (file-backed): do block-wise parallel remap+serialization into flat buffers,
+        // then bulk append to the file-backed sink.
+        //
+        // This uses all cores on the CPU-heavy side (var remap + arkworks serialization) while keeping
+        // IO writes large and sequential.
+        let Some(coeff_size) = gb.file_coeff_size() else {
+            // Should be impossible since `is_file_backed()` was true.
+            for ic in constraints {
+                gb.add_constraint_terms_iter(
+                    a_terms[ic.a.clone()]
+                        .iter()
+                        .map(|(coef, v)| (*coef, lowered.map_var(*v))),
+                    b_terms[ic.b.clone()]
+                        .iter()
+                        .map(|(coef, v)| (*coef, lowered.map_var(*v))),
+                    c_terms[ic.c.clone()]
+                        .iter()
+                        .map(|(coef, v)| (*coef, lowered.map_var(*v))),
+                );
+            }
+            return lowered;
+        };
+
+        // Tuneable: constraints per block (bounds peak RAM of flat buffers).
+        let block_constraints: usize = std::env::var("LFP_TINY_FILE_LOWER_BLOCK_CONSTRAINTS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(4096);
+
+        // Local serialization helper: write canonical uncompressed bytes into `out` (fixed size).
+        #[inline]
+        fn serialize_fixed_noalloc<F: ark_serialize::CanonicalSerialize>(x: &F, out: &mut [u8]) {
+            use ark_serialize::{Compress, CanonicalSerialize};
+            use core::cmp::min;
+            use std::io::Write as _;
+
+            struct SliceWriter<'a> {
+                buf: &'a mut [u8],
+                pos: usize,
+            }
+            impl<'a> std::io::Write for SliceWriter<'a> {
+                fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                    let rem = self.buf.len().saturating_sub(self.pos);
+                    let n = min(rem, data.len());
+                    if n == 0 {
+                        return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "SliceWriter overflow"));
+                    }
+                    self.buf[self.pos..self.pos + n].copy_from_slice(&data[..n]);
+                    self.pos += n;
+                    Ok(n)
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+
+            let mut w = SliceWriter { buf: out, pos: 0 };
+            x.serialize_with_mode(&mut w, Compress::No)
+                .expect("serialize_fixed_noalloc failed");
+            debug_assert_eq!(w.pos, out.len());
+        }
+
+        // Capture mapping pieces for fast remap.
+        let base_nvars_local = lowered.base_nvars;
+        let local_to_var = &lowered.local_to_var;
+        #[inline]
+        fn map_var_fast(base_nvars: usize, local_to_var: &[usize], v: VarRef) -> u64 {
+            match v {
+                VarRef::Base(i) => i as u64,
+                VarRef::Local(j) => {
+                    debug_assert!(j > 0);
+                    debug_assert_eq!(local_to_var[j], base_nvars + (j - 1));
+                    local_to_var[j] as u64
+                }
+            }
+        }
+
+        let mut idx0: usize = 0;
+        while idx0 < constraints.len() {
+            let idx1 = (idx0 + block_constraints).min(constraints.len());
+            let cons = &constraints[idx0..idx1];
+
+            // Per-constraint term counts and prefix sums.
+            let n = cons.len();
+            let mut a_counts: Vec<usize> = Vec::with_capacity(n);
+            let mut b_counts: Vec<usize> = Vec::with_capacity(n);
+            let mut c_counts: Vec<usize> = Vec::with_capacity(n);
+            for ic in cons {
+                a_counts.push(ic.a.end - ic.a.start);
+                b_counts.push(ic.b.end - ic.b.start);
+                c_counts.push(ic.c.end - ic.c.start);
+            }
+            let mut a_offs: Vec<usize> = Vec::with_capacity(n + 1);
+            let mut b_offs: Vec<usize> = Vec::with_capacity(n + 1);
+            let mut c_offs: Vec<usize> = Vec::with_capacity(n + 1);
+            a_offs.push(0);
+            b_offs.push(0);
+            c_offs.push(0);
+            for i in 0..n {
+                a_offs.push(a_offs[i] + a_counts[i]);
+                b_offs.push(b_offs[i] + b_counts[i]);
+                c_offs.push(c_offs[i] + c_counts[i]);
+            }
+            let total_a = *a_offs.last().unwrap_or(&0);
+            let total_b = *b_offs.last().unwrap_or(&0);
+            let total_c = *c_offs.last().unwrap_or(&0);
+
+            // Flat buffers (coeff bytes + indices).
+            let mut a_coeffs: Vec<u8> = vec![0u8; total_a.saturating_mul(coeff_size)];
+            let mut b_coeffs: Vec<u8> = vec![0u8; total_b.saturating_mul(coeff_size)];
+            let mut c_coeffs: Vec<u8> = vec![0u8; total_c.saturating_mul(coeff_size)];
+            let mut a_idx: Vec<u64> = vec![0u64; total_a];
+            let mut b_idx: Vec<u64> = vec![0u64; total_b];
+            let mut c_idx: Vec<u64> = vec![0u64; total_c];
+
+            // Parallel fill with disjoint writes.
+            #[derive(Copy, Clone)]
+            struct SyncPtr<T>(*mut T);
+            unsafe impl<T> Send for SyncPtr<T> {}
+            unsafe impl<T> Sync for SyncPtr<T> {}
+            impl<T> SyncPtr<T> {
+                #[inline]
+                unsafe fn write(&self, off: usize, v: T) {
+                    core::ptr::write(self.0.add(off), v);
+                }
+            }
+
+            let out_a_idx: SyncPtr<u64> = SyncPtr(a_idx.as_mut_ptr());
+            let out_b_idx: SyncPtr<u64> = SyncPtr(b_idx.as_mut_ptr());
+            let out_c_idx: SyncPtr<u64> = SyncPtr(c_idx.as_mut_ptr());
+
+            // Raw ptrs to coefficient byte buffers.
+            let a_bytes_ptr: usize = a_coeffs.as_mut_ptr() as usize;
+            let b_bytes_ptr: usize = b_coeffs.as_mut_ptr() as usize;
+            let c_bytes_ptr: usize = c_coeffs.as_mut_ptr() as usize;
+
+            use rayon::prelude::*;
+            cons.par_iter().enumerate().for_each(|(i, ic)| unsafe {
+                // A terms.
+                let a_dst0 = a_offs[i];
+                for (k, (coef, v)) in a_terms[ic.a.clone()].iter().enumerate() {
+                    let pos = a_dst0 + k;
+                    out_a_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, *v));
+                    let dst = (a_bytes_ptr as *mut u8).add(pos * coeff_size);
+                    let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
+                    serialize_fixed_noalloc(coef, dst_slice);
+                }
+                // B terms.
+                let b_dst0 = b_offs[i];
+                for (k, (coef, v)) in b_terms[ic.b.clone()].iter().enumerate() {
+                    let pos = b_dst0 + k;
+                    out_b_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, *v));
+                    let dst = (b_bytes_ptr as *mut u8).add(pos * coeff_size);
+                    let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
+                    serialize_fixed_noalloc(coef, dst_slice);
+                }
+                // C terms.
+                let c_dst0 = c_offs[i];
+                for (k, (coef, v)) in c_terms[ic.c.clone()].iter().enumerate() {
+                    let pos = c_dst0 + k;
+                    out_c_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, *v));
+                    let dst = (c_bytes_ptr as *mut u8).add(pos * coeff_size);
+                    let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
+                    serialize_fixed_noalloc(coef, dst_slice);
+                }
+            });
+
+            // Bulk append: write all terms, then all rows.
+            let (_rows0, a0, b0, c0) = gb
+                .file_counts()
+                .expect("file_counts must be Some in file-backed mode");
+
+            // A pool.
+            for t in 0..total_a {
+                let off = t * coeff_size;
+                gb.file_push_a_term_raw(&a_coeffs[off..off + coeff_size], a_idx[t])?;
+            }
+            // B pool.
+            for t in 0..total_b {
+                let off = t * coeff_size;
+                gb.file_push_b_term_raw(&b_coeffs[off..off + coeff_size], b_idx[t])?;
+            }
+            // C pool.
+            for t in 0..total_c {
+                let off = t * coeff_size;
+                gb.file_push_c_term_raw(&c_coeffs[off..off + coeff_size], c_idx[t])?;
+            }
+
+            // Rows referencing the just-appended pools.
+            for i in 0..n {
+                let a_start = a0 + (a_offs[i] as u64);
+                let a_end = a_start + (a_counts[i] as u64);
+                let b_start = b0 + (b_offs[i] as u64);
+                let b_end = b_start + (b_counts[i] as u64);
+                let c_start = c0 + (c_offs[i] as u64);
+                let c_end = c_start + (c_counts[i] as u64);
+                gb.file_push_constraint_row(a_start, a_end, b_start, b_end, c_start, c_end)?;
+            }
+
+            idx0 = idx1;
+        }
+
         return lowered;
     }
     // Big win for wall-time: avoid repeated reallocations during append.
