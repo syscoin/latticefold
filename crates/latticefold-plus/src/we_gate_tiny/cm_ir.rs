@@ -1,4 +1,4 @@
-use ark_ff::Field;
+use ark_ff::{Field, PrimeField};
 use latticefold::transcript::poseidon::F257;
 use symphony::dpp_poseidon::{Constraint, SparseDr1csInstance};
 use symphony::dpp_sumcheck::Dr1csBuilder;
