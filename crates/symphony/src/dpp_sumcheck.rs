@@ -119,6 +119,66 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         self.file_sink.is_some()
     }
 
+    /// If file-backed, return the fixed serialized coefficient size (bytes).
+    #[inline]
+    pub fn file_coeff_size(&self) -> Option<usize> {
+        self.file_sink.as_ref().map(|s| s.coeff_size())
+    }
+
+    /// If file-backed, return the current on-disk counters (rows, a_terms, b_terms, c_terms).
+    #[inline]
+    pub fn file_counts(&self) -> Option<(u64, u64, u64, u64)> {
+        if self.file_sink.is_some() {
+            Some((self.file_rows, self.file_a_terms, self.file_b_terms, self.file_c_terms))
+        } else {
+            None
+        }
+    }
+
+    /// File-backed: append a block of A-terms.
+    pub fn file_push_a_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u64]) -> Result<(), String> {
+        let sink = self
+            .file_sink
+            .as_mut()
+            .ok_or_else(|| "file_push_a_terms_raw_block called on non-file-backed builder".to_string())?;
+        sink.push_a_terms_raw_block(coeff_bytes, idx)?;
+        self.file_a_terms = self.file_a_terms.saturating_add(idx.len() as u64);
+        Ok(())
+    }
+
+    /// File-backed: append a block of B-terms.
+    pub fn file_push_b_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u64]) -> Result<(), String> {
+        let sink = self
+            .file_sink
+            .as_mut()
+            .ok_or_else(|| "file_push_b_terms_raw_block called on non-file-backed builder".to_string())?;
+        sink.push_b_terms_raw_block(coeff_bytes, idx)?;
+        self.file_b_terms = self.file_b_terms.saturating_add(idx.len() as u64);
+        Ok(())
+    }
+
+    /// File-backed: append a block of C-terms.
+    pub fn file_push_c_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u64]) -> Result<(), String> {
+        let sink = self
+            .file_sink
+            .as_mut()
+            .ok_or_else(|| "file_push_c_terms_raw_block called on non-file-backed builder".to_string())?;
+        sink.push_c_terms_raw_block(coeff_bytes, idx)?;
+        self.file_c_terms = self.file_c_terms.saturating_add(idx.len() as u64);
+        Ok(())
+    }
+
+    /// File-backed: append a block of constraint rows (6 u64 words per row).
+    pub fn file_push_constraint_rows_block(&mut self, words: &[u64]) -> Result<(), String> {
+        let sink = self
+            .file_sink
+            .as_mut()
+            .ok_or_else(|| "file_push_constraint_rows_block called on non-file-backed builder".to_string())?;
+        sink.push_constraint_rows_block(words)?;
+        self.file_rows = self.file_rows.saturating_add((words.len() / 6) as u64);
+        Ok(())
+    }
+
     #[inline]
     pub fn nconstraints(&self) -> u64 {
         if self.file_sink.is_some() {

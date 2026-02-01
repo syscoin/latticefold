@@ -317,25 +317,236 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
     // This avoids the "term pool" RAM blow-ups at the cost of slower lowering (we can optimize
     // streaming writes later).
     if gb.is_file_backed() {
+        // Keep deterministic single-step streaming when constraint debugging is enabled.
+        if std::env::var("LF_DEBUG_CONSTRAINT_AT").ok().is_some() {
+            let mut local_to_var: Vec<usize> = Vec::with_capacity(local_asg.len());
+            local_to_var.push(0); // Local(0) unused
+            for &v in local_asg.iter().skip(1) {
+                local_to_var.push(gb.new_var(v));
+            }
+            let lowered = LoweredIr { base_nvars, local_to_var };
+            for ic in constraints {
+                gb.add_constraint_terms_iter(
+                    a_terms[ic.a.clone()]
+                        .iter()
+                        .map(|(coef, v)| (*coef, lowered.map_var(*v))),
+                    b_terms[ic.b.clone()]
+                        .iter()
+                        .map(|(coef, v)| (*coef, lowered.map_var(*v))),
+                    c_terms[ic.c.clone()]
+                        .iter()
+                        .map(|(coef, v)| (*coef, lowered.map_var(*v))),
+                );
+            }
+            return lowered;
+        }
+
+        // Parallel file-backed lowering (CPU-side remap + buffered block append / optional pwrite).
+        //
+        // This is the only way to use many cores while staying file-backed: build big contiguous
+        // blocks in memory in parallel, then append them.
+        let n_threads = rayon::current_num_threads().max(1);
+        let use_parallel = constraints.len() >= 50_000 && n_threads > 1;
+        if !use_parallel {
+            let mut local_to_var: Vec<usize> = Vec::with_capacity(local_asg.len());
+            local_to_var.push(0); // Local(0) unused
+            for &v in local_asg.iter().skip(1) {
+                local_to_var.push(gb.new_var(v));
+            }
+            let lowered = LoweredIr { base_nvars, local_to_var };
+            for ic in constraints {
+                gb.add_constraint_terms_iter(
+                    a_terms[ic.a.clone()]
+                        .iter()
+                        .map(|(coef, v)| (*coef, lowered.map_var(*v))),
+                    b_terms[ic.b.clone()]
+                        .iter()
+                        .map(|(coef, v)| (*coef, lowered.map_var(*v))),
+                    c_terms[ic.c.clone()]
+                        .iter()
+                        .map(|(coef, v)| (*coef, lowered.map_var(*v))),
+                );
+            }
+            return lowered;
+        }
+
+        let coeff_size = gb
+            .file_coeff_size()
+            .expect("file-backed lowering: missing coeff_size");
+
+        // Allocate locals sequentially.
         let mut local_to_var: Vec<usize> = Vec::with_capacity(local_asg.len());
         local_to_var.push(0); // Local(0) unused
         for &v in local_asg.iter().skip(1) {
             local_to_var.push(gb.new_var(v));
         }
         let lowered = LoweredIr { base_nvars, local_to_var };
-        for ic in constraints {
-            gb.add_constraint_terms_iter(
-                a_terms[ic.a.clone()]
-                    .iter()
-                    .map(|(coef, v)| (*coef, lowered.map_var(*v))),
-                b_terms[ic.b.clone()]
-                    .iter()
-                    .map(|(coef, v)| (*coef, lowered.map_var(*v))),
-                c_terms[ic.c.clone()]
-                    .iter()
-                    .map(|(coef, v)| (*coef, lowered.map_var(*v))),
-            );
+
+        // Precompute coefficient bytes for F257 (0..=256) once per process.
+        static COEFF_TABLE: std::sync::OnceLock<(usize, Vec<u8>)> = std::sync::OnceLock::new();
+        let table = COEFF_TABLE.get_or_init(|| {
+            let mut bytes = vec![0u8; 257usize.saturating_mul(coeff_size)];
+            for v in 0u64..=256u64 {
+                let f = F257::from(v);
+                let off = (v as usize) * coeff_size;
+                // Use arkworks canonical uncompressed encoding into fixed slice.
+                // This is a one-time cost and is amortized heavily.
+                {
+                    use ark_serialize::{CanonicalSerialize, Compress};
+                    struct SliceWriter<'a> {
+                        buf: &'a mut [u8],
+                        pos: usize,
+                    }
+                    impl<'a> std::io::Write for SliceWriter<'a> {
+                        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                            let rem = self.buf.len().saturating_sub(self.pos);
+                            if data.len() > rem {
+                                return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "SliceWriter overflow"));
+                            }
+                            self.buf[self.pos..self.pos + data.len()].copy_from_slice(data);
+                            self.pos += data.len();
+                            Ok(data.len())
+                        }
+                        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+                    }
+                    let mut w = SliceWriter { buf: &mut bytes[off..off + coeff_size], pos: 0 };
+                    f.serialize_with_mode(&mut w, Compress::No).expect("serialize coeff table");
+                    debug_assert_eq!(w.pos, coeff_size);
+                }
+            }
+            (coeff_size, bytes)
+        });
+        debug_assert_eq!(table.0, coeff_size, "unexpected coeff_size mismatch for F257 table");
+        let coeff_bytes = &table.1;
+
+        // Capture map pieces for fast remap.
+        let base_nvars_local = lowered.base_nvars;
+        let local_to_var = &lowered.local_to_var;
+        #[inline]
+        fn map_var_fast(base_nvars: usize, local_to_var: &[usize], v: VarRef) -> u64 {
+            match v {
+                VarRef::Base(i) => i as u64,
+                VarRef::Local(j) => {
+                    debug_assert!(j > 0);
+                    debug_assert_eq!(local_to_var[j], base_nvars + (j - 1));
+                    local_to_var[j] as u64
+                }
+            }
         }
+
+        // Build flat blocks for the whole fragment.
+        let n = constraints.len();
+        let mut a_counts: Vec<usize> = Vec::with_capacity(n);
+        let mut b_counts: Vec<usize> = Vec::with_capacity(n);
+        let mut c_counts: Vec<usize> = Vec::with_capacity(n);
+        for ic in &constraints {
+            a_counts.push(ic.a.end - ic.a.start);
+            b_counts.push(ic.b.end - ic.b.start);
+            c_counts.push(ic.c.end - ic.c.start);
+        }
+        let mut a_offs: Vec<usize> = Vec::with_capacity(n + 1);
+        let mut b_offs: Vec<usize> = Vec::with_capacity(n + 1);
+        let mut c_offs: Vec<usize> = Vec::with_capacity(n + 1);
+        a_offs.push(0);
+        b_offs.push(0);
+        c_offs.push(0);
+        for i in 0..n {
+            a_offs.push(a_offs[i] + a_counts[i]);
+            b_offs.push(b_offs[i] + b_counts[i]);
+            c_offs.push(c_offs[i] + c_counts[i]);
+        }
+        let total_a = *a_offs.last().unwrap_or(&0);
+        let total_b = *b_offs.last().unwrap_or(&0);
+        let total_c = *c_offs.last().unwrap_or(&0);
+
+        let mut a_coeffs: Vec<u8> = vec![0u8; total_a.saturating_mul(coeff_size)];
+        let mut b_coeffs: Vec<u8> = vec![0u8; total_b.saturating_mul(coeff_size)];
+        let mut c_coeffs: Vec<u8> = vec![0u8; total_c.saturating_mul(coeff_size)];
+        let mut a_idx: Vec<u64> = vec![0u64; total_a];
+        let mut b_idx: Vec<u64> = vec![0u64; total_b];
+        let mut c_idx: Vec<u64> = vec![0u64; total_c];
+
+        #[derive(Copy, Clone)]
+        struct SyncPtr<T>(*mut T);
+        unsafe impl<T> Send for SyncPtr<T> {}
+        unsafe impl<T> Sync for SyncPtr<T> {}
+        impl<T> SyncPtr<T> {
+            #[inline]
+            unsafe fn write(&self, off: usize, v: T) {
+                core::ptr::write(self.0.add(off), v);
+            }
+        }
+        let out_a_idx: SyncPtr<u64> = SyncPtr(a_idx.as_mut_ptr());
+        let out_b_idx: SyncPtr<u64> = SyncPtr(b_idx.as_mut_ptr());
+        let out_c_idx: SyncPtr<u64> = SyncPtr(c_idx.as_mut_ptr());
+        let a_bytes_ptr: usize = a_coeffs.as_mut_ptr() as usize;
+        let b_bytes_ptr: usize = b_coeffs.as_mut_ptr() as usize;
+        let c_bytes_ptr: usize = c_coeffs.as_mut_ptr() as usize;
+
+        use rayon::prelude::*;
+        constraints.par_iter().enumerate().for_each(|(i, ic)| unsafe {
+            // A
+            let a_dst0 = a_offs[i];
+            for (k, &(coef, v)) in a_terms[ic.a.clone()].iter().enumerate() {
+                let pos = a_dst0 + k;
+                out_a_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, v));
+                let dst = (a_bytes_ptr as *mut u8).add(pos * coeff_size);
+                let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
+                let limbs = coef.into_bigint();
+                let vv = limbs.as_ref()[0] as usize;
+                dst_slice.copy_from_slice(&coeff_bytes[vv * coeff_size..(vv + 1) * coeff_size]);
+            }
+            // B
+            let b_dst0 = b_offs[i];
+            for (k, &(coef, v)) in b_terms[ic.b.clone()].iter().enumerate() {
+                let pos = b_dst0 + k;
+                out_b_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, v));
+                let dst = (b_bytes_ptr as *mut u8).add(pos * coeff_size);
+                let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
+                let limbs = coef.into_bigint();
+                let vv = limbs.as_ref()[0] as usize;
+                dst_slice.copy_from_slice(&coeff_bytes[vv * coeff_size..(vv + 1) * coeff_size]);
+            }
+            // C
+            let c_dst0 = c_offs[i];
+            for (k, &(coef, v)) in c_terms[ic.c.clone()].iter().enumerate() {
+                let pos = c_dst0 + k;
+                out_c_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, v));
+                let dst = (c_bytes_ptr as *mut u8).add(pos * coeff_size);
+                let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
+                let limbs = coef.into_bigint();
+                let vv = limbs.as_ref()[0] as usize;
+                dst_slice.copy_from_slice(&coeff_bytes[vv * coeff_size..(vv + 1) * coeff_size]);
+            }
+        });
+
+        // Compute row words and append blocks.
+        let (_rows0, a0, b0, c0) = gb.file_counts().expect("file_counts must be Some in file-backed mode");
+        gb.file_push_a_terms_raw_block(&a_coeffs, &a_idx)
+            .unwrap_or_else(|e| panic!("file-backed append A block failed: {e}"));
+        gb.file_push_b_terms_raw_block(&b_coeffs, &b_idx)
+            .unwrap_or_else(|e| panic!("file-backed append B block failed: {e}"));
+        gb.file_push_c_terms_raw_block(&c_coeffs, &c_idx)
+            .unwrap_or_else(|e| panic!("file-backed append C block failed: {e}"));
+        let mut row_words: Vec<u64> = vec![0u64; n.saturating_mul(6)];
+        for i in 0..n {
+            let a_start = a0 + (a_offs[i] as u64);
+            let a_end = a_start + (a_counts[i] as u64);
+            let b_start = b0 + (b_offs[i] as u64);
+            let b_end = b_start + (b_counts[i] as u64);
+            let c_start = c0 + (c_offs[i] as u64);
+            let c_end = c_start + (c_counts[i] as u64);
+            let w0 = i * 6;
+            row_words[w0 + 0] = a_start;
+            row_words[w0 + 1] = a_end;
+            row_words[w0 + 2] = b_start;
+            row_words[w0 + 3] = b_end;
+            row_words[w0 + 4] = c_start;
+            row_words[w0 + 5] = c_end;
+        }
+        gb.file_push_constraint_rows_block(&row_words)
+            .unwrap_or_else(|e| panic!("file-backed append rows block failed: {e}"));
+
         return lowered;
     }
     // Big win for wall-time: avoid repeated reallocations during append.

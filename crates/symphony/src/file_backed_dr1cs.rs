@@ -13,6 +13,7 @@ use std::fs::{create_dir_all, File};
 use std::io::{BufReader, BufWriter, Read as IoRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::io::Seek;
+use std::io::SeekFrom;
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -46,6 +47,48 @@ fn read_u64(r: &mut impl IoRead) -> std::io::Result<u64> {
     let mut buf = [0u8; 8];
     r.read_exact(&mut buf)?;
     Ok(u64::from_le_bytes(buf))
+}
+
+#[inline]
+fn write_u64_slice_le(w: &mut impl IoWrite, xs: &[u64]) -> Result<(), String> {
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: u64 is POD. We encode indices/rows as little-endian u64 words.
+        let nbytes = xs.len().saturating_mul(8);
+        let ptr = xs.as_ptr() as *const u8;
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, nbytes) };
+        w.write_all(bytes).map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &x in xs {
+            w.write_all(&x.to_le_bytes()).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+#[inline]
+fn cfg_pwrite_enabled() -> bool {
+    matches!(std::env::var("LFP_FILE_BACKED_PWRITE").as_deref(), Ok("1") | Ok("true") | Ok("yes"))
+}
+
+#[inline]
+fn cfg_pwrite_chunk_bytes() -> usize {
+    let mb: usize = std::env::var("LFP_FILE_BACKED_PWRITE_CHUNK_MB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+    (mb.saturating_mul(1024 * 1024)).max(1 * 1024 * 1024)
+}
+
+#[inline]
+fn cfg_pwrite_min_bytes() -> usize {
+    let mb: usize = std::env::var("LFP_FILE_BACKED_PWRITE_MIN_MB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+    (mb.saturating_mul(1024 * 1024)).max(1 * 1024 * 1024)
 }
 
 fn term_paths(dir: &Path, which: &str) -> (PathBuf, PathBuf) {
@@ -286,6 +329,75 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
         self.a_terms += 1;
         Ok(())
     }
+
+    /// Append a block of A-term coefficients and indices.
+    ///
+    /// `coeff_bytes` must be `idx.len() * coeff_size` bytes (fixed-size blobs).
+    pub fn push_a_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u64]) -> Result<(), String> {
+        if coeff_bytes.len() != idx.len().saturating_mul(self.coeff_size) {
+            return Err("push_a_terms_raw_block: coeff_bytes length mismatch".to_string());
+        }
+        let n = idx.len() as u64;
+        if n == 0 {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        if cfg_pwrite_enabled() && coeff_bytes.len() >= cfg_pwrite_min_bytes() {
+            self.fc_a.flush().map_err(|e| e.to_string())?;
+            self.fi_a.flush().map_err(|e| e.to_string())?;
+            let base = self.a_terms;
+            let coeff_off = (base as u128)
+                .saturating_mul(self.coeff_size as u128)
+                .min(u64::MAX as u128) as u64;
+            let idx_off = base.saturating_mul(8);
+            // Ensure file sizes cover the appended region.
+            self.fc_a
+                .get_ref()
+                .set_len(coeff_off.saturating_add(coeff_bytes.len() as u64))
+                .map_err(|e| e.to_string())?;
+            self.fi_a
+                .get_ref()
+                .set_len(idx_off.saturating_add((idx.len().saturating_mul(8)) as u64))
+                .map_err(|e| e.to_string())?;
+
+            let chunk = cfg_pwrite_chunk_bytes();
+            let f_coeff = self.fc_a.get_ref();
+            let f_idx = self.fi_a.get_ref();
+            use rayon::prelude::*;
+            // Write coeff bytes in parallel chunks.
+            (0..coeff_bytes.len())
+                .into_par_iter()
+                .step_by(chunk)
+                .try_for_each(|off| -> Result<(), String> {
+                    let end = (off + chunk).min(coeff_bytes.len());
+                    let buf = &coeff_bytes[off..end];
+                    pwrite_all(f_coeff, coeff_off.saturating_add(off as u64), buf)
+                })?;
+            // Write idx u64 slice as bytes in parallel chunks.
+            let idx_bytes = unsafe {
+                core::slice::from_raw_parts(idx.as_ptr() as *const u8, idx.len().saturating_mul(8))
+            };
+            (0..idx_bytes.len())
+                .into_par_iter()
+                .step_by(chunk)
+                .try_for_each(|off| -> Result<(), String> {
+                    let end = (off + chunk).min(idx_bytes.len());
+                    let buf = &idx_bytes[off..end];
+                    pwrite_all(f_idx, idx_off.saturating_add(off as u64), buf)
+                })?;
+            // Sync BufWriter cursor to end for any subsequent buffered appends.
+            self.fc_a.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+            self.fi_a.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+            self.a_terms = self.a_terms.saturating_add(n);
+            return Ok(());
+        }
+
+        // Default: single-threaded buffered append.
+        self.fc_a.write_all(coeff_bytes).map_err(|e| e.to_string())?;
+        write_u64_slice_le(&mut self.fi_a, idx)?;
+        self.a_terms = self.a_terms.saturating_add(n);
+        Ok(())
+    }
     #[inline]
     pub fn push_b_term(&mut self, coef: &F, idx: u64) -> Result<(), String> {
         self.write_coeff_cached(coef)?;
@@ -300,6 +412,67 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
         self.fc_b.write_all(coef_bytes).map_err(|e| e.to_string())?;
         write_u64(&mut self.fi_b, idx).map_err(|e| e.to_string())?;
         self.b_terms += 1;
+        Ok(())
+    }
+
+    pub fn push_b_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u64]) -> Result<(), String> {
+        if coeff_bytes.len() != idx.len().saturating_mul(self.coeff_size) {
+            return Err("push_b_terms_raw_block: coeff_bytes length mismatch".to_string());
+        }
+        let n = idx.len() as u64;
+        if n == 0 {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        if cfg_pwrite_enabled() && coeff_bytes.len() >= cfg_pwrite_min_bytes() {
+            self.fc_b.flush().map_err(|e| e.to_string())?;
+            self.fi_b.flush().map_err(|e| e.to_string())?;
+            let base = self.b_terms;
+            let coeff_off = (base as u128)
+                .saturating_mul(self.coeff_size as u128)
+                .min(u64::MAX as u128) as u64;
+            let idx_off = base.saturating_mul(8);
+            self.fc_b
+                .get_ref()
+                .set_len(coeff_off.saturating_add(coeff_bytes.len() as u64))
+                .map_err(|e| e.to_string())?;
+            self.fi_b
+                .get_ref()
+                .set_len(idx_off.saturating_add((idx.len().saturating_mul(8)) as u64))
+                .map_err(|e| e.to_string())?;
+
+            let chunk = cfg_pwrite_chunk_bytes();
+            let f_coeff = self.fc_b.get_ref();
+            let f_idx = self.fi_b.get_ref();
+            use rayon::prelude::*;
+            (0..coeff_bytes.len())
+                .into_par_iter()
+                .step_by(chunk)
+                .try_for_each(|off| -> Result<(), String> {
+                    let end = (off + chunk).min(coeff_bytes.len());
+                    let buf = &coeff_bytes[off..end];
+                    pwrite_all(f_coeff, coeff_off.saturating_add(off as u64), buf)
+                })?;
+            let idx_bytes = unsafe {
+                core::slice::from_raw_parts(idx.as_ptr() as *const u8, idx.len().saturating_mul(8))
+            };
+            (0..idx_bytes.len())
+                .into_par_iter()
+                .step_by(chunk)
+                .try_for_each(|off| -> Result<(), String> {
+                    let end = (off + chunk).min(idx_bytes.len());
+                    let buf = &idx_bytes[off..end];
+                    pwrite_all(f_idx, idx_off.saturating_add(off as u64), buf)
+                })?;
+            self.fc_b.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+            self.fi_b.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+            self.b_terms = self.b_terms.saturating_add(n);
+            return Ok(());
+        }
+
+        self.fc_b.write_all(coeff_bytes).map_err(|e| e.to_string())?;
+        write_u64_slice_le(&mut self.fi_b, idx)?;
+        self.b_terms = self.b_terms.saturating_add(n);
         Ok(())
     }
     #[inline]
@@ -357,6 +530,67 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
         Ok(())
     }
 
+    pub fn push_c_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u64]) -> Result<(), String> {
+        if coeff_bytes.len() != idx.len().saturating_mul(self.coeff_size) {
+            return Err("push_c_terms_raw_block: coeff_bytes length mismatch".to_string());
+        }
+        let n = idx.len() as u64;
+        if n == 0 {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        if cfg_pwrite_enabled() && coeff_bytes.len() >= cfg_pwrite_min_bytes() {
+            self.fc_c.flush().map_err(|e| e.to_string())?;
+            self.fi_c.flush().map_err(|e| e.to_string())?;
+            let base = self.c_terms;
+            let coeff_off = (base as u128)
+                .saturating_mul(self.coeff_size as u128)
+                .min(u64::MAX as u128) as u64;
+            let idx_off = base.saturating_mul(8);
+            self.fc_c
+                .get_ref()
+                .set_len(coeff_off.saturating_add(coeff_bytes.len() as u64))
+                .map_err(|e| e.to_string())?;
+            self.fi_c
+                .get_ref()
+                .set_len(idx_off.saturating_add((idx.len().saturating_mul(8)) as u64))
+                .map_err(|e| e.to_string())?;
+
+            let chunk = cfg_pwrite_chunk_bytes();
+            let f_coeff = self.fc_c.get_ref();
+            let f_idx = self.fi_c.get_ref();
+            use rayon::prelude::*;
+            (0..coeff_bytes.len())
+                .into_par_iter()
+                .step_by(chunk)
+                .try_for_each(|off| -> Result<(), String> {
+                    let end = (off + chunk).min(coeff_bytes.len());
+                    let buf = &coeff_bytes[off..end];
+                    pwrite_all(f_coeff, coeff_off.saturating_add(off as u64), buf)
+                })?;
+            let idx_bytes = unsafe {
+                core::slice::from_raw_parts(idx.as_ptr() as *const u8, idx.len().saturating_mul(8))
+            };
+            (0..idx_bytes.len())
+                .into_par_iter()
+                .step_by(chunk)
+                .try_for_each(|off| -> Result<(), String> {
+                    let end = (off + chunk).min(idx_bytes.len());
+                    let buf = &idx_bytes[off..end];
+                    pwrite_all(f_idx, idx_off.saturating_add(off as u64), buf)
+                })?;
+            self.fc_c.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+            self.fi_c.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+            self.c_terms = self.c_terms.saturating_add(n);
+            return Ok(());
+        }
+
+        self.fc_c.write_all(coeff_bytes).map_err(|e| e.to_string())?;
+        write_u64_slice_le(&mut self.fi_c, idx)?;
+        self.c_terms = self.c_terms.saturating_add(n);
+        Ok(())
+    }
+
     #[inline]
     pub fn push_constraint_row(
         &mut self,
@@ -374,6 +608,49 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
         write_u64(&mut self.f_rows, c0).map_err(|e| e.to_string())?;
         write_u64(&mut self.f_rows, c1).map_err(|e| e.to_string())?;
         self.nconstraints += 1;
+        Ok(())
+    }
+
+    /// Append a block of constraint rows.
+    ///
+    /// `words` must be 6*u64 per row, in order: a0,a1,b0,b1,c0,c1 repeated.
+    pub fn push_constraint_rows_block(&mut self, words: &[u64]) -> Result<(), String> {
+        if (words.len() % 6) != 0 {
+            return Err("push_constraint_rows_block: words length must be multiple of 6".to_string());
+        }
+        if words.is_empty() {
+            return Ok(());
+        }
+        let nrows = (words.len() / 6) as u64;
+        let bytes_len = words.len().saturating_mul(8);
+        #[cfg(unix)]
+        if cfg_pwrite_enabled() && bytes_len >= cfg_pwrite_min_bytes() {
+            self.f_rows.flush().map_err(|e| e.to_string())?;
+            let base = self.nconstraints;
+            let row_off = base.saturating_mul(48);
+            self.f_rows
+                .get_ref()
+                .set_len(row_off.saturating_add(bytes_len as u64))
+                .map_err(|e| e.to_string())?;
+            let chunk = cfg_pwrite_chunk_bytes();
+            let f_rows = self.f_rows.get_ref();
+            let row_bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, bytes_len) };
+            use rayon::prelude::*;
+            (0..row_bytes.len())
+                .into_par_iter()
+                .step_by(chunk)
+                .try_for_each(|off| -> Result<(), String> {
+                    let end = (off + chunk).min(row_bytes.len());
+                    let buf = &row_bytes[off..end];
+                    pwrite_all(f_rows, row_off.saturating_add(off as u64), buf)
+                })?;
+            self.f_rows.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+            self.nconstraints = self.nconstraints.saturating_add(nrows);
+            return Ok(());
+        }
+
+        write_u64_slice_le(&mut self.f_rows, words)?;
+        self.nconstraints = self.nconstraints.saturating_add(nrows);
         Ok(())
     }
 
@@ -413,6 +690,20 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             _pd: core::marker::PhantomData,
         })
     }
+}
+
+#[cfg(unix)]
+#[inline]
+fn pwrite_all(f: &File, mut off: u64, mut buf: &[u8]) -> Result<(), String> {
+    while !buf.is_empty() {
+        let n = f.write_at(buf, off).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("pwrite returned 0".to_string());
+        }
+        off = off.saturating_add(n as u64);
+        buf = &buf[n..];
+    }
+    Ok(())
 }
 
 /// Dump an in-memory sparse instance to disk in a file-backed format.
