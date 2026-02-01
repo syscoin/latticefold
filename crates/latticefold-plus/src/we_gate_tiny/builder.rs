@@ -60,6 +60,13 @@ struct DcomEvalDigits {
     c: Vec<RingDigits>,
 }
 
+#[derive(Clone, Debug)]
+struct FComsDigits {
+    cm_f: Vec<RingDigits>,
+    c_mf: Vec<RingDigits>,
+    cm_mtau: Vec<RingDigits>,
+}
+
 /// CM verifier shared precomputations built once in the **base** glue module.
 ///
 /// The full WE gate computes these once and reuses them across the two CM sumchecks (`which=0,1`).
@@ -141,11 +148,6 @@ pub(crate) struct TinyExtraWitness {
     pub(crate) decomp_v0b: Vec<Vec<u64>>, // [vlen][ring_dim]
     pub(crate) decomp_v1a: Vec<Vec<u64>>, // [vlen][ring_dim]
     pub(crate) decomp_v1b: Vec<Vec<u64>>, // [vlen][ring_dim]
-
-    // LinB2X
-    pub(crate) linb2x_cm_g: Vec<Vec<u64>>, // [kappa][ring_dim]
-    pub(crate) linb2x_vo_a: Vec<Vec<u64>>, // [vlen][ring_dim]
-    pub(crate) linb2x_vo_b: Vec<Vec<u64>>, // [vlen][ring_dim]
 }
 
 #[inline]
@@ -550,6 +552,9 @@ fn add_decomp_linb2x_constraints(
     ring_dim: usize,
     params: &WeParams,
     extra_witness: Option<&TinyExtraWitness>,
+    cm_g_target: &[RingDigits],
+    vo_a_target: &[RingDigits],
+    vo_b_target: &[RingDigits],
 ) -> Result<(), String> {
     // Mirrors `we_gate_arith.rs::decomp_verifier_math_dr1cs`:
     // - C0 + B*C1 == cm_g
@@ -565,6 +570,12 @@ fn add_decomp_linb2x_constraints(
     let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
     let b_u64: u64 = ((params.decomp_b as u128) % (p_u64 as u128)) as u64;
     let vlen = 1usize + (params.mlen as usize);
+    if cm_g_target.len() != kappa {
+        return Err("tiny gate: cm_g_target length mismatch (decomp)".to_string());
+    }
+    if vo_a_target.len() != vlen || vo_b_target.len() != vlen {
+        return Err("tiny gate: vo_target length mismatch (decomp)".to_string());
+    }
 
     #[inline]
     fn alloc_witness_ring_digits(
@@ -581,6 +592,22 @@ fn add_decomp_linb2x_constraints(
     }
 
     #[inline]
+    fn alloc_witness_ring_digits_like(gb: &mut Dr1csBuilder<F257>, target: &RingDigits) -> RingDigits {
+        // Allocate a fresh witness ring whose digit-vars are initialized to the same assignment values
+        // as `target` (no extra constraints). This is used to keep the statement-only builder
+        // satisfiable by choosing a trivial decomposition (r0=target, r1=0).
+        let mut out: RingDigits = Vec::with_capacity(target.len());
+        for coeff in target {
+            let digits: GoldilocksScalar = core::array::from_fn(|j| {
+                let v = gb.assignment[coeff[j]];
+                gb.new_var(v)
+            });
+            out.push(digits);
+        }
+        out
+    }
+
+    #[inline]
     fn ring_recompose_base_b(gb: &mut Dr1csBuilder<F257>, r0: &RingDigits, r1: &RingDigits, b_u64: u64) -> RingDigits {
         debug_assert_eq!(r0.len(), r1.len());
         let mut out: RingDigits = Vec::with_capacity(r0.len());
@@ -593,52 +620,55 @@ fn add_decomp_linb2x_constraints(
         out
     }
 
-    // Allocate witnesses (default 0; overridden by `extra_witness` when provided).
+    // Allocate witnesses (default: trivial decomposition of derived targets; overridden by `extra_witness`).
     let mut dcomp_c0: Vec<RingDigits> = Vec::with_capacity(kappa);
     let mut dcomp_c1: Vec<RingDigits> = Vec::with_capacity(kappa);
-    let mut cm_g: Vec<RingDigits> = Vec::with_capacity(kappa);
     for i in 0..kappa {
-        let w = extra_witness;
-        let c0 = w.and_then(|w| w.decomp_c0.get(i).map(|v| v.as_slice()));
-        let c1 = w.and_then(|w| w.decomp_c1.get(i).map(|v| v.as_slice()));
-        let g = w.and_then(|w| w.linb2x_cm_g.get(i).map(|v| v.as_slice()));
-        dcomp_c0.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, c0));
-        dcomp_c1.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, c1));
-        cm_g.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, g));
+        if let Some(w) = extra_witness {
+            let c0 = w.decomp_c0.get(i).map(|v| v.as_slice());
+            let c1 = w.decomp_c1.get(i).map(|v| v.as_slice());
+            dcomp_c0.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, c0));
+            dcomp_c1.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, c1));
+        } else {
+            // Choose c0 = cm_g_target, c1 = 0.
+            dcomp_c0.push(alloc_witness_ring_digits_like(&mut glue.gb, &cm_g_target[i]));
+            dcomp_c1.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, None));
+        }
     }
 
     let mut v0a: Vec<RingDigits> = Vec::with_capacity(vlen);
     let mut v0b: Vec<RingDigits> = Vec::with_capacity(vlen);
     let mut v1a: Vec<RingDigits> = Vec::with_capacity(vlen);
     let mut v1b: Vec<RingDigits> = Vec::with_capacity(vlen);
-    let mut va: Vec<RingDigits> = Vec::with_capacity(vlen);
-    let mut vb: Vec<RingDigits> = Vec::with_capacity(vlen);
     for i in 0..vlen {
-        let w = extra_witness;
-        let v0a_i = w.and_then(|w| w.decomp_v0a.get(i).map(|v| v.as_slice()));
-        let v0b_i = w.and_then(|w| w.decomp_v0b.get(i).map(|v| v.as_slice()));
-        let v1a_i = w.and_then(|w| w.decomp_v1a.get(i).map(|v| v.as_slice()));
-        let v1b_i = w.and_then(|w| w.decomp_v1b.get(i).map(|v| v.as_slice()));
-        let va_i = w.and_then(|w| w.linb2x_vo_a.get(i).map(|v| v.as_slice()));
-        let vb_i = w.and_then(|w| w.linb2x_vo_b.get(i).map(|v| v.as_slice()));
-        v0a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v0a_i));
-        v0b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v0b_i));
-        v1a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v1a_i));
-        v1b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v1b_i));
-        va.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, va_i));
-        vb.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, vb_i));
+        if let Some(w) = extra_witness {
+            let v0a_i = w.decomp_v0a.get(i).map(|v| v.as_slice());
+            let v0b_i = w.decomp_v0b.get(i).map(|v| v.as_slice());
+            let v1a_i = w.decomp_v1a.get(i).map(|v| v.as_slice());
+            let v1b_i = w.decomp_v1b.get(i).map(|v| v.as_slice());
+            v0a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v0a_i));
+            v0b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v0b_i));
+            v1a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v1a_i));
+            v1b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v1b_i));
+        } else {
+            // Choose v0 = vo_target, v1 = 0.
+            v0a.push(alloc_witness_ring_digits_like(&mut glue.gb, &vo_a_target[i]));
+            v0b.push(alloc_witness_ring_digits_like(&mut glue.gb, &vo_b_target[i]));
+            v1a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, None));
+            v1b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, None));
+        }
     }
 
     // Enforce recomposition equalities.
     for i in 0..kappa {
         let rec = ring_recompose_base_b(&mut glue.gb, &dcomp_c0[i], &dcomp_c1[i], b_u64);
-        ring_eq_digits(&mut glue.gb, &rec, &cm_g[i]);
+        ring_eq_digits(&mut glue.gb, &rec, &cm_g_target[i]);
     }
     for i in 0..vlen {
         let rec_a = ring_recompose_base_b(&mut glue.gb, &v0a[i], &v1a[i], b_u64);
         let rec_b = ring_recompose_base_b(&mut glue.gb, &v0b[i], &v1b[i], b_u64);
-        ring_eq_digits(&mut glue.gb, &rec_a, &va[i]);
-        ring_eq_digits(&mut glue.gb, &rec_b, &vb[i]);
+        ring_eq_digits(&mut glue.gb, &rec_a, &vo_a_target[i]);
+        ring_eq_digits(&mut glue.gb, &rec_b, &vo_b_target[i]);
     }
 
     Ok(())
@@ -743,6 +773,253 @@ fn build_cm_shards(
     Ok(vec![g0, g1])
 }
 
+fn compute_cm_x_targets_for_decomp(
+    glue: &mut GlueCtx,
+    ring_dim: usize,
+    params: &WeParams,
+    l_instances_expected: usize,
+    short_locals: &[ShortChallengeWiring],
+    pose_wiring: &PoseidonDr1csWiring,
+    comh_absorbs: &[(usize, usize)],
+    eval_absorbs: &[Vec<(usize, usize)>],
+    fcoms_for_cm: &Option<Vec<FComsDigits>>,
+) -> Result<(Vec<RingDigits>, Vec<RingDigits>, Vec<RingDigits>), String> {
+    let kappa = params.kappa as usize;
+    if kappa == 0 {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+    let rows_per_l = 1usize + (params.mlen as usize);
+    let rows_total = l_instances_expected
+        .checked_mul(rows_per_l)
+        .ok_or_else(|| "tiny gate: rows_total overflow (cm x targets)".to_string())?;
+    if eval_absorbs.len() != 2 {
+        return Err("tiny gate: expected eval_absorbs[2] (cm x targets)".to_string());
+    }
+    if eval_absorbs[0].len() != rows_total * 4 || eval_absorbs[1].len() != rows_total * 4 {
+        return Err("tiny gate: eval_absorbs length mismatch (cm x targets)".to_string());
+    }
+    let fcoms = fcoms_for_cm
+        .as_ref()
+        .ok_or_else(|| "tiny gate: missing fcoms_for_cm (cm x targets)".to_string())?;
+    if fcoms.len() != l_instances_expected {
+        return Err("tiny gate: fcoms_for_cm length mismatch (cm x targets)".to_string());
+    }
+    if comh_absorbs.len() != l_instances_expected * kappa {
+        return Err("tiny gate: comh_absorbs length mismatch (cm x targets)".to_string());
+    }
+    if short_locals.len() < 3 {
+        return Err("tiny gate: short_locals too short for s[0..3] (cm x targets)".to_string());
+    }
+    for i in 0..3 {
+        if short_locals[i].byte_vars.len() != ring_dim {
+            return Err("tiny gate: short byte_vars len mismatch (cm x targets)".to_string());
+        }
+    }
+
+    // Build s[0..3] ring elements in digit-domain from the transcript byte view.
+    let exp = (128usize / ring_dim) as usize;
+    let u = 1u64 << (exp as u32);
+    debug_assert!(u.is_power_of_two() && u <= 256);
+    let half = u / 2;
+    let z = glue.gb.new_var(F257::ZERO);
+    glue.gb.enforce_var_eq_const(z, F257::ZERO);
+    let half_bytes = alloc_const_goldilocks_u64(&mut glue.gb, half);
+    let half_digits = goldilocks_bytes_to_digits(&mut glue.gb, half_bytes);
+
+    let mut s_rings: [RingDigits; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for si in 0..3 {
+        let mut ring: RingDigits = Vec::with_capacity(ring_dim);
+        for &bv in &short_locals[si].byte_vars {
+            ring.push(short_challenge_coeff_digits_from_byte_var_128(
+                &mut glue.gb,
+                bv,
+                exp,
+                u,
+                &half_digits,
+                z,
+            ));
+        }
+        s_rings[si] = ring;
+    }
+
+    // Accumulate folded (over l) cm_g and vo.
+    let mut cm_g_acc: Vec<RingDigits> = (0..kappa)
+        .map(|_| super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim))
+        .collect();
+    let mut vo_a_acc: Vec<RingDigits> = (0..rows_per_l)
+        .map(|_| super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim))
+        .collect();
+    let mut vo_b_acc: Vec<RingDigits> = (0..rows_per_l)
+        .map(|_| super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim))
+        .collect();
+
+    for l in 0..l_instances_expected {
+        // Parse com(h)[l][*] from transcript absorbs.
+        let mut comh_l: Vec<RingDigits> = Vec::with_capacity(kappa);
+        for j in 0..kappa {
+            let (st, ln) = comh_absorbs[l * kappa + j];
+            let rb = parse_ring_elem_absorb_as_ringbytes(glue, pose_wiring, ring_dim, st, ln)?;
+            comh_l.push(ring_bytes_to_digits(&mut glue.gb, &rb));
+        }
+
+        // cm_g[l][j] = s0*C_Mf + s1*cm_mtau + s2*cm_f + com(h).
+        let fc = &fcoms[l];
+        if fc.cm_f.len() != kappa || fc.c_mf.len() != kappa || fc.cm_mtau.len() != kappa {
+            return Err("tiny gate: fcoms entry length mismatch (cm x targets)".to_string());
+        }
+
+        // vo[l][row] = (s0*e0 + s1*e1 + s2*e2 + e3) for each sumcheck (which=0,1).
+        //
+        // Performance note: The number of ring multiplications here is large (3*kappa + 6*rows_per_l per `l`).
+        // To improve wall-clock time we build the ring-mul IR shards in parallel, then lower sequentially.
+        #[derive(Clone, Copy, Debug)]
+        enum MulKind {
+            Cmg { j: usize, term: usize },     // term in 0..3
+            Vo { which: usize, row: usize, term: usize }, // term in 0..3 (only 0..3 where 3 is unused)
+        }
+
+        // Parse evals for this `l` once (needs &mut glue).
+        let mut eval0: Vec<[RingDigits; 4]> = Vec::with_capacity(rows_per_l);
+        let mut eval1: Vec<[RingDigits; 4]> = Vec::with_capacity(rows_per_l);
+        for row in 0..rows_per_l {
+            let flat = l * rows_per_l + row;
+            let idx0 = flat * 4;
+            let idx1 = idx0 + 1;
+            let idx2 = idx0 + 2;
+            let idx3 = idx0 + 3;
+
+            let mut parse_eval = |which: usize, idx: usize| -> Result<RingDigits, String> {
+                let (st, ln) = eval_absorbs[which][idx];
+                let rb = parse_ring_elem_absorb_as_ringbytes(glue, pose_wiring, ring_dim, st, ln)?;
+                Ok(ring_bytes_to_digits(&mut glue.gb, &rb))
+            };
+            eval0.push([
+                parse_eval(0, idx0)?,
+                parse_eval(0, idx1)?,
+                parse_eval(0, idx2)?,
+                parse_eval(0, idx3)?,
+            ]);
+            eval1.push([
+                parse_eval(1, idx0)?,
+                parse_eval(1, idx1)?,
+                parse_eval(1, idx2)?,
+                parse_eval(1, idx3)?,
+            ]);
+        }
+
+        // Build all ring-mul tasks for this `l`.
+        let mut tasks: Vec<MulKind> = Vec::with_capacity(3 * kappa + 6 * rows_per_l);
+        for j in 0..kappa {
+            tasks.push(MulKind::Cmg { j, term: 0 }); // s0 * C_Mf
+            tasks.push(MulKind::Cmg { j, term: 1 }); // s1 * cm_mtau
+            tasks.push(MulKind::Cmg { j, term: 2 }); // s2 * cm_f
+        }
+        for row in 0..rows_per_l {
+            for term in 0..3 {
+                tasks.push(MulKind::Vo { which: 0, row, term });
+                tasks.push(MulKind::Vo { which: 1, row, term });
+            }
+        }
+
+        // Snapshot assignment for parallel IR building.
+        let base_asg_addr: usize = glue.gb.assignment.as_ptr() as usize;
+        let base_asg_len: usize = glue.gb.assignment.len();
+
+        use super::cm_ir::{lower_ir_into_builder, ring_mul_negacyclic_ntt_goldilocks_d64_ir, IrBuilder, VarRef as IrVarRef};
+        #[inline]
+        fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
+            if a.len() != 64 {
+                return Err("tiny gate: expected ring element with 64 coeffs (cm x targets mul)".to_string());
+            }
+            Ok(core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j]))))
+        }
+        #[inline]
+        fn map_ring_out(out_ir: &[[IrVarRef; 17]; 64], lowered: &super::cm_ir::LoweredIr) -> RingDigits {
+            let out: [GoldilocksScalar; 64] = core::array::from_fn(|i| {
+                core::array::from_fn(|j| lowered.map_var(out_ir[i][j]))
+            });
+            out.into_iter().collect()
+        }
+
+        let frags: Vec<(MulKind, super::cm_ir::CmIr, [[IrVarRef; 17]; 64])> = tasks
+            .into_par_iter()
+            .map(|kind| -> Result<_, String> {
+                let base_asg_ptr: *const F257 = base_asg_addr as *const F257;
+                let base_asg: &[F257] = unsafe { core::slice::from_raw_parts(base_asg_ptr, base_asg_len) };
+                let mut ib = IrBuilder::new(base_asg);
+
+                let (lhs, rhs): (&RingDigits, &RingDigits) = match kind {
+                    MulKind::Cmg { j, term: 0 } => (&s_rings[0], &fc.c_mf[j]),
+                    MulKind::Cmg { j, term: 1 } => (&s_rings[1], &fc.cm_mtau[j]),
+                    MulKind::Cmg { j, term: 2 } => (&s_rings[2], &fc.cm_f[j]),
+                    MulKind::Cmg { .. } => return Err("tiny gate: invalid cmg mul term".to_string()),
+                    MulKind::Vo { which: 0, row, term } => (&s_rings[term], &eval0[row][term]),
+                    MulKind::Vo { which: 1, row, term } => (&s_rings[term], &eval1[row][term]),
+                    MulKind::Vo { .. } => return Err("tiny gate: invalid vo mul kind".to_string()),
+                };
+
+                let lhs_ir = ringdigits64_to_ir(lhs)?;
+                let rhs_ir = ringdigits64_to_ir(rhs)?;
+                let out_ir = ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &lhs_ir, &rhs_ir);
+                Ok((kind, ib.ir, out_ir))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Lower sequentially and assemble products.
+        let mut cmg_mul: Vec<[Option<RingDigits>; 3]> = vec![[None, None, None]; kappa];
+        let mut vo_mul0: Vec<[Option<RingDigits>; 3]> = vec![[None, None, None]; rows_per_l];
+        let mut vo_mul1: Vec<[Option<RingDigits>; 3]> = vec![[None, None, None]; rows_per_l];
+        super::op_counts::tiny_cm_bump(|c| c.ring_mul_negacyclic += frags.len() as u64);
+
+        for (kind, ir, out_ir) in frags {
+            let lowered = lower_ir_into_builder(&mut glue.gb, ir);
+            let out = map_ring_out(&out_ir, &lowered);
+            match kind {
+                MulKind::Cmg { j, term } => {
+                    cmg_mul[j][term] = Some(out);
+                }
+                MulKind::Vo { which: 0, row, term } => {
+                    vo_mul0[row][term] = Some(out);
+                }
+                MulKind::Vo { which: 1, row, term } => {
+                    vo_mul1[row][term] = Some(out);
+                }
+                _ => {}
+            }
+        }
+
+        for j in 0..kappa {
+            let t0 = cmg_mul[j][0].take().ok_or("tiny gate: missing cmg mul term0")?;
+            let t1 = cmg_mul[j][1].take().ok_or("tiny gate: missing cmg mul term1")?;
+            let t2 = cmg_mul[j][2].take().ok_or("tiny gate: missing cmg mul term2")?;
+            let sum = ring_add_digits(&mut glue.gb, &t0, &t1);
+            let sum = ring_add_digits(&mut glue.gb, &sum, &t2);
+            let sum = ring_add_digits(&mut glue.gb, &sum, &comh_l[j]);
+            cm_g_acc[j] = ring_add_digits(&mut glue.gb, &cm_g_acc[j], &sum);
+        }
+
+        for row in 0..rows_per_l {
+            let a0 = vo_mul0[row][0].take().ok_or("tiny gate: missing vo0 mul term0")?;
+            let a1 = vo_mul0[row][1].take().ok_or("tiny gate: missing vo0 mul term1")?;
+            let a2 = vo_mul0[row][2].take().ok_or("tiny gate: missing vo0 mul term2")?;
+            let a = ring_add_digits(&mut glue.gb, &a0, &a1);
+            let a = ring_add_digits(&mut glue.gb, &a, &a2);
+            let a = ring_add_digits(&mut glue.gb, &a, &eval0[row][3]);
+            vo_a_acc[row] = ring_add_digits(&mut glue.gb, &vo_a_acc[row], &a);
+
+            let b0 = vo_mul1[row][0].take().ok_or("tiny gate: missing vo1 mul term0")?;
+            let b1 = vo_mul1[row][1].take().ok_or("tiny gate: missing vo1 mul term1")?;
+            let b2 = vo_mul1[row][2].take().ok_or("tiny gate: missing vo1 mul term2")?;
+            let b = ring_add_digits(&mut glue.gb, &b0, &b1);
+            let b = ring_add_digits(&mut glue.gb, &b, &b2);
+            let b = ring_add_digits(&mut glue.gb, &b, &eval1[row][3]);
+            vo_b_acc[row] = ring_add_digits(&mut glue.gb, &vo_b_acc[row], &b);
+        }
+    }
+
+    Ok((cm_g_acc, vo_a_acc, vo_b_acc))
+}
+
 fn build_surfaces_with_shared_arcs(
     glue: &mut GlueCtx,
     ring_dim: usize,
@@ -813,6 +1090,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
     extra_witness: Option<&TinyExtraWitness>,
     setchk_out_e_vars_for_cm: &mut Option<Vec<Vec<Vec<RingDigits>>>>,
     dcom_evals_for_cm: &mut Option<Vec<DcomEvalDigits>>,
+    fcoms_for_cm: &mut Option<Vec<FComsDigits>>,
     setchk_r_point_for_cm: &mut Option<Vec<GoldilocksScalar>>,
 ) -> Result<(), String> {
     // Mirrors the corresponding block in `build()`; keep verifier-math constraints identical.
@@ -1003,19 +1281,47 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
         }
     }
 
-    // Skip Dcom commitment absorbs (cm_f, C_Mf, cm_mtau): 3 * L * kappa ring elems.
+    // Dcom witness commitments: cm_f, C_Mf, cm_mtau (in that order, per instance).
+    //
+    // These are needed to derive the reduced statement component `cm_g` inside CM verification,
+    // so we parse them into ring digits here.
     let kappa = params.kappa as usize;
     let l_instances = l_instances_expected;
-    let n_commit_ring_absorbs = 3usize
-        .checked_mul(l_instances)
-        .and_then(|x| x.checked_mul(kappa))
-        .ok_or_else(|| "tiny gate: commitment absorb count overflow (setchk)".to_string())?;
-    for _ in 0..n_commit_ring_absorbs {
-        if prefix_payload.get(cur).map(|x| x.1) != Some(ring_elem_bytes) {
-            return Err("tiny gate: dcom commitment ring absorb len mismatch".to_string());
+    let mut fcoms: Vec<FComsDigits> = Vec::with_capacity(l_instances);
+    for _l in 0..l_instances {
+        let mut cm_f: Vec<RingDigits> = Vec::with_capacity(kappa);
+        let mut c_mf: Vec<RingDigits> = Vec::with_capacity(kappa);
+        let mut cm_mtau: Vec<RingDigits> = Vec::with_capacity(kappa);
+        for _ in 0..kappa {
+            let (st, ln) = *prefix_payload.get(cur).ok_or("tiny gate: dcom cm_f absorb oob")?;
+            cur += 1;
+            if ln != ring_elem_bytes {
+                return Err("tiny gate: dcom cm_f ring absorb len mismatch".to_string());
+            }
+            let rb = parse_ring_elem_absorb_as_ringbytes(glue, pose_wiring, ring_dim, st, ln)?;
+            cm_f.push(ring_bytes_to_digits(&mut glue.gb, &rb));
         }
-        cur += 1;
+        for _ in 0..kappa {
+            let (st, ln) = *prefix_payload.get(cur).ok_or("tiny gate: dcom C_Mf absorb oob")?;
+            cur += 1;
+            if ln != ring_elem_bytes {
+                return Err("tiny gate: dcom C_Mf ring absorb len mismatch".to_string());
+            }
+            let rb = parse_ring_elem_absorb_as_ringbytes(glue, pose_wiring, ring_dim, st, ln)?;
+            c_mf.push(ring_bytes_to_digits(&mut glue.gb, &rb));
+        }
+        for _ in 0..kappa {
+            let (st, ln) = *prefix_payload.get(cur).ok_or("tiny gate: dcom cm_mtau absorb oob")?;
+            cur += 1;
+            if ln != ring_elem_bytes {
+                return Err("tiny gate: dcom cm_mtau ring absorb len mismatch".to_string());
+            }
+            let rb = parse_ring_elem_absorb_as_ringbytes(glue, pose_wiring, ring_dim, st, ln)?;
+            cm_mtau.push(ring_bytes_to_digits(&mut glue.gb, &rb));
+        }
+        fcoms.push(FComsDigits { cm_f, c_mf, cm_mtau });
     }
+    *fcoms_for_cm = Some(fcoms);
 
     // Next in the prefix payload is the SetChk sumcheck header (nvars, degree=3).
     let start = cur;
@@ -4160,6 +4466,7 @@ pub(super) fn build(
     // Stored as base-glue vars and passed (by Arc) into CM submodules for import/glue.
     let mut setchk_out_e_vars_for_cm: Option<Vec<Vec<Vec<RingDigits>>>> = None;
     let mut dcom_evals_for_cm: Option<Vec<DcomEvalDigits>> = None;
+    let mut fcoms_for_cm: Option<Vec<FComsDigits>> = None;
     let mut setchk_r_point_for_cm: Option<Vec<GoldilocksScalar>> = None;
 
     arithmetize_pi_lin_setchk_rgchk_prefix(
@@ -4174,6 +4481,7 @@ pub(super) fn build(
         extra_witness,
         &mut setchk_out_e_vars_for_cm,
         &mut dcom_evals_for_cm,
+        &mut fcoms_for_cm,
         &mut setchk_r_point_for_cm,
     )?;
 
@@ -4242,7 +4550,29 @@ pub(super) fn build(
     )?;
 
     // Decomp verifier math (LinB2X + DecompProof) — algebraic-only checks.
-    add_decomp_linb2x_constraints(&mut glue, ring_dim, params, extra_witness)?;
+    //
+    // IMPORTANT: bind these checks to the CM-derived reduced instance x = (cm_g, r_o, v_o),
+    // not to a prover-supplied copy.
+    let (cm_g_target, vo_a_target, vo_b_target) = compute_cm_x_targets_for_decomp(
+        &mut glue,
+        ring_dim,
+        params,
+        l_instances_expected,
+        &short_locals,
+        &pose_wiring,
+        &comh_absorbs,
+        &eval_absorbs,
+        &fcoms_for_cm,
+    )?;
+    add_decomp_linb2x_constraints(
+        &mut glue,
+        ring_dim,
+        params,
+        extra_witness,
+        &cm_g_target,
+        &vo_a_target,
+        &vo_b_target,
+    )?;
 
     // Surfaces (same as `build()`; these are comparatively small vs Poseidon/CM).
     let (

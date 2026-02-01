@@ -1117,12 +1117,6 @@ where
     if proof.dproof.v.0.len() != vlen || proof.dproof.v.1.len() != vlen {
         return Err("tiny witness: dproof.v length mismatch".to_string());
     }
-    if proof.linb2x.cm_g.len() != kappa {
-        return Err("tiny witness: linb2x.cm_g length mismatch".to_string());
-    }
-    if proof.linb2x.vo.len() != vlen {
-        return Err("tiny witness: linb2x.vo length mismatch".to_string());
-    }
 
     let extra = tiny::TinyExtraWitness {
         dcom_eval_b,
@@ -1133,9 +1127,6 @@ where
         decomp_v0b: proof.dproof.v.0.iter().map(|(_, b)| ring_to_u64_coeffs::<R>(b)).collect(),
         decomp_v1a: proof.dproof.v.1.iter().map(|(a, _)| ring_to_u64_coeffs::<R>(a)).collect(),
         decomp_v1b: proof.dproof.v.1.iter().map(|(_, b)| ring_to_u64_coeffs::<R>(b)).collect(),
-        linb2x_cm_g: proof.linb2x.cm_g.iter().map(|r| ring_to_u64_coeffs::<R>(r)).collect(),
-        linb2x_vo_a: proof.linb2x.vo.iter().map(|(a, _)| ring_to_u64_coeffs::<R>(a)).collect(),
-        linb2x_vo_b: proof.linb2x.vo.iter().map(|(_, b)| ring_to_u64_coeffs::<R>(b)).collect(),
     };
 
     // Lift recorded ops and infer wiring.
