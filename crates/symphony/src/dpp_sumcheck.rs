@@ -147,6 +147,17 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         Ok(())
     }
 
+    /// File-backed fast path: append a block of A-terms.
+    pub fn file_push_a_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u64]) -> Result<(), String> {
+        let sink = self
+            .file_sink
+            .as_mut()
+            .ok_or_else(|| "file_push_a_terms_raw_block called on non-file-backed builder".to_string())?;
+        sink.push_a_terms_raw_block(coeff_bytes, idx)?;
+        self.file_a_terms = self.file_a_terms.saturating_add(idx.len() as u64);
+        Ok(())
+    }
+
     /// File-backed fast path: append a raw B-term (already serialized coefficient bytes).
     #[inline]
     pub fn file_push_b_term_raw(&mut self, coef_bytes: &[u8], idx: u64) -> Result<(), String> {
@@ -159,6 +170,17 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         Ok(())
     }
 
+    /// File-backed fast path: append a block of B-terms.
+    pub fn file_push_b_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u64]) -> Result<(), String> {
+        let sink = self
+            .file_sink
+            .as_mut()
+            .ok_or_else(|| "file_push_b_terms_raw_block called on non-file-backed builder".to_string())?;
+        sink.push_b_terms_raw_block(coeff_bytes, idx)?;
+        self.file_b_terms = self.file_b_terms.saturating_add(idx.len() as u64);
+        Ok(())
+    }
+
     /// File-backed fast path: append a raw C-term (already serialized coefficient bytes).
     #[inline]
     pub fn file_push_c_term_raw(&mut self, coef_bytes: &[u8], idx: u64) -> Result<(), String> {
@@ -168,6 +190,17 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             .ok_or_else(|| "file_push_c_term_raw called on non-file-backed builder".to_string())?;
         sink.push_c_term_raw(coef_bytes, idx)?;
         self.file_c_terms = self.file_c_terms.saturating_add(1);
+        Ok(())
+    }
+
+    /// File-backed fast path: append a block of C-terms.
+    pub fn file_push_c_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u64]) -> Result<(), String> {
+        let sink = self
+            .file_sink
+            .as_mut()
+            .ok_or_else(|| "file_push_c_terms_raw_block called on non-file-backed builder".to_string())?;
+        sink.push_c_terms_raw_block(coeff_bytes, idx)?;
+        self.file_c_terms = self.file_c_terms.saturating_add(idx.len() as u64);
         Ok(())
     }
 
@@ -188,6 +221,17 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             .ok_or_else(|| "file_push_constraint_row called on non-file-backed builder".to_string())?;
         sink.push_constraint_row(a0, a1, b0, b1, c0, c1)?;
         self.file_rows = self.file_rows.saturating_add(1);
+        Ok(())
+    }
+
+    /// File-backed fast path: append a block of constraint rows (u64 words, 6 per row).
+    pub fn file_push_constraint_rows_block(&mut self, words: &[u64]) -> Result<(), String> {
+        let sink = self
+            .file_sink
+            .as_mut()
+            .ok_or_else(|| "file_push_constraint_rows_block called on non-file-backed builder".to_string())?;
+        sink.push_constraint_rows_block(words)?;
+        self.file_rows = self.file_rows.saturating_add((words.len() / 6) as u64);
         Ok(())
     }
 

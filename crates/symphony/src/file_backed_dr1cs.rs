@@ -248,6 +248,19 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
         self.a_terms += 1;
         Ok(())
     }
+
+    /// Append a block of A-term coefficients and indices.
+    ///
+    /// `coeff_bytes` must be `idx.len() * coeff_size` bytes, laid out as contiguous fixed-size blobs.
+    pub fn push_a_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u64]) -> Result<(), String> {
+        if coeff_bytes.len() != idx.len().saturating_mul(self.coeff_size) {
+            return Err("push_a_terms_raw_block: coeff_bytes length mismatch".to_string());
+        }
+        self.fc_a.write_all(coeff_bytes).map_err(|e| e.to_string())?;
+        write_u64_slice_le(&mut self.fi_a, idx)?;
+        self.a_terms = self.a_terms.saturating_add(idx.len() as u64);
+        Ok(())
+    }
     #[inline]
     pub fn push_b_term(&mut self, coef: &F, idx: u64) -> Result<(), String> {
         self.write_coeff_cached(coef)?;
@@ -262,6 +275,17 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
         self.fc_b.write_all(coef_bytes).map_err(|e| e.to_string())?;
         write_u64(&mut self.fi_b, idx).map_err(|e| e.to_string())?;
         self.b_terms += 1;
+        Ok(())
+    }
+
+    /// Append a block of B-term coefficients and indices.
+    pub fn push_b_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u64]) -> Result<(), String> {
+        if coeff_bytes.len() != idx.len().saturating_mul(self.coeff_size) {
+            return Err("push_b_terms_raw_block: coeff_bytes length mismatch".to_string());
+        }
+        self.fc_b.write_all(coeff_bytes).map_err(|e| e.to_string())?;
+        write_u64_slice_le(&mut self.fi_b, idx)?;
+        self.b_terms = self.b_terms.saturating_add(idx.len() as u64);
         Ok(())
     }
     #[inline]
@@ -306,6 +330,17 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
         Ok(())
     }
 
+    /// Append a block of C-term coefficients and indices.
+    pub fn push_c_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u64]) -> Result<(), String> {
+        if coeff_bytes.len() != idx.len().saturating_mul(self.coeff_size) {
+            return Err("push_c_terms_raw_block: coeff_bytes length mismatch".to_string());
+        }
+        self.fc_c.write_all(coeff_bytes).map_err(|e| e.to_string())?;
+        write_u64_slice_le(&mut self.fi_c, idx)?;
+        self.c_terms = self.c_terms.saturating_add(idx.len() as u64);
+        Ok(())
+    }
+
     #[inline]
     pub fn push_constraint_row(
         &mut self,
@@ -323,6 +358,19 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
         write_u64(&mut self.f_rows, c0).map_err(|e| e.to_string())?;
         write_u64(&mut self.f_rows, c1).map_err(|e| e.to_string())?;
         self.nconstraints += 1;
+        Ok(())
+    }
+
+    /// Append a block of constraint rows.
+    ///
+    /// Layout is the same as `constraints.bin`: u64 words in order:
+    /// (a0,a1,b0,b1,c0,c1) repeated for each constraint.
+    pub fn push_constraint_rows_block(&mut self, words: &[u64]) -> Result<(), String> {
+        if (words.len() % 6) != 0 {
+            return Err("push_constraint_rows_block: words length must be a multiple of 6".to_string());
+        }
+        write_u64_slice_le(&mut self.f_rows, words)?;
+        self.nconstraints = self.nconstraints.saturating_add((words.len() / 6) as u64);
         Ok(())
     }
 
@@ -361,6 +409,26 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             layout,
             _pd: core::marker::PhantomData,
         })
+    }
+}
+
+#[inline]
+fn write_u64_slice_le(w: &mut impl IoWrite, xs: &[u64]) -> Result<(), String> {
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: u64 is POD, and we write raw bytes in host little-endian order, which matches
+        // the file format's chosen encoding (little-endian).
+        let nbytes = xs.len().saturating_mul(8);
+        let ptr = xs.as_ptr() as *const u8;
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, nbytes) };
+        w.write_all(bytes).map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &x in xs {
+            w.write_all(&x.to_le_bytes()).map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 }
 
