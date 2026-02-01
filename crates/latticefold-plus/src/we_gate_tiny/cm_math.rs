@@ -775,8 +775,17 @@ pub(crate) fn eval_x_powers_basis_mle_ring_digits(
         return Err("eval_x_powers_basis_mle_ring_digits: r4 length mismatch".to_string());
     }
     let _prev = gb.profile_enter("cm_math::eval_x_powers_basis_mle_ring_digits");
+    // IMPORTANT: `eval_small_mle_*` interprets index bits with **r[0] as the LSB variable**.
+    //
+    // The helper `tensor_goldilocks_scalars_digits` follows `utils::tensor` ordering, where the
+    // *last* coordinate toggles fastest (i.e. last coordinate is the LSB variable).
+    //
+    // To make the resulting coefficient ordering match the MLE evaluation used elsewhere in the
+    // CM verifier (and in `we_gate_arith`), we must reverse `r4` here so that `r4[0]` becomes the
+    // fastest-changing (LSB) variable.
+    let r4_rev: Vec<GoldilocksScalar> = r4.iter().copied().rev().collect();
     // weights length = ring_dim; each weight is a Goldilocks scalar in digit encoding.
-    let weights = tensor_goldilocks_scalars_digits(gb, r4);
+    let weights = tensor_goldilocks_scalars_digits(gb, &r4_rev);
     debug_assert_eq!(weights.len(), ring_dim);
     // Interpret weights as the ring coefficients.
     gb.profile_exit(_prev);
