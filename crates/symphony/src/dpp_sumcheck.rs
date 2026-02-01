@@ -119,6 +119,14 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         self.file_sink.is_some()
     }
 
+    /// Debug tag for file-backed builders (derived from output directory name).
+    ///
+    /// This is `None` for in-memory builders.
+    #[inline]
+    pub fn debug_tag(&self) -> Option<&str> {
+        self.debug_tag.as_deref()
+    }
+
     #[inline]
     pub fn nconstraints(&self) -> u64 {
         if self.file_sink.is_some() {
