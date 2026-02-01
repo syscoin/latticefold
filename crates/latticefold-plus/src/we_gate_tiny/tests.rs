@@ -78,9 +78,17 @@ fn test_poseidon_f257_ops_arithmetization_satisfies() {
 
     let ops: Vec<PoseidonTraceOp<F257>> = tr.trace().ops.clone();
 
+    let out_dir = {
+        let mut p = std::env::temp_dir();
+        p.push("lfplus_test_poseidon_f257_ops_arithmetization");
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("create temp out_dir");
+        p
+    };
     let (inst, asg, _wiring, _byte_wiring) =
-        poseidon_f257_arithmetize(None, &ops).expect("poseidon_f257_arithmetize");
+        poseidon_f257_arithmetize(None, &ops, &out_dir).expect("poseidon_f257_arithmetize");
     inst.check(&asg).expect("poseidon(F257) dR1CS satisfied");
+    let _ = std::fs::remove_dir_all(&out_dir);
 }
 
 #[test]

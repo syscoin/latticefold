@@ -251,6 +251,18 @@ pub fn run_sp1_oneproof_we_gate_from_files(
     // -------------------------------------------------------------------------
     // Tiny-field (F257) WE gate (Theorem 4.3 path)
     // -------------------------------------------------------------------------
+    // File-backed instance artifacts (canonical tiny gate path).
+    //
+    // Use a fixed temp dir with best-effort cleanup so callers don't have to manage paths.
+    // If you need to inspect artifacts, set `LFP_KEEP_TINY_GATE_OUT_DIR=1`.
+    let out_dir = {
+        let mut p = std::env::temp_dir();
+        p.push("lfplus_sp1_oneproof_tiny_gate");
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).map_err(|e| format!("create temp out_dir failed: {e}"))?;
+        p
+    };
+
     let pairs: Vec<(usize, usize)> = vec![(0, 0)];
     let shape = crate::we_gate_arith::we_plus_tiny_dr1cs_shape::<R>(
         &we_params,
@@ -258,6 +270,7 @@ pub fn run_sp1_oneproof_we_gate_from_files(
         proof.lproof.len(),
         m0.len(),
         &pairs,
+        &out_dir,
     )
     .map_err(|e| format!("we_plus_tiny_dr1cs_shape: {e}"))?;
 
@@ -282,6 +295,7 @@ pub fn run_sp1_oneproof_we_gate_from_files(
         proof.lproof.len(),
         m0.len(),
         &pairs,
+        &out_dir,
     )
     .map_err(|e| format!("build_we_dr1cs_for_plus_proof_witness_tiny: {e}"))?;
 
@@ -310,6 +324,10 @@ pub fn run_sp1_oneproof_we_gate_from_files(
 
     // Debug-only: keep deterministic footprints if you need to compare runs.
     let _ = hex32(&stmt_digest);
+
+    if std::env::var("LFP_KEEP_TINY_GATE_OUT_DIR").ok().as_deref() != Some("1") {
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
 
     Ok(Sp1OneProofWeGateOutput {
         stmt_digest,

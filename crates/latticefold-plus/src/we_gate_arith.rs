@@ -19,6 +19,7 @@ use symphony::dpp_poseidon::{
     poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes, Constraint, PoseidonByteWiring,
     PoseidonDr1csWiring, SparseDr1csInstance,
 };
+use symphony::file_backed_dr1cs::{merge_file_backed_sparse_dr1cs_share_one, FileBackedSparseDr1csInstance};
 use symphony::dpp_sumcheck::Dr1csBuilder;
 use symphony::dpp_sumcheck::{sumcheck_verify_degree3, RingVars};
 
@@ -91,6 +92,7 @@ fn build_we_dr1cs_for_plus_proof_shape_tiny<R>(
     n_lin_proofs: usize,
     mlen_mats: usize,
     pairs: &[(usize, usize)],
+    out_dir: impl AsRef<std::path::Path>,
 ) -> Result<WeDr1csShape<F257>, String>
 where
     R: OverField + CoeffRing + PolyRing,
@@ -152,10 +154,17 @@ where
             params,
             &wiring_abs,
             pairs,
+            {
+                let out_dir = out_dir.as_ref();
+                out_dir.join("tiny_gate")
+            },
         )?;
 
     // Public statement prefix (arm-time bound): [ONE] || [10×WeParams] || [public_inputs...]
-    let mut b_params = Dr1csBuilder::<F257>::new();
+    // Build as a file-backed instance so the full tiny-shape pipeline is file-backed.
+    let out_dir = out_dir.as_ref();
+    let mut b_params = Dr1csBuilder::<F257>::new_file_backed(out_dir.join("params_prefix"))
+        .map_err(|e| format!("tiny gate: params prefix new_file_backed failed: {e}"))?;
     b_params.enforce_var_eq_const(b_params.one(), F257::from(1u64));
     for &x in &params.to_field_vec::<F257>() {
         b_params.new_var(x);
@@ -164,33 +173,45 @@ where
     for _ in 0..public_inputs_len {
         b_params.new_var(F257::from(0u64));
     }
-    let (params_inst, params_asg) = b_params.into_instance();
+    let (params_inst, params_asg) = b_params
+        .into_file_backed_instance()
+        .map_err(|e| format!("tiny gate: params prefix into_file_backed_instance failed: {e}"))?;
 
-    // Merge params prefix first so the DPP public prefix matches `[1] || WeParams`.
-    // (The DPP/FLPCP expects the first `public_len` variables to be the public input vector `x`.)
-    let parts = vec![(params_inst, params_asg), (inst_pose, asg_pose)];
-    let (mut inst, _asg) = merge_sparse_dr1cs_share_one(parts).map_err(|e| e.to_string())?;
+    // Optional third part: constrain the transcript prefix absorb bytes to match the public prefix.
+    // We encode these constraints in a small additional file-backed module and glue it to:
+    // - params prefix vars (public inputs)
+    // - Poseidon absorb byte vars inside the tiny-gate instance
+    let mut extra_eqs: Vec<(usize, usize)> = Vec::new();
+    let mut parts: Vec<(FileBackedSparseDr1csInstance<F257>, Vec<F257>)> =
+        vec![(params_inst, params_asg), (inst_pose, asg_pose)];
 
-    // ------------------------------------------------------------
-    // Glue statement public inputs into the transcript prefix.
-    //
-    // In the real verifier transcript, public inputs (e.g. SP1 digest bits as base-field elements)
-    // are absorbed *before* any challenges are squeezed. Our tiny-field transcript arithmetization
-    // therefore must bind the public prefix variables to the first `public_inputs_len` `Absorb`
-    // ops of the Poseidon(F257) schedule.
-    //
-    // Current statement convention for public inputs in this tiny gate: each public input is a
-    // single bit/value in F257, and we bind it to the *first byte* of the absorbed base-field
-    // element; the remaining absorbed bytes are constrained to 0. This matches absorbing a
-    // base-field element `0/1` under little-endian fixed-width encoding.
-    // ------------------------------------------------------------
     if public_inputs_len > 0 {
         let coeff_bytes = ((<R::BaseRing as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8;
-        // Variable offset of the Poseidon part inside `inst` (excluding var0).
-        let pose_offset = (1 + 10 + public_inputs_len) - 1; // params_inst.nvars - 1
         if pose_wiring.absorb_ranges.len() < public_inputs_len {
             return Err("tiny gate: not enough Absorb ops for public inputs".to_string());
         }
+
+        let (params_asg, tiny_asg) = (&parts[0].1, &parts[1].1);
+        let params_nvars = params_asg.len();
+        let tiny_nvars = tiny_asg.len();
+        let offsets = [0usize, params_nvars.saturating_sub(1), params_nvars.saturating_sub(1).saturating_add(tiny_nvars.saturating_sub(1))];
+        let remap = |part: usize, local: usize, offsets: &[usize; 3]| -> usize {
+            if local == 0 { 0 } else { local + offsets[part] }
+        };
+
+        let mut gb_pub = Dr1csBuilder::<F257>::new_file_backed(out_dir.join("public_inputs_glue"))
+            .map_err(|e| format!("tiny gate: public_inputs_glue new_file_backed failed: {e}"))?;
+        gb_pub.enforce_var_eq_const(gb_pub.one(), F257::ONE);
+
+        // Allocate module-local copies of the public vars (one per public input).
+        let mut pub_locals: Vec<usize> = Vec::with_capacity(public_inputs_len);
+        for _ in 0..public_inputs_len {
+            pub_locals.push(gb_pub.new_var(F257::ZERO));
+        }
+
+        // Allocate module-local copies of absorb-byte vars as needed.
+        let mut absorb_local_map: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+
         for i in 0..public_inputs_len {
             let pub_var = 1usize + 10usize + i;
             let (ab_start, ab_len) = pose_wiring.absorb_ranges[i];
@@ -201,41 +222,42 @@ where
             }
             for j in 0..ab_len {
                 let v_ab_local = pose_wiring.absorb_vars[ab_start + j];
-                let v_ab = if v_ab_local == 0 {
-                    0
-                } else {
-                    v_ab_local + pose_offset
-                };
+                if v_ab_local == 0 {
+                    continue;
+                }
+                let ab_local = *absorb_local_map.entry(v_ab_local).or_insert_with(|| gb_pub.new_var(tiny_asg[v_ab_local]));
                 if j == 0 {
-                    // v_ab == pub_var
-                    let a0 = inst.a_terms.len();
-                    inst.a_terms
-                        .extend_from_slice(&[(F257::ONE, v_ab), (-F257::ONE, pub_var)]);
-                    let a1 = inst.a_terms.len();
-                    let b0 = inst.b_terms.len();
-                    inst.b_terms.push((F257::ONE, 0));
-                    let b1 = inst.b_terms.len();
-                    let c0 = inst.c_terms.len();
-                    inst.c_terms.push((F257::ZERO, 0));
-                    let c1 = inst.c_terms.len();
-                    inst.constraints.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
+                    // ab_local == pub_local
+                    gb_pub.enforce_lc_times_one_eq_const(vec![
+                        (F257::ONE, ab_local),
+                        (-F257::ONE, pub_locals[i]),
+                    ]);
                 } else {
-                    // v_ab == 0
-                    let a0 = inst.a_terms.len();
-                    inst.a_terms.extend_from_slice(&[(F257::ONE, v_ab)]);
-                    let a1 = inst.a_terms.len();
-                    let b0 = inst.b_terms.len();
-                    inst.b_terms.push((F257::ONE, 0));
-                    let b1 = inst.b_terms.len();
-                    let c0 = inst.c_terms.len();
-                    inst.c_terms.push((F257::ZERO, 0));
-                    let c1 = inst.c_terms.len();
-                    inst.constraints.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
+                    // ab_local == 0
+                    gb_pub.enforce_var_eq_const(ab_local, F257::ZERO);
                 }
             }
+
+            // Glue pub_local[i] to params prefix pub_var.
+            extra_eqs.push((remap(0, pub_var, &offsets), remap(2, pub_locals[i], &offsets)));
         }
+
+        // Glue absorb-byte locals to tiny-gate absorb-byte vars.
+        for (v_ab_local, ab_local) in absorb_local_map {
+            extra_eqs.push((remap(1, v_ab_local, &offsets), remap(2, ab_local, &offsets)));
+        }
+
+        let (pub_inst, pub_asg) = gb_pub
+            .into_file_backed_instance()
+            .map_err(|e| format!("tiny gate: public_inputs_glue into_file_backed_instance failed: {e}"))?;
+        parts.push((pub_inst, pub_asg));
     }
 
+    let (inst, _asg) = merge_file_backed_sparse_dr1cs_share_one::<F257>(
+        parts,
+        out_dir.join("merged"),
+        &extra_eqs,
+    )?;
     Ok(WeDr1csShape { inst, public_len: 1 + 10 + public_inputs_len })
 }
 
@@ -441,9 +463,16 @@ pub struct WeDr1csOutput<F: PrimeField> {
     pub public_len: usize,
 }
 
-/// Shape-only WE gate output (arm-time artifact): fixed instance + public prefix length.
+/// Shape-only WE gate output (arm-time artifact): fixed **file-backed** instance + public prefix length.
 #[derive(Clone, Debug)]
 pub struct WeDr1csShape<F: PrimeField> {
+    pub inst: FileBackedSparseDr1csInstance<F>,
+    pub public_len: usize,
+}
+
+/// Shape-only WE gate output (arm-time artifact): fixed **in-memory** instance + public prefix length.
+#[derive(Clone, Debug)]
+pub struct WeDr1csShapeInMemory<F: PrimeField> {
     pub inst: SparseDr1csInstance<F>,
     pub public_len: usize,
 }
@@ -784,7 +813,7 @@ pub fn build_we_dr1cs_for_plus_proof_shape<R>(
     public_inputs_len: usize,
     n_lin_proofs: usize,
     mlen_mats: usize,
-) -> Result<WeDr1csShape<BF<R>>, String>
+) -> Result<WeDr1csShapeInMemory<BF<R>>, String>
 where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + Field + PrimeField,
@@ -802,7 +831,7 @@ where
         mlen_mats,
         B,
     )?;
-    Ok(WeDr1csShape { inst: out.inst, public_len: out.public_len })
+    Ok(WeDr1csShapeInMemory { inst: out.inst, public_len: out.public_len })
 }
 
 /// Witness-time builder for the full LF+ Π_plus WE gate.
@@ -838,12 +867,20 @@ pub fn we_plus_tiny_dr1cs_shape<R>(
     n_lin_proofs: usize,
     mlen_mats: usize,
     pairs: &[(usize, usize)],
+    out_dir: impl AsRef<std::path::Path>,
 ) -> Result<WeDr1csShape<F257>, String>
 where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + Field + PrimeField,
 {
-    build_we_dr1cs_for_plus_proof_shape_tiny::<R>(params, public_inputs_len, n_lin_proofs, mlen_mats, pairs)
+    build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
+        params,
+        public_inputs_len,
+        n_lin_proofs,
+        mlen_mats,
+        pairs,
+        out_dir,
+    )
 }
 
 /// Witness-time (assignment) builder for the **tiny-field** (F257) Π_plus WE gate.
@@ -864,6 +901,7 @@ pub fn build_we_dr1cs_for_plus_proof_witness_tiny<R>(
     _n_lin_proofs: usize,
     _mlen_mats: usize,
     pairs: &[(usize, usize)],
+    out_dir: impl AsRef<std::path::Path>,
 ) -> Result<Vec<F257>, String>
 where
     R: OverField + CoeffRing + PolyRing,
@@ -914,7 +952,7 @@ where
         _goldilocks,
         _surfaces_mul,
         _surfaces_sq,
-        _pose_wiring,
+        pose_wiring,
     ) =
         tiny::we_tiny_f257_build_cm_gate_from_trace_ops(
             None,
@@ -923,10 +961,17 @@ where
             params,
             &wiring_abs,
             pairs,
+            {
+                let out_dir = out_dir.as_ref();
+                out_dir.join("tiny_gate")
+            },
         )?;
 
+    let out_dir = out_dir.as_ref();
+
     // Public statement prefix: [ONE] || [10×WeParams] || [public_inputs...]
-    let mut b_params = Dr1csBuilder::<F257>::new();
+    let mut b_params = Dr1csBuilder::<F257>::new_file_backed(out_dir.join("params_prefix"))
+        .map_err(|e| format!("tiny witness: params prefix new_file_backed failed: {e}"))?;
     b_params.enforce_var_eq_const(b_params.one(), F257::from(1u64));
     for &x in &params.to_field_vec::<F257>() {
         b_params.new_var(x);
@@ -934,11 +979,79 @@ where
     for &pi in public_inputs {
         b_params.new_var(pi);
     }
-    let (params_inst, params_asg) = b_params.into_instance();
+    let (params_inst, params_asg) = b_params
+        .into_file_backed_instance()
+        .map_err(|e| format!("tiny witness: params prefix into_file_backed_instance failed: {e}"))?;
 
-    // Merge in the same order as the shape builder.
-    let parts = vec![(params_inst, params_asg), (inst_pose, asg_pose)];
-    let (_inst, asg) = merge_sparse_dr1cs_share_one(parts).map_err(|e| e.to_string())?;
+    let mut extra_eqs: Vec<(usize, usize)> = Vec::new();
+    let mut parts: Vec<(FileBackedSparseDr1csInstance<F257>, Vec<F257>)> =
+        vec![(params_inst, params_asg), (inst_pose, asg_pose)];
+
+    if !public_inputs.is_empty() {
+        let public_inputs_len = public_inputs.len();
+        let coeff_bytes = ((<R::BaseRing as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8;
+        if pose_wiring.absorb_ranges.len() < public_inputs_len {
+            return Err("tiny witness: not enough Absorb ops for public inputs".to_string());
+        }
+
+        let (params_asg, tiny_asg) = (&parts[0].1, &parts[1].1);
+        let params_nvars = params_asg.len();
+        let tiny_nvars = tiny_asg.len();
+        let offsets = [0usize, params_nvars.saturating_sub(1), params_nvars.saturating_sub(1).saturating_add(tiny_nvars.saturating_sub(1))];
+        let remap = |part: usize, local: usize, offsets: &[usize; 3]| -> usize {
+            if local == 0 { 0 } else { local + offsets[part] }
+        };
+
+        let mut gb_pub = Dr1csBuilder::<F257>::new_file_backed(out_dir.join("public_inputs_glue"))
+            .map_err(|e| format!("tiny witness: public_inputs_glue new_file_backed failed: {e}"))?;
+        gb_pub.enforce_var_eq_const(gb_pub.one(), F257::ONE);
+
+        let mut pub_locals: Vec<usize> = Vec::with_capacity(public_inputs_len);
+        for &pi in public_inputs {
+            pub_locals.push(gb_pub.new_var(pi));
+        }
+        let mut absorb_local_map: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+
+        for i in 0..public_inputs_len {
+            let pub_var = 1usize + 10usize + i;
+            let (ab_start, ab_len) = pose_wiring.absorb_ranges[i];
+            if ab_len != coeff_bytes {
+                return Err(format!(
+                    "tiny witness: public input absorb len mismatch (got {ab_len}, expected {coeff_bytes})"
+                ));
+            }
+            for j in 0..ab_len {
+                let v_ab_local = pose_wiring.absorb_vars[ab_start + j];
+                if v_ab_local == 0 {
+                    continue;
+                }
+                let ab_local = *absorb_local_map.entry(v_ab_local).or_insert_with(|| gb_pub.new_var(tiny_asg[v_ab_local]));
+                if j == 0 {
+                    gb_pub.enforce_lc_times_one_eq_const(vec![
+                        (F257::ONE, ab_local),
+                        (-F257::ONE, pub_locals[i]),
+                    ]);
+                } else {
+                    gb_pub.enforce_var_eq_const(ab_local, F257::ZERO);
+                }
+            }
+            extra_eqs.push((remap(0, pub_var, &offsets), remap(2, pub_locals[i], &offsets)));
+        }
+        for (v_ab_local, ab_local) in absorb_local_map {
+            extra_eqs.push((remap(1, v_ab_local, &offsets), remap(2, ab_local, &offsets)));
+        }
+
+        let (pub_inst, pub_asg) = gb_pub
+            .into_file_backed_instance()
+            .map_err(|e| format!("tiny witness: public_inputs_glue into_file_backed_instance failed: {e}"))?;
+        parts.push((pub_inst, pub_asg));
+    }
+
+    let (_inst, asg) = merge_file_backed_sparse_dr1cs_share_one::<F257>(
+        parts,
+        out_dir.join("merged"),
+        &extra_eqs,
+    )?;
     Ok(asg)
 }
 
@@ -957,6 +1070,7 @@ pub fn build_we_dr1cs_for_plus_proof_witness_tiny_from_proof<R>(
     proof: &crate::plus::PlusProof<R, crate::r1cs::ComR1CSProof<R>>,
     mlen_mats: usize,
     pairs: &[(usize, usize)],
+    out_dir: impl AsRef<std::path::Path>,
 ) -> Result<Vec<F257>, String>
 where
     R: OverField + CoeffRing + PolyRing,
@@ -1049,7 +1163,7 @@ where
     wiring_abs.u32_squeeze_ops = wiring_rel.u32_squeeze_ops.into_iter().map(|i| i + squeeze_field_op_offset).collect();
     wiring_abs.u32_squeeze_ops.splice(0..0, prefix_u32_squeeze_ops.into_iter());
 
-    let (inst_pose, asg_pose, _shorts, _u32s, _goldilocks, _surfaces_mul, _surfaces_sq, _pose_wiring) =
+    let (inst_pose, asg_pose, _shorts, _u32s, _goldilocks, _surfaces_mul, _surfaces_sq, pose_wiring) =
         tiny::we_tiny_f257_build_cm_gate_from_trace_ops_with_extra_witness(
             None,
             &ops_f257,
@@ -1058,10 +1172,17 @@ where
             &wiring_abs,
             pairs,
             Some(&extra),
+            {
+                let out_dir = out_dir.as_ref();
+                out_dir.join("tiny_gate")
+            },
         )?;
 
+    let out_dir = out_dir.as_ref();
+
     // Public statement prefix: [ONE] || [10×WeParams] || [public_inputs...]
-    let mut b_params = Dr1csBuilder::<F257>::new();
+    let mut b_params = Dr1csBuilder::<F257>::new_file_backed(out_dir.join("params_prefix"))
+        .map_err(|e| format!("tiny witness(from_proof): params prefix new_file_backed failed: {e}"))?;
     b_params.enforce_var_eq_const(b_params.one(), F257::from(1u64));
     for &x in &params.to_field_vec::<F257>() {
         b_params.new_var(x);
@@ -1069,9 +1190,79 @@ where
     for &pi in public_inputs {
         b_params.new_var(pi);
     }
-    let (params_inst, params_asg) = b_params.into_instance();
-    let parts = vec![(params_inst, params_asg), (inst_pose, asg_pose)];
-    let (_inst, asg) = merge_sparse_dr1cs_share_one(parts).map_err(|e| e.to_string())?;
+    let (params_inst, params_asg) = b_params
+        .into_file_backed_instance()
+        .map_err(|e| format!("tiny witness(from_proof): params prefix into_file_backed_instance failed: {e}"))?;
+
+    let mut extra_eqs: Vec<(usize, usize)> = Vec::new();
+    let mut parts: Vec<(FileBackedSparseDr1csInstance<F257>, Vec<F257>)> =
+        vec![(params_inst, params_asg), (inst_pose, asg_pose)];
+
+    if !public_inputs.is_empty() {
+        let public_inputs_len = public_inputs.len();
+        let coeff_bytes = ((<R::BaseRing as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8;
+        if pose_wiring.absorb_ranges.len() < public_inputs_len {
+            return Err("tiny witness(from_proof): not enough Absorb ops for public inputs".to_string());
+        }
+
+        let (params_asg, tiny_asg) = (&parts[0].1, &parts[1].1);
+        let params_nvars = params_asg.len();
+        let tiny_nvars = tiny_asg.len();
+        let offsets = [0usize, params_nvars.saturating_sub(1), params_nvars.saturating_sub(1).saturating_add(tiny_nvars.saturating_sub(1))];
+        let remap = |part: usize, local: usize, offsets: &[usize; 3]| -> usize {
+            if local == 0 { 0 } else { local + offsets[part] }
+        };
+
+        let mut gb_pub = Dr1csBuilder::<F257>::new_file_backed(out_dir.join("public_inputs_glue"))
+            .map_err(|e| format!("tiny witness(from_proof): public_inputs_glue new_file_backed failed: {e}"))?;
+        gb_pub.enforce_var_eq_const(gb_pub.one(), F257::ONE);
+
+        let mut pub_locals: Vec<usize> = Vec::with_capacity(public_inputs_len);
+        for &pi in public_inputs {
+            pub_locals.push(gb_pub.new_var(pi));
+        }
+        let mut absorb_local_map: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+
+        for i in 0..public_inputs_len {
+            let pub_var = 1usize + 10usize + i;
+            let (ab_start, ab_len) = pose_wiring.absorb_ranges[i];
+            if ab_len != coeff_bytes {
+                return Err(format!(
+                    "tiny witness(from_proof): public input absorb len mismatch (got {ab_len}, expected {coeff_bytes})"
+                ));
+            }
+            for j in 0..ab_len {
+                let v_ab_local = pose_wiring.absorb_vars[ab_start + j];
+                if v_ab_local == 0 {
+                    continue;
+                }
+                let ab_local = *absorb_local_map.entry(v_ab_local).or_insert_with(|| gb_pub.new_var(tiny_asg[v_ab_local]));
+                if j == 0 {
+                    gb_pub.enforce_lc_times_one_eq_const(vec![
+                        (F257::ONE, ab_local),
+                        (-F257::ONE, pub_locals[i]),
+                    ]);
+                } else {
+                    gb_pub.enforce_var_eq_const(ab_local, F257::ZERO);
+                }
+            }
+            extra_eqs.push((remap(0, pub_var, &offsets), remap(2, pub_locals[i], &offsets)));
+        }
+        for (v_ab_local, ab_local) in absorb_local_map {
+            extra_eqs.push((remap(1, v_ab_local, &offsets), remap(2, ab_local, &offsets)));
+        }
+
+        let (pub_inst, pub_asg) = gb_pub
+            .into_file_backed_instance()
+            .map_err(|e| format!("tiny witness(from_proof): public_inputs_glue into_file_backed_instance failed: {e}"))?;
+        parts.push((pub_inst, pub_asg));
+    }
+
+    let (_inst, asg) = merge_file_backed_sparse_dr1cs_share_one::<F257>(
+        parts,
+        out_dir.join("merged"),
+        &extra_eqs,
+    )?;
     Ok(asg)
 }
 
@@ -6066,6 +6257,13 @@ mod tests {
             .u32_squeeze_ops
             .splice(0..0, prefix_u32_squeeze_ops.into_iter());
 
+        let out_dir = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_tiny_gate_build_from_ops");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir");
+            p
+        };
         let (inst, asg, _shorts, _u32s, _goldilocks, _sm, _ssq, _w) =
             tiny::we_tiny_f257_build_cm_gate_from_trace_ops(
                 None,
@@ -6074,98 +6272,14 @@ mod tests {
                 &params,
                 &wiring_abs,
                 &pairs,
+                &out_dir,
             )
             .expect("we_tiny_f257_build_cm_gate_from_trace_ops");
 
         inst.check(&asg).expect("dr1cs check");
-    }
-
-    #[test]
-    #[ignore = "slow: file-backed tiny gate + checks all constraints (GoldilocksRing64)"]
-    fn test_tiny_gate_shape_builds_and_constraints_check_goldilocks_file_backed() {
-        use cyclotomic_rings::rings::GoldilocksRing64 as RR;
-
-        init_rayon_stack();
-
-        let ring_dim = <RR as PolyRing>::dimension() as u64;
-        let nvars = 12u64;
-        let params = WeParams {
-            nvars_setchk: nvars,
-            degree_setchk: 3,
-            nvars_cm: nvars,
-            degree_cm: 2,
-            kappa: 1,
-            ring_dim_d: ring_dim,
-            decomp_b: 16,
-            k: 1,
-            l: 1,
-            mlen: 0,
-        };
-        let pairs: Vec<(usize, usize)> = vec![(0, 0)];
-
-        let trace = super::poseidon_trace_schedule_for_plus::<RR>(0, &params, 1, 0)
-            .expect("poseidon_trace_schedule_for_plus");
-        let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<RR>>(&trace.ops)
-            .expect("lift_recording_trace_ops_to_f257");
-
-        let squeeze_field_op_offset =
-            super::first_squeeze_field_op_index_of_len(&ops_f257, <RR as PolyRing>::dimension())
-                .expect("first short SqueezeField(len=ring_dim) exists");
-        let prefix_u32_squeeze_ops =
-            super::collect_get_challenge_squeeze_field_indices(&ops_f257, 0, squeeze_field_op_offset);
-
-        let k = params.k as usize;
-        let log_kappa = ark_std::log2((params.kappa as usize).next_power_of_two()) as usize;
-        let nvars_cm = params.nvars_cm as usize;
-        let wiring_rel = tiny::infer_cm_coin_op_wiring_from_ops(
-            &ops_f257,
-            <RR as PolyRing>::dimension(),
-            k,
-            log_kappa,
-            nvars_cm,
-            squeeze_field_op_offset,
-        )
-        .expect("infer_cm_coin_op_wiring_from_ops");
-
-        let mut wiring_abs = tiny::TinyCoinOpWiring::default();
-        wiring_abs.short_squeeze_ops = wiring_rel
-            .short_squeeze_ops
-            .into_iter()
-            .map(|i| i + squeeze_field_op_offset)
-            .collect();
-        wiring_abs.u32_squeeze_ops = wiring_rel
-            .u32_squeeze_ops
-            .into_iter()
-            .map(|i| i + squeeze_field_op_offset)
-            .collect();
-        wiring_abs
-            .u32_squeeze_ops
-            .splice(0..0, prefix_u32_squeeze_ops.into_iter());
-
-        let out_dir = {
-            let mut p = std::env::temp_dir();
-            p.push("lfplus_tiny_gate_goldilocks_file_backed");
-            let _ = std::fs::remove_dir_all(&p);
-            std::fs::create_dir_all(&p).expect("create temp out_dir");
-            p
-        };
-
-        let (inst, asg, _shorts, _u32s, _goldilocks, _sm, _ssq, _w) =
-            tiny::we_tiny_f257_build_cm_gate_from_trace_ops_file_backed_with_extra_witness(
-                None,
-                &ops_f257,
-                <RR as PolyRing>::dimension(),
-                &params,
-                &wiring_abs,
-                &pairs,
-                None,
-                &out_dir,
-            )
-            .expect("we_tiny_f257_build_cm_gate_from_trace_ops_file_backed_with_extra_witness");
-
-        inst.check(&asg).expect("dr1cs check (file-backed)");
         let _ = std::fs::remove_dir_all(&out_dir);
     }
+
 
     #[test]
     #[ignore = "very slow in debug: runs full DPP prove+decap; run with `--release`"]
@@ -6213,17 +6327,32 @@ mod tests {
 
         // Armer builds the shape.
         let t_shape = Instant::now();
+        let out_dir_shape = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_tiny_shape_roundtrip_shape");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_shape");
+            p
+        };
         let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
             &params,
             public_inputs_len,
             n_lin_proofs,
             mlen_mats,
             &pairs,
+            &out_dir_shape,
         )
         .expect("build_we_dr1cs_for_plus_proof_shape_tiny");
         assert_eq!(shape.public_len, 1 + 10 + public_inputs_len);
 
         // Prover builds a satisfying assignment for *that same shape* from the recorded trace.
+        let out_dir_witness = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_tiny_shape_roundtrip_witness");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_witness");
+            p
+        };
         let asg = build_we_dr1cs_for_plus_proof_witness_tiny::<R>(
             &trace,
             &params,
@@ -6231,80 +6360,18 @@ mod tests {
             n_lin_proofs,
             mlen_mats,
             &pairs,
+            &out_dir_witness,
         )
         .expect("build_we_dr1cs_for_plus_proof_witness_tiny");
+        let _ = std::fs::remove_dir_all(&out_dir_witness);
         assert_eq!(asg.len(), shape.inst.nvars);
-        // If satisfiability fails, dump the failing constraint so we can pinpoint whether
-        // this is a Poseidon/glue mismatch or an actual verifier-math bug.
-        if let Err(e) = shape.inst.check(&asg) {
-            fn parse_failed_constraint_idx(msg: &str) -> Option<usize> {
-                // Expected format (from symphony): "constraint N failed"
-                let needle = "constraint ";
-                let i = msg.find(needle)? + needle.len();
-                let rest = &msg[i..];
-                let j = rest.find(' ')?;
-                rest[..j].parse::<usize>().ok()
-            }
-            fn dot<F: PrimeField>(a: &[(F, usize)], z: &[F]) -> F {
-                let mut acc = F::ZERO;
-                for (c, idx) in a {
-                    let v = if *idx == 0 { F::ONE } else { z[*idx] };
-                    acc += *c * v;
-                }
-                acc
-            }
-
-            eprintln!("[tiny_gate] DR1CS unsat: {e}");
-            if let Some(ci) = parse_failed_constraint_idx(&e) {
-                if let Some(con) = shape.inst.constraints.get(ci) {
-                    let av = dot(&shape.inst.a_terms[con.a.clone()], &asg);
-                    let bv = dot(&shape.inst.b_terms[con.b.clone()], &asg);
-                    let cv = dot(&shape.inst.c_terms[con.c.clone()], &asg);
-                    let res = av * bv - cv;
-                    eprintln!(
-                        "[tiny_gate] failing constraint idx={ci}  (A·z)={av:?} (B·z)={bv:?} (C·z)={cv:?}  residual=A·B-C={res:?}"
-                    );
-                    eprintln!("[tiny_gate] constraint a-len={} b-len={} c-len={}", con.a.len(), con.b.len(), con.c.len());
-                    // Print a small prefix of each term list (enough to see which vars are involved).
-                    let show = |name: &str, terms: &[(F257, usize)]| {
-                        let k = terms.len().min(12);
-                        eprintln!("[tiny_gate] {name} first {k} terms: {:?}", &terms[..k]);
-                    };
-                    // NOTE: `Constraint` here is over `F257` in this test.
-                    show("A", &shape.inst.a_terms[con.a.clone()]);
-                    show("B", &shape.inst.b_terms[con.b.clone()]);
-                    show("C", &shape.inst.c_terms[con.c.clone()]);
-
-                    // Also print the concrete z-values for the vars appearing in A (common for glue/equality failures).
-                    if con.a.len() <= 8 {
-                        for (c, idx) in &shape.inst.a_terms[con.a.clone()] {
-                            if *idx == 0 {
-                                eprintln!("[tiny_gate] A term: coeff={c:?} var=ONE value=1");
-                            } else {
-                                eprintln!(
-                                    "[tiny_gate] A term: coeff={c:?} var={idx} value={:?}",
-                                    asg[*idx]
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    eprintln!(
-                        "[tiny_gate] failing constraint idx={ci} out of range (constraints={})",
-                        shape.inst.constraints.len()
-                    );
-                }
-            } else {
-                eprintln!("[tiny_gate] could not parse failing constraint index from error");
-            }
-            panic!("shape should be satisfied by witness assignment: {e}");
-        }
+        shape.inst.check(&asg).expect("shape should be satisfied by witness assignment");
         eprintln!(
             "[tiny_gate] built shape in {:?}: public_len={} nvars={} constraints={}",
             t_shape.elapsed(),
             shape.public_len,
             shape.inst.nvars,
-            shape.inst.constraints.len()
+            shape.inst.layout.nconstraints
         );
 
         // Arm and then prove+decap using the satisfying assignment split into (x || z_w).
@@ -6809,21 +6876,51 @@ mod tests {
         alt.mlen = 1;
 
         // Arm-time binding: changing `mlen` should change the arm-time circuit shape.
-        let s0 = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(&base, public_inputs_len, n_lin_proofs, 0, &pairs)
-            .expect("shape(base)");
-        let s1 = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(&alt, public_inputs_len, n_lin_proofs, 1, &pairs)
-            .expect("shape(alt)");
+        let out_dir0 = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_tiny_shape_mlen0");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir0");
+            p
+        };
+        let out_dir1 = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_tiny_shape_mlen1");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir1");
+            p
+        };
+        let s0 = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
+            &base,
+            public_inputs_len,
+            n_lin_proofs,
+            0,
+            &pairs,
+            &out_dir0,
+        )
+        .expect("shape(base)");
+        let s1 = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
+            &alt,
+            public_inputs_len,
+            n_lin_proofs,
+            1,
+            &pairs,
+            &out_dir1,
+        )
+        .expect("shape(alt)");
         assert_ne!(s0.public_len, 0);
         assert_ne!(s1.public_len, 0);
         // We don't require a specific delta, but `mlen` should affect at least one size metric.
         assert!(
             s0.inst.nvars != s1.inst.nvars
-                || s0.inst.constraints.len() != s1.inst.constraints.len()
-                || s0.inst.a_terms.len() != s1.inst.a_terms.len()
-                || s0.inst.b_terms.len() != s1.inst.b_terms.len()
-                || s0.inst.c_terms.len() != s1.inst.c_terms.len(),
+                || s0.inst.layout.nconstraints != s1.inst.layout.nconstraints
+                || s0.inst.layout.a_terms != s1.inst.layout.a_terms
+                || s0.inst.layout.b_terms != s1.inst.layout.b_terms
+                || s0.inst.layout.c_terms != s1.inst.layout.c_terms,
             "expected mlen change to alter tiny gate shape metrics"
         );
+        let _ = std::fs::remove_dir_all(&out_dir0);
+        let _ = std::fs::remove_dir_all(&out_dir1);
     }
 
     #[test]
@@ -6874,14 +6971,29 @@ mod tests {
         )
         .expect("poseidon_trace_schedule_for_plus_with_public_inputs");
 
+        let out_dir_shape = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_we_plus_tiny_shape_public_inputs_bound");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_shape");
+            p
+        };
         let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
             &params,
             public_inputs_len,
             n_lin_proofs,
             mlen_mats,
             &pairs,
+            &out_dir_shape,
         )
         .expect("shape tiny");
+        let out_dir_witness = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_we_plus_tiny_witness_public_inputs_bound");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_witness");
+            p
+        };
         let asg = build_we_dr1cs_for_plus_proof_witness_tiny::<RR>(
             &trace,
             &params,
@@ -6889,8 +7001,10 @@ mod tests {
             n_lin_proofs,
             mlen_mats,
             &pairs,
+            &out_dir_witness,
         )
         .expect("witness tiny");
+        let _ = std::fs::remove_dir_all(&out_dir_witness);
         shape.inst.check(&asg).expect("baseline should satisfy");
 
         // Flip the first public input. Public prefix layout:
@@ -6902,6 +7016,7 @@ mod tests {
             shape.inst.check(&bad).is_err(),
             "public input flip should break satisfaction (bound into transcript absorbs)"
         );
+        let _ = std::fs::remove_dir_all(&out_dir_shape);
     }
 
     #[test]
@@ -6934,14 +7049,29 @@ mod tests {
                 .expect("poseidon_trace_schedule_for_plus");
         let public_inputs: Vec<F257> = Vec::new();
 
+        let out_dir_shape = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_we_plus_tiny_shape_var_flip");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_shape");
+            p
+        };
         let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
             &params,
             public_inputs_len,
             n_lin_proofs,
             mlen_mats,
             &pairs,
+            &out_dir_shape,
         )
         .expect("shape tiny");
+        let out_dir_witness = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_we_plus_tiny_witness_var_flip");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_witness");
+            p
+        };
         let asg = build_we_dr1cs_for_plus_proof_witness_tiny::<RR>(
             &trace,
             &params,
@@ -6949,29 +7079,16 @@ mod tests {
             n_lin_proofs,
             mlen_mats,
             &pairs,
+            &out_dir_witness,
         )
         .expect("witness tiny");
+        let _ = std::fs::remove_dir_all(&out_dir_witness);
         shape.inst.check(&asg).expect("baseline should satisfy");
 
-        // Find a non-public variable index that appears in some constraint.
+        // Perturb a non-public variable (the first witness slot after the public prefix).
         let pub_len = shape.public_len;
-        let pick = |terms: &[(F257, usize)], pub_len: usize| -> Option<usize> {
-            terms
-                .iter()
-                .map(|(_, v)| *v)
-                .find(|&v| v != 0 && v >= pub_len)
-        };
-        let mut v: Option<usize> = None;
-        for con in &shape.inst.constraints {
-            v = pick(&shape.inst.a_terms[con.a.clone()], pub_len)
-                .or_else(|| pick(&shape.inst.b_terms[con.b.clone()], pub_len))
-                .or_else(|| pick(&shape.inst.c_terms[con.c.clone()], pub_len));
-            if v.is_some() {
-                break;
-            }
-        }
-        let v = v.expect("expected to find a constrained, non-public variable");
-        assert!(v < asg.len());
+        let v = pub_len;
+        assert!(v < asg.len(), "expected v within assignment");
 
         let mut bad = asg.clone();
         bad[v] += F257::ONE;
@@ -6979,6 +7096,7 @@ mod tests {
             shape.inst.check(&bad).is_err(),
             "flipping constrained non-public var should break satisfaction"
         );
+        let _ = std::fs::remove_dir_all(&out_dir_shape);
     }
 
     #[test]
@@ -7051,9 +7169,17 @@ mod tests {
                 .expect("poseidon_trace_schedule_for_plus");
         let ops_f257 = crate::we_gate_tiny::lift_recording_trace_ops_to_f257::<BF<RR>>(&trace.ops)
             .expect("lift trace ops to f257");
+        let out_dir = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_poseidon_f257_arithmetize");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir");
+            p
+        };
         let (inst, asg, _wiring, _byte_wiring) =
-            crate::we_gate_tiny::poseidon_f257_arithmetize(None, &ops_f257).expect("poseidon f257");
+            crate::we_gate_tiny::poseidon_f257_arithmetize(None, &ops_f257, &out_dir).expect("poseidon f257");
         inst.check(&asg).expect("poseidon f257 schedule satisfiable");
+        let _ = std::fs::remove_dir_all(&out_dir);
     }
 
     // Large-scale (n=2^20) end-to-end WE->DPP sanity + digest "before/after" metric.
@@ -7434,16 +7560,16 @@ mod tests {
 
             // Fixed temp dir (no pid/seq). Best-effort cleanup before/after so users don't have to
             // manually delete large file-backed artifacts.
-            let out_dir = {
+        let out_dir = {
                 let mut p = std::env::temp_dir();
-                p.push("lfplus_tiny_gate_file_backed");
+            p.push("lfplus_tiny_gate");
                 // If a previous run crashed or was interrupted, ensure a clean slate.
                 let _ = std::fs::remove_dir_all(&p);
                 std::fs::create_dir_all(&p).expect("create temp out_dir");
                 p
             };
             let (tiny_inst, tiny_asg, _shorts, _u32s, _gold, _sm, _ssq, _pose_wiring) =
-                tiny::we_tiny_f257_build_cm_gate_from_trace_ops_file_backed_with_extra_witness(
+                tiny::we_tiny_f257_build_cm_gate_from_trace_ops_with_extra_witness(
                     None,
                     &ops_f257,
                     ring_dim,
@@ -7453,7 +7579,7 @@ mod tests {
                     Some(&extra),
                     &out_dir,
                 )
-                .expect("build tiny gate (file-backed) from real trace");
+                .expect("build tiny gate from real trace");
             tiny_inst.check(&tiny_asg).expect("tiny gate dr1cs check");
             eprintln!(
                 "[test_large_trace] build_we_tiny_gate: {:?} (nvars={}, constraints={})",

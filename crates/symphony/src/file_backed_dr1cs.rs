@@ -642,7 +642,6 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
         Ok(v) => v != "0",
         Err(_) => false,
     };
-    let t_asg = std::time::Instant::now();
     let mut tail_lens: Vec<usize> = Vec::with_capacity(parts.len());
     let mut total_tail: usize = 0;
     for (_inst, asg) in parts.iter() {
@@ -699,14 +698,6 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
             new_assignment[start..start + tl].copy_from_slice(&asg[1..]);
         }
     }
-    if timing {
-        eprintln!(
-            "file_backed_merge: assignment concat done in {:?} (nvars={})",
-            t_asg.elapsed(),
-            new_assignment.len()
-        );
-    }
-
     // IMPORTANT: merge is dominated by streaming IO + index remapping.
     // Large buffers significantly reduce syscall overhead during merges.
     // Use a moderately large chunk size per worker to avoid over-allocating when many Rayon workers run.
@@ -728,7 +719,7 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
         create_dir_all(&out_dir).map_err(|e| format!("create_dir_all failed: {e}"))?;
         if timing {
             eprintln!(
-                "file_backed_merge: parallel start parts={} threads={} out_dir={}",
+                "file_backed_merge: start parts={} threads={} out_dir={}",
                 parts.len(),
                 n_threads,
                 out_dir.display()
@@ -976,9 +967,7 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                     }
                 }
             })?;
-            if timing {
-                eprintln!("file_backed_merge: direct-write pools done in {:?}", t_direct.elapsed());
-            }
+            let _ = (timing, t_direct);
 
             // Append equality constraints at the tail (write_at into pre-sized file ranges).
             if !extra_eqs.is_empty() {
@@ -1072,9 +1061,7 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                     i0 = i1;
                 }
 
-                if timing {
-                    eprintln!("file_backed_merge: appended eqs={} in {:?}", extra_eqs.len(), t_eq.elapsed());
-                }
+                let _ = (timing, extra_eqs, t_eq);
             }
 
             // Write meta (human-readable).
@@ -1090,7 +1077,7 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
             }
 
             if timing {
-                eprintln!("file_backed_merge: done total {:?}", t_all.elapsed());
+                eprintln!("file_backed_merge: done elapsed={:?}", t_all.elapsed());
             }
 
             let layout = FileBackedLayout {

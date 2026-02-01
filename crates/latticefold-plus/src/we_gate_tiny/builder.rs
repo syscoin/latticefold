@@ -11,7 +11,7 @@ use rayon::prelude::*;
 use ark_ff::{Field, PrimeField};
 use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
 use latticefold::transcript::poseidon::{f257_poseidon_config, F257};
-use symphony::dpp_poseidon::{merge_sparse_dr1cs_share_one, Constraint, PoseidonDr1csWiring, SparseDr1csInstance};
+use symphony::dpp_poseidon::PoseidonDr1csWiring;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 use symphony::file_backed_dr1cs::{
     merge_file_backed_sparse_dr1cs_share_one, FileBackedSparseDr1csInstance,
@@ -38,20 +38,20 @@ use super::goldilocks::{
 };
 use super::gadgets::{alloc_byte, decompose_existing_byte_var_to_bits};
 use super::params::DIGITS_PER_TRY;
-use super::poseidon::{poseidon_f257_arithmetize, poseidon_f257_arithmetize_file_backed};
+use super::poseidon::poseidon_f257_arithmetize;
 use super::surfaces::{CmDigitMulSqSurfaceWiring, CmDigitMulSurfaceWiring};
 
 use super::cm_math::{
     alloc_const_goldilocks_u64,
     eq_eval_goldilocks_digits, eval_t_z_optimized_ring_digits_pair, goldilocks_bytes_to_digits, goldilocks_pow_table_digits,
-    goldilocks_add_mod_p_digits, goldilocks_mul_const_mod_p_digits, goldilocks_mul_mod_p_digits, goldilocks_sub_mod_p_digits,
+    goldilocks_add_mod_p_digits, goldilocks_mul_mod_p_digits, goldilocks_sub_mod_p_digits,
     ct_psi_mul_ring_digits_d64,
     ring_eval_at_scalar_digits,
     ring_add_digits, ring_bytes_to_digits, ring_eq_digits,
     ring_const_coeff_digits,
     tensor_goldilocks_ringconst_digits, tensor_goldilocks_scalars_digits, RingBytes, RingDigits,
 };
-use super::op_counts::{tiny_cm_counts_reset, tiny_cm_counts_take};
+use super::op_counts::tiny_cm_counts_take;
 
 #[derive(Clone, Debug)]
 struct DcomEvalDigits {
@@ -162,6 +162,21 @@ fn lf_mem_on() -> bool {
     }
 }
 
+#[inline]
+fn lf_profile_on() -> bool {
+    match std::env::var("LF_PROFILE_DR1CS") {
+        Ok(v) => v != "0",
+        Err(_) => false,
+    }
+}
+
+#[inline]
+fn lf_profile_log(msg: &str) {
+    if lf_profile_on() {
+        eprintln!("[LF_PROFILE] tiny_gate {msg}");
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct LfMemSample {
     rss_bytes: Option<u64>,
@@ -208,124 +223,6 @@ fn fmt_mib(x: Option<u64>) -> String {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct LfStageCounts {
-    pose_constraints: usize,
-    pose_vars: usize,
-    glue_constraints: usize,
-    glue_vars: usize,
-}
-
-fn lf_stage_log(
-    stage: &str,
-    pose_inst: Option<&SparseDr1csInstance<F257>>,
-    glue: Option<&GlueCtx>,
-    prev: &mut Option<LfStageCounts>,
-) {
-    if !lf_mem_on() {
-        return;
-    }
-    let mem = lf_mem_sample();
-    let cur = LfStageCounts {
-        pose_constraints: pose_inst.map(|p| p.constraints.len()).unwrap_or(0),
-        pose_vars: pose_inst.map(|p| p.nvars).unwrap_or(0),
-        glue_constraints: glue.map(|g| g.gb.rows.len()).unwrap_or(0),
-        glue_vars: glue.map(|g| g.gb.assignment.len()).unwrap_or(0),
-    };
-    let (d_pose_c, d_pose_v, d_glue_c, d_glue_v) = match prev {
-        Some(p) => (
-            cur.pose_constraints.saturating_sub(p.pose_constraints),
-            cur.pose_vars.saturating_sub(p.pose_vars),
-            cur.glue_constraints.saturating_sub(p.glue_constraints),
-            cur.glue_vars.saturating_sub(p.glue_vars),
-        ),
-        None => (0, 0, 0, 0),
-    };
-    let caches = glue.map(|g| {
-        format!(
-            " local_map={} byte_bits_cache={} u64_bal16_cache={} u32_bal16_cache={}",
-            g.local_map.len(),
-            g.gb.byte_bits_cache.len(),
-            g.gb.u64_bal16_cache.len(),
-            g.gb.u32_bal16_cache.len()
-        )
-    });
-
-    eprintln!(
-        "[LF_MEM] stage={} rss={} hwm={} vmsize={} | pose(c={},v={},Δc={},Δv={}) glue(c={},v={},Δc={},Δv={}){}",
-        stage,
-        fmt_mib(mem.rss_bytes),
-        fmt_mib(mem.hwm_bytes),
-        fmt_mib(mem.vmsize_bytes),
-        cur.pose_constraints,
-        cur.pose_vars,
-        d_pose_c,
-        d_pose_v,
-        cur.glue_constraints,
-        cur.glue_vars,
-        d_glue_c,
-        d_glue_v,
-        caches.as_deref().unwrap_or(""),
-    );
-    *prev = Some(cur);
-}
-
-fn lf_stage_log_file_backed(
-    stage: &str,
-    pose_inst: Option<&FileBackedSparseDr1csInstance<F257>>,
-    glue: Option<&GlueCtx>,
-    prev: &mut Option<LfStageCounts>,
-) {
-    if !lf_mem_on() {
-        return;
-    }
-    let mem = lf_mem_sample();
-    let cur = LfStageCounts {
-        pose_constraints: pose_inst
-            .map(|p| core::cmp::min(p.layout.nconstraints, usize::MAX as u64) as usize)
-            .unwrap_or(0),
-        pose_vars: pose_inst.map(|p| p.nvars).unwrap_or(0),
-        glue_constraints: glue.map(|g| g.gb.rows.len()).unwrap_or(0),
-        glue_vars: glue.map(|g| g.gb.assignment.len()).unwrap_or(0),
-    };
-    let (d_pose_c, d_pose_v, d_glue_c, d_glue_v) = match prev {
-        Some(p) => (
-            cur.pose_constraints.saturating_sub(p.pose_constraints),
-            cur.pose_vars.saturating_sub(p.pose_vars),
-            cur.glue_constraints.saturating_sub(p.glue_constraints),
-            cur.glue_vars.saturating_sub(p.glue_vars),
-        ),
-        None => (0, 0, 0, 0),
-    };
-    let caches = glue.map(|g| {
-        format!(
-            " local_map={} byte_bits_cache={} u64_bal16_cache={} u32_bal16_cache={}",
-            g.local_map.len(),
-            g.gb.byte_bits_cache.len(),
-            g.gb.u64_bal16_cache.len(),
-            g.gb.u32_bal16_cache.len()
-        )
-    });
-
-    eprintln!(
-        "[LF_MEM] stage={} rss={} hwm={} vmsize={} | pose(c={},v={},Δc={},Δv={}) glue(c={},v={},Δc={},Δv={}){}",
-        stage,
-        fmt_mib(mem.rss_bytes),
-        fmt_mib(mem.hwm_bytes),
-        fmt_mib(mem.vmsize_bytes),
-        cur.pose_constraints,
-        cur.pose_vars,
-        d_pose_c,
-        d_pose_v,
-        cur.glue_constraints,
-        cur.glue_vars,
-        d_glue_c,
-        d_glue_v,
-        caches.as_deref().unwrap_or(""),
-    );
-    *prev = Some(cur);
-}
-
-#[derive(Clone, Copy, Debug, Default)]
 struct TinyAbsorbBreakdownCounts {
     comh_ops: usize,
     comh_bytes_total: usize,
@@ -342,39 +239,6 @@ struct TinyAbsorbBreakdownCounts {
 #[inline]
 fn sum_absorb_bytes(ranges: &[(usize, usize)]) -> usize {
     ranges.iter().map(|&(_st, ln)| ln).sum::<usize>()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn maybe_print_tiny_opmix(
-    cfg: Option<&PoseidonConfig<F257>>,
-    ops: &[PoseidonTraceOp<F257>],
-    pose_inst: &SparseDr1csInstance<F257>,
-    glue: &GlueCtx,
-    absorb_counts: &TinyAbsorbBreakdownCounts,
-    pairs_len: usize,
-    mul_surfaces_len: usize,
-    sq_surfaces_len: usize,
-    sum_all_pairs_digits_len: usize,
-    sum_all_pairs_coeffwise_len: usize,
-    sq_sum_all_pairs_digits_len: usize,
-    sq_sum_all_pairs_coeffwise_len: usize,
-) {
-    maybe_print_tiny_opmix_common(
-        cfg,
-        ops,
-        pose_inst.constraints.len(),
-        glue.gb.nconstraints() as usize,
-        "",
-        glue,
-        absorb_counts,
-        pairs_len,
-        mul_surfaces_len,
-        sq_surfaces_len,
-        sum_all_pairs_digits_len,
-        sum_all_pairs_coeffwise_len,
-        sq_sum_all_pairs_digits_len,
-        sq_sum_all_pairs_coeffwise_len,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -567,19 +431,7 @@ struct GlueCtx {
 }
 
 impl GlueCtx {
-    fn new(pose_asg: Arc<Vec<F257>>) -> Self {
-        let mut gb = Dr1csBuilder::<F257>::new();
-        gb.enforce_var_eq_const(gb.one(), F257::ONE);
-        Self {
-            gb,
-            pose_asg,
-            local_map: BTreeMap::new(),
-            base_map: BTreeMap::new(),
-            base_eqs: Vec::new(),
-        }
-    }
-
-    fn new_file_backed(pose_asg: Arc<Vec<F257>>, out_dir: impl AsRef<Path>) -> Result<Self, String> {
+    fn new(pose_asg: Arc<Vec<F257>>, out_dir: impl AsRef<Path>) -> Result<Self, String> {
         let mut gb = Dr1csBuilder::<F257>::new_file_backed(out_dir)?;
         gb.enforce_var_eq_const(gb.one(), F257::ONE);
         Ok(Self {
@@ -617,7 +469,7 @@ impl GlueCtx {
 }
 
 #[derive(Clone, Debug)]
-struct FileBackedDirs {
+struct BuildDirs {
     root: PathBuf,
     poseidon_dir: PathBuf,
     base_glue_dir: PathBuf,
@@ -626,9 +478,9 @@ struct FileBackedDirs {
     cm1_dir: PathBuf,
 }
 
-fn file_backed_dirs(out_dir: impl AsRef<Path>) -> FileBackedDirs {
+fn build_dirs(out_dir: impl AsRef<Path>) -> BuildDirs {
     let root: PathBuf = out_dir.as_ref().to_path_buf();
-    FileBackedDirs {
+    BuildDirs {
         poseidon_dir: root.join("poseidon"),
         base_glue_dir: root.join("base_glue"),
         merged_dir: root.join("merged"),
@@ -638,21 +490,21 @@ fn file_backed_dirs(out_dir: impl AsRef<Path>) -> FileBackedDirs {
     }
 }
 
-fn build_poseidon_file_backed(
+fn build_poseidon(
     cfg: Option<&PoseidonConfig<F257>>,
     ops: &[PoseidonTraceOp<F257>],
-    dirs: &FileBackedDirs,
+    dirs: &BuildDirs,
 ) -> Result<(FileBackedSparseDr1csInstance<F257>, Vec<F257>, PoseidonDr1csWiring), String> {
     let (pose_inst, pose_asg, pose_wiring, _byte_wiring) =
-        poseidon_f257_arithmetize_file_backed(cfg, ops, &dirs.poseidon_dir)?;
+        poseidon_f257_arithmetize(cfg, ops, &dirs.poseidon_dir)?;
     Ok((pose_inst, pose_asg, pose_wiring))
 }
 
-fn build_canonicality_shards_file_backed(
+fn build_canonicality_shards(
     pose_asg: &Arc<Vec<F257>>,
     ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
-    dirs: &FileBackedDirs,
+    dirs: &BuildDirs,
 ) -> Result<Vec<GlueCtx>, String> {
     let canonical_ranges = collect_nonreabsorb_absorb_ranges(ops, pose_wiring)?;
     if canonical_ranges.is_empty() {
@@ -677,14 +529,14 @@ fn build_canonicality_shards_file_backed(
         .into_par_iter()
         .map(|(idx, chunk)| -> Result<GlueCtx, String> {
             let dir = dirs.root.join(format!("canon_{idx}"));
-            let mut g = GlueCtx::new_file_backed(pose_asg.clone(), dir)?;
+            let mut g = GlueCtx::new(pose_asg.clone(), dir)?;
             enforce_canonical_goldilocks_for_ranges(&mut g, pose_wiring, chunk)?;
             Ok(g)
         })
         .collect::<Result<Vec<_>, _>>()
 }
 
-fn build_cm_shards_file_backed(
+fn build_cm_shards(
     cfg: Option<&PoseidonConfig<F257>>,
     ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
@@ -703,7 +555,7 @@ fn build_cm_shards_file_backed(
     short_locals: &[ShortChallengeWiring],
     u32_locals: &[BoundedU32ChallengeWiring],
     goldilocks_locals: &[GoldilocksChallengeWiring],
-    dirs: &FileBackedDirs,
+    dirs: &BuildDirs,
 ) -> Result<Vec<GlueCtx>, String> {
     if !(ring_dim > 0 && l_instances_expected > 0 && !comh_absorbs.is_empty()) {
         return Ok(Vec::new());
@@ -730,7 +582,7 @@ fn build_cm_shards_file_backed(
                 short_locals,
                 u32_locals,
                 goldilocks_locals,
-                Some(dirs.cm0_dir.as_path()),
+                dirs.cm0_dir.as_path(),
             )
         },
         || {
@@ -754,7 +606,7 @@ fn build_cm_shards_file_backed(
                 short_locals,
                 u32_locals,
                 goldilocks_locals,
-                Some(dirs.cm1_dir.as_path()),
+                dirs.cm1_dir.as_path(),
             )
         },
     );
@@ -2778,45 +2630,6 @@ fn build_sq_surfaces(
     Ok((surfaces, all_sum_digits, all_sum_coeffwise))
 }
 
-fn enforce_fiat_shamir_reabsorb_semantics(
-    inst: &mut SparseDr1csInstance<F257>,
-    ops: &[PoseidonTraceOp<F257>],
-    pose_wiring: &PoseidonDr1csWiring,
-) -> Result<(), String> {
-    let eqs = collect_fiat_shamir_reabsorb_eqs(ops, pose_wiring)?;
-    if eqs.is_empty() { return Ok(()); }
-
-    // Each equality adds:
-    // - A: 2 terms (v_ab - v_sq)
-    // - B: 1 term (ONE * var0)
-    // - C: 1 term (ZERO * var0)
-    // - 1 constraint referencing these ranges
-    let n = eqs.len();
-    inst.a_terms.reserve(n * 2);
-    inst.b_terms.reserve(n);
-    inst.c_terms.reserve(n);
-    inst.constraints.reserve(n);
-
-    let mut a0 = inst.a_terms.len();
-    let mut b0 = inst.b_terms.len();
-    let mut c0 = inst.c_terms.len();
-    for (v_ab, v_sq) in eqs {
-        inst.a_terms.push((F257::ONE, v_ab));
-        inst.a_terms.push((-F257::ONE, v_sq));
-        inst.b_terms.push((F257::ONE, 0));
-        inst.c_terms.push((F257::ZERO, 0));
-        inst.constraints.push(Constraint {
-            a: a0..(a0 + 2),
-            b: b0..(b0 + 1),
-            c: c0..(c0 + 1),
-        });
-        a0 += 2;
-        b0 += 1;
-        c0 += 1;
-    }
-    Ok(())
-}
-
 fn collect_fiat_shamir_reabsorb_eqs(
     ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
@@ -2924,293 +2737,11 @@ fn enforce_canonical_goldilocks_for_ranges(
     Ok(())
 }
 
-fn build_canonical_goldilocks_glue_for_ranges(
-    pose_asg: Arc<Vec<F257>>,
-    pose_wiring: &PoseidonDr1csWiring,
-    ranges: &[(usize, usize)],
-) -> Result<GlueCtx, String> {
-    let mut glue = GlueCtx::new(pose_asg);
-    enforce_canonical_goldilocks_for_ranges(&mut glue, pose_wiring, ranges)?;
-    Ok(glue)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn finalize(
-    pose_inst: SparseDr1csInstance<F257>,
-    pose_wiring: PoseidonDr1csWiring,
-    ops: &[PoseidonTraceOp<F257>],
-    glue: GlueCtx,
-    extra_glues: Vec<GlueCtx>,
-    short_locals: Vec<ShortChallengeWiring>,
-    u32_locals: Vec<BoundedU32ChallengeWiring>,
-    goldilocks_locals: Vec<GoldilocksChallengeWiring>,
-    surfaces_mul_local: Vec<CmDigitMulSurfaceWiring>,
-    surfaces_sq_local: Vec<CmDigitMulSqSurfaceWiring>,
-    all_sum_digits: Arc<Vec<usize>>,
-    all_sum_coeffwise: Arc<Vec<Vec<usize>>>,
-    all_sq_sum_digits: Arc<Vec<usize>>,
-    all_sq_sum_coeffwise: Arc<Vec<Vec<usize>>>,
-) -> Result<
-    (
-        SparseDr1csInstance<F257>,
-        Vec<F257>,
-        Vec<ShortChallengeWiring>,
-        Vec<BoundedU32ChallengeWiring>,
-        Vec<GoldilocksChallengeWiring>,
-        Vec<CmDigitMulSurfaceWiring>,
-        Vec<CmDigitMulSqSurfaceWiring>,
-        PoseidonDr1csWiring,
-    ),
-    String,
-> {
-    // Use the same single switch as op-mix printing.
-    let timing_merge = tiny_opmix_on();
-
-    // Convert glue builders to instances; keep per-part local maps so we can add explicit equality constraints.
-    let GlueCtx { gb, pose_asg, local_map: base_local_map, base_eqs: base_base_eqs, .. } = glue;
-    let (base_inst, base_asg) = gb.into_instance();
-    debug_assert!(base_base_eqs.is_empty(), "base glue should not contain base_eqs");
-
-    let mut extra_insts: Vec<(SparseDr1csInstance<F257>, Vec<F257>)> = Vec::with_capacity(extra_glues.len());
-    let mut extra_maps: Vec<BTreeMap<usize, usize>> = Vec::with_capacity(extra_glues.len());
-    let mut extra_base_eqs: Vec<Vec<(usize, usize)>> = Vec::with_capacity(extra_glues.len());
-    for g in extra_glues {
-        let GlueCtx { gb, pose_asg: _pa, local_map, base_eqs, .. } = g;
-        let (inst, asg) = gb.into_instance();
-        extra_insts.push((inst, asg));
-        extra_maps.push(local_map);
-        extra_base_eqs.push(base_eqs);
-    }
-
-    // Recover the owned pose assignment (avoid cloning).
-    let pose_asg = Arc::try_unwrap(pose_asg)
-        .map_err(|_| "tiny gate: internal error: pose assignment still shared at finalize")?;
-
-    // Save lightweight stats for optional op-mix reporting (before moving instances into merge).
-    let c_pose = pose_inst.constraints.len();
-    let mut c_glue = base_inst.constraints.len();
-    for (inst, _asg) in &extra_insts {
-        c_glue = c_glue.saturating_add(inst.constraints.len());
-    }
-    let mut glue_eq_constraints = base_local_map.len();
-    for m in &extra_maps {
-        glue_eq_constraints = glue_eq_constraints.saturating_add(m.len());
-    }
-    for v in &extra_base_eqs {
-        glue_eq_constraints = glue_eq_constraints.saturating_add(v.len());
-    }
-
-    // Compute part offsets in merged space (excluding var0).
-    // Part 0: poseidon, part 1: base glue, parts 2..: extra glue modules.
-    let mut offsets: Vec<usize> = Vec::with_capacity(2 + extra_insts.len());
-    let mut cur = 0usize;
-    offsets.push(cur);
-    cur += pose_asg.len().saturating_sub(1);
-    offsets.push(cur);
-    cur += base_asg.len().saturating_sub(1);
-    for (_inst, asg) in &extra_insts {
-        offsets.push(cur);
-        cur += asg.len().saturating_sub(1);
-    }
-    let remap = |part: usize, local: usize, offsets: &[usize]| -> usize {
-        if local == 0 { 0 } else { local + offsets[part] }
-    };
-
-    let mut parts: Vec<(SparseDr1csInstance<F257>, Vec<F257>)> = Vec::with_capacity(2 + extra_insts.len());
-    parts.push((pose_inst, pose_asg));
-    parts.push((base_inst, base_asg));
-    parts.extend(extra_insts);
-    let t_merge = Instant::now();
-    let (mut inst, asg) = merge_sparse_dr1cs_share_one::<F257>(parts)
-        .map_err(|e| format!("merge poseidon+tiny-glue parts failed: {e}"))?;
-    let dt_merge = t_merge.elapsed();
-
-    let c_after_merge = inst.constraints.len();
-    let t_reabsorb = Instant::now();
-    enforce_fiat_shamir_reabsorb_semantics(&mut inst, ops, &pose_wiring)?;
-    let dt_reabsorb = t_reabsorb.elapsed();
-    let c_after_reabsorb = inst.constraints.len();
-
-    // Add explicit equality constraints: pose var == each module's local copy.
-    let t_eqs = Instant::now();
-    let mut eq_pairs: Vec<(usize, usize)> = Vec::with_capacity(glue_eq_constraints);
-    for (&gv, &lv) in base_local_map.iter() {
-        eq_pairs.push((remap(0, gv, &offsets), remap(1, lv, &offsets)));
-    }
-    for (i, m) in extra_maps.iter().enumerate() {
-        let part = 2 + i;
-        for (&gv, &lv) in m.iter() {
-            eq_pairs.push((remap(0, gv, &offsets), remap(part, lv, &offsets)));
-        }
-    }
-    for (i, v) in extra_base_eqs.iter().enumerate() {
-        let part = 2 + i;
-        for &(base_var, local_var) in v {
-            eq_pairs.push((remap(1, base_var, &offsets), remap(part, local_var, &offsets)));
-        }
-    }
-    debug_assert_eq!(eq_pairs.len(), glue_eq_constraints);
-
-    // Bulk-append equality constraints (faster than calling `enforce_var_eq` in a tight loop).
-    // Each equality adds 1 constraint with:
-    // - A: (x - y)
-    // - B: (ONE * var0)
-    // - C: (ZERO * var0)
-    inst.a_terms.reserve(eq_pairs.len() * 2);
-    inst.b_terms.reserve(eq_pairs.len());
-    inst.c_terms.reserve(eq_pairs.len());
-    inst.constraints.reserve(eq_pairs.len());
-    let mut a0 = inst.a_terms.len();
-    let mut b0 = inst.b_terms.len();
-    let mut c0 = inst.c_terms.len();
-    for (x, y) in eq_pairs {
-        inst.a_terms.push((F257::ONE, x));
-        inst.a_terms.push((-F257::ONE, y));
-        inst.b_terms.push((F257::ONE, 0));
-        inst.c_terms.push((F257::ZERO, 0));
-        inst.constraints.push(Constraint { a: a0..(a0 + 2), b: b0..(b0 + 1), c: c0..(c0 + 1) });
-        a0 += 2;
-        b0 += 1;
-        c0 += 1;
-    }
-    let c_after_glue_eq = inst.constraints.len();
-    let dt_eqs = t_eqs.elapsed();
-
-    if timing_merge {
-        eprintln!(
-            "tiny_gate: finalize timing: merge={:?} reabsorb={:?} glue_eqs={:?} parts={} constraints_after_merge={} constraints_after_reabsorb={} constraints_after_eqs={}",
-            dt_merge,
-            dt_reabsorb,
-            dt_eqs,
-            offsets.len(),
-            c_after_merge,
-            c_after_reabsorb,
-            c_after_glue_eq,
-        );
-    }
-
-    if tiny_opmix_on() {
-        eprintln!(
-            "LF+ WE tiny gate merged: nvars={} constraints={} (poseidon={} glue={} merge={} reabsorb_delta={} glue_eq_constraints={} glue_eq_delta={})",
-            inst.nvars,
-            c_after_glue_eq,
-            c_pose,
-            c_glue,
-            c_after_merge,
-            c_after_reabsorb.saturating_sub(c_after_merge),
-            glue_eq_constraints,
-            c_after_glue_eq.saturating_sub(c_after_reabsorb),
-        );
-    }
-
-    // All exported wiring is from the base glue module (part 1).
-    let to_glue_global = |glue_local: usize| -> usize { remap(1, glue_local, &offsets) };
-
-    let shorts_out = short_locals
-        .into_iter()
-        .map(|w| ShortChallengeWiring {
-            digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
-            byte_vars: w.byte_vars.into_iter().map(to_glue_global).collect(),
-            coeff_vars: w.coeff_vars.into_iter().map(to_glue_global).collect(),
-            coeff_bal16_digits: w
-                .coeff_bal16_digits
-                .into_iter()
-                .map(|a| a.map(to_glue_global))
-                .collect(),
-        })
-        .collect::<Vec<_>>();
-    let u32s_out = u32_locals
-        .into_iter()
-        .map(|w| BoundedU32ChallengeWiring {
-            digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
-            byte_vars: w.byte_vars.map(to_glue_global),
-            limbs: w.limbs.map(to_glue_global),
-            bal16_digits: w.bal16_digits.into_iter().map(to_glue_global).collect(),
-            bal16_sq_digits: w.bal16_sq_digits.into_iter().map(to_glue_global).collect(),
-        })
-        .collect::<Vec<_>>();
-    let goldilocks_out = goldilocks_locals
-        .into_iter()
-        .map(|w| GoldilocksChallengeWiring {
-            digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
-            byte_vars: w.byte_vars.map(to_glue_global),
-            q_bit: to_glue_global(w.q_bit),
-            limbs: w.limbs.map(to_glue_global),
-            res257: to_glue_global(w.res257),
-        })
-        .collect::<Vec<_>>();
-
-    let all_sum_digits_global: Arc<Vec<usize>> =
-        Arc::new(all_sum_digits.iter().copied().map(to_glue_global).collect());
-    let all_sum_coeffwise_global: Arc<Vec<Vec<usize>>> = Arc::new(
-        all_sum_coeffwise
-            .iter()
-            .map(|v| v.iter().copied().map(to_glue_global).collect())
-            .collect(),
-    );
-    let all_sq_sum_digits_global: Arc<Vec<usize>> =
-        Arc::new(all_sq_sum_digits.iter().copied().map(to_glue_global).collect());
-    let all_sq_sum_coeffwise_global: Arc<Vec<Vec<usize>>> = Arc::new(
-        all_sq_sum_coeffwise
-            .iter()
-            .map(|v| v.iter().copied().map(to_glue_global).collect())
-            .collect(),
-    );
-
-    let surfaces_out = surfaces_mul_local
-        .into_iter()
-        .map(|s| CmDigitMulSurfaceWiring {
-            short_block_idx: s.short_block_idx,
-            u32_idx: s.u32_idx,
-            products: s.products.into_iter().map(|p| p.map(to_glue_global)).collect(),
-            products13: s
-                .products13
-                .into_iter()
-                .map(|p| p.map(to_glue_global))
-                .collect(),
-            sum_digits: s.sum_digits.into_iter().map(to_glue_global).collect(),
-            sum_all_pairs_digits: all_sum_digits_global.clone(),
-            sum_all_pairs_coeffwise: all_sum_coeffwise_global.clone(),
-        })
-        .collect::<Vec<_>>();
-
-    let surfaces_sq_out = surfaces_sq_local
-        .into_iter()
-        .map(|s| CmDigitMulSqSurfaceWiring {
-            short_block_idx: s.short_block_idx,
-            u32_idx: s.u32_idx,
-            products21: s.products21.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
-            products22: s.products22.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
-            sum_digits: s.sum_digits.into_iter().map(to_glue_global).collect(),
-            sum_all_pairs_digits: all_sq_sum_digits_global.clone(),
-            sum_all_pairs_coeffwise: all_sq_sum_coeffwise_global.clone(),
-        })
-        .collect::<Vec<_>>();
-
-    if tiny_opmix_on() {
-        eprintln!(
-            "tiny_gate: finalize done: nvars={} constraints={} (returning instance + wiring)",
-            inst.nvars,
-            inst.constraints.len()
-        );
-    }
-    Ok((
-        inst,
-        asg,
-        shorts_out,
-        u32s_out,
-        goldilocks_out,
-        surfaces_out,
-        surfaces_sq_out,
-        pose_wiring,
-    ))
-}
-
 // NOTE: The LF+ verifier computes `tcch0/tcch1` internally and uses them in `claimed_sum`, but does not
 // export them. The tiny gate follows that model: we do not export `tcch0/tcch1` surfaces.
 
 #[allow(clippy::too_many_arguments)]
-fn finalize_file_backed(
+fn finalize(
     pose_inst: FileBackedSparseDr1csInstance<F257>,
     pose_wiring: PoseidonDr1csWiring,
     ops: &[PoseidonTraceOp<F257>],
@@ -3260,7 +2791,7 @@ fn finalize_file_backed(
 
     // Recover the owned pose assignment (avoid cloning).
     let pose_asg = Arc::try_unwrap(pose_asg)
-        .map_err(|_| "tiny gate: internal error: pose assignment still shared at finalize_file_backed")?;
+        .map_err(|_| "tiny gate: internal error: pose assignment still shared at finalize")?;
 
     // Compute part offsets in merged space (excluding var0).
     // Part 0: poseidon, part 1: base glue, parts 2..: extra glue modules.
@@ -3311,32 +2842,18 @@ fn finalize_file_backed(
     parts.push((base_inst, base_asg));
     parts.extend(extra_insts);
     let t_fb_merge = Instant::now();
-    if tiny_opmix_on() {
-        eprintln!(
-            "tiny_gate: file_backed merge start: parts={} eq_pairs={} threads={} out_dir={}",
-            parts.len(),
-            eq_pairs.len(),
-            rayon::current_num_threads(),
-            out_dir.as_ref().display()
-        );
-    }
     let (inst, asg) = merge_file_backed_sparse_dr1cs_share_one::<F257>(
         parts,
         out_dir.as_ref(),
         &eq_pairs,
     )
     .map_err(|e| format!("tiny gate: file-backed merge failed: {e}"))?;
-    if tiny_opmix_on() {
-        eprintln!(
-            "tiny_gate: file_backed merge done in {:?}: nvars={} constraints={} a_terms={} b_terms={} c_terms={}",
-            t_fb_merge.elapsed(),
-            inst.nvars,
-            inst.layout.nconstraints,
-            inst.layout.a_terms,
-            inst.layout.b_terms,
-            inst.layout.c_terms
-        );
-    }
+    lf_profile_log(&format!(
+        "merge_done elapsed={:?} nvars={} constraints={}",
+        t_fb_merge.elapsed(),
+        inst.nvars,
+        inst.layout.nconstraints
+    ));
 
     // All exported wiring is from the base glue module (part 1).
     let to_glue_global = |glue_local: usize| -> usize { remap(1, glue_local, &offsets) };
@@ -3423,7 +2940,7 @@ fn finalize_file_backed(
         .collect::<Vec<_>>();
         if tiny_opmix_on() {
             eprintln!(
-                "tiny_gate: finalize_file_backed done: nvars={} constraints={} (returning instance + wiring)",
+                "tiny_gate: finalize done: nvars={} constraints={} (returning instance + wiring)",
                 inst.nvars,
                 inst.layout.nconstraints
             );
@@ -3463,13 +2980,9 @@ fn build_cm_glue_for_which(
     short_locals: &[ShortChallengeWiring],
     u32_locals: &[BoundedU32ChallengeWiring],
     goldilocks_locals: &[GoldilocksChallengeWiring],
-    out_dir: Option<&Path>,
+    out_dir: &Path,
 ) -> Result<GlueCtx, String> {
-    let mut glue = if let Some(dir) = out_dir {
-        GlueCtx::new_file_backed(pose_asg, dir)?
-    } else {
-        GlueCtx::new(pose_asg)
-    };
+    let mut glue = GlueCtx::new(pose_asg, out_dir)?;
     if ring_dim == 0 || l_instances_expected == 0 {
         return Ok(glue);
     }
@@ -4485,469 +3998,8 @@ fn build_cm_glue_for_which(
     Ok(glue)
 }
 
+/// Build Poseidon(F257) + WE-tiny glue as a file-backed dR1CS instance.
 pub(super) fn build(
-    cfg: Option<&PoseidonConfig<F257>>,
-    ops: &[PoseidonTraceOp<F257>],
-    ring_dim: usize,
-    params: &WeParams,
-    wiring: &TinyCoinOpWiring,
-    pairs: &[(usize, usize)],
-    extra_witness: Option<&TinyExtraWitness>,
-) -> Result<
-    (
-        SparseDr1csInstance<F257>,
-        Vec<F257>,
-        Vec<ShortChallengeWiring>,
-        Vec<BoundedU32ChallengeWiring>,
-        Vec<GoldilocksChallengeWiring>,
-        Vec<CmDigitMulSurfaceWiring>,
-        Vec<CmDigitMulSqSurfaceWiring>,
-        PoseidonDr1csWiring,
-    ),
-    String,
-> {
-    let mut mem_prev: Option<LfStageCounts> = None;
-    if tiny_opmix_on() {
-        tiny_cm_counts_reset();
-    }
-
-    let (pose_inst, pose_asg, pose_wiring, _byte_wiring) = poseidon_f257_arithmetize(cfg, ops)?;
-    lf_stage_log("poseidon_f257_arithmetize", Some(&pose_inst), None, &mut mem_prev);
-
-    let short_ranges = squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.short_squeeze_ops)?;
-    let u32_ranges = squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.u32_squeeze_ops)?;
-    validate_pairs(pairs, short_ranges.len(), u32_ranges.len())?;
-    validate_params_and_short_schedule(ring_dim, params, short_ranges.len())?;
-
-    let pose_asg = Arc::new(pose_asg);
-    let mut glue = GlueCtx::new(pose_asg.clone());
-    lf_stage_log("glue_init", Some(&pose_inst), Some(&glue), &mut mem_prev);
-
-    // Bind all proof/statement payload absorbs that encode base-field elements as canonical 8-byte scalars.
-    // (Skip fiat–shamir reabsorbs, which are F257 digits and may contain 256.)
-    //
-    // This is a huge independent workload; build it as many glue modules in parallel and merge.
-    let canonical_ranges = collect_nonreabsorb_absorb_ranges(ops, &pose_wiring)?;
-    let n_threads = rayon::current_num_threads().max(1);
-    // Over-decompose to improve load-balance; avoid too many tiny tasks / too many merge parts.
-    // Override with `LFP_TINY_CANON_CHUNKS`.
-    let n_chunks = std::env::var("LFP_TINY_CANON_CHUNKS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or_else(|| {
-            // Heuristic: pick a chunk count that keeps per-chunk work non-trivial to avoid
-            // creating hundreds of tiny glue modules (which makes `merge_sparse_dr1cs_share_one`
-            // dominate wall-time).
-            //
-            // For small traces, aim for ~256 absorb-ranges per chunk; for huge traces, cap to
-            // ~2x threads (and 256 overall) for good parallelism without exploding merge parts.
-            let target_chunk_ranges: usize = 256;
-            let by_work = (canonical_ranges.len() + target_chunk_ranges - 1) / target_chunk_ranges;
-            by_work.max(1).min((n_threads * 2).min(256).max(1))
-        })
-        .min(canonical_ranges.len().max(1));
-    let chunk_size = (canonical_ranges.len() + n_chunks - 1) / n_chunks;
-    if lf_mem_on() || tiny_opmix_on() {
-        eprintln!(
-            "[tiny_gate/par] canonical_goldilocks ranges={} threads={} chunks={} chunk_size={}",
-            canonical_ranges.len(),
-            n_threads,
-            n_chunks,
-            chunk_size.max(1)
-        );
-    }
-    let canonical_glues: Vec<GlueCtx> = if canonical_ranges.is_empty() {
-        Vec::new()
-    } else {
-        canonical_ranges
-            .chunks(chunk_size.max(1))
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|chunk| build_canonical_goldilocks_glue_for_ranges(pose_asg.clone(), &pose_wiring, chunk))
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    // `lf_stage_log` expects a single glue ctx; log the base ctx here and rely on merge stats for totals.
-    lf_stage_log(
-        "enforce_nonreabsorb_absorbs_are_canonical_goldilocks(par)",
-        Some(&pose_inst),
-        Some(&glue),
-        &mut mem_prev,
-    );
-
-    validate_cm_u32_schedule(params, wiring)?;
-    let (n_comh_ring_elems, coeff_bytes) = count_comh_ring_elements(ops, &pose_wiring, ring_dim, wiring)?;
-    if ring_dim > 0 && n_comh_ring_elems > 0 && coeff_bytes != 8 {
-        return Err(format!(
-            "tiny gate: expected Goldilocks base-field coeff_bytes=8, got {coeff_bytes}"
-        ));
-    }
-    let kappa = params.kappa as usize;
-    if kappa > 0 && (n_comh_ring_elems % kappa) != 0 {
-        return Err("tiny gate: comh ring element count not divisible by kappa".to_string());
-    }
-    let l_instances_expected = if kappa == 0 { 0 } else { n_comh_ring_elems / kappa };
-
-    let short_locals = build_short_blocks(&mut glue, &pose_wiring, ring_dim, &short_ranges)?;
-    lf_stage_log("build_short_blocks", Some(&pose_inst), Some(&glue), &mut mem_prev);
-    let (u32_locals, goldilocks_locals) =
-        build_u32_and_goldilocks_blocks(&mut glue, &pose_wiring, &wiring.u32_squeeze_ops)?;
-    lf_stage_log("build_u32_and_goldilocks_blocks", Some(&pose_inst), Some(&glue), &mut mem_prev);
-
-    // Values parsed/allocated during SetChk/RgChk that the CM verifier math needs later.
-    // Stored as base-glue vars and passed (by Arc) into CM submodules for import/glue.
-    let mut setchk_out_e_vars_for_cm: Option<Vec<Vec<Vec<RingDigits>>>> = None;
-    let mut dcom_evals_for_cm: Option<Vec<DcomEvalDigits>> = None;
-    let mut setchk_r_point_for_cm: Option<Vec<GoldilocksScalar>> = None;
-
-    arithmetize_pi_lin_setchk_rgchk_prefix(
-        &mut glue,
-        ops,
-        &pose_wiring,
-        ring_dim,
-        params,
-        wiring,
-        l_instances_expected,
-        &u32_locals,
-        extra_witness,
-        &mut setchk_out_e_vars_for_cm,
-        &mut dcom_evals_for_cm,
-        &mut setchk_r_point_for_cm,
-    )?;
-    // Parse and constrain the CM segment after short challenges (sumcheck headers, etc.).
-    let (comh_absorbs, sc_msg_absorbs, eval_absorbs) = parse_and_enforce_cm_after_short(
-        &mut glue,
-        ops,
-        &pose_wiring,
-        ring_dim,
-        params,
-        wiring,
-        l_instances_expected,
-        &goldilocks_locals,
-    )?;
-    lf_stage_log("parse_and_enforce_cm_after_short", Some(&pose_inst), Some(&glue), &mut mem_prev);
-
-    // Capture a lightweight absorb breakdown summary for optional op-mix reporting.
-    let absorb_counts = TinyAbsorbBreakdownCounts {
-        comh_ops: comh_absorbs.len(),
-        comh_bytes_total: sum_absorb_bytes(&comh_absorbs),
-        sc_msgs_ops_0: sc_msg_absorbs.get(0).map(|v| v.len()).unwrap_or(0),
-        sc_msgs_bytes_total_0: sc_msg_absorbs.get(0).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
-        sc_msgs_ops_1: sc_msg_absorbs.get(1).map(|v| v.len()).unwrap_or(0),
-        sc_msgs_bytes_total_1: sc_msg_absorbs.get(1).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
-        eval_ops_0: eval_absorbs.get(0).map(|v| v.len()).unwrap_or(0),
-        eval_bytes_total_0: eval_absorbs.get(0).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
-        eval_ops_1: eval_absorbs.get(1).map(|v| v.len()).unwrap_or(0),
-        eval_bytes_total_1: eval_absorbs.get(1).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
-    };
-
-    // CM sumcheck verifier wiring (degree-2), starting from a placeholder claimed_sum=0 ring.
-    // This already enforces transcript-consistency of the per-round prover messages and the
-    // verifier challenges `r_sc` (derived from transcript u32 coins).
-    //
-    // Claimed sums and recombination will be wired once Dcom prefix verifier math is integrated.
-
-    // Convert shared SetChk/Dcom values into Arc containers for parallel CM modules.
-    let setchk_out_e_vars_for_cm = setchk_out_e_vars_for_cm.map(Arc::new);
-    let dcom_evals_for_cm = dcom_evals_for_cm.map(Arc::new);
-    let setchk_r_point_for_cm = setchk_r_point_for_cm.map(Arc::new);
-
-    // Compute CM shared precomputations once in the base glue module (matches full WE gate behavior).
-    let cm_shared_base: Option<Arc<CmSharedPrecompBase>> = compute_cm_shared_precomp_base(
-        &mut glue,
-        ring_dim,
-        params,
-        wiring,
-        l_instances_expected,
-        &short_locals,
-        &u32_locals,
-        &setchk_out_e_vars_for_cm,
-        &setchk_r_point_for_cm,
-    )?;
-
-    // Build the CM verifier math in parallel modules (one per sumcheck), then merge by explicitly
-    // gluing their local copies to Poseidon vars.
-    let cm_extra_glues: Vec<GlueCtx> =
-        if ring_dim > 0 && l_instances_expected > 0 && !comh_absorbs.is_empty() {
-            lf_stage_log("cm_block_enter", Some(&pose_inst), Some(&glue), &mut mem_prev);
-            eprintln!(
-                "[tiny_gate/cm] ring_dim={} kappa={} n_comh_ring_elems={} L_expected={} comh_absorbs_len={}",
-                ring_dim,
-                kappa,
-                n_comh_ring_elems,
-                l_instances_expected,
-                comh_absorbs.len()
-            );
-            let pose_asg = glue.pose_asg.clone();
-            let base_asg = glue.gb.assignment.as_slice();
-            let (g0, g1) = join(
-                || {
-                    build_cm_glue_for_which(
-                        cfg,
-                        ops,
-                        &pose_wiring,
-                        ring_dim,
-                        params,
-                        wiring,
-                        l_instances_expected,
-                        &comh_absorbs,
-                        &sc_msg_absorbs[0],
-                        &eval_absorbs[0],
-                        setchk_out_e_vars_for_cm.clone(),
-                        dcom_evals_for_cm.clone(),
-                        cm_shared_base.clone(),
-                        0,
-                        pose_asg.clone(),
-                        base_asg,
-                        &short_locals,
-                        &u32_locals,
-                        &goldilocks_locals,
-                        None,
-                    )
-                },
-                || {
-                    build_cm_glue_for_which(
-                        cfg,
-                        ops,
-                        &pose_wiring,
-                        ring_dim,
-                        params,
-                        wiring,
-                        l_instances_expected,
-                        &comh_absorbs,
-                        &sc_msg_absorbs[1],
-                        &eval_absorbs[1],
-                        setchk_out_e_vars_for_cm.clone(),
-                        dcom_evals_for_cm.clone(),
-                        cm_shared_base.clone(),
-                        1,
-                        pose_asg.clone(),
-                        base_asg,
-                        &short_locals,
-                        &u32_locals,
-                        &goldilocks_locals,
-                        None,
-                    )
-                },
-            );
-            vec![g0?, g1?]
-        } else {
-            Vec::new()
-        };
-
-    // ------------------------------------------------------------------------
-    // Decomp verifier math (LinB2X + DecompProof)
-    // ------------------------------------------------------------------------
-    //
-    // Mirrors `we_gate_arith.rs::decomp_verifier_math_dr1cs`:
-    // - C0 + B*C1 == cm_g
-    // - v0a + B*v1a == va, v0b + B*v1b == vb
-    //
-    // Note: this part does not interact with the transcript; these are pure algebraic checks over the ring.
-    // In the tiny gate shape harness we allocate witness values as zeros (satisfiable); in the real
-    // large-trace path the witness assignment must supply actual proof values.
-    if ring_dim == 64 {
-        let kappa = params.kappa as usize;
-        let vlen = 1usize + (params.mlen as usize); // matches `we_gate_arith.rs` dummy proof shape
-        let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
-        let b_u64: u64 = ((params.decomp_b as u128) % (p_u64 as u128)) as u64;
-
-        #[inline]
-        fn alloc_witness_ring_digits(gb: &mut Dr1csBuilder<F257>, ring_dim: usize) -> RingDigits {
-            let mut r: RingDigits = Vec::with_capacity(ring_dim);
-            for _ in 0..ring_dim {
-                r.push(alloc_witness_goldilocks_u64_digits(gb, 0u64));
-            }
-            r
-        }
-        #[inline]
-        fn alloc_witness_ring_digits_from_u64s(
-            gb: &mut Dr1csBuilder<F257>,
-            ring_dim: usize,
-            coeffs: Option<&[u64]>,
-        ) -> RingDigits {
-            if let Some(c) = coeffs {
-                if c.len() == ring_dim {
-                    let mut r: RingDigits = Vec::with_capacity(ring_dim);
-                    for k in 0..ring_dim {
-                        r.push(alloc_witness_goldilocks_u64_digits(gb, c[k]));
-                    }
-                    return r;
-                }
-            }
-            alloc_witness_ring_digits(gb, ring_dim)
-        }
-
-        #[inline]
-        fn ring_recompose_base_b(
-            gb: &mut Dr1csBuilder<F257>,
-            r0: &RingDigits,
-            r1: &RingDigits,
-            b_u64: u64,
-        ) -> RingDigits {
-            debug_assert_eq!(r0.len(), 64);
-            debug_assert_eq!(r1.len(), 64);
-            let mut out: RingDigits = Vec::with_capacity(64);
-            for j in 0..64 {
-                let t = goldilocks_mul_const_mod_p_digits(gb, &r1[j], b_u64);
-                let s = goldilocks_add_mod_p_digits(gb, &r0[j], &t);
-                out.push(s);
-            }
-            out
-        }
-
-        // Allocate DecompProof witnesses: C0,C1 (kappa each), v0/v1 (vlen pairs each).
-        let mut dcomp_c0: Vec<RingDigits> = Vec::with_capacity(kappa);
-        let mut dcomp_c1: Vec<RingDigits> = Vec::with_capacity(kappa);
-        for _ in 0..kappa {
-            dcomp_c0.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
-            dcomp_c1.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
-        }
-        let mut v0a: Vec<RingDigits> = Vec::with_capacity(vlen);
-        let mut v0b: Vec<RingDigits> = Vec::with_capacity(vlen);
-        let mut v1a: Vec<RingDigits> = Vec::with_capacity(vlen);
-        let mut v1b: Vec<RingDigits> = Vec::with_capacity(vlen);
-        for _ in 0..vlen {
-            v0a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
-            v0b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
-            v1a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
-            v1b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
-        }
-
-        // Allocate LinB2X witnesses: cm_g (kappa), vo (vlen pairs).
-        let mut cm_g: Vec<RingDigits> = Vec::with_capacity(kappa);
-        for _ in 0..kappa {
-            cm_g.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
-        }
-        let mut va: Vec<RingDigits> = Vec::with_capacity(vlen);
-        let mut vb: Vec<RingDigits> = Vec::with_capacity(vlen);
-        for _ in 0..vlen {
-            va.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
-            vb.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim));
-        }
-
-        // If provided, allocate from the real proof coefficients.
-        if let Some(w) = extra_witness {
-            if w.decomp_c0.len() == kappa && w.decomp_c1.len() == kappa && w.linb2x_cm_g.len() == kappa {
-                dcomp_c0 = (0..kappa)
-                    .map(|i| alloc_witness_ring_digits_from_u64s(&mut glue.gb, ring_dim, Some(&w.decomp_c0[i])))
-                    .collect();
-                dcomp_c1 = (0..kappa)
-                    .map(|i| alloc_witness_ring_digits_from_u64s(&mut glue.gb, ring_dim, Some(&w.decomp_c1[i])))
-                    .collect();
-                cm_g = (0..kappa)
-                    .map(|i| alloc_witness_ring_digits_from_u64s(&mut glue.gb, ring_dim, Some(&w.linb2x_cm_g[i])))
-                    .collect();
-            }
-            if w.decomp_v0a.len() == vlen
-                && w.decomp_v0b.len() == vlen
-                && w.decomp_v1a.len() == vlen
-                && w.decomp_v1b.len() == vlen
-                && w.linb2x_vo_a.len() == vlen
-                && w.linb2x_vo_b.len() == vlen
-            {
-                v0a = (0..vlen)
-                    .map(|i| alloc_witness_ring_digits_from_u64s(&mut glue.gb, ring_dim, Some(&w.decomp_v0a[i])))
-                    .collect();
-                v0b = (0..vlen)
-                    .map(|i| alloc_witness_ring_digits_from_u64s(&mut glue.gb, ring_dim, Some(&w.decomp_v0b[i])))
-                    .collect();
-                v1a = (0..vlen)
-                    .map(|i| alloc_witness_ring_digits_from_u64s(&mut glue.gb, ring_dim, Some(&w.decomp_v1a[i])))
-                    .collect();
-                v1b = (0..vlen)
-                    .map(|i| alloc_witness_ring_digits_from_u64s(&mut glue.gb, ring_dim, Some(&w.decomp_v1b[i])))
-                    .collect();
-                va = (0..vlen)
-                    .map(|i| alloc_witness_ring_digits_from_u64s(&mut glue.gb, ring_dim, Some(&w.linb2x_vo_a[i])))
-                    .collect();
-                vb = (0..vlen)
-                    .map(|i| alloc_witness_ring_digits_from_u64s(&mut glue.gb, ring_dim, Some(&w.linb2x_vo_b[i])))
-                    .collect();
-            }
-        }
-
-        // Enforce recomposition equalities.
-        for i in 0..kappa {
-            let rec = ring_recompose_base_b(&mut glue.gb, &dcomp_c0[i], &dcomp_c1[i], b_u64);
-            ring_eq_digits(&mut glue.gb, &rec, &cm_g[i]);
-        }
-        for i in 0..vlen {
-            let rec_a = ring_recompose_base_b(&mut glue.gb, &v0a[i], &v1a[i], b_u64);
-            let rec_b = ring_recompose_base_b(&mut glue.gb, &v0b[i], &v1b[i], b_u64);
-            ring_eq_digits(&mut glue.gb, &rec_a, &va[i]);
-            ring_eq_digits(&mut glue.gb, &rec_b, &vb[i]);
-        }
-    }
-
-    let (mut surfaces_mul_local, all_sum_digits, all_sum_coeffwise) =
-        build_mul_surfaces(&mut glue, ring_dim, pairs, &short_locals, &u32_locals)?;
-    lf_stage_log("build_mul_surfaces", Some(&pose_inst), Some(&glue), &mut mem_prev);
-    let (mut surfaces_sq_local, all_sq_sum_digits, all_sq_sum_coeffwise) =
-        build_sq_surfaces(&mut glue, ring_dim, pairs, &short_locals, &u32_locals)?;
-    lf_stage_log("build_sq_surfaces", Some(&pose_inst), Some(&glue), &mut mem_prev);
-
-    let all_sum_digits = Arc::new(all_sum_digits);
-    let all_sum_coeffwise = Arc::new(all_sum_coeffwise);
-    for s in &mut surfaces_mul_local {
-        s.sum_all_pairs_digits = all_sum_digits.clone();
-        s.sum_all_pairs_coeffwise = all_sum_coeffwise.clone();
-    }
-    let all_sq_sum_digits = Arc::new(all_sq_sum_digits);
-    let all_sq_sum_coeffwise = Arc::new(all_sq_sum_coeffwise);
-    for s in &mut surfaces_sq_local {
-        s.sum_all_pairs_digits = all_sq_sum_digits.clone();
-        s.sum_all_pairs_coeffwise = all_sq_sum_coeffwise.clone();
-    }
-    lf_stage_log("surfaces_arc_share", Some(&pose_inst), Some(&glue), &mut mem_prev);
-
-    // Optional: print an op-mix breakdown for tiny-field porting estimates.
-    //
-    // Enable with: `LFP_WE_GATE_OPMIX=1 ...`
-    maybe_print_tiny_opmix(
-        cfg,
-        ops,
-        &pose_inst,
-        &glue,
-        &absorb_counts,
-        pairs.len(),
-        surfaces_mul_local.len(),
-        surfaces_sq_local.len(),
-        all_sum_digits.len(),
-        all_sum_coeffwise.len(),
-        all_sq_sum_digits.len(),
-        all_sq_sum_coeffwise.len(),
-    );
-
-    // `finalize()` needs to recover the owned pose assignment without cloning.
-    // Drop the extra Arc handle held by this stack frame.
-    drop(pose_asg);
-
-    finalize(
-        pose_inst,
-        pose_wiring,
-        ops,
-        glue,
-        {
-            let mut extra = canonical_glues;
-            extra.extend(cm_extra_glues);
-            extra
-        },
-        short_locals,
-        u32_locals,
-        goldilocks_locals,
-        surfaces_mul_local,
-        surfaces_sq_local,
-        all_sum_digits,
-        all_sum_coeffwise,
-        all_sq_sum_digits,
-        all_sq_sum_coeffwise,
-    )
-}
-
-/// File-backed build (temporary wrapper).
-///
-pub(super) fn build_file_backed(
     cfg: Option<&PoseidonConfig<F257>>,
     ops: &[PoseidonTraceOp<F257>],
     ring_dim: usize,
@@ -4969,11 +4021,15 @@ pub(super) fn build_file_backed(
     ),
     String,
 > {
-    let dirs = file_backed_dirs(out_dir);
-    let mut mem_prev: Option<LfStageCounts> = None;
+    let dirs = build_dirs(out_dir);
+    lf_profile_log(&format!(
+        "start out_dir={} threads={}",
+        dirs.root.display(),
+        rayon::current_num_threads().max(1)
+    ));
 
     // Build Poseidon as a file-backed instance + assignment (deterministic from ops schedule).
-    let (pose_inst, pose_asg, pose_wiring) = build_poseidon_file_backed(cfg, ops, &dirs)?;
+    let (pose_inst, pose_asg, pose_wiring) = build_poseidon(cfg, ops, &dirs)?;
 
     let short_ranges =
         squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.short_squeeze_ops)?;
@@ -4983,10 +4039,10 @@ pub(super) fn build_file_backed(
     validate_params_and_short_schedule(ring_dim, params, short_ranges.len())?;
 
     let pose_asg = Arc::new(pose_asg);
-    let mut glue = GlueCtx::new_file_backed(pose_asg.clone(), &dirs.base_glue_dir)?;
+    let mut glue = GlueCtx::new(pose_asg.clone(), &dirs.base_glue_dir)?;
 
     // Canonicality constraints: build parallel file-backed glue shards.
-    let canonical_glues = build_canonicality_shards_file_backed(&pose_asg, ops, &pose_wiring, &dirs)?;
+    let canonical_glues = build_canonicality_shards(&pose_asg, ops, &pose_wiring, &dirs)?;
 
     validate_cm_u32_schedule(params, wiring)?;
     let (n_comh_ring_elems, coeff_bytes) = count_comh_ring_elements(ops, &pose_wiring, ring_dim, wiring)?;
@@ -5068,13 +4124,7 @@ pub(super) fn build_file_backed(
         &setchk_out_e_vars_for_cm,
         &setchk_r_point_for_cm,
     )?;
-    lf_stage_log_file_backed(
-        "cm_shared_precomp_base_done",
-        Some(&pose_inst),
-        Some(&glue),
-        &mut mem_prev,
-    );
-    let cm_extra_glues = build_cm_shards_file_backed(
+    let cm_extra_glues = build_cm_shards(
         cfg,
         ops,
         &pose_wiring,
@@ -5095,12 +4145,6 @@ pub(super) fn build_file_backed(
         &goldilocks_locals,
         &dirs,
     )?;
-    lf_stage_log_file_backed(
-        "cm_shards_file_backed_done",
-        Some(&pose_inst),
-        Some(&glue),
-        &mut mem_prev,
-    );
 
     // Surfaces (same as `build()`; these are comparatively small vs Poseidon/CM).
     let (
@@ -5133,7 +4177,7 @@ pub(super) fn build_file_backed(
     );
 
     drop(pose_asg);
-    finalize_file_backed(
+    let out = finalize(
         pose_inst,
         pose_wiring,
         ops,
@@ -5153,5 +4197,11 @@ pub(super) fn build_file_backed(
         all_sq_sum_digits,
         all_sq_sum_coeffwise,
         dirs.merged_dir,
-    )
+    )?;
+    lf_profile_log(&format!(
+        "finish nvars={} constraints={}",
+        out.0.nvars,
+        out.0.layout.nconstraints
+    ));
+    Ok(out)
 }

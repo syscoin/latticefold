@@ -1,8 +1,8 @@
 use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
 
 use latticefold::transcript::poseidon::F257;
-use symphony::dpp_poseidon::{PoseidonDr1csWiring, SparseDr1csInstance};
 use symphony::file_backed_dr1cs::FileBackedSparseDr1csInstance;
+use symphony::dpp_poseidon::PoseidonDr1csWiring;
 use symphony::transcript::PoseidonTraceOp;
 
 use crate::we_statement::WeParams;
@@ -26,33 +26,6 @@ pub fn we_tiny_f257_build_cm_gate_from_trace_ops(
     params: &WeParams,
     wiring: &TinyCoinOpWiring,
     pairs: &[(usize, usize)],
-) -> Result<
-    (
-        SparseDr1csInstance<F257>,
-        Vec<F257>,
-        Vec<ShortChallengeWiring>,
-        Vec<BoundedU32ChallengeWiring>,
-        Vec<GoldilocksChallengeWiring>,
-        Vec<CmDigitMulSurfaceWiring>,
-        Vec<CmDigitMulSqSurfaceWiring>,
-        PoseidonDr1csWiring,
-    ),
-    String,
-> {
-    builder::build(cfg, ops, ring_dim, params, wiring, pairs, None)
-}
-
-/// File-backed version of `we_tiny_f257_build_cm_gate_from_trace_ops`.
-///
-/// This avoids building a giant in-RAM `SparseDr1csInstance` for huge traces by streaming
-/// constraints/term pools to disk and returning a `FileBackedSparseDr1csInstance`.
-pub fn we_tiny_f257_build_cm_gate_from_trace_ops_file_backed(
-    cfg: Option<&PoseidonConfig<F257>>,
-    ops: &[PoseidonTraceOp<F257>],
-    ring_dim: usize,
-    params: &WeParams,
-    wiring: &TinyCoinOpWiring,
-    pairs: &[(usize, usize)],
     out_dir: impl AsRef<std::path::Path>,
 ) -> Result<
     (
@@ -67,33 +40,7 @@ pub fn we_tiny_f257_build_cm_gate_from_trace_ops_file_backed(
     ),
     String,
 > {
-    builder::build_file_backed(cfg, ops, ring_dim, params, wiring, pairs, None, out_dir)
-}
-
-/// File-backed version of `we_tiny_f257_build_cm_gate_from_trace_ops_with_extra_witness`.
-pub(crate) fn we_tiny_f257_build_cm_gate_from_trace_ops_file_backed_with_extra_witness(
-    cfg: Option<&PoseidonConfig<F257>>,
-    ops: &[PoseidonTraceOp<F257>],
-    ring_dim: usize,
-    params: &WeParams,
-    wiring: &TinyCoinOpWiring,
-    pairs: &[(usize, usize)],
-    extra_witness: Option<&TinyExtraWitness>,
-    out_dir: impl AsRef<std::path::Path>,
-) -> Result<
-    (
-        FileBackedSparseDr1csInstance<F257>,
-        Vec<F257>,
-        Vec<ShortChallengeWiring>,
-        Vec<BoundedU32ChallengeWiring>,
-        Vec<GoldilocksChallengeWiring>,
-        Vec<CmDigitMulSurfaceWiring>,
-        Vec<CmDigitMulSqSurfaceWiring>,
-        PoseidonDr1csWiring,
-    ),
-    String,
-> {
-    builder::build_file_backed(cfg, ops, ring_dim, params, wiring, pairs, extra_witness, out_dir)
+    builder::build(cfg, ops, ring_dim, params, wiring, pairs, None, out_dir)
 }
 
 /// Same as `we_tiny_f257_build_cm_gate_from_trace_ops`, but allows providing extra non-transcript witness values
@@ -106,9 +53,10 @@ pub(crate) fn we_tiny_f257_build_cm_gate_from_trace_ops_with_extra_witness(
     wiring: &TinyCoinOpWiring,
     pairs: &[(usize, usize)],
     extra_witness: Option<&TinyExtraWitness>,
+    out_dir: impl AsRef<std::path::Path>,
 ) -> Result<
     (
-        SparseDr1csInstance<F257>,
+        FileBackedSparseDr1csInstance<F257>,
         Vec<F257>,
         Vec<ShortChallengeWiring>,
         Vec<BoundedU32ChallengeWiring>,
@@ -119,6 +67,6 @@ pub(crate) fn we_tiny_f257_build_cm_gate_from_trace_ops_with_extra_witness(
     ),
     String,
 > {
-    builder::build(cfg, ops, ring_dim, params, wiring, pairs, extra_witness)
+    builder::build(cfg, ops, ring_dim, params, wiring, pairs, extra_witness, out_dir)
 }
 

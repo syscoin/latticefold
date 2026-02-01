@@ -9,6 +9,7 @@
 //!   serving as a stand-in for LWE hints in the real lock layer.
 
 use ark_ff::{FftField, PrimeField};
+use ark_serialize::{CanonicalDeserialize, Compress, Validate};
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 
@@ -16,7 +17,7 @@ use dpp::dr1cs_flpcp::{ChunkedMulCodeDr1csNpFlpcpSparse, Dr1csInstanceSparse, Mu
 use dpp::theorem43::{Theorem43Coins, Theorem43Dpp, Theorem43LockArtifact};
 use dpp::dr1cs_flpcp::Dr1csQueryScratch;
 use dpp::SparseVec;
-use symphony::dpp_poseidon::SparseDr1csInstance as SymDr1cs;
+use symphony::file_backed_dr1cs::FileBackedSparseDr1csInstance;
 
 use crate::lockable_ringlwe::{arm_ringlwe_lock, RingLweLockArtifact, RingLweParams};
 use crate::lockable_ringlwe::QueryBlockAccumulator;
@@ -109,7 +110,7 @@ impl<F: PrimeField + FftField> WeRingLweStreamingContext<F> {
 
 /// Arm a Ring-LWE lock and return a streaming context for chunked proof generation.
 pub(crate) fn arm_we_ringlwe_from_dr1cs_streaming<F: PrimeField + FftField>(
-    dr1cs: SymDr1cs<F>,
+    dr1cs: FileBackedSparseDr1csInstance<F>,
     public_len: usize,
     stmt_digest: [u8; 32],
     x: &[F],
@@ -123,7 +124,7 @@ pub(crate) fn arm_we_ringlwe_from_dr1cs_streaming<F: PrimeField + FftField>(
     if x.len() != public_len {
         return Err("arm_we_ringlwe_from_dr1cs_streaming: x length != public_len".to_string());
     }
-    let inst = dr1cs_from_symphony(dr1cs);
+    let inst = dr1cs_from_symphony(&dr1cs)?;
     let code = TensorRsMulCode::<F>::new(48, 3)?;
     let k_block = code.dim_k();
     let blocks = chunk_dr1cs_sparse(inst, k_block);
@@ -199,23 +200,90 @@ where
     )
 }
 
-fn dr1cs_from_symphony<F: PrimeField>(inst: SymDr1cs<F>) -> Dr1csInstanceSparse<F> {
-    let SymDr1cs {
-        nvars,
-        constraints,
-        a_terms,
-        b_terms,
-        c_terms,
-    } = inst;
-    let mut a = Vec::with_capacity(constraints.len());
-    let mut b = Vec::with_capacity(constraints.len());
-    let mut c = Vec::with_capacity(constraints.len());
-    for row in constraints {
-        a.push(SparseVec::new(a_terms[row.a.clone()].to_vec()));
-        b.push(SparseVec::new(b_terms[row.b.clone()].to_vec()));
-        c.push(SparseVec::new(c_terms[row.c.clone()].to_vec()));
+fn dr1cs_from_symphony<F: PrimeField + CanonicalDeserialize>(
+    inst: &FileBackedSparseDr1csInstance<F>,
+) -> Result<Dr1csInstanceSparse<F>, String> {
+    use std::fs::File;
+    use std::io::{BufReader, Read as IoRead};
+
+    #[inline]
+    fn read_u64(r: &mut impl IoRead) -> Result<u64, String> {
+        let mut buf = [0u8; 8];
+        r.read_exact(&mut buf).map_err(|e| e.to_string())?;
+        Ok(u64::from_le_bytes(buf))
     }
-    Dr1csInstanceSparse { n: nvars, a, b, c }
+
+    #[inline]
+    fn read_terms<F: PrimeField + CanonicalDeserialize>(
+        fc: &mut BufReader<File>,
+        fi: &mut BufReader<File>,
+        n: u64,
+        coeff_size: usize,
+    ) -> Result<Vec<(F, usize)>, String> {
+        let n_usize: usize = n
+            .try_into()
+            .map_err(|_| "dr1cs_from_symphony: term count overflow".to_string())?;
+        let mut out: Vec<(F, usize)> = Vec::with_capacity(n_usize);
+        let mut coeff_buf = vec![0u8; coeff_size];
+        for _ in 0..n_usize {
+            fc.read_exact(&mut coeff_buf).map_err(|e| e.to_string())?;
+            let mut rdr = std::io::Cursor::new(&coeff_buf);
+            let coeff =
+                F::deserialize_with_mode(&mut rdr, Compress::No, Validate::No).map_err(|e| e.to_string())?;
+            let idx_u64 = read_u64(fi)?;
+            let idx: usize = idx_u64
+                .try_into()
+                .map_err(|_| "dr1cs_from_symphony: var index overflow".to_string())?;
+            out.push((coeff, idx));
+        }
+        Ok(out)
+    }
+
+    let dir = &inst.layout.dir;
+    let coeff_size = inst.layout.coeff_size;
+    let nrows: usize = inst
+        .layout
+        .nconstraints
+        .try_into()
+        .map_err(|_| "dr1cs_from_symphony: nconstraints overflow".to_string())?;
+
+    let mut fr = BufReader::new(File::open(dir.join("constraints.bin")).map_err(|e| e.to_string())?);
+    let mut fa_c = BufReader::new(File::open(dir.join("a_coeffs.bin")).map_err(|e| e.to_string())?);
+    let mut fa_i = BufReader::new(File::open(dir.join("a_idx.bin")).map_err(|e| e.to_string())?);
+    let mut fb_c = BufReader::new(File::open(dir.join("b_coeffs.bin")).map_err(|e| e.to_string())?);
+    let mut fb_i = BufReader::new(File::open(dir.join("b_idx.bin")).map_err(|e| e.to_string())?);
+    let mut fc_c = BufReader::new(File::open(dir.join("c_coeffs.bin")).map_err(|e| e.to_string())?);
+    let mut fc_i = BufReader::new(File::open(dir.join("c_idx.bin")).map_err(|e| e.to_string())?);
+
+    let mut a: Vec<SparseVec<F>> = Vec::with_capacity(nrows);
+    let mut b: Vec<SparseVec<F>> = Vec::with_capacity(nrows);
+    let mut c: Vec<SparseVec<F>> = Vec::with_capacity(nrows);
+
+    let mut prev_a1: u64 = 0;
+    let mut prev_b1: u64 = 0;
+    let mut prev_c1: u64 = 0;
+    for _ in 0..nrows {
+        let a0 = read_u64(&mut fr)?;
+        let a1 = read_u64(&mut fr)?;
+        let b0 = read_u64(&mut fr)?;
+        let b1 = read_u64(&mut fr)?;
+        let c0 = read_u64(&mut fr)?;
+        let c1 = read_u64(&mut fr)?;
+
+        // The file-backed writer appends terms/rows in order; ranges should be monotone.
+        if a0 != prev_a1 || b0 != prev_b1 || c0 != prev_c1 {
+            return Err("dr1cs_from_symphony: non-contiguous term ranges".to_string());
+        }
+        prev_a1 = a1;
+        prev_b1 = b1;
+        prev_c1 = c1;
+
+        a.push(SparseVec::new(read_terms::<F>(&mut fa_c, &mut fa_i, a1 - a0, coeff_size)?));
+        b.push(SparseVec::new(read_terms::<F>(&mut fb_c, &mut fb_i, b1 - b0, coeff_size)?));
+        c.push(SparseVec::new(read_terms::<F>(&mut fc_c, &mut fc_i, c1 - c0, coeff_size)?));
+    }
+
+    Ok(Dr1csInstanceSparse { n: inst.nvars, a, b, c })
 }
 
 fn chunk_dr1cs_sparse<F: PrimeField>(inst: Dr1csInstanceSparse<F>, k_block: usize) -> Vec<Dr1csInstanceSparse<F>> {
