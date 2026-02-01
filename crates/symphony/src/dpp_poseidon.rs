@@ -25,7 +25,7 @@ enum PoseidonInstance<F: PrimeField> {
 
 #[inline]
 fn poseidon_profile_on() -> bool {
-    match std::env::var("LF_PROFILE_DR1CS") {
+    match std::env::var("LF_PLUS_PROFILE") {
         Ok(v) => v != "0",
         Err(_) => false,
     }
