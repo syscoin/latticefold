@@ -1159,8 +1159,11 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
         return Err("tiny gate: prefix too short for absorbed out.e/out.b".to_string());
     }
     let mut out_e_vars: Vec<Vec<Vec<RingDigits>>> = vec![vec![Vec::new(); out_e0_len]; out_e_blocks];
-    for i in 0..out_e0_len {
-        for blk in 0..out_e_blocks {
+    // IMPORTANT: match LF+ transcript order in `setchk::absorb_evaluations`:
+    // for ek in e { for ej in ek { transcript.absorb_slice(ej) } }.
+    // That is: `blk` (ek) outermost, then `i` (ej), then `lane` (slice element).
+    for blk in 0..out_e_blocks {
+        for i in 0..out_e0_len {
             out_e_vars[blk][i] = Vec::with_capacity(lane_len);
             for _lane in 0..lane_len {
                 let (st, ln) = prefix_payload[cur];
