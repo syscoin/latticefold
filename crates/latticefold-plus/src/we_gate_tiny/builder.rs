@@ -4439,6 +4439,69 @@ fn build_cm_glue_for_which(
             }
         }
 
+        // Optional debug: localize the recombination equality failure
+        // `subclaim_eval == eval_acc` (this is the failing `cm0` constraint you tagged).
+        if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1") {
+            let asg = glue.gb.assignment.as_slice();
+            #[inline]
+            fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
+                let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
+                let mut acc: i128 = 0;
+                let mut pow: i128 = 1;
+                for i in 0..17 {
+                    let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
+                    acc += di * pow;
+                    pow *= 16;
+                }
+                acc.rem_euclid(p) as u64
+            }
+            let mut n: usize = 0;
+            for (coeff, (a, b)) in subclaim_eval.iter().zip(eval_acc.iter()).enumerate() {
+                for d in 0..17 {
+                    let va = asg[a[d]];
+                    let vb = asg[b[d]];
+                    if va == vb {
+                        continue;
+                    }
+                    eprintln!(
+                        "[LF_DEBUG_CM_RECOMB_EQ_MISMATCH] which={} coeff={} digit={} \
+                         sub_var={} sub_val={}({}) eval_var={} eval_val={}({}) diff={}",
+                        which,
+                        coeff,
+                        d,
+                        a[d],
+                        va,
+                        super::digits::f257_to_i32_bal(va),
+                        b[d],
+                        vb,
+                        super::digits::f257_to_i32_bal(vb),
+                        super::digits::f257_to_i32_bal(va - vb),
+                    );
+                    if coeff == 0 && d == 0 {
+                        let su = scalar_digits_to_u64_mod_p(asg, a);
+                        let eu = scalar_digits_to_u64_mod_p(asg, b);
+                        eprintln!(
+                            "  [LF_DEBUG_CM_RECOMB_EQ_MISMATCH_SCALAR] which={} coeff=0 sub_u64={} eval_u64={} delta_u64={}",
+                            which,
+                            su,
+                            eu,
+                            su.wrapping_sub(eu),
+                        );
+                    }
+                    n += 1;
+                    if n >= 8 {
+                        break;
+                    }
+                }
+                if n >= 8 {
+                    break;
+                }
+            }
+            if n == 0 {
+                eprintln!("[LF_DEBUG_CM_RECOMB_EQ_MISMATCH] which={} subclaim_eval==eval_acc (no mismatches)", which);
+            }
+        }
+
         ring_eq_digits(&mut glue.gb, &subclaim_eval, &eval_acc);
     }
 
