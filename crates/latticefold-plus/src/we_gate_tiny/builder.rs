@@ -1675,30 +1675,17 @@ fn compute_cm_shared_precomp_base(
                 acc = ((acc as u128) * (dp as u128) % (p as u128)) as u64;
             }
 
-            // s_prime_flat: k*d short challenges, each is a ring element with centered coeff bytes.
+            // s_prime_flat: k*d short challenges; each entry is a ring element whose coefficients are
+            // derived via the short-challenge rule (byte % u) - (u/2), NOT a centered byte.
             let need_sprime = k_decomp * ring_dim;
-            let z = glue.gb.new_var(F257::ZERO);
-            glue.gb.enforce_var_eq_const(z, F257::ZERO);
-            let c128 = super::cm_math::alloc_const_goldilocks_u64(&mut glue.gb, 128u64);
-            let c128_d = goldilocks_bytes_to_digits(&mut glue.gb, c128);
             let mut sflat: Vec<RingDigits> = Vec::with_capacity(need_sprime);
             for blk in 0..need_sprime {
                 let sb = &short_locals[3 + blk];
-                if sb.byte_vars.len() != ring_dim {
-                    return Err("tiny gate: short byte_vars len mismatch (base s_prime_flat)".to_string());
-                }
-                let mut re: RingDigits = Vec::with_capacity(ring_dim);
-                for &bv in &sb.byte_vars {
-                    let mut bbytes = [0usize; 8];
-                    bbytes[0] = bv;
-                    for i in 1..8 {
-                        bbytes[i] = z;
-                    }
-                    let bd = goldilocks_bytes_to_digits(&mut glue.gb, bbytes);
-                    let centered = super::cm_math::goldilocks_sub_mod_p_digits(&mut glue.gb, &bd, &c128_d);
-                    re.push(centered);
-                }
-                sflat.push(re);
+                sflat.push(super::challenges::short_coeff_bal16_digits_to_ringdigits(
+                    &mut glue.gb,
+                    &sb.coeff_bal16_digits,
+                    ring_dim,
+                )?);
             }
 
             // SetChk verifier point `r` used in eq(r, ro).
@@ -3622,7 +3609,8 @@ fn build_cm_glue_for_which(
         }
         dpp_ring = Some(dpp);
 
-        // s_prime_flat: k*d short challenges, each is a ring element with centered coeff bytes.
+        // s_prime_flat: k*d short challenges; each entry is a ring element whose coefficients are
+        // derived via the short-challenge rule (byte % u) - (u/2), NOT a centered byte.
         let need_sprime = k_decomp
             .checked_mul(ring_dim)
             .ok_or_else(|| "tiny gate: k*ring_dim overflow (s_prime_flat)".to_string())?;
@@ -3631,26 +3619,22 @@ fn build_cm_glue_for_which(
         }
         let z = glue.gb.new_var(F257::ZERO);
         glue.gb.enforce_var_eq_const(z, F257::ZERO);
-        let c128 = super::cm_math::alloc_const_goldilocks_u64(&mut glue.gb, 128u64);
-        let c128_d = goldilocks_bytes_to_digits(&mut glue.gb, c128);
         let mut sflat: Vec<RingDigits> = Vec::with_capacity(need_sprime);
         for blk in 0..need_sprime {
             let sb = &short_locals[3 + blk];
-            if sb.byte_vars.len() != ring_dim {
-                return Err("tiny gate: short byte_vars len mismatch (s_prime_flat)".to_string());
-            }
             let mut re: RingDigits = Vec::with_capacity(ring_dim);
-            for &bv in &sb.byte_vars {
-                let bv_local = glue.import_base_var(base_asg, bv);
-                let mut bbytes = [0usize; 8];
-                bbytes[0] = bv_local;
-                for i in 1..8 {
-                    bbytes[i] = z;
-                }
-                // Centered coefficient = (byte - 128) mod p, in digit domain.
-                let bd = goldilocks_bytes_to_digits(&mut glue.gb, bbytes);
-                let centered = super::cm_math::goldilocks_sub_mod_p_digits(&mut glue.gb, &bd, &c128_d);
-                re.push(centered);
+            if sb.coeff_bal16_digits.len() != ring_dim {
+                return Err("tiny gate: short coeff_bal16_digits len mismatch (s_prime_flat)".to_string());
+            }
+            for d3_base in sb.coeff_bal16_digits.iter() {
+                let d0 = glue.import_base_var(base_asg, d3_base[0]);
+                let d1 = glue.import_base_var(base_asg, d3_base[1]);
+                let d2 = glue.import_base_var(base_asg, d3_base[2]);
+                let mut d17 = [z; 17];
+                d17[0] = d0;
+                d17[1] = d1;
+                d17[2] = d2;
+                re.push(d17);
             }
             sflat.push(re);
         }

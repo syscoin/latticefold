@@ -9,6 +9,7 @@ use super::op_counts::tiny_cm_bump;
 use super::digits::{
     alloc_bal16_digit, f257_to_i32_bal, mul_u32ish9_to_fixed_bal16, u32_bytes_to_bal16_digits,
 };
+use super::cm_math::RingDigits;
 use super::gadgets::decompose_existing_byte_var_to_bits;
 use super::params::{DIGITS_PER_TRY, LIMBS_U32, LIMBS_U64};
 use super::cm_ir::{
@@ -408,5 +409,35 @@ pub(super) fn short_challenge_from_digits_128(
     }
 
     (byte_vars, coeff_vars, coeff_bal16_digits)
+}
+
+/// Convert short-challenge coefficient base-16 digits into full Goldilocks scalar digit encoding.
+///
+/// The short-challenge gadget constrains each coefficient `cv` as a small centered integer (e.g.
+/// for `lambda=128` and `ring_dim=64`, coeff ∈ {-2,-1,0,1}) and produces a *3-digit* balanced-base16
+/// decomposition `[d0,d1,d2]` (little-endian) with each digit in [-8,7].
+///
+/// Many CM gadgets expect a **full Goldilocks scalar** encoded as 17 balanced-base16 digits, so we
+/// pad the remaining high digits with explicit zeros.
+pub(super) fn short_coeff_bal16_digits_to_ringdigits(
+    gb: &mut Dr1csBuilder<F257>,
+    coeff_bal16_digits: &[[usize; 3]],
+    ring_dim: usize,
+) -> Result<RingDigits, String> {
+    if coeff_bal16_digits.len() != ring_dim {
+        return Err("tiny gate: short coeff_bal16_digits len mismatch".to_string());
+    }
+    let z = gb.new_var(F257::ZERO);
+    gb.enforce_var_eq_const(z, F257::ZERO);
+
+    let mut out: RingDigits = Vec::with_capacity(ring_dim);
+    for d3 in coeff_bal16_digits.iter() {
+        let mut d17 = [z; 17];
+        d17[0] = d3[0];
+        d17[1] = d3[1];
+        d17[2] = d3[2];
+        out.push(d17);
+    }
+    Ok(out)
 }
 
