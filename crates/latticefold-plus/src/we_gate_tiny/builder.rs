@@ -4139,6 +4139,137 @@ fn build_cm_glue_for_which(
     }
 
     let claimed_sum = claimed_sum_opt.unwrap_or_else(|| super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim));
+
+    // Debug: show claimed_sum vs round-0 g01 (coeff 0) and a term breakdown for l=0.
+    if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1") {
+        #[inline]
+        fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
+            let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
+            let mut acc: i128 = 0;
+            let mut pow: i128 = 1;
+            for i in 0..17 {
+                let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
+                acc += di * pow;
+                pow *= 16;
+            }
+            acc.rem_euclid(p) as u64
+        }
+        #[inline]
+        fn ring_coeff0_u64(asg: &[F257], r: &RingDigits) -> u64 {
+            scalar_digits_to_u64_mod_p(asg, &r[0])
+        }
+        #[inline]
+        fn mul_mod_p(a: u64, b: u64, p: u64) -> u64 {
+            ((a as u128 * b as u128) % (p as u128)) as u64
+        }
+        #[inline]
+        fn add_mod_p(a: u64, b: u64, p: u64) -> u64 {
+            let s = a as u128 + b as u128;
+            (s % (p as u128)) as u64
+        }
+
+        let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+        let asg = glue.gb.assignment.as_slice();
+
+        // g01 for round 0, coeff 0
+        if !msgs_digits.is_empty() {
+            let m0c0 = ring_coeff0_u64(asg, &msgs_digits[0][0]);
+            let m1c0 = ring_coeff0_u64(asg, &msgs_digits[0][1]);
+            let g01c0 = add_mod_p(m0c0, m1c0, p);
+            let claimc0 = ring_coeff0_u64(asg, &claimed_sum);
+            eprintln!(
+                "[LF_DEBUG_CM_CLAIMED_SUM_BREAKDOWN] which={} round0 g01_coeff0_u64={} claim_coeff0_u64={} delta_u64={}",
+                which,
+                g01c0,
+                claimc0,
+                g01c0.wrapping_sub(claimc0),
+            );
+        }
+
+        // If we have the data, print l=0 contribution breakdown (coeff 0 only).
+        if let (Some(out_e_base), Some(dcom_evals_base)) = (setchk_out_e_vars_base.as_ref(), dcom_evals_base.as_ref()) {
+            if !dcom_evals_base.is_empty() && !msgs_digits.is_empty() && ring_dim == 64 {
+                let z_idx = l_instances_expected * (4 + 4 * (params.mlen as usize));
+                let max_pow = z_idx + 1;
+                // Avoid holding `asg` (immutable) across `&mut glue.gb` calls.
+                let rc_d = goldilocks_bytes_to_digits(&mut glue.gb, rc_bytes);
+                let rc_pows = goldilocks_pow_table_digits(&mut glue.gb, &rc_d, max_pow);
+
+                let l = 0usize;
+                let ev = &dcom_evals_base[l];
+                let l_idx = l * (4 + 4 * (params.mlen as usize));
+
+                // Recompute u_l[ni] for l=0 (coeff0 only) using the *same* ringmul gadget results already in witness:
+                // we just read u_l if it was computed/imported above.
+                let u_l: Vec<RingDigits> = if let Some(shared) = cm_shared_base.as_ref() {
+                    shared.u[l].clone()
+                } else {
+                    // If no shared base, we can't cheaply recompute here without duplicating work.
+                    Vec::new()
+                };
+
+                let mut acc = 0u64;
+                // a0
+                let asg = glue.gb.assignment.as_slice();
+                let a0 = scalar_digits_to_u64_mod_p(asg, &ev.a[0]);
+                let rc0 = scalar_digits_to_u64_mod_p(asg, &rc_pows[l_idx]);
+                acc = add_mod_p(acc, mul_mod_p(a0, rc0, p), p);
+                // b0/c0/u0 (coeff0)
+                let b0 = ring_coeff0_u64(asg, &ev.b[0]);
+                let c0 = ring_coeff0_u64(asg, &ev.c[0]);
+                let rc1 = scalar_digits_to_u64_mod_p(asg, &rc_pows[l_idx + 1]);
+                let rc2 = scalar_digits_to_u64_mod_p(asg, &rc_pows[l_idx + 2]);
+                let rc3 = scalar_digits_to_u64_mod_p(asg, &rc_pows[l_idx + 3]);
+                acc = add_mod_p(acc, mul_mod_p(b0, rc1, p), p);
+                acc = add_mod_p(acc, mul_mod_p(c0, rc2, p), p);
+                if !u_l.is_empty() {
+                    let u0 = ring_coeff0_u64(asg, &u_l[0]);
+                    acc = add_mod_p(acc, mul_mod_p(u0, rc3, p), p);
+                }
+                // M rows
+                for i in 0..(params.mlen as usize) {
+                    let idx = l_idx + 4 + i * 4;
+                    let ai = scalar_digits_to_u64_mod_p(asg, &ev.a[1 + i]);
+                    let rci = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx]);
+                    acc = add_mod_p(acc, mul_mod_p(ai, rci, p), p);
+                    let bi = ring_coeff0_u64(asg, &ev.b[1 + i]);
+                    let ci = ring_coeff0_u64(asg, &ev.c[1 + i]);
+                    let rcb = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx + 1]);
+                    let rcc = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx + 2]);
+                    let rcu = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx + 3]);
+                    acc = add_mod_p(acc, mul_mod_p(bi, rcb, p), p);
+                    acc = add_mod_p(acc, mul_mod_p(ci, rcc, p), p);
+                    if !u_l.is_empty() {
+                        let ui = ring_coeff0_u64(asg, &u_l[1 + i]);
+                        acc = add_mod_p(acc, mul_mod_p(ui, rcu, p), p);
+                    }
+                }
+                // NOTE: tcch terms omitted from this quick breakdown unless we thread `tcch0/tcch1`
+                // out of the claimed_sum builder. (They are still included in the real claimed_sum.)
+
+                let claimc0 = ring_coeff0_u64(asg, &claimed_sum);
+                eprintln!(
+                    "[LF_DEBUG_CM_CLAIMED_SUM_BREAKDOWN_L0] which={} recomputed_claim_coeff0_u64={} actual_claim_coeff0_u64={} delta_u64={}",
+                    which,
+                    acc,
+                    claimc0,
+                    acc.wrapping_sub(claimc0),
+                );
+
+                // Also show whether our out_e shape matches what CM expects (helps catch wiring drift).
+                eprintln!(
+                    "[LF_DEBUG_CM_CLAIMED_SUM_BREAKDOWN_SHAPES] which={} out_e_base_len={} dcom_evals_len={} mlen={} k={} l_instances_expected={}",
+                    which,
+                    out_e_base.len(),
+                    dcom_evals_base.len(),
+                    params.mlen,
+                    params.k,
+                    l_instances_expected,
+                );
+            }
+        }
+    }
+
     let subclaim_eval = super::cm_math::sumcheck_verify_degree2_ring_digits(&mut glue.gb, claimed_sum, &msgs_digits, &rs_digits)?;
 
     // Eval table absorbs sanity.
