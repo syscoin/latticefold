@@ -58,7 +58,6 @@ struct DcomEvalDigits {
     a: Vec<GoldilocksScalar>,
     b: Vec<RingDigits>,
     c: Vec<RingDigits>,
-    v: Vec<GoldilocksScalar>,
 }
 
 /// CM verifier shared precomputations built once in the **base** glue module.
@@ -740,7 +739,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
         #[inline]
         fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
             if a.len() != 64 {
-                return Err("tiny gate: expected ring_dim=64 for Π_lin ring-mul".to_string());
+                return Err("tiny gate: expected ring element with 64 coeffs (Π_lin ring-mul)".to_string());
             }
             Ok(core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j]))))
         }
@@ -848,51 +847,49 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
             let vb = &tail[2];
             let vc = &tail[3];
 
-            if ring_dim == 64 {
-                let e = super::cm_math::eq_eval_goldilocks_digits(&mut glue.gb, &r_pre_digits, &rs_digits)?;
-                // Avoid cloning the full assignment: build IR using an immutable slice, then lower after borrow ends.
-                let (ir, prod_ir) = {
+            let e = super::cm_math::eq_eval_goldilocks_digits(&mut glue.gb, &r_pre_digits, &rs_digits)?;
+            // Avoid cloning the full assignment: build IR using an immutable slice, then lower after borrow ends.
+            let (ir, prod_ir) = {
+                let base_asg: &[F257] = glue.gb.assignment.as_slice();
+                let mut ib = IrBuilder::new(base_asg);
+                let va_ir = ringdigits64_to_ir(va)?;
+                let vb_ir = ringdigits64_to_ir(vb)?;
+                let prod_ir = ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &va_ir, &vb_ir);
+                (ib.ir, prod_ir)
+            };
+            super::op_counts::tiny_cm_bump(|c| c.ring_mul_negacyclic += 1);
+            let lowered = lower_ir_into_builder(&mut glue.gb, ir);
+            let vab = map_ring_out(&prod_ir, &lowered);
+            let diff = super::cm_math::ring_sub_digits(&mut glue.gb, &vab, vc);
+            // Enforce `diff * e == subclaim_eval` in the **bal4** domain to avoid allocating
+            // the scaled ring as bal16 digits (which would require a bal4->bal16 carry-chain conversion
+            // per coefficient).
+            //
+            // This is sound: we convert the existing checked bal16 digits into checked bal4 digits
+            // via a carry chain, do a checked bal4 multiplication mod p, then equate bal4 digits.
+            {
+                use super::cm_ir::{goldilocks_mul_mod_p_digits_bal4_ir, IrBuilder, VarRef as IrVarRef};
+                let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+                // Avoid cloning the full assignment: build IR using an immutable slice,
+                // then lower after the borrow ends.
+                let ir = {
                     let base_asg: &[F257] = glue.gb.assignment.as_slice();
                     let mut ib = IrBuilder::new(base_asg);
-                    let va_ir = ringdigits64_to_ir(va)?;
-                    let vb_ir = ringdigits64_to_ir(vb)?;
-                    let prod_ir = ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &va_ir, &vb_ir);
-                    (ib.ir, prod_ir)
-                };
-                super::op_counts::tiny_cm_bump(|c| c.ring_mul_negacyclic += 1);
-                let lowered = lower_ir_into_builder(&mut glue.gb, ir);
-                let vab = map_ring_out(&prod_ir, &lowered);
-                let diff = super::cm_math::ring_sub_digits(&mut glue.gb, &vab, vc);
-                // Enforce `diff * e == subclaim_eval` in the **bal4** domain to avoid allocating
-                // the scaled ring as bal16 digits (which would require a bal4->bal16 carry-chain conversion
-                // per coefficient).
-                //
-                // This is sound: we convert the existing checked bal16 digits into checked bal4 digits
-                // via a carry chain, do a checked bal4 multiplication mod p, then equate bal4 digits.
-                {
-                    use super::cm_ir::{goldilocks_mul_mod_p_digits_bal4_ir, IrBuilder, VarRef as IrVarRef};
-                    let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
-                    // Avoid cloning the full assignment: build IR using an immutable slice,
-                    // then lower after the borrow ends.
-                    let ir = {
-                        let base_asg: &[F257] = glue.gb.assignment.as_slice();
-                        let mut ib = IrBuilder::new(base_asg);
-                        let e16: [IrVarRef; 17] = core::array::from_fn(|k| IrVarRef::Base(e[k]));
-                        let e4 = ib.bal16_to_bal4_digits_cached(&e16);
-                        let diff_ir = ringdigits64_to_ir(&diff)?;
-                        let sub_ir = ringdigits64_to_ir(&subclaim_eval)?;
-                        for i in 0..64 {
-                            let d4 = ib.bal16_to_bal4_digits_cached(&diff_ir[i]);
-                            let prod4 = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &d4, &e4, p_u64);
-                            let sub4 = ib.bal16_to_bal4_digits_cached(&sub_ir[i]);
-                            for k in 0..33 {
-                                ib.enforce_lc_eq_zero(vec![(F257::ONE, prod4[k]), (-F257::ONE, sub4[k])]);
-                            }
+                    let e16: [IrVarRef; 17] = core::array::from_fn(|k| IrVarRef::Base(e[k]));
+                    let e4 = ib.bal16_to_bal4_digits_cached(&e16);
+                    let diff_ir = ringdigits64_to_ir(&diff)?;
+                    let sub_ir = ringdigits64_to_ir(&subclaim_eval)?;
+                    for i in 0..64 {
+                        let d4 = ib.bal16_to_bal4_digits_cached(&diff_ir[i]);
+                        let prod4 = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &d4, &e4, p_u64);
+                        let sub4 = ib.bal16_to_bal4_digits_cached(&sub_ir[i]);
+                        for k in 0..33 {
+                            ib.enforce_lc_eq_zero(vec![(F257::ONE, prod4[k]), (-F257::ONE, sub4[k])]);
                         }
-                        ib.ir
-                    };
-                    let _lowered = super::cm_ir::lower_ir_into_builder(&mut glue.gb, ir);
-                }
+                    }
+                    ib.ir
+                };
+                let _lowered = super::cm_ir::lower_ir_into_builder(&mut glue.gb, ir);
             }
         }
     }
@@ -988,10 +985,6 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
     *setchk_r_point_for_cm = Some(rs_digits.clone());
     let claimed0 = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
     let v_sc = super::cm_math::sumcheck_verify_degree3_ring_digits(&mut glue.gb, claimed0, &msgs_digits, &rs_digits)?;
-
-    if ring_dim != 64 {
-        return Err("tiny gate: setchk digest/recomb currently wired only for ring_dim=64".to_string());
-    }
 
     let k_rg = params.k as usize;
     let out_e0_len = k_rg;
@@ -1124,7 +1117,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                     for lane in r.clone() {
                         let ejv = &out_e_vars[0][i][lane];
                         if ejv.len() != 64 {
-                            return Err("tiny gate: expected ring_dim=64 for setchk ev IR".to_string());
+                            return Err("tiny gate: expected ring element with 64 coeffs (setchk ev IR)".to_string());
                         }
                         let coeffs_ir: [[IrVarRef; 17]; 64] = core::array::from_fn(|t| {
                             core::array::from_fn(|j| IrVarRef::Base(ejv[t][j]))
@@ -1196,7 +1189,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
     }
 
     // Precompute `dppow` in bal4 once (shared across all rgchk shards).
-    let dppow4_base: Option<Vec<[usize; 33]>> = if ring_dim == 64 {
+    let dppow4_base: Vec<[usize; 33]> = {
         use super::cm_ir::{lower_ir_into_builder, IrBuilder, VarRef as IrVarRef};
         // Avoid borrowing `glue.gb.assignment` across lowering: build IR under a scoped immutable borrow,
         // then lower after the borrow ends (no giant `assignment.clone()`).
@@ -1211,23 +1204,22 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
             (ib.ir, out)
         };
         let lowered = lower_ir_into_builder(&mut glue.gb, ir);
-        Some(out_ir.into_iter().map(|d| core::array::from_fn(|k| lowered.map_var(d[k]))).collect())
-    } else {
-        None
+        out_ir
+            .into_iter()
+            .map(|d| core::array::from_fn(|k| lowered.map_var(d[k])))
+            .collect()
     };
 
     // Precompute ct(psi * x) constant weights for ring_dim=64 once (host-side constants).
-    let psi_ct_u64s: Option<[u64; 64]> = if ring_dim == 64 {
+    let psi_ct_u64s: [u64; 64] = {
         use cyclotomic_rings::rings::GoldilocksRing64 as GR64;
         use stark_rings::{psi, unit_monomial, CoeffRing};
         let psi_r = psi::<GR64>();
-        Some(core::array::from_fn(|j| {
+        core::array::from_fn(|j| {
             let basis = unit_monomial::<GR64>(j);
             let w_br = (psi_r * basis).ct();
             w_br.into_bigint().as_ref().get(0).copied().unwrap_or(0)
-        }))
-    } else {
-        None
+        })
     };
 
     #[inline]
@@ -1310,34 +1302,32 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
             .checked_mul(k_rg)
             .ok_or_else(|| "tiny gate: rgchk base overflow".to_string())?;
         for ni in 0..out_e_blocks {
-            if ring_dim == 64 {
-                // Big optimization: compute the entire rgchk `ct(psi * Σ_i ui_col * dp^i)` per (ni,col)
-                // as an IR shard in the bal4 domain, converting back to bal16 only once at the end.
-                //
-                // This removes the repeated bal16<->bal4 conversions inside `ring_scale_digits` and
-                // inside `ct_psi_mul_ring_digits_d64` for each intermediate ring value.
-                use super::cm_ir::{
-                    bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir, goldilocks_sub_mod_p_digits_bal4_ir, goldilocks_mul_const_mod_p_digits_bal4_ir,
-                    goldilocks_mul_mod_p_digits_bal4_ir, lower_ir_into_builder, IrBuilder, VarRef as IrVarRef,
-                };
-                let dppow4_base = dppow4_base.as_ref().ok_or("tiny gate: missing dppow4_base")?;
-                let psi_ct_u64s = psi_ct_u64s.as_ref().ok_or("tiny gate: missing psi_ct_u64s")?;
+            // Big optimization: compute the entire rgchk `ct(psi * Σ_i ui_col * dp^i)` per (ni,col)
+            // as an IR shard in the bal4 domain, converting back to bal16 only once at the end.
+            //
+            // This removes the repeated bal16<->bal4 conversions inside `ring_scale_digits` and
+            // inside `ct_psi_mul_ring_digits_d64` for each intermediate ring value.
+            use super::cm_ir::{
+                bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir, goldilocks_mul_const_mod_p_digits_bal4_ir,
+                goldilocks_mul_mod_p_digits_bal4_ir, goldilocks_sub_mod_p_digits_bal4_ir, lower_ir_into_builder,
+                IrBuilder, VarRef as IrVarRef,
+            };
 
-                let cols = ring_dim;
-                let col_batch: usize = (8 * rayon::current_num_threads().max(1)).max(1);
-                for c0 in (0..cols).step_by(col_batch) {
-                    let c1 = (c0 + col_batch).min(cols);
-                    let batch_len = c1 - c0;
-                    let base_asg: &[F257] = &glue.gb.assignment;
+            let cols = ring_dim;
+            let col_batch: usize = (8 * rayon::current_num_threads().max(1)).max(1);
+            for c0 in (0..cols).step_by(col_batch) {
+                let c1 = (c0 + col_batch).min(cols);
+                let batch_len = c1 - c0;
+                let base_asg: &[F257] = &glue.gb.assignment;
 
-                    let frags: Vec<(_, [IrVarRef; 17], usize)> = (0..batch_len)
-                        .into_par_iter()
-                        .map(|c_local| -> Result<_, String> {
-                            let col = c0 + c_local;
-                            let mut ib = IrBuilder::new(base_asg);
-                            let z = ib.new_var(F257::ZERO);
-                            ib.ir.enforce_var_eq_const(z, F257::ZERO);
-                            let z4: [IrVarRef; 33] = [z; 33];
+                let frags: Vec<(_, [IrVarRef; 17], usize)> = (0..batch_len)
+                    .into_par_iter()
+                    .map(|c_local| -> Result<_, String> {
+                        let col = c0 + c_local;
+                        let mut ib = IrBuilder::new(base_asg);
+                        let z = ib.new_var(F257::ZERO);
+                        ib.ir.enforce_var_eq_const(z, F257::ZERO);
+                        let z4: [IrVarRef; 33] = [z; 33];
 
                             // acc_ring in bal4 per coefficient.
                             let mut acc4: [[IrVarRef; 33]; 64] = [z4; 64];
@@ -1348,7 +1338,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                                 }
                                 let ui_col = &out_e_vars[ni][idx][col];
                                 if ui_col.len() != 64 {
-                                    return Err("tiny gate: expected ring_dim=64 for rgchk".to_string());
+                                    return Err("tiny gate: expected ring element with 64 coeffs (rgchk)".to_string());
                                 }
                                 let s4: [IrVarRef; 33] = core::array::from_fn(|k| IrVarRef::Base(dppow4_base[i][k]));
                                 for coeff in 0..64 {
@@ -1378,32 +1368,29 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                             }
 
                             let ct16 = bal4_to_bal16_digits_ir(&mut ib, &ct4);
-                            Ok((ib.ir, ct16, col))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
+                        Ok((ib.ir, ct16, col))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
 
-                    for (ir, ct16_ir, col) in frags {
-                        let lowered = lower_ir_into_builder(&mut glue.gb, ir);
-                        let ct: GoldilocksScalar = core::array::from_fn(|k| lowered.map_var(ct16_ir[k]));
-                        let expected = if ni == 0 {
-                            eval_v[col]
-                        } else {
-                            *eval_c
-                                .get(ni)
-                                .ok_or("tiny gate: eval.c length mismatch (rgchk)")?
-                                .get(col)
-                                .ok_or("tiny gate: eval.c coeff index oob (rgchk)")?
-                        };
-                        for di in 0..17 {
-                            glue.gb.enforce_lc_times_one_eq_const(vec![
-                                (F257::ONE, ct[di]),
-                                (-F257::ONE, expected[di]),
-                            ]);
-                        }
+                for (ir, ct16_ir, col) in frags {
+                    let lowered = lower_ir_into_builder(&mut glue.gb, ir);
+                    let ct: GoldilocksScalar = core::array::from_fn(|k| lowered.map_var(ct16_ir[k]));
+                    let expected = if ni == 0 {
+                        eval_v[col]
+                    } else {
+                        *eval_c
+                            .get(ni)
+                            .ok_or("tiny gate: eval.c length mismatch (rgchk)")?
+                            .get(col)
+                            .ok_or("tiny gate: eval.c coeff index oob (rgchk)")?
+                    };
+                    for di in 0..17 {
+                        glue.gb.enforce_lc_times_one_eq_const(vec![
+                            (F257::ONE, ct[di]),
+                            (-F257::ONE, expected[di]),
+                        ]);
                     }
                 }
-            } else {
-                return Err("tiny gate: rgchk optimized path requires ring_dim=64".to_string());
             }
         }
 
@@ -1411,7 +1398,6 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
             a: eval_a,
             b: eval_b,
             c: eval_c,
-            v: eval_v,
         });
     }
 
@@ -1433,8 +1419,8 @@ fn compute_cm_shared_precomp_base(
 ) -> Result<Option<Arc<CmSharedPrecompBase>>, String> {
     // Exact logic previously inlined in `build()`. Keep it in one place so both in-memory and
     // file-backed builds share the *same* precompute logic and op-mix behavior.
-    let cm_shared_base: Option<Arc<CmSharedPrecompBase>> = if ring_dim == 64
-        && l_instances_expected > 0
+    debug_assert_eq!(ring_dim, 64);
+    let cm_shared_base: Option<Arc<CmSharedPrecompBase>> = if l_instances_expected > 0
         && params.kappa > 0
         && (params.kappa as usize).is_power_of_two()
         && ((params.k as usize) * ring_dim).is_power_of_two()
@@ -1587,7 +1573,7 @@ fn compute_cm_shared_precomp_base(
                     #[inline]
                     fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
                         if a.len() != 64 {
-                            return Err("tiny gate: expected ring_dim=64 for IR ring-mul".to_string());
+                                    return Err("tiny gate: expected ring element with 64 coeffs (IR ring-mul)".to_string());
                         }
                         Ok(core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j]))))
                     }
@@ -1725,6 +1711,9 @@ fn validate_params_and_short_schedule(
             "tiny gate: ring_dim mismatch (arg={} params.ring_dim_d={})",
             ring_dim, params.ring_dim_d
         ));
+    }
+    if ring_dim != 64 {
+        return Err(format!("tiny gate: only supports ring_dim=64 (got {ring_dim})"));
     }
     if params.degree_cm != 2 {
         return Err("tiny gate: expected params.degree_cm == 2".to_string());
@@ -3041,7 +3030,6 @@ fn build_cm_glue_for_which(
     let mut dpp_ring: Option<Vec<RingDigits>> = None;
     let mut r_point_digits: Option<Vec<GoldilocksScalar>> = None;
     if cm_shared_base.is_none()
-        && ring_dim == 64
         && kappa.is_power_of_two()
         && (k_decomp * ring_dim).is_power_of_two()
         && ell.is_power_of_two()
@@ -3226,7 +3214,6 @@ fn build_cm_glue_for_which(
             let rows_per_l = 1usize + (params.mlen as usize);
             if dcom_evals_base.len() == l_instances_expected
                 && out_e_base.len() == out_e_blocks
-                && ring_dim == 64
             {
                 #[inline]
                 fn import_scalar(glue: &mut GlueCtx, base_asg: &[F257], s: &GoldilocksScalar) -> GoldilocksScalar {
@@ -3319,7 +3306,7 @@ fn build_cm_glue_for_which(
                     #[inline]
                     fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
                         if a.len() != 64 {
-                            return Err("tiny gate: expected ring_dim=64 for tcch bal4 shards".to_string());
+                            return Err("tiny gate: expected ring element with 64 coeffs (tcch bal4 shards)".to_string());
                         }
                         Ok(core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j]))))
                     }
@@ -3474,7 +3461,7 @@ fn build_cm_glue_for_which(
                                 #[inline]
                                 fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
                                     if a.len() != 64 {
-                                        return Err("tiny gate: expected ring_dim=64 for IR ring-mul".to_string());
+                                        return Err("tiny gate: expected ring element with 64 coeffs (IR ring-mul)".to_string());
                                     }
                                     Ok(core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j]))))
                                 }
@@ -3581,7 +3568,7 @@ fn build_cm_glue_for_which(
                         #[inline]
                         fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
                             if a.len() != 64 {
-                                return Err("tiny gate: expected ring_dim=64 for claimed_sum bal4 shards".to_string());
+                                return Err("tiny gate: expected ring element with 64 coeffs (claimed_sum bal4 shards)".to_string());
                             }
                             Ok(core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j]))))
                         }
@@ -3779,21 +3766,20 @@ fn build_cm_glue_for_which(
         // We'll batch over `l` so we don't materialize all eval table ring elements at once.
         let l_batch: usize = (8 * rayon::current_num_threads().max(1)).max(1);
 
-        if ring_dim == 64 {
-            // Precompute `eq` in bal4 once (shared across all per-l shards).
-            let eq4_base: [usize; 33] = {
-                use super::cm_ir::{IrBuilder, VarRef as IrVarRef};
-                // Avoid borrowing `glue.gb.assignment` across lowering (which needs `&mut glue.gb`).
-                let (ir, eq4_ir): (super::cm_ir::CmIr, [IrVarRef; 33]) = {
-                    let base_asg: &[F257] = glue.gb.assignment.as_slice();
-                    let mut ib = IrBuilder::new(base_asg);
-                    let eq16: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(eq[j]));
-                    let eq4 = ib.bal16_to_bal4_digits_cached(&eq16);
-                    (ib.ir, eq4)
-                };
-                let lowered = super::cm_ir::lower_ir_into_builder(&mut glue.gb, ir);
-                core::array::from_fn(|k| lowered.map_var(eq4_ir[k]))
+        // Precompute `eq` in bal4 once (shared across all per-l shards).
+        let eq4_base: [usize; 33] = {
+            use super::cm_ir::{IrBuilder, VarRef as IrVarRef};
+            // Avoid borrowing `glue.gb.assignment` across lowering (which needs `&mut glue.gb`).
+            let (ir, eq4_ir): (super::cm_ir::CmIr, [IrVarRef; 33]) = {
+                let base_asg: &[F257] = glue.gb.assignment.as_slice();
+                let mut ib = IrBuilder::new(base_asg);
+                let eq16: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(eq[j]));
+                let eq4 = ib.bal16_to_bal4_digits_cached(&eq16);
+                (ib.ir, eq4)
             };
+            let lowered = super::cm_ir::lower_ir_into_builder(&mut glue.gb, ir);
+            core::array::from_fn(|k| lowered.map_var(eq4_ir[k]))
+        };
 
             // Build recombination shards in parallel per batch, then lower + accumulate.
             for l0 in (0..l_instances_expected).step_by(l_batch) {
@@ -3831,7 +3817,7 @@ fn build_cm_glue_for_which(
                 #[inline]
                 fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
                     if a.len() != 64 {
-                        return Err("tiny gate: expected ring_dim=64 for bal4 recombination".to_string());
+                        return Err("tiny gate: expected ring element with 64 coeffs (bal4 recombination)".to_string());
                     }
                     Ok(core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j]))))
                 }
@@ -3893,10 +3879,7 @@ fn build_cm_glue_for_which(
                     eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &contrib);
                 }
             }
-        } else {
-            return Err("tiny gate: recombination check requires ring_dim=64".to_string());
-        }
-
+        
         // t(z) terms: for each l, add t0(ro)*e00(l)*rc^z + t1(ro)*e00(l)*rc^{z+1}.
         //
         // These ring-muls are independent across l, so we build them as IR fragments in parallel,
@@ -3910,7 +3893,7 @@ fn build_cm_glue_for_which(
             #[inline]
             fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
                 if a.len() != 64 {
-                    return Err("tiny gate: expected ring_dim=64 for IR ring-mul".to_string());
+                    return Err("tiny gate: expected ring element with 64 coeffs (IR ring-mul)".to_string());
                 }
                 Ok(core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j]))))
             }
@@ -4145,6 +4128,109 @@ pub(super) fn build(
         &goldilocks_locals,
         &dirs,
     )?;
+
+    // ------------------------------------------------------------------------
+    // Decomp verifier math (LinB2X + DecompProof) — algebraic-only checks
+    // ------------------------------------------------------------------------
+    //
+    // Mirrors `we_gate_arith.rs::decomp_verifier_math_dr1cs`:
+    // - C0 + B*C1 == cm_g
+    // - v0a + B*v1a == va, v0b + B*v1b == vb
+    //
+    // These do not interact with the transcript; they are purely ring algebraic checks.
+    // The witness-time builder can populate these from a real proof via `TinyExtraWitness`.
+    let kappa = params.kappa as usize;
+    if kappa > 0 {
+        let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+        let b_u64: u64 = ((params.decomp_b as u128) % (p_u64 as u128)) as u64;
+        let b_digits = {
+            let bs = alloc_const_goldilocks_u64(&mut glue.gb, b_u64);
+            goldilocks_bytes_to_digits(&mut glue.gb, bs)
+        };
+        let vlen = 1usize + (params.mlen as usize);
+
+            #[inline]
+            fn alloc_witness_ring_digits(
+                gb: &mut Dr1csBuilder<F257>,
+                ring_dim: usize,
+                coeffs: Option<&[u64]>,
+            ) -> RingDigits {
+                let mut r: RingDigits = Vec::with_capacity(ring_dim);
+                for j in 0..ring_dim {
+                    let u = coeffs.and_then(|c| c.get(j).copied()).unwrap_or(0u64);
+                    r.push(alloc_witness_goldilocks_u64_digits(gb, u));
+                }
+                r
+            }
+
+            #[inline]
+            fn ring_recompose_base_b(
+                gb: &mut Dr1csBuilder<F257>,
+                r0: &RingDigits,
+                r1: &RingDigits,
+                b_digits: &GoldilocksScalar,
+                p_u64: u64,
+            ) -> RingDigits {
+                debug_assert_eq!(r0.len(), r1.len());
+                let mut out: RingDigits = Vec::with_capacity(r0.len());
+                for j in 0..r0.len() {
+                    let t = goldilocks_mul_mod_p_digits(gb, &r1[j], b_digits);
+                    let s = goldilocks_add_mod_p_digits(gb, &r0[j], &t);
+                    // `goldilocks_add_mod_p_digits` already reduces mod p; keep p_u64 unused in this path.
+                    let _ = p_u64;
+                    out.push(s);
+                }
+                out
+            }
+
+            // Allocate witnesses (default 0; overridden by `extra_witness` when provided).
+            let mut dcomp_c0: Vec<RingDigits> = Vec::with_capacity(kappa);
+            let mut dcomp_c1: Vec<RingDigits> = Vec::with_capacity(kappa);
+            let mut cm_g: Vec<RingDigits> = Vec::with_capacity(kappa);
+            for i in 0..kappa {
+                let w = extra_witness;
+                let c0 = w.and_then(|w| w.decomp_c0.get(i).map(|v| v.as_slice()));
+                let c1 = w.and_then(|w| w.decomp_c1.get(i).map(|v| v.as_slice()));
+                let g = w.and_then(|w| w.linb2x_cm_g.get(i).map(|v| v.as_slice()));
+                dcomp_c0.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, c0));
+                dcomp_c1.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, c1));
+                cm_g.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, g));
+            }
+
+            let mut v0a: Vec<RingDigits> = Vec::with_capacity(vlen);
+            let mut v0b: Vec<RingDigits> = Vec::with_capacity(vlen);
+            let mut v1a: Vec<RingDigits> = Vec::with_capacity(vlen);
+            let mut v1b: Vec<RingDigits> = Vec::with_capacity(vlen);
+            let mut va: Vec<RingDigits> = Vec::with_capacity(vlen);
+            let mut vb: Vec<RingDigits> = Vec::with_capacity(vlen);
+            for i in 0..vlen {
+                let w = extra_witness;
+                let v0a_i = w.and_then(|w| w.decomp_v0a.get(i).map(|v| v.as_slice()));
+                let v0b_i = w.and_then(|w| w.decomp_v0b.get(i).map(|v| v.as_slice()));
+                let v1a_i = w.and_then(|w| w.decomp_v1a.get(i).map(|v| v.as_slice()));
+                let v1b_i = w.and_then(|w| w.decomp_v1b.get(i).map(|v| v.as_slice()));
+                let va_i = w.and_then(|w| w.linb2x_vo_a.get(i).map(|v| v.as_slice()));
+                let vb_i = w.and_then(|w| w.linb2x_vo_b.get(i).map(|v| v.as_slice()));
+                v0a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v0a_i));
+                v0b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v0b_i));
+                v1a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v1a_i));
+                v1b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v1b_i));
+                va.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, va_i));
+                vb.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, vb_i));
+            }
+
+            // Enforce recomposition equalities.
+            for i in 0..kappa {
+                let rec = ring_recompose_base_b(&mut glue.gb, &dcomp_c0[i], &dcomp_c1[i], &b_digits, p_u64);
+                ring_eq_digits(&mut glue.gb, &rec, &cm_g[i]);
+            }
+            for i in 0..vlen {
+                let rec_a = ring_recompose_base_b(&mut glue.gb, &v0a[i], &v1a[i], &b_digits, p_u64);
+                let rec_b = ring_recompose_base_b(&mut glue.gb, &v0b[i], &v1b[i], &b_digits, p_u64);
+                ring_eq_digits(&mut glue.gb, &rec_a, &va[i]);
+                ring_eq_digits(&mut glue.gb, &rec_b, &vb[i]);
+            }
+    }
 
     // Surfaces (same as `build()`; these are comparatively small vs Poseidon/CM).
     let (
