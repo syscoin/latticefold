@@ -1355,21 +1355,32 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
 
     let mut dcom_evals_local: Vec<DcomEvalDigits> = Vec::with_capacity(l_evals);
     for l in 0..l_evals {
+        // Optional debug: show where we are in the prefix payload stream.
+        let dbg_on = std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1");
+        let dbg_cur_at_l = if dbg_on { Some(cur) } else { None };
         let mut eval_a: Vec<GoldilocksScalar> = Vec::with_capacity(dcom_eval_vec_len);
+        let mut dbg_a0_absorb: Option<(usize, usize)> = None;
         for _ in 0..dcom_eval_vec_len {
             let (st, ln) = *prefix_payload.get(cur).ok_or("tiny gate: dcom eval.a absorb oob")?;
             cur += 1;
             if ln != 8 {
                 return Err("tiny gate: expected 8-byte absorb for dcom eval.a".to_string());
             }
+            if dbg_on && dbg_a0_absorb.is_none() {
+                dbg_a0_absorb = Some((st, ln));
+            }
             eval_a.push(parse_absorbed_scalar_as_goldilocks_digits(glue, pose_wiring, st));
         }
         let mut eval_c: Vec<RingDigits> = Vec::with_capacity(dcom_eval_vec_len);
+        let mut dbg_c0_absorb: Option<(usize, usize)> = None;
         for _ in 0..dcom_eval_vec_len {
             let (st, ln) = *prefix_payload.get(cur).ok_or("tiny gate: dcom eval.c absorb oob")?;
             cur += 1;
             if ln != ring_elem_bytes {
                 return Err("tiny gate: expected ring-elem absorb for dcom eval.c".to_string());
+            }
+            if dbg_on && dbg_c0_absorb.is_none() {
+                dbg_c0_absorb = Some((st, ln));
             }
             let rb = parse_ring_elem_absorb_as_ringbytes(glue, pose_wiring, ring_dim, st, ln)?;
             eval_c.push(ring_bytes_to_digits(&mut glue.gb, &rb));
@@ -1403,6 +1414,34 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                     }
                 }
             }
+        }
+
+        // Debug: dump the first dcom eval.a[0] and eval.c[0] (coeff0) so we can compare against the
+        // CM sumcheck's implied claim.
+        if dbg_on && l == 0 && ring_dim == 64 {
+            #[inline]
+            fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
+                let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
+                let mut acc: i128 = 0;
+                let mut pow: i128 = 1;
+                for i in 0..17 {
+                    let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
+                    acc += di * pow;
+                    pow *= 16;
+                }
+                acc.rem_euclid(p) as u64
+            }
+            let asg = glue.gb.assignment.as_slice();
+            let a0_u64 = eval_a.get(0).map(|s| scalar_digits_to_u64_mod_p(asg, s)).unwrap_or(0);
+            let c0_u64 = eval_c.get(0).map(|r| scalar_digits_to_u64_mod_p(asg, &r[0])).unwrap_or(0);
+            eprintln!(
+                "[LF_DEBUG_DCOM_EVAL0] l=0 cur_start={} a0_u64={} c0_coeff0_u64={} a0_absorb={:?} c0_absorb={:?}",
+                dbg_cur_at_l.unwrap_or(0),
+                a0_u64,
+                c0_u64,
+                dbg_a0_absorb,
+                dbg_c0_absorb
+            );
         }
 
         // Debug: sanity-check that `eval.b[0]` matches the setchk `out.b` ring element when present.
