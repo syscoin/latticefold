@@ -4164,6 +4164,38 @@ fn build_cm_glue_for_which(
         // eq(r, ro) where r is the transcript-derived SetChk point (recovered above).
         let eq = eq_eval_goldilocks_digits(&mut glue.gb, rpt, &rs_digits)?;
 
+        // Optional debug for the recombination equality `subclaim_eval == eval_acc`.
+        // This is intentionally lightweight (prints only coeff 0 as a u64 mod p).
+        if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1") {
+            #[inline]
+            fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
+                let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
+                let mut acc: i128 = 0;
+                let mut pow: i128 = 1;
+                for i in 0..17 {
+                    let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
+                    acc += di * pow;
+                    pow *= 16;
+                }
+                acc.rem_euclid(p) as u64
+            }
+
+            #[inline]
+            fn ring_coeff0_to_u64_mod_p(asg: &[F257], r: &RingDigits) -> u64 {
+                // RingDigits is coeff-major, so coeff 0 is `r[0]`.
+                scalar_digits_to_u64_mod_p(asg, &r[0])
+            }
+
+            let asg = glue.gb.assignment.as_slice();
+            let eq_u64 = scalar_digits_to_u64_mod_p(asg, &eq);
+            let rp0 = rpt.get(0).map(|s| scalar_digits_to_u64_mod_p(asg, s)).unwrap_or(0);
+            let ro0 = rs_digits.get(0).map(|s| scalar_digits_to_u64_mod_p(asg, s)).unwrap_or(0);
+            eprintln!(
+                "[LF_DEBUG_CM_RECOMB_EQ_SCALAR] which={} eq_u64={} rpt0_u64={} ro0_u64={}",
+                which, eq_u64, rp0, ro0
+            );
+        }
+
         // Evaluate t0(ro), t1(ro) directly as **bal4** digits (avoids bal16->bal4 conversion later).
         let (t0_4_base, t1_4_base) = eval_t_z_optimized_ring_digits_pair(
             &mut glue.gb,
