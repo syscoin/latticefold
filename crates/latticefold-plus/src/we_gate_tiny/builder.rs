@@ -813,6 +813,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
     extra_witness: Option<&TinyExtraWitness>,
     setchk_out_e_vars_for_cm: &mut Option<Vec<Vec<Vec<RingDigits>>>>,
     dcom_evals_for_cm: &mut Option<Vec<DcomEvalDigits>>,
+    setchk_r_point_for_cm: &mut Option<Vec<GoldilocksScalar>>,
 ) -> Result<(), String> {
     // Mirrors the corresponding block in `build()`; keep verifier-math constraints identical.
     if ring_dim == 0 || wiring.short_squeeze_ops.is_empty() {
@@ -1091,6 +1092,9 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
         );
         rs_digits.push(goldilocks_bytes_to_digits(&mut glue.gb, bytes));
     }
+    // Plumb the setchk verifier point `r` forward for CM `eq(r, ro)`, rather than recomputing
+    // coin offsets again in the CM module (more deterministic, less error-prone).
+    *setchk_r_point_for_cm = Some(rs_digits.clone());
     let claimed0 = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
     let v_sc = super::cm_math::sumcheck_verify_degree3_ring_digits(&mut glue.gb, claimed0, &msgs_digits, &rs_digits)?;
 
@@ -1564,6 +1568,7 @@ fn compute_cm_shared_precomp_base(
     short_locals: &[ShortChallengeWiring],
     u32_locals: &[BoundedU32ChallengeWiring],
     setchk_out_e_vars_for_cm: &Option<Arc<Vec<Vec<Vec<RingDigits>>>>>,
+    setchk_r_point_for_cm: &Option<Arc<Vec<GoldilocksScalar>>>,
 ) -> Result<Option<Arc<CmSharedPrecompBase>>, String> {
     // Exact logic previously inlined in `build()`. Keep it in one place so both in-memory and
     // file-backed builds share the *same* precompute logic and op-mix behavior.
@@ -1654,26 +1659,32 @@ fn compute_cm_shared_precomp_base(
                 sflat.push(re);
             }
 
-            // Recover the SetChk verifier point `r` used in eq(r, ro) (same deterministic cursor math as CM module).
-            let nvars_lin = params.nvars_setchk as usize;
-            let n_lin_proofs = l_instances_expected;
-            let lin_chals = n_lin_proofs
-                .checked_mul(2usize.saturating_mul(nvars_lin))
-                .ok_or_else(|| "tiny gate: lin_chals overflow".to_string())?;
-            let nclaims = k_decomp.checked_add(1).ok_or_else(|| "tiny gate: nclaims overflow".to_string())?;
-            let out_coin_total = nclaims
-                .checked_mul(nvars_lin + 2)
-                .and_then(|x| x.checked_add(if k_decomp > 1 { 1 } else { 0 }))
-                .ok_or_else(|| "tiny gate: out_coin_total overflow".to_string())?;
-            let r_start = lin_chals
-                .checked_add(out_coin_total)
-                .ok_or_else(|| "tiny gate: r_start overflow".to_string())?;
-            let r_end = r_start
-                .checked_add(nvars_lin)
-                .ok_or_else(|| "tiny gate: r_end overflow".to_string())?;
-            if u32_locals.len() < r_end {
-                None
+            // SetChk verifier point `r` used in eq(r, ro).
+            //
+            // Prefer the point computed (and transcript-bound) during the SetChk prefix arithmetization
+            // to avoid duplicating coin-offset arithmetic here.
+            let rdig: Vec<GoldilocksScalar> = if let Some(rp) = setchk_r_point_for_cm.as_ref() {
+                rp.as_ref().clone()
             } else {
+                let nvars_lin = params.nvars_setchk as usize;
+                let n_lin_proofs = l_instances_expected;
+                let lin_chals = n_lin_proofs
+                    .checked_mul(2usize.saturating_mul(nvars_lin))
+                    .ok_or_else(|| "tiny gate: lin_chals overflow".to_string())?;
+                let nclaims = k_decomp.checked_add(1).ok_or_else(|| "tiny gate: nclaims overflow".to_string())?;
+                let out_coin_total = nclaims
+                    .checked_mul(nvars_lin + 2)
+                    .and_then(|x| x.checked_add(if k_decomp > 1 { 1 } else { 0 }))
+                    .ok_or_else(|| "tiny gate: out_coin_total overflow".to_string())?;
+                let r_start = lin_chals
+                    .checked_add(out_coin_total)
+                    .ok_or_else(|| "tiny gate: r_start overflow".to_string())?;
+                let r_end = r_start
+                    .checked_add(nvars_lin)
+                    .ok_or_else(|| "tiny gate: r_end overflow".to_string())?;
+                if u32_locals.len() < r_end {
+                    return Ok(None);
+                }
                 let mut rdig: Vec<GoldilocksScalar> = Vec::with_capacity(nvars_lin);
                 for u in &u32_locals[r_start..r_end] {
                     let bytes = goldilocks_bytes_from_u32_le_bytes(
@@ -1682,12 +1693,14 @@ fn compute_cm_shared_precomp_base(
                     );
                     rdig.push(goldilocks_bytes_to_digits(&mut glue.gb, bytes));
                 }
+                rdig
+            };
 
-                // Compute u[l][ni] once (heavy): Σ out.e * s_prime_flat.
-                let out_e_base = setchk_out_e_vars_for_cm.as_ref().unwrap().as_ref();
-                if out_e_base.len() != rows_per_l {
-                    None
-                } else {
+            // Compute u[l][ni] once (heavy): Σ out.e * s_prime_flat.
+            let out_e_base = setchk_out_e_vars_for_cm.as_ref().unwrap().as_ref();
+            if out_e_base.len() != rows_per_l {
+                None
+            } else {
                     use super::cm_ir::{
                         lower_ir_into_builder, ring_mul_negacyclic_ntt_goldilocks_d64_ir, IrBuilder,
                         VarRef as IrVarRef,
@@ -1793,15 +1806,14 @@ fn compute_cm_shared_precomp_base(
                         );
                     }
 
-                    Some(Arc::new(CmSharedPrecompBase {
-                        tensor_c0_ring,
-                        tensor_c1_ring,
-                        s_prime_flat_ring: sflat,
-                        dpp_ring: dpp,
-                        r_point_digits: rdig,
-                        u: u_all,
-                    }))
-                }
+                Some(Arc::new(CmSharedPrecompBase {
+                    tensor_c0_ring,
+                    tensor_c1_ring,
+                    s_prime_flat_ring: sflat,
+                    dpp_ring: dpp,
+                    r_point_digits: rdig,
+                    u: u_all,
+                }))
             }
         }
     } else {
@@ -4703,6 +4715,7 @@ pub(super) fn build(
     // Stored as base-glue vars and passed (by Arc) into CM submodules for import/glue.
     let mut setchk_out_e_vars_for_cm: Option<Vec<Vec<Vec<RingDigits>>>> = None;
     let mut dcom_evals_for_cm: Option<Vec<DcomEvalDigits>> = None;
+    let mut setchk_r_point_for_cm: Option<Vec<GoldilocksScalar>> = None;
 
     arithmetize_pi_lin_setchk_rgchk_prefix(
         &mut glue,
@@ -4716,6 +4729,7 @@ pub(super) fn build(
         extra_witness,
         &mut setchk_out_e_vars_for_cm,
         &mut dcom_evals_for_cm,
+        &mut setchk_r_point_for_cm,
     )?;
     // Parse and constrain the CM segment after short challenges (sumcheck headers, etc.).
     let (comh_absorbs, sc_msg_absorbs, eval_absorbs) = parse_and_enforce_cm_after_short(
@@ -4753,6 +4767,7 @@ pub(super) fn build(
     // Convert shared SetChk/Dcom values into Arc containers for parallel CM modules.
     let setchk_out_e_vars_for_cm = setchk_out_e_vars_for_cm.map(Arc::new);
     let dcom_evals_for_cm = dcom_evals_for_cm.map(Arc::new);
+    let setchk_r_point_for_cm = setchk_r_point_for_cm.map(Arc::new);
 
     // Compute CM shared precomputations once in the base glue module (matches full WE gate behavior).
     let cm_shared_base: Option<Arc<CmSharedPrecompBase>> = compute_cm_shared_precomp_base(
@@ -4764,6 +4779,7 @@ pub(super) fn build(
         &short_locals,
         &u32_locals,
         &setchk_out_e_vars_for_cm,
+        &setchk_r_point_for_cm,
     )?;
 
     // Build the CM verifier math in parallel modules (one per sumcheck), then merge by explicitly
@@ -5110,6 +5126,7 @@ pub(super) fn build_file_backed(
     // Stored as base-glue vars and passed (by Arc) into CM submodules for import/glue.
     let mut setchk_out_e_vars_for_cm: Option<Vec<Vec<Vec<RingDigits>>>> = None;
     let mut dcom_evals_for_cm: Option<Vec<DcomEvalDigits>> = None;
+    let mut setchk_r_point_for_cm: Option<Vec<GoldilocksScalar>> = None;
 
     arithmetize_pi_lin_setchk_rgchk_prefix(
         &mut glue,
@@ -5123,6 +5140,7 @@ pub(super) fn build_file_backed(
         extra_witness,
         &mut setchk_out_e_vars_for_cm,
         &mut dcom_evals_for_cm,
+        &mut setchk_r_point_for_cm,
     )?;
 
     // Parse and constrain the CM segment after short challenges.
@@ -5154,6 +5172,7 @@ pub(super) fn build_file_backed(
     // CM modules: build as file-backed glue shards.
     let setchk_out_e_vars_for_cm = setchk_out_e_vars_for_cm.map(Arc::new);
     let dcom_evals_for_cm = dcom_evals_for_cm.map(Arc::new);
+    let setchk_r_point_for_cm = setchk_r_point_for_cm.map(Arc::new);
 
     let cm_shared_base: Option<Arc<CmSharedPrecompBase>> = compute_cm_shared_precomp_base(
         &mut glue,
@@ -5164,6 +5183,7 @@ pub(super) fn build_file_backed(
         &short_locals,
         &u32_locals,
         &setchk_out_e_vars_for_cm,
+        &setchk_r_point_for_cm,
     )?;
     lf_stage_log_file_backed(
         "cm_shared_precomp_base_done",
