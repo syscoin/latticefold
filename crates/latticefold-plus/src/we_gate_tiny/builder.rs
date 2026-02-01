@@ -2027,6 +2027,12 @@ fn build_u32_and_goldilocks_blocks(
     let tries: usize = DEFAULT_REJECTION_TRIES;
     let mut u32_out: Vec<BoundedU32ChallengeWiring> = Vec::with_capacity(u32_starts.len());
     let mut goldilocks_out: Vec<GoldilocksChallengeWiring> = Vec::with_capacity(u32_starts.len());
+
+    // `TracePoseidonTranscript::get_challenge()` returns a u32 embedded in the base ring.
+    // Therefore, its canonical 8-byte little-endian encoding has the high 4 bytes equal to zero.
+    let zero_byte = glue.gb.new_var(F257::ZERO);
+    glue.gb.enforce_var_eq_const(zero_byte, F257::ZERO);
+
     for (ui, &u_start_op) in u32_starts.iter().enumerate() {
         // Copy all try digits locally (but keep wiring compact: store only the selected digits).
         let mut all_digits_local: Vec<usize> = Vec::with_capacity(tries * DIGITS_PER_TRY);
@@ -2058,7 +2064,7 @@ fn build_u32_and_goldilocks_blocks(
         let mut u64_bytes = [0usize; 8];
         u64_bytes[0..4].copy_from_slice(&u_bytes);
         for i in 4..8 {
-            u64_bytes[i] = digit_to_byte_var(&mut glue.gb, u_digits_local[i]);
+            u64_bytes[i] = zero_byte;
         }
         let (q_bit, goldilocks_limbs) = reduce_u64_mod_goldilocks_from_byte_vars::<F257>(&mut glue.gb, &u64_bytes);
         let res257 = res257_from_u64_bytes_le(&mut glue.gb, &u64_bytes);
