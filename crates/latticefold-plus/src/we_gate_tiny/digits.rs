@@ -206,8 +206,8 @@ fn normalize_bal16_loose_same_len_with_bound(
     loose: &Bal16Loose,
 ) -> (Bal16Checked, usize) {
     let _prev = b.profile_enter("digits::normalize_bal16_loose");
-    debug_assert!(loose.abs_bound >= 0);
-    debug_assert!(loose.abs_bound < 128);
+    assert!(loose.abs_bound >= 0);
+    assert!(loose.abs_bound < 128);
 
     // Delegate to the IR "source of truth" implementation, then lower into this builder.
     let (ir, out_ir, carry_ir) = {

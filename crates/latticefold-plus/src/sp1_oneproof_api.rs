@@ -224,7 +224,7 @@ pub fn run_sp1_oneproof_we_gate_from_files(
     // - arm the WE gate *shape* (instance depends only on params + sizes),
     // - compute a satisfying witness assignment for that armed instance,
     // - extract the witness tail for downstream lock scaffolding.
-    let poseidon_cfg = PC::get_poseidon_config();
+    let _poseidon_cfg = PC::get_poseidon_config();
     let mut rec = crate::recording_transcript::TracePoseidonTranscript::<R>::empty::<PC>();
     for b in &public_inputs {
         rec.absorb_field_element(b);
@@ -279,7 +279,7 @@ pub fn run_sp1_oneproof_we_gate_from_files(
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    let (shape, assignment) = crate::we_gate_arith::build_we_plus_tiny_dr1cs_from_proof::<R>(
+    let (shape, assignment) = crate::we_gate_arith::build_we_plus_tiny_dr1cs::<R>(
         &trace,
         &we_params,
         &public_inputs_f257,
@@ -288,7 +288,7 @@ pub fn run_sp1_oneproof_we_gate_from_files(
         &pairs,
         &out_dir,
     )
-    .map_err(|e| format!("build_we_plus_tiny_dr1cs_from_proof: {e}"))?;
+    .map_err(|e| format!("build_we_plus_tiny_dr1cs: {e}"))?;
 
     // Optional sanity: the witness must satisfy the armed instance.
     // This can be expensive for large gates; enable only when debugging.

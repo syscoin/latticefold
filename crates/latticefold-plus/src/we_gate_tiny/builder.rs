@@ -137,17 +137,17 @@ fn short_challenge_coeff_digits_from_byte_var_128(
 ///
 /// Coefficients are Goldilocks field elements, stored as canonical `u64` reps mod `p`.
 #[derive(Clone, Debug)]
-pub(crate) struct TinyExtraWitness {
-    pub(crate) dcom_eval_b: Vec<Vec<Vec<u64>>>, // [l][eval_len][ring_dim]
-    pub(crate) dcom_eval_v: Vec<Vec<u64>>,      // [l][ring_dim]
+pub struct TinyExtraWitness {
+    pub dcom_eval_b: Vec<Vec<Vec<u64>>>, // [l][eval_len][ring_dim]
+    pub dcom_eval_v: Vec<Vec<u64>>,      // [l][ring_dim]
 
     // DecompProof
-    pub(crate) decomp_c0: Vec<Vec<u64>>, // [kappa][ring_dim]
-    pub(crate) decomp_c1: Vec<Vec<u64>>, // [kappa][ring_dim]
-    pub(crate) decomp_v0a: Vec<Vec<u64>>, // [vlen][ring_dim]
-    pub(crate) decomp_v0b: Vec<Vec<u64>>, // [vlen][ring_dim]
-    pub(crate) decomp_v1a: Vec<Vec<u64>>, // [vlen][ring_dim]
-    pub(crate) decomp_v1b: Vec<Vec<u64>>, // [vlen][ring_dim]
+    pub decomp_c0: Vec<Vec<u64>>,  // [kappa][ring_dim]
+    pub decomp_c1: Vec<Vec<u64>>,  // [kappa][ring_dim]
+    pub decomp_v0a: Vec<Vec<u64>>, // [vlen][ring_dim]
+    pub decomp_v0b: Vec<Vec<u64>>, // [vlen][ring_dim]
+    pub decomp_v1a: Vec<Vec<u64>>, // [vlen][ring_dim]
+    pub decomp_v1b: Vec<Vec<u64>>, // [vlen][ring_dim]
 }
 
 #[inline]
@@ -551,7 +551,7 @@ fn add_decomp_linb2x_constraints(
     glue: &mut GlueCtx,
     ring_dim: usize,
     params: &WeParams,
-    extra_witness: Option<&TinyExtraWitness>,
+    extra_witness: &TinyExtraWitness,
     cm_g_target: &[RingDigits],
     vo_a_target: &[RingDigits],
     vo_b_target: &[RingDigits],
@@ -620,20 +620,14 @@ fn add_decomp_linb2x_constraints(
         out
     }
 
-    // Allocate witnesses (default: trivial decomposition of derived targets; overridden by `extra_witness`).
+    // Allocate witnesses from the provided extra witness (dummy for shape, real for proof).
     let mut dcomp_c0: Vec<RingDigits> = Vec::with_capacity(kappa);
     let mut dcomp_c1: Vec<RingDigits> = Vec::with_capacity(kappa);
     for i in 0..kappa {
-        if let Some(w) = extra_witness {
-            let c0 = w.decomp_c0.get(i).map(|v| v.as_slice());
-            let c1 = w.decomp_c1.get(i).map(|v| v.as_slice());
-            dcomp_c0.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, c0));
-            dcomp_c1.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, c1));
-        } else {
-            // Choose c0 = cm_g_target, c1 = 0.
-            dcomp_c0.push(alloc_witness_ring_digits_like(&mut glue.gb, &cm_g_target[i]));
-            dcomp_c1.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, None));
-        }
+        let c0 = extra_witness.decomp_c0.get(i).map(|v| v.as_slice());
+        let c1 = extra_witness.decomp_c1.get(i).map(|v| v.as_slice());
+        dcomp_c0.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, c0));
+        dcomp_c1.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, c1));
     }
 
     let mut v0a: Vec<RingDigits> = Vec::with_capacity(vlen);
@@ -641,22 +635,14 @@ fn add_decomp_linb2x_constraints(
     let mut v1a: Vec<RingDigits> = Vec::with_capacity(vlen);
     let mut v1b: Vec<RingDigits> = Vec::with_capacity(vlen);
     for i in 0..vlen {
-        if let Some(w) = extra_witness {
-            let v0a_i = w.decomp_v0a.get(i).map(|v| v.as_slice());
-            let v0b_i = w.decomp_v0b.get(i).map(|v| v.as_slice());
-            let v1a_i = w.decomp_v1a.get(i).map(|v| v.as_slice());
-            let v1b_i = w.decomp_v1b.get(i).map(|v| v.as_slice());
-            v0a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v0a_i));
-            v0b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v0b_i));
-            v1a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v1a_i));
-            v1b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v1b_i));
-        } else {
-            // Choose v0 = vo_target, v1 = 0.
-            v0a.push(alloc_witness_ring_digits_like(&mut glue.gb, &vo_a_target[i]));
-            v0b.push(alloc_witness_ring_digits_like(&mut glue.gb, &vo_b_target[i]));
-            v1a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, None));
-            v1b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, None));
-        }
+        let v0a_i = extra_witness.decomp_v0a.get(i).map(|v| v.as_slice());
+        let v0b_i = extra_witness.decomp_v0b.get(i).map(|v| v.as_slice());
+        let v1a_i = extra_witness.decomp_v1a.get(i).map(|v| v.as_slice());
+        let v1b_i = extra_witness.decomp_v1b.get(i).map(|v| v.as_slice());
+        v0a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v0a_i));
+        v0b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v0b_i));
+        v1a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v1a_i));
+        v1b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v1b_i));
     }
 
     // Enforce recomposition equalities.
@@ -1087,7 +1073,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
     wiring: &TinyCoinOpWiring,
     l_instances_expected: usize,
     u32_locals: &[BoundedU32ChallengeWiring],
-    extra_witness: Option<&TinyExtraWitness>,
+    extra_witness: &TinyExtraWitness,
     setchk_out_e_vars_for_cm: &mut Option<Vec<Vec<Vec<RingDigits>>>>,
     dcom_evals_for_cm: &mut Option<Vec<DcomEvalDigits>>,
     fcoms_for_cm: &mut Option<Vec<FComsDigits>>,
@@ -1673,34 +1659,33 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
             eval_c.push(ring_bytes_to_digits(&mut glue.gb, &rb));
         }
 
+        // Extra witness provides `dcom.evals[*].b` and `dcom.evals[*].v`, which are not fully transcript-derived
+        // but are required for the full faithful verifier arithmetic checks.
+        let b_l = extra_witness
+            .dcom_eval_b
+            .get(l)
+            .ok_or("tiny gate: missing dcom_eval_b for instance")?;
+        let v_l = extra_witness
+            .dcom_eval_v
+            .get(l)
+            .ok_or("tiny gate: missing dcom_eval_v for instance")?;
+        if b_l.len() != eval_a.len() || v_l.len() != ring_dim {
+            return Err("tiny gate: dcom extra witness length mismatch".to_string());
+        }
         let mut eval_b: Vec<RingDigits> = Vec::with_capacity(eval_a.len());
-        for _ in 0..eval_a.len() {
+        for b_i in b_l {
+            if b_i.len() != ring_dim {
+                return Err("tiny gate: dcom_eval_b row length mismatch".to_string());
+            }
             let mut r: RingDigits = Vec::with_capacity(ring_dim);
-            for _ in 0..ring_dim {
-                r.push(alloc_witness_goldilocks_u64_digits(&mut glue.gb, 0u64));
+            for k in 0..ring_dim {
+                r.push(alloc_witness_goldilocks_u64_digits(&mut glue.gb, b_i[k]));
             }
             eval_b.push(r);
         }
         let mut eval_v: Vec<GoldilocksScalar> = Vec::with_capacity(ring_dim);
-        for _ in 0..ring_dim {
-            eval_v.push(alloc_witness_goldilocks_u64_digits(&mut glue.gb, 0u64));
-        }
-
-        if let Some(w) = extra_witness {
-            if let (Some(b_l), Some(v_l)) = (w.dcom_eval_b.get(l), w.dcom_eval_v.get(l)) {
-                if b_l.len() == eval_b.len() && v_l.len() == ring_dim {
-                    for (i, b_i) in b_l.iter().enumerate() {
-                        if b_i.len() == ring_dim {
-                            for k in 0..ring_dim {
-                                eval_b[i][k] = alloc_witness_goldilocks_u64_digits(&mut glue.gb, b_i[k]);
-                            }
-                        }
-                    }
-                    for k in 0..ring_dim {
-                        eval_v[k] = alloc_witness_goldilocks_u64_digits(&mut glue.gb, v_l[k]);
-                    }
-                }
-            }
+        for k in 0..ring_dim {
+            eval_v.push(alloc_witness_goldilocks_u64_digits(&mut glue.gb, v_l[k]));
         }
 
         for i in 0..eval_a.len() {
@@ -4125,7 +4110,10 @@ fn build_cm_glue_for_which(
         }
     }
 
-    let claimed_sum = claimed_sum_opt.unwrap_or_else(|| super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim));
+    let claimed_sum = claimed_sum_opt.ok_or_else(|| {
+        "tiny gate: CM claimed_sum missing (full faithful relation requires SetChk/Dcom wiring + pow2 preconditions)"
+            .to_string()
+    })?;
     let subclaim_eval = super::cm_math::sumcheck_verify_degree2_ring_digits(&mut glue.gb, claimed_sum, &msgs_digits, &rs_digits)?;
 
     // Eval table absorbs sanity.
@@ -4404,7 +4392,7 @@ pub(super) fn build(
     params: &WeParams,
     wiring: &TinyCoinOpWiring,
     pairs: &[(usize, usize)],
-    extra_witness: Option<&TinyExtraWitness>,
+    extra_witness: &TinyExtraWitness,
     out_dir: impl AsRef<std::path::Path>,
 ) -> Result<
     (

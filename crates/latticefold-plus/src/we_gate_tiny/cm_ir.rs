@@ -999,7 +999,10 @@ pub(crate) fn u32_bits_to_base128_limbs_ir(b: &mut IrBuilder<'_>, bits32: &[VarR
         let mut limb_u8: u8 = 0;
         for j in start..end {
             let bv = b.val(bits32[j]);
-            debug_assert!(bv == F257::ZERO || bv == F257::ONE, "u32_bits_to_base128_limbs_ir: non-boolean bit witness");
+            assert!(
+                bv == F257::ZERO || bv == F257::ONE,
+                "u32_bits_to_base128_limbs_ir: non-boolean bit witness"
+            );
             if bv == F257::ONE {
                 limb_u8 |= 1u8 << (j - start);
             }
@@ -1189,8 +1192,8 @@ pub(crate) fn add_bal16_loose_same_len_ir(b: &mut IrBuilder<'_>, a: &Bal16LooseI
 ///
 /// For each i: `loose_i + carry_i = checked_i + 16*carry_{i+1}`.
 pub(crate) fn normalize_bal16_loose_same_len_ir(b: &mut IrBuilder<'_>, loose: &Bal16LooseIr) -> (Bal16CheckedIr, VarRef) {
-    debug_assert!(loose.abs_bound >= 0);
-    debug_assert!(loose.abs_bound < 128);
+    assert!(loose.abs_bound >= 0);
+    assert!(loose.abs_bound < 128);
     let n = loose.len();
     let digit_abs_bound = loose.abs_bound;
 
@@ -1201,7 +1204,7 @@ pub(crate) fn normalize_bal16_loose_same_len_ir(b: &mut IrBuilder<'_>, loose: &B
         let max_sum = digit_abs_bound + carry_bound;
         carry_bound = ((max_sum + 8) / 16) + 1;
         carry_bounds.push(carry_bound);
-        debug_assert!(carry_bound < 128);
+        assert!(carry_bound < 128);
     }
 
     let mut out: Vec<VarRef> = Vec::with_capacity(n);
@@ -1210,14 +1213,14 @@ pub(crate) fn normalize_bal16_loose_same_len_ir(b: &mut IrBuilder<'_>, loose: &B
     let mut carry_var: Option<VarRef> = None;
 
     let div_floor = |x: i32, d: i32| -> i32 {
-        debug_assert!(d > 0);
+        assert!(d > 0);
         if x >= 0 { x / d } else { -(((-x) + d - 1) / d) }
     };
 
     for i in 0..n {
         let dv = loose.digits[i];
         let di = f257_to_i32_bal(b.val(dv));
-        debug_assert!(
+        assert!(
             (-digit_abs_bound..=digit_abs_bound).contains(&di),
             "normalize_bal16_loose_same_len_ir: digit out of assumed bound"
         );
@@ -1233,8 +1236,8 @@ pub(crate) fn normalize_bal16_loose_same_len_ir(b: &mut IrBuilder<'_>, loose: &B
             carry_next -= 1;
             rem += 16;
         }
-        debug_assert!((-8..=7).contains(&rem));
-        debug_assert!(
+        assert!((-8..=7).contains(&rem));
+        assert!(
             (-carry_bounds[i]..=carry_bounds[i]).contains(&carry_next),
             "normalize_bal16_loose_same_len_ir: carry out of bound"
         );
@@ -1396,7 +1399,7 @@ pub(crate) fn rebalance_tail_pm11_to_pm2_ir(b: &mut IrBuilder<'_>, digits: &[Var
     assert!(!digits.is_empty());
     let l = digits.len();
     let tail = f257_to_i32_bal(b.val(digits[l - 1]));
-    debug_assert!((-11..=11).contains(&tail));
+    assert!((-11..=11).contains(&tail));
 
     let mut carry2 = if tail >= 0 { (tail + 8) / 16 } else { -(((-tail) + 8) / 16) };
     let mut rem = tail - 16 * carry2;
@@ -1408,8 +1411,8 @@ pub(crate) fn rebalance_tail_pm11_to_pm2_ir(b: &mut IrBuilder<'_>, digits: &[Var
         carry2 -= 1;
         rem += 16;
     }
-    debug_assert!((-8..=7).contains(&rem));
-    debug_assert!((-2..=2).contains(&carry2));
+    assert!((-8..=7).contains(&rem));
+    assert!((-2..=2).contains(&carry2));
 
     let rem_digit = alloc_bal16_digit_ir(b, rem as i8);
     let carry2_var = alloc_carry_pm2_ir(b, carry2);
