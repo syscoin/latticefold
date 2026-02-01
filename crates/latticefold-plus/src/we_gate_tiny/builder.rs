@@ -165,7 +165,7 @@ fn lf_mem_on() -> bool {
 
 #[inline]
 fn lf_profile_on() -> bool {
-    match std::env::var("LF_PROFILE_DR1CS") {
+    match std::env::var("LF_PLUS_PROFILE") {
         Ok(v) => v != "0",
         Err(_) => false,
     }
