@@ -1664,6 +1664,43 @@ fn compute_cm_shared_precomp_base(
             // Prefer the point computed (and transcript-bound) during the SetChk prefix arithmetization
             // to avoid duplicating coin-offset arithmetic here.
             let rdig: Vec<GoldilocksScalar> = if let Some(rp) = setchk_r_point_for_cm.as_ref() {
+                // Also compute the cursor/offset-derived r and enforce equality, so we never silently
+                // diverge from the transcript schedule.
+                let nvars_lin = params.nvars_setchk as usize;
+                let n_lin_proofs = l_instances_expected;
+                let lin_chals = n_lin_proofs
+                    .checked_mul(2usize.saturating_mul(nvars_lin))
+                    .ok_or_else(|| "tiny gate: lin_chals overflow".to_string())?;
+                let nclaims = k_decomp.checked_add(1).ok_or_else(|| "tiny gate: nclaims overflow".to_string())?;
+                let out_coin_total = nclaims
+                    .checked_mul(nvars_lin + 2)
+                    .and_then(|x| x.checked_add(if k_decomp > 1 { 1 } else { 0 }))
+                    .ok_or_else(|| "tiny gate: out_coin_total overflow".to_string())?;
+                let r_start = lin_chals
+                    .checked_add(out_coin_total)
+                    .ok_or_else(|| "tiny gate: r_start overflow".to_string())?;
+                let r_end = r_start
+                    .checked_add(nvars_lin)
+                    .ok_or_else(|| "tiny gate: r_end overflow".to_string())?;
+                if u32_locals.len() < r_end {
+                    return Ok(None);
+                }
+                let mut rdig_cursor: Vec<GoldilocksScalar> = Vec::with_capacity(nvars_lin);
+                for u in &u32_locals[r_start..r_end] {
+                    let bytes = goldilocks_bytes_from_u32_le_bytes(
+                        &mut glue.gb,
+                        &[u.byte_vars[0], u.byte_vars[1], u.byte_vars[2], u.byte_vars[3]],
+                    );
+                    rdig_cursor.push(goldilocks_bytes_to_digits(&mut glue.gb, bytes));
+                }
+                if rp.len() != rdig_cursor.len() {
+                    return Ok(None);
+                }
+                for (a, b) in rp.iter().zip(rdig_cursor.iter()) {
+                    for i in 0..17 {
+                        glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, a[i]), (-F257::ONE, b[i])]);
+                    }
+                }
                 rp.as_ref().clone()
             } else {
                 let nvars_lin = params.nvars_setchk as usize;
@@ -4018,6 +4055,115 @@ fn build_cm_glue_for_which(
                             u_l,
                         }));
                         }
+
+                    // Debug: break down claimed_sum coeff0 for l=0 (local vars only).
+                    if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1")
+                        && l0 == 0
+                        && !per_l.is_empty()
+                        && ring_dim == 64
+                    {
+                        #[inline]
+                        fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
+                            let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
+                            let mut acc: i128 = 0;
+                            let mut pow: i128 = 1;
+                            for i in 0..17 {
+                                let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
+                                acc += di * pow;
+                                pow *= 16;
+                            }
+                            acc.rem_euclid(p) as u64
+                        }
+                        #[inline]
+                        fn ring_coeff0_u64(asg: &[F257], r: &RingDigits) -> u64 {
+                            scalar_digits_to_u64_mod_p(asg, &r[0])
+                        }
+                        #[inline]
+                        fn mul_mod_p(a: u64, b: u64, p: u64) -> u64 {
+                            ((a as u128 * b as u128) % (p as u128)) as u64
+                        }
+                        #[inline]
+                        fn add_mod_p(a: u64, b: u64, p: u64) -> u64 {
+                            ((a as u128 + b as u128) % (p as u128)) as u64
+                        }
+
+                        let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+                        let asg = glue.gb.assignment.as_slice();
+                        let (l, data) = &per_l[0];
+                        let l = *l;
+
+                        let mut acc = 0u64;
+                        let a0 = scalar_digits_to_u64_mod_p(asg, &data.eval_a[0]);
+                        let rc_l = scalar_digits_to_u64_mod_p(asg, &rc_pows[data.l_idx]);
+                        let t_a0 = mul_mod_p(a0, rc_l, p);
+                        acc = add_mod_p(acc, t_a0, p);
+
+                        let b0 = ring_coeff0_u64(asg, &data.eval_b[0]);
+                        let c0 = ring_coeff0_u64(asg, &data.eval_c[0]);
+                        let u0 = ring_coeff0_u64(asg, &data.u_l[0]);
+                        let rc_b0 = scalar_digits_to_u64_mod_p(asg, &rc_pows[data.l_idx + 1]);
+                        let rc_c0 = scalar_digits_to_u64_mod_p(asg, &rc_pows[data.l_idx + 2]);
+                        let rc_u0 = scalar_digits_to_u64_mod_p(asg, &rc_pows[data.l_idx + 3]);
+                        let t_b0 = mul_mod_p(b0, rc_b0, p);
+                        let t_c0 = mul_mod_p(c0, rc_c0, p);
+                        let t_u0 = mul_mod_p(u0, rc_u0, p);
+                        acc = add_mod_p(acc, t_b0, p);
+                        acc = add_mod_p(acc, t_c0, p);
+                        acc = add_mod_p(acc, t_u0, p);
+
+                        // First M row only (i=0) to keep output small.
+                        let mut t_ai = None;
+                        let mut t_bi = None;
+                        let mut t_ci = None;
+                        let mut t_ui = None;
+                        if (params.mlen as usize) > 0 {
+                            let idx = data.l_idx + 4;
+                            let ai = scalar_digits_to_u64_mod_p(asg, &data.eval_a[1]);
+                            let rci = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx]);
+                            let aip = mul_mod_p(ai, rci, p);
+                            acc = add_mod_p(acc, aip, p);
+                            t_ai = Some(aip);
+
+                            let bi = ring_coeff0_u64(asg, &data.eval_b[1]);
+                            let ci = ring_coeff0_u64(asg, &data.eval_c[1]);
+                            let ui = ring_coeff0_u64(asg, &data.u_l[1]);
+                            let rcb = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx + 1]);
+                            let rcc = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx + 2]);
+                            let rcu = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx + 3]);
+                            let bip = mul_mod_p(bi, rcb, p);
+                            let cip = mul_mod_p(ci, rcc, p);
+                            let uip = mul_mod_p(ui, rcu, p);
+                            acc = add_mod_p(acc, bip, p);
+                            acc = add_mod_p(acc, cip, p);
+                            acc = add_mod_p(acc, uip, p);
+                            t_bi = Some(bip);
+                            t_ci = Some(cip);
+                            t_ui = Some(uip);
+                        }
+
+                        let tc0 = ring_coeff0_u64(asg, &tcch0[l]);
+                        let tc1 = ring_coeff0_u64(asg, &tcch1[l]);
+                        let rcz = scalar_digits_to_u64_mod_p(asg, &rc_pows[z_idx]);
+                        let rcz1 = scalar_digits_to_u64_mod_p(asg, &rc_pows[z_idx + 1]);
+                        let t_tc0 = mul_mod_p(tc0, rcz, p);
+                        let t_tc1 = mul_mod_p(tc1, rcz1, p);
+                        acc = add_mod_p(acc, t_tc0, p);
+                        acc = add_mod_p(acc, t_tc1, p);
+
+                        eprintln!(
+                            "[LF_DEBUG_CM_CLAIMED_SUM_TERMS] which={} l={} coeff0 terms: a0={} b0={} c0={} u0={} m0(a,b,c,u)={:?} tc0={} tc1={} total={}",
+                            which,
+                            l,
+                            t_a0,
+                            t_b0,
+                            t_c0,
+                            t_u0,
+                            (t_ai, t_bi, t_ci, t_ui),
+                            t_tc0,
+                            t_tc1,
+                            acc
+                        );
+                    }
 
                     // Build this batch's claimed_sum contributions as IR shards in parallel,
                     // then lower sequentially and accumulate in digit domain.
