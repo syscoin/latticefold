@@ -7358,7 +7358,7 @@ mod tests {
                 l: ell as u64,
                 mlen: m0.len() as u64,
             };
-            let poseidon_cfg = PCF::get_poseidon_config();
+            let _poseidon_cfg = PCF::get_poseidon_config();
 
             // NOTE: this benchmark is now tiny-gate focused; we intentionally skip building the
             // large-field WE gate here.
@@ -7405,6 +7405,36 @@ mod tests {
             .expect("build tiny gate (inst+asg) from proof");
 
             shape.inst.check(&tiny_asg).expect("tiny gate dr1cs check");
+
+            // Strong soundness regression: using a *dummy* proof-derived extra witness against a
+            // *real verifier trace* must be UNSAT.
+            //
+            // This directly models an adversary trying to satisfy the armed tiny-gate instance
+            // without having a real LF+ proof consistent with the transcript.
+            let out_dir_bad = {
+                let mut p = std::env::temp_dir();
+                p.push("lfplus_tiny_gate_bad_witness");
+                let _ = std::fs::remove_dir_all(&p);
+                std::fs::create_dir_all(&p).expect("create temp out_dir_bad");
+                p
+            };
+            let dummy = super::dummy_plus_proof_shape::<RR>(&params, m0.len(), 1)
+                .expect("dummy_plus_proof_shape");
+            let (_shape_bad, tiny_asg_bad) = build_we_plus_tiny_dr1cs::<RR>(
+                &trace,
+                &params,
+                &public_inputs_f257,
+                &dummy,
+                m0.len(),
+                &pairs,
+                &out_dir_bad,
+            )
+            .expect("build tiny gate (inst+asg) from dummy proof");
+            assert!(
+                shape.inst.check(&tiny_asg_bad).is_err(),
+                "dummy proof-derived extra witness should be UNSAT against real verifier trace"
+            );
+            let _ = std::fs::remove_dir_all(&out_dir_bad);
             eprintln!(
                 "[test_large_trace] build_we_tiny_gate: {:?} (nvars={}, constraints={})",
                 t_tiny.elapsed(),
