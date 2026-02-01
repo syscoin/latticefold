@@ -4581,6 +4581,16 @@ fn build_cm_glue_for_which(
         let l_batch: usize = (8 * rayon::current_num_threads().max(1)).max(1);
 
         if ring_dim == 64 {
+            // Debug: recompute eval_core coeff0 as u64 mod p directly from parsed eval table + rc_pows + eq.
+            // This lets us distinguish:
+            // - eval-table parse/weighting bugs (expected_core != eval_core), vs
+            // - t(z) path bugs (core matches, but total still mismatches).
+            let mut debug_eval_core_expected_u64: Option<u64> = if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1") {
+                Some(0u64)
+            } else {
+                None
+            };
+
             // Precompute `eq` in bal4 once (shared across all per-l shards).
             let eq4_base: [usize; 33] = {
                 use super::cm_ir::{IrBuilder, VarRef as IrVarRef};
@@ -4606,6 +4616,8 @@ fn build_cm_glue_for_which(
                 for l in l0..l1 {
                     let mut terms: Vec<RingDigits> = Vec::with_capacity(rows_per_l * 4);
                     let mut e00_opt: Option<RingDigits> = None;
+                    // Debug: accumulate coeff0 contribution for this l (before multiplying by eq).
+                    let mut dbg_sum_l_u64: u64 = 0;
                     for row in 0..rows_per_l {
                         let flat = l * rows_per_l + row;
                         for j in 0..4 {
@@ -4615,12 +4627,67 @@ fn build_cm_glue_for_which(
                             if row == 0 && j == 0 {
                                 e00_opt = Some(rd.clone());
                             }
+                            if let Some(total) = debug_eval_core_expected_u64.as_mut() {
+                                // coeff0(rd) * rc_pows[l_idx + row*4 + j]
+                                #[inline]
+                                fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
+                                    let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
+                                    let mut acc: i128 = 0;
+                                    let mut pow: i128 = 1;
+                                    for i in 0..17 {
+                                        let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
+                                        acc += di * pow;
+                                        pow *= 16;
+                                    }
+                                    acc.rem_euclid(p) as u64
+                                }
+                                #[inline]
+                                fn mul_mod_p(a: u64, b: u64, p: u64) -> u64 {
+                                    ((a as u128 * b as u128) % (p as u128)) as u64
+                                }
+                                #[inline]
+                                fn add_mod_p(a: u64, b: u64, p: u64) -> u64 {
+                                    ((a as u128 + b as u128) % (p as u128)) as u64
+                                }
+                                let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+                                let asg = glue.gb.assignment.as_slice();
+                                let term_u64 = scalar_digits_to_u64_mod_p(asg, &rd[0]);
+                                let idx = l * (4 + 4 * (params.mlen as usize)) + row * 4 + j;
+                                let rc_u64 = scalar_digits_to_u64_mod_p(asg, &rc_pows[idx]);
+                                dbg_sum_l_u64 = add_mod_p(dbg_sum_l_u64, mul_mod_p(term_u64, rc_u64, p), p);
+                            }
                             terms.push(rd);
                         }
                     }
                     let e00 = e00_opt.ok_or_else(|| "tiny gate: missing e00 in recombination".to_string())?;
                     e00s.push(e00);
                     batch_terms.push(terms);
+                    if let Some(total) = debug_eval_core_expected_u64.as_mut() {
+                        #[inline]
+                        fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
+                            let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
+                            let mut acc: i128 = 0;
+                            let mut pow: i128 = 1;
+                            for i in 0..17 {
+                                let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
+                                acc += di * pow;
+                                pow *= 16;
+                            }
+                            acc.rem_euclid(p) as u64
+                        }
+                        #[inline]
+                        fn mul_mod_p(a: u64, b: u64, p: u64) -> u64 {
+                            ((a as u128 * b as u128) % (p as u128)) as u64
+                        }
+                        #[inline]
+                        fn add_mod_p(a: u64, b: u64, p: u64) -> u64 {
+                            ((a as u128 + b as u128) % (p as u128)) as u64
+                        }
+                        let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+                        let asg = glue.gb.assignment.as_slice();
+                        let eq_u64 = scalar_digits_to_u64_mod_p(asg, &eq);
+                        *total = add_mod_p(*total, mul_mod_p(eq_u64, dbg_sum_l_u64, p), p);
+                    }
                 }
 
                 let frags = {
@@ -4693,6 +4760,34 @@ fn build_cm_glue_for_which(
                     };
                     eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &contrib);
                 }
+            }
+
+            if let Some(expected_core_u64) = debug_eval_core_expected_u64 {
+                #[inline]
+                fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
+                    let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
+                    let mut acc: i128 = 0;
+                    let mut pow: i128 = 1;
+                    for i in 0..17 {
+                        let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
+                        acc += di * pow;
+                        pow *= 16;
+                    }
+                    acc.rem_euclid(p) as u64
+                }
+                #[inline]
+                fn ring_coeff0_u64(asg: &[F257], r: &RingDigits) -> u64 {
+                    scalar_digits_to_u64_mod_p(asg, &r[0])
+                }
+                let asg = glue.gb.assignment.as_slice();
+                let eval_core_u64 = ring_coeff0_u64(asg, &eval_acc);
+                eprintln!(
+                    "[LF_DEBUG_CM_RECOMB_CORE_EXPECTED] which={} expected_core_u64={} eval_core_u64={} delta_u64={}",
+                    which,
+                    expected_core_u64,
+                    eval_core_u64,
+                    expected_core_u64.wrapping_sub(eval_core_u64),
+                );
             }
         } else {
             return Err("tiny gate: recombination check requires ring_dim=64".to_string());
