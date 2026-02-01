@@ -4575,6 +4575,7 @@ fn build_cm_glue_for_which(
         // We only need to keep `e00s` for the later t(z) terms.
         let mut e00s: Vec<RingDigits> = Vec::with_capacity(l_instances_expected);
         let mut eval_acc = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
+        let mut eval_acc_core_opt: Option<RingDigits> = None;
 
         // We'll batch over `l` so we don't materialize all eval table ring elements at once.
         let l_batch: usize = (8 * rayon::current_num_threads().max(1)).max(1);
@@ -4697,6 +4698,11 @@ fn build_cm_glue_for_which(
             return Err("tiny gate: recombination check requires ring_dim=64".to_string());
         }
 
+        // Snapshot eval_acc *before* adding the t(z) terms, for debugging.
+        if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1") && ring_dim == 64 {
+            eval_acc_core_opt = Some(eval_acc.clone());
+        }
+
         // t(z) terms: for each l, add t0(ro)*e00(l)*rc^z + t1(ro)*e00(l)*rc^{z+1}.
         //
         // These ring-muls are independent across l, so we build them as IR fragments in parallel,
@@ -4790,6 +4796,48 @@ fn build_cm_glue_for_which(
                 let contrib = map_ring_out(&out_ir, &lowered);
                 eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &contrib);
             }
+        }
+
+        // Optional debug: show coeff0 breakdown for recombination accumulator.
+        if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1") && ring_dim == 64 {
+            #[inline]
+            fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
+                let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
+                let mut acc: i128 = 0;
+                let mut pow: i128 = 1;
+                for i in 0..17 {
+                    let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
+                    acc += di * pow;
+                    pow *= 16;
+                }
+                acc.rem_euclid(p) as u64
+            }
+            #[inline]
+            fn ring_coeff0_u64(asg: &[F257], r: &RingDigits) -> u64 {
+                scalar_digits_to_u64_mod_p(asg, &r[0])
+            }
+            #[inline]
+            fn sub_mod_p(a: u64, b: u64, p: u64) -> u64 {
+                ((a as i128 - b as i128).rem_euclid(p as i128)) as u64
+            }
+            let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+            let asg = glue.gb.assignment.as_slice();
+            let sub_u64 = ring_coeff0_u64(asg, &subclaim_eval);
+            let acc_total_u64 = ring_coeff0_u64(asg, &eval_acc);
+            let acc_core_u64 = eval_acc_core_opt
+                .as_ref()
+                .map(|r| ring_coeff0_u64(asg, r))
+                .unwrap_or(0);
+            let t_u64 = sub_mod_p(acc_total_u64, acc_core_u64, p);
+            eprintln!(
+                "[LF_DEBUG_CM_RECOMB_BREAKDOWN] which={} sub_u64={} eval_core_u64={} t_u64={} eval_total_u64={} delta_u64={}",
+                which,
+                sub_u64,
+                acc_core_u64,
+                t_u64,
+                acc_total_u64,
+                sub_u64.wrapping_sub(acc_total_u64),
+            );
         }
 
         // Optional debug: localize the recombination equality failure
