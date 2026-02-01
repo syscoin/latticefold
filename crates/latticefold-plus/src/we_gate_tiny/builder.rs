@@ -1678,14 +1678,53 @@ fn compute_cm_shared_precomp_base(
             // s_prime_flat: k*d short challenges; each entry is a ring element whose coefficients are
             // derived via the short-challenge rule (byte % u) - (u/2), NOT a centered byte.
             let need_sprime = k_decomp * ring_dim;
+            // short_challenge(128): u = 2^(128/d), u <= 256 since d >= 1 and we only use this path for d=64.
+            let exp = (128usize / ring_dim) as u32;
+            let u = 1u64 << exp;
+            debug_assert!(u.is_power_of_two() && u <= 256);
+            let half = u / 2;
+            let half_bytes = alloc_const_goldilocks_u64(&mut glue.gb, half);
+            let half_digits = goldilocks_bytes_to_digits(&mut glue.gb, half_bytes);
+            let zero_byte = glue.gb.new_var(F257::ZERO);
+            glue.gb.enforce_var_eq_const(zero_byte, F257::ZERO);
             let mut sflat: Vec<RingDigits> = Vec::with_capacity(need_sprime);
             for blk in 0..need_sprime {
                 let sb = &short_locals[3 + blk];
-                sflat.push(super::challenges::short_coeff_bal16_digits_to_ringdigits(
-                    &mut glue.gb,
-                    &sb.coeff_bal16_digits,
-                    ring_dim,
-                )?);
+                if sb.byte_vars.len() != ring_dim {
+                    return Err("tiny gate: short byte_vars len mismatch (base s_prime_flat)".to_string());
+                }
+                let mut re: RingDigits = Vec::with_capacity(ring_dim);
+                for &bv in &sb.byte_vars {
+                    // low = byte % u (u is power-of-two): low is the low `exp` bits.
+                    let bits = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, bv);
+                    let limb0: u64 = glue
+                        .gb
+                        .assignment[bv]
+                        .into_bigint()
+                        .as_ref()
+                        .get(0)
+                        .copied()
+                        .unwrap_or(0);
+                    let byte0 = (limb0 & 0xFF) as u64;
+                    let low_u64 = byte0 & (u - 1);
+                    let low_var = glue.gb.new_var(F257::from(low_u64));
+                    // Enforce low_var = Σ_{i<exp} 2^i * bits[i]
+                    let mut lc = vec![(F257::ONE, low_var)];
+                    let mut p2 = F257::ONE;
+                    for i in 0..(exp as usize) {
+                        lc.push((-p2, bits[i]));
+                        p2 = p2.double();
+                    }
+                    glue.gb.enforce_lc_times_one_eq_const(lc);
+
+                    // Interpret low as a u64 and compute (low - half) mod Goldilocks p in digit domain.
+                    let mut low_bytes = [zero_byte; 8];
+                    low_bytes[0] = low_var;
+                    let low_digits = goldilocks_bytes_to_digits(&mut glue.gb, low_bytes);
+                    let coeff_digits = goldilocks_sub_mod_p_digits(&mut glue.gb, &low_digits, &half_digits);
+                    re.push(coeff_digits);
+                }
+                sflat.push(re);
             }
 
             // SetChk verifier point `r` used in eq(r, ro).
@@ -3619,22 +3658,46 @@ fn build_cm_glue_for_which(
         }
         let z = glue.gb.new_var(F257::ZERO);
         glue.gb.enforce_var_eq_const(z, F257::ZERO);
+        let exp = (128usize / ring_dim) as u32;
+        let u = 1u64 << exp;
+        debug_assert!(u.is_power_of_two() && u <= 256);
+        let half = u / 2;
+        let half_bytes = alloc_const_goldilocks_u64(&mut glue.gb, half);
+        let half_digits = goldilocks_bytes_to_digits(&mut glue.gb, half_bytes);
         let mut sflat: Vec<RingDigits> = Vec::with_capacity(need_sprime);
         for blk in 0..need_sprime {
             let sb = &short_locals[3 + blk];
-            let mut re: RingDigits = Vec::with_capacity(ring_dim);
-            if sb.coeff_bal16_digits.len() != ring_dim {
-                return Err("tiny gate: short coeff_bal16_digits len mismatch (s_prime_flat)".to_string());
+            if sb.byte_vars.len() != ring_dim {
+                return Err("tiny gate: short byte_vars len mismatch (s_prime_flat)".to_string());
             }
-            for d3_base in sb.coeff_bal16_digits.iter() {
-                let d0 = glue.import_base_var(base_asg, d3_base[0]);
-                let d1 = glue.import_base_var(base_asg, d3_base[1]);
-                let d2 = glue.import_base_var(base_asg, d3_base[2]);
-                let mut d17 = [z; 17];
-                d17[0] = d0;
-                d17[1] = d1;
-                d17[2] = d2;
-                re.push(d17);
+            let mut re: RingDigits = Vec::with_capacity(ring_dim);
+            for &bv_base in &sb.byte_vars {
+                let bv = glue.import_base_var(base_asg, bv_base);
+                let bits = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, bv);
+                let limb0: u64 = glue
+                    .gb
+                    .assignment[bv]
+                    .into_bigint()
+                    .as_ref()
+                    .get(0)
+                    .copied()
+                    .unwrap_or(0);
+                let byte0 = (limb0 & 0xFF) as u64;
+                let low_u64 = byte0 & (u - 1);
+                let low_var = glue.gb.new_var(F257::from(low_u64));
+                let mut lc = vec![(F257::ONE, low_var)];
+                let mut p2 = F257::ONE;
+                for i in 0..(exp as usize) {
+                    lc.push((-p2, bits[i]));
+                    p2 = p2.double();
+                }
+                glue.gb.enforce_lc_times_one_eq_const(lc);
+
+                let mut low_bytes = [z; 8];
+                low_bytes[0] = low_var;
+                let low_digits = goldilocks_bytes_to_digits(&mut glue.gb, low_bytes);
+                let coeff_digits = goldilocks_sub_mod_p_digits(&mut glue.gb, &low_digits, &half_digits);
+                re.push(coeff_digits);
             }
             sflat.push(re);
         }
