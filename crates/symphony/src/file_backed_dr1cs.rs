@@ -69,7 +69,12 @@ fn write_u64_slice_le(w: &mut impl IoWrite, xs: &[u64]) -> Result<(), String> {
 
 #[inline]
 fn cfg_pwrite_enabled() -> bool {
-    matches!(std::env::var("LFP_FILE_BACKED_PWRITE").as_deref(), Ok("1") | Ok("true") | Ok("yes"))
+    // Enabled by default: file-backed builds want maximal parallelism.
+    // Disable explicitly with: LFP_FILE_BACKED_PWRITE=0/false/no
+    match std::env::var("LFP_FILE_BACKED_PWRITE").as_deref() {
+        Ok("0") | Ok("false") | Ok("no") => false,
+        _ => true,
+    }
 }
 
 #[inline]
