@@ -43,7 +43,7 @@ use super::surfaces::{CmDigitMulSqSurfaceWiring, CmDigitMulSurfaceWiring};
 
 use super::cm_math::{
     alloc_const_goldilocks_u64,
-    eq_eval_goldilocks_digits, eval_t_z_optimized_ring_digits_pair, goldilocks_bytes_to_digits, goldilocks_pow_table_digits,
+    eq_eval_goldilocks_digits, eval_t_z_optimized_ring_digits_pair_bal16, goldilocks_bytes_to_digits, goldilocks_pow_table_digits,
     goldilocks_add_mod_p_digits, goldilocks_mul_const_mod_p_digits, goldilocks_mul_mod_p_digits, goldilocks_sub_mod_p_digits,
     ct_psi_mul_ring_digits_d64,
     ring_eval_at_scalar_digits,
@@ -4549,8 +4549,9 @@ fn build_cm_glue_for_which(
             );
         }
 
-        // Evaluate t0(ro), t1(ro) directly as **bal4** digits (avoids bal16->bal4 conversion later).
-        let (t0_4_base, t1_4_base) = eval_t_z_optimized_ring_digits_pair(
+        // Evaluate t0(ro), t1(ro) conservatively in **bal16** digits.
+        // This avoids relying on the bal4 end-to-end fast path when debugging correctness.
+        let (t0_ro, t1_ro) = eval_t_z_optimized_ring_digits_pair_bal16(
             &mut glue.gb,
             tc0_ring,
             tc1_ring,
@@ -4799,97 +4800,17 @@ fn build_cm_glue_for_which(
         }
 
         // t(z) terms: for each l, add t0(ro)*e00(l)*rc^z + t1(ro)*e00(l)*rc^{z+1}.
-        //
-        // These ring-muls are independent across l, so we build them as IR fragments in parallel,
-        // then lower sequentially into this module's builder.
+        // Conservative digit-domain path (bal16): avoids the bal4 end-to-end pipeline.
         {
-            use super::cm_ir::{
-                bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir, goldilocks_mul_mod_p_digits_bal4_ir,
-                lower_ir_into_builder, ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir, IrBuilder, VarRef as IrVarRef,
-            };
-
-            #[inline]
-            fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
-                if a.len() != 64 {
-                    return Err("tiny gate: expected ring_dim=64 for IR ring-mul".to_string());
-                }
-                Ok(core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j]))))
-            }
-
-            #[inline]
-            fn map_ring_out(out_ir: &[[IrVarRef; 17]; 64], lowered: &super::cm_ir::LoweredIr) -> RingDigits {
-                let out: [GoldilocksScalar; 64] =
-                    core::array::from_fn(|i| core::array::from_fn(|j| lowered.map_var(out_ir[i][j])));
-                out.into_iter().collect()
-            }
-
-            // Precompute rc^z scalars in bal4 once.
-            // Avoid borrowing `glue.gb.assignment` across `lower_ir_into_builder(&mut glue.gb, ...)`.
-            // IMPORTANT: after lowering this precompute IR, we must take a *fresh* snapshot for the
-            // per-`l` shards, since they will read witness values of the newly allocated base vars.
-            let (rcz4_base, rcz14_base): ([usize; 33], [usize; 33]) = {
-                let rcz16: [IrVarRef; 17] = core::array::from_fn(|k| IrVarRef::Base(rc_pows[z_idx][k]));
-                let rcz116: [IrVarRef; 17] = core::array::from_fn(|k| IrVarRef::Base(rc_pows[z_idx + 1][k]));
-                let (ir, rcz4_ir, rcz14_ir) = {
-                    let base_asg = glue.gb.assignment.as_slice();
-                    let mut ib = IrBuilder::new(base_asg);
-                    let rcz4 = ib.bal16_to_bal4_digits_cached(&rcz16);
-                    let rcz14 = ib.bal16_to_bal4_digits_cached(&rcz116);
-                    (ib.ir, rcz4, rcz14)
-                };
-                let lowered = lower_ir_into_builder(&mut glue.gb, ir);
-                let rcz4_base: [usize; 33] = core::array::from_fn(|k| lowered.map_var(rcz4_ir[k]));
-                let rcz14_base: [usize; 33] = core::array::from_fn(|k| lowered.map_var(rcz14_ir[k]));
-                (rcz4_base, rcz14_base)
-            };
-
-            let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
-
-            // Fresh snapshot including the precompute vars (no clone, and no borrow held across lowering).
-            // Safety: `glue.gb.assignment` is not mutated while building `frags` (lowering happens after `collect`).
-            // NOTE: use `usize` address so it is `Sync` for rayon closures.
-            let base_asg_addr: usize = glue.gb.assignment.as_ptr() as usize;
-            let base_asg_len: usize = glue.gb.assignment.len();
-
-            let frags: Vec<(_, [[IrVarRef; 17]; 64])> = e00s
-                .par_iter()
-                .map(|e00| -> Result<_, String> {
-                    // Build one shard that does:
-                    //  - ring-mul in bal4
-                    //  - scale in bal4 by rc^z / rc^{z+1}
-                    //  - add in bal4, then convert once to bal16 for accumulation
-                    let e00_16 = ringdigits64_to_ir(e00)?;
-                    let t0_4: [[IrVarRef; 33]; 64] =
-                        core::array::from_fn(|i| core::array::from_fn(|k| IrVarRef::Base(t0_4_base[i][k])));
-                    let t1_4: [[IrVarRef; 33]; 64] =
-                        core::array::from_fn(|i| core::array::from_fn(|k| IrVarRef::Base(t1_4_base[i][k])));
-                    let rcz4: [IrVarRef; 33] = core::array::from_fn(|k| IrVarRef::Base(rcz4_base[k]));
-                    let rcz14: [IrVarRef; 33] = core::array::from_fn(|k| IrVarRef::Base(rcz14_base[k]));
-
-                    let base_asg_ptr: *const F257 = base_asg_addr as *const F257;
-                    let base_asg: &[F257] = unsafe { core::slice::from_raw_parts(base_asg_ptr, base_asg_len) };
-                    let mut ib = IrBuilder::new(base_asg);
-                    let e00_4: [[IrVarRef; 33]; 64] = core::array::from_fn(|i| ib.bal16_to_bal4_digits_cached(&e00_16[i]));
-
-                    let out0_4 = ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir(&mut ib, &t0_4, &e00_4);
-                    let out1_4 = ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir(&mut ib, &t1_4, &e00_4);
-                    super::op_counts::tiny_cm_bump(|c| c.ring_mul_negacyclic += 2);
-
-                    let mut out16: [[IrVarRef; 17]; 64] = [[IrVarRef::Base(0); 17]; 64];
-                    for i in 0..64 {
-                        let s0 = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &out0_4[i], &rcz4, p_u64);
-                        let s1 = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &out1_4[i], &rcz14, p_u64);
-                        let sum4 = goldilocks_add_mod_p_digits_bal4_ir(&mut ib, &s0, &s1, p_u64);
-                        out16[i] = bal4_to_bal16_digits_ir(&mut ib, &sum4);
-                    }
-                    Ok((ib.ir, out16))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            for (ir, out_ir) in frags {
-                let lowered = lower_ir_into_builder(&mut glue.gb, ir);
-                let contrib = map_ring_out(&out_ir, &lowered);
-                eval_acc = ring_add_digits(&mut glue.gb, &eval_acc, &contrib);
+            let rcz = &rc_pows[z_idx];
+            let rcz1 = &rc_pows[z_idx + 1];
+            for e00 in &e00s {
+                let out0 = super::cm_math::ring_mul_negacyclic_digits_d64(&mut glue.gb, &t0_ro, e00)?;
+                let out1 = super::cm_math::ring_mul_negacyclic_digits_d64(&mut glue.gb, &t1_ro, e00)?;
+                let s0 = super::cm_math::ring_scale_digits(&mut glue.gb, &out0, rcz);
+                let s1 = super::cm_math::ring_scale_digits(&mut glue.gb, &out1, rcz1);
+                let sum = super::cm_math::ring_add_digits(&mut glue.gb, &s0, &s1);
+                eval_acc = super::cm_math::ring_add_digits(&mut glue.gb, &eval_acc, &sum);
             }
         }
 

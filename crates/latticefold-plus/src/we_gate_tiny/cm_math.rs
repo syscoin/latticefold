@@ -1107,3 +1107,67 @@ pub(crate) fn eval_t_z_optimized_ring_digits_pair(
     out
 }
 
+/// Compute `t0(ro)` and `t1(ro)` together, returning **bal16** ring digits.
+///
+/// This is the conservative/reference digit-domain implementation:
+/// it uses the same factorization as `eval_t_z_optimized_ring_digits_pair`, but keeps ring elements
+/// in the standard bal16 digit encoding and uses the standard ring-mul + ring-scale gadgets.
+///
+/// If the bal4 end-to-end pipeline ever drifts, this is the "correctness first" fallback.
+pub(crate) fn eval_t_z_optimized_ring_digits_pair_bal16(
+    gb: &mut Dr1csBuilder<F257>,
+    tensor_c0_ring: &[RingDigits],
+    tensor_c1_ring: &[RingDigits],
+    s_prime_flat: &[RingDigits],
+    dpp: &[RingDigits],
+    ring_dim: usize,
+    r: &[GoldilocksScalar],
+) -> Result<(RingDigits, RingDigits), String> {
+    let sizes = [ring_dim, dpp.len(), s_prime_flat.len(), tensor_c0_ring.len(), tensor_c1_ring.len()];
+    if sizes.iter().any(|&s| s == 0 || !s.is_power_of_two()) {
+        return Err("eval_t_z_optimized_ring_digits_pair_bal16: expected power-of-two non-empty factor sizes".to_string());
+    }
+    if tensor_c0_ring.len() != tensor_c1_ring.len() {
+        return Err("eval_t_z_optimized_ring_digits_pair_bal16: tensor_c length mismatch".to_string());
+    }
+    if ring_dim != 64 {
+        return Err("eval_t_z_optimized_ring_digits_pair_bal16: expected ring_dim=64".to_string());
+    }
+    let vars4 = [ring_dim, dpp.len(), s_prime_flat.len(), tensor_c0_ring.len()].map(|s| ark_std::log2(s) as usize);
+    let tensor_vars = vars4.iter().sum::<usize>();
+    if r.len() < tensor_vars {
+        return Err("eval_t_z_optimized_ring_digits_pair_bal16: r too short".to_string());
+    }
+
+    let _prev = gb.profile_enter("cm_math::eval_t_z_optimized_ring_digits_pair_bal16");
+    let r4 = &r[0..vars4[0]];
+    let r3 = &r[vars4[0]..vars4[0] + vars4[1]];
+    let r2 = &r[vars4[0] + vars4[1]..vars4[0] + vars4[1] + vars4[2]];
+    let r1 = &r[vars4[0] + vars4[1] + vars4[2]..tensor_vars];
+
+    let v2 = eval_small_mle_ring_digits(gb, s_prime_flat, r2);
+    let v3 = eval_small_mle_ring_digits(gb, dpp, r3);
+    let v4 = eval_x_powers_basis_mle_ring_digits(gb, r4, ring_dim)?;
+    let v10 = eval_small_mle_ring_digits(gb, tensor_c0_ring, r1);
+    let v11 = eval_small_mle_ring_digits(gb, tensor_c1_ring, r1);
+
+    // pad = Π_{j=tensor_vars..} (1 - r[j])
+    let mut pad = goldilocks_const_u64_digits(gb, 1u64);
+    for rj in &r[tensor_vars..] {
+        let om = goldilocks_one_minus_digits(gb, rj);
+        pad = goldilocks_mul_mod_p_digits(gb, &pad, &om);
+    }
+
+    // u = v2*v3*v4 (ring muls)
+    let u = ring_mul_negacyclic_digits_d64(gb, &v2, &v3)?;
+    let u = ring_mul_negacyclic_digits_d64(gb, &u, &v4)?;
+    // t0/t1 = v1*u, then scale by pad
+    let t0 = ring_mul_negacyclic_digits_d64(gb, &v10, &u)?;
+    let t1 = ring_mul_negacyclic_digits_d64(gb, &v11, &u)?;
+    let t0 = ring_scale_digits(gb, &t0, &pad);
+    let t1 = ring_scale_digits(gb, &t1, &pad);
+
+    gb.profile_exit(_prev);
+    Ok((t0, t1))
+}
+
