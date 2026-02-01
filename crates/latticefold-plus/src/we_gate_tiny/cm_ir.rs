@@ -350,9 +350,23 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
         //
         // This uses all cores on the CPU-heavy side (var remap + arkworks serialization) while keeping
         // IO writes large and sequential.
-        let coeff_size = gb
-            .file_coeff_size()
-            .expect("file-backed lowering: missing coeff_size (file_sink must be Some)");
+        let Some(coeff_size) = gb.file_coeff_size() else {
+            // Should be impossible since `is_file_backed()` was true.
+            for ic in constraints {
+                gb.add_constraint_terms_iter(
+                    a_terms[ic.a.clone()]
+                        .iter()
+                        .map(|(coef, v)| (*coef, lowered.map_var(*v))),
+                    b_terms[ic.b.clone()]
+                        .iter()
+                        .map(|(coef, v)| (*coef, lowered.map_var(*v))),
+                    c_terms[ic.c.clone()]
+                        .iter()
+                        .map(|(coef, v)| (*coef, lowered.map_var(*v))),
+                );
+            }
+            return lowered;
+        };
 
         // Tuneable: constraints per block (bounds peak RAM of flat buffers).
         let block_constraints: usize = std::env::var("LFP_TINY_FILE_LOWER_BLOCK_CONSTRAINTS")
@@ -392,92 +406,6 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
             x.serialize_with_mode(&mut w, Compress::No)
                 .expect("serialize_fixed_noalloc failed");
             debug_assert_eq!(w.pos, out.len());
-        }
-
-        // Mirror `file_backed_dr1cs::hash_u64s` so we keep the same "fast hash + limb verify" strategy
-        // as the sequential writer's `coeff_cache`.
-        #[inline]
-        fn hash_u64s(limbs: &[u64]) -> u64 {
-            let mut h: u64 = 0x9E37_79B9_7F4A_7C15;
-            for &x in limbs {
-                let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-                z ^= z >> 31;
-                h ^= z;
-                h = h.rotate_left(13).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            }
-            h
-        }
-
-        #[derive(Clone, Debug)]
-        struct CoeffCacheEntry {
-            limbs: Vec<u64>,
-            bytes: Vec<u8>,
-        }
-
-        struct CoeffCache {
-            coeff_size: usize,
-            zero_bytes: Vec<u8>,
-            one_bytes: Vec<u8>,
-            neg_one_bytes: Vec<u8>,
-            buckets: HashMap<u64, Vec<CoeffCacheEntry>>,
-        }
-        impl CoeffCache {
-            #[inline]
-            fn new(coeff_size: usize) -> Self {
-                let mut zero_bytes = vec![0u8; coeff_size];
-                let mut one_bytes = vec![0u8; coeff_size];
-                let mut neg_one_bytes = vec![0u8; coeff_size];
-                serialize_fixed_noalloc(&F257::ZERO, &mut zero_bytes);
-                serialize_fixed_noalloc(&F257::ONE, &mut one_bytes);
-                serialize_fixed_noalloc(&(-F257::ONE), &mut neg_one_bytes);
-                Self {
-                    coeff_size,
-                    zero_bytes,
-                    one_bytes,
-                    neg_one_bytes,
-                    buckets: HashMap::new(),
-                }
-            }
-
-            #[inline]
-            fn write_coeff(&mut self, coef: &F257, out: &mut [u8]) {
-                debug_assert_eq!(out.len(), self.coeff_size);
-                // Hot fast-path for the most common coefficients in R1CS.
-                if *coef == F257::ZERO {
-                    out.copy_from_slice(&self.zero_bytes);
-                    return;
-                }
-                if *coef == F257::ONE {
-                    out.copy_from_slice(&self.one_bytes);
-                    return;
-                }
-                if *coef == -F257::ONE {
-                    out.copy_from_slice(&self.neg_one_bytes);
-                    return;
-                }
-
-                let big = coef.into_bigint();
-                let limbs = big.as_ref();
-                let key = hash_u64s(limbs);
-                if let Some(bucket) = self.buckets.get(&key) {
-                    for ent in bucket {
-                        if ent.limbs.as_slice() == limbs {
-                            out.copy_from_slice(&ent.bytes);
-                            return;
-                        }
-                    }
-                }
-
-                // Cache miss: serialize directly into `out` once, then stash a copy.
-                serialize_fixed_noalloc(coef, out);
-                let ent = CoeffCacheEntry {
-                    limbs: limbs.to_vec(),
-                    bytes: out.to_vec(),
-                };
-                self.buckets.entry(key).or_default().push(ent);
-            }
         }
 
         // Capture mapping pieces for fast remap.
@@ -555,9 +483,7 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
             let c_bytes_ptr: usize = c_coeffs.as_mut_ptr() as usize;
 
             use rayon::prelude::*;
-            cons.par_iter()
-                .enumerate()
-                .for_each_init(|| CoeffCache::new(coeff_size), |cc, (i, ic)| unsafe {
+            cons.par_iter().enumerate().for_each(|(i, ic)| unsafe {
                 // A terms.
                 let a_dst0 = a_offs[i];
                 for (k, (coef, v)) in a_terms[ic.a.clone()].iter().enumerate() {
@@ -565,7 +491,7 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
                     out_a_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, *v));
                     let dst = (a_bytes_ptr as *mut u8).add(pos * coeff_size);
                     let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
-                    cc.write_coeff(coef, dst_slice);
+                    serialize_fixed_noalloc(coef, dst_slice);
                 }
                 // B terms.
                 let b_dst0 = b_offs[i];
@@ -574,7 +500,7 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
                     out_b_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, *v));
                     let dst = (b_bytes_ptr as *mut u8).add(pos * coeff_size);
                     let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
-                    cc.write_coeff(coef, dst_slice);
+                    serialize_fixed_noalloc(coef, dst_slice);
                 }
                 // C terms.
                 let c_dst0 = c_offs[i];
@@ -583,7 +509,7 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
                     out_c_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, *v));
                     let dst = (c_bytes_ptr as *mut u8).add(pos * coeff_size);
                     let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
-                    cc.write_coeff(coef, dst_slice);
+                    serialize_fixed_noalloc(coef, dst_slice);
                 }
             });
 
@@ -595,20 +521,17 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
             // A pool.
             for t in 0..total_a {
                 let off = t * coeff_size;
-                gb.file_push_a_term_raw(&a_coeffs[off..off + coeff_size], a_idx[t])
-                    .unwrap_or_else(|e| panic!("file-backed dr1cs write failed (a_term_raw): {e}"));
+                gb.file_push_a_term_raw(&a_coeffs[off..off + coeff_size], a_idx[t])?;
             }
             // B pool.
             for t in 0..total_b {
                 let off = t * coeff_size;
-                gb.file_push_b_term_raw(&b_coeffs[off..off + coeff_size], b_idx[t])
-                    .unwrap_or_else(|e| panic!("file-backed dr1cs write failed (b_term_raw): {e}"));
+                gb.file_push_b_term_raw(&b_coeffs[off..off + coeff_size], b_idx[t])?;
             }
             // C pool.
             for t in 0..total_c {
                 let off = t * coeff_size;
-                gb.file_push_c_term_raw(&c_coeffs[off..off + coeff_size], c_idx[t])
-                    .unwrap_or_else(|e| panic!("file-backed dr1cs write failed (c_term_raw): {e}"));
+                gb.file_push_c_term_raw(&c_coeffs[off..off + coeff_size], c_idx[t])?;
             }
 
             // Rows referencing the just-appended pools.
@@ -619,8 +542,7 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
                 let b_end = b_start + (b_counts[i] as u64);
                 let c_start = c0 + (c_offs[i] as u64);
                 let c_end = c_start + (c_counts[i] as u64);
-                gb.file_push_constraint_row(a_start, a_end, b_start, b_end, c_start, c_end)
-                    .unwrap_or_else(|e| panic!("file-backed dr1cs write failed (constraint_row): {e}"));
+                gb.file_push_constraint_row(a_start, a_end, b_start, b_end, c_start, c_end)?;
             }
 
             idx0 = idx1;
