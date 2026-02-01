@@ -7466,7 +7466,8 @@ mod tests {
                 }
                 eprintln!("[test_large_trace] tiny gate file-backed check failed: {e}");
                 if let Some(ci) = parse_failed_constraint_idx(&e) {
-                    let _ = tiny_inst.debug_constraint(&tiny_asg, ci, 8);
+                    // Print enough terms to cover small linear constraints (e.g. digit/byte maps).
+                    let _ = tiny_inst.debug_constraint(&tiny_asg, ci, 32);
 
                     // Also try to localize which part produced this constraint (pre-merge),
                     // and evaluate it against that part's local files using the corresponding
@@ -7540,7 +7541,7 @@ mod tests {
                                 "[test_large_trace] failing constraint belongs to part[{pi}] dir={}  local_ci={local_ci}  v_off={v_off} nvars={nvars} nrows={nrows}",
                                 pdir.display()
                             );
-                            let _ = pinst.debug_constraint(&local_asg, local_ci, 8);
+                            let _ = pinst.debug_constraint(&local_asg, local_ci, 32);
                             break;
                         }
                         row_base = row_base.saturating_add(nrows);
