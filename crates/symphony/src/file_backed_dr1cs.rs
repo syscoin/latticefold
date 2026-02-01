@@ -687,7 +687,6 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
         let (av, a_shown) = eval_range("a", a0, a1)?;
         let (bv, b_shown) = eval_range("b", b0, b1)?;
         let (cv, c_shown) = eval_range("c", c0, c1)?;
-        let residual = av * bv - cv;
 
         eprintln!(
             "[file_backed_debug] constraint {} ranges: A=[{},{})(len={}) B=[{},{})(len={}) C=[{},{})(len={})",
@@ -696,22 +695,11 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
             b0, b1, b1.saturating_sub(b0),
             c0, c1, c1.saturating_sub(c0),
         );
-        eprintln!(
-            "[file_backed_debug] values: (A·z)={av:?} (B·z)={bv:?} (C·z)={cv:?}  residual=A·B-C={residual:?}"
-        );
+        eprintln!("[file_backed_debug] values: (A·z)={av:?} (B·z)={bv:?} (C·z)={cv:?}  residual=A·B-C={(av * bv - cv):?}");
         if show_terms > 0 {
             eprintln!("[file_backed_debug] A first {} terms: {:?}", a_shown.len(), a_shown);
             eprintln!("[file_backed_debug] B first {} terms: {:?}", b_shown.len(), b_shown);
             eprintln!("[file_backed_debug] C first {} terms: {:?}", c_shown.len(), c_shown);
-            let show_vals = |name: &str, terms: &[(F, usize)]| {
-                for (c, idx) in terms {
-                    let v = assignment[*idx];
-                    eprintln!("[file_backed_debug] {name} term: coeff={c:?} idx={idx} value={v:?}");
-                }
-            };
-            show_vals("A", &a_shown);
-            show_vals("B", &b_shown);
-            show_vals("C", &c_shown);
         }
         Ok(())
     }
@@ -734,13 +722,10 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
     // Validate and compute merged assignment.
     // This can be a huge memory copy (hundreds of millions of field elements), so parallelize it
     // when Rayon has >1 thread available.
-    //
-    // Logging: reuse existing knobs (no new env vars).
     let timing = match std::env::var("LF_PROFILE_DR1CS") {
         Ok(v) => v != "0",
         Err(_) => false,
     };
-    let verbose = timing || std::env::var("LFP_WE_GATE_OPMIX").is_ok();
     let t_asg = std::time::Instant::now();
     let mut tail_lens: Vec<usize> = Vec::with_capacity(parts.len());
     let mut total_tail: usize = 0;
@@ -825,11 +810,10 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
         let out_dir = out_dir.as_ref().to_path_buf();
         let _ = std::fs::remove_dir_all(&out_dir);
         create_dir_all(&out_dir).map_err(|e| format!("create_dir_all failed: {e}"))?;
-        if verbose {
+        if timing {
             eprintln!(
-                "file_backed_merge: parallel start parts={} eqs={} threads={} out_dir={}",
+                "file_backed_merge: parallel start parts={} threads={} out_dir={}",
                 parts.len(),
-                extra_eqs.len(),
                 n_threads,
                 out_dir.display()
             );
@@ -871,50 +855,6 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
             cur_v = cur_v
                 .checked_add(asg.len().saturating_sub(1) as u64)
                 .ok_or("var_tail_off overflow")?;
-        }
-
-        if verbose {
-            eprintln!("file_backed_merge: part ranges (vars/terms/rows):");
-            for (pi, (inst, asg)) in parts.iter().enumerate() {
-                let v_tail = var_tail_off[pi];
-                let v_start = 1u64.saturating_add(v_tail);
-                let v_end = v_start.saturating_add(asg.len().saturating_sub(1) as u64);
-                let a0 = a_off[pi];
-                let b0 = b_off[pi];
-                let c0 = c_off[pi];
-                let r0 = row_off[pi];
-                eprintln!(
-                    "  part[{pi}]: nvars={} (tail [{}..{}))  A[{}..{}) B[{}..{}) C[{}..{}) rows[{}..{}) dir={}",
-                    asg.len(),
-                    v_start,
-                    v_end,
-                    a0,
-                    a0.saturating_add(inst.layout.a_terms),
-                    b0,
-                    b0.saturating_add(inst.layout.b_terms),
-                    c0,
-                    c0.saturating_add(inst.layout.c_terms),
-                    r0,
-                    r0.saturating_add(inst.layout.nconstraints),
-                    inst.layout.dir.display()
-                );
-            }
-            eprintln!(
-                "file_backed_merge: totals pre-eqs: nvars={} A={} B={} C={} rows={}",
-                new_assignment.len(),
-                cur_a,
-                cur_b,
-                cur_c,
-                cur_rows
-            );
-            eprintln!(
-                "file_backed_merge: appended-eqs: eqs={} => final A={} B={} C={} rows={}",
-                extra_eqs.len(),
-                cur_a.saturating_add((extra_eqs.len() as u64).saturating_mul(2)),
-                cur_b.saturating_add(extra_eqs.len() as u64),
-                cur_c.saturating_add(extra_eqs.len() as u64),
-                cur_rows.saturating_add(extra_eqs.len() as u64),
-            );
         }
 
         // Helper: map local var index to global.

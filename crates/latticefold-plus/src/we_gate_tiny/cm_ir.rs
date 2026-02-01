@@ -309,7 +309,6 @@ impl LoweredIr {
 /// Lower a `CmIr` fragment into a mutable `Dr1csBuilder` by appending:
 /// - all local witnesses as new vars
 /// - all constraints as R1CS constraints over concrete var indices
-#[track_caller]
 pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> LoweredIr {
     let CmIr { local_asg, constraints, a_terms, b_terms, c_terms, stats } = ir;
     let base_nvars = gb.assignment.len();
@@ -318,46 +317,10 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
     // This avoids the "term pool" RAM blow-ups at the cost of slower lowering (we can optimize
     // streaming writes later).
     if gb.is_file_backed() {
-        #[inline]
-        fn watch_vars() -> &'static Option<std::collections::BTreeSet<usize>> {
-            static WATCH: std::sync::OnceLock<Option<std::collections::BTreeSet<usize>>> = std::sync::OnceLock::new();
-            WATCH.get_or_init(|| {
-                let s = std::env::var("LF_WATCH_VARS").ok()?;
-                let mut out = std::collections::BTreeSet::new();
-                for part in s.split(',') {
-                    let p = part.trim();
-                    if p.is_empty() {
-                        continue;
-                    }
-                    if let Ok(v) = p.parse::<usize>() {
-                        out.insert(v);
-                    }
-                }
-                Some(out)
-            })
-        }
-        let caller = std::panic::Location::caller();
         let mut local_to_var: Vec<usize> = Vec::with_capacity(local_asg.len());
         local_to_var.push(0); // Local(0) unused
         for &v in local_asg.iter().skip(1) {
-            let idx = gb.new_var(v);
-            if let Some(ws) = watch_vars().as_ref() {
-                if ws.contains(&idx) {
-                    eprintln!(
-                        "[dr1cs_watch_var_owner] tag={:?} idx={} val={:?} scope={:?} ir_locals={} ir_constraints={} at {}:{}",
-                        // `debug_tag` identifies which file-backed module (poseidon/base_glue/cm0/...)
-                        gb.debug_tag(),
-                        idx,
-                        gb.assignment[idx],
-                        gb.profile_current.unwrap_or("unlabeled"),
-                        local_asg.len().saturating_sub(1),
-                        constraints.len(),
-                        caller.file(),
-                        caller.line(),
-                    );
-                }
-            }
-            local_to_var.push(idx);
+            local_to_var.push(gb.new_var(v));
         }
         let lowered = LoweredIr { base_nvars, local_to_var };
         for ic in constraints {

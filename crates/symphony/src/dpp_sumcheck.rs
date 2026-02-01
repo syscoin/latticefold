@@ -119,14 +119,6 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         self.file_sink.is_some()
     }
 
-    /// Debug tag for file-backed builders (derived from output directory name).
-    ///
-    /// This is `None` for in-memory builders.
-    #[inline]
-    pub fn debug_tag(&self) -> Option<&str> {
-        self.debug_tag.as_deref()
-    }
-
     #[inline]
     pub fn nconstraints(&self) -> u64 {
         if self.file_sink.is_some() {
@@ -136,53 +128,12 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         }
     }
     pub fn one(&self) -> usize { 0 }
-    #[track_caller]
     pub fn new_var(&mut self, value: F) -> usize {
         let idx = self.assignment.len();
         self.assignment.push(value);
         if self.profile_enabled {
             let key = self.profile_current.unwrap_or("unlabeled");
             self.profile.entry(key).or_default().vars += 1;
-        }
-        // Optional pinpoint debugging: print when allocating specific vars.
-        //
-        // Usage:
-        //   LF_WATCH_VARS="123,456"  (indices in the *current* module's local index space)
-        //
-        // This is intended for debugging file-backed postmortems where we know an unsatisfied
-        // constraint uses a small number of specific variable indices and we want to locate
-        // their creation sites.
-        #[inline]
-        fn watch_vars() -> &'static Option<std::collections::BTreeSet<usize>> {
-            static WATCH: OnceLock<Option<std::collections::BTreeSet<usize>>> = OnceLock::new();
-            WATCH.get_or_init(|| {
-                let s = std::env::var("LF_WATCH_VARS").ok()?;
-                let mut out = std::collections::BTreeSet::new();
-                for part in s.split(',') {
-                    let p = part.trim();
-                    if p.is_empty() {
-                        continue;
-                    }
-                    if let Ok(v) = p.parse::<usize>() {
-                        out.insert(v);
-                    }
-                }
-                Some(out)
-            })
-        }
-        if let Some(ws) = watch_vars().as_ref() {
-            if ws.contains(&idx) {
-                let loc = std::panic::Location::caller();
-                eprintln!(
-                    "[dr1cs_watch_var] tag={:?} idx={} val={:?} scope={:?} at {}:{}",
-                    self.debug_tag,
-                    idx,
-                    self.assignment[idx],
-                    self.profile_current.unwrap_or("unlabeled"),
-                    loc.file(),
-                    loc.line()
-                );
-            }
         }
         idx
     }

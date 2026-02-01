@@ -592,16 +592,7 @@ pub(crate) fn sumcheck_verify_degree2_ring_digits(
     let one = goldilocks_bytes_to_digits(gb, one_bytes);
     let two = goldilocks_bytes_to_digits(gb, two_bytes);
 
-    #[inline]
-    fn dbg_ring_eq_mismatch_on() -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| match std::env::var("LFP_WE_GATE_OPMIX") {
-            Ok(v) => v != "0",
-            Err(_) => false,
-        })
-    }
-
-    for (round_idx, (m, r)) in msgs.iter().zip(rs.iter()).enumerate() {
+    for (m, r) in msgs.iter().zip(rs.iter()) {
         if m[0].len() != d || m[1].len() != d || m[2].len() != d {
             gb.profile_exit(_prev);
             return Err("sumcheck_verify_degree2_ring_digits: ring dimension mismatch".to_string());
@@ -609,92 +600,6 @@ pub(crate) fn sumcheck_verify_degree2_ring_digits(
 
         // g(0) + g(1) == claim
         let g01 = ring_add_digits(gb, &m[0], &m[1]);
-
-        if dbg_ring_eq_mismatch_on() {
-            // Pre-check: if the witness is already inconsistent, print where it first differs.
-            // This is specifically to localize failures like the file-backed `ring_eq_digits` mismatch.
-            let asg = &gb.assignment;
-            #[inline]
-            fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
-                // Interpret balanced base-16 digits as an integer in [0,2^64),
-                // then reduce mod p (Goldilocks).
-                let mut acc: i128 = 0;
-                let mut pow: i128 = 1;
-                for j in 0..17 {
-                    let dj = f257_to_i32_bal(asg[s[j]]) as i128;
-                    acc += dj * pow;
-                    pow *= 16;
-                }
-                // Bring into canonical u64 (acc should already be in-range for canonical digits).
-                let mut x: i128 = acc;
-                if x < 0 {
-                    // Should not happen for canonical encoding, but keep debug robust.
-                    x = x.rem_euclid(1i128 << 64);
-                }
-                let xu: u64 = x as u64;
-                let p: u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
-                (xu as u128 % (p as u128)) as u64
-            }
-            let mut n: usize = 0;
-            for (coeff_idx, (ai, bi)) in g01.iter().zip(claimed_sum.iter()).enumerate() {
-                for j in 0..17 {
-                    let va = asg[ai[j]];
-                    let vb = asg[bi[j]];
-                    if va == vb {
-                        continue;
-                    }
-                    // Also print the underlying message digits that produced g01 at this location.
-                    let m0v = asg[m[0][coeff_idx][j]];
-                    let m1v = asg[m[1][coeff_idx][j]];
-                    eprintln!(
-                        "[LF_DEBUG_RING_EQ_MISMATCH] degree2 round={} coeff={} digit={} \
-                         g01_var={} g01_val={}({}) \
-                         claim_var={} claim_val={}({}) diff={} \
-                         m0_var={} m0_val={}({}) m1_var={} m1_val={}({})",
-                        round_idx,
-                        coeff_idx,
-                        j,
-                        ai[j],
-                        va,
-                        f257_to_i32_bal(va),
-                        bi[j],
-                        vb,
-                        f257_to_i32_bal(vb),
-                        f257_to_i32_bal(va - vb),
-                        m[0][coeff_idx][j],
-                        m0v,
-                        f257_to_i32_bal(m0v),
-                        m[1][coeff_idx][j],
-                        m1v,
-                        f257_to_i32_bal(m1v),
-                    );
-                    if j == 0 {
-                        // Also print the full scalar values at this coefficient for fast triage.
-                        let g01_u = scalar_digits_to_u64_mod_p(asg, ai);
-                        let cl_u = scalar_digits_to_u64_mod_p(asg, bi);
-                        eprintln!(
-                            "  [LF_DEBUG_RING_EQ_MISMATCH_SCALAR] degree2 round={} coeff={} g01_u64={} claim_u64={} delta_u64={}",
-                            round_idx,
-                            coeff_idx,
-                            g01_u,
-                            cl_u,
-                            ((g01_u as i128 - cl_u as i128).rem_euclid(crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128)) as u64
-                        );
-                    }
-                    n += 1;
-                    if n >= 8 {
-                        break;
-                    }
-                }
-                if n >= 8 {
-                    break;
-                }
-            }
-            if n == 0 {
-                eprintln!("[LF_DEBUG_RING_EQ_MISMATCH] degree2 round={} g01==claim (no mismatches)", round_idx);
-            }
-        }
-
         ring_eq_digits(gb, &g01, &claimed_sum);
 
         // claim = g(r)
@@ -775,11 +680,6 @@ pub(crate) fn eval_x_powers_basis_mle_ring_digits(
         return Err("eval_x_powers_basis_mle_ring_digits: r4 length mismatch".to_string());
     }
     let _prev = gb.profile_enter("cm_math::eval_x_powers_basis_mle_ring_digits");
-    // IMPORTANT: `eval_small_mle_*` interprets index bits with **r[0] as the LSB variable**.
-    //
-    // The helper `tensor_goldilocks_scalars_digits` follows `utils::tensor` ordering, where the
-    // *last* coordinate toggles fastest (i.e. last coordinate is the LSB variable).
-    //
     // To make the resulting coefficient ordering match the MLE evaluation used elsewhere in the
     // CM verifier (and in `we_gate_arith`), we must reverse `r4` here so that `r4[0]` becomes the
     // fastest-changing (LSB) variable.
@@ -787,77 +687,6 @@ pub(crate) fn eval_x_powers_basis_mle_ring_digits(
     // weights length = ring_dim; each weight is a Goldilocks scalar in digit encoding.
     let weights = tensor_goldilocks_scalars_digits(gb, &r4_rev);
     debug_assert_eq!(weights.len(), ring_dim);
-
-    // Debug: sanity-check the first few weights against the closed form under LSB-first convention:
-    //   w[0] = Π_j (1 - r4[j])
-    //   w[1] = r4[0] * Π_{j>=1} (1 - r4[j])
-    //   w[2] = (1 - r4[0]) * r4[1] * Π_{j>=2} (1 - r4[j])
-    //
-    // This catches bit-order mistakes in the basis weights without building the full unit-monomial table.
-    if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1") && ring_dim == 64 && r4.len() == 6 {
-        #[inline]
-        fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
-            let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
-            let mut acc: i128 = 0;
-            let mut pow: i128 = 1;
-            for i in 0..17 {
-                let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
-                acc += di * pow;
-                pow *= 16;
-            }
-            acc.rem_euclid(p) as u64
-        }
-        #[inline]
-        fn mul_mod_p(a: u64, b: u64, p: u64) -> u64 {
-            ((a as u128 * b as u128) % (p as u128)) as u64
-        }
-        #[inline]
-        fn sub_mod_p(a: u64, b: u64, p: u64) -> u64 {
-            ((a as i128 - b as i128).rem_euclid(p as i128)) as u64
-        }
-
-        let r0 = r4[0];
-        let r1 = r4[1];
-        let om0 = goldilocks_one_minus_digits(gb, &r0);
-        let om1 = goldilocks_one_minus_digits(gb, &r1);
-
-        // tail = Π_{j>=2} (1 - r4[j])
-        let mut tail = goldilocks_const_u64_digits(gb, 1u64);
-        for rj in &r4[2..] {
-            let om = goldilocks_one_minus_digits(gb, rj);
-            tail = goldilocks_mul_mod_p_digits(gb, &tail, &om);
-        }
-
-        let w0 = goldilocks_mul_mod_p_digits(gb, &om0, &om1);
-        let w0 = goldilocks_mul_mod_p_digits(gb, &w0, &tail);
-        let w1 = goldilocks_mul_mod_p_digits(gb, &r0, &om1);
-        let w1 = goldilocks_mul_mod_p_digits(gb, &w1, &tail);
-        let w2 = goldilocks_mul_mod_p_digits(gb, &om0, &r1);
-        let w2 = goldilocks_mul_mod_p_digits(gb, &w2, &tail);
-
-        let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
-        let asg = gb.assignment.as_slice();
-        let w0_u = scalar_digits_to_u64_mod_p(asg, &weights[0]);
-        let w1_u = scalar_digits_to_u64_mod_p(asg, &weights[1]);
-        let w2_u = scalar_digits_to_u64_mod_p(asg, &weights[2]);
-        let ew0_u = scalar_digits_to_u64_mod_p(asg, &w0);
-        let ew1_u = scalar_digits_to_u64_mod_p(asg, &w1);
-        let ew2_u = scalar_digits_to_u64_mod_p(asg, &w2);
-
-        eprintln!(
-            "[LF_DEBUG_CM_XPOW_WEIGHTS] w0={} exp0={} delta0={} | w1={} exp1={} delta1={} | w2={} exp2={} delta2={}",
-            w0_u,
-            ew0_u,
-            sub_mod_p(w0_u, ew0_u, p),
-            w1_u,
-            ew1_u,
-            sub_mod_p(w1_u, ew1_u, p),
-            w2_u,
-            ew2_u,
-            sub_mod_p(w2_u, ew2_u, p),
-        );
-    }
-
     // Interpret weights as the ring coefficients.
     gb.profile_exit(_prev);
     Ok(weights)
@@ -1105,69 +934,5 @@ pub(crate) fn eval_t_z_optimized_ring_digits_pair(
     let out = Ok((out0_base, out1_base));
     gb.profile_exit(_prev);
     out
-}
-
-/// Compute `t0(ro)` and `t1(ro)` together, returning **bal16** ring digits.
-///
-/// This is the conservative/reference digit-domain implementation:
-/// it uses the same factorization as `eval_t_z_optimized_ring_digits_pair`, but keeps ring elements
-/// in the standard bal16 digit encoding and uses the standard ring-mul + ring-scale gadgets.
-///
-/// If the bal4 end-to-end pipeline ever drifts, this is the "correctness first" fallback.
-pub(crate) fn eval_t_z_optimized_ring_digits_pair_bal16(
-    gb: &mut Dr1csBuilder<F257>,
-    tensor_c0_ring: &[RingDigits],
-    tensor_c1_ring: &[RingDigits],
-    s_prime_flat: &[RingDigits],
-    dpp: &[RingDigits],
-    ring_dim: usize,
-    r: &[GoldilocksScalar],
-) -> Result<(RingDigits, RingDigits), String> {
-    let sizes = [ring_dim, dpp.len(), s_prime_flat.len(), tensor_c0_ring.len(), tensor_c1_ring.len()];
-    if sizes.iter().any(|&s| s == 0 || !s.is_power_of_two()) {
-        return Err("eval_t_z_optimized_ring_digits_pair_bal16: expected power-of-two non-empty factor sizes".to_string());
-    }
-    if tensor_c0_ring.len() != tensor_c1_ring.len() {
-        return Err("eval_t_z_optimized_ring_digits_pair_bal16: tensor_c length mismatch".to_string());
-    }
-    if ring_dim != 64 {
-        return Err("eval_t_z_optimized_ring_digits_pair_bal16: expected ring_dim=64".to_string());
-    }
-    let vars4 = [ring_dim, dpp.len(), s_prime_flat.len(), tensor_c0_ring.len()].map(|s| ark_std::log2(s) as usize);
-    let tensor_vars = vars4.iter().sum::<usize>();
-    if r.len() < tensor_vars {
-        return Err("eval_t_z_optimized_ring_digits_pair_bal16: r too short".to_string());
-    }
-
-    let _prev = gb.profile_enter("cm_math::eval_t_z_optimized_ring_digits_pair_bal16");
-    let r4 = &r[0..vars4[0]];
-    let r3 = &r[vars4[0]..vars4[0] + vars4[1]];
-    let r2 = &r[vars4[0] + vars4[1]..vars4[0] + vars4[1] + vars4[2]];
-    let r1 = &r[vars4[0] + vars4[1] + vars4[2]..tensor_vars];
-
-    let v2 = eval_small_mle_ring_digits(gb, s_prime_flat, r2);
-    let v3 = eval_small_mle_ring_digits(gb, dpp, r3);
-    let v4 = eval_x_powers_basis_mle_ring_digits(gb, r4, ring_dim)?;
-    let v10 = eval_small_mle_ring_digits(gb, tensor_c0_ring, r1);
-    let v11 = eval_small_mle_ring_digits(gb, tensor_c1_ring, r1);
-
-    // pad = Π_{j=tensor_vars..} (1 - r[j])
-    let mut pad = goldilocks_const_u64_digits(gb, 1u64);
-    for rj in &r[tensor_vars..] {
-        let om = goldilocks_one_minus_digits(gb, rj);
-        pad = goldilocks_mul_mod_p_digits(gb, &pad, &om);
-    }
-
-    // u = v2*v3*v4 (ring muls)
-    let u = ring_mul_negacyclic_digits_d64(gb, &v2, &v3)?;
-    let u = ring_mul_negacyclic_digits_d64(gb, &u, &v4)?;
-    // t0/t1 = v1*u, then scale by pad
-    let t0 = ring_mul_negacyclic_digits_d64(gb, &v10, &u)?;
-    let t1 = ring_mul_negacyclic_digits_d64(gb, &v11, &u)?;
-    let t0 = ring_scale_digits(gb, &t0, &pad);
-    let t1 = ring_scale_digits(gb, &t1, &pad);
-
-    gb.profile_exit(_prev);
-    Ok((t0, t1))
 }
 
