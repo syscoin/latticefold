@@ -172,7 +172,17 @@ fn lf_profile_on() -> bool {
 #[inline]
 fn lf_profile_log(msg: &str) {
     if lf_profile_on() {
-        eprintln!("[LF_PROFILE] tiny_gate {msg}");
+        if lf_mem_on() {
+            let m = lf_mem_sample();
+            eprintln!(
+                "[LF_PROFILE] tiny_gate {msg} mem(rss={} hwm={} vmsize={})",
+                fmt_mib(m.rss_bytes),
+                fmt_mib(m.hwm_bytes),
+                fmt_mib(m.vmsize_bytes)
+            );
+        } else {
+            eprintln!("[LF_PROFILE] tiny_gate {msg}");
+        }
     }
 }
 
@@ -533,6 +543,105 @@ fn build_canonicality_shards(
             Ok(g)
         })
         .collect::<Result<Vec<_>, _>>()
+}
+
+fn add_decomp_linb2x_constraints(
+    glue: &mut GlueCtx,
+    ring_dim: usize,
+    params: &WeParams,
+    extra_witness: Option<&TinyExtraWitness>,
+) -> Result<(), String> {
+    // Mirrors `we_gate_arith.rs::decomp_verifier_math_dr1cs`:
+    // - C0 + B*C1 == cm_g
+    // - v0a + B*v1a == va, v0b + B*v1b == vb
+    //
+    // These do not interact with the transcript; they are purely ring algebraic checks.
+    // The witness-time builder can populate these from a real proof via `TinyExtraWitness`.
+    let kappa = params.kappa as usize;
+    if kappa == 0 {
+        return Ok(());
+    }
+
+    let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+    let b_u64: u64 = ((params.decomp_b as u128) % (p_u64 as u128)) as u64;
+    let vlen = 1usize + (params.mlen as usize);
+
+    #[inline]
+    fn alloc_witness_ring_digits(
+        gb: &mut Dr1csBuilder<F257>,
+        ring_dim: usize,
+        coeffs: Option<&[u64]>,
+    ) -> RingDigits {
+        let mut r: RingDigits = Vec::with_capacity(ring_dim);
+        for j in 0..ring_dim {
+            let u = coeffs.and_then(|c| c.get(j).copied()).unwrap_or(0u64);
+            r.push(alloc_witness_goldilocks_u64_digits(gb, u));
+        }
+        r
+    }
+
+    #[inline]
+    fn ring_recompose_base_b(gb: &mut Dr1csBuilder<F257>, r0: &RingDigits, r1: &RingDigits, b_u64: u64) -> RingDigits {
+        debug_assert_eq!(r0.len(), r1.len());
+        let mut out: RingDigits = Vec::with_capacity(r0.len());
+        for j in 0..r0.len() {
+            // Use a const-mul gadget here: b is a fixed parameter in WE.
+            let t = super::cm_math::goldilocks_mul_const_mod_p_digits(gb, &r1[j], b_u64);
+            let s = goldilocks_add_mod_p_digits(gb, &r0[j], &t);
+            out.push(s);
+        }
+        out
+    }
+
+    // Allocate witnesses (default 0; overridden by `extra_witness` when provided).
+    let mut dcomp_c0: Vec<RingDigits> = Vec::with_capacity(kappa);
+    let mut dcomp_c1: Vec<RingDigits> = Vec::with_capacity(kappa);
+    let mut cm_g: Vec<RingDigits> = Vec::with_capacity(kappa);
+    for i in 0..kappa {
+        let w = extra_witness;
+        let c0 = w.and_then(|w| w.decomp_c0.get(i).map(|v| v.as_slice()));
+        let c1 = w.and_then(|w| w.decomp_c1.get(i).map(|v| v.as_slice()));
+        let g = w.and_then(|w| w.linb2x_cm_g.get(i).map(|v| v.as_slice()));
+        dcomp_c0.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, c0));
+        dcomp_c1.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, c1));
+        cm_g.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, g));
+    }
+
+    let mut v0a: Vec<RingDigits> = Vec::with_capacity(vlen);
+    let mut v0b: Vec<RingDigits> = Vec::with_capacity(vlen);
+    let mut v1a: Vec<RingDigits> = Vec::with_capacity(vlen);
+    let mut v1b: Vec<RingDigits> = Vec::with_capacity(vlen);
+    let mut va: Vec<RingDigits> = Vec::with_capacity(vlen);
+    let mut vb: Vec<RingDigits> = Vec::with_capacity(vlen);
+    for i in 0..vlen {
+        let w = extra_witness;
+        let v0a_i = w.and_then(|w| w.decomp_v0a.get(i).map(|v| v.as_slice()));
+        let v0b_i = w.and_then(|w| w.decomp_v0b.get(i).map(|v| v.as_slice()));
+        let v1a_i = w.and_then(|w| w.decomp_v1a.get(i).map(|v| v.as_slice()));
+        let v1b_i = w.and_then(|w| w.decomp_v1b.get(i).map(|v| v.as_slice()));
+        let va_i = w.and_then(|w| w.linb2x_vo_a.get(i).map(|v| v.as_slice()));
+        let vb_i = w.and_then(|w| w.linb2x_vo_b.get(i).map(|v| v.as_slice()));
+        v0a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v0a_i));
+        v0b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v0b_i));
+        v1a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v1a_i));
+        v1b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v1b_i));
+        va.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, va_i));
+        vb.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, vb_i));
+    }
+
+    // Enforce recomposition equalities.
+    for i in 0..kappa {
+        let rec = ring_recompose_base_b(&mut glue.gb, &dcomp_c0[i], &dcomp_c1[i], b_u64);
+        ring_eq_digits(&mut glue.gb, &rec, &cm_g[i]);
+    }
+    for i in 0..vlen {
+        let rec_a = ring_recompose_base_b(&mut glue.gb, &v0a[i], &v1a[i], b_u64);
+        let rec_b = ring_recompose_base_b(&mut glue.gb, &v0b[i], &v1b[i], b_u64);
+        ring_eq_digits(&mut glue.gb, &rec_a, &va[i]);
+        ring_eq_digits(&mut glue.gb, &rec_b, &vb[i]);
+    }
+
+    Ok(())
 }
 
 fn build_cm_shards(
@@ -4010,6 +4119,9 @@ pub(super) fn build(
         dirs.root.display(),
         rayon::current_num_threads().max(1)
     ));
+    if tiny_opmix_on() {
+        super::op_counts::tiny_cm_counts_reset();
+    }
 
     // Build Poseidon as a file-backed instance + assignment (deterministic from ops schedule).
     let (pose_inst, pose_asg, pose_wiring) = build_poseidon(cfg, ops, &dirs)?;
@@ -4129,108 +4241,8 @@ pub(super) fn build(
         &dirs,
     )?;
 
-    // ------------------------------------------------------------------------
-    // Decomp verifier math (LinB2X + DecompProof) — algebraic-only checks
-    // ------------------------------------------------------------------------
-    //
-    // Mirrors `we_gate_arith.rs::decomp_verifier_math_dr1cs`:
-    // - C0 + B*C1 == cm_g
-    // - v0a + B*v1a == va, v0b + B*v1b == vb
-    //
-    // These do not interact with the transcript; they are purely ring algebraic checks.
-    // The witness-time builder can populate these from a real proof via `TinyExtraWitness`.
-    let kappa = params.kappa as usize;
-    if kappa > 0 {
-        let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
-        let b_u64: u64 = ((params.decomp_b as u128) % (p_u64 as u128)) as u64;
-        let b_digits = {
-            let bs = alloc_const_goldilocks_u64(&mut glue.gb, b_u64);
-            goldilocks_bytes_to_digits(&mut glue.gb, bs)
-        };
-        let vlen = 1usize + (params.mlen as usize);
-
-            #[inline]
-            fn alloc_witness_ring_digits(
-                gb: &mut Dr1csBuilder<F257>,
-                ring_dim: usize,
-                coeffs: Option<&[u64]>,
-            ) -> RingDigits {
-                let mut r: RingDigits = Vec::with_capacity(ring_dim);
-                for j in 0..ring_dim {
-                    let u = coeffs.and_then(|c| c.get(j).copied()).unwrap_or(0u64);
-                    r.push(alloc_witness_goldilocks_u64_digits(gb, u));
-                }
-                r
-            }
-
-            #[inline]
-            fn ring_recompose_base_b(
-                gb: &mut Dr1csBuilder<F257>,
-                r0: &RingDigits,
-                r1: &RingDigits,
-                b_digits: &GoldilocksScalar,
-                p_u64: u64,
-            ) -> RingDigits {
-                debug_assert_eq!(r0.len(), r1.len());
-                let mut out: RingDigits = Vec::with_capacity(r0.len());
-                for j in 0..r0.len() {
-                    let t = goldilocks_mul_mod_p_digits(gb, &r1[j], b_digits);
-                    let s = goldilocks_add_mod_p_digits(gb, &r0[j], &t);
-                    // `goldilocks_add_mod_p_digits` already reduces mod p; keep p_u64 unused in this path.
-                    let _ = p_u64;
-                    out.push(s);
-                }
-                out
-            }
-
-            // Allocate witnesses (default 0; overridden by `extra_witness` when provided).
-            let mut dcomp_c0: Vec<RingDigits> = Vec::with_capacity(kappa);
-            let mut dcomp_c1: Vec<RingDigits> = Vec::with_capacity(kappa);
-            let mut cm_g: Vec<RingDigits> = Vec::with_capacity(kappa);
-            for i in 0..kappa {
-                let w = extra_witness;
-                let c0 = w.and_then(|w| w.decomp_c0.get(i).map(|v| v.as_slice()));
-                let c1 = w.and_then(|w| w.decomp_c1.get(i).map(|v| v.as_slice()));
-                let g = w.and_then(|w| w.linb2x_cm_g.get(i).map(|v| v.as_slice()));
-                dcomp_c0.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, c0));
-                dcomp_c1.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, c1));
-                cm_g.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, g));
-            }
-
-            let mut v0a: Vec<RingDigits> = Vec::with_capacity(vlen);
-            let mut v0b: Vec<RingDigits> = Vec::with_capacity(vlen);
-            let mut v1a: Vec<RingDigits> = Vec::with_capacity(vlen);
-            let mut v1b: Vec<RingDigits> = Vec::with_capacity(vlen);
-            let mut va: Vec<RingDigits> = Vec::with_capacity(vlen);
-            let mut vb: Vec<RingDigits> = Vec::with_capacity(vlen);
-            for i in 0..vlen {
-                let w = extra_witness;
-                let v0a_i = w.and_then(|w| w.decomp_v0a.get(i).map(|v| v.as_slice()));
-                let v0b_i = w.and_then(|w| w.decomp_v0b.get(i).map(|v| v.as_slice()));
-                let v1a_i = w.and_then(|w| w.decomp_v1a.get(i).map(|v| v.as_slice()));
-                let v1b_i = w.and_then(|w| w.decomp_v1b.get(i).map(|v| v.as_slice()));
-                let va_i = w.and_then(|w| w.linb2x_vo_a.get(i).map(|v| v.as_slice()));
-                let vb_i = w.and_then(|w| w.linb2x_vo_b.get(i).map(|v| v.as_slice()));
-                v0a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v0a_i));
-                v0b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v0b_i));
-                v1a.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v1a_i));
-                v1b.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, v1b_i));
-                va.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, va_i));
-                vb.push(alloc_witness_ring_digits(&mut glue.gb, ring_dim, vb_i));
-            }
-
-            // Enforce recomposition equalities.
-            for i in 0..kappa {
-                let rec = ring_recompose_base_b(&mut glue.gb, &dcomp_c0[i], &dcomp_c1[i], &b_digits, p_u64);
-                ring_eq_digits(&mut glue.gb, &rec, &cm_g[i]);
-            }
-            for i in 0..vlen {
-                let rec_a = ring_recompose_base_b(&mut glue.gb, &v0a[i], &v1a[i], &b_digits, p_u64);
-                let rec_b = ring_recompose_base_b(&mut glue.gb, &v0b[i], &v1b[i], &b_digits, p_u64);
-                ring_eq_digits(&mut glue.gb, &rec_a, &va[i]);
-                ring_eq_digits(&mut glue.gb, &rec_b, &vb[i]);
-            }
-    }
+    // Decomp verifier math (LinB2X + DecompProof) — algebraic-only checks.
+    add_decomp_linb2x_constraints(&mut glue, ring_dim, params, extra_witness)?;
 
     // Surfaces (same as `build()`; these are comparatively small vs Poseidon/CM).
     let (
