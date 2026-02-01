@@ -458,7 +458,7 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
                     return;
                 }
 
-                let big = coef.into_bigint();
+                let big = (*coef).into_bigint();
                 let limbs = big.as_ref();
                 let key = hash_u64s(limbs);
                 if let Some(bucket) = self.buckets.get(&key) {
