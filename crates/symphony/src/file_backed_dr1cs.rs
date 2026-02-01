@@ -117,7 +117,19 @@ pub struct SparseDr1csFileWriter<F> {
     // Cache of canonical serialized coefficients keyed by a fast hash of BigInt limbs.
     // This avoids repeatedly running arkworks serialization on hot constant coefficients.
     coeff_cache: HashMap<u64, Vec<CoeffCacheEntry>>,
+    // Optional fast path for tiny prime fields: precomputed canonical bytes for all field elements.
+    //
+    // When present, coefficient "serialization" is just an indexed memcpy, bypassing hashing and
+    // arkworks serialization entirely. This is intended for fields like F257.
+    small_coeff_table: Option<SmallCoeffTable>,
     _pd: core::marker::PhantomData<F>,
+}
+
+#[derive(Clone, Debug)]
+struct SmallCoeffTable {
+    modulus: u64,
+    coeff_size: usize,
+    bytes: Vec<u8>, // concatenated fixed-size blobs for values 0..modulus-1
 }
 
 #[derive(Clone, Debug)]
@@ -202,6 +214,31 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             cap,
             File::create(constraints_path(dir)).map_err(|e| format!("create constraints failed: {e}"))?,
         );
+
+        // Optional: build a coefficient lookup table for very small prime fields.
+        //
+        // This is a huge win for F257-heavy workloads, since coefficients are overwhelmingly small
+        // constants (0/±1/twiddles) and we otherwise pay arkworks serialization per term.
+        let small_coeff_table = {
+            // Keep the table bounded (bytes = modulus * coeff_size).
+            const MAX_SMALL_MODULUS: u64 = 4096;
+            let modulus_bigint = F::MODULUS;
+            let limbs = modulus_bigint.as_ref();
+            if limbs.len() == 1 && limbs[0] > 1 && limbs[0] <= MAX_SMALL_MODULUS {
+                let modulus = limbs[0];
+                let mut bytes = vec![0u8; (modulus as usize).saturating_mul(coeff_size)];
+                for v in 0u64..modulus {
+                    let f = F::from(v);
+                    let off = (v as usize) * coeff_size;
+                    serialize_fixed(&f, &mut bytes[off..off + coeff_size])
+                        .map_err(|e| format!("serialize coeff table entry failed: {e}"))?;
+                }
+                Some(SmallCoeffTable { modulus, coeff_size, bytes })
+            } else {
+                None
+            }
+        };
+
         Ok(Self {
             dir: dir.to_path_buf(),
             coeff_size,
@@ -218,6 +255,7 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             c_terms: 0,
             coeff_buf: vec![0u8; coeff_size],
             coeff_cache: HashMap::new(),
+            small_coeff_table,
             _pd: core::marker::PhantomData,
         })
     }
@@ -275,6 +313,19 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
 
     #[inline]
     fn write_coeff_cached(&mut self, coef: &F) -> Result<(), String> {
+        // Tiny-field fast path: use precomputed bytes for all coefficients.
+        if let Some(t) = self.small_coeff_table.as_ref() {
+            let big = coef.into_bigint();
+            let limbs = big.as_ref();
+            debug_assert!(!limbs.is_empty());
+            debug_assert_eq!(limbs.len(), 1, "small_coeff_table expects single-limb field");
+            let v = limbs[0];
+            debug_assert!(v < t.modulus, "field element out of modulus range");
+            let off = (v as usize) * t.coeff_size;
+            self.coeff_buf.copy_from_slice(&t.bytes[off..off + t.coeff_size]);
+            return Ok(());
+        }
+
         let big = coef.into_bigint();
         let limbs = big.as_ref();
         let key = hash_u64s(limbs);
