@@ -787,6 +787,78 @@ pub(crate) fn eval_x_powers_basis_mle_ring_digits(
     // weights length = ring_dim; each weight is a Goldilocks scalar in digit encoding.
     let weights = tensor_goldilocks_scalars_digits(gb, &r4_rev);
     debug_assert_eq!(weights.len(), ring_dim);
+
+    // Debug: sanity-check the first few weights against the closed form under LSB-first convention:
+    //   w[0] = Π_j (1 - r4[j])
+    //   w[1] = r4[0] * Π_{j>=1} (1 - r4[j])
+    //   w[2] = (1 - r4[0]) * r4[1] * Π_{j>=2} (1 - r4[j])
+    //
+    // This catches bit-order mistakes in the basis weights without building the full unit-monomial table.
+    if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1") && ring_dim == 64 && r4.len() == 6 {
+        #[inline]
+        fn scalar_digits_to_u64_mod_p(asg: &[F257], s: &[usize; 17]) -> u64 {
+            let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P as i128;
+            let mut acc: i128 = 0;
+            let mut pow: i128 = 1;
+            for i in 0..17 {
+                let di = super::digits::f257_to_i32_bal(asg[s[i]]) as i128;
+                acc += di * pow;
+                pow *= 16;
+            }
+            acc.rem_euclid(p) as u64
+        }
+        #[inline]
+        fn mul_mod_p(a: u64, b: u64, p: u64) -> u64 {
+            ((a as u128 * b as u128) % (p as u128)) as u64
+        }
+        #[inline]
+        fn sub_mod_p(a: u64, b: u64, p: u64) -> u64 {
+            ((a as i128 - b as i128).rem_euclid(p as i128)) as u64
+        }
+
+        let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+        let asg = gb.assignment.as_slice();
+
+        let r0 = r4[0];
+        let r1 = r4[1];
+        let om0 = goldilocks_one_minus_digits(gb, &r0);
+        let om1 = goldilocks_one_minus_digits(gb, &r1);
+
+        // tail = Π_{j>=2} (1 - r4[j])
+        let mut tail = goldilocks_const_u64_digits(gb, 1u64);
+        for rj in &r4[2..] {
+            let om = goldilocks_one_minus_digits(gb, rj);
+            tail = goldilocks_mul_mod_p_digits(gb, &tail, &om);
+        }
+
+        let w0 = goldilocks_mul_mod_p_digits(gb, &om0, &om1);
+        let w0 = goldilocks_mul_mod_p_digits(gb, &w0, &tail);
+        let w1 = goldilocks_mul_mod_p_digits(gb, &r0, &om1);
+        let w1 = goldilocks_mul_mod_p_digits(gb, &w1, &tail);
+        let w2 = goldilocks_mul_mod_p_digits(gb, &om0, &r1);
+        let w2 = goldilocks_mul_mod_p_digits(gb, &w2, &tail);
+
+        let w0_u = scalar_digits_to_u64_mod_p(asg, &weights[0]);
+        let w1_u = scalar_digits_to_u64_mod_p(asg, &weights[1]);
+        let w2_u = scalar_digits_to_u64_mod_p(asg, &weights[2]);
+        let ew0_u = scalar_digits_to_u64_mod_p(asg, &w0);
+        let ew1_u = scalar_digits_to_u64_mod_p(asg, &w1);
+        let ew2_u = scalar_digits_to_u64_mod_p(asg, &w2);
+
+        eprintln!(
+            "[LF_DEBUG_CM_XPOW_WEIGHTS] w0={} exp0={} delta0={} | w1={} exp1={} delta1={} | w2={} exp2={} delta2={}",
+            w0_u,
+            ew0_u,
+            sub_mod_p(w0_u, ew0_u, p),
+            w1_u,
+            ew1_u,
+            sub_mod_p(w1_u, ew1_u, p),
+            w2_u,
+            ew2_u,
+            sub_mod_p(w2_u, ew2_u, p),
+        );
+    }
+
     // Interpret weights as the ring coefficients.
     gb.profile_exit(_prev);
     Ok(weights)
