@@ -26,6 +26,7 @@ use crate::dpp_poseidon::SparseDr1csInstance;
 pub struct FileBackedLayout {
     pub dir: PathBuf,
     pub coeff_size: usize,
+    pub idx_size: usize,
     pub nconstraints: u64,
     pub a_terms: u64,
     pub b_terms: u64,
@@ -48,12 +49,39 @@ fn read_u64(r: &mut impl IoRead) -> std::io::Result<u64> {
     Ok(u64::from_le_bytes(buf))
 }
 
+fn write_u32(w: &mut impl IoWrite, x: u32) -> std::io::Result<()> {
+    w.write_all(&x.to_le_bytes())
+}
+fn read_u32(r: &mut impl IoRead) -> std::io::Result<u32> {
+    let mut buf = [0u8; 4];
+    r.read_exact(&mut buf)?;
+    Ok(u32::from_le_bytes(buf))
+}
+
 #[inline]
 fn write_u64_slice_le(w: &mut impl IoWrite, xs: &[u64]) -> Result<(), String> {
     #[cfg(target_endian = "little")]
     {
         // SAFETY: u64 is POD. We encode indices/rows as little-endian u64 words.
         let nbytes = xs.len().saturating_mul(8);
+        let ptr = xs.as_ptr() as *const u8;
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, nbytes) };
+        w.write_all(bytes).map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &x in xs {
+            w.write_all(&x.to_le_bytes()).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+#[inline]
+fn write_u32_slice_le(w: &mut impl IoWrite, xs: &[u32]) -> Result<(), String> {
+    #[cfg(target_endian = "little")]
+    {
+        let nbytes = xs.len().saturating_mul(4);
         let ptr = xs.as_ptr() as *const u8;
         let bytes = unsafe { core::slice::from_raw_parts(ptr, nbytes) };
         w.write_all(bytes).map_err(|e| e.to_string())
@@ -146,7 +174,9 @@ fn deserialize_fixed<F: CanonicalDeserialize>(buf: &[u8]) -> Result<F, Serializa
 #[derive(Debug)]
 pub struct SparseDr1csFileWriter<F> {
     dir: PathBuf,
+    modulus: u64,
     coeff_size: usize,
+    idx_size: usize,
     fc_a: BufWriter<File>,
     fi_a: BufWriter<File>,
     fc_b: BufWriter<File>,
@@ -161,16 +191,7 @@ pub struct SparseDr1csFileWriter<F> {
     c_terms: u64,
     // Reusable coefficient buffer.
     coeff_buf: Vec<u8>,
-    // Precomputed canonical bytes for all field elements (tiny fields only).
-    small_coeff_table: SmallCoeffTable,
     _pd: core::marker::PhantomData<F>,
-}
-
-#[derive(Clone, Debug)]
-struct SmallCoeffTable {
-    modulus: u64,
-    coeff_size: usize,
-    bytes: Vec<u8>, // concatenated fixed-size blobs for values 0..modulus-1
 }
 
 impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
@@ -178,15 +199,23 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
         let dir = dir.as_ref();
         create_dir_all(dir).map_err(|e| format!("create_dir_all failed: {e}"))?;
 
-        // Determine fixed coeff size.
-        let mut tmp = Vec::new();
-        F::ONE
-            .serialize_with_mode(&mut tmp, Compress::No)
-            .map_err(|e| format!("serialize ONE failed: {e}"))?;
-        let coeff_size = tmp.len();
-        if coeff_size == 0 {
-            return Err("invalid coeff_size=0".to_string());
+        // Tiny-field file-backed format (for LF+): store coefficients as u16 and indices as u32.
+        //
+        // This is critical for scaling to billions of constraints without multi-TB scratch usage.
+        // We only support small prime fields here (e.g. F257).
+        const MAX_SMALL_MODULUS: u64 = 65535;
+        let modulus_bigint = F::MODULUS;
+        let limbs = modulus_bigint.as_ref();
+        if !(limbs.len() == 1 && limbs[0] > 1 && limbs[0] <= MAX_SMALL_MODULUS) {
+            return Err(format!(
+                "file-backed dr1cs: only supports small prime fields with modulus<= {MAX_SMALL_MODULUS} (got limbs={:?})",
+                limbs
+            ));
         }
+        let modulus = limbs[0];
+        // coeff_size=2 (u16 little-endian), idx_size=4 (u32 little-endian)
+        let coeff_size: usize = 2;
+        let idx_size: usize = 4;
 
         // Buffered IO is critical: file-backed Poseidon emits huge volumes of small-ish records.
         // Use a large BufWriter capacity by default, configurable via env var.
@@ -234,31 +263,11 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             File::create(constraints_path(dir)).map_err(|e| format!("create constraints failed: {e}"))?,
         );
 
-        // Small-field-only writer: build a coefficient lookup table for all field elements.
-        //
-        // We intentionally do NOT support a generic hash-cache fallback here.
-        const MAX_SMALL_MODULUS: u64 = 4096; // bounds memory: modulus * coeff_size bytes
-        let modulus_bigint = F::MODULUS;
-        let limbs = modulus_bigint.as_ref();
-        if !(limbs.len() == 1 && limbs[0] > 1 && limbs[0] <= MAX_SMALL_MODULUS) {
-            return Err(format!(
-                "file-backed dr1cs: only supports small prime fields with modulus<= {MAX_SMALL_MODULUS} (got limbs={:?})",
-                limbs
-            ));
-        }
-        let modulus = limbs[0];
-        let mut bytes = vec![0u8; (modulus as usize).saturating_mul(coeff_size)];
-        for v in 0u64..modulus {
-            let f = F::from(v);
-            let off = (v as usize) * coeff_size;
-            serialize_fixed(&f, &mut bytes[off..off + coeff_size])
-                .map_err(|e| format!("serialize coeff table entry failed: {e}"))?;
-        }
-        let small_coeff_table = SmallCoeffTable { modulus, coeff_size, bytes };
-
         Ok(Self {
             dir: dir.to_path_buf(),
+            modulus,
             coeff_size,
+            idx_size,
             fc_a,
             fi_a,
             fc_b,
@@ -271,7 +280,6 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             b_terms: 0,
             c_terms: 0,
             coeff_buf: vec![0u8; coeff_size],
-            small_coeff_table,
             _pd: core::marker::PhantomData,
         })
     }
@@ -279,6 +287,11 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
     #[inline]
     pub fn coeff_size(&self) -> usize {
         self.coeff_size
+    }
+
+    #[inline]
+    pub fn idx_size(&self) -> usize {
+        self.idx_size
     }
 
     #[inline]
@@ -290,7 +303,8 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
     pub fn push_a_term(&mut self, coef: &F, idx: u64) -> Result<(), String> {
         self.write_coeff_cached(coef)?;
         self.fc_a.write_all(&self.coeff_buf).map_err(|e| e.to_string())?;
-        write_u64(&mut self.fi_a, idx).map_err(|e| e.to_string())?;
+        let idx32: u32 = idx.try_into().map_err(|_| "a_term idx overflow u32".to_string())?;
+        write_u32(&mut self.fi_a, idx32).map_err(|e| e.to_string())?;
         self.a_terms += 1;
         Ok(())
     }
@@ -298,7 +312,8 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
     pub fn push_a_term_raw(&mut self, coef_bytes: &[u8], idx: u64) -> Result<(), String> {
         debug_assert_eq!(coef_bytes.len(), self.coeff_size);
         self.fc_a.write_all(coef_bytes).map_err(|e| e.to_string())?;
-        write_u64(&mut self.fi_a, idx).map_err(|e| e.to_string())?;
+        let idx32: u32 = idx.try_into().map_err(|_| "a_term_raw idx overflow u32".to_string())?;
+        write_u32(&mut self.fi_a, idx32).map_err(|e| e.to_string())?;
         self.a_terms += 1;
         Ok(())
     }
@@ -322,7 +337,7 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             let coeff_off = (base as u128)
                 .saturating_mul(self.coeff_size as u128)
                 .min(u64::MAX as u128) as u64;
-            let idx_off = base.saturating_mul(8);
+            let idx_off = base.saturating_mul(self.idx_size as u64);
             // Ensure file sizes cover the appended region.
             self.fc_a
                 .get_ref()
@@ -330,7 +345,7 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
                 .map_err(|e| e.to_string())?;
             self.fi_a
                 .get_ref()
-                .set_len(idx_off.saturating_add((idx.len().saturating_mul(8)) as u64))
+                .set_len(idx_off.saturating_add((idx.len().saturating_mul(self.idx_size)) as u64))
                 .map_err(|e| e.to_string())?;
 
             let chunk = cfg_pwrite_chunk_bytes();
@@ -346,10 +361,12 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
                     let buf = &coeff_bytes[off..end];
                     pwrite_all(f_coeff, coeff_off.saturating_add(off as u64), buf)
                 })?;
-            // Write idx u64 slice as bytes in parallel chunks.
-            let idx_bytes = unsafe {
-                core::slice::from_raw_parts(idx.as_ptr() as *const u8, idx.len().saturating_mul(8))
-            };
+            // Write idx u32s (converted) as bytes in parallel chunks.
+            let mut idx32: Vec<u32> = Vec::with_capacity(idx.len());
+            for &v in idx {
+                idx32.push(v.try_into().map_err(|_| "push_a_terms_raw_block: idx overflow u32".to_string())?);
+            }
+            let idx_bytes = unsafe { core::slice::from_raw_parts(idx32.as_ptr() as *const u8, idx32.len().saturating_mul(4)) };
             (0..idx_bytes.len())
                 .into_par_iter()
                 .step_by(chunk)
@@ -367,7 +384,11 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
 
         // Default: single-threaded buffered append.
         self.fc_a.write_all(coeff_bytes).map_err(|e| e.to_string())?;
-        write_u64_slice_le(&mut self.fi_a, idx)?;
+        let mut idx32: Vec<u32> = Vec::with_capacity(idx.len());
+        for &v in idx {
+            idx32.push(v.try_into().map_err(|_| "push_a_terms_raw_block: idx overflow u32".to_string())?);
+        }
+        write_u32_slice_le(&mut self.fi_a, &idx32)?;
         self.a_terms = self.a_terms.saturating_add(n);
         Ok(())
     }
@@ -375,7 +396,8 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
     pub fn push_b_term(&mut self, coef: &F, idx: u64) -> Result<(), String> {
         self.write_coeff_cached(coef)?;
         self.fc_b.write_all(&self.coeff_buf).map_err(|e| e.to_string())?;
-        write_u64(&mut self.fi_b, idx).map_err(|e| e.to_string())?;
+        let idx32: u32 = idx.try_into().map_err(|_| "b_term idx overflow u32".to_string())?;
+        write_u32(&mut self.fi_b, idx32).map_err(|e| e.to_string())?;
         self.b_terms += 1;
         Ok(())
     }
@@ -383,7 +405,8 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
     pub fn push_b_term_raw(&mut self, coef_bytes: &[u8], idx: u64) -> Result<(), String> {
         debug_assert_eq!(coef_bytes.len(), self.coeff_size);
         self.fc_b.write_all(coef_bytes).map_err(|e| e.to_string())?;
-        write_u64(&mut self.fi_b, idx).map_err(|e| e.to_string())?;
+        let idx32: u32 = idx.try_into().map_err(|_| "b_term_raw idx overflow u32".to_string())?;
+        write_u32(&mut self.fi_b, idx32).map_err(|e| e.to_string())?;
         self.b_terms += 1;
         Ok(())
     }
@@ -404,14 +427,14 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             let coeff_off = (base as u128)
                 .saturating_mul(self.coeff_size as u128)
                 .min(u64::MAX as u128) as u64;
-            let idx_off = base.saturating_mul(8);
+            let idx_off = base.saturating_mul(self.idx_size as u64);
             self.fc_b
                 .get_ref()
                 .set_len(coeff_off.saturating_add(coeff_bytes.len() as u64))
                 .map_err(|e| e.to_string())?;
             self.fi_b
                 .get_ref()
-                .set_len(idx_off.saturating_add((idx.len().saturating_mul(8)) as u64))
+                .set_len(idx_off.saturating_add((idx.len().saturating_mul(self.idx_size)) as u64))
                 .map_err(|e| e.to_string())?;
 
             let chunk = cfg_pwrite_chunk_bytes();
@@ -426,9 +449,11 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
                     let buf = &coeff_bytes[off..end];
                     pwrite_all(f_coeff, coeff_off.saturating_add(off as u64), buf)
                 })?;
-            let idx_bytes = unsafe {
-                core::slice::from_raw_parts(idx.as_ptr() as *const u8, idx.len().saturating_mul(8))
-            };
+            let mut idx32: Vec<u32> = Vec::with_capacity(idx.len());
+            for &v in idx {
+                idx32.push(v.try_into().map_err(|_| "push_b_terms_raw_block: idx overflow u32".to_string())?);
+            }
+            let idx_bytes = unsafe { core::slice::from_raw_parts(idx32.as_ptr() as *const u8, idx32.len().saturating_mul(4)) };
             (0..idx_bytes.len())
                 .into_par_iter()
                 .step_by(chunk)
@@ -444,7 +469,11 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
         }
 
         self.fc_b.write_all(coeff_bytes).map_err(|e| e.to_string())?;
-        write_u64_slice_le(&mut self.fi_b, idx)?;
+        let mut idx32: Vec<u32> = Vec::with_capacity(idx.len());
+        for &v in idx {
+            idx32.push(v.try_into().map_err(|_| "push_b_terms_raw_block: idx overflow u32".to_string())?);
+        }
+        write_u32_slice_le(&mut self.fi_b, &idx32)?;
         self.b_terms = self.b_terms.saturating_add(n);
         Ok(())
     }
@@ -452,29 +481,30 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
     pub fn push_c_term(&mut self, coef: &F, idx: u64) -> Result<(), String> {
         self.write_coeff_cached(coef)?;
         self.fc_c.write_all(&self.coeff_buf).map_err(|e| e.to_string())?;
-        write_u64(&mut self.fi_c, idx).map_err(|e| e.to_string())?;
+        let idx32: u32 = idx.try_into().map_err(|_| "c_term idx overflow u32".to_string())?;
+        write_u32(&mut self.fi_c, idx32).map_err(|e| e.to_string())?;
         self.c_terms += 1;
         Ok(())
     }
 
     #[inline]
     fn write_coeff_cached(&mut self, coef: &F) -> Result<(), String> {
-        let t = &self.small_coeff_table;
+        // Tiny format: encode coefficient as u16 little-endian of the canonical representative in [0, p-1].
         let big = coef.into_bigint();
         let limbs = big.as_ref();
         debug_assert!(!limbs.is_empty());
-        debug_assert_eq!(limbs.len(), 1, "SmallCoeffTable expects single-limb field");
+        debug_assert_eq!(limbs.len(), 1, "tiny_u16_u32 expects single-limb field");
         let v = limbs[0];
-        debug_assert!(v < t.modulus, "field element out of modulus range");
-        let off = (v as usize) * t.coeff_size;
-        self.coeff_buf.copy_from_slice(&t.bytes[off..off + t.coeff_size]);
+        let vv: u16 = v.try_into().map_err(|_| "coef overflow u16".to_string())?;
+        self.coeff_buf.copy_from_slice(&vv.to_le_bytes());
         Ok(())
     }
     #[inline]
     pub fn push_c_term_raw(&mut self, coef_bytes: &[u8], idx: u64) -> Result<(), String> {
         debug_assert_eq!(coef_bytes.len(), self.coeff_size);
         self.fc_c.write_all(coef_bytes).map_err(|e| e.to_string())?;
-        write_u64(&mut self.fi_c, idx).map_err(|e| e.to_string())?;
+        let idx32: u32 = idx.try_into().map_err(|_| "c_term_raw idx overflow u32".to_string())?;
+        write_u32(&mut self.fi_c, idx32).map_err(|e| e.to_string())?;
         self.c_terms += 1;
         Ok(())
     }
@@ -495,14 +525,14 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             let coeff_off = (base as u128)
                 .saturating_mul(self.coeff_size as u128)
                 .min(u64::MAX as u128) as u64;
-            let idx_off = base.saturating_mul(8);
+            let idx_off = base.saturating_mul(self.idx_size as u64);
             self.fc_c
                 .get_ref()
                 .set_len(coeff_off.saturating_add(coeff_bytes.len() as u64))
                 .map_err(|e| e.to_string())?;
             self.fi_c
                 .get_ref()
-                .set_len(idx_off.saturating_add((idx.len().saturating_mul(8)) as u64))
+                .set_len(idx_off.saturating_add((idx.len().saturating_mul(self.idx_size)) as u64))
                 .map_err(|e| e.to_string())?;
 
             let chunk = cfg_pwrite_chunk_bytes();
@@ -517,9 +547,11 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
                     let buf = &coeff_bytes[off..end];
                     pwrite_all(f_coeff, coeff_off.saturating_add(off as u64), buf)
                 })?;
-            let idx_bytes = unsafe {
-                core::slice::from_raw_parts(idx.as_ptr() as *const u8, idx.len().saturating_mul(8))
-            };
+            let mut idx32: Vec<u32> = Vec::with_capacity(idx.len());
+            for &v in idx {
+                idx32.push(v.try_into().map_err(|_| "push_c_terms_raw_block: idx overflow u32".to_string())?);
+            }
+            let idx_bytes = unsafe { core::slice::from_raw_parts(idx32.as_ptr() as *const u8, idx32.len().saturating_mul(4)) };
             (0..idx_bytes.len())
                 .into_par_iter()
                 .step_by(chunk)
@@ -535,7 +567,11 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
         }
 
         self.fc_c.write_all(coeff_bytes).map_err(|e| e.to_string())?;
-        write_u64_slice_le(&mut self.fi_c, idx)?;
+        let mut idx32: Vec<u32> = Vec::with_capacity(idx.len());
+        for &v in idx {
+            idx32.push(v.try_into().map_err(|_| "push_c_terms_raw_block: idx overflow u32".to_string())?);
+        }
+        write_u32_slice_le(&mut self.fi_c, &idx32)?;
         self.c_terms = self.c_terms.saturating_add(n);
         Ok(())
     }
@@ -623,11 +659,15 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             writeln!(f, "b_terms={}", self.b_terms).ok();
             writeln!(f, "c_terms={}", self.c_terms).ok();
             writeln!(f, "coeff_size={}", self.coeff_size).ok();
+            writeln!(f, "idx_size={}", self.idx_size).ok();
+            writeln!(f, "format=tiny_u16_u32").ok();
+            writeln!(f, "modulus={}", self.modulus).ok();
         }
 
         let layout = FileBackedLayout {
             dir: self.dir.clone(),
             coeff_size: self.coeff_size,
+            idx_size: self.idx_size,
             nconstraints: self.nconstraints,
             a_terms: self.a_terms,
             b_terms: self.b_terms,
@@ -666,15 +706,19 @@ pub fn dump_sparse_to_dir<F: PrimeField + CanonicalSerialize>(
     let dir = dir.as_ref();
     create_dir_all(dir).map_err(|e| format!("create_dir_all failed: {e}"))?;
 
-    // Determine fixed coeff size.
-    let mut tmp = Vec::new();
-    F::ONE
-        .serialize_with_mode(&mut tmp, Compress::No)
-        .map_err(|e| format!("serialize ONE failed: {e}"))?;
-    let coeff_size = tmp.len();
-    if coeff_size == 0 {
-        return Err("invalid coeff_size=0".to_string());
+    // Tiny-field file-backed format only (coeff=u16, idx=u32).
+    const MAX_SMALL_MODULUS: u64 = 65535;
+    let modulus_bigint = F::MODULUS;
+    let limbs = modulus_bigint.as_ref();
+    if !(limbs.len() == 1 && limbs[0] > 1 && limbs[0] <= MAX_SMALL_MODULUS) {
+        return Err(format!(
+            "dump_sparse_to_dir: only supports small prime fields with modulus<= {MAX_SMALL_MODULUS} (got limbs={:?})",
+            limbs
+        ));
     }
+    let modulus = limbs[0];
+    let coeff_size: usize = 2;
+    let idx_size: usize = 4;
 
     // Constraints: for each row store (a_start,a_end,b_start,b_end,c_start,c_end) as u64.
     {
@@ -689,7 +733,7 @@ pub fn dump_sparse_to_dir<F: PrimeField + CanonicalSerialize>(
         }
     }
 
-    // Term pools: write coeffs as fixed-size blobs, and indices as u64.
+    // Term pools: write coeffs as u16 blobs and indices as u32.
     for (which, terms) in [
         ("a", &inst.a_terms),
         ("b", &inst.b_terms),
@@ -698,11 +742,15 @@ pub fn dump_sparse_to_dir<F: PrimeField + CanonicalSerialize>(
         let (p_coeffs, p_idx) = term_paths(dir, which);
         let mut fc = BufWriter::new(File::create(p_coeffs).map_err(|e| format!("create {which}_coeffs failed: {e}"))?);
         let mut fi = BufWriter::new(File::create(p_idx).map_err(|e| format!("create {which}_idx failed: {e}"))?);
-        let mut buf = vec![0u8; coeff_size];
         for (coef, idx) in terms.iter() {
-            serialize_fixed(coef, &mut buf).map_err(|e| format!("serialize coeff failed: {e}"))?;
-            fc.write_all(&buf).map_err(|e| e.to_string())?;
-            write_u64(&mut fi, *idx as u64).map_err(|e| e.to_string())?;
+            let big = coef.into_bigint();
+            let vv = big.as_ref()[0];
+            let vv16: u16 = vv.try_into().map_err(|_| "dump_sparse_to_dir: coef overflow u16".to_string())?;
+            fc.write_all(&vv16.to_le_bytes()).map_err(|e| e.to_string())?;
+            let idx32: u32 = (*idx as u64)
+                .try_into()
+                .map_err(|_| "dump_sparse_to_dir: idx overflow u32".to_string())?;
+            write_u32(&mut fi, idx32).map_err(|e| e.to_string())?;
         }
     }
 
@@ -715,11 +763,15 @@ pub fn dump_sparse_to_dir<F: PrimeField + CanonicalSerialize>(
         writeln!(f, "b_terms={}", inst.b_terms.len()).ok();
         writeln!(f, "c_terms={}", inst.c_terms.len()).ok();
         writeln!(f, "coeff_size={}", coeff_size).ok();
+        writeln!(f, "idx_size={}", idx_size).ok();
+        writeln!(f, "format=tiny_u16_u32").ok();
+        writeln!(f, "modulus={}", modulus).ok();
     }
 
     Ok(FileBackedLayout {
         dir: dir.to_path_buf(),
         coeff_size,
+        idx_size,
         nconstraints: inst.constraints.len() as u64,
         a_terms: inst.a_terms.len() as u64,
         b_terms: inst.b_terms.len() as u64,
@@ -738,6 +790,7 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
         let mut b_terms: Option<u64> = None;
         let mut c_terms: Option<u64> = None;
         let mut coeff_size: Option<usize> = None;
+        let mut idx_size: Option<usize> = None;
         for line in meta.lines() {
             if let Some(rest) = line.strip_prefix("nvars=") {
                 nvars = rest.trim().parse::<usize>().ok();
@@ -751,12 +804,15 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                 c_terms = rest.trim().parse::<u64>().ok();
             } else if let Some(rest) = line.strip_prefix("coeff_size=") {
                 coeff_size = rest.trim().parse::<usize>().ok();
+            } else if let Some(rest) = line.strip_prefix("idx_size=") {
+                idx_size = rest.trim().parse::<usize>().ok();
             }
         }
         let nvars = nvars.ok_or("meta missing nvars")?;
         let layout = FileBackedLayout {
             dir: layout.dir,
             coeff_size: coeff_size.unwrap_or(layout.coeff_size),
+            idx_size: idx_size.unwrap_or(layout.idx_size),
             nconstraints: nconstraints.unwrap_or(layout.nconstraints),
             a_terms: a_terms.unwrap_or(layout.a_terms),
             b_terms: b_terms.unwrap_or(layout.b_terms),
@@ -788,17 +844,26 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
             return Ok(());
         }
 
+        // Tiny format only.
+        if self.layout.coeff_size != 2 || self.layout.idx_size != 4 {
+            return Err(format!(
+                "file-backed check: unsupported format (coeff_size={} idx_size={})",
+                self.layout.coeff_size, self.layout.idx_size
+            ));
+        }
+
         // Per-thread streaming term reader (sequential reads, rare seeks).
-        struct TermStream<F: PrimeField + CanonicalDeserialize> {
+        struct TermStream<F: PrimeField> {
             coeff_size: usize,
+            idx_size: usize,
             fc: BufReader<File>,
             fi: BufReader<File>,
             cur: u64,
             coeff_buf: Vec<u8>,
             _pd: core::marker::PhantomData<F>,
         }
-        impl<F: PrimeField + CanonicalDeserialize> TermStream<F> {
-            fn open(dir: &Path, which: &str, coeff_size: usize, start_term: u64) -> Result<Self, String> {
+        impl<F: PrimeField> TermStream<F> {
+            fn open(dir: &Path, which: &str, coeff_size: usize, idx_size: usize, start_term: u64) -> Result<Self, String> {
                 let (p_coeffs, p_idx) = term_paths(dir, which);
                 let mut fc = File::open(p_coeffs).map_err(|e| format!("open {which}_coeffs failed: {e}"))?;
                 let mut fi = File::open(p_idx).map_err(|e| format!("open {which}_idx failed: {e}"))?;
@@ -807,10 +872,11 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                     .min(u64::MAX as u128) as u64;
                 fc.seek(std::io::SeekFrom::Start(off_c))
                     .map_err(|e| format!("seek {which}_coeffs failed: {e}"))?;
-                fi.seek(std::io::SeekFrom::Start(start_term.saturating_mul(8)))
+                fi.seek(std::io::SeekFrom::Start(start_term.saturating_mul(idx_size as u64)))
                     .map_err(|e| format!("seek {which}_idx failed: {e}"))?;
                 Ok(Self {
                     coeff_size,
+                    idx_size,
                     fc: BufReader::with_capacity(8 * 1024 * 1024, fc),
                     fi: BufReader::with_capacity(8 * 1024 * 1024, fi),
                     cur: start_term,
@@ -831,7 +897,7 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                     .seek(std::io::SeekFrom::Start(off_c))
                     .map_err(|e| format!("seek {which}_coeffs failed: {e}"))?;
                 self.fi
-                    .seek(std::io::SeekFrom::Start(term.saturating_mul(8)))
+                    .seek(std::io::SeekFrom::Start(term.saturating_mul(self.idx_size as u64)))
                     .map_err(|e| format!("seek {which}_idx failed: {e}"))?;
                 self.cur = term;
                 Ok(())
@@ -845,9 +911,9 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                     self.fc
                         .read_exact(&mut self.coeff_buf)
                         .map_err(|e| format!("read {which}_coeffs failed: {e}"))?;
-                    let idx = read_u64(&mut self.fi).map_err(|e| format!("read {which}_idx failed: {e}"))? as usize;
-                    let coef =
-                        deserialize_fixed::<F>(&self.coeff_buf).map_err(|e| format!("deserialize {which}_coeff failed: {e}"))?;
+                    let idx = read_u32(&mut self.fi).map_err(|e| format!("read {which}_idx failed: {e}"))? as usize;
+                    let vv = u16::from_le_bytes([self.coeff_buf[0], self.coeff_buf[1]]) as u64;
+                    let coef = F::from(vv);
                     acc += coef * assignment[idx];
                     self.cur = self.cur.saturating_add(1);
                 }
@@ -856,6 +922,7 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
         }
 
         let coeff_size = self.layout.coeff_size;
+        let idx_size = self.layout.idx_size;
         let dir = self.layout.dir.clone();
 
         // Split constraints into disjoint ranges and check them in parallel.
@@ -894,9 +961,9 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                     let c1 = read_u64(&mut rows).map_err(|e| format!("read constraint row failed: {e}"))?;
 
                     if first {
-                        ts_a = Some(TermStream::<F>::open(&dir, "a", coeff_size, a0)?);
-                        ts_b = Some(TermStream::<F>::open(&dir, "b", coeff_size, b0)?);
-                        ts_c = Some(TermStream::<F>::open(&dir, "c", coeff_size, c0)?);
+                        ts_a = Some(TermStream::<F>::open(&dir, "a", coeff_size, idx_size, a0)?);
+                        ts_b = Some(TermStream::<F>::open(&dir, "b", coeff_size, idx_size, b0)?);
+                        ts_c = Some(TermStream::<F>::open(&dir, "c", coeff_size, idx_size, c0)?);
                         first = false;
                     }
 
@@ -1019,10 +1086,20 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
 
         // Validate layouts are compatible and precompute offsets.
         let coeff_size = parts[0].0.layout.coeff_size;
+        let idx_size = parts[0].0.layout.idx_size;
         for (inst, _asg) in parts.iter() {
             if inst.layout.coeff_size != coeff_size {
                 return Err("merge_file_backed_sparse_dr1cs_share_one: coeff_size mismatch across parts".to_string());
             }
+            if inst.layout.idx_size != idx_size {
+                return Err("merge_file_backed_sparse_dr1cs_share_one: idx_size mismatch across parts".to_string());
+            }
+        }
+        if coeff_size != 2 || idx_size != 4 {
+            return Err(format!(
+                "merge_file_backed_sparse_dr1cs_share_one: unsupported format (coeff_size={} idx_size={})",
+                coeff_size, idx_size
+            ));
         }
 
         // Prefix sums for output term offsets per part.
@@ -1079,9 +1156,15 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
             let bytes_c_coeff = (tot_c_terms as u128)
                 .saturating_mul(coeff_size as u128)
                 .min(u64::MAX as u128) as u64;
-            let bytes_a_idx = (tot_a_terms as u128).saturating_mul(8).min(u64::MAX as u128) as u64;
-            let bytes_b_idx = (tot_b_terms as u128).saturating_mul(8).min(u64::MAX as u128) as u64;
-            let bytes_c_idx = (tot_c_terms as u128).saturating_mul(8).min(u64::MAX as u128) as u64;
+            let bytes_a_idx = (tot_a_terms as u128)
+                .saturating_mul(idx_size as u128)
+                .min(u64::MAX as u128) as u64;
+            let bytes_b_idx = (tot_b_terms as u128)
+                .saturating_mul(idx_size as u128)
+                .min(u64::MAX as u128) as u64;
+            let bytes_c_idx = (tot_c_terms as u128)
+                .saturating_mul(idx_size as u128)
+                .min(u64::MAX as u128) as u64;
             let bytes_rows = (tot_rows as u128).saturating_mul(48).min(u64::MAX as u128) as u64;
 
             // Create output files and pre-size them to allow concurrent pwrite.
@@ -1187,24 +1270,29 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                             File::open(p_idx).map_err(|e| format!("open {which}_idx failed: {e}"))?,
                         );
 
-                        // Process u64 indices in big blocks.
+                        // Process u32 indices in big blocks (tiny_u16_u32 format).
                         let mut remaining = n_terms;
-                        let mut out_u64_pos = base_terms;
-                        let block_u64s = (STREAM_CHUNK_BYTES / 8).max(1) as u64;
-                        let mut buf = vec![0u8; (block_u64s as usize) * 8];
+                        let mut out_pos = base_terms;
+                        let block_u32s = (STREAM_CHUNK_BYTES / 4).max(1) as u64;
+                        let mut buf = vec![0u8; (block_u32s as usize) * 4];
                         while remaining > 0 {
-                            let take = remaining.min(block_u64s);
-                            let bytes = (take as usize) * 8;
+                            let take = remaining.min(block_u32s);
+                            let bytes = (take as usize) * 4;
                             r.read_exact(&mut buf[..bytes]).map_err(|e| e.to_string())?;
                             for i in 0..(take as usize) {
-                                let j = i * 8;
-                                let idx = u64::from_le_bytes(buf[j..j + 8].try_into().unwrap());
+                                let j = i * 4;
+                                let idx = u32::from_le_bytes(buf[j..j + 4].try_into().unwrap()) as u64;
                                 let mapped = map_var(idx, v_off);
-                                buf[j..j + 8].copy_from_slice(&mapped.to_le_bytes());
+                                let mapped32: u32 = mapped
+                                    .try_into()
+                                    .map_err(|_| "merge_file_backed: mapped var idx overflow u32".to_string())?;
+                                buf[j..j + 4].copy_from_slice(&mapped32.to_le_bytes());
                             }
-                            let out_off = (out_u64_pos as u128).saturating_mul(8).min(u64::MAX as u128) as u64;
+                            let out_off = (out_pos as u128)
+                                .saturating_mul(idx_size as u128)
+                                .min(u64::MAX as u128) as u64;
                             pwrite_all(out_file, out_off, &buf[..bytes])?;
-                            out_u64_pos = out_u64_pos.saturating_add(take);
+                            out_pos = out_pos.saturating_add(take);
                             remaining -= take;
                         }
                         Ok(())
@@ -1263,12 +1351,13 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
             // Append equality constraints at the tail (write_at into pre-sized file ranges).
             if !extra_eqs.is_empty() {
                 let t_eq = std::time::Instant::now();
-                let mut one_bytes = vec![0u8; coeff_size];
-                let mut neg_one_bytes = vec![0u8; coeff_size];
-                let mut zero_bytes = vec![0u8; coeff_size];
-                serialize_fixed::<F>(&F::ONE, &mut one_bytes).map_err(|e| e.to_string())?;
-                serialize_fixed::<F>(&(-F::ONE), &mut neg_one_bytes).map_err(|e| e.to_string())?;
-                serialize_fixed::<F>(&F::ZERO, &mut zero_bytes).map_err(|e| e.to_string())?;
+                // Coeff encoding: u16 little-endian (canonical representative).
+                let one_u16: u16 = F::ONE.into_bigint().as_ref()[0] as u16;
+                let neg_one_u16: u16 = (-F::ONE).into_bigint().as_ref()[0] as u16;
+                let zero_u16: u16 = 0;
+                let one_bytes = one_u16.to_le_bytes();
+                let neg_one_bytes = neg_one_u16.to_le_bytes();
+                let zero_bytes = zero_u16.to_le_bytes();
 
                 let base_a_terms = cur_a;
                 let base_b_terms = cur_b;
@@ -1283,27 +1372,33 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
 
                     // Build batch buffers.
                     let mut a_coeff = vec![0u8; batch.len() * 2 * coeff_size];
-                    let mut a_idx = vec![0u8; batch.len() * 2 * 8];
+                    let mut a_idx = vec![0u8; batch.len() * 2 * idx_size];
                     let mut b_coeff = vec![0u8; batch.len() * coeff_size];
-                    let mut b_idx = vec![0u8; batch.len() * 8];
+                    let mut b_idx = vec![0u8; batch.len() * idx_size];
                     let mut c_coeff = vec![0u8; batch.len() * coeff_size];
-                    let mut c_idx = vec![0u8; batch.len() * 8];
+                    let mut c_idx = vec![0u8; batch.len() * idx_size];
                     let mut rows = vec![0u8; batch.len() * 48];
 
                     for (j, &(x, y)) in batch.iter().enumerate() {
                         // A pool: [+1*x, -1*y]
                         a_coeff[(2 * j) * coeff_size..(2 * j + 1) * coeff_size].copy_from_slice(&one_bytes);
                         a_coeff[(2 * j + 1) * coeff_size..(2 * j + 2) * coeff_size].copy_from_slice(&neg_one_bytes);
-                        a_idx[(2 * j) * 8..(2 * j + 1) * 8].copy_from_slice(&(x as u64).to_le_bytes());
-                        a_idx[(2 * j + 1) * 8..(2 * j + 2) * 8].copy_from_slice(&(y as u64).to_le_bytes());
+                        let x32: u32 = (x as u64)
+                            .try_into()
+                            .map_err(|_| "merge_file_backed: eq var idx overflow u32".to_string())?;
+                        let y32: u32 = (y as u64)
+                            .try_into()
+                            .map_err(|_| "merge_file_backed: eq var idx overflow u32".to_string())?;
+                        a_idx[(2 * j) * idx_size..(2 * j + 1) * idx_size].copy_from_slice(&x32.to_le_bytes());
+                        a_idx[(2 * j + 1) * idx_size..(2 * j + 2) * idx_size].copy_from_slice(&y32.to_le_bytes());
 
                         // B pool: [+1*var0]
                         b_coeff[j * coeff_size..(j + 1) * coeff_size].copy_from_slice(&one_bytes);
-                        b_idx[j * 8..(j + 1) * 8].copy_from_slice(&0u64.to_le_bytes());
+                        b_idx[j * idx_size..(j + 1) * idx_size].copy_from_slice(&0u32.to_le_bytes());
 
                         // C pool: [0*var0]
                         c_coeff[j * coeff_size..(j + 1) * coeff_size].copy_from_slice(&zero_bytes);
-                        c_idx[j * 8..(j + 1) * 8].copy_from_slice(&0u64.to_le_bytes());
+                        c_idx[j * idx_size..(j + 1) * idx_size].copy_from_slice(&0u32.to_le_bytes());
 
                         // Constraint row for this equality.
                         let eq_i = (i0 + j) as u64;
@@ -1330,15 +1425,21 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                     let a_coeff_off = ((base_a_terms + 2 * eq0) as u128)
                         .saturating_mul(coeff_size as u128)
                         .min(u64::MAX as u128) as u64;
-                    let a_idx_off = ((base_a_terms + 2 * eq0) as u128).saturating_mul(8).min(u64::MAX as u128) as u64;
+                    let a_idx_off = ((base_a_terms + 2 * eq0) as u128)
+                        .saturating_mul(idx_size as u128)
+                        .min(u64::MAX as u128) as u64;
                     let b_coeff_off = ((base_b_terms + eq0) as u128)
                         .saturating_mul(coeff_size as u128)
                         .min(u64::MAX as u128) as u64;
-                    let b_idx_off = ((base_b_terms + eq0) as u128).saturating_mul(8).min(u64::MAX as u128) as u64;
+                    let b_idx_off = ((base_b_terms + eq0) as u128)
+                        .saturating_mul(idx_size as u128)
+                        .min(u64::MAX as u128) as u64;
                     let c_coeff_off = ((base_c_terms + eq0) as u128)
                         .saturating_mul(coeff_size as u128)
                         .min(u64::MAX as u128) as u64;
-                    let c_idx_off = ((base_c_terms + eq0) as u128).saturating_mul(8).min(u64::MAX as u128) as u64;
+                    let c_idx_off = ((base_c_terms + eq0) as u128)
+                        .saturating_mul(idx_size as u128)
+                        .min(u64::MAX as u128) as u64;
                     let rows_off = ((base_rows + eq0) as u128).saturating_mul(48).min(u64::MAX as u128) as u64;
 
                     pwrite_all(&out_fc_a, a_coeff_off, &a_coeff)?;
@@ -1365,6 +1466,8 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                 writeln!(f, "b_terms={}", tot_b_terms).ok();
                 writeln!(f, "c_terms={}", tot_c_terms).ok();
                 writeln!(f, "coeff_size={}", coeff_size).ok();
+                writeln!(f, "idx_size={}", idx_size).ok();
+                writeln!(f, "format=tiny_u16_u32").ok();
             }
 
             if timing {
@@ -1374,6 +1477,7 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
             let layout = FileBackedLayout {
                 dir: out_dir.clone(),
                 coeff_size,
+                idx_size,
                 nconstraints: tot_rows,
                 a_terms: tot_a_terms,
                 b_terms: tot_b_terms,
@@ -1428,7 +1532,7 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
             let mut buf = vec![0u8; inst.layout.coeff_size];
             for _ in 0..n_terms {
                 fc.read_exact(&mut buf).map_err(|e| format!("read {which}_coeffs failed: {e}"))?;
-                let idx = read_u64(&mut fi).map_err(|e| format!("read {which}_idx failed: {e}"))?;
+                let idx = read_u32(&mut fi).map_err(|e| format!("read {which}_idx failed: {e}"))? as u64;
                 let mapped = map_var(idx, var_tail_off);
                 match which {
                     "a" => w.push_a_term_raw(&buf, mapped)?,
