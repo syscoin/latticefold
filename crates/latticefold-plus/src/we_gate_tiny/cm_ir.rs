@@ -322,9 +322,12 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
     if gb.is_count_only() {
         let mut local_to_var: Vec<usize> = Vec::with_capacity(local_asg.len());
         local_to_var.push(0); // Local(0) unused
-        // Allocate locals with dummy witness values (shape-only).
-        for _ in 1..local_asg.len() {
-            local_to_var.push(gb.new_var(F257::ZERO));
+        // Allocate locals with their IR witness values.
+        //
+        // Even in count-only mode we must keep assignment values consistent because some callers
+        // perform witness-time sanity checks (e.g. transcript byte equalities) during construction.
+        for &v in local_asg.iter().skip(1) {
+            local_to_var.push(gb.new_var(v));
         }
         let lowered = LoweredIr { base_nvars, local_to_var };
         let rows = constraints.len() as u64;
