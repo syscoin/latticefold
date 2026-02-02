@@ -656,6 +656,17 @@ struct Dr1csBuilder<F: PrimeField> {
     file_a_terms: u64,
     file_b_terms: u64,
     file_c_terms: u64,
+    // File-backed fast path: stage blocks in memory and flush via raw-block APIs.
+    fb_modulus: u16,
+    fb_stage_bytes: usize,
+    fb_stage_limit_bytes: usize,
+    fb_a_coeffs: Vec<u8>,
+    fb_a_idx: Vec<u32>,
+    fb_b_coeffs: Vec<u8>,
+    fb_b_idx: Vec<u32>,
+    fb_c_coeffs: Vec<u8>,
+    fb_c_idx: Vec<u32>,
+    fb_row_lens: Vec<u32>, // 3*u32 per row: a_len,b_len,c_len
 }
 
 impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
@@ -666,6 +677,21 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
     }
 
     fn new() -> Self {
+        #[inline]
+        fn stage_limit_bytes() -> usize {
+            // Keep staging bounded to avoid huge memory spikes in sharded mode.
+            // Override with LFP_POSEIDON_FILE_BACKED_STAGE_MB.
+            let mb: usize = std::env::var("LFP_POSEIDON_FILE_BACKED_STAGE_MB")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or(64);
+            mb.saturating_mul(1024 * 1024)
+        }
+        // For file-backed mode we only support small prime fields; compute modulus once.
+        let modulus_big = F::MODULUS;
+        let limbs = modulus_big.as_ref();
+        let fb_modulus: u16 = limbs.get(0).copied().unwrap_or(0).min(u16::MAX as u64) as u16;
         // var 0 is the constant-1 slot
         Self {
             assignment: vec![F::ONE],
@@ -678,6 +704,16 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             file_a_terms: 0,
             file_b_terms: 0,
             file_c_terms: 0,
+            fb_modulus,
+            fb_stage_bytes: 0,
+            fb_stage_limit_bytes: stage_limit_bytes(),
+            fb_a_coeffs: Vec::new(),
+            fb_a_idx: Vec::new(),
+            fb_b_coeffs: Vec::new(),
+            fb_b_idx: Vec::new(),
+            fb_c_coeffs: Vec::new(),
+            fb_c_idx: Vec::new(),
+            fb_row_lens: Vec::new(),
         }
     }
 
@@ -685,6 +721,61 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         let mut b = Self::new();
         b.file_sink = Some(SparseDr1csFileWriter::<F>::create(dir)?);
         Ok(b)
+    }
+
+    #[inline]
+    fn fb_coeff_u16(&self, coef: F) -> u16 {
+        // Same convention as file-backed writer: canonical integer representative in [0, p-1].
+        if coef == F::ZERO {
+            0
+        } else if coef == F::ONE {
+            1
+        } else if coef == -F::ONE {
+            self.fb_modulus.wrapping_sub(1)
+        } else {
+            let big = coef.into_bigint();
+            let limbs = big.as_ref();
+            limbs.get(0).copied().unwrap_or(0) as u16
+        }
+    }
+
+    fn fb_maybe_flush(&mut self) {
+        if self.file_sink.is_none() {
+            return;
+        }
+        if self.fb_stage_bytes < self.fb_stage_limit_bytes {
+            return;
+        }
+        self.fb_flush().expect("file-backed dr1cs flush failed");
+    }
+
+    fn fb_flush(&mut self) -> Result<(), String> {
+        let Some(sink) = self.file_sink.as_mut() else {
+            return Ok(());
+        };
+        if self.fb_row_lens.is_empty() {
+            return Ok(());
+        }
+        // Write term pools first, then row lens block.
+        sink.push_a_terms_raw_block(&self.fb_a_coeffs, &self.fb_a_idx)?;
+        sink.push_b_terms_raw_block(&self.fb_b_coeffs, &self.fb_b_idx)?;
+        sink.push_c_terms_raw_block(&self.fb_c_coeffs, &self.fb_c_idx)?;
+        sink.push_constraint_lens_block(&self.fb_row_lens)?;
+
+        self.file_a_terms = self.file_a_terms.saturating_add(self.fb_a_idx.len() as u64);
+        self.file_b_terms = self.file_b_terms.saturating_add(self.fb_b_idx.len() as u64);
+        self.file_c_terms = self.file_c_terms.saturating_add(self.fb_c_idx.len() as u64);
+        self.file_rows = self.file_rows.saturating_add((self.fb_row_lens.len() / 3) as u64);
+
+        self.fb_a_coeffs.clear();
+        self.fb_a_idx.clear();
+        self.fb_b_coeffs.clear();
+        self.fb_b_idx.clear();
+        self.fb_c_coeffs.clear();
+        self.fb_c_idx.clear();
+        self.fb_row_lens.clear();
+        self.fb_stage_bytes = 0;
+        Ok(())
     }
 
     #[inline]
@@ -713,33 +804,43 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
 
     fn add_constraint(&mut self, a: Vec<(F, usize)>, b: Vec<(F, usize)>, c: Vec<(F, usize)>) {
         if let Some(sink) = self.file_sink.as_mut() {
-            let a0 = self.file_a_terms;
-            for (coef, idx) in a.iter() {
-                sink.push_a_term(coef, Self::idx_u32(*idx))
-                    .expect("file-backed dr1cs write failed (a_term)");
-            }
-            let a1 = a0 + (a.len() as u64);
-            self.file_a_terms = a1;
+            let _ = sink; // staged path below uses self.file_sink via fb_flush()
+            // Stage term bytes/indices and row lengths, then flush in large blocks.
+            self.fb_row_lens
+                .extend_from_slice(&[(a.len() as u32), (b.len() as u32), (c.len() as u32)]);
+            self.fb_stage_bytes = self.fb_stage_bytes.saturating_add(12);
 
-            let b0 = self.file_b_terms;
-            for (coef, idx) in b.iter() {
-                sink.push_b_term(coef, Self::idx_u32(*idx))
-                    .expect("file-backed dr1cs write failed (b_term)");
+            let a_len = a.len();
+            self.fb_a_coeffs.reserve(a_len * 2);
+            self.fb_a_idx.reserve(a_len);
+            for (coef, idx) in a.into_iter() {
+                let vv = self.fb_coeff_u16(coef);
+                self.fb_a_coeffs.extend_from_slice(&vv.to_le_bytes());
+                self.fb_a_idx.push(Self::idx_u32(idx));
             }
-            let b1 = b0 + (b.len() as u64);
-            self.file_b_terms = b1;
+            self.fb_stage_bytes = self.fb_stage_bytes.saturating_add(a_len * 6);
 
-            let c0 = self.file_c_terms;
-            for (coef, idx) in c.iter() {
-                sink.push_c_term(coef, Self::idx_u32(*idx))
-                    .expect("file-backed dr1cs write failed (c_term)");
+            let b_len = b.len();
+            self.fb_b_coeffs.reserve(b_len * 2);
+            self.fb_b_idx.reserve(b_len);
+            for (coef, idx) in b.into_iter() {
+                let vv = self.fb_coeff_u16(coef);
+                self.fb_b_coeffs.extend_from_slice(&vv.to_le_bytes());
+                self.fb_b_idx.push(Self::idx_u32(idx));
             }
-            let c1 = c0 + (c.len() as u64);
-            self.file_c_terms = c1;
+            self.fb_stage_bytes = self.fb_stage_bytes.saturating_add(b_len * 6);
 
-            sink.push_constraint_row(a0, a1, b0, b1, c0, c1)
-                .expect("file-backed dr1cs write failed (constraint)");
-            self.file_rows += 1;
+            let c_len = c.len();
+            self.fb_c_coeffs.reserve(c_len * 2);
+            self.fb_c_idx.reserve(c_len);
+            for (coef, idx) in c.into_iter() {
+                let vv = self.fb_coeff_u16(coef);
+                self.fb_c_coeffs.extend_from_slice(&vv.to_le_bytes());
+                self.fb_c_idx.push(Self::idx_u32(idx));
+            }
+            self.fb_stage_bytes = self.fb_stage_bytes.saturating_add(c_len * 6);
+
+            self.fb_maybe_flush();
         } else {
             let a0 = self.a_terms.len();
             self.a_terms.extend(a);
@@ -877,6 +978,7 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
 
     fn into_file_backed_instance(self) -> Result<(FileBackedSparseDr1csInstance<F>, Vec<F>), String> {
         let mut me = self;
+        me.fb_flush()?;
         let sink = me
             .file_sink
             .take()

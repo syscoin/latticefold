@@ -1000,60 +1000,8 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
             ));
         }
 
-        // Per-thread streaming term reader (sequential reads, rare seeks).
-        struct TermStream<F: PrimeField> {
-            coeff_size: usize,
-            idx_size: usize,
-            fc: BufReader<File>,
-            fi: BufReader<File>,
-            cur: u64,
-            coeff_buf: Vec<u8>,
-            _pd: core::marker::PhantomData<F>,
-        }
-        impl<F: PrimeField> TermStream<F> {
-            fn open(dir: &Path, which: &str, coeff_size: usize, idx_size: usize, start_term: u64) -> Result<Self, String> {
-                let (p_coeffs, p_idx) = term_paths(dir, which);
-                let mut fc = File::open(p_coeffs).map_err(|e| format!("open {which}_coeffs failed: {e}"))?;
-                let mut fi = File::open(p_idx).map_err(|e| format!("open {which}_idx failed: {e}"))?;
-                let off_c = (start_term as u128)
-                    .saturating_mul(coeff_size as u128)
-                    .min(u64::MAX as u128) as u64;
-                fc.seek(std::io::SeekFrom::Start(off_c))
-                    .map_err(|e| format!("seek {which}_coeffs failed: {e}"))?;
-                fi.seek(std::io::SeekFrom::Start(start_term.saturating_mul(idx_size as u64)))
-                    .map_err(|e| format!("seek {which}_idx failed: {e}"))?;
-                Ok(Self {
-                    coeff_size,
-                    idx_size,
-                    fc: BufReader::with_capacity(8 * 1024 * 1024, fc),
-                    fi: BufReader::with_capacity(8 * 1024 * 1024, fi),
-                    cur: start_term,
-                    coeff_buf: vec![0u8; coeff_size],
-                    _pd: core::marker::PhantomData,
-                })
-            }
-
-            #[inline]
-            fn seek_term(&mut self, which: &str, term: u64) -> Result<(), String> {
-                if self.cur == term {
-                    return Ok(());
-                }
-                let off_c = (term as u128)
-                    .saturating_mul(self.coeff_size as u128)
-                    .min(u64::MAX as u128) as u64;
-                self.fc
-                    .seek(std::io::SeekFrom::Start(off_c))
-                    .map_err(|e| format!("seek {which}_coeffs failed: {e}"))?;
-                self.fi
-                    .seek(std::io::SeekFrom::Start(term.saturating_mul(self.idx_size as u64)))
-                    .map_err(|e| format!("seek {which}_idx failed: {e}"))?;
-                self.cur = term;
-                Ok(())
-            }
-        }
-
-        let coeff_size = self.layout.coeff_size;
-        let idx_size = self.layout.idx_size;
+        let _coeff_size = self.layout.coeff_size;
+        let _idx_size = self.layout.idx_size;
         let row_size = self.layout.row_size;
         let dir = self.layout.dir.clone();
 
@@ -1160,11 +1108,6 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                 b0 = b0.saturating_add(b_len);
                 c0 = c0.saturating_add(c_len);
             }
-
-            // Open term streams at the computed offsets.
-            let mut ts_a = TermStream::<F>::open(&dir, "a", coeff_size, idx_size, a0)?;
-            let mut ts_b = TermStream::<F>::open(&dir, "b", coeff_size, idx_size, b0)?;
-            let mut ts_c = TermStream::<F>::open(&dir, "c", coeff_size, idx_size, c0)?;
 
             let mut row_idx = c_start;
             while row_idx < c_end {
