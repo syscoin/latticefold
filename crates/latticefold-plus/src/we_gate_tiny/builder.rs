@@ -5562,9 +5562,14 @@ fn build_direct_to_merged_unix(
     let surfaces_out = surfaces_mul_local
         .into_iter()
         .map(|s| CmDigitMulSurfaceWiring {
-            inputs0: s.inputs0.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
-            inputs1: s.inputs1.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
-            products: s.products.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
+            short_block_idx: s.short_block_idx,
+            u32_idx: s.u32_idx,
+            products: s.products.into_iter().map(|p| p.map(to_glue_global)).collect(),
+            products13: s
+                .products13
+                .into_iter()
+                .map(|p| p.map(to_glue_global))
+                .collect(),
             sum_digits: s.sum_digits.into_iter().map(to_glue_global).collect(),
             sum_all_pairs_digits: all_sum_digits_global.clone(),
             sum_all_pairs_coeffwise: all_sum_coeffwise_global.clone(),
@@ -5573,10 +5578,8 @@ fn build_direct_to_merged_unix(
     let surfaces_sq_out = surfaces_sq_local
         .into_iter()
         .map(|s| CmDigitMulSqSurfaceWiring {
-            inputs0: s.inputs0.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
-            products10: s.products10.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
-            products11: s.products11.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
-            products20: s.products20.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
+            short_block_idx: s.short_block_idx,
+            u32_idx: s.u32_idx,
             products21: s.products21.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
             products22: s.products22.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
             sum_digits: s.sum_digits.into_iter().map(to_glue_global).collect(),
