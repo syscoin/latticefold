@@ -567,24 +567,24 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
             gb.file_push_c_terms_raw_block(&c_coeffs, &c_idx)
                 .unwrap_or_else(|e| panic!("file-backed append C block failed: {e}"));
 
-            let mut row_words: Vec<u64> = vec![0u64; n.saturating_mul(6)];
+            let mut row_lens: Vec<u32> = vec![0u32; n.saturating_mul(3)];
             for i in 0..n {
-                let a_start = a0 + (a_offs[i] as u64);
-                let a_end = a_start + (a_counts[i] as u64);
-                let b_start = b0 + (b_offs[i] as u64);
-                let b_end = b_start + (b_counts[i] as u64);
-                let c_start = c0 + (c_offs[i] as u64);
-                let c_end = c_start + (c_counts[i] as u64);
-                let w0 = i * 6;
-                row_words[w0 + 0] = a_start;
-                row_words[w0 + 1] = a_end;
-                row_words[w0 + 2] = b_start;
-                row_words[w0 + 3] = b_end;
-                row_words[w0 + 4] = c_start;
-                row_words[w0 + 5] = c_end;
+                let a_len: u32 = a_counts[i]
+                    .try_into()
+                    .unwrap_or_else(|_| panic!("file-backed row a_len overflow u32 (a_len={})", a_counts[i]));
+                let b_len: u32 = b_counts[i]
+                    .try_into()
+                    .unwrap_or_else(|_| panic!("file-backed row b_len overflow u32 (b_len={})", b_counts[i]));
+                let c_len: u32 = c_counts[i]
+                    .try_into()
+                    .unwrap_or_else(|_| panic!("file-backed row c_len overflow u32 (c_len={})", c_counts[i]));
+                let w0 = i * 3;
+                row_lens[w0 + 0] = a_len;
+                row_lens[w0 + 1] = b_len;
+                row_lens[w0 + 2] = c_len;
             }
-            gb.file_push_constraint_rows_block(&row_words)
-                .unwrap_or_else(|e| panic!("file-backed append rows block failed: {e}"));
+            gb.file_push_constraint_lens_block(&row_lens)
+                .unwrap_or_else(|e| panic!("file-backed append row lens block failed: {e}"));
 
             // Advance bases for the next chunk.
             rows0 = rows0.saturating_add(n as u64);

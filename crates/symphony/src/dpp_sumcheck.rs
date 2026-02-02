@@ -173,14 +173,14 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         Ok(())
     }
 
-    /// File-backed: append a block of constraint rows (6 u64 words per row).
-    pub fn file_push_constraint_rows_block(&mut self, words: &[u64]) -> Result<(), String> {
+    /// File-backed: append a block of constraint row lengths (3 u32 words per row).
+    pub fn file_push_constraint_lens_block(&mut self, lens: &[u32]) -> Result<(), String> {
         let sink = self
             .file_sink
             .as_mut()
-            .ok_or_else(|| "file_push_constraint_rows_block called on non-file-backed builder".to_string())?;
-        sink.push_constraint_rows_block(words)?;
-        self.file_rows = self.file_rows.saturating_add((words.len() / 6) as u64);
+            .ok_or_else(|| "file_push_constraint_lens_block called on non-file-backed builder".to_string())?;
+        sink.push_constraint_lens_block(lens)?;
+        self.file_rows = self.file_rows.saturating_add((lens.len() / 3) as u64);
         Ok(())
     }
 

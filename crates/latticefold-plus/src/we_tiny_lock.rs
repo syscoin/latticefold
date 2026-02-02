@@ -214,6 +214,13 @@ fn dr1cs_from_symphony<F: PrimeField + CanonicalDeserialize>(
     }
 
     #[inline]
+    fn read_u32(r: &mut impl IoRead) -> Result<u32, String> {
+        let mut buf = [0u8; 4];
+        r.read_exact(&mut buf).map_err(|e| e.to_string())?;
+        Ok(u32::from_le_bytes(buf))
+    }
+
+    #[inline]
     fn read_terms<F: PrimeField + CanonicalDeserialize>(
         fc: &mut BufReader<File>,
         fi: &mut BufReader<File>,
@@ -230,8 +237,8 @@ fn dr1cs_from_symphony<F: PrimeField + CanonicalDeserialize>(
             let mut rdr = std::io::Cursor::new(&coeff_buf);
             let coeff =
                 F::deserialize_with_mode(&mut rdr, Compress::No, Validate::No).map_err(|e| e.to_string())?;
-            let idx_u64 = read_u64(fi)?;
-            let idx: usize = idx_u64
+            let idx_u32 = read_u32(fi)? as u64;
+            let idx: usize = idx_u32
                 .try_into()
                 .map_err(|_| "dr1cs_from_symphony: var index overflow".to_string())?;
             out.push((coeff, idx));
@@ -263,12 +270,15 @@ fn dr1cs_from_symphony<F: PrimeField + CanonicalDeserialize>(
     let mut prev_b1: u64 = 0;
     let mut prev_c1: u64 = 0;
     for _ in 0..nrows {
-        let a0 = read_u64(&mut fr)?;
-        let a1 = read_u64(&mut fr)?;
-        let b0 = read_u64(&mut fr)?;
-        let b1 = read_u64(&mut fr)?;
-        let c0 = read_u64(&mut fr)?;
-        let c1 = read_u64(&mut fr)?;
+        let a_len = read_u32(&mut fr)? as u64;
+        let b_len = read_u32(&mut fr)? as u64;
+        let c_len = read_u32(&mut fr)? as u64;
+        let a0 = prev_a1;
+        let b0 = prev_b1;
+        let c0 = prev_c1;
+        let a1 = a0.saturating_add(a_len);
+        let b1 = b0.saturating_add(b_len);
+        let c1 = c0.saturating_add(c_len);
 
         // The file-backed writer appends terms/rows in order; ranges should be monotone.
         if a0 != prev_a1 || b0 != prev_b1 || c0 != prev_c1 {

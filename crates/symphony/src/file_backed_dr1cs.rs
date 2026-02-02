@@ -134,6 +134,17 @@ fn term_paths(dir: &Path, which: &str) -> (PathBuf, PathBuf) {
 fn constraints_path(dir: &Path) -> PathBuf {
     dir.join("constraints.bin")
 }
+fn rows_ckpt_path(dir: &Path) -> PathBuf {
+    dir.join("rows_ckpt.bin")
+}
+
+// Row encoding (production-only):
+// - constraints.bin stores (a_len, b_len, c_len) as 3×u32 per constraint => 12 bytes/row
+// - rows_ckpt.bin stores periodic checkpoints for parallel/seek:
+//     (row_idx u64, a0 u64, b0 u64, c0 u64) => 32 bytes/entry
+const ROW_LENS_SIZE: usize = 12;
+const ROW_CKPT_ENTRY_SIZE: usize = 32;
+const ROW_CKPT_STRIDE: u64 = 1 << 20; // 1,048,576 rows (~32KB checkpoints per 1B constraints)
 fn meta_path(dir: &Path) -> PathBuf {
     dir.join("meta.txt")
 }
@@ -340,7 +351,6 @@ pub struct SparseDr1csFileWriter<F> {
     modulus: u64,
     coeff_size: usize,
     idx_size: usize,
-    row_size: usize,
     fc_a: BufWriter<File>,
     fi_a: BufWriter<File>,
     fc_b: BufWriter<File>,
@@ -348,6 +358,7 @@ pub struct SparseDr1csFileWriter<F> {
     fc_c: BufWriter<File>,
     fi_c: BufWriter<File>,
     f_rows: BufWriter<File>,
+    f_rows_ckpt: BufWriter<File>,
     // Running counts (u64 for huge instances).
     nconstraints: u64,
     a_terms: u64,
@@ -355,8 +366,6 @@ pub struct SparseDr1csFileWriter<F> {
     c_terms: u64,
     // Reusable coefficient buffer.
     coeff_buf: Vec<u8>,
-    // Reusable row conversion buffer for u32-row format.
-    row_u32_buf: Vec<u32>,
     _pd: core::marker::PhantomData<F>,
 }
 
@@ -382,15 +391,7 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
         // coeff_size=2 (u16 little-endian canonical representative in [0, p-1]), idx_size=4 (u32 little-endian)
         let coeff_size: usize = 2;
         let idx_size: usize = 4;
-        // Row encoding: default to u32 rows (24B) for throughput/disk, opt-out with env.
-        #[inline]
-        fn cfg_rows_u32_enabled() -> bool {
-            match std::env::var("LFP_FILE_BACKED_ROWS_U32").as_deref() {
-                Ok("0") | Ok("false") | Ok("no") => false,
-                _ => true,
-            }
-        }
-        let row_size: usize = if cfg_rows_u32_enabled() { 24 } else { 48 };
+        // Row encoding (production-only): 12 bytes per constraint (a_len,b_len,c_len as u32).
 
         // Buffered IO is critical: file-backed Poseidon emits huge volumes of small-ish records.
         // Use a large BufWriter capacity by default, configurable via env var.
@@ -437,13 +438,16 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             cap,
             File::create(constraints_path(dir)).map_err(|e| format!("create constraints failed: {e}"))?,
         );
+        let f_rows_ckpt = BufWriter::with_capacity(
+            cap.min(8 * 1024 * 1024),
+            File::create(rows_ckpt_path(dir)).map_err(|e| format!("create rows_ckpt failed: {e}"))?,
+        );
 
         Ok(Self {
             dir: dir.to_path_buf(),
             modulus,
             coeff_size,
             idx_size,
-            row_size,
             fc_a,
             fi_a,
             fc_b,
@@ -451,12 +455,12 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             fc_c,
             fi_c,
             f_rows,
+            f_rows_ckpt,
             nconstraints: 0,
             a_terms: 0,
             b_terms: 0,
             c_terms: 0,
             coeff_buf: vec![0u8; coeff_size],
-            row_u32_buf: Vec::new(),
             _pd: core::marker::PhantomData,
         })
     }
@@ -473,7 +477,7 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
 
     #[inline]
     pub fn row_size(&self) -> usize {
-        self.row_size
+        ROW_LENS_SIZE
     }
 
     #[inline]
@@ -676,80 +680,64 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
         c0: u64,
         c1: u64,
     ) -> Result<(), String> {
-        if self.row_size == 24 {
-            let a0: u32 = a0.try_into().map_err(|_| "row_u32 overflow (a0)".to_string())?;
-            let a1: u32 = a1.try_into().map_err(|_| "row_u32 overflow (a1)".to_string())?;
-            let b0: u32 = b0.try_into().map_err(|_| "row_u32 overflow (b0)".to_string())?;
-            let b1: u32 = b1.try_into().map_err(|_| "row_u32 overflow (b1)".to_string())?;
-            let c0: u32 = c0.try_into().map_err(|_| "row_u32 overflow (c0)".to_string())?;
-            let c1: u32 = c1.try_into().map_err(|_| "row_u32 overflow (c1)".to_string())?;
-            write_u32(&mut self.f_rows, a0).map_err(|e| e.to_string())?;
-            write_u32(&mut self.f_rows, a1).map_err(|e| e.to_string())?;
-            write_u32(&mut self.f_rows, b0).map_err(|e| e.to_string())?;
-            write_u32(&mut self.f_rows, b1).map_err(|e| e.to_string())?;
-            write_u32(&mut self.f_rows, c0).map_err(|e| e.to_string())?;
-            write_u32(&mut self.f_rows, c1).map_err(|e| e.to_string())?;
-        } else {
-            write_u64(&mut self.f_rows, a0).map_err(|e| e.to_string())?;
-            write_u64(&mut self.f_rows, a1).map_err(|e| e.to_string())?;
-            write_u64(&mut self.f_rows, b0).map_err(|e| e.to_string())?;
-            write_u64(&mut self.f_rows, b1).map_err(|e| e.to_string())?;
-            write_u64(&mut self.f_rows, c0).map_err(|e| e.to_string())?;
-            write_u64(&mut self.f_rows, c1).map_err(|e| e.to_string())?;
-        }
-        self.nconstraints += 1;
-        Ok(())
+        let a_len: u32 = a1
+            .saturating_sub(a0)
+            .try_into()
+            .map_err(|_| "row_len overflow u32 (a_len)".to_string())?;
+        let b_len: u32 = b1
+            .saturating_sub(b0)
+            .try_into()
+            .map_err(|_| "row_len overflow u32 (b_len)".to_string())?;
+        let c_len: u32 = c1
+            .saturating_sub(c0)
+            .try_into()
+            .map_err(|_| "row_len overflow u32 (c_len)".to_string())?;
+        self.push_constraint_lens_block(&[a_len, b_len, c_len])
     }
 
-    /// Append a block of constraint rows.
+    /// Append a block of constraint row lengths.
     ///
-    /// `words` must be 6*u64 per row, in order: a0,a1,b0,b1,c0,c1 repeated.
-    pub fn push_constraint_rows_block(&mut self, words: &[u64]) -> Result<(), String> {
-        if (words.len() % 6) != 0 {
-            return Err("push_constraint_rows_block: words length must be multiple of 6".to_string());
+    /// `lens` must be 3*u32 per row, in order: a_len,b_len,c_len repeated.
+    pub fn push_constraint_lens_block(&mut self, lens: &[u32]) -> Result<(), String> {
+        if (lens.len() % 3) != 0 {
+            return Err("push_constraint_lens_block: lens length must be multiple of 3".to_string());
         }
-        if words.is_empty() {
+        if lens.is_empty() {
             return Ok(());
         }
-        let nrows = (words.len() / 6) as u64;
-        let bytes_len = words.len().saturating_mul(self.row_size / 6);
-        #[cfg(unix)]
-        if cfg_pwrite_enabled() && bytes_len >= cfg_pwrite_min_bytes() {
-            self.f_rows.flush().map_err(|e| e.to_string())?;
-            let base = self.nconstraints;
-            let row_off = base.saturating_mul(self.row_size as u64);
-            let f_rows = self.f_rows.get_ref();
-            if self.row_size == 24 {
-                // Convert to u32 words once, then pwrite.
-                self.row_u32_buf.clear();
-                self.row_u32_buf.reserve(words.len());
-                for &w in words {
-                    let v: u32 = w.try_into().map_err(|_| "row_u32 overflow in block".to_string())?;
-                    self.row_u32_buf.push(v);
-                }
-                let row_bytes =
-                    unsafe { core::slice::from_raw_parts(self.row_u32_buf.as_ptr() as *const u8, words.len() * 4) };
-                pwrite_all(f_rows, row_off, row_bytes)?;
-            } else {
-                let row_bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 8) };
-                pwrite_all(f_rows, row_off, row_bytes)?;
+        let nrows = (lens.len() / 3) as u64;
+
+        // Term counters currently point to the end (terms already appended). Reconstruct the start offsets
+        // for the first row in this block by subtracting total lens sums.
+        let mut total_a: u64 = 0;
+        let mut total_b: u64 = 0;
+        let mut total_c: u64 = 0;
+        for i in 0..(lens.len() / 3) {
+            total_a = total_a.saturating_add(lens[3 * i + 0] as u64);
+            total_b = total_b.saturating_add(lens[3 * i + 1] as u64);
+            total_c = total_c.saturating_add(lens[3 * i + 2] as u64);
+        }
+        let mut a0 = self.a_terms.saturating_sub(total_a);
+        let mut b0 = self.b_terms.saturating_sub(total_b);
+        let mut c0 = self.c_terms.saturating_sub(total_c);
+
+        // Emit checkpoints for rows that start at multiples of ROW_CKPT_STRIDE.
+        let mut row_idx = self.nconstraints;
+        for i in 0..(lens.len() / 3) {
+            if (row_idx % ROW_CKPT_STRIDE) == 0 {
+                write_u64(&mut self.f_rows_ckpt, row_idx).map_err(|e| e.to_string())?;
+                write_u64(&mut self.f_rows_ckpt, a0).map_err(|e| e.to_string())?;
+                write_u64(&mut self.f_rows_ckpt, b0).map_err(|e| e.to_string())?;
+                write_u64(&mut self.f_rows_ckpt, c0).map_err(|e| e.to_string())?;
             }
-            self.f_rows.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
-            self.nconstraints = self.nconstraints.saturating_add(nrows);
-            return Ok(());
+            a0 = a0.saturating_add(lens[3 * i + 0] as u64);
+            b0 = b0.saturating_add(lens[3 * i + 1] as u64);
+            c0 = c0.saturating_add(lens[3 * i + 2] as u64);
+            row_idx = row_idx.saturating_add(1);
         }
 
-        if self.row_size == 24 {
-            self.row_u32_buf.clear();
-            self.row_u32_buf.reserve(words.len());
-            for &w in words {
-                let v: u32 = w.try_into().map_err(|_| "row_u32 overflow in block".to_string())?;
-                self.row_u32_buf.push(v);
-            }
-            write_u32_slice_le(&mut self.f_rows, &self.row_u32_buf)?;
-        } else {
-            write_u64_slice_le(&mut self.f_rows, words)?;
-        }
+        // Write lens bytes (12 bytes per row).
+        write_u32_slice_le(&mut self.f_rows, lens)?;
         self.nconstraints = self.nconstraints.saturating_add(nrows);
         Ok(())
     }
@@ -763,6 +751,7 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
         self.fc_c.flush().map_err(|e| e.to_string())?;
         self.fi_c.flush().map_err(|e| e.to_string())?;
         self.f_rows.flush().map_err(|e| e.to_string())?;
+        self.f_rows_ckpt.flush().map_err(|e| e.to_string())?;
 
         // Write meta (human-readable).
         {
@@ -775,12 +764,9 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             writeln!(f, "c_terms={}", self.c_terms).ok();
             writeln!(f, "coeff_size={}", self.coeff_size).ok();
             writeln!(f, "idx_size={}", self.idx_size).ok();
-            writeln!(f, "row_size={}", self.row_size).ok();
-            if self.row_size == 24 {
-                writeln!(f, "format=tiny_u16_u32_rows_u32").ok();
-            } else {
-                writeln!(f, "format=tiny_u16_u32").ok();
-            }
+            writeln!(f, "row_size={}", ROW_LENS_SIZE).ok();
+            writeln!(f, "row_ckpt_stride={}", ROW_CKPT_STRIDE).ok();
+            writeln!(f, "format=tiny_u16_u32_rows_len_u32_v1").ok();
             writeln!(f, "modulus={}", self.modulus).ok();
         }
 
@@ -788,7 +774,7 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             dir: self.dir.clone(),
             coeff_size: self.coeff_size,
             idx_size: self.idx_size,
-            row_size: self.row_size,
+            row_size: ROW_LENS_SIZE,
             nconstraints: self.nconstraints,
             a_terms: self.a_terms,
             b_terms: self.b_terms,
@@ -840,43 +826,41 @@ pub fn dump_sparse_to_dir<F: PrimeField + CanonicalSerialize>(
     let modulus = limbs[0];
     let coeff_size: usize = 2;
     let idx_size: usize = 4;
-    // Keep dump format compatible with writer defaults (u32 rows unless opted out).
-    let row_size: usize = match std::env::var("LFP_FILE_BACKED_ROWS_U32").as_deref() {
-        Ok("0") | Ok("false") | Ok("no") => 48,
-        _ => 24,
-    };
+    // Production row encoding: 12 bytes per constraint (a_len,b_len,c_len as u32).
+    let row_size: usize = ROW_LENS_SIZE;
 
-    // Constraints: for each row store (a_start,a_end,b_start,b_end,c_start,c_end).
+    // Constraints: for each row store (a_len,b_len,c_len) as u32, plus a checkpoint file.
     {
         let mut f = BufWriter::new(File::create(constraints_path(dir)).map_err(|e| format!("create constraints failed: {e}"))?);
+        let mut f_ckpt =
+            BufWriter::new(File::create(rows_ckpt_path(dir)).map_err(|e| format!("create rows_ckpt failed: {e}"))?);
+        let mut a0: u64 = 0;
+        let mut b0: u64 = 0;
+        let mut c0: u64 = 0;
+        let mut row_idx: u64 = 0;
         for row in &inst.constraints {
-            let a0 = row.a.start as u64;
-            let a1 = row.a.end as u64;
-            let b0 = row.b.start as u64;
-            let b1 = row.b.end as u64;
-            let c0 = row.c.start as u64;
-            let c1 = row.c.end as u64;
-            if row_size == 24 {
-                write_u32(&mut f, a0.try_into().map_err(|_| "dump_sparse_to_dir: row_u32 overflow".to_string())?)
-                    .map_err(|e| e.to_string())?;
-                write_u32(&mut f, a1.try_into().map_err(|_| "dump_sparse_to_dir: row_u32 overflow".to_string())?)
-                    .map_err(|e| e.to_string())?;
-                write_u32(&mut f, b0.try_into().map_err(|_| "dump_sparse_to_dir: row_u32 overflow".to_string())?)
-                    .map_err(|e| e.to_string())?;
-                write_u32(&mut f, b1.try_into().map_err(|_| "dump_sparse_to_dir: row_u32 overflow".to_string())?)
-                    .map_err(|e| e.to_string())?;
-                write_u32(&mut f, c0.try_into().map_err(|_| "dump_sparse_to_dir: row_u32 overflow".to_string())?)
-                    .map_err(|e| e.to_string())?;
-                write_u32(&mut f, c1.try_into().map_err(|_| "dump_sparse_to_dir: row_u32 overflow".to_string())?)
-                    .map_err(|e| e.to_string())?;
-            } else {
-                write_u64(&mut f, a0).map_err(|e| e.to_string())?;
-                write_u64(&mut f, a1).map_err(|e| e.to_string())?;
-                write_u64(&mut f, b0).map_err(|e| e.to_string())?;
-                write_u64(&mut f, b1).map_err(|e| e.to_string())?;
-                write_u64(&mut f, c0).map_err(|e| e.to_string())?;
-                write_u64(&mut f, c1).map_err(|e| e.to_string())?;
+            let a_len: u32 = (row.a.end - row.a.start)
+                .try_into()
+                .map_err(|_| "dump_sparse_to_dir: a_len overflow u32".to_string())?;
+            let b_len: u32 = (row.b.end - row.b.start)
+                .try_into()
+                .map_err(|_| "dump_sparse_to_dir: b_len overflow u32".to_string())?;
+            let c_len: u32 = (row.c.end - row.c.start)
+                .try_into()
+                .map_err(|_| "dump_sparse_to_dir: c_len overflow u32".to_string())?;
+            if (row_idx % ROW_CKPT_STRIDE) == 0 {
+                write_u64(&mut f_ckpt, row_idx).map_err(|e| e.to_string())?;
+                write_u64(&mut f_ckpt, a0).map_err(|e| e.to_string())?;
+                write_u64(&mut f_ckpt, b0).map_err(|e| e.to_string())?;
+                write_u64(&mut f_ckpt, c0).map_err(|e| e.to_string())?;
             }
+            write_u32(&mut f, a_len).map_err(|e| e.to_string())?;
+            write_u32(&mut f, b_len).map_err(|e| e.to_string())?;
+            write_u32(&mut f, c_len).map_err(|e| e.to_string())?;
+            a0 = a0.saturating_add(a_len as u64);
+            b0 = b0.saturating_add(b_len as u64);
+            c0 = c0.saturating_add(c_len as u64);
+            row_idx = row_idx.saturating_add(1);
         }
     }
 
@@ -922,11 +906,8 @@ pub fn dump_sparse_to_dir<F: PrimeField + CanonicalSerialize>(
         writeln!(f, "coeff_size={}", coeff_size).ok();
         writeln!(f, "idx_size={}", idx_size).ok();
         writeln!(f, "row_size={}", row_size).ok();
-        if row_size == 24 {
-            writeln!(f, "format=tiny_u16_u32_rows_u32").ok();
-        } else {
-            writeln!(f, "format=tiny_u16_u32").ok();
-        }
+        writeln!(f, "row_ckpt_stride={}", ROW_CKPT_STRIDE).ok();
+        writeln!(f, "format=tiny_u16_u32_rows_len_u32_v1").ok();
         writeln!(f, "modulus={}", modulus).ok();
     }
 
@@ -1108,57 +1089,117 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
             s = e;
         }
 
-        use rayon::prelude::*;
-        ranges
-            .into_par_iter()
-            .try_for_each(|(c_start, c_end)| -> Result<(), String> {
-                // Open constraints and seek to start row.
-                let mut fr = File::open(constraints_path(&dir)).map_err(|e| format!("open constraints failed: {e}"))?;
-                fr.seek(std::io::SeekFrom::Start(c_start.saturating_mul(row_size as u64)))
-                    .map_err(|e| format!("seek constraints failed: {e}"))?;
-                let mut rows = BufReader::with_capacity(8 * 1024 * 1024, fr);
+        // Row encoding is fixed (production): (a_len,b_len,c_len) as 3×u32 per row.
+        if row_size != ROW_LENS_SIZE {
+            return Err(format!(
+                "file-backed check: unsupported row_size={} (expected {})",
+                row_size, ROW_LENS_SIZE
+            ));
+        }
 
-                // Read first row to get starting term pointers.
-                let mut first = true;
-                let mut ts_a: Option<TermStream<F>> = None;
-                let mut ts_b: Option<TermStream<F>> = None;
-                let mut ts_c: Option<TermStream<F>> = None;
-
-                for ci in c_start..c_end {
-                    let (a0, a1, b0, b1, c0, c1) = if row_size == 24 {
-                        let a0 = read_u32(&mut rows).map_err(|e| format!("read constraint row failed: {e}"))? as u64;
-                        let a1 = read_u32(&mut rows).map_err(|e| format!("read constraint row failed: {e}"))? as u64;
-                        let b0 = read_u32(&mut rows).map_err(|e| format!("read constraint row failed: {e}"))? as u64;
-                        let b1 = read_u32(&mut rows).map_err(|e| format!("read constraint row failed: {e}"))? as u64;
-                        let c0 = read_u32(&mut rows).map_err(|e| format!("read constraint row failed: {e}"))? as u64;
-                        let c1 = read_u32(&mut rows).map_err(|e| format!("read constraint row failed: {e}"))? as u64;
-                        (a0, a1, b0, b1, c0, c1)
-                    } else {
-                        let a0 = read_u64(&mut rows).map_err(|e| format!("read constraint row failed: {e}"))?;
-                        let a1 = read_u64(&mut rows).map_err(|e| format!("read constraint row failed: {e}"))?;
-                        let b0 = read_u64(&mut rows).map_err(|e| format!("read constraint row failed: {e}"))?;
-                        let b1 = read_u64(&mut rows).map_err(|e| format!("read constraint row failed: {e}"))?;
-                        let c0 = read_u64(&mut rows).map_err(|e| format!("read constraint row failed: {e}"))?;
-                        let c1 = read_u64(&mut rows).map_err(|e| format!("read constraint row failed: {e}"))?;
-                        (a0, a1, b0, b1, c0, c1)
-                    };
-
-                    if first {
-                        ts_a = Some(TermStream::<F>::open(&dir, "a", coeff_size, idx_size, a0)?);
-                        ts_b = Some(TermStream::<F>::open(&dir, "b", coeff_size, idx_size, b0)?);
-                        ts_c = Some(TermStream::<F>::open(&dir, "c", coeff_size, idx_size, c0)?);
-                        first = false;
+        // Load checkpoints (best-effort). If missing, we fall back to ckpt_row=0.
+        let ckpts: Vec<(u64, u64, u64, u64)> = {
+            let p = rows_ckpt_path(&dir);
+            match File::open(&p) {
+                Ok(f) => {
+                    let mut r = BufReader::with_capacity(8 * 1024 * 1024, f);
+                    let mut out = Vec::new();
+                    loop {
+                        let row_idx = match read_u64(&mut r) {
+                            Ok(v) => v,
+                            Err(_) => break,
+                        };
+                        let a0 = read_u64(&mut r).map_err(|e| e.to_string())?;
+                        let b0 = read_u64(&mut r).map_err(|e| e.to_string())?;
+                        let c0 = read_u64(&mut r).map_err(|e| e.to_string())?;
+                        out.push((row_idx, a0, b0, c0));
                     }
-
-                    let a = ts_a.as_mut().unwrap().eval_range("a", a0, a1, assignment)?;
-                    let b = ts_b.as_mut().unwrap().eval_range("b", b0, b1, assignment)?;
-                    let c = ts_c.as_mut().unwrap().eval_range("c", c0, c1, assignment)?;
-                    if a * b != c {
-                        return Err(format!("constraint {ci} failed"));
-                    }
+                    out
                 }
-                Ok(())
-            })
+                Err(_) => Vec::new(),
+            }
+        };
+
+        #[inline]
+        fn ckpt_lookup(ckpts: &[(u64, u64, u64, u64)], row: u64) -> (u64, u64, u64, u64) {
+            if ckpts.is_empty() {
+                return (0, 0, 0, 0);
+            }
+            let mut lo = 0usize;
+            let mut hi = ckpts.len();
+            while lo + 1 < hi {
+                let mid = (lo + hi) / 2;
+                if ckpts[mid].0 <= row {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            // If the first ckpt is after row (shouldn't happen), return 0.
+            if ckpts[lo].0 > row {
+                (0, 0, 0, 0)
+            } else {
+                ckpts[lo]
+            }
+        }
+
+        use rayon::prelude::*;
+        ranges.into_par_iter().try_for_each(|(c_start, c_end)| -> Result<(), String> {
+            let ckpt_row = if ckpts.is_empty() {
+                0
+            } else {
+                (c_start / ROW_CKPT_STRIDE) * ROW_CKPT_STRIDE
+            };
+            let (row0, mut a0, mut b0, mut c0) = ckpt_lookup(&ckpts, ckpt_row);
+            debug_assert!(row0 <= ckpt_row);
+            // If ckpt file didn't have the exact row, fall back to 0.
+            if row0 != ckpt_row {
+                a0 = 0;
+                b0 = 0;
+                c0 = 0;
+            }
+
+            let mut fr = File::open(constraints_path(&dir)).map_err(|e| format!("open constraints failed: {e}"))?;
+            fr.seek(std::io::SeekFrom::Start(ckpt_row.saturating_mul(ROW_LENS_SIZE as u64)))
+                .map_err(|e| format!("seek constraints failed: {e}"))?;
+            let mut rows = BufReader::with_capacity(8 * 1024 * 1024, fr);
+
+            // Advance from ckpt_row to c_start (skip evaluation) to compute starting offsets.
+            for _ in ckpt_row..c_start {
+                let a_len = read_u32(&mut rows).map_err(|e| format!("read row lens failed: {e}"))? as u64;
+                let b_len = read_u32(&mut rows).map_err(|e| format!("read row lens failed: {e}"))? as u64;
+                let c_len = read_u32(&mut rows).map_err(|e| format!("read row lens failed: {e}"))? as u64;
+                a0 = a0.saturating_add(a_len);
+                b0 = b0.saturating_add(b_len);
+                c0 = c0.saturating_add(c_len);
+            }
+
+            // Open term streams at the computed offsets.
+            let mut ts_a = TermStream::<F>::open(&dir, "a", coeff_size, idx_size, a0)?;
+            let mut ts_b = TermStream::<F>::open(&dir, "b", coeff_size, idx_size, b0)?;
+            let mut ts_c = TermStream::<F>::open(&dir, "c", coeff_size, idx_size, c0)?;
+
+            let mut row_idx = c_start;
+            while row_idx < c_end {
+                let a_len = read_u32(&mut rows).map_err(|e| format!("read row lens failed: {e}"))? as u64;
+                let b_len = read_u32(&mut rows).map_err(|e| format!("read row lens failed: {e}"))? as u64;
+                let c_len = read_u32(&mut rows).map_err(|e| format!("read row lens failed: {e}"))? as u64;
+                let a1 = a0.saturating_add(a_len);
+                let b1 = b0.saturating_add(b_len);
+                let c1 = c0.saturating_add(c_len);
+                let a = ts_a.eval_range("a", a0, a1, assignment)?;
+                let b = ts_b.eval_range("b", b0, b1, assignment)?;
+                let c = ts_c.eval_range("c", c0, c1, assignment)?;
+                if a * b != c {
+                    return Err(format!("constraint {row_idx} failed"));
+                }
+                a0 = a1;
+                b0 = b1;
+                c0 = c1;
+                row_idx = row_idx.saturating_add(1);
+            }
+            Ok(())
+        })
     }
 }
 
@@ -1287,9 +1328,9 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                 coeff_size, idx_size
             ));
         }
-        if row_size != 24 && row_size != 48 {
+        if row_size != ROW_LENS_SIZE {
             return Err(format!(
-                "merge_file_backed_sparse_dr1cs_share_one: unsupported row_size={row_size} (expected 24 or 48)"
+                "merge_file_backed_sparse_dr1cs_share_one: unsupported row_size={row_size} (expected {ROW_LENS_SIZE})"
             ));
         }
 
@@ -1394,7 +1435,7 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                 .saturating_mul(idx_size as u128)
                 .min(u64::MAX as u128) as u64;
             let bytes_rows = (tot_rows as u128)
-                .saturating_mul(row_size as u128)
+                .saturating_mul(ROW_LENS_SIZE as u128)
                 .min(u64::MAX as u128) as u64;
 
             // Open output files and pre-size them to allow concurrent pwrite.
@@ -1546,74 +1587,25 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                         Ok(())
                     }
                     JobKind::Rows => {
+                        // Row encoding is length-only; rows do not require any remapping.
                         let in_path = constraints_path(&inst.layout.dir);
                         let mut r = BufReader::with_capacity(
                             MERGE_BUF_BYTES.min(STREAM_CHUNK_BYTES),
                             File::open(in_path).map_err(|e| format!("open constraints failed: {e}"))?,
                         );
-                        let base_a = a_off[job.pi];
-                        let base_b = b_off[job.pi];
-                        let base_c = c_off[job.pi];
                         let base_row = row_off[job.pi];
-
-                        let mut remaining = inst.layout.nconstraints;
-                        let row_size = inst.layout.row_size;
-                        let block_rows = (STREAM_CHUNK_BYTES / row_size).max(1) as u64;
-                        let mut buf = vec![0u8; (block_rows as usize) * row_size];
-                        let mut out_row_pos = base_row;
-                        while remaining > 0 {
-                            let take = remaining.min(block_rows);
-                            let bytes = (take as usize) * row_size;
-                            r.read_exact(&mut buf[..bytes]).map_err(|e| e.to_string())?;
-                            for i in 0..(take as usize) {
-                                let j = i * row_size;
-                                if row_size == 24 {
-                                    let read6 = |k: usize| -> u32 {
-                                        u32::from_le_bytes(buf[j + 4 * k..j + 4 * (k + 1)].try_into().unwrap())
-                                    };
-                                    let a0 = read6(0) as u64;
-                                    let a1 = read6(1) as u64;
-                                    let b0 = read6(2) as u64;
-                                    let b1 = read6(3) as u64;
-                                    let c0 = read6(4) as u64;
-                                    let c1 = read6(5) as u64;
-                                    let w6 = |buf: &mut [u8], k: usize, v: u64| {
-                                        let vv: u32 = v.try_into().expect("merge_file_backed: row_u32 overflow");
-                                        buf[j + 4 * k..j + 4 * (k + 1)].copy_from_slice(&vv.to_le_bytes());
-                                    };
-                                    w6(&mut buf, 0, base_a + a0);
-                                    w6(&mut buf, 1, base_a + a1);
-                                    w6(&mut buf, 2, base_b + b0);
-                                    w6(&mut buf, 3, base_b + b1);
-                                    w6(&mut buf, 4, base_c + c0);
-                                    w6(&mut buf, 5, base_c + c1);
-                                } else {
-                                    let read6 = |k: usize| -> u64 {
-                                        u64::from_le_bytes(buf[j + 8 * k..j + 8 * (k + 1)].try_into().unwrap())
-                                    };
-                                    let a0 = read6(0);
-                                    let a1 = read6(1);
-                                    let b0 = read6(2);
-                                    let b1 = read6(3);
-                                    let c0 = read6(4);
-                                    let c1 = read6(5);
-                                    let mut w6 = |k: usize, x: u64| {
-                                        buf[j + 8 * k..j + 8 * (k + 1)].copy_from_slice(&x.to_le_bytes());
-                                    };
-                                    w6(0, base_a + a0);
-                                    w6(1, base_a + a1);
-                                    w6(2, base_b + b0);
-                                    w6(3, base_b + b1);
-                                    w6(4, base_c + c0);
-                                    w6(5, base_c + c1);
-                                }
+                        let out_base = (base_row as u128)
+                            .saturating_mul(ROW_LENS_SIZE as u128)
+                            .min(u64::MAX as u128) as u64;
+                        let mut buf = vec![0u8; STREAM_CHUNK_BYTES];
+                        let mut wrote: u64 = 0;
+                        loop {
+                            let n = r.read(&mut buf).map_err(|e| e.to_string())?;
+                            if n == 0 {
+                                break;
                             }
-                            let out_off = (out_row_pos as u128)
-                                .saturating_mul(row_size as u128)
-                                .min(u64::MAX as u128) as u64;
-                            pwrite_all(&out_rows, out_off, &buf[..bytes])?;
-                            out_row_pos = out_row_pos.saturating_add(take);
-                            remaining -= take;
+                            pwrite_all(&out_rows, out_base.saturating_add(wrote), &buf[..n])?;
+                            wrote = wrote.saturating_add(n as u64);
                         }
                         Ok(())
                     }
@@ -1658,7 +1650,7 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                     let mut b_idx = vec![0u8; batch.len() * idx_size];
                     let mut c_coeff = vec![0u8; batch.len() * coeff_size];
                     let mut c_idx = vec![0u8; batch.len() * idx_size];
-                    let mut rows = vec![0u8; batch.len() * row_size];
+                    let mut rows = vec![0u8; batch.len() * ROW_LENS_SIZE];
 
                     for (j, &(x, y)) in batch.iter().enumerate() {
                         // A pool: [+1*x, -1*y]
@@ -1682,36 +1674,12 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                         c_idx[j * idx_size..(j + 1) * idx_size].copy_from_slice(&0u32.to_le_bytes());
 
                         // Constraint row for this equality.
-                        let eq_i = (i0 + j) as u64;
-                        let a0 = base_a_terms + 2 * eq_i;
-                        let a1 = a0 + 2;
-                        let b0 = base_b_terms + eq_i;
-                        let b1 = b0 + 1;
-                        let c0 = base_c_terms + eq_i;
-                        let c1 = c0 + 1;
-                        let row = &mut rows[j * row_size..(j + 1) * row_size];
-                        if row_size == 24 {
-                            let w6 = |buf: &mut [u8], k: usize, v: u64| {
-                                let vv: u32 = v.try_into().expect("merge_file_backed: row_u32 overflow");
-                                buf[4 * k..4 * (k + 1)].copy_from_slice(&vv.to_le_bytes());
-                            };
-                            w6(row, 0, a0);
-                            w6(row, 1, a1);
-                            w6(row, 2, b0);
-                            w6(row, 3, b1);
-                            w6(row, 4, c0);
-                            w6(row, 5, c1);
-                        } else {
-                            let w6 = |buf: &mut [u8], k: usize, v: u64| {
-                                buf[8 * k..8 * (k + 1)].copy_from_slice(&v.to_le_bytes());
-                            };
-                            w6(row, 0, a0);
-                            w6(row, 1, a1);
-                            w6(row, 2, b0);
-                            w6(row, 3, b1);
-                            w6(row, 4, c0);
-                            w6(row, 5, c1);
-                        }
+                        let _eq_i = (i0 + j) as u64;
+                        // Row lens for equality constraint: A has 2 terms, B has 1, C has 1.
+                        let row = &mut rows[j * ROW_LENS_SIZE..(j + 1) * ROW_LENS_SIZE];
+                        row[0..4].copy_from_slice(&(2u32).to_le_bytes());
+                        row[4..8].copy_from_slice(&(1u32).to_le_bytes());
+                        row[8..12].copy_from_slice(&(1u32).to_le_bytes());
                     }
 
                     // Offsets (in bytes) to write this batch.
@@ -1735,7 +1703,7 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                         .saturating_mul(idx_size as u128)
                         .min(u64::MAX as u128) as u64;
                     let rows_off = ((base_rows + eq0) as u128)
-                        .saturating_mul(row_size as u128)
+                        .saturating_mul(ROW_LENS_SIZE as u128)
                         .min(u64::MAX as u128) as u64;
 
                     pwrite_all(&out_fc_a, a_coeff_off, &a_coeff)?;
@@ -1752,6 +1720,50 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                 let _ = (timing, extra_eqs, t_eq);
             }
 
+            // Write merged row checkpoints (small, but critical for fast parallel checking).
+            // IMPORTANT: if we reused a base dir and renamed it to out_dir, reading ckpts must happen
+            // before truncating the destination ckpt file.
+            {
+                let mut merged_ckpts: Vec<(u64, u64, u64, u64)> = Vec::new();
+                for (pi, (inst, _asg)) in parts.iter().enumerate() {
+                    let base_row = row_off[pi];
+                    let base_a = a_off[pi];
+                    let base_b = b_off[pi];
+                    let base_c = c_off[pi];
+                    let mut r = BufReader::with_capacity(
+                        8 * 1024 * 1024,
+                        File::open(rows_ckpt_path(&inst.layout.dir))
+                            .map_err(|e| format!("open rows_ckpt failed: {e}"))?,
+                    );
+                    loop {
+                        let row_i = match read_u64(&mut r) {
+                            Ok(v) => v,
+                            Err(_) => break,
+                        };
+                        let a0 = read_u64(&mut r).map_err(|e| e.to_string())?;
+                        let b0 = read_u64(&mut r).map_err(|e| e.to_string())?;
+                        let c0 = read_u64(&mut r).map_err(|e| e.to_string())?;
+                        merged_ckpts.push((
+                            base_row.saturating_add(row_i),
+                            base_a.saturating_add(a0),
+                            base_b.saturating_add(b0),
+                            base_c.saturating_add(c0),
+                        ));
+                    }
+                }
+                merged_ckpts.sort_by_key(|x| x.0);
+                let mut ckpt_out = BufWriter::with_capacity(
+                    8 * 1024 * 1024,
+                    File::create(rows_ckpt_path(&out_dir)).map_err(|e| format!("create rows_ckpt failed: {e}"))?,
+                );
+                for (row_i, a0, b0, c0) in merged_ckpts {
+                    write_u64(&mut ckpt_out, row_i).map_err(|e| e.to_string())?;
+                    write_u64(&mut ckpt_out, a0).map_err(|e| e.to_string())?;
+                    write_u64(&mut ckpt_out, b0).map_err(|e| e.to_string())?;
+                    write_u64(&mut ckpt_out, c0).map_err(|e| e.to_string())?;
+                }
+            }
+
             // Write meta (human-readable).
             {
                 let mut f =
@@ -1763,12 +1775,9 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                 writeln!(f, "c_terms={}", tot_c_terms).ok();
                 writeln!(f, "coeff_size={}", coeff_size).ok();
                 writeln!(f, "idx_size={}", idx_size).ok();
-                writeln!(f, "row_size={}", row_size).ok();
-                if row_size == 24 {
-                    writeln!(f, "format=tiny_u16_u32_rows_u32").ok();
-                } else {
-                    writeln!(f, "format=tiny_u16_u32").ok();
-                }
+                writeln!(f, "row_size={}", ROW_LENS_SIZE).ok();
+                writeln!(f, "row_ckpt_stride={}", ROW_CKPT_STRIDE).ok();
+                writeln!(f, "format=tiny_u16_u32_rows_len_u32_v1").ok();
             }
 
             if timing {
@@ -1779,7 +1788,7 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                 dir: out_dir.clone(),
                 coeff_size,
                 idx_size,
-                row_size,
+                row_size: ROW_LENS_SIZE,
                 nconstraints: tot_rows,
                 a_terms: tot_a_terms,
                 b_terms: tot_b_terms,
