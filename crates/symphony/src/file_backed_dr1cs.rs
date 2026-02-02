@@ -1578,15 +1578,16 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                         let out_base = (base_row as u128)
                             .saturating_mul(ROW_LENS_SIZE as u128)
                             .min(u64::MAX as u128) as u64;
+                        let want = (inst.layout.nconstraints as u128)
+                            .saturating_mul(ROW_LENS_SIZE as u128)
+                            .min(u64::MAX as u128) as u64;
                         let mut buf = vec![0u8; STREAM_CHUNK_BYTES];
                         let mut wrote: u64 = 0;
-                        loop {
-                            let n = r.read(&mut buf).map_err(|e| e.to_string())?;
-                            if n == 0 {
-                                break;
-                            }
-                            pwrite_all(&out_rows, out_base.saturating_add(wrote), &buf[..n])?;
-                            wrote = wrote.saturating_add(n as u64);
+                        while wrote < want {
+                            let take = (want - wrote).min(buf.len() as u64) as usize;
+                            r.read_exact(&mut buf[..take]).map_err(|e| e.to_string())?;
+                            pwrite_all(&out_rows, out_base.saturating_add(wrote), &buf[..take])?;
+                            wrote = wrote.saturating_add(take as u64);
                         }
                         Ok(())
                     }
