@@ -1711,7 +1711,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
             use super::cm_ir::{
                 bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir, goldilocks_mul_const_mod_p_digits_bal4_ir,
                 goldilocks_mul_mod_p_digits_bal4_ir, goldilocks_sub_mod_p_digits_bal4_ir, lower_ir_into_builder,
-                        merge_disjoint_ir_with_scalar_outputs, IrBuilder, VarRef as IrVarRef,
+                IrBuilder, VarRef as IrVarRef,
             };
 
             let cols = ring_dim;
@@ -1721,7 +1721,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                 let batch_len = c1 - c0;
                 let base_asg: &[F257] = &glue.gb.assignment;
 
-                let frags: Vec<(_, ([IrVarRef; 17], usize))> = (0..batch_len)
+                let frags: Vec<(_, [IrVarRef; 17], usize)> = (0..batch_len)
                     .into_par_iter()
                     .map(|c_local| -> Result<_, String> {
                         let col = c0 + c_local;
@@ -1769,14 +1769,12 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                             }
 
                             let ct16 = ib.bal4_to_bal16_digits_cached(&ct4);
-                        Ok((ib.ir, (ct16, col)))
+                        Ok((ib.ir, ct16, col))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
-                // Merge all per-column IR shards and lower once (lets file-backed lowering go wide).
-                let (merged_ir, outs) = merge_disjoint_ir_with_scalar_outputs(frags)?;
-                let lowered = lower_ir_into_builder(&mut glue.gb, merged_ir);
-                for (ct16_ir, col) in outs {
+                for (ir, ct16_ir, col) in frags {
+                    let lowered = lower_ir_into_builder(&mut glue.gb, ir);
                     let ct: GoldilocksScalar = core::array::from_fn(|k| lowered.map_var(ct16_ir[k]));
                     let expected = if ni == 0 {
                         eval_v[col]
@@ -1788,7 +1786,10 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                             .ok_or("tiny gate: eval.c coeff index oob (rgchk)")?
                     };
                     for di in 0..17 {
-                        glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, ct[di]), (-F257::ONE, expected[di])]);
+                        glue.gb.enforce_lc_times_one_eq_const(vec![
+                            (F257::ONE, ct[di]),
+                            (-F257::ONE, expected[di]),
+                        ]);
                     }
                 }
             }
@@ -1981,8 +1982,8 @@ fn compute_cm_shared_precomp_base(
                 None
                 } else {
                     use super::cm_ir::{
-                        bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir, lower_ir_into_builder,
-                        merge_disjoint_ir_with_ring_outputs, ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir, IrBuilder,
+                        bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir,
+                        lower_ir_into_builder, ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir, IrBuilder,
                         VarRef as IrVarRef,
                     };
 
@@ -2119,12 +2120,11 @@ fn compute_cm_shared_precomp_base(
                             u_ir_build_time = u_ir_build_time.saturating_add(t_build.elapsed());
                             u_frag_count = u_frag_count.saturating_add(frags.len());
 
-                            // Merge shards then lower once; this removes serial "append" bottlenecks.
+                            // Lower shards and reduce their outputs with a tree of ring additions.
                             let t_lower = Instant::now();
-                            let (merged_ir, outs) = merge_disjoint_ir_with_ring_outputs(frags)?;
-                            let lowered = lower_ir_into_builder(&mut glue.gb, merged_ir);
-                            let mut partials: Vec<RingDigits> = Vec::with_capacity(outs.len());
-                            for out_ir in outs {
+                            let mut partials: Vec<RingDigits> = Vec::with_capacity(frags.len());
+                            for (ir, out_ir) in frags {
+                                let lowered = lower_ir_into_builder(&mut glue.gb, ir);
                                 partials.push(map_ring_out(&out_ir, &lowered));
                             }
                             // Tree reduction (pairwise) to keep addition depth logarithmic.
