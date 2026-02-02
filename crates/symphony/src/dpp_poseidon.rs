@@ -656,14 +656,6 @@ struct Dr1csBuilder<F: PrimeField> {
     file_a_terms: u64,
     file_b_terms: u64,
     file_c_terms: u64,
-    // File-backed staging buffers (to avoid per-term tiny writes).
-    st_a_coeff: Vec<u8>,
-    st_a_idx: Vec<u32>,
-    st_b_coeff: Vec<u8>,
-    st_b_idx: Vec<u32>,
-    st_c_coeff: Vec<u8>,
-    st_c_idx: Vec<u32>,
-    st_rows: Vec<u64>, // 6 words per constraint row
 }
 
 impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
@@ -686,13 +678,6 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             file_a_terms: 0,
             file_b_terms: 0,
             file_c_terms: 0,
-            st_a_coeff: Vec::new(),
-            st_a_idx: Vec::new(),
-            st_b_coeff: Vec::new(),
-            st_b_idx: Vec::new(),
-            st_c_coeff: Vec::new(),
-            st_c_idx: Vec::new(),
-            st_rows: Vec::new(),
         }
     }
 
@@ -705,76 +690,6 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
     #[inline]
     fn is_file_backed(&self) -> bool {
         self.file_sink.is_some()
-    }
-
-    #[inline]
-    fn stage_flush_bytes_limit() -> usize {
-        let mb: usize = std::env::var("LFP_FILE_BACKED_STAGE_MB")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256);
-        (mb.saturating_mul(1024 * 1024)).max(8 * 1024 * 1024)
-    }
-
-    #[inline]
-    fn staged_bytes(&self) -> usize {
-        self.st_a_coeff.len()
-            + self.st_b_coeff.len()
-            + self.st_c_coeff.len()
-            + self.st_a_idx.len().saturating_mul(4)
-            + self.st_b_idx.len().saturating_mul(4)
-            + self.st_c_idx.len().saturating_mul(4)
-            + self.st_rows.len().saturating_mul(8)
-    }
-
-    #[inline]
-    fn flush_file_staging(&mut self) -> Result<(), String> {
-        if self.file_sink.is_none() {
-            return Ok(());
-        }
-        if self.st_rows.is_empty()
-            && self.st_a_idx.is_empty()
-            && self.st_b_idx.is_empty()
-            && self.st_c_idx.is_empty()
-        {
-            return Ok(());
-        }
-        let sink = self
-            .file_sink
-            .as_mut()
-            .expect("file-backed sink vanished unexpectedly");
-        if !self.st_a_idx.is_empty() {
-            sink.push_a_terms_raw_block(&self.st_a_coeff, &self.st_a_idx)?;
-            self.file_a_terms = self.file_a_terms.saturating_add(self.st_a_idx.len() as u64);
-            self.st_a_coeff.clear();
-            self.st_a_idx.clear();
-        }
-        if !self.st_b_idx.is_empty() {
-            sink.push_b_terms_raw_block(&self.st_b_coeff, &self.st_b_idx)?;
-            self.file_b_terms = self.file_b_terms.saturating_add(self.st_b_idx.len() as u64);
-            self.st_b_coeff.clear();
-            self.st_b_idx.clear();
-        }
-        if !self.st_c_idx.is_empty() {
-            sink.push_c_terms_raw_block(&self.st_c_coeff, &self.st_c_idx)?;
-            self.file_c_terms = self.file_c_terms.saturating_add(self.st_c_idx.len() as u64);
-            self.st_c_coeff.clear();
-            self.st_c_idx.clear();
-        }
-        if !self.st_rows.is_empty() {
-            sink.push_constraint_rows_block(&self.st_rows)?;
-            self.file_rows = self.file_rows.saturating_add((self.st_rows.len() / 6) as u64);
-            self.st_rows.clear();
-        }
-        Ok(())
-    }
-
-    #[inline]
-    fn maybe_flush_file_staging(&mut self) -> Result<(), String> {
-        if self.file_sink.is_some() && self.staged_bytes() >= Self::stage_flush_bytes_limit() {
-            self.flush_file_staging()?;
-        }
-        Ok(())
     }
 
     #[inline]
@@ -798,35 +713,33 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
 
     fn add_constraint(&mut self, a: Vec<(F, usize)>, b: Vec<(F, usize)>, c: Vec<(F, usize)>) {
         if let Some(sink) = self.file_sink.as_mut() {
-            // Buffer terms/rows and flush in large blocks for throughput.
-            debug_assert_eq!(sink.coeff_size(), 2, "tiny_u16_u32 expected");
-
-            let a0 = self.file_a_terms + (self.st_a_idx.len() as u64);
+            let a0 = self.file_a_terms;
             for (coef, idx) in a.iter() {
-                let bytes = sink.encode_coeff_u16_le_bytes(coef).expect("encode coeff failed");
-                self.st_a_coeff.extend_from_slice(&bytes);
-                self.st_a_idx.push(Self::idx_u32(*idx));
+                sink.push_a_term(coef, Self::idx_u32(*idx))
+                    .expect("file-backed dr1cs write failed (a_term)");
             }
             let a1 = a0 + (a.len() as u64);
+            self.file_a_terms = a1;
 
-            let b0 = self.file_b_terms + (self.st_b_idx.len() as u64);
+            let b0 = self.file_b_terms;
             for (coef, idx) in b.iter() {
-                let bytes = sink.encode_coeff_u16_le_bytes(coef).expect("encode coeff failed");
-                self.st_b_coeff.extend_from_slice(&bytes);
-                self.st_b_idx.push(Self::idx_u32(*idx));
+                sink.push_b_term(coef, Self::idx_u32(*idx))
+                    .expect("file-backed dr1cs write failed (b_term)");
             }
             let b1 = b0 + (b.len() as u64);
+            self.file_b_terms = b1;
 
-            let c0 = self.file_c_terms + (self.st_c_idx.len() as u64);
+            let c0 = self.file_c_terms;
             for (coef, idx) in c.iter() {
-                let bytes = sink.encode_coeff_u16_le_bytes(coef).expect("encode coeff failed");
-                self.st_c_coeff.extend_from_slice(&bytes);
-                self.st_c_idx.push(Self::idx_u32(*idx));
+                sink.push_c_term(coef, Self::idx_u32(*idx))
+                    .expect("file-backed dr1cs write failed (c_term)");
             }
             let c1 = c0 + (c.len() as u64);
+            self.file_c_terms = c1;
 
-            self.st_rows.extend_from_slice(&[a0, a1, b0, b1, c0, c1]);
-            self.maybe_flush_file_staging().expect("file-backed dr1cs flush failed");
+            sink.push_constraint_row(a0, a1, b0, b1, c0, c1)
+                .expect("file-backed dr1cs write failed (constraint)");
+            self.file_rows += 1;
         } else {
             let a0 = self.a_terms.len();
             self.a_terms.extend(a);
@@ -964,7 +877,6 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
 
     fn into_file_backed_instance(self) -> Result<(FileBackedSparseDr1csInstance<F>, Vec<F>), String> {
         let mut me = self;
-        me.flush_file_staging()?;
         let sink = me
             .file_sink
             .take()
