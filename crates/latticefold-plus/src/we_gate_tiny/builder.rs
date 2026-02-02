@@ -554,7 +554,7 @@ fn build_count_plan(
     wiring: &TinyCoinOpWiring,
     pairs: &[(usize, usize)],
     extra_witness: &TinyExtraWitness,
-) -> Result<(Vec<F257>, PoseidonDr1csWiring, GlueCtx, Vec<GlueCtx>, TinyGatePlan), String> {
+) -> Result<(Arc<Vec<F257>>, PoseidonDr1csWiring, GlueCtx, Vec<GlueCtx>, TinyGatePlan), String> {
     // Poseidon (count-only sharded, no disk writes).
     let shard_permutes = tiny_gate_poseidon_shard_permutes(cfg, ops);
     let (pose_asg, pose_wiring, pose_counts) =
@@ -819,10 +819,6 @@ fn build_count_plan(
         total_b_terms,
         total_c_terms,
     };
-
-    // Recover owned pose assignment (avoid cloning).
-    let pose_asg = Arc::try_unwrap(pose_asg)
-        .map_err(|_| "tiny gate: internal error: pose assignment still shared at count plan")?;
 
     Ok((pose_asg, pose_wiring, glue, extra_glues, plan))
 }
