@@ -19,6 +19,8 @@ use std::sync::OnceLock;
 
 use crate::dpp_poseidon::{Constraint, SparseDr1csInstance};
 use crate::file_backed_dr1cs::{FileBackedSparseDr1csInstance, SparseDr1csFileWriter};
+#[cfg(unix)]
+use crate::file_backed_dr1cs::FileBackedRangeWriter;
 
 #[derive(Clone, Debug, Default)]
 pub struct Dr1csProfileCounts {
@@ -36,11 +38,27 @@ pub struct Dr1csBuilder<F: PrimeField> {
     /// Optional file-backed sink for constraints/term pools.
     ///
     /// When present, `rows/a_terms/b_terms/c_terms` are not populated (to avoid giant Vec pools).
-    file_sink: Option<SparseDr1csFileWriter<F>>,
+    file_sink: Option<Dr1csFileSink<F>>,
     file_rows: u64,
     file_a_terms: u64,
     file_b_terms: u64,
     file_c_terms: u64,
+    /// Var index remap for direct-to-merged writing.
+    ///
+    /// Global var idx = 0 if local==0 else local + file_var_tail_off.
+    file_var_tail_off: u32,
+    // File-backed staging: accumulate large blocks and flush via raw-block APIs.
+    fb_modulus: u16,
+    fb_stage_bytes: usize,
+    fb_stage_limit_bytes: usize,
+    fb_a_coeffs: Vec<u8>,
+    fb_a_idx: Vec<u32>,
+    fb_b_coeffs: Vec<u8>,
+    fb_b_idx: Vec<u32>,
+    fb_c_coeffs: Vec<u8>,
+    fb_c_idx: Vec<u32>,
+    fb_row_lens: Vec<u32>, // 3*u32 per row
+    fb_tmp_idx: Vec<u32>,  // scratch for remapping idx blocks
     /// Cache for reusing a byte var's bit-decomposition across gadgets.
     ///
     /// Key: byte variable index. Value: 8 boolean bit variable indices (little-endian).
@@ -73,11 +91,124 @@ pub struct Dr1csBuilder<F: PrimeField> {
     debug_tag: Option<String>,
 }
 
+#[derive(Debug)]
+enum Dr1csFileSink<F: PrimeField> {
+    Append(SparseDr1csFileWriter<F>),
+    #[cfg(unix)]
+    Range(FileBackedRangeWriter),
+    /// Count-only: maintain file_* counters but do not write any pools/rows.
+    Count,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Dr1csFileCounts {
+    pub rows: u64,
+    pub a_terms: u64,
+    pub b_terms: u64,
+    pub c_terms: u64,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Default)]
+pub struct Dr1csRangeResult {
+    pub counts: Dr1csFileCounts,
+    pub ckpts: Vec<(u64, u64, u64, u64)>,
+}
+
 impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
     #[inline]
     fn idx_u32(idx: usize) -> u32 {
         idx.try_into()
             .unwrap_or_else(|_| panic!("file-backed dr1cs: var idx overflow u32 (idx={idx})"))
+    }
+
+    #[inline]
+    fn map_idx_u32(&self, idx: usize) -> u32 {
+        if idx == 0 {
+            return 0;
+        }
+        let add = self.file_var_tail_off as u64;
+        let v = (idx as u64).saturating_add(add);
+        v.try_into()
+            .unwrap_or_else(|_| panic!("file-backed dr1cs: mapped var idx overflow u32 (idx={idx} add={add})"))
+    }
+
+    fn stage_limit_bytes() -> usize {
+        // Keep the existing knob name (historically introduced for Poseidon).
+        // Default: 64 MiB.
+        let mb = std::env::var("LFP_POSEIDON_FILE_BACKED_STAGE_MB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(64);
+        mb.saturating_mul(1024 * 1024)
+    }
+
+    fn init_fb_modulus() -> u16 {
+        let modulus_big = F::MODULUS;
+        let limbs = modulus_big.as_ref();
+        if limbs.len() == 1 && limbs[0] > 1 && limbs[0] <= 65535 {
+            limbs[0] as u16
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    fn fb_coeff_u16(&self, coef: F) -> u16 {
+        let rep = coef.into_bigint();
+        let limbs = rep.as_ref();
+        debug_assert!(!limbs.is_empty());
+        let v = limbs[0];
+        v.try_into().unwrap_or_else(|_| panic!("file-backed dr1cs: coeff overflow u16 (v={v})"))
+    }
+
+    #[inline]
+    fn fb_maybe_flush(&mut self) -> Result<(), String> {
+        if self.fb_stage_bytes >= self.fb_stage_limit_bytes {
+            self.fb_flush()?;
+        }
+        Ok(())
+    }
+
+    fn fb_flush(&mut self) -> Result<(), String> {
+        let Some(sink) = self.file_sink.as_mut() else { return Ok(()); };
+        if self.fb_row_lens.is_empty() {
+            return Ok(());
+        }
+        // Write term pools first, then row lens block.
+        match sink {
+            Dr1csFileSink::Append(w) => {
+                w.push_a_terms_raw_block(&self.fb_a_coeffs, &self.fb_a_idx)?;
+                w.push_b_terms_raw_block(&self.fb_b_coeffs, &self.fb_b_idx)?;
+                w.push_c_terms_raw_block(&self.fb_c_coeffs, &self.fb_c_idx)?;
+                w.push_constraint_lens_block(&self.fb_row_lens)?;
+            }
+            #[cfg(unix)]
+            Dr1csFileSink::Range(w) => {
+                w.push_a_terms_raw_block(&self.fb_a_coeffs, &self.fb_a_idx)?;
+                w.push_b_terms_raw_block(&self.fb_b_coeffs, &self.fb_b_idx)?;
+                w.push_c_terms_raw_block(&self.fb_c_coeffs, &self.fb_c_idx)?;
+                w.push_constraint_lens_block(&self.fb_row_lens)?;
+            }
+            Dr1csFileSink::Count => {
+                // No-op: counts are derived from buffer sizes below.
+            }
+        }
+        self.file_a_terms = self.file_a_terms.saturating_add(self.fb_a_idx.len() as u64);
+        self.file_b_terms = self.file_b_terms.saturating_add(self.fb_b_idx.len() as u64);
+        self.file_c_terms = self.file_c_terms.saturating_add(self.fb_c_idx.len() as u64);
+        self.file_rows = self.file_rows.saturating_add((self.fb_row_lens.len() / 3) as u64);
+
+        self.fb_a_coeffs.clear();
+        self.fb_a_idx.clear();
+        self.fb_b_coeffs.clear();
+        self.fb_b_idx.clear();
+        self.fb_c_coeffs.clear();
+        self.fb_c_idx.clear();
+        self.fb_row_lens.clear();
+        self.fb_stage_bytes = 0;
+        Ok(())
     }
     pub fn new() -> Self {
         let profile_enabled = match std::env::var("LF_PROFILE_DR1CS") {
@@ -95,6 +226,18 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             file_a_terms: 0,
             file_b_terms: 0,
             file_c_terms: 0,
+            file_var_tail_off: 0,
+            fb_modulus: Self::init_fb_modulus(),
+            fb_stage_bytes: 0,
+            fb_stage_limit_bytes: Self::stage_limit_bytes(),
+            fb_a_coeffs: Vec::new(),
+            fb_a_idx: Vec::new(),
+            fb_b_coeffs: Vec::new(),
+            fb_b_idx: Vec::new(),
+            fb_c_coeffs: Vec::new(),
+            fb_c_idx: Vec::new(),
+            fb_row_lens: Vec::new(),
+            fb_tmp_idx: Vec::new(),
             byte_bits_cache: BTreeMap::new(),
             u64_bal16_cache: BTreeMap::new(),
             u32_bal16_cache: BTreeMap::new(),
@@ -115,8 +258,23 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             .as_ref()
             .file_name()
             .map(|s| s.to_string_lossy().to_string());
-        b.file_sink = Some(SparseDr1csFileWriter::<F>::create(dir)?);
+        b.file_sink = Some(Dr1csFileSink::Append(SparseDr1csFileWriter::<F>::create(dir)?));
         Ok(b)
+    }
+
+    #[cfg(unix)]
+    pub fn new_file_backed_range(writer: FileBackedRangeWriter, var_tail_off: u32) -> Self {
+        let mut b = Self::new();
+        b.file_var_tail_off = var_tail_off;
+        b.file_sink = Some(Dr1csFileSink::Range(writer));
+        b
+    }
+
+    /// Count-only builder: computes assignment and exact row/term counts but does not write pools/rows.
+    pub fn new_count_only() -> Self {
+        let mut b = Self::new();
+        b.file_sink = Some(Dr1csFileSink::Count);
+        b
     }
 
     #[inline]
@@ -127,7 +285,13 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
     /// If file-backed, return the fixed serialized coefficient size (bytes).
     #[inline]
     pub fn file_coeff_size(&self) -> Option<usize> {
-        self.file_sink.as_ref().map(|s| s.coeff_size())
+        match self.file_sink.as_ref() {
+            Some(Dr1csFileSink::Append(s)) => Some(s.coeff_size()),
+            Some(Dr1csFileSink::Count) => Some(2),
+            #[cfg(unix)]
+            Some(Dr1csFileSink::Range(_)) => Some(2),
+            None => None,
+        }
     }
 
     /// If file-backed, return the current on-disk counters (rows, a_terms, b_terms, c_terms).
@@ -146,7 +310,27 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             .file_sink
             .as_mut()
             .ok_or_else(|| "file_push_a_terms_raw_block called on non-file-backed builder".to_string())?;
-        sink.push_a_terms_raw_block(coeff_bytes, idx)?;
+        if matches!(sink, Dr1csFileSink::Count) {
+            self.file_a_terms = self.file_a_terms.saturating_add(idx.len() as u64);
+            return Ok(());
+        }
+        let idx_mapped: &[u32] = if self.file_var_tail_off == 0 {
+            idx
+        } else {
+            self.fb_tmp_idx.clear();
+            self.fb_tmp_idx.reserve(idx.len());
+            let add = self.file_var_tail_off;
+            for &v in idx {
+                self.fb_tmp_idx.push(if v == 0 { 0 } else { v.saturating_add(add) });
+            }
+            &self.fb_tmp_idx
+        };
+        match sink {
+            Dr1csFileSink::Append(w) => w.push_a_terms_raw_block(coeff_bytes, idx_mapped)?,
+            #[cfg(unix)]
+            Dr1csFileSink::Range(w) => w.push_a_terms_raw_block(coeff_bytes, idx_mapped)?,
+            Dr1csFileSink::Count => {}
+        }
         self.file_a_terms = self.file_a_terms.saturating_add(idx.len() as u64);
         Ok(())
     }
@@ -157,7 +341,27 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             .file_sink
             .as_mut()
             .ok_or_else(|| "file_push_b_terms_raw_block called on non-file-backed builder".to_string())?;
-        sink.push_b_terms_raw_block(coeff_bytes, idx)?;
+        if matches!(sink, Dr1csFileSink::Count) {
+            self.file_b_terms = self.file_b_terms.saturating_add(idx.len() as u64);
+            return Ok(());
+        }
+        let idx_mapped: &[u32] = if self.file_var_tail_off == 0 {
+            idx
+        } else {
+            self.fb_tmp_idx.clear();
+            self.fb_tmp_idx.reserve(idx.len());
+            let add = self.file_var_tail_off;
+            for &v in idx {
+                self.fb_tmp_idx.push(if v == 0 { 0 } else { v.saturating_add(add) });
+            }
+            &self.fb_tmp_idx
+        };
+        match sink {
+            Dr1csFileSink::Append(w) => w.push_b_terms_raw_block(coeff_bytes, idx_mapped)?,
+            #[cfg(unix)]
+            Dr1csFileSink::Range(w) => w.push_b_terms_raw_block(coeff_bytes, idx_mapped)?,
+            Dr1csFileSink::Count => {}
+        }
         self.file_b_terms = self.file_b_terms.saturating_add(idx.len() as u64);
         Ok(())
     }
@@ -168,7 +372,27 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             .file_sink
             .as_mut()
             .ok_or_else(|| "file_push_c_terms_raw_block called on non-file-backed builder".to_string())?;
-        sink.push_c_terms_raw_block(coeff_bytes, idx)?;
+        if matches!(sink, Dr1csFileSink::Count) {
+            self.file_c_terms = self.file_c_terms.saturating_add(idx.len() as u64);
+            return Ok(());
+        }
+        let idx_mapped: &[u32] = if self.file_var_tail_off == 0 {
+            idx
+        } else {
+            self.fb_tmp_idx.clear();
+            self.fb_tmp_idx.reserve(idx.len());
+            let add = self.file_var_tail_off;
+            for &v in idx {
+                self.fb_tmp_idx.push(if v == 0 { 0 } else { v.saturating_add(add) });
+            }
+            &self.fb_tmp_idx
+        };
+        match sink {
+            Dr1csFileSink::Append(w) => w.push_c_terms_raw_block(coeff_bytes, idx_mapped)?,
+            #[cfg(unix)]
+            Dr1csFileSink::Range(w) => w.push_c_terms_raw_block(coeff_bytes, idx_mapped)?,
+            Dr1csFileSink::Count => {}
+        }
         self.file_c_terms = self.file_c_terms.saturating_add(idx.len() as u64);
         Ok(())
     }
@@ -179,7 +403,16 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             .file_sink
             .as_mut()
             .ok_or_else(|| "file_push_constraint_lens_block called on non-file-backed builder".to_string())?;
-        sink.push_constraint_lens_block(lens)?;
+        if matches!(sink, Dr1csFileSink::Count) {
+            self.file_rows = self.file_rows.saturating_add((lens.len() / 3) as u64);
+            return Ok(());
+        }
+        match sink {
+            Dr1csFileSink::Append(w) => w.push_constraint_lens_block(lens)?,
+            #[cfg(unix)]
+            Dr1csFileSink::Range(w) => w.push_constraint_lens_block(lens)?,
+            Dr1csFileSink::Count => {}
+        }
         self.file_rows = self.file_rows.saturating_add((lens.len() / 3) as u64);
         Ok(())
     }
@@ -238,44 +471,54 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
                 self.debug_dump_constraint_slices("add_constraint_terms_iter", &a_v, &b_v, &c_v);
                 return self.add_constraint_slices(&a_v, &b_v, &c_v);
             }
-
-            let sink = self
-                .file_sink
-                .as_mut()
-                .expect("file-backed sink vanished unexpectedly");
-            let a0 = self.file_a_terms;
-            let mut a_n: u64 = 0;
+            if matches!(self.file_sink, Some(Dr1csFileSink::Count)) {
+                let mut a_len: u64 = 0;
+                for _ in a.into_iter() {
+                    a_len += 1;
+                }
+                let mut b_len: u64 = 0;
+                for _ in b.into_iter() {
+                    b_len += 1;
+                }
+                let mut c_len: u64 = 0;
+                for _ in c.into_iter() {
+                    c_len += 1;
+                }
+                self.file_a_terms = self.file_a_terms.saturating_add(a_len);
+                self.file_b_terms = self.file_b_terms.saturating_add(b_len);
+                self.file_c_terms = self.file_c_terms.saturating_add(c_len);
+                self.file_rows = self.file_rows.saturating_add(1);
+            } else {
+            // Stage term blocks and row lens, then flush in large blocks.
+            let a_len0 = self.fb_a_idx.len();
             for (coef, idx) in a.into_iter() {
-                sink.push_a_term(&coef, Self::idx_u32(idx))
-                    .expect("file-backed dr1cs write failed (a_term)");
-                a_n += 1;
+                let vv = self.fb_coeff_u16(coef);
+                self.fb_a_coeffs.extend_from_slice(&vv.to_le_bytes());
+                self.fb_a_idx.push(self.map_idx_u32(idx));
             }
-            let a1 = a0 + a_n;
-            self.file_a_terms = a1;
-
-            let b0 = self.file_b_terms;
-            let mut b_n: u64 = 0;
+            let a_len = self.fb_a_idx.len().saturating_sub(a_len0);
+            let b_len0 = self.fb_b_idx.len();
             for (coef, idx) in b.into_iter() {
-                sink.push_b_term(&coef, Self::idx_u32(idx))
-                    .expect("file-backed dr1cs write failed (b_term)");
-                b_n += 1;
+                let vv = self.fb_coeff_u16(coef);
+                self.fb_b_coeffs.extend_from_slice(&vv.to_le_bytes());
+                self.fb_b_idx.push(self.map_idx_u32(idx));
             }
-            let b1 = b0 + b_n;
-            self.file_b_terms = b1;
-
-            let c0 = self.file_c_terms;
-            let mut c_n: u64 = 0;
+            let b_len = self.fb_b_idx.len().saturating_sub(b_len0);
+            let c_len0 = self.fb_c_idx.len();
             for (coef, idx) in c.into_iter() {
-                sink.push_c_term(&coef, Self::idx_u32(idx))
-                    .expect("file-backed dr1cs write failed (c_term)");
-                c_n += 1;
+                let vv = self.fb_coeff_u16(coef);
+                self.fb_c_coeffs.extend_from_slice(&vv.to_le_bytes());
+                self.fb_c_idx.push(self.map_idx_u32(idx));
             }
-            let c1 = c0 + c_n;
-            self.file_c_terms = c1;
-
-            sink.push_constraint_row(a0, a1, b0, b1, c0, c1)
-                .expect("file-backed dr1cs write failed (constraint)");
-            self.file_rows += 1;
+            let c_len = self.fb_c_idx.len().saturating_sub(c_len0);
+            self.fb_row_lens
+                .extend_from_slice(&[(a_len as u32), (b_len as u32), (c_len as u32)]);
+            self.fb_stage_bytes = self
+                .fb_stage_bytes
+                .saturating_add(2 * (a_len + b_len + c_len))
+                .saturating_add(12);
+            self.fb_maybe_flush().expect("file-backed dr1cs flush failed");
+            }
         } else {
             if dbg {
                 let a_v: Vec<(F, usize)> = a.into_iter().collect();
@@ -307,35 +550,34 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         if self.debug_should_dump_next_constraint() {
             self.debug_dump_constraint_slices("add_constraint_slices", a, b, c);
         }
-        if let Some(sink) = self.file_sink.as_mut() {
-            // Stream to disk.
-            let a0 = self.file_a_terms;
-            for (coef, idx) in a.iter() {
-                sink.push_a_term(coef, Self::idx_u32(*idx))
-                    .expect("file-backed dr1cs write failed (a_term)");
+        if matches!(self.file_sink, Some(Dr1csFileSink::Count)) {
+            self.file_a_terms = self.file_a_terms.saturating_add(a.len() as u64);
+            self.file_b_terms = self.file_b_terms.saturating_add(b.len() as u64);
+            self.file_c_terms = self.file_c_terms.saturating_add(c.len() as u64);
+            self.file_rows = self.file_rows.saturating_add(1);
+        } else if self.file_sink.is_some() {
+            for (coef, idx) in a.iter().copied() {
+                let vv = self.fb_coeff_u16(coef);
+                self.fb_a_coeffs.extend_from_slice(&vv.to_le_bytes());
+                self.fb_a_idx.push(self.map_idx_u32(idx));
             }
-            let a1 = self.file_a_terms + (a.len() as u64);
-            self.file_a_terms = a1;
-
-            let b0 = self.file_b_terms;
-            for (coef, idx) in b.iter() {
-                sink.push_b_term(coef, Self::idx_u32(*idx))
-                    .expect("file-backed dr1cs write failed (b_term)");
+            for (coef, idx) in b.iter().copied() {
+                let vv = self.fb_coeff_u16(coef);
+                self.fb_b_coeffs.extend_from_slice(&vv.to_le_bytes());
+                self.fb_b_idx.push(self.map_idx_u32(idx));
             }
-            let b1 = self.file_b_terms + (b.len() as u64);
-            self.file_b_terms = b1;
-
-            let c0 = self.file_c_terms;
-            for (coef, idx) in c.iter() {
-                sink.push_c_term(coef, Self::idx_u32(*idx))
-                    .expect("file-backed dr1cs write failed (c_term)");
+            for (coef, idx) in c.iter().copied() {
+                let vv = self.fb_coeff_u16(coef);
+                self.fb_c_coeffs.extend_from_slice(&vv.to_le_bytes());
+                self.fb_c_idx.push(self.map_idx_u32(idx));
             }
-            let c1 = self.file_c_terms + (c.len() as u64);
-            self.file_c_terms = c1;
-
-            sink.push_constraint_row(a0, a1, b0, b1, c0, c1)
-                .expect("file-backed dr1cs write failed (constraint)");
-            self.file_rows += 1;
+            self.fb_row_lens
+                .extend_from_slice(&[(a.len() as u32), (b.len() as u32), (c.len() as u32)]);
+            self.fb_stage_bytes = self
+                .fb_stage_bytes
+                .saturating_add(2 * (a.len() + b.len() + c.len()))
+                .saturating_add(12);
+            self.fb_maybe_flush().expect("file-backed dr1cs flush failed");
         } else {
             let ar = Self::push_terms(&mut self.a_terms, a);
             let br = Self::push_terms(&mut self.b_terms, b);
@@ -461,12 +703,59 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         F: CanonicalSerialize,
     {
         let mut me = self;
+        me.fb_flush()?;
         let sink = me
             .file_sink
             .take()
             .ok_or_else(|| "into_file_backed_instance called on in-memory Dr1csBuilder".to_string())?;
+        let Dr1csFileSink::Append(sink) = sink else {
+            return Err("into_file_backed_instance called on non-append file-backed builder".to_string());
+        };
         let inst = sink.finish(me.assignment.len())?;
         Ok((inst, me.assignment))
+    }
+
+    pub fn into_count_result(self) -> Result<(Vec<F>, Dr1csFileCounts), String> {
+        let mut me = self;
+        me.fb_flush()?;
+        if !matches!(me.file_sink, Some(Dr1csFileSink::Count)) {
+            return Err("into_count_result called on non-count builder".to_string());
+        }
+        Ok((
+            me.assignment,
+            Dr1csFileCounts {
+                rows: me.file_rows,
+                a_terms: me.file_a_terms,
+                b_terms: me.file_b_terms,
+                c_terms: me.file_c_terms,
+            },
+        ))
+    }
+
+    #[cfg(unix)]
+    pub fn into_range_result(self) -> Result<(Vec<F>, Dr1csRangeResult), String> {
+        let mut me = self;
+        me.fb_flush()?;
+        let sink = me
+            .file_sink
+            .take()
+            .ok_or_else(|| "into_range_result called on in-memory Dr1csBuilder".to_string())?;
+        let Dr1csFileSink::Range(mut w) = sink else {
+            return Err("into_range_result called on non-range builder".to_string());
+        };
+        let ckpts = w.take_ckpts();
+        Ok((
+            me.assignment,
+            Dr1csRangeResult {
+                counts: Dr1csFileCounts {
+                    rows: me.file_rows,
+                    a_terms: me.file_a_terms,
+                    b_terms: me.file_b_terms,
+                    c_terms: me.file_c_terms,
+                },
+                ckpts,
+            },
+        ))
     }
 
     /// Enter a profiling scope; returns the previous scope label.

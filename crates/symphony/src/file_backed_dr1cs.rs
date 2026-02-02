@@ -176,35 +176,35 @@ pub(crate) fn pwrite_all(f: &File, mut off: u64, mut buf: &[u8]) -> Result<(), S
 /// (no per-shard directories and no subsequent merge copy).
 #[cfg(unix)]
 #[derive(Debug)]
-pub(crate) struct FileBackedRangeWriter {
-    pub(crate) out_fc_a: File,
-    pub(crate) out_fi_a: File,
-    pub(crate) out_fc_b: File,
-    pub(crate) out_fi_b: File,
-    pub(crate) out_fc_c: File,
-    pub(crate) out_fi_c: File,
-    pub(crate) out_rows: File,
+pub struct FileBackedRangeWriter {
+    out_fc_a: File,
+    out_fi_a: File,
+    out_fc_b: File,
+    out_fi_b: File,
+    out_fc_c: File,
+    out_fi_c: File,
+    out_rows: File,
     // base offsets (in terms/rows, not bytes)
-    pub(crate) base_a_terms: u64,
-    pub(crate) base_b_terms: u64,
-    pub(crate) base_c_terms: u64,
-    pub(crate) base_rows: u64,
+    base_a_terms: u64,
+    base_b_terms: u64,
+    base_c_terms: u64,
+    base_rows: u64,
     // cursors (counts written by this writer)
-    pub(crate) a_terms_written: u64,
-    pub(crate) b_terms_written: u64,
-    pub(crate) c_terms_written: u64,
-    pub(crate) rows_written: u64,
+    a_terms_written: u64,
+    b_terms_written: u64,
+    c_terms_written: u64,
+    rows_written: u64,
     // checkpoints to be merged and written once at end (global row_idx, global a0,b0,c0)
-    pub(crate) ckpt_entries: Vec<(u64, u64, u64, u64)>,
+    ckpt_entries: Vec<(u64, u64, u64, u64)>,
     // running term offsets for checkpoint emission (global)
-    pub(crate) a0: u64,
-    pub(crate) b0: u64,
-    pub(crate) c0: u64,
+    a0: u64,
+    b0: u64,
+    c0: u64,
 }
 
 #[cfg(unix)]
 impl FileBackedRangeWriter {
-    pub(crate) fn new(
+    pub fn new(
         out_fc_a: File,
         out_fi_a: File,
         out_fc_b: File,
@@ -268,7 +268,7 @@ impl FileBackedRangeWriter {
         Ok(())
     }
 
-    pub(crate) fn push_a_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u32]) -> Result<(), String> {
+    pub fn push_a_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u32]) -> Result<(), String> {
         self.write_terms_block(
             &self.out_fc_a,
             &self.out_fi_a,
@@ -281,7 +281,7 @@ impl FileBackedRangeWriter {
         self.a0 = self.a0.saturating_add(idx.len() as u64);
         Ok(())
     }
-    pub(crate) fn push_b_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u32]) -> Result<(), String> {
+    pub fn push_b_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u32]) -> Result<(), String> {
         self.write_terms_block(
             &self.out_fc_b,
             &self.out_fi_b,
@@ -294,7 +294,7 @@ impl FileBackedRangeWriter {
         self.b0 = self.b0.saturating_add(idx.len() as u64);
         Ok(())
     }
-    pub(crate) fn push_c_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u32]) -> Result<(), String> {
+    pub fn push_c_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u32]) -> Result<(), String> {
         self.write_terms_block(
             &self.out_fc_c,
             &self.out_fi_c,
@@ -308,7 +308,7 @@ impl FileBackedRangeWriter {
         Ok(())
     }
 
-    pub(crate) fn push_constraint_lens_block(&mut self, lens: &[u32]) -> Result<(), String> {
+    pub fn push_constraint_lens_block(&mut self, lens: &[u32]) -> Result<(), String> {
         if (lens.len() % 3) != 0 {
             return Err("FileBackedRangeWriter::push_constraint_lens_block: lens length must be multiple of 3".to_string());
         }
@@ -346,6 +346,10 @@ impl FileBackedRangeWriter {
         }
         self.rows_written = self.rows_written.saturating_add((lens.len() / 3) as u64);
         Ok(())
+    }
+
+    pub fn take_ckpts(&mut self) -> Vec<(u64, u64, u64, u64)> {
+        core::mem::take(&mut self.ckpt_entries)
     }
 }
 

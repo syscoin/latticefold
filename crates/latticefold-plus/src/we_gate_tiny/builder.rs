@@ -12,11 +12,19 @@ use rayon::prelude::*;
 use ark_ff::{Field, PrimeField};
 use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
 use latticefold::transcript::poseidon::{f257_poseidon_config, F257};
-use symphony::dpp_poseidon::PoseidonDr1csWiring;
+use symphony::dpp_poseidon::{
+    poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_count_sharded, PoseidonDr1csWiring,
+    RangeWriteResult as PoseidonCounts,
+};
+#[cfg(unix)]
+use symphony::dpp_poseidon::poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_range_sharded_into_files;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 use symphony::file_backed_dr1cs::{
-    merge_file_backed_sparse_dr1cs_share_one, FileBackedSparseDr1csInstance,
+    FileBackedLayout, FileBackedSparseDr1csInstance, merge_file_backed_sparse_dr1cs_share_one,
 };
+#[cfg(unix)]
+use symphony::file_backed_dr1cs::FileBackedRangeWriter;
+use symphony::poseidon_trace::count_permutes_for_ops;
 use symphony::transcript::PoseidonTraceOp;
 
 use crate::we_statement::WeParams;
@@ -442,9 +450,491 @@ struct GlueCtx {
     base_eqs: Vec<(usize, usize)>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TinyGateBuildMode {
+    Count,
+    #[cfg(unix)]
+    Append,
+    #[cfg(unix)]
+    RangeBase,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct TinyGateMergedFiles {
+    fc_a: std::fs::File,
+    fi_a: std::fs::File,
+    fc_b: std::fs::File,
+    fi_b: std::fs::File,
+    fc_c: std::fs::File,
+    fi_c: std::fs::File,
+    f_rows: std::fs::File,
+}
+
+#[cfg(unix)]
+impl TinyGateMergedFiles {
+    fn try_clone_all(
+        &self,
+    ) -> Result<
+        (
+            std::fs::File,
+            std::fs::File,
+            std::fs::File,
+            std::fs::File,
+            std::fs::File,
+            std::fs::File,
+            std::fs::File,
+        ),
+        String,
+    > {
+        Ok((
+            self.fc_a.try_clone().map_err(|e| format!("clone a_coeffs failed: {e}"))?,
+            self.fi_a.try_clone().map_err(|e| format!("clone a_idx failed: {e}"))?,
+            self.fc_b.try_clone().map_err(|e| format!("clone b_coeffs failed: {e}"))?,
+            self.fi_b.try_clone().map_err(|e| format!("clone b_idx failed: {e}"))?,
+            self.fc_c.try_clone().map_err(|e| format!("clone c_coeffs failed: {e}"))?,
+            self.fi_c.try_clone().map_err(|e| format!("clone c_idx failed: {e}"))?,
+            self.f_rows
+                .try_clone()
+                .map_err(|e| format!("clone constraints failed: {e}"))?,
+        ))
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct TinyGateRangeBase {
+    files: Arc<TinyGateMergedFiles>,
+    plan: Arc<TinyGatePlan>,
+    part_base: usize,
+}
+
+// Stub type on non-unix so signatures can stay uniform.
+#[cfg(not(unix))]
+#[derive(Clone, Debug)]
+struct TinyGateRangeBase;
+
+#[derive(Clone, Debug)]
+struct TinyGatePlan {
+    // Part ordering matches finalize(): part0=poseidon, part1=base_glue, parts2..=extra glues.
+    // These offsets are in the merged variable space and exclude var0.
+    var_tail_off: Vec<usize>,
+    // Offsets into merged term pools and constraint rows (in counts, not bytes), per part.
+    row_off: Vec<u64>,
+    a_off: Vec<u64>,
+    b_off: Vec<u64>,
+    c_off: Vec<u64>,
+    // Equality constraints appended after all parts (in merged var space).
+    eq_pairs: Vec<(usize, usize)>,
+    // Totals for parts only (no eq tail).
+    part_rows: u64,
+    part_a_terms: u64,
+    part_b_terms: u64,
+    part_c_terms: u64,
+    // Totals including eq tail.
+    total_rows: u64,
+    total_a_terms: u64,
+    total_b_terms: u64,
+    total_c_terms: u64,
+}
+
+fn tiny_gate_poseidon_shard_permutes(cfg: &PoseidonConfig<F257>, ops: &[PoseidonTraceOp<F257>]) -> usize {
+    let n_threads = rayon::current_num_threads().max(1);
+    let total_permutes = count_permutes_for_ops(cfg, ops);
+    let target_shards = n_threads.min(16).max(2);
+    let shard_permutes = (total_permutes + target_shards - 1) / target_shards;
+    shard_permutes.max(1024)
+}
+
+fn build_count_plan(
+    cfg: &PoseidonConfig<F257>,
+    ops: &[PoseidonTraceOp<F257>],
+    ring_dim: usize,
+    params: &WeParams,
+    wiring: &TinyCoinOpWiring,
+    pairs: &[(usize, usize)],
+    extra_witness: &TinyExtraWitness,
+) -> Result<(Vec<F257>, PoseidonDr1csWiring, GlueCtx, Vec<GlueCtx>, TinyGatePlan), String> {
+    // Poseidon (count-only sharded, no disk writes).
+    let shard_permutes = tiny_gate_poseidon_shard_permutes(cfg, ops);
+    let (pose_asg, pose_wiring, pose_counts) =
+        poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_count_sharded::<F257>(cfg, ops, shard_permutes)
+            .map_err(|e| format!("poseidon(F257) count-only sharded arith failed: {e}"))?;
+    let pose_asg = Arc::new(pose_asg);
+
+    let short_ranges =
+        squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.short_squeeze_ops)?;
+    let u32_ranges =
+        squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.u32_squeeze_ops)?;
+    validate_pairs(pairs, short_ranges.len(), u32_ranges.len())?;
+    validate_params_and_short_schedule(ring_dim, params, short_ranges.len())?;
+
+    // Base glue in count-only mode.
+    let mut glue = GlueCtx::new(&TinyGateBuildMode::Count, pose_asg.clone(), PathBuf::new(), 0, None)?;
+
+    // Canonicality constraints: count-only shards.
+    // NOTE: the function expects BuildDirs for naming only; in Count mode it does not write.
+    let dirs_dummy = build_dirs("/dev/null");
+    let canonical_glues =
+        build_canonicality_shards(&TinyGateBuildMode::Count, 2, None, &pose_asg, ops, &pose_wiring, &dirs_dummy)?;
+
+    validate_cm_u32_schedule(params, wiring)?;
+    let (n_comh_ring_elems, coeff_bytes) = count_comh_ring_elements(ops, &pose_wiring, ring_dim, wiring)?;
+    if ring_dim > 0 && n_comh_ring_elems > 0 && coeff_bytes != 8 {
+        return Err(format!(
+            "tiny gate: expected Goldilocks base-field coeff_bytes=8, got {coeff_bytes}"
+        ));
+    }
+    let kappa = params.kappa as usize;
+    if kappa > 0 && (n_comh_ring_elems % kappa) != 0 {
+        return Err("tiny gate: comh ring element count not divisible by kappa".to_string());
+    }
+    let l_instances_expected = if kappa == 0 { 0 } else { n_comh_ring_elems / kappa };
+
+    let short_locals = build_short_blocks(&mut glue, &pose_wiring, ring_dim, &short_ranges)?;
+    let (u32_locals, goldilocks_locals) =
+        build_u32_and_goldilocks_blocks(&mut glue, &pose_wiring, &wiring.u32_squeeze_ops)?;
+
+    let mut setchk_out_e_vars_for_cm: Option<Vec<Vec<Vec<RingDigits>>>> = None;
+    let mut dcom_evals_for_cm: Option<Vec<DcomEvalDigits>> = None;
+    let mut fcoms_for_cm: Option<Vec<FComsDigits>> = None;
+    let mut setchk_r_point_for_cm: Option<Vec<GoldilocksScalar>> = None;
+
+    arithmetize_pi_lin_setchk_rgchk_prefix(
+        &mut glue,
+        ops,
+        &pose_wiring,
+        ring_dim,
+        params,
+        wiring,
+        l_instances_expected,
+        &u32_locals,
+        extra_witness,
+        &mut setchk_out_e_vars_for_cm,
+        &mut dcom_evals_for_cm,
+        &mut fcoms_for_cm,
+        &mut setchk_r_point_for_cm,
+    )?;
+
+    let (comh_absorbs, sc_msg_absorbs, eval_absorbs) = parse_and_enforce_cm_after_short(
+        &mut glue,
+        ops,
+        &pose_wiring,
+        ring_dim,
+        params,
+        wiring,
+        l_instances_expected,
+        &goldilocks_locals,
+    )?;
+
+    let setchk_out_e_vars_for_cm = setchk_out_e_vars_for_cm.map(Arc::new);
+    let dcom_evals_for_cm = dcom_evals_for_cm.map(Arc::new);
+    let setchk_r_point_for_cm = setchk_r_point_for_cm.map(Arc::new);
+    let cm_shared_base: Option<Arc<CmSharedPrecompBase>> = compute_cm_shared_precomp_base(
+        &mut glue,
+        ring_dim,
+        params,
+        wiring,
+        l_instances_expected,
+        &short_locals,
+        &u32_locals,
+        &setchk_out_e_vars_for_cm,
+        &setchk_r_point_for_cm,
+    )?;
+
+    // CM modules: count-only shards.
+    let cm_extra_glues = build_cm_shards(
+        &TinyGateBuildMode::Count,
+        2 + canonical_glues.len(),
+        None,
+        Some(cfg),
+        ops,
+        &pose_wiring,
+        ring_dim,
+        params,
+        wiring,
+        l_instances_expected,
+        &comh_absorbs,
+        &sc_msg_absorbs,
+        &eval_absorbs,
+        setchk_out_e_vars_for_cm.clone(),
+        dcom_evals_for_cm.clone(),
+        cm_shared_base.clone(),
+        glue.pose_asg.clone(),
+        glue.gb.assignment.as_slice(),
+        &short_locals,
+        &u32_locals,
+        &goldilocks_locals,
+        &dirs_dummy,
+    )?;
+
+    // Decomp verifier math (LinB2X + DecompProof) — algebraic-only checks.
+    //
+    // IMPORTANT: bind these checks to the CM-derived reduced instance x = (cm_g, r_o, v_o),
+    // not to a prover-supplied copy.
+    let (cm_g_target, vo_a_target, vo_b_target) = compute_cm_x_targets_for_decomp(
+        &mut glue,
+        ring_dim,
+        params,
+        l_instances_expected,
+        &short_locals,
+        &pose_wiring,
+        &comh_absorbs,
+        &eval_absorbs,
+        &fcoms_for_cm,
+    )?;
+    add_decomp_linb2x_constraints(
+        &mut glue,
+        ring_dim,
+        params,
+        extra_witness,
+        &cm_g_target,
+        &vo_a_target,
+        &vo_b_target,
+    )?;
+
+    // Surfaces (small vs Poseidon/CM, but must be counted for exact Pass0 sizing).
+    let _ = build_surfaces_with_shared_arcs(&mut glue, ring_dim, pairs, &short_locals, &u32_locals)?;
+
+    // Assemble the list of "extra glues" in the same order as finalize(): canonical shards + cm shards.
+    let mut extra_glues: Vec<GlueCtx> = Vec::new();
+    extra_glues.extend(canonical_glues);
+    extra_glues.extend(cm_extra_glues);
+
+    // Compute part offsets in merged space (excluding var0).
+    // Part 0: poseidon, part 1: base glue, parts 2..: extra glue modules.
+    let mut offsets: Vec<usize> = Vec::with_capacity(2 + extra_glues.len());
+    let mut cur = 0usize;
+    offsets.push(cur);
+    cur += pose_asg.len().saturating_sub(1);
+    offsets.push(cur);
+    cur += glue.gb.assignment.len().saturating_sub(1);
+    for g in &extra_glues {
+        offsets.push(cur);
+        cur += g.gb.assignment.len().saturating_sub(1);
+    }
+    let remap = |part: usize, local: usize, offsets: &[usize]| -> usize {
+        if local == 0 { 0 } else { local + offsets[part] }
+    };
+
+    // Equality constraints: same construction as finalize().
+    let mut eq_pairs: Vec<(usize, usize)> = Vec::new();
+    {
+        let reabsorb = collect_fiat_shamir_reabsorb_eqs(ops, &pose_wiring)?;
+        eq_pairs.reserve(reabsorb.len());
+        for (v_ab, v_sq) in reabsorb {
+            eq_pairs.push((remap(0, v_ab, &offsets), remap(0, v_sq, &offsets)));
+        }
+    }
+    // glue links between copied pose vars and module-local vars
+    for (&gv, &lv) in glue.local_map.iter() {
+        eq_pairs.push((remap(0, gv, &offsets), remap(1, lv, &offsets)));
+    }
+    for (i, m) in extra_glues.iter().enumerate() {
+        let part = 2 + i;
+        for (&gv, &lv) in m.local_map.iter() {
+            eq_pairs.push((remap(0, gv, &offsets), remap(part, lv, &offsets)));
+        }
+    }
+    for (i, g) in extra_glues.iter().enumerate() {
+        let part = 2 + i;
+        for &(base_var, local_var) in &g.base_eqs {
+            eq_pairs.push((remap(1, base_var, &offsets), remap(part, local_var, &offsets)));
+        }
+    }
+
+    // Gather per-part counts and compute pool offsets.
+    let mut row_off: Vec<u64> = Vec::with_capacity(2 + extra_glues.len());
+    let mut a_off: Vec<u64> = Vec::with_capacity(2 + extra_glues.len());
+    let mut b_off: Vec<u64> = Vec::with_capacity(2 + extra_glues.len());
+    let mut c_off: Vec<u64> = Vec::with_capacity(2 + extra_glues.len());
+    let mut cur_rows: u64 = 0;
+    let mut cur_a: u64 = 0;
+    let mut cur_b: u64 = 0;
+    let mut cur_c: u64 = 0;
+
+    // Poseidon counts
+    row_off.push(cur_rows);
+    a_off.push(cur_a);
+    b_off.push(cur_b);
+    c_off.push(cur_c);
+    cur_rows = cur_rows.saturating_add(pose_counts.rows);
+    cur_a = cur_a.saturating_add(pose_counts.a_terms);
+    cur_b = cur_b.saturating_add(pose_counts.b_terms);
+    cur_c = cur_c.saturating_add(pose_counts.c_terms);
+
+    // Base glue counts
+    let (_base_asg, base_counts) = glue.gb.clone().into_count_result()?;
+    row_off.push(cur_rows);
+    a_off.push(cur_a);
+    b_off.push(cur_b);
+    c_off.push(cur_c);
+    cur_rows = cur_rows.saturating_add(base_counts.rows);
+    cur_a = cur_a.saturating_add(base_counts.a_terms);
+    cur_b = cur_b.saturating_add(base_counts.b_terms);
+    cur_c = cur_c.saturating_add(base_counts.c_terms);
+
+    // Extra glues counts
+    for g in &extra_glues {
+        let (_asg, ct) = g.gb.clone().into_count_result()?;
+        row_off.push(cur_rows);
+        a_off.push(cur_a);
+        b_off.push(cur_b);
+        c_off.push(cur_c);
+        cur_rows = cur_rows.saturating_add(ct.rows);
+        cur_a = cur_a.saturating_add(ct.a_terms);
+        cur_b = cur_b.saturating_add(ct.b_terms);
+        cur_c = cur_c.saturating_add(ct.c_terms);
+    }
+
+    let part_rows = cur_rows;
+    let part_a_terms = cur_a;
+    let part_b_terms = cur_b;
+    let part_c_terms = cur_c;
+    let eqs = eq_pairs.len() as u64;
+    let total_rows = part_rows.saturating_add(eqs);
+    let total_a_terms = part_a_terms.saturating_add(2 * eqs);
+    let total_b_terms = part_b_terms.saturating_add(eqs);
+    let total_c_terms = part_c_terms.saturating_add(eqs);
+
+    let plan = TinyGatePlan {
+        var_tail_off: offsets,
+        row_off,
+        a_off,
+        b_off,
+        c_off,
+        eq_pairs,
+        part_rows,
+        part_a_terms,
+        part_b_terms,
+        part_c_terms,
+        total_rows,
+        total_a_terms,
+        total_b_terms,
+        total_c_terms,
+    };
+
+    // Recover owned pose assignment (avoid cloning).
+    let pose_asg = Arc::try_unwrap(pose_asg)
+        .map_err(|_| "tiny gate: internal error: pose assignment still shared at count plan")?;
+
+    Ok((pose_asg, pose_wiring, glue, extra_glues, plan))
+}
+
+#[cfg(unix)]
+fn prealloc_merged_files(
+    merged_dir: &Path,
+    total_a_terms: u64,
+    total_b_terms: u64,
+    total_c_terms: u64,
+    total_rows: u64,
+) -> Result<
+    (
+        std::fs::File,
+        std::fs::File,
+        std::fs::File,
+        std::fs::File,
+        std::fs::File,
+        std::fs::File,
+        std::fs::File,
+    ),
+    String,
+> {
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom};
+
+    // Clear any previous output quickly (rename+rm in background).
+    crate::fs_cleanup::fast_remove_dir_best_effort_to_tmp(merged_dir);
+    std::fs::create_dir_all(merged_dir).map_err(|e| format!("create merged_dir failed: {e}"))?;
+
+    let open_rw = |p: &Path| -> Result<std::fs::File, String> {
+        OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(p)
+            .map_err(|e| format!("open {p:?} failed: {e}"))
+    };
+    let mut fc_a = open_rw(&merged_dir.join("a_coeffs.bin"))?;
+    let mut fi_a = open_rw(&merged_dir.join("a_idx.bin"))?;
+    let mut fc_b = open_rw(&merged_dir.join("b_coeffs.bin"))?;
+    let mut fi_b = open_rw(&merged_dir.join("b_idx.bin"))?;
+    let mut fc_c = open_rw(&merged_dir.join("c_coeffs.bin"))?;
+    let mut fi_c = open_rw(&merged_dir.join("c_idx.bin"))?;
+    let mut f_rows = open_rw(&merged_dir.join("constraints.bin"))?;
+
+    fc_a.set_len(total_a_terms.saturating_mul(2)).map_err(|e| e.to_string())?;
+    fi_a.set_len(total_a_terms.saturating_mul(4)).map_err(|e| e.to_string())?;
+    fc_b.set_len(total_b_terms.saturating_mul(2)).map_err(|e| e.to_string())?;
+    fi_b.set_len(total_b_terms.saturating_mul(4)).map_err(|e| e.to_string())?;
+    fc_c.set_len(total_c_terms.saturating_mul(2)).map_err(|e| e.to_string())?;
+    fi_c.set_len(total_c_terms.saturating_mul(4)).map_err(|e| e.to_string())?;
+    f_rows
+        .set_len(total_rows.saturating_mul(12))
+        .map_err(|e| e.to_string())?;
+
+    let _ = fc_a.seek(SeekFrom::End(0));
+    let _ = fi_a.seek(SeekFrom::End(0));
+    let _ = fc_b.seek(SeekFrom::End(0));
+    let _ = fi_b.seek(SeekFrom::End(0));
+    let _ = fc_c.seek(SeekFrom::End(0));
+    let _ = fi_c.seek(SeekFrom::End(0));
+    let _ = f_rows.seek(SeekFrom::End(0));
+
+    Ok((fc_a, fi_a, fc_b, fi_b, fc_c, fi_c, f_rows))
+}
+
 impl GlueCtx {
-    fn new(pose_asg: Arc<Vec<F257>>, out_dir: impl AsRef<Path>) -> Result<Self, String> {
-        let mut gb = Dr1csBuilder::<F257>::new_file_backed(out_dir)?;
+    fn new(
+        mode: &TinyGateBuildMode,
+        pose_asg: Arc<Vec<F257>>,
+        out_dir: impl AsRef<Path>,
+        part_idx: usize,
+        range: Option<&TinyGateRangeBase>,
+    ) -> Result<Self, String> {
+        let mut gb = match mode {
+            TinyGateBuildMode::Count => Dr1csBuilder::<F257>::new_count_only(),
+            #[cfg(unix)]
+            TinyGateBuildMode::Append => Dr1csBuilder::<F257>::new_file_backed(out_dir)?,
+            #[cfg(not(unix))]
+            TinyGateBuildMode::Append => Dr1csBuilder::<F257>::new_file_backed(out_dir)?,
+            #[cfg(unix)]
+            TinyGateBuildMode::RangeBase => {
+                let rb = range.ok_or("tiny gate: missing range base for RangeBase mode")?;
+                let part = rb
+                    .part_base
+                    .checked_add(part_idx)
+                    .ok_or("tiny gate: part idx overflow (range base)")?;
+                if part >= rb.plan.row_off.len()
+                    || part >= rb.plan.a_off.len()
+                    || part >= rb.plan.b_off.len()
+                    || part >= rb.plan.c_off.len()
+                    || part >= rb.plan.var_tail_off.len()
+                {
+                    return Err("tiny gate: part idx out of range for plan (range base)".to_string());
+                }
+                let (fc_a, fi_a, fc_b, fi_b, fc_c, fi_c, f_rows) = rb.files.try_clone_all()?;
+                let writer = FileBackedRangeWriter::new(
+                    fc_a,
+                    fi_a,
+                    fc_b,
+                    fi_b,
+                    fc_c,
+                    fi_c,
+                    f_rows,
+                    rb.plan.a_off[part],
+                    rb.plan.b_off[part],
+                    rb.plan.c_off[part],
+                    rb.plan.row_off[part],
+                );
+                let var_tail_off: u32 = (rb.plan.var_tail_off[part] as u64)
+                    .try_into()
+                    .map_err(|_| "tiny gate: var_tail_off overflow u32".to_string())?;
+                Dr1csBuilder::<F257>::new_file_backed_range(writer, var_tail_off)
+            }
+        };
+        // var0 is the constant-1 slot
         gb.enforce_var_eq_const(gb.one(), F257::ONE);
         Ok(Self {
             gb,
@@ -513,6 +1003,9 @@ fn build_poseidon(
 }
 
 fn build_canonicality_shards(
+    mode: &TinyGateBuildMode,
+    part_base: usize,
+    range: Option<&TinyGateRangeBase>,
     pose_asg: &Arc<Vec<F257>>,
     ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
@@ -541,7 +1034,7 @@ fn build_canonicality_shards(
         .into_par_iter()
         .map(|(idx, chunk)| -> Result<GlueCtx, String> {
             let dir = dirs.root.join(format!("canon_{idx}"));
-            let mut g = GlueCtx::new(pose_asg.clone(), dir)?;
+            let mut g = GlueCtx::new(mode, pose_asg.clone(), dir, part_base + idx, range)?;
             enforce_canonical_goldilocks_for_ranges(&mut g, pose_wiring, chunk)?;
             Ok(g)
         })
@@ -662,6 +1155,9 @@ fn add_decomp_linb2x_constraints(
 }
 
 fn build_cm_shards(
+    mode: &TinyGateBuildMode,
+    part_base: usize,
+    range: Option<&TinyGateRangeBase>,
     cfg: Option<&PoseidonConfig<F257>>,
     ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
@@ -688,6 +1184,9 @@ fn build_cm_shards(
     let (g0, g1) = join(
         || {
             build_cm_glue_for_which(
+                mode,
+                part_base + 0,
+                range,
                 cfg,
                 ops,
                 pose_wiring,
@@ -712,6 +1211,9 @@ fn build_cm_shards(
         },
         || {
             build_cm_glue_for_which(
+                mode,
+                part_base + 1,
+                range,
                 cfg,
                 ops,
                 pose_wiring,
@@ -3370,12 +3872,8 @@ fn finalize(
     parts.push((base_inst, base_asg));
     parts.extend(extra_insts);
     let t_fb_merge = Instant::now();
-    let (inst, asg) = merge_file_backed_sparse_dr1cs_share_one::<F257>(
-        parts,
-        out_dir.as_ref(),
-        &eq_pairs,
-    )
-    .map_err(|e| format!("tiny gate: file-backed merge failed: {e}"))?;
+    let (inst, asg) = merge_file_backed_sparse_dr1cs_share_one::<F257>(parts, out_dir.as_ref(), &eq_pairs)
+        .map_err(|e| format!("tiny gate: file-backed merge failed: {e}"))?;
     lf_profile_log(&format!(
         "merge_done elapsed={:?} nvars={} constraints={}",
         t_fb_merge.elapsed(),
@@ -3486,6 +3984,9 @@ fn finalize(
 }
 
 fn build_cm_glue_for_which(
+    mode: &TinyGateBuildMode,
+    part_idx: usize,
+    range: Option<&TinyGateRangeBase>,
     _cfg: Option<&PoseidonConfig<F257>>,
     _ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
@@ -3510,7 +4011,7 @@ fn build_cm_glue_for_which(
     goldilocks_locals: &[GoldilocksChallengeWiring],
     out_dir: &Path,
 ) -> Result<GlueCtx, String> {
-    let mut glue = GlueCtx::new(pose_asg, out_dir)?;
+    let mut glue = GlueCtx::new(mode, pose_asg, out_dir, part_idx, range)?;
     if ring_dim == 0 || l_instances_expected == 0 {
         return Ok(glue);
     }
@@ -4504,6 +5005,598 @@ fn build_cm_glue_for_which(
     Ok(glue)
 }
 
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn build_direct_to_merged_unix(
+    cfg: Option<&PoseidonConfig<F257>>,
+    ops: &[PoseidonTraceOp<F257>],
+    ring_dim: usize,
+    params: &WeParams,
+    wiring: &TinyCoinOpWiring,
+    pairs: &[(usize, usize)],
+    extra_witness: &TinyExtraWitness,
+    out_dir: impl AsRef<std::path::Path>,
+) -> Result<
+    (
+        FileBackedSparseDr1csInstance<F257>,
+        Vec<F257>,
+        Vec<ShortChallengeWiring>,
+        Vec<BoundedU32ChallengeWiring>,
+        Vec<GoldilocksChallengeWiring>,
+        Vec<CmDigitMulSurfaceWiring>,
+        Vec<CmDigitMulSqSurfaceWiring>,
+        PoseidonDr1csWiring,
+    ),
+    String,
+> {
+    use std::io::Write;
+
+    let dirs = build_dirs(&out_dir);
+
+    let default_cfg;
+    let poseidon_cfg = match cfg {
+        Some(c) => c,
+        None => {
+            default_cfg = f257_poseidon_config();
+            &default_cfg
+        }
+    };
+
+    // Pass 0: count plan for the entire tiny-gate (exact sizes + eq_pairs + var offsets).
+    let (_pose_asg0, _pose_wiring0, _glue0, _extra0, plan0) =
+        build_count_plan(poseidon_cfg, ops, ring_dim, params, wiring, pairs, extra_witness)?;
+    let plan = Arc::new(plan0);
+
+    // Preallocate merged/* pools/rows.
+    let (fc_a, fi_a, fc_b, fi_b, fc_c, fi_c, f_rows) = prealloc_merged_files(
+        &dirs.merged_dir,
+        plan.total_a_terms,
+        plan.total_b_terms,
+        plan.total_c_terms,
+        plan.total_rows,
+    )?;
+    let files = Arc::new(TinyGateMergedFiles {
+        fc_a,
+        fi_a,
+        fc_b,
+        fi_b,
+        fc_c,
+        fi_c,
+        f_rows,
+    });
+    let rb = TinyGateRangeBase {
+        files: files.clone(),
+        plan: plan.clone(),
+        part_base: 0,
+    };
+
+    // Pass 1a: Poseidon sharded into merged ranges (part 0).
+    let shard_permutes = tiny_gate_poseidon_shard_permutes(poseidon_cfg, ops);
+    let (pose_asg, pose_wiring, pose_range) =
+        poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_range_sharded_into_files::<F257>(
+            poseidon_cfg,
+            ops,
+            shard_permutes,
+            &files.fc_a,
+            &files.fi_a,
+            &files.fc_b,
+            &files.fi_b,
+            &files.fc_c,
+            &files.fi_c,
+            &files.f_rows,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        .map_err(|e| format!("poseidon(F257) range-write sharded failed: {e}"))?;
+    // Validate poseidon counts match Pass0.
+    let exp_pose_rows = plan.row_off.get(1).copied().unwrap_or(0);
+    let exp_pose_a = plan.a_off.get(1).copied().unwrap_or(0);
+    let exp_pose_b = plan.b_off.get(1).copied().unwrap_or(0);
+    let exp_pose_c = plan.c_off.get(1).copied().unwrap_or(0);
+    if pose_range.rows != exp_pose_rows
+        || pose_range.a_terms != exp_pose_a
+        || pose_range.b_terms != exp_pose_b
+        || pose_range.c_terms != exp_pose_c
+    {
+        return Err(format!(
+            "tiny gate: Pass0/Pass1 poseidon count mismatch: rows got {} exp {}, a_terms got {} exp {}, b_terms got {} exp {}, c_terms got {} exp {}",
+            pose_range.rows, exp_pose_rows, pose_range.a_terms, exp_pose_a, pose_range.b_terms, exp_pose_b, pose_range.c_terms, exp_pose_c
+        ));
+    }
+
+    // Base glue (part 1) and all submodules write directly into merged ranges.
+    let pose_asg = Arc::new(pose_asg);
+    let mut glue = GlueCtx::new(&TinyGateBuildMode::RangeBase, pose_asg.clone(), &dirs.base_glue_dir, 1, Some(&rb))?;
+
+    // Canonicality constraints: parallel shards (parts 2..).
+    let canonical_glues = build_canonicality_shards(
+        &TinyGateBuildMode::RangeBase,
+        2,
+        Some(&rb),
+        &pose_asg,
+        ops,
+        &pose_wiring,
+        &dirs,
+    )?;
+
+    validate_cm_u32_schedule(params, wiring)?;
+    let (n_comh_ring_elems, coeff_bytes) = count_comh_ring_elements(ops, &pose_wiring, ring_dim, wiring)?;
+    if ring_dim > 0 && n_comh_ring_elems > 0 && coeff_bytes != 8 {
+        return Err(format!(
+            "tiny gate: expected Goldilocks base-field coeff_bytes=8, got {coeff_bytes}"
+        ));
+    }
+    let kappa = params.kappa as usize;
+    if kappa > 0 && (n_comh_ring_elems % kappa) != 0 {
+        return Err("tiny gate: comh ring element count not divisible by kappa".to_string());
+    }
+    let l_instances_expected = if kappa == 0 { 0 } else { n_comh_ring_elems / kappa };
+
+    let short_ranges =
+        squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.short_squeeze_ops)?;
+    let u32_ranges =
+        squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.u32_squeeze_ops)?;
+    validate_pairs(pairs, short_ranges.len(), u32_ranges.len())?;
+    validate_params_and_short_schedule(ring_dim, params, short_ranges.len())?;
+
+    let short_locals = build_short_blocks(&mut glue, &pose_wiring, ring_dim, &short_ranges)?;
+    let (u32_locals, goldilocks_locals) =
+        build_u32_and_goldilocks_blocks(&mut glue, &pose_wiring, &wiring.u32_squeeze_ops)?;
+
+    // Values parsed/allocated during SetChk/RgChk that the CM verifier math needs later.
+    let mut setchk_out_e_vars_for_cm: Option<Vec<Vec<Vec<RingDigits>>>> = None;
+    let mut dcom_evals_for_cm: Option<Vec<DcomEvalDigits>> = None;
+    let mut fcoms_for_cm: Option<Vec<FComsDigits>> = None;
+    let mut setchk_r_point_for_cm: Option<Vec<GoldilocksScalar>> = None;
+    arithmetize_pi_lin_setchk_rgchk_prefix(
+        &mut glue,
+        ops,
+        &pose_wiring,
+        ring_dim,
+        params,
+        wiring,
+        l_instances_expected,
+        &u32_locals,
+        extra_witness,
+        &mut setchk_out_e_vars_for_cm,
+        &mut dcom_evals_for_cm,
+        &mut fcoms_for_cm,
+        &mut setchk_r_point_for_cm,
+    )?;
+    let (comh_absorbs, sc_msg_absorbs, eval_absorbs) = parse_and_enforce_cm_after_short(
+        &mut glue,
+        ops,
+        &pose_wiring,
+        ring_dim,
+        params,
+        wiring,
+        l_instances_expected,
+        &goldilocks_locals,
+    )?;
+
+    let setchk_out_e_vars_for_cm = setchk_out_e_vars_for_cm.map(Arc::new);
+    let dcom_evals_for_cm = dcom_evals_for_cm.map(Arc::new);
+    let setchk_r_point_for_cm = setchk_r_point_for_cm.map(Arc::new);
+    let cm_shared_base: Option<Arc<CmSharedPrecompBase>> = compute_cm_shared_precomp_base(
+        &mut glue,
+        ring_dim,
+        params,
+        wiring,
+        l_instances_expected,
+        &short_locals,
+        &u32_locals,
+        &setchk_out_e_vars_for_cm,
+        &setchk_r_point_for_cm,
+    )?;
+
+    // CM modules: parts (2+canon_len) and (2+canon_len+1).
+    let cm_extra_glues = build_cm_shards(
+        &TinyGateBuildMode::RangeBase,
+        2 + canonical_glues.len(),
+        Some(&rb),
+        cfg,
+        ops,
+        &pose_wiring,
+        ring_dim,
+        params,
+        wiring,
+        l_instances_expected,
+        &comh_absorbs,
+        &sc_msg_absorbs,
+        &eval_absorbs,
+        setchk_out_e_vars_for_cm.clone(),
+        dcom_evals_for_cm.clone(),
+        cm_shared_base.clone(),
+        glue.pose_asg.clone(),
+        glue.gb.assignment.as_slice(),
+        &short_locals,
+        &u32_locals,
+        &goldilocks_locals,
+        &dirs,
+    )?;
+
+    // Decomp verifier math.
+    let (cm_g_target, vo_a_target, vo_b_target) = compute_cm_x_targets_for_decomp(
+        &mut glue,
+        ring_dim,
+        params,
+        l_instances_expected,
+        &short_locals,
+        &pose_wiring,
+        &comh_absorbs,
+        &eval_absorbs,
+        &fcoms_for_cm,
+    )?;
+    add_decomp_linb2x_constraints(
+        &mut glue,
+        ring_dim,
+        params,
+        extra_witness,
+        &cm_g_target,
+        &vo_a_target,
+        &vo_b_target,
+    )?;
+
+    // Surfaces (comparatively small).
+    let (
+        surfaces_mul_local,
+        surfaces_sq_local,
+        all_sum_digits,
+        all_sum_coeffwise,
+        all_sq_sum_digits,
+        all_sq_sum_coeffwise,
+    ) = build_surfaces_with_shared_arcs(&mut glue, ring_dim, pairs, &short_locals, &u32_locals)?;
+
+    // ---------------------------------------------------------------------
+    // Collect parts: assignments + ckpts + local maps for equality tail.
+    // ---------------------------------------------------------------------
+    #[cfg(unix)]
+    fn expect_part_delta(off: &[u64], part: usize, total: u64) -> u64 {
+        if part + 1 < off.len() {
+            off[part + 1].saturating_sub(off[part])
+        } else {
+            total.saturating_sub(off[part])
+        }
+    }
+
+    // Base glue range result (part 1).
+    let GlueCtx {
+        gb,
+        pose_asg: _pa,
+        local_map: base_local_map,
+        base_eqs: base_base_eqs,
+        ..
+    } = glue;
+    debug_assert!(base_base_eqs.is_empty(), "base glue should not contain base_eqs");
+    let (base_asg, base_range) = gb.into_range_result()?;
+    let exp_base_rows = expect_part_delta(&plan.row_off, 1, plan.part_rows);
+    let exp_base_a = expect_part_delta(&plan.a_off, 1, plan.part_a_terms);
+    let exp_base_b = expect_part_delta(&plan.b_off, 1, plan.part_b_terms);
+    let exp_base_c = expect_part_delta(&plan.c_off, 1, plan.part_c_terms);
+    if base_range.counts.rows != exp_base_rows
+        || base_range.counts.a_terms != exp_base_a
+        || base_range.counts.b_terms != exp_base_b
+        || base_range.counts.c_terms != exp_base_c
+    {
+        return Err("tiny gate: base glue Pass0/Pass1 count mismatch".to_string());
+    }
+
+    // Extra glues: canonical shards then cm shards (same order as finalize()).
+    #[cfg(unix)]
+    struct ExtraOut {
+        local_map: BTreeMap<usize, usize>,
+        base_eqs: Vec<(usize, usize)>,
+        asg: Vec<F257>,
+        range: symphony::dpp_sumcheck::Dr1csRangeResult,
+    }
+    let mut extra_out: Vec<ExtraOut> = Vec::new();
+    for (i, g) in canonical_glues
+        .into_iter()
+        .chain(cm_extra_glues.into_iter())
+        .enumerate()
+    {
+        let GlueCtx { gb, pose_asg: _pa, local_map, base_eqs, .. } = g;
+        let (asg, range) = gb.into_range_result()?;
+        let part = 2 + i;
+        let exp_rows = expect_part_delta(&plan.row_off, part, plan.part_rows);
+        let exp_a = expect_part_delta(&plan.a_off, part, plan.part_a_terms);
+        let exp_b = expect_part_delta(&plan.b_off, part, plan.part_b_terms);
+        let exp_c = expect_part_delta(&plan.c_off, part, plan.part_c_terms);
+        if range.counts.rows != exp_rows
+            || range.counts.a_terms != exp_a
+            || range.counts.b_terms != exp_b
+            || range.counts.c_terms != exp_c
+        {
+            return Err(format!("tiny gate: extra glue Pass0/Pass1 count mismatch at part={part}"));
+        }
+        extra_out.push(ExtraOut {
+            local_map,
+            base_eqs,
+            asg,
+            range,
+        });
+    }
+
+    // Reconstruct merged assignment and verify var offset plan matches.
+    let mut merged_asg: Vec<F257> = Vec::with_capacity(1);
+    merged_asg.push(F257::ONE);
+    merged_asg.extend_from_slice(&pose_asg[1..]);
+    merged_asg.extend_from_slice(&base_asg[1..]);
+    for eo in &extra_out {
+        merged_asg.extend_from_slice(&eo.asg[1..]);
+    }
+    if merged_asg.len().saturating_sub(1) != *plan.var_tail_off.last().unwrap_or(&0) + extra_out.last().map(|x| x.asg.len().saturating_sub(1)).unwrap_or(0) {
+        // soft check only; exact check below
+    }
+    // Exact offsets from Pass1 assignments.
+    let mut offsets: Vec<usize> = Vec::with_capacity(2 + extra_out.len());
+    let mut cur = 0usize;
+    offsets.push(cur);
+    cur += pose_asg.len().saturating_sub(1);
+    offsets.push(cur);
+    cur += base_asg.len().saturating_sub(1);
+    for eo in &extra_out {
+        offsets.push(cur);
+        cur += eo.asg.len().saturating_sub(1);
+    }
+    if offsets != plan.var_tail_off {
+        return Err("tiny gate: Pass1 var offsets diverged from Pass0 plan".to_string());
+    }
+    let remap = |part: usize, local: usize, offsets: &[usize]| -> usize {
+        if local == 0 { 0 } else { local + offsets[part] }
+    };
+
+    // Equality pairs as in finalize().
+    let mut eq_pairs: Vec<(usize, usize)> = Vec::new();
+    {
+        let reabsorb = collect_fiat_shamir_reabsorb_eqs(ops, &pose_wiring)?;
+        for (v_ab, v_sq) in reabsorb {
+            eq_pairs.push((remap(0, v_ab, &offsets), remap(0, v_sq, &offsets)));
+        }
+    }
+    for (&gv, &lv) in base_local_map.iter() {
+        eq_pairs.push((remap(0, gv, &offsets), remap(1, lv, &offsets)));
+    }
+    for (i, eo) in extra_out.iter().enumerate() {
+        let part = 2 + i;
+        for (&gv, &lv) in eo.local_map.iter() {
+            eq_pairs.push((remap(0, gv, &offsets), remap(part, lv, &offsets)));
+        }
+        for &(base_var, local_var) in &eo.base_eqs {
+            eq_pairs.push((remap(1, base_var, &offsets), remap(part, local_var, &offsets)));
+        }
+    }
+    if eq_pairs.len() != plan.eq_pairs.len() {
+        return Err(format!(
+            "tiny gate: Pass0/Pass1 eq_pairs length mismatch (got {}, expected {})",
+            eq_pairs.len(),
+            plan.eq_pairs.len()
+        ));
+    }
+
+    // Append eq tail into reserved ranges.
+    let mut eq_writer = FileBackedRangeWriter::new(
+        files.fc_a.try_clone().map_err(|e| format!("clone a_coeffs failed: {e}"))?,
+        files.fi_a.try_clone().map_err(|e| format!("clone a_idx failed: {e}"))?,
+        files.fc_b.try_clone().map_err(|e| format!("clone b_coeffs failed: {e}"))?,
+        files.fi_b.try_clone().map_err(|e| format!("clone b_idx failed: {e}"))?,
+        files.fc_c.try_clone().map_err(|e| format!("clone c_coeffs failed: {e}"))?,
+        files.fi_c.try_clone().map_err(|e| format!("clone c_idx failed: {e}"))?,
+        files.f_rows.try_clone().map_err(|e| format!("clone constraints failed: {e}"))?,
+        plan.part_a_terms,
+        plan.part_b_terms,
+        plan.part_c_terms,
+        plan.part_rows,
+    );
+    const EQ_BATCH: usize = 4096;
+    let one_bytes: [u8; 2] = [0x01, 0x00];
+    let neg_one_bytes: [u8; 2] = [0x00, 0x01]; // 256 mod 257
+    let zero_bytes: [u8; 2] = [0x00, 0x00];
+    let mut i0 = 0usize;
+    while i0 < eq_pairs.len() {
+        let i1 = (i0 + EQ_BATCH).min(eq_pairs.len());
+        let batch = &eq_pairs[i0..i1];
+        let mut a_coeff: Vec<u8> = Vec::with_capacity(batch.len() * 2 * 2);
+        let mut a_idx: Vec<u32> = Vec::with_capacity(batch.len() * 2);
+        let mut b_coeff: Vec<u8> = Vec::with_capacity(batch.len() * 2);
+        let mut b_idx: Vec<u32> = Vec::with_capacity(batch.len());
+        let mut c_coeff: Vec<u8> = Vec::with_capacity(batch.len() * 2);
+        let mut c_idx: Vec<u32> = Vec::with_capacity(batch.len());
+        let mut lens: Vec<u32> = Vec::with_capacity(batch.len() * 3);
+        for &(x, y) in batch {
+            // A: [+1*x, -1*y]
+            a_coeff.extend_from_slice(&one_bytes);
+            a_coeff.extend_from_slice(&neg_one_bytes);
+            a_idx.push((x as u64).try_into().map_err(|_| "tiny gate: eq var idx overflow u32")?);
+            a_idx.push((y as u64).try_into().map_err(|_| "tiny gate: eq var idx overflow u32")?);
+            // B: [+1*var0]
+            b_coeff.extend_from_slice(&one_bytes);
+            b_idx.push(0u32);
+            // C: [0*var0]
+            c_coeff.extend_from_slice(&zero_bytes);
+            c_idx.push(0u32);
+            lens.extend_from_slice(&[2u32, 1u32, 1u32]);
+        }
+        eq_writer.push_a_terms_raw_block(&a_coeff, &a_idx)?;
+        eq_writer.push_b_terms_raw_block(&b_coeff, &b_idx)?;
+        eq_writer.push_c_terms_raw_block(&c_coeff, &c_idx)?;
+        eq_writer.push_constraint_lens_block(&lens)?;
+        i0 = i1;
+    }
+    if (eq_pairs.len() as u64) != plan.total_rows.saturating_sub(plan.part_rows) {
+        return Err("tiny gate: eq tail row count mismatch vs plan".to_string());
+    }
+
+    // Merge checkpoints.
+    let mut ckpts_all: Vec<(u64, u64, u64, u64)> = Vec::new();
+    ckpts_all.extend_from_slice(&pose_range.ckpts);
+    ckpts_all.extend_from_slice(&base_range.ckpts);
+    for eo in &extra_out {
+        ckpts_all.extend_from_slice(&eo.range.ckpts);
+    }
+    ckpts_all.extend(eq_writer.take_ckpts().into_iter());
+    ckpts_all.sort_by_key(|(row_idx, _, _, _)| *row_idx);
+    ckpts_all.dedup_by_key(|(row_idx, _, _, _)| *row_idx);
+    if ckpts_all.first().map(|x| x.0) != Some(0) {
+        ckpts_all.insert(0, (0, 0, 0, 0));
+    }
+    {
+        let mut f = std::io::BufWriter::new(
+            std::fs::File::create(dirs.merged_dir.join("rows_ckpt.bin"))
+                .map_err(|e| format!("create rows_ckpt failed: {e}"))?,
+        );
+        for (row_idx, a0, b0, c0) in &ckpts_all {
+            f.write_all(&row_idx.to_le_bytes()).map_err(|e| e.to_string())?;
+            f.write_all(&a0.to_le_bytes()).map_err(|e| e.to_string())?;
+            f.write_all(&b0.to_le_bytes()).map_err(|e| e.to_string())?;
+            f.write_all(&c0.to_le_bytes()).map_err(|e| e.to_string())?;
+        }
+    }
+
+    // meta.txt for the merged instance.
+    {
+        let limbs = F257::MODULUS.as_ref();
+        let modulus = limbs.get(0).copied().unwrap_or(0);
+        let mut f = std::io::BufWriter::new(
+            std::fs::File::create(dirs.merged_dir.join("meta.txt"))
+                .map_err(|e| format!("create meta failed: {e}"))?,
+        );
+        writeln!(f, "nvars={}", merged_asg.len()).ok();
+        writeln!(f, "constraints={}", plan.total_rows).ok();
+        writeln!(f, "a_terms={}", plan.total_a_terms).ok();
+        writeln!(f, "b_terms={}", plan.total_b_terms).ok();
+        writeln!(f, "c_terms={}", plan.total_c_terms).ok();
+        writeln!(f, "coeff_size=2").ok();
+        writeln!(f, "idx_size=4").ok();
+        writeln!(f, "row_size=12").ok();
+        writeln!(f, "row_ckpt_stride={}", 1u64 << 20).ok();
+        writeln!(f, "format=tiny_u16_u32_rows_len_u32_v1").ok();
+        writeln!(f, "modulus={}", modulus).ok();
+    }
+
+    // Strict size invariants: fail fast if final files don't match the planned layout.
+    {
+        let check = |name: &str, want: u64| -> Result<(), String> {
+            let p = dirs.merged_dir.join(name);
+            let got = std::fs::metadata(&p)
+                .map_err(|e| format!("stat {p:?} failed: {e}"))?
+                .len();
+            if got != want {
+                return Err(format!(
+                    "tiny gate: {name} size mismatch: got {got} bytes, expected {want}"
+                ));
+            }
+            Ok(())
+        };
+        check("constraints.bin", plan.total_rows.saturating_mul(12))?;
+        check("a_coeffs.bin", plan.total_a_terms.saturating_mul(2))?;
+        check("a_idx.bin", plan.total_a_terms.saturating_mul(4))?;
+        check("b_coeffs.bin", plan.total_b_terms.saturating_mul(2))?;
+        check("b_idx.bin", plan.total_b_terms.saturating_mul(4))?;
+        check("c_coeffs.bin", plan.total_c_terms.saturating_mul(2))?;
+        check("c_idx.bin", plan.total_c_terms.saturating_mul(4))?;
+        check("rows_ckpt.bin", (ckpts_all.len() as u64).saturating_mul(32))?;
+    }
+
+    let inst = FileBackedSparseDr1csInstance::<F257>::new(
+        merged_asg.len(),
+        FileBackedLayout {
+            dir: dirs.merged_dir.clone(),
+            coeff_size: 2,
+            idx_size: 4,
+            row_size: 12,
+            nconstraints: plan.total_rows,
+            a_terms: plan.total_a_terms,
+            b_terms: plan.total_b_terms,
+            c_terms: plan.total_c_terms,
+        },
+    );
+
+    // All exported wiring is from the base glue module (part 1).
+    let to_glue_global = |glue_local: usize| -> usize { remap(1, glue_local, &offsets) };
+    let shorts_out = short_locals
+        .into_iter()
+        .map(|w| ShortChallengeWiring {
+            digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
+            byte_vars: w.byte_vars.into_iter().map(to_glue_global).collect(),
+            coeff_vars: w.coeff_vars.into_iter().map(to_glue_global).collect(),
+            coeff_bal16_digits: w
+                .coeff_bal16_digits
+                .into_iter()
+                .map(|a| a.map(to_glue_global))
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let u32s_out = u32_locals
+        .into_iter()
+        .map(|w| BoundedU32ChallengeWiring {
+            digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
+            byte_vars: w.byte_vars.into_iter().map(to_glue_global).collect(),
+            coeff_vars: w.coeff_vars.into_iter().map(to_glue_global).collect(),
+        })
+        .collect::<Vec<_>>();
+    let goldilocks_out = goldilocks_locals
+        .into_iter()
+        .map(|w| GoldilocksChallengeWiring {
+            byte_vars: w.byte_vars.into_iter().map(to_glue_global).collect(),
+        })
+        .collect::<Vec<_>>();
+
+    let all_sum_digits_global = Arc::new(all_sum_digits.iter().map(|&v| to_glue_global(v)).collect::<Vec<_>>());
+    let all_sq_sum_digits_global = Arc::new(all_sq_sum_digits.iter().map(|&v| to_glue_global(v)).collect::<Vec<_>>());
+    let all_sum_coeffwise_global = Arc::new(
+        all_sum_coeffwise
+            .iter()
+            .map(|row| row.iter().map(|&v| to_glue_global(v)).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+    );
+    let all_sq_sum_coeffwise_global = Arc::new(
+        all_sq_sum_coeffwise
+            .iter()
+            .map(|row| row.iter().map(|&v| to_glue_global(v)).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+    );
+    let surfaces_out = surfaces_mul_local
+        .into_iter()
+        .map(|s| CmDigitMulSurfaceWiring {
+            inputs0: s.inputs0.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
+            inputs1: s.inputs1.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
+            products: s.products.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
+            sum_digits: s.sum_digits.into_iter().map(to_glue_global).collect(),
+            sum_all_pairs_digits: all_sum_digits_global.clone(),
+            sum_all_pairs_coeffwise: all_sum_coeffwise_global.clone(),
+        })
+        .collect::<Vec<_>>();
+    let surfaces_sq_out = surfaces_sq_local
+        .into_iter()
+        .map(|s| CmDigitMulSqSurfaceWiring {
+            inputs0: s.inputs0.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
+            products10: s.products10.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
+            products11: s.products11.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
+            products20: s.products20.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
+            products21: s.products21.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
+            products22: s.products22.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
+            sum_digits: s.sum_digits.into_iter().map(to_glue_global).collect(),
+            sum_all_pairs_digits: all_sq_sum_digits_global.clone(),
+            sum_all_pairs_coeffwise: all_sq_sum_coeffwise_global.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    Ok((
+        inst,
+        merged_asg,
+        shorts_out,
+        u32s_out,
+        goldilocks_out,
+        surfaces_out,
+        surfaces_sq_out,
+        pose_wiring,
+    ))
+}
+
 /// Build Poseidon(F257) + WE-tiny glue as a file-backed dR1CS instance.
 pub(super) fn build(
     cfg: Option<&PoseidonConfig<F257>>,
@@ -4527,6 +5620,17 @@ pub(super) fn build(
     ),
     String,
 > {
+    #[cfg(unix)]
+    {
+        // Default: direct-to-merged (two-pass) on unix.
+        let direct = match std::env::var("LFP_TINY_GATE_DIRECT_MERGED").as_deref() {
+            Ok("0") | Ok("false") | Ok("no") => false,
+            _ => true,
+        };
+        if direct {
+            return build_direct_to_merged_unix(cfg, ops, ring_dim, params, wiring, pairs, extra_witness, out_dir);
+        }
+    }
     let dirs = build_dirs(out_dir);
     lf_profile_log(&format!(
         "start out_dir={} threads={}",
@@ -4548,10 +5652,10 @@ pub(super) fn build(
     validate_params_and_short_schedule(ring_dim, params, short_ranges.len())?;
 
     let pose_asg = Arc::new(pose_asg);
-    let mut glue = GlueCtx::new(pose_asg.clone(), &dirs.base_glue_dir)?;
+    let mut glue = GlueCtx::new(&TinyGateBuildMode::Append, pose_asg.clone(), &dirs.base_glue_dir, 1, None)?;
 
     // Canonicality constraints: build parallel file-backed glue shards.
-    let canonical_glues = build_canonicality_shards(&pose_asg, ops, &pose_wiring, &dirs)?;
+    let canonical_glues = build_canonicality_shards(&TinyGateBuildMode::Append, 2, None, &pose_asg, ops, &pose_wiring, &dirs)?;
 
     validate_cm_u32_schedule(params, wiring)?;
     let (n_comh_ring_elems, coeff_bytes) = count_comh_ring_elements(ops, &pose_wiring, ring_dim, wiring)?;
@@ -4636,6 +5740,9 @@ pub(super) fn build(
         &setchk_r_point_for_cm,
     )?;
     let cm_extra_glues = build_cm_shards(
+        &TinyGateBuildMode::Append,
+        2 + canonical_glues.len(),
+        None,
         cfg,
         ops,
         &pose_wiring,
