@@ -13,7 +13,7 @@ use crate::poseidon_trace::{permute_in_place, permute_with_round_trace, Poseidon
 use crate::poseidon_trace::{replay_ops, PoseidonReplayError as ReplayErr, PoseidonSpongeReplayResult};
 use crate::transcript::PoseidonTraceOp;
 use crate::file_backed_dr1cs::{
-    merge_file_backed_sparse_dr1cs_share_one, FileBackedSparseDr1csInstance, SparseDr1csFileWriter,
+    fast_prepare_out_dir, merge_file_backed_sparse_dr1cs_share_one, FileBackedSparseDr1csInstance, SparseDr1csFileWriter,
 };
 
 #[derive(Debug)]
@@ -1478,8 +1478,7 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
     }
 
     let merged_dir = out_dir.join("poseidon_merged");
-    let _ = std::fs::remove_dir_all(&merged_dir);
-    create_dir_all(&merged_dir).map_err(|e| ReplayErr::Invalid(format!("create merged dir failed: {e}")))?;
+    fast_prepare_out_dir(&merged_dir).map_err(ReplayErr::Invalid)?;
 
     let parts: Vec<(FileBackedSparseDr1csInstance<F>, Vec<F>)> = groups
         .into_iter()

@@ -16,6 +16,7 @@ use std::io::Seek;
 use std::io::SeekFrom;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ark_ff::PrimeField;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, SerializationError};
@@ -132,6 +133,32 @@ fn constraints_path(dir: &Path) -> PathBuf {
 }
 fn meta_path(dir: &Path) -> PathBuf {
     dir.join("meta.txt")
+}
+
+/// Fast "cleanup" for huge output dirs: rename then delete in background.
+///
+/// This avoids blocking on `remove_dir_all` for directories containing many large files.
+/// Space is reclaimed asynchronously as the deleter runs.
+pub(crate) fn fast_prepare_out_dir(dir: &Path) -> Result<(), String> {
+    if dir.exists() {
+        let pid = std::process::id();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let trash = dir.with_extension(format!("trash.{pid}.{ts}"));
+        // Try constant-time rename; if it works, delete old contents asynchronously.
+        if std::fs::rename(dir, &trash).is_ok() {
+            std::thread::spawn(move || {
+                let _ = std::fs::remove_dir_all(trash);
+            });
+        } else {
+            // Fallback (slower): remove in-place.
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+    create_dir_all(dir).map_err(|e| format!("create_dir_all failed: {e}"))?;
+    Ok(())
 }
 
 fn serialize_fixed<F: CanonicalSerialize>(x: &F, out: &mut [u8]) -> Result<(), SerializationError> {
@@ -1073,8 +1100,7 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
         use rayon::prelude::*;
 
         let out_dir = out_dir.as_ref().to_path_buf();
-        let _ = std::fs::remove_dir_all(&out_dir);
-        create_dir_all(&out_dir).map_err(|e| format!("create_dir_all failed: {e}"))?;
+        fast_prepare_out_dir(&out_dir)?;
         if timing {
             eprintln!(
                 "file_backed_merge: start parts={} threads={} out_dir={}",
