@@ -1982,9 +1982,8 @@ fn compute_cm_shared_precomp_base(
                 None
                 } else {
                     use super::cm_ir::{
-                        bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir,
-                        lower_ir_into_builder, ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir, IrBuilder,
-                        VarRef as IrVarRef,
+                        bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir, lower_ir_into_builder,
+                        ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir, IrBuilder, VarRef as IrVarRef,
                     };
 
                     #[inline]
@@ -2000,6 +1999,12 @@ fn compute_cm_shared_precomp_base(
                             core::array::from_fn(|j| lowered.map_var(out_ir[i][j]))
                         });
                         out.into_iter().collect()
+                    }
+                    type Scalar4 = [usize; 33];
+                    type Ring4 = [Scalar4; 64];
+                    #[inline]
+                    fn map_ring_out4(out_ir: &[[IrVarRef; 33]; 64], lowered: &super::cm_ir::LoweredIr) -> Ring4 {
+                        core::array::from_fn(|i| core::array::from_fn(|j| lowered.map_var(out_ir[i][j])))
                     }
 
                     let timing_u = tiny_opmix_on();
@@ -2054,18 +2059,20 @@ fn compute_cm_shared_precomp_base(
                                 v
                             } else {
                                 let threads = rayon::current_num_threads().max(1);
-                                let target_frags = (threads.saturating_mul(2)).min(64).max(1);
+                                // Now that we do the shard reduction in **bal4** (and convert to bal16 only once at the end),
+                                // we can safely target more shards to saturate wide machines without multiplying conversion work.
+                                let target_frags = (threads.saturating_mul(4)).min(256).max(1);
                                 let raw = (terms.len() + target_frags - 1) / target_frags;
-                                // For “large” rows (e.g. k*d >= 256), keep shards coarse to avoid
-                                // multiplying the per-shard bal4->bal16 conversion work.
-                                let min_batch = if terms.len() >= 256 { 64 } else { 8 };
+                                // Keep shards reasonably coarse to avoid overwhelming IR/lowering overhead,
+                                // but do not artificially cap parallelism on large instances.
+                                let min_batch = if terms.len() >= 512 { 16 } else { 8 };
                                 raw.clamp(min_batch, 256)
                             };
                             u_batch_used = batch_size;
 
                             // Build shard IRs in parallel.
                             let t_build = Instant::now();
-                            let frags: Vec<(_, [[IrVarRef; 17]; 64])> = terms
+                            let frags: Vec<(_, [[IrVarRef; 33]; 64])> = terms
                                 .chunks(batch_size)
                                 .collect::<Vec<_>>()
                                 .into_par_iter()
@@ -2108,39 +2115,84 @@ fn compute_cm_shared_precomp_base(
                                         super::op_counts::tiny_cm_bump(|c| c.ring_mul_negacyclic += 1);
                                     }
 
-                                    // Convert back to bal16 once per coefficient.
-                                    let mut out16: [[IrVarRef; 17]; 64] = [[zero_digit; 17]; 64];
-                                    for i in 0..64 {
-                                        out16[i] = ib.bal4_to_bal16_digits_cached(&acc4[i]);
-                                    }
-                                    Ok((ib.ir, out16))
+                                    // Return the shard accumulator in **bal4**.
+                                    Ok((ib.ir, acc4))
                                 })
                                 .collect::<Result<Vec<_>, _>>()?;
 
                             u_ir_build_time = u_ir_build_time.saturating_add(t_build.elapsed());
                             u_frag_count = u_frag_count.saturating_add(frags.len());
 
-                            // Lower shards and reduce their outputs with a tree of ring additions.
+                            // Lower shards and reduce their outputs in **bal4**, then convert once to bal16.
                             let t_lower = Instant::now();
-                            let mut partials: Vec<RingDigits> = Vec::with_capacity(frags.len());
-                            for (ir, out_ir) in frags {
+                            let mut cur4: Vec<Ring4> = Vec::with_capacity(frags.len());
+                            for (ir, out4_ir) in frags {
                                 let lowered = lower_ir_into_builder(&mut glue.gb, ir);
-                                partials.push(map_ring_out(&out_ir, &lowered));
+                                cur4.push(map_ring_out4(&out4_ir, &lowered));
                             }
-                            // Tree reduction (pairwise) to keep addition depth logarithmic.
-                            let mut cur = partials;
-                            while cur.len() > 1 {
-                                let mut next: Vec<RingDigits> = Vec::with_capacity((cur.len() + 1) / 2);
-                                for pair in cur.chunks(2) {
-                                    if pair.len() == 1 {
-                                        next.push(pair[0].clone());
-                                    } else {
-                                        next.push(ring_add_digits(&mut glue.gb, &pair[0], &pair[1]));
-                                    }
+
+                            // Reduce in bal4 using a tree of bal4 ring additions (pairwise).
+                            // Build IRs in parallel, lower sequentially (single builder).
+                            let base_asg_addr2: usize = glue.gb.assignment.as_ptr() as usize;
+                            let base_asg_len2: usize = glue.gb.assignment.len();
+                            while cur4.len() > 1 {
+                                let pairs: Vec<[Ring4; 2]> = cur4
+                                    .chunks(2)
+                                    .filter_map(|p| if p.len() == 2 { Some([p[0], p[1]]) } else { None })
+                                    .collect();
+                                let carry: Option<Ring4> = if (cur4.len() & 1) == 1 { Some(*cur4.last().unwrap()) } else { None };
+
+                                let reduce_frags: Vec<(_, [[IrVarRef; 33]; 64])> = pairs
+                                    .into_par_iter()
+                                    .map(|[a, b]| -> Result<_, String> {
+                                        let base_asg_ptr: *const F257 = base_asg_addr2 as *const F257;
+                                        let base_asg_ir: &[F257] =
+                                            unsafe { core::slice::from_raw_parts(base_asg_ptr, base_asg_len2) };
+                                        let mut ib = IrBuilder::new(base_asg_ir);
+                                        let mut out: [[IrVarRef; 33]; 64] = [[IrVarRef::Base(0); 33]; 64];
+                                        for i in 0..64 {
+                                            let a4: [IrVarRef; 33] = core::array::from_fn(|k| IrVarRef::Base(a[i][k]));
+                                            let b4: [IrVarRef; 33] = core::array::from_fn(|k| IrVarRef::Base(b[i][k]));
+                                            out[i] = goldilocks_add_mod_p_digits_bal4_ir(
+                                                &mut ib,
+                                                &a4,
+                                                &b4,
+                                                crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P,
+                                            );
+                                        }
+                                        Ok((ib.ir, out))
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?;
+
+                                let mut next4: Vec<Ring4> = Vec::with_capacity((cur4.len() + 1) / 2);
+                                for (ir, out4_ir) in reduce_frags {
+                                    let lowered = lower_ir_into_builder(&mut glue.gb, ir);
+                                    next4.push(map_ring_out4(&out4_ir, &lowered));
                                 }
-                                cur = next;
+                                if let Some(last) = carry {
+                                    next4.push(last);
+                                }
+                                cur4 = next4;
                             }
-                            let acc_ring = cur.pop().unwrap_or_else(|| super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim));
+
+                            let acc4: Ring4 = cur4
+                                .pop()
+                                .unwrap_or_else(|| core::array::from_fn(|_| core::array::from_fn(|_| glue.gb.one())));
+
+                            // Convert the final accumulator to bal16 once per coefficient.
+                            let base_asg_ptr: *const F257 = base_asg_addr as *const F257;
+                            let base_asg_ir: &[F257] = unsafe { core::slice::from_raw_parts(base_asg_ptr, base_asg_len) };
+                            let (ir_conv, out16_ir): (_, [[IrVarRef; 17]; 64]) = {
+                                let mut ib = IrBuilder::new(base_asg_ir);
+                                let mut out: [[IrVarRef; 17]; 64] = [[IrVarRef::Base(0); 17]; 64];
+                                for i in 0..64 {
+                                    let a4: [IrVarRef; 33] = core::array::from_fn(|k| IrVarRef::Base(acc4[i][k]));
+                                    out[i] = bal4_to_bal16_digits_ir(&mut ib, &a4);
+                                }
+                                (ib.ir, out)
+                            };
+                            let lowered = lower_ir_into_builder(&mut glue.gb, ir_conv);
+                            let acc_ring: RingDigits = map_ring_out(&out16_ir, &lowered);
                             u_lower_time = u_lower_time.saturating_add(t_lower.elapsed());
 
                             u_l.push(acc_ring);
