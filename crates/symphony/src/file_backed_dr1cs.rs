@@ -1507,22 +1507,21 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
             // Append equality constraints at the tail (write_at into pre-sized file ranges).
             if !extra_eqs.is_empty() {
                 let t_eq = std::time::Instant::now();
-                // Coeff encoding: tiny_u16_u32.
-                let modulus_bigint = F::MODULUS;
-                let limbs = modulus_bigint.as_ref();
-                let modulus_u64 = limbs.get(0).copied().unwrap_or(0);
-                let one_bytes: Vec<u8> = match coeff_size {
-                    2 => (1u16).to_le_bytes().to_vec(),
-                    _ => return Err("merge_file_backed: unsupported coeff_size (expected 1 or 2)".to_string()),
-                };
-                let neg_one_bytes: Vec<u8> = match coeff_size {
-                    2 => ((modulus_u64.saturating_sub(1) as u16)).to_le_bytes().to_vec(),
-                    _ => unreachable!(),
-                };
-                let zero_bytes: Vec<u8> = match coeff_size {
-                    2 => (0u16).to_le_bytes().to_vec(),
-                    _ => unreachable!(),
-                };
+                // Coeff encoding: tiny_u16_u32 for F257 (canonical reps in u16 LE).
+                //
+                // Since this code path is only used for the LF+ file-backed tiny gate (F257),
+                // we can hardcode 0/1/-1 encodings and avoid bigint/modulus plumbing + Vec allocs.
+                //
+                // F257 canonical representatives:
+                //   0  -> 0x0000
+                //   1  -> 0x0001
+                //  -1  -> 256 -> 0x0100
+                if coeff_size != 2 {
+                    return Err("merge_file_backed: unsupported coeff_size (expected 2 for tiny_u16_u32/F257)".to_string());
+                }
+                let one_bytes: [u8; 2] = [0x01, 0x00];
+                let neg_one_bytes: [u8; 2] = [0x00, 0x01];
+                let zero_bytes: [u8; 2] = [0x00, 0x00];
 
                 let base_a_terms = cur_a;
                 let base_b_terms = cur_b;
