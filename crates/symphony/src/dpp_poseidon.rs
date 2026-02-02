@@ -739,10 +739,6 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         {
             return Ok(());
         }
-        let sink = self
-            .file_sink
-            .as_mut()
-            .expect("file-backed sink vanished unexpectedly");
         // Optional flush trace (helps validate we're writing big blocks).
         #[inline]
         fn trace_enabled() -> bool {
@@ -752,6 +748,10 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         }
         let t0 = if trace_enabled() { Some(std::time::Instant::now()) } else { None };
         let bytes0 = if t0.is_some() { self.staged_bytes() } else { 0 };
+        let sink = self
+            .file_sink
+            .as_mut()
+            .expect("file-backed sink vanished unexpectedly");
         if !self.st_a_idx.is_empty() {
             sink.push_a_terms_raw_block(&self.st_a_coeff, &self.st_a_idx)?;
             self.file_a_terms = self.file_a_terms.saturating_add(self.st_a_idx.len() as u64);

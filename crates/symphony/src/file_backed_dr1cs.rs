@@ -1099,6 +1099,42 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                 }
                 Ok(acc)
             }
+
+            #[inline]
+            fn eval_range_head(
+                &mut self,
+                which: &str,
+                start: u64,
+                end: u64,
+                assignment: &[F],
+                head: usize,
+            ) -> Result<(F, Vec<(u64, u32, F)>), String> {
+                self.seek_term(which, start)?;
+                let mut acc = F::ZERO;
+                let mut out: Vec<(u64, u32, F)> = Vec::new();
+                let mut k: usize = 0;
+                for _ in start..end {
+                    self.fc
+                        .read_exact(&mut self.coeff_buf)
+                        .map_err(|e| format!("read {which}_coeffs failed: {e}"))?;
+                    let idx_u32 = read_u32(&mut self.fi).map_err(|e| format!("read {which}_idx failed: {e}"))?;
+                    let idx = idx_u32 as usize;
+                    let vv: u64 = match self.coeff_size {
+                        1 => self.coeff_buf[0] as u64,
+                        2 => u16::from_le_bytes([self.coeff_buf[0], self.coeff_buf[1]]) as u64,
+                        _ => return Err(format!("unsupported coeff_size={} (expected 1 or 2)", self.coeff_size)),
+                    };
+                    let coef = F::from(vv);
+                    let x = assignment[idx];
+                    acc += coef * x;
+                    if k < head {
+                        out.push((vv, idx_u32, x));
+                    }
+                    k += 1;
+                    self.cur = self.cur.saturating_add(1);
+                }
+                Ok((acc, out))
+            }
         }
 
         let coeff_size = self.layout.coeff_size;
@@ -1117,6 +1153,20 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
         }
 
         use rayon::prelude::*;
+        fn debug_target() -> Option<u64> {
+            static TGT: OnceLock<Option<u64>> = OnceLock::new();
+            *TGT.get_or_init(|| std::env::var("LF_DEBUG_CONSTRAINT_AT").ok().and_then(|s| s.parse::<u64>().ok()))
+        }
+        fn debug_head() -> usize {
+            static HEAD: OnceLock<usize> = OnceLock::new();
+            *HEAD.get_or_init(|| {
+                std::env::var("LF_DEBUG_CONSTRAINT_HEAD")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(8)
+                    .min(64)
+            })
+        }
         ranges
             .into_par_iter()
             .try_for_each(|(c_start, c_end)| -> Result<(), String> {
@@ -1147,11 +1197,29 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                         first = false;
                     }
 
-                    let a = ts_a.as_mut().unwrap().eval_range("a", a0, a1, assignment)?;
-                    let b = ts_b.as_mut().unwrap().eval_range("b", b0, b1, assignment)?;
-                    let c = ts_c.as_mut().unwrap().eval_range("c", c0, c1, assignment)?;
-                    if a * b != c {
-                        return Err(format!("constraint {ci} failed"));
+                    let dbg = debug_target().is_some_and(|t| t == ci);
+                    if dbg {
+                        let head = debug_head();
+                        let (a, ah) = ts_a.as_mut().unwrap().eval_range_head("a", a0, a1, assignment, head)?;
+                        let (b, bh) = ts_b.as_mut().unwrap().eval_range_head("b", b0, b1, assignment, head)?;
+                        let (c, ch) = ts_c.as_mut().unwrap().eval_range_head("c", c0, c1, assignment, head)?;
+                        if a * b != c {
+                            eprintln!(
+                                "[LF_DEBUG_CONSTRAINT] idx={ci} a=[{a0},{a1}) b=[{b0},{b1}) c=[{c0},{c1})"
+                            );
+                            eprintln!("[LF_DEBUG_CONSTRAINT] A(head): {:?}", ah);
+                            eprintln!("[LF_DEBUG_CONSTRAINT] B(head): {:?}", bh);
+                            eprintln!("[LF_DEBUG_CONSTRAINT] C(head): {:?}", ch);
+                            eprintln!("[LF_DEBUG_CONSTRAINT] A={:?} B={:?} C={:?} A*B={:?}", a, b, c, a * b);
+                            return Err(format!("constraint {ci} failed"));
+                        }
+                    } else {
+                        let a = ts_a.as_mut().unwrap().eval_range("a", a0, a1, assignment)?;
+                        let b = ts_b.as_mut().unwrap().eval_range("b", b0, b1, assignment)?;
+                        let c = ts_c.as_mut().unwrap().eval_range("c", c0, c1, assignment)?;
+                        if a * b != c {
+                            return Err(format!("constraint {ci} failed"));
+                        }
                     }
                 }
                 Ok(())
