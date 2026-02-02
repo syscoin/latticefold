@@ -1096,6 +1096,21 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                 row_size, ROW_LENS_SIZE
             ));
         }
+        // Hard sanity check: constraints file must match declared row_size exactly.
+        {
+            let p = constraints_path(&dir);
+            let len = std::fs::metadata(&p)
+                .map_err(|e| format!("stat constraints failed: {e}"))?
+                .len();
+            let expect = (nconstraints as u128)
+                .saturating_mul(ROW_LENS_SIZE as u128)
+                .min(u64::MAX as u128) as u64;
+            if len != expect {
+                return Err(format!(
+                    "file-backed check: constraints.bin size mismatch (got {len} bytes, expected {expect} = {nconstraints}*{ROW_LENS_SIZE}); old row format still present?"
+                ));
+            }
+        }
 
         // Load checkpoints (best-effort). If missing, we fall back to ckpt_row=0.
         let ckpts: Vec<(u64, u64, u64, u64)> = {
@@ -1145,27 +1160,20 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
 
         use rayon::prelude::*;
         ranges.into_par_iter().try_for_each(|(c_start, c_end)| -> Result<(), String> {
-            let ckpt_row = if ckpts.is_empty() {
-                0
-            } else {
-                (c_start / ROW_CKPT_STRIDE) * ROW_CKPT_STRIDE
-            };
-            let (row0, mut a0, mut b0, mut c0) = ckpt_lookup(&ckpts, ckpt_row);
-            debug_assert!(row0 <= ckpt_row);
-            // If ckpt file didn't have the exact row, fall back to 0.
-            if row0 != ckpt_row {
-                a0 = 0;
-                b0 = 0;
-                c0 = 0;
-            }
+            // Pick the nearest checkpoint at/before this chunk start.
+            // IMPORTANT: ckpt files may not contain every multiple of ROW_CKPT_STRIDE (e.g. merged
+            // instances with appended equality constraints), so we must *not* require an exact
+            // stride-aligned checkpoint.
+            let (row0, mut a0, mut b0, mut c0) = ckpt_lookup(&ckpts, c_start);
+            debug_assert!(row0 <= c_start);
 
             let mut fr = File::open(constraints_path(&dir)).map_err(|e| format!("open constraints failed: {e}"))?;
-            fr.seek(std::io::SeekFrom::Start(ckpt_row.saturating_mul(ROW_LENS_SIZE as u64)))
+            fr.seek(std::io::SeekFrom::Start(row0.saturating_mul(ROW_LENS_SIZE as u64)))
                 .map_err(|e| format!("seek constraints failed: {e}"))?;
             let mut rows = BufReader::with_capacity(8 * 1024 * 1024, fr);
 
-            // Advance from ckpt_row to c_start (skip evaluation) to compute starting offsets.
-            for _ in ckpt_row..c_start {
+            // Advance from row0 to c_start (skip evaluation) to compute starting offsets.
+            for _ in row0..c_start {
                 let a_len = read_u32(&mut rows).map_err(|e| format!("read row lens failed: {e}"))? as u64;
                 let b_len = read_u32(&mut rows).map_err(|e| format!("read row lens failed: {e}"))? as u64;
                 let c_len = read_u32(&mut rows).map_err(|e| format!("read row lens failed: {e}"))? as u64;
