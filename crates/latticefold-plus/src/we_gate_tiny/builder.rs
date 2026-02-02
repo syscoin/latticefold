@@ -1767,7 +1767,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                                 ct4 = goldilocks_add_mod_p_digits_bal4_ir(&mut ib, &ct4, &t, p_u64);
                             }
 
-                            let ct16 = bal4_to_bal16_digits_ir(&mut ib, &ct4);
+                            let ct16 = ib.bal4_to_bal16_digits_cached(&ct4);
                         Ok((ib.ir, ct16, col))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -2083,7 +2083,7 @@ fn compute_cm_shared_precomp_base(
                                     // Convert back to bal16 once per coefficient.
                                     let mut out16: [[IrVarRef; 17]; 64] = [[zero_digit; 17]; 64];
                                     for i in 0..64 {
-                                        out16[i] = bal4_to_bal16_digits_ir(&mut ib, &acc4[i]);
+                                        out16[i] = ib.bal4_to_bal16_digits_cached(&acc4[i]);
                                     }
                                     Ok((ib.ir, out16))
                                 })
@@ -3836,8 +3836,8 @@ fn build_cm_glue_for_which(
                                 let mut out0_16: [[IrVarRef; 17]; 64] = [[IrVarRef::Base(0); 17]; 64];
                                 let mut out1_16: [[IrVarRef; 17]; 64] = [[IrVarRef::Base(0); 17]; 64];
                                 for i in 0..64 {
-                                    out0_16[i] = bal4_to_bal16_digits_ir(&mut ib, &acc0_4[i]);
-                                    out1_16[i] = bal4_to_bal16_digits_ir(&mut ib, &acc1_4[i]);
+                                    out0_16[i] = ib.bal4_to_bal16_digits_cached(&acc0_4[i]);
+                                    out1_16[i] = ib.bal4_to_bal16_digits_cached(&acc1_4[i]);
                                 }
                                 Ok((ib.ir, out0_16, out1_16))
                             })
@@ -4150,7 +4150,7 @@ fn build_cm_glue_for_which(
                                 // Convert to bal16 once (required by downstream digit-domain gadgets).
                                 let mut out16: [[IrVarRef; 17]; 64] = [[IrVarRef::Base(0); 17]; 64];
                                 for coeff in 0..64 {
-                                    out16[coeff] = bal4_to_bal16_digits_ir(&mut ib, &acc4[coeff]);
+                                    out16[coeff] = ib.bal4_to_bal16_digits_cached(&acc4[coeff]);
                                 }
                                 Ok((ib.ir, out16))
                             })
@@ -4328,7 +4328,7 @@ fn build_cm_glue_for_which(
                         let mut out16: [[IrVarRef; 17]; 64] = [[IrVarRef::Base(0); 17]; 64];
                         for coeff in 0..64 {
                             let prod4 = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &inner4[coeff], &eq4_ir, p_u64);
-                            out16[coeff] = bal4_to_bal16_digits_ir(&mut ib, &prod4);
+                            out16[coeff] = ib.bal4_to_bal16_digits_cached(&prod4);
                         }
                         Ok((ib.ir, out16))
                     })
@@ -4430,7 +4430,7 @@ fn build_cm_glue_for_which(
                         let s0 = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &out0_4[i], &rcz4, p_u64);
                         let s1 = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &out1_4[i], &rcz14, p_u64);
                         let sum4 = goldilocks_add_mod_p_digits_bal4_ir(&mut ib, &s0, &s1, p_u64);
-                        out16[i] = bal4_to_bal16_digits_ir(&mut ib, &sum4);
+                        out16[i] = ib.bal4_to_bal16_digits_cached(&sum4);
                     }
                     Ok((ib.ir, out16))
                 })

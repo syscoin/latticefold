@@ -711,6 +711,8 @@ pub(crate) struct IrBuilder<'a> {
     pub(crate) ir: CmIr,
     // Cache for expensive representation conversions used in hot paths.
     bal16_to_bal4_cache: HashMap<[VarRef; 17], [VarRef; 33]>,
+    // Cache for bal4 -> bal16 conversions (inverse direction).
+    bal4_to_bal16_cache: HashMap<[VarRef; 33], [VarRef; 17]>,
     // Cache for constant-mul carry schedules (NTT twiddles repeat a lot).
     bal4_const_mul_cache: HashMap<u64, Bal4ConstMulPrecomp>,
 }
@@ -722,6 +724,7 @@ impl<'a> IrBuilder<'a> {
             base_asg,
             ir: CmIr::new(),
             bal16_to_bal4_cache: HashMap::new(),
+            bal4_to_bal16_cache: HashMap::new(),
             bal4_const_mul_cache: HashMap::new(),
         }
     }
@@ -786,6 +789,18 @@ impl<'a> IrBuilder<'a> {
         }
         let out = bal16_to_bal4_digits_ir(self, x16);
         self.bal16_to_bal4_cache.insert(key, out);
+        out
+    }
+
+    /// Convert bal4 digits to bal16 digits with caching keyed by input var IDs.
+    #[inline]
+    pub(crate) fn bal4_to_bal16_digits_cached(&mut self, x4: &[VarRef; 33]) -> [VarRef; 17] {
+        let key = *x4;
+        if let Some(v) = self.bal4_to_bal16_cache.get(&key) {
+            return *v;
+        }
+        let out = bal4_to_bal16_digits_ir(self, x4);
+        self.bal4_to_bal16_cache.insert(key, out);
         out
     }
 
