@@ -1819,7 +1819,8 @@ fn compute_cm_shared_precomp_base(
 ) -> Result<Option<Arc<CmSharedPrecompBase>>, String> {
     // Exact logic previously inlined in `build()`. Keep it in one place so both in-memory and
     // file-backed builds share the *same* precompute logic and op-mix behavior.
-    debug_assert_eq!(ring_dim, 64);
+    assert_eq!(ring_dim, 64);
+    assert_eq!(l_instances_expected, 1, "unexpected number of CM instances");
     let cm_shared_base: Option<Arc<CmSharedPrecompBase>> = if l_instances_expected > 0
         && params.kappa > 0
         && (params.kappa as usize).is_power_of_two()
@@ -1837,10 +1838,24 @@ fn compute_cm_shared_precomp_base(
         // Shared CM challenge seed blocks: c0/c1.
         let cm_u32_start = cm_u32_start_idx(wiring);
         if u32_locals.len() < cm_u32_start + 2 * log_kappa {
-            None
-        } else if short_locals.len() < 3 + k_decomp * ring_dim {
-            None
-        } else {
+            return Err(format!(
+                "tiny gate: cannot compute cm_shared_base (missing u32 challenges for c0/c1): have_u32={} need_u32={} (cm_u32_start={} log_kappa={})",
+                u32_locals.len(),
+                cm_u32_start + 2 * log_kappa,
+                cm_u32_start,
+                log_kappa
+            ));
+        }
+        if short_locals.len() < 3 + k_decomp * ring_dim {
+            return Err(format!(
+                "tiny gate: cannot compute cm_shared_base (missing short challenges for s_prime_flat): have_short={} need_short={} (k={} ring_dim={})",
+                short_locals.len(),
+                3 + k_decomp * ring_dim,
+                k_decomp,
+                ring_dim
+            ));
+        }
+        {
             // c0/c1 digits, then tensor-expand.
             let c0_u32 = &u32_locals[cm_u32_start..cm_u32_start + log_kappa];
             let c1_u32 = &u32_locals[cm_u32_start + log_kappa..cm_u32_start + 2 * log_kappa];
@@ -1966,7 +1981,7 @@ fn compute_cm_shared_precomp_base(
                 None
                 } else {
                     use super::cm_ir::{
-                        alloc_zero_const_ir, bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir,
+                        bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir,
                         lower_ir_into_builder, ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir, IrBuilder,
                         VarRef as IrVarRef,
                     };
@@ -2032,7 +2047,13 @@ fn compute_cm_shared_precomp_base(
                                         unsafe { core::slice::from_raw_parts(base_asg_ptr, base_asg_len) };
                                     let mut ib = IrBuilder::new(base_asg_ir);
 
-                                    let zero_digit = alloc_zero_const_ir(&mut ib);
+                                    // Local helper: allocate a reusable 0 constant inside this IR.
+                                    // (We can't call cm_ir's `alloc_zero_const_ir` since it's private.)
+                                    let zero_digit: IrVarRef = {
+                                        let z = ib.new_var(F257::ZERO);
+                                        ib.ir.enforce_var_eq_const(z, F257::ZERO);
+                                        z
+                                    };
                                     let zero4: [IrVarRef; 33] = [zero_digit; 33];
                                     let mut acc4: [[IrVarRef; 33]; 64] = [zero4; 64];
 
@@ -2052,7 +2073,7 @@ fn compute_cm_shared_precomp_base(
                                                 &mut ib,
                                                 &acc4[i],
                                                 &prod4[i],
-                                                gl_ntt64::GOLDILOCKS_P_U64,
+                                                crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P,
                                             );
                                         }
                                         // Keep op-mix accounting consistent: one ring-mul per term.
