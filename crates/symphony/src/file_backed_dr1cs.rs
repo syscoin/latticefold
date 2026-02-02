@@ -522,37 +522,14 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
                 .saturating_mul(self.coeff_size as u128)
                 .min(u64::MAX as u128) as u64;
             let idx_off = base.saturating_mul(self.idx_size as u64);
-            self.fc_a
-                .get_ref()
-                .set_len(coeff_off.saturating_add(coeff_bytes.len() as u64))
-                .map_err(|e| e.to_string())?;
-            self.fi_a
-                .get_ref()
-                .set_len(idx_off.saturating_add((idx.len().saturating_mul(self.idx_size)) as u64))
-                .map_err(|e| e.to_string())?;
-
-            let chunk = cfg_pwrite_chunk_bytes();
             let f_coeff = self.fc_a.get_ref();
             let f_idx = self.fi_a.get_ref();
-            use rayon::prelude::*;
-            (0..coeff_bytes.len())
-                .into_par_iter()
-                .step_by(chunk)
-                .try_for_each(|off| -> Result<(), String> {
-                    let end = (off + chunk).min(coeff_bytes.len());
-                    let buf = &coeff_bytes[off..end];
-                    pwrite_all(f_coeff, coeff_off.saturating_add(off as u64), buf)
-                })?;
+            // Single large `pwrite` is typically faster than many chunked writes + Rayon overhead
+            // for the sequential append pattern.
+            pwrite_all(f_coeff, coeff_off, coeff_bytes)?;
             let idx_bytes =
                 unsafe { core::slice::from_raw_parts(idx.as_ptr() as *const u8, idx.len().saturating_mul(4)) };
-            (0..idx_bytes.len())
-                .into_par_iter()
-                .step_by(chunk)
-                .try_for_each(|off| -> Result<(), String> {
-                    let end = (off + chunk).min(idx_bytes.len());
-                    let buf = &idx_bytes[off..end];
-                    pwrite_all(f_idx, idx_off.saturating_add(off as u64), buf)
-                })?;
+            pwrite_all(f_idx, idx_off, idx_bytes)?;
             self.fc_a.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
             self.fi_a.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
             self.a_terms = self.a_terms.saturating_add(n);
@@ -599,37 +576,12 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
                 .saturating_mul(self.coeff_size as u128)
                 .min(u64::MAX as u128) as u64;
             let idx_off = base.saturating_mul(self.idx_size as u64);
-            self.fc_b
-                .get_ref()
-                .set_len(coeff_off.saturating_add(coeff_bytes.len() as u64))
-                .map_err(|e| e.to_string())?;
-            self.fi_b
-                .get_ref()
-                .set_len(idx_off.saturating_add((idx.len().saturating_mul(self.idx_size)) as u64))
-                .map_err(|e| e.to_string())?;
-
-            let chunk = cfg_pwrite_chunk_bytes();
             let f_coeff = self.fc_b.get_ref();
             let f_idx = self.fi_b.get_ref();
-            use rayon::prelude::*;
-            (0..coeff_bytes.len())
-                .into_par_iter()
-                .step_by(chunk)
-                .try_for_each(|off| -> Result<(), String> {
-                    let end = (off + chunk).min(coeff_bytes.len());
-                    let buf = &coeff_bytes[off..end];
-                    pwrite_all(f_coeff, coeff_off.saturating_add(off as u64), buf)
-                })?;
+            pwrite_all(f_coeff, coeff_off, coeff_bytes)?;
             let idx_bytes =
                 unsafe { core::slice::from_raw_parts(idx.as_ptr() as *const u8, idx.len().saturating_mul(4)) };
-            (0..idx_bytes.len())
-                .into_par_iter()
-                .step_by(chunk)
-                .try_for_each(|off| -> Result<(), String> {
-                    let end = (off + chunk).min(idx_bytes.len());
-                    let buf = &idx_bytes[off..end];
-                    pwrite_all(f_idx, idx_off.saturating_add(off as u64), buf)
-                })?;
+            pwrite_all(f_idx, idx_off, idx_bytes)?;
             self.fc_b.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
             self.fi_b.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
             self.b_terms = self.b_terms.saturating_add(n);
@@ -700,37 +652,12 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
                 .saturating_mul(self.coeff_size as u128)
                 .min(u64::MAX as u128) as u64;
             let idx_off = base.saturating_mul(self.idx_size as u64);
-            self.fc_c
-                .get_ref()
-                .set_len(coeff_off.saturating_add(coeff_bytes.len() as u64))
-                .map_err(|e| e.to_string())?;
-            self.fi_c
-                .get_ref()
-                .set_len(idx_off.saturating_add((idx.len().saturating_mul(self.idx_size)) as u64))
-                .map_err(|e| e.to_string())?;
-
-            let chunk = cfg_pwrite_chunk_bytes();
             let f_coeff = self.fc_c.get_ref();
             let f_idx = self.fi_c.get_ref();
-            use rayon::prelude::*;
-            (0..coeff_bytes.len())
-                .into_par_iter()
-                .step_by(chunk)
-                .try_for_each(|off| -> Result<(), String> {
-                    let end = (off + chunk).min(coeff_bytes.len());
-                    let buf = &coeff_bytes[off..end];
-                    pwrite_all(f_coeff, coeff_off.saturating_add(off as u64), buf)
-                })?;
+            pwrite_all(f_coeff, coeff_off, coeff_bytes)?;
             let idx_bytes =
                 unsafe { core::slice::from_raw_parts(idx.as_ptr() as *const u8, idx.len().saturating_mul(4)) };
-            (0..idx_bytes.len())
-                .into_par_iter()
-                .step_by(chunk)
-                .try_for_each(|off| -> Result<(), String> {
-                    let end = (off + chunk).min(idx_bytes.len());
-                    let buf = &idx_bytes[off..end];
-                    pwrite_all(f_idx, idx_off.saturating_add(off as u64), buf)
-                })?;
+            pwrite_all(f_idx, idx_off, idx_bytes)?;
             self.fc_c.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
             self.fi_c.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
             self.c_terms = self.c_terms.saturating_add(n);
@@ -780,22 +707,9 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             self.f_rows.flush().map_err(|e| e.to_string())?;
             let base = self.nconstraints;
             let row_off = base.saturating_mul(48);
-            self.f_rows
-                .get_ref()
-                .set_len(row_off.saturating_add(bytes_len as u64))
-                .map_err(|e| e.to_string())?;
-            let chunk = cfg_pwrite_chunk_bytes();
             let f_rows = self.f_rows.get_ref();
             let row_bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, bytes_len) };
-            use rayon::prelude::*;
-            (0..row_bytes.len())
-                .into_par_iter()
-                .step_by(chunk)
-                .try_for_each(|off| -> Result<(), String> {
-                    let end = (off + chunk).min(row_bytes.len());
-                    let buf = &row_bytes[off..end];
-                    pwrite_all(f_rows, row_off.saturating_add(off as u64), buf)
-                })?;
+            pwrite_all(f_rows, row_off, row_bytes)?;
             self.f_rows.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
             self.nconstraints = self.nconstraints.saturating_add(nrows);
             return Ok(());
