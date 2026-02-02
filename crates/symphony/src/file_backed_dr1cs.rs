@@ -1895,6 +1895,17 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                 writeln!(f, "format=tiny_u16_u32_rows_len_u32_v1").ok();
             }
 
+            // Defensive truncation: if the output directory reused an existing "base" part, the
+            // pre-sized files may retain extra trailing bytes. Ensure all outputs exactly match
+            // the declared layout sizes.
+            out_fc_a.set_len(bytes_a_coeff).map_err(|e| e.to_string())?;
+            out_fc_b.set_len(bytes_b_coeff).map_err(|e| e.to_string())?;
+            out_fc_c.set_len(bytes_c_coeff).map_err(|e| e.to_string())?;
+            out_fi_a.set_len(bytes_a_idx).map_err(|e| e.to_string())?;
+            out_fi_b.set_len(bytes_b_idx).map_err(|e| e.to_string())?;
+            out_fi_c.set_len(bytes_c_idx).map_err(|e| e.to_string())?;
+            out_rows.set_len(bytes_rows).map_err(|e| e.to_string())?;
+
             if timing {
                 eprintln!("file_backed_merge: done elapsed={:?}", t_all.elapsed());
             }
