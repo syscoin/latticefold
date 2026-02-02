@@ -632,7 +632,7 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
         // Tiny format: encode coefficient as u16 little-endian of the canonical representative in [0, p-1].
         //
         // Hot-path micro-optimization: most coefficients are 0/±1; avoid `into_bigint()` there.
-        let v: u64 = if coef.is_zero() {
+        let v: u64 = if *coef == F::ZERO {
             0
         } else if *coef == F::ONE {
             1

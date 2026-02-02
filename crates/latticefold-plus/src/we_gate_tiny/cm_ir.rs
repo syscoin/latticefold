@@ -422,7 +422,7 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
         #[inline]
         fn coeff_idx_f257(coef: F257) -> usize {
             // Fast-path the common coefficients to avoid `into_bigint()` in hot loops.
-            if coef.is_zero() {
+            if coef == F257::ZERO {
                 0
             } else if coef == F257::ONE {
                 1
