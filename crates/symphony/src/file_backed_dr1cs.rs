@@ -44,6 +44,16 @@ pub struct FileBackedSparseDr1csInstance<F: PrimeField> {
     _pd: core::marker::PhantomData<F>,
 }
 
+impl<F: PrimeField> FileBackedSparseDr1csInstance<F> {
+    pub(crate) fn new(nvars: usize, layout: FileBackedLayout) -> Self {
+        Self {
+            nvars,
+            layout,
+            _pd: core::marker::PhantomData,
+        }
+    }
+}
+
 fn write_u64(w: &mut impl IoWrite, x: u64) -> std::io::Result<()> {
     w.write_all(&x.to_le_bytes())
 }
@@ -145,6 +155,200 @@ fn rows_ckpt_path(dir: &Path) -> PathBuf {
 const ROW_LENS_SIZE: usize = 12;
 const ROW_CKPT_ENTRY_SIZE: usize = 32;
 const ROW_CKPT_STRIDE: u64 = 1 << 20; // 1,048,576 rows (~32KB checkpoints per 1B constraints)
+
+#[cfg(unix)]
+#[inline]
+pub(crate) fn pwrite_all(f: &File, mut off: u64, mut buf: &[u8]) -> Result<(), String> {
+    while !buf.is_empty() {
+        let n = f.write_at(buf, off).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("pwrite returned 0".to_string());
+        }
+        off = off.saturating_add(n as u64);
+        buf = &buf[n..];
+    }
+    Ok(())
+}
+
+/// Range writer into preallocated merged files.
+///
+/// This is used by "direct-to-merged" builders: each shard writes into disjoint file ranges
+/// (no per-shard directories and no subsequent merge copy).
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct FileBackedRangeWriter {
+    pub(crate) out_fc_a: File,
+    pub(crate) out_fi_a: File,
+    pub(crate) out_fc_b: File,
+    pub(crate) out_fi_b: File,
+    pub(crate) out_fc_c: File,
+    pub(crate) out_fi_c: File,
+    pub(crate) out_rows: File,
+    // base offsets (in terms/rows, not bytes)
+    pub(crate) base_a_terms: u64,
+    pub(crate) base_b_terms: u64,
+    pub(crate) base_c_terms: u64,
+    pub(crate) base_rows: u64,
+    // cursors (counts written by this writer)
+    pub(crate) a_terms_written: u64,
+    pub(crate) b_terms_written: u64,
+    pub(crate) c_terms_written: u64,
+    pub(crate) rows_written: u64,
+    // checkpoints to be merged and written once at end (global row_idx, global a0,b0,c0)
+    pub(crate) ckpt_entries: Vec<(u64, u64, u64, u64)>,
+    // running term offsets for checkpoint emission (global)
+    pub(crate) a0: u64,
+    pub(crate) b0: u64,
+    pub(crate) c0: u64,
+}
+
+#[cfg(unix)]
+impl FileBackedRangeWriter {
+    pub(crate) fn new(
+        out_fc_a: File,
+        out_fi_a: File,
+        out_fc_b: File,
+        out_fi_b: File,
+        out_fc_c: File,
+        out_fi_c: File,
+        out_rows: File,
+        base_a_terms: u64,
+        base_b_terms: u64,
+        base_c_terms: u64,
+        base_rows: u64,
+    ) -> Self {
+        let a0 = base_a_terms;
+        let b0 = base_b_terms;
+        let c0 = base_c_terms;
+        Self {
+            out_fc_a,
+            out_fi_a,
+            out_fc_b,
+            out_fi_b,
+            out_fc_c,
+            out_fi_c,
+            out_rows,
+            base_a_terms,
+            base_b_terms,
+            base_c_terms,
+            base_rows,
+            a_terms_written: 0,
+            b_terms_written: 0,
+            c_terms_written: 0,
+            rows_written: 0,
+            ckpt_entries: Vec::new(),
+            a0,
+            b0,
+            c0,
+        }
+    }
+
+    #[inline]
+    fn write_terms_block(
+        &self,
+        fc: &File,
+        fi: &File,
+        base_terms: u64,
+        written: u64,
+        coeff_bytes: &[u8],
+        idx: &[u32],
+    ) -> Result<(), String> {
+        // coeff_size=2, idx_size=4 (tiny format)
+        let coeff_off = (base_terms as u128)
+            .saturating_mul(2u128)
+            .saturating_add((written as u128).saturating_mul(2u128))
+            .min(u64::MAX as u128) as u64;
+        let idx_off = (base_terms as u128)
+            .saturating_mul(4u128)
+            .saturating_add((written as u128).saturating_mul(4u128))
+            .min(u64::MAX as u128) as u64;
+        pwrite_all(fc, coeff_off, coeff_bytes)?;
+        let idx_bytes = unsafe { core::slice::from_raw_parts(idx.as_ptr() as *const u8, idx.len() * 4) };
+        pwrite_all(fi, idx_off, idx_bytes)?;
+        Ok(())
+    }
+
+    pub(crate) fn push_a_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u32]) -> Result<(), String> {
+        self.write_terms_block(
+            &self.out_fc_a,
+            &self.out_fi_a,
+            self.base_a_terms,
+            self.a_terms_written,
+            coeff_bytes,
+            idx,
+        )?;
+        self.a_terms_written = self.a_terms_written.saturating_add(idx.len() as u64);
+        self.a0 = self.a0.saturating_add(idx.len() as u64);
+        Ok(())
+    }
+    pub(crate) fn push_b_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u32]) -> Result<(), String> {
+        self.write_terms_block(
+            &self.out_fc_b,
+            &self.out_fi_b,
+            self.base_b_terms,
+            self.b_terms_written,
+            coeff_bytes,
+            idx,
+        )?;
+        self.b_terms_written = self.b_terms_written.saturating_add(idx.len() as u64);
+        self.b0 = self.b0.saturating_add(idx.len() as u64);
+        Ok(())
+    }
+    pub(crate) fn push_c_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u32]) -> Result<(), String> {
+        self.write_terms_block(
+            &self.out_fc_c,
+            &self.out_fi_c,
+            self.base_c_terms,
+            self.c_terms_written,
+            coeff_bytes,
+            idx,
+        )?;
+        self.c_terms_written = self.c_terms_written.saturating_add(idx.len() as u64);
+        self.c0 = self.c0.saturating_add(idx.len() as u64);
+        Ok(())
+    }
+
+    pub(crate) fn push_constraint_lens_block(&mut self, lens: &[u32]) -> Result<(), String> {
+        if (lens.len() % 3) != 0 {
+            return Err("FileBackedRangeWriter::push_constraint_lens_block: lens length must be multiple of 3".to_string());
+        }
+        // Write lens bytes.
+        let row_off = (self.base_rows as u128)
+            .saturating_mul(ROW_LENS_SIZE as u128)
+            .saturating_add((self.rows_written as u128).saturating_mul(ROW_LENS_SIZE as u128))
+            .min(u64::MAX as u128) as u64;
+        let lens_bytes = unsafe { core::slice::from_raw_parts(lens.as_ptr() as *const u8, lens.len() * 4) };
+        pwrite_all(&self.out_rows, row_off, lens_bytes)?;
+
+        // Emit checkpoints for stride boundaries covered by these rows.
+        // `self.a0/b0/c0` are **end** pointers after writing the corresponding term blocks.
+        // Reconstruct the starting pointers for the first row in this block by subtracting totals.
+        let mut total_a: u64 = 0;
+        let mut total_b: u64 = 0;
+        let mut total_c: u64 = 0;
+        for i in 0..(lens.len() / 3) {
+            total_a = total_a.saturating_add(lens[3 * i + 0] as u64);
+            total_b = total_b.saturating_add(lens[3 * i + 1] as u64);
+            total_c = total_c.saturating_add(lens[3 * i + 2] as u64);
+        }
+        let mut row_idx = self.base_rows.saturating_add(self.rows_written);
+        let mut a0 = self.a0.saturating_sub(total_a);
+        let mut b0 = self.b0.saturating_sub(total_b);
+        let mut c0 = self.c0.saturating_sub(total_c);
+        for i in 0..(lens.len() / 3) {
+            if (row_idx % ROW_CKPT_STRIDE) == 0 {
+                self.ckpt_entries.push((row_idx, a0, b0, c0));
+            }
+            a0 = a0.saturating_add(lens[3 * i + 0] as u64);
+            b0 = b0.saturating_add(lens[3 * i + 1] as u64);
+            c0 = c0.saturating_add(lens[3 * i + 2] as u64);
+            row_idx = row_idx.saturating_add(1);
+        }
+        self.rows_written = self.rows_written.saturating_add((lens.len() / 3) as u64);
+        Ok(())
+    }
+}
+
 fn meta_path(dir: &Path) -> PathBuf {
     dir.join("meta.txt")
 }
@@ -786,20 +990,6 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             _pd: core::marker::PhantomData,
         })
     }
-}
-
-#[cfg(unix)]
-#[inline]
-fn pwrite_all(f: &File, mut off: u64, mut buf: &[u8]) -> Result<(), String> {
-    while !buf.is_empty() {
-        let n = f.write_at(buf, off).map_err(|e| e.to_string())?;
-        if n == 0 {
-            return Err("pwrite returned 0".to_string());
-        }
-        off = off.saturating_add(n as u64);
-        buf = &buf[n..];
-    }
-    Ok(())
 }
 
 /// Dump an in-memory sparse instance to disk in a file-backed format.
