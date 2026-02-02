@@ -1,4 +1,6 @@
 use std::path::Path;
+#[cfg(unix)]
+use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Best-effort fast deletion for huge intermediate dirs: rename then delete asynchronously.
@@ -18,12 +20,44 @@ pub fn fast_remove_dir_best_effort(dir: &Path) {
     if std::fs::rename(dir, &trash).is_ok() {
         #[cfg(unix)]
         {
-            if std::process::Command::new("rm")
+            // Prefer a detached, low-priority deleter to avoid competing with ongoing writes.
+            let null = Stdio::null();
+            let ok = std::process::Command::new("setsid")
+                .arg("ionice")
+                .arg("-c3")
+                .arg("nice")
+                .arg("-n")
+                .arg("19")
+                .arg("rm")
                 .arg("-rf")
                 .arg(&trash)
+                .stdin(null)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .spawn()
-                .is_err()
-            {
+                .is_ok()
+                || std::process::Command::new("setsid")
+                    .arg("nice")
+                    .arg("-n")
+                    .arg("19")
+                    .arg("rm")
+                    .arg("-rf")
+                    .arg(&trash)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .is_ok()
+                || std::process::Command::new("setsid")
+                    .arg("rm")
+                    .arg("-rf")
+                    .arg(&trash)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .is_ok();
+            if !ok {
                 std::thread::spawn(move || {
                     let _ = std::fs::remove_dir_all(trash);
                 });
@@ -69,12 +103,43 @@ pub fn fast_remove_dir_best_effort_to_tmp(dir: &Path) {
 
     #[cfg(unix)]
     {
-        if std::process::Command::new("rm")
+        let null = Stdio::null();
+        let ok = std::process::Command::new("setsid")
+            .arg("ionice")
+            .arg("-c3")
+            .arg("nice")
+            .arg("-n")
+            .arg("19")
+            .arg("rm")
             .arg("-rf")
             .arg(&trash)
+            .stdin(null)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
-            .is_err()
-        {
+            .is_ok()
+            || std::process::Command::new("setsid")
+                .arg("nice")
+                .arg("-n")
+                .arg("19")
+                .arg("rm")
+                .arg("-rf")
+                .arg(&trash)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .is_ok()
+            || std::process::Command::new("setsid")
+                .arg("rm")
+                .arg("-rf")
+                .arg(&trash)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .is_ok();
+        if !ok {
             std::thread::spawn(move || {
                 let _ = std::fs::remove_dir_all(trash);
             });

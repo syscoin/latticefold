@@ -151,41 +151,61 @@ pub(crate) fn fast_prepare_out_dir(dir: &Path) -> Result<(), String> {
         let trash = dir.with_extension(format!("trash.{pid}.{ts}"));
         #[cfg(unix)]
         fn spawn_detached_rm_rf(trash: &Path) -> bool {
+            // Critical path impact: deletion competes with ongoing writes. Prefer to run the
+            // deleter at *low* CPU and IO priority when possible.
+            //
             // Best effort "survive Ctrl-C": put deleter in a new session.
-            // If `setsid` is unavailable, fall back to `nohup`, then plain `rm`.
+            // We try (in order): setsid+ionice+nice, setsid+nice, setsid+rm, then nohup variants.
             let null = Stdio::null();
-            if std::process::Command::new("setsid")
-                .arg("rm")
-                .arg("-rf")
-                .arg(trash)
-                .stdin(null)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .is_ok()
-            {
+            let try_spawn = |prog: &str, args: &[&std::ffi::OsStr]| -> bool {
+                let mut c = std::process::Command::new(prog);
+                c.args(args).stdin(null).stdout(Stdio::null()).stderr(Stdio::null());
+                c.spawn().is_ok()
+            };
+
+            use std::ffi::OsStr;
+            let rm = OsStr::new("rm");
+            let rf = OsStr::new("-rf");
+            let setsid = "setsid";
+            let nohup = "nohup";
+            let ionice = OsStr::new("ionice");
+            let c3 = OsStr::new("-c3");
+            let nice = OsStr::new("nice");
+            let n19 = OsStr::new("-n");
+            let v19 = OsStr::new("19");
+
+            // setsid ionice -c3 nice -n 19 rm -rf trash
+            if try_spawn(
+                setsid,
+                &[ionice, c3, nice, n19, v19, rm, rf, trash.as_os_str()],
+            ) {
                 return true;
             }
-            if std::process::Command::new("nohup")
-                .arg("rm")
-                .arg("-rf")
-                .arg(trash)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .is_ok()
-            {
+            // setsid nice -n 19 rm -rf trash
+            if try_spawn(setsid, &[nice, n19, v19, rm, rf, trash.as_os_str()]) {
                 return true;
             }
-            std::process::Command::new("rm")
-                .arg("-rf")
-                .arg(trash)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .is_ok()
+            // setsid rm -rf trash
+            if try_spawn(setsid, &[rm, rf, trash.as_os_str()]) {
+                return true;
+            }
+            // nohup ionice -c3 nice -n 19 rm -rf trash
+            if try_spawn(
+                nohup,
+                &[ionice, c3, nice, n19, v19, rm, rf, trash.as_os_str()],
+            ) {
+                return true;
+            }
+            // nohup nice -n 19 rm -rf trash
+            if try_spawn(nohup, &[nice, n19, v19, rm, rf, trash.as_os_str()]) {
+                return true;
+            }
+            // nohup rm -rf trash
+            if try_spawn(nohup, &[rm, rf, trash.as_os_str()]) {
+                return true;
+            }
+            // rm -rf trash
+            try_spawn("rm", &[rf, trash.as_os_str()])
         }
         // Try constant-time rename; if it works, delete old contents asynchronously.
         if std::fs::rename(dir, &trash).is_ok() {
