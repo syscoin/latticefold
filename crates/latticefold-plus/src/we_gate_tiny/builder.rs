@@ -2004,7 +2004,22 @@ fn compute_cm_shared_precomp_base(
                     let mut u_ir_build_time = Duration::ZERO;
                     let mut u_lower_time = Duration::ZERO;
                     let mut u_frag_count: usize = 0;
-                    let batch_size: usize = 64;
+                    // Shard granularity for u_shared.
+                    //
+                    // If this is too large, small instances produce very few shards (e.g. frags=4),
+                    // leaving most cores idle. If it's too small, we create too many fragments and
+                    // pay overhead in IR merge + lowering.
+                    //
+                    // Default heuristic: target ~O(min(2*threads, 64)) shards per (l,ni).
+                    let batch_size: usize = std::env::var("LFP_CM_U_SHARED_BATCH")
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .filter(|&v| v > 0)
+                        .unwrap_or_else(|| {
+                            // `terms.len()` is computed below per (l,ni); this is just a placeholder
+                            // used before we know the exact size. We will recompute per-row.
+                            64
+                        });
 
                     let mut u_all: Vec<Vec<RingDigits>> = Vec::with_capacity(l_instances_expected);
                     for l in 0..l_instances_expected {
@@ -2033,6 +2048,16 @@ fn compute_cm_shared_precomp_base(
                             // This avoids the very expensive builder-level `ring_add_digits` chain.
                             let base_asg_addr: usize = glue.gb.assignment.as_ptr() as usize;
                             let base_asg_len: usize = glue.gb.assignment.len();
+
+                            // Determine shard size for this row.
+                            let batch_size: usize = if std::env::var("LFP_CM_U_SHARED_BATCH").ok().is_some() {
+                                batch_size
+                            } else {
+                                let threads = rayon::current_num_threads().max(1);
+                                let target_frags = (threads.saturating_mul(2)).min(64).max(1);
+                                let raw = (terms.len() + target_frags - 1) / target_frags;
+                                raw.clamp(8, 256)
+                            };
 
                             // Build shard IRs in parallel.
                             let t_build = Instant::now();
