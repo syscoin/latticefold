@@ -45,7 +45,7 @@ pub struct FileBackedSparseDr1csInstance<F: PrimeField> {
 }
 
 impl<F: PrimeField> FileBackedSparseDr1csInstance<F> {
-    pub(crate) fn new(nvars: usize, layout: FileBackedLayout) -> Self {
+    pub fn new(nvars: usize, layout: FileBackedLayout) -> Self {
         Self {
             nvars,
             layout,

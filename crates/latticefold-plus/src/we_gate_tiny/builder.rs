@@ -763,28 +763,34 @@ fn build_count_plan(
     cur_b = cur_b.saturating_add(pose_counts.b_terms);
     cur_c = cur_c.saturating_add(pose_counts.c_terms);
 
-    // Base glue counts
-    let (_base_asg, base_counts) = glue.gb.clone().into_count_result()?;
+    // Base glue counts (Count mode: read counters without consuming the builder).
+    let (base_rows, base_a_terms, base_b_terms, base_c_terms) = glue
+        .gb
+        .file_counts()
+        .ok_or("tiny gate: expected file_counts in base glue count mode")?;
     row_off.push(cur_rows);
     a_off.push(cur_a);
     b_off.push(cur_b);
     c_off.push(cur_c);
-    cur_rows = cur_rows.saturating_add(base_counts.rows);
-    cur_a = cur_a.saturating_add(base_counts.a_terms);
-    cur_b = cur_b.saturating_add(base_counts.b_terms);
-    cur_c = cur_c.saturating_add(base_counts.c_terms);
+    cur_rows = cur_rows.saturating_add(base_rows);
+    cur_a = cur_a.saturating_add(base_a_terms);
+    cur_b = cur_b.saturating_add(base_b_terms);
+    cur_c = cur_c.saturating_add(base_c_terms);
 
     // Extra glues counts
     for g in &extra_glues {
-        let (_asg, ct) = g.gb.clone().into_count_result()?;
+        let (rows, a_terms, b_terms, c_terms) = g
+            .gb
+            .file_counts()
+            .ok_or("tiny gate: expected file_counts in extra glue count mode")?;
         row_off.push(cur_rows);
         a_off.push(cur_a);
         b_off.push(cur_b);
         c_off.push(cur_c);
-        cur_rows = cur_rows.saturating_add(ct.rows);
-        cur_a = cur_a.saturating_add(ct.a_terms);
-        cur_b = cur_b.saturating_add(ct.b_terms);
-        cur_c = cur_c.saturating_add(ct.c_terms);
+        cur_rows = cur_rows.saturating_add(rows);
+        cur_a = cur_a.saturating_add(a_terms);
+        cur_b = cur_b.saturating_add(b_terms);
+        cur_c = cur_c.saturating_add(c_terms);
     }
 
     let part_rows = cur_rows;
@@ -5534,14 +5540,20 @@ fn build_direct_to_merged_unix(
         .into_iter()
         .map(|w| BoundedU32ChallengeWiring {
             digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
-            byte_vars: w.byte_vars.into_iter().map(to_glue_global).collect(),
-            coeff_vars: w.coeff_vars.into_iter().map(to_glue_global).collect(),
+            byte_vars: w.byte_vars.map(to_glue_global),
+            limbs: w.limbs.map(to_glue_global),
+            bal16_digits: w.bal16_digits.into_iter().map(to_glue_global).collect(),
+            bal16_sq_digits: w.bal16_sq_digits.into_iter().map(to_glue_global).collect(),
         })
         .collect::<Vec<_>>();
     let goldilocks_out = goldilocks_locals
         .into_iter()
         .map(|w| GoldilocksChallengeWiring {
-            byte_vars: w.byte_vars.into_iter().map(to_glue_global).collect(),
+            digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
+            byte_vars: w.byte_vars.map(to_glue_global),
+            q_bit: to_glue_global(w.q_bit),
+            limbs: w.limbs.map(to_glue_global),
+            res257: to_glue_global(w.res257),
         })
         .collect::<Vec<_>>();
 
