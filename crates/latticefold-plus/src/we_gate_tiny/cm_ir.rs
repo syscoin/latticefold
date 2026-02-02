@@ -597,118 +597,145 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
             }
         }
 
-        // Build flat blocks for the whole fragment.
-        let n = constraints.len();
-        let mut a_counts: Vec<usize> = Vec::with_capacity(n);
-        let mut b_counts: Vec<usize> = Vec::with_capacity(n);
-        let mut c_counts: Vec<usize> = Vec::with_capacity(n);
-        for ic in &constraints {
-            a_counts.push(ic.a.end - ic.a.start);
-            b_counts.push(ic.b.end - ic.b.start);
-            c_counts.push(ic.c.end - ic.c.start);
-        }
-        let mut a_offs: Vec<usize> = Vec::with_capacity(n + 1);
-        let mut b_offs: Vec<usize> = Vec::with_capacity(n + 1);
-        let mut c_offs: Vec<usize> = Vec::with_capacity(n + 1);
-        a_offs.push(0);
-        b_offs.push(0);
-        c_offs.push(0);
-        for i in 0..n {
-            a_offs.push(a_offs[i] + a_counts[i]);
-            b_offs.push(b_offs[i] + b_counts[i]);
-            c_offs.push(c_offs[i] + c_counts[i]);
-        }
-        let total_a = *a_offs.last().unwrap_or(&0);
-        let total_b = *b_offs.last().unwrap_or(&0);
-        let total_c = *c_offs.last().unwrap_or(&0);
+        // Chunked build+append: avoids allocating enormous flat buffers for the whole fragment at once.
+        //
+        // This is important for large merged IR fragments (e.g. `u_shared`), where full-fragment
+        // buffers can reach tens of GB and become both RAM- and wall-time-dominant.
+        let chunk_constraints: usize = std::env::var("LFP_FILE_BACKED_LOWER_CHUNK_CONSTRAINTS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(100_000);
 
-        let mut a_coeffs: Vec<u8> = vec![0u8; total_a.saturating_mul(coeff_size)];
-        let mut b_coeffs: Vec<u8> = vec![0u8; total_b.saturating_mul(coeff_size)];
-        let mut c_coeffs: Vec<u8> = vec![0u8; total_c.saturating_mul(coeff_size)];
-        let mut a_idx: Vec<u64> = vec![0u64; total_a];
-        let mut b_idx: Vec<u64> = vec![0u64; total_b];
-        let mut c_idx: Vec<u64> = vec![0u64; total_c];
+        let (mut rows0, mut a0, mut b0, mut c0) =
+            gb.file_counts().expect("file_counts must be Some in file-backed mode");
+        debug_assert_eq!(rows0, gb.file_counts().unwrap().0);
+        let n_total = constraints.len();
+        let mut start = 0usize;
+        while start < n_total {
+            let end = (start + chunk_constraints).min(n_total);
+            let chunk = &constraints[start..end];
+            let n = chunk.len();
 
-        #[derive(Copy, Clone)]
-        struct SyncPtr<T>(*mut T);
-        unsafe impl<T> Send for SyncPtr<T> {}
-        unsafe impl<T> Sync for SyncPtr<T> {}
-        impl<T> SyncPtr<T> {
-            #[inline]
-            unsafe fn write(&self, off: usize, v: T) {
-                core::ptr::write(self.0.add(off), v);
+            // Per-chunk counts and prefix sums.
+            let mut a_counts: Vec<usize> = Vec::with_capacity(n);
+            let mut b_counts: Vec<usize> = Vec::with_capacity(n);
+            let mut c_counts: Vec<usize> = Vec::with_capacity(n);
+            for ic in chunk {
+                a_counts.push(ic.a.end - ic.a.start);
+                b_counts.push(ic.b.end - ic.b.start);
+                c_counts.push(ic.c.end - ic.c.start);
             }
+            let mut a_offs: Vec<usize> = Vec::with_capacity(n + 1);
+            let mut b_offs: Vec<usize> = Vec::with_capacity(n + 1);
+            let mut c_offs: Vec<usize> = Vec::with_capacity(n + 1);
+            a_offs.push(0);
+            b_offs.push(0);
+            c_offs.push(0);
+            for i in 0..n {
+                a_offs.push(a_offs[i] + a_counts[i]);
+                b_offs.push(b_offs[i] + b_counts[i]);
+                c_offs.push(c_offs[i] + c_counts[i]);
+            }
+            let total_a = *a_offs.last().unwrap_or(&0);
+            let total_b = *b_offs.last().unwrap_or(&0);
+            let total_c = *c_offs.last().unwrap_or(&0);
+
+            let mut a_coeffs: Vec<u8> = vec![0u8; total_a.saturating_mul(coeff_size)];
+            let mut b_coeffs: Vec<u8> = vec![0u8; total_b.saturating_mul(coeff_size)];
+            let mut c_coeffs: Vec<u8> = vec![0u8; total_c.saturating_mul(coeff_size)];
+            let mut a_idx: Vec<u64> = vec![0u64; total_a];
+            let mut b_idx: Vec<u64> = vec![0u64; total_b];
+            let mut c_idx: Vec<u64> = vec![0u64; total_c];
+
+            #[derive(Copy, Clone)]
+            struct SyncPtr<T>(*mut T);
+            unsafe impl<T> Send for SyncPtr<T> {}
+            unsafe impl<T> Sync for SyncPtr<T> {}
+            impl<T> SyncPtr<T> {
+                #[inline]
+                unsafe fn write(&self, off: usize, v: T) {
+                    core::ptr::write(self.0.add(off), v);
+                }
+            }
+            let out_a_idx: SyncPtr<u64> = SyncPtr(a_idx.as_mut_ptr());
+            let out_b_idx: SyncPtr<u64> = SyncPtr(b_idx.as_mut_ptr());
+            let out_c_idx: SyncPtr<u64> = SyncPtr(c_idx.as_mut_ptr());
+            let a_bytes_ptr: usize = a_coeffs.as_mut_ptr() as usize;
+            let b_bytes_ptr: usize = b_coeffs.as_mut_ptr() as usize;
+            let c_bytes_ptr: usize = c_coeffs.as_mut_ptr() as usize;
+
+            use rayon::prelude::*;
+            chunk.par_iter().enumerate().for_each(|(i, ic)| unsafe {
+                // A
+                let a_dst0 = a_offs[i];
+                for (k, &(coef, v)) in a_terms[ic.a.clone()].iter().enumerate() {
+                    let pos = a_dst0 + k;
+                    out_a_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, v));
+                    let dst = (a_bytes_ptr as *mut u8).add(pos * coeff_size);
+                    let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
+                    let limbs = coef.into_bigint();
+                    let vv = limbs.as_ref()[0] as usize;
+                    dst_slice.copy_from_slice(&coeff_bytes[vv * coeff_size..(vv + 1) * coeff_size]);
+                }
+                // B
+                let b_dst0 = b_offs[i];
+                for (k, &(coef, v)) in b_terms[ic.b.clone()].iter().enumerate() {
+                    let pos = b_dst0 + k;
+                    out_b_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, v));
+                    let dst = (b_bytes_ptr as *mut u8).add(pos * coeff_size);
+                    let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
+                    let limbs = coef.into_bigint();
+                    let vv = limbs.as_ref()[0] as usize;
+                    dst_slice.copy_from_slice(&coeff_bytes[vv * coeff_size..(vv + 1) * coeff_size]);
+                }
+                // C
+                let c_dst0 = c_offs[i];
+                for (k, &(coef, v)) in c_terms[ic.c.clone()].iter().enumerate() {
+                    let pos = c_dst0 + k;
+                    out_c_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, v));
+                    let dst = (c_bytes_ptr as *mut u8).add(pos * coeff_size);
+                    let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
+                    let limbs = coef.into_bigint();
+                    let vv = limbs.as_ref()[0] as usize;
+                    dst_slice.copy_from_slice(&coeff_bytes[vv * coeff_size..(vv + 1) * coeff_size]);
+                }
+            });
+
+            // Append blocks, then append row ranges for this chunk using the *pre-append* bases.
+            gb.file_push_a_terms_raw_block(&a_coeffs, &a_idx)
+                .unwrap_or_else(|e| panic!("file-backed append A block failed: {e}"));
+            gb.file_push_b_terms_raw_block(&b_coeffs, &b_idx)
+                .unwrap_or_else(|e| panic!("file-backed append B block failed: {e}"));
+            gb.file_push_c_terms_raw_block(&c_coeffs, &c_idx)
+                .unwrap_or_else(|e| panic!("file-backed append C block failed: {e}"));
+
+            let mut row_words: Vec<u64> = vec![0u64; n.saturating_mul(6)];
+            for i in 0..n {
+                let a_start = a0 + (a_offs[i] as u64);
+                let a_end = a_start + (a_counts[i] as u64);
+                let b_start = b0 + (b_offs[i] as u64);
+                let b_end = b_start + (b_counts[i] as u64);
+                let c_start = c0 + (c_offs[i] as u64);
+                let c_end = c_start + (c_counts[i] as u64);
+                let w0 = i * 6;
+                row_words[w0 + 0] = a_start;
+                row_words[w0 + 1] = a_end;
+                row_words[w0 + 2] = b_start;
+                row_words[w0 + 3] = b_end;
+                row_words[w0 + 4] = c_start;
+                row_words[w0 + 5] = c_end;
+            }
+            gb.file_push_constraint_rows_block(&row_words)
+                .unwrap_or_else(|e| panic!("file-backed append rows block failed: {e}"));
+
+            // Advance bases for the next chunk.
+            rows0 = rows0.saturating_add(n as u64);
+            a0 = a0.saturating_add(total_a as u64);
+            b0 = b0.saturating_add(total_b as u64);
+            c0 = c0.saturating_add(total_c as u64);
+            start = end;
         }
-        let out_a_idx: SyncPtr<u64> = SyncPtr(a_idx.as_mut_ptr());
-        let out_b_idx: SyncPtr<u64> = SyncPtr(b_idx.as_mut_ptr());
-        let out_c_idx: SyncPtr<u64> = SyncPtr(c_idx.as_mut_ptr());
-        let a_bytes_ptr: usize = a_coeffs.as_mut_ptr() as usize;
-        let b_bytes_ptr: usize = b_coeffs.as_mut_ptr() as usize;
-        let c_bytes_ptr: usize = c_coeffs.as_mut_ptr() as usize;
-
-        use rayon::prelude::*;
-        constraints.par_iter().enumerate().for_each(|(i, ic)| unsafe {
-            // A
-            let a_dst0 = a_offs[i];
-            for (k, &(coef, v)) in a_terms[ic.a.clone()].iter().enumerate() {
-                let pos = a_dst0 + k;
-                out_a_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, v));
-                let dst = (a_bytes_ptr as *mut u8).add(pos * coeff_size);
-                let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
-                let limbs = coef.into_bigint();
-                let vv = limbs.as_ref()[0] as usize;
-                dst_slice.copy_from_slice(&coeff_bytes[vv * coeff_size..(vv + 1) * coeff_size]);
-            }
-            // B
-            let b_dst0 = b_offs[i];
-            for (k, &(coef, v)) in b_terms[ic.b.clone()].iter().enumerate() {
-                let pos = b_dst0 + k;
-                out_b_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, v));
-                let dst = (b_bytes_ptr as *mut u8).add(pos * coeff_size);
-                let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
-                let limbs = coef.into_bigint();
-                let vv = limbs.as_ref()[0] as usize;
-                dst_slice.copy_from_slice(&coeff_bytes[vv * coeff_size..(vv + 1) * coeff_size]);
-            }
-            // C
-            let c_dst0 = c_offs[i];
-            for (k, &(coef, v)) in c_terms[ic.c.clone()].iter().enumerate() {
-                let pos = c_dst0 + k;
-                out_c_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, v));
-                let dst = (c_bytes_ptr as *mut u8).add(pos * coeff_size);
-                let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
-                let limbs = coef.into_bigint();
-                let vv = limbs.as_ref()[0] as usize;
-                dst_slice.copy_from_slice(&coeff_bytes[vv * coeff_size..(vv + 1) * coeff_size]);
-            }
-        });
-
-        // Compute row words and append blocks.
-        let (_rows0, a0, b0, c0) = gb.file_counts().expect("file_counts must be Some in file-backed mode");
-        gb.file_push_a_terms_raw_block(&a_coeffs, &a_idx)
-            .unwrap_or_else(|e| panic!("file-backed append A block failed: {e}"));
-        gb.file_push_b_terms_raw_block(&b_coeffs, &b_idx)
-            .unwrap_or_else(|e| panic!("file-backed append B block failed: {e}"));
-        gb.file_push_c_terms_raw_block(&c_coeffs, &c_idx)
-            .unwrap_or_else(|e| panic!("file-backed append C block failed: {e}"));
-        let mut row_words: Vec<u64> = vec![0u64; n.saturating_mul(6)];
-        for i in 0..n {
-            let a_start = a0 + (a_offs[i] as u64);
-            let a_end = a_start + (a_counts[i] as u64);
-            let b_start = b0 + (b_offs[i] as u64);
-            let b_end = b_start + (b_counts[i] as u64);
-            let c_start = c0 + (c_offs[i] as u64);
-            let c_end = c_start + (c_counts[i] as u64);
-            let w0 = i * 6;
-            row_words[w0 + 0] = a_start;
-            row_words[w0 + 1] = a_end;
-            row_words[w0 + 2] = b_start;
-            row_words[w0 + 3] = b_end;
-            row_words[w0 + 4] = c_start;
-            row_words[w0 + 5] = c_end;
-        }
-        gb.file_push_constraint_rows_block(&row_words)
-            .unwrap_or_else(|e| panic!("file-backed append rows block failed: {e}"));
 
         return lowered;
     }
