@@ -7237,7 +7237,7 @@ mod tests {
                     bind_prefix,
                 )
                 .expect("cm verify");
-            let trace = rec.trace().clone();
+            let trace = rec.into_trace();
             eprintln!("[test_large_trace] plus.verify(record): {:?}", t1.elapsed());
 
             let params = WeParams {
@@ -7272,11 +7272,30 @@ mod tests {
 
             // Fixed temp dir (no pid/seq). Best-effort cleanup before/after so users don't have to
             // manually delete large file-backed artifacts.
-        let out_dir = {
+            fn fast_remove_dir_best_effort(dir: &std::path::Path) {
+                if !dir.exists() {
+                    return;
+                }
+                let pid = std::process::id();
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let trash = dir.with_extension(format!("trash.{pid}.{ts}"));
+                if std::fs::rename(dir, &trash).is_ok() {
+                    std::thread::spawn(move || {
+                        let _ = std::fs::remove_dir_all(trash);
+                    });
+                } else {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+
+            let out_dir = {
                 let mut p = std::env::temp_dir();
             p.push("lfplus_tiny_gate");
                 // If a previous run crashed or was interrupted, ensure a clean slate.
-                let _ = std::fs::remove_dir_all(&p);
+                fast_remove_dir_best_effort(&p);
                 std::fs::create_dir_all(&p).expect("create temp out_dir");
                 p
             };
@@ -7299,6 +7318,7 @@ mod tests {
             .expect("build tiny gate (inst+asg) from proof");
 
             shape.inst.check(&tiny_asg).expect("tiny gate dr1cs check");
+            fast_remove_dir_best_effort(&out_dir);
         };
 
         run_one("sha256->bits", &sp1_digest_bits);

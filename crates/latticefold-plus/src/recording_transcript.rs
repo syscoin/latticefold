@@ -144,6 +144,12 @@ where
         &self.trace
     }
 
+    /// Consume the recorder and return the accumulated trace without cloning.
+    #[inline]
+    pub fn into_trace(self) -> PoseidonTranscriptTrace<R::BaseRing> {
+        self.trace
+    }
+
     #[inline]
     fn lift_f257_to_base_ring(x: &F257) -> R::BaseRing {
         // F257 elements are always in 0..=256; lift that integer into the transcript's base ring.
