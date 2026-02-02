@@ -950,6 +950,7 @@ where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + Field + PrimeField,
 {
+    use crate::fs_cleanup::fast_remove_dir_best_effort_to_tmp;
     let ring_dim = R::dimension();
     if ring_dim != 64 {
         return Err("build_we_plus_tiny_dr1cs: only ring_dim=64 supported".to_string());
@@ -1094,6 +1095,21 @@ where
         out_dir.join("merged"),
         &extra_eqs,
     )?;
+
+    // Disk hygiene: the final artifact for this builder is `out_dir/merged`.
+    // Everything else is an intermediate used to construct it.
+    //
+    // Opt-out with: LFP_TINY_WITNESS_KEEP_PARTS=1/true/yes
+    let keep_parts = match std::env::var("LFP_TINY_WITNESS_KEEP_PARTS").as_deref() {
+        Ok("1") | Ok("true") | Ok("yes") => true,
+        _ => false,
+    };
+    if !keep_parts {
+        // Move intermediates out of `out_dir` so `du -sh out_dir` drops immediately.
+        fast_remove_dir_best_effort_to_tmp(&out_dir.join("tiny_gate"));
+        fast_remove_dir_best_effort_to_tmp(&out_dir.join("params_prefix"));
+        fast_remove_dir_best_effort_to_tmp(&out_dir.join("public_inputs_glue"));
+    }
 
     Ok((
         WeDr1csShape { inst, public_len: 1 + 10 + public_inputs.len() },
@@ -7272,24 +7288,7 @@ mod tests {
 
             // Fixed temp dir (no pid/seq). Best-effort cleanup before/after so users don't have to
             // manually delete large file-backed artifacts.
-            fn fast_remove_dir_best_effort(dir: &std::path::Path) {
-                if !dir.exists() {
-                    return;
-                }
-                let pid = std::process::id();
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                let trash = dir.with_extension(format!("trash.{pid}.{ts}"));
-                if std::fs::rename(dir, &trash).is_ok() {
-                    std::thread::spawn(move || {
-                        let _ = std::fs::remove_dir_all(trash);
-                    });
-                } else {
-                    let _ = std::fs::remove_dir_all(dir);
-                }
-            }
+            use crate::fs_cleanup::fast_remove_dir_best_effort;
 
             let out_dir = {
                 let mut p = std::env::temp_dir();

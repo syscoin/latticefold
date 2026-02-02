@@ -14,6 +14,7 @@ pub mod streaming_sumcheck;
 pub mod tensor_eval;
 pub mod transcript;
 pub mod utils;
+pub mod fs_cleanup;
 
 // SP1 lift vacuity/soundness regression tests (WE-gate only).
 #[cfg(all(test, feature = "we_gate"))]

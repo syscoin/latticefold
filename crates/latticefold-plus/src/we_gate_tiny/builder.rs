@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::transcript::DEFAULT_REJECTION_TRIES;
+use crate::fs_cleanup::fast_remove_dir_best_effort;
 
 use rayon::join;
 use rayon::prelude::*;
@@ -4704,6 +4705,33 @@ pub(super) fn build(
         all_sq_sum_coeffwise,
         dirs.merged_dir,
     )?;
+
+    // Disk hygiene: keep only the merged instance directory by default.
+    //
+    // The tiny gate build uses multiple file-backed intermediate sub-instances under `dirs.root`
+    // (poseidon/, base_glue/, cm0/, cm1/, canon_*, ...). These are no longer needed after `merged/`
+    // exists, but leaving them around keeps /tmp usage huge and makes repeated runs painful.
+    //
+    // Opt-out with: LFP_TINY_GATE_KEEP_PARTS=1/true/yes
+    let keep_parts = match std::env::var("LFP_TINY_GATE_KEEP_PARTS").as_deref() {
+        Ok("1") | Ok("true") | Ok("yes") => true,
+        _ => false,
+    };
+    if !keep_parts {
+        if let Ok(rd) = std::fs::read_dir(&dirs.root) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if p == dirs.merged_dir {
+                    continue;
+                }
+                // Don't delete non-directories (shouldn't exist, but be conservative).
+                if p.is_dir() {
+                    fast_remove_dir_best_effort(&p);
+                }
+            }
+        }
+    }
+
     lf_profile_log(&format!(
         "finish nvars={} constraints={}",
         out.0.nvars,

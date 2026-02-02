@@ -16,6 +16,8 @@ use std::io::Seek;
 use std::io::SeekFrom;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(unix)]
+use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ark_ff::PrimeField;
@@ -147,11 +149,60 @@ pub(crate) fn fast_prepare_out_dir(dir: &Path) -> Result<(), String> {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let trash = dir.with_extension(format!("trash.{pid}.{ts}"));
+        #[cfg(unix)]
+        fn spawn_detached_rm_rf(trash: &Path) -> bool {
+            // Best effort "survive Ctrl-C": put deleter in a new session.
+            // If `setsid` is unavailable, fall back to `nohup`, then plain `rm`.
+            let null = Stdio::null();
+            if std::process::Command::new("setsid")
+                .arg("rm")
+                .arg("-rf")
+                .arg(trash)
+                .stdin(null)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .is_ok()
+            {
+                return true;
+            }
+            if std::process::Command::new("nohup")
+                .arg("rm")
+                .arg("-rf")
+                .arg(trash)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .is_ok()
+            {
+                return true;
+            }
+            std::process::Command::new("rm")
+                .arg("-rf")
+                .arg(trash)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .is_ok()
+        }
         // Try constant-time rename; if it works, delete old contents asynchronously.
         if std::fs::rename(dir, &trash).is_ok() {
-            std::thread::spawn(move || {
-                let _ = std::fs::remove_dir_all(trash);
-            });
+            #[cfg(unix)]
+            {
+                if !spawn_detached_rm_rf(&trash) {
+                    std::thread::spawn(move || {
+                        let _ = std::fs::remove_dir_all(trash);
+                    });
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                std::thread::spawn(move || {
+                    let _ = std::fs::remove_dir_all(trash);
+                });
+            }
         } else {
             // Fallback (slower): remove in-place.
             let _ = std::fs::remove_dir_all(dir);
@@ -175,9 +226,48 @@ pub(crate) fn fast_remove_dir_best_effort(dir: &Path) {
         .unwrap_or(0);
     let trash = dir.with_extension(format!("trash.{pid}.{ts}"));
     if std::fs::rename(dir, &trash).is_ok() {
-        std::thread::spawn(move || {
-            let _ = std::fs::remove_dir_all(trash);
-        });
+        #[cfg(unix)]
+        {
+            // Same detached-deleter logic as `fast_prepare_out_dir`.
+            let null = Stdio::null();
+            let ok = std::process::Command::new("setsid")
+                .arg("rm")
+                .arg("-rf")
+                .arg(&trash)
+                .stdin(null)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .is_ok()
+                || std::process::Command::new("nohup")
+                    .arg("rm")
+                    .arg("-rf")
+                    .arg(&trash)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .is_ok()
+                || std::process::Command::new("rm")
+                    .arg("-rf")
+                    .arg(&trash)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .is_ok();
+            if !ok {
+                std::thread::spawn(move || {
+                    let _ = std::fs::remove_dir_all(trash);
+                });
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            std::thread::spawn(move || {
+                let _ = std::fs::remove_dir_all(trash);
+            });
+        }
     } else {
         // Fallback: try removing in-place (may block).
         let _ = std::fs::remove_dir_all(dir);
