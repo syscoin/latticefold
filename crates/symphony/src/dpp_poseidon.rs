@@ -712,7 +712,7 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         let mb: usize = std::env::var("LFP_FILE_BACKED_STAGE_MB")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(256);
+            .unwrap_or(1024);
         (mb.saturating_mul(1024 * 1024)).max(8 * 1024 * 1024)
     }
 
@@ -743,6 +743,15 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             .file_sink
             .as_mut()
             .expect("file-backed sink vanished unexpectedly");
+        // Optional flush trace (helps validate we're writing big blocks).
+        #[inline]
+        fn trace_enabled() -> bool {
+            use std::sync::OnceLock;
+            static ON: OnceLock<bool> = OnceLock::new();
+            *ON.get_or_init(|| matches!(std::env::var("LFP_FILE_BACKED_STAGE_TRACE").as_deref(), Ok("1") | Ok("true") | Ok("yes")))
+        }
+        let t0 = if trace_enabled() { Some(std::time::Instant::now()) } else { None };
+        let bytes0 = if t0.is_some() { self.staged_bytes() } else { 0 };
         if !self.st_a_idx.is_empty() {
             sink.push_a_terms_raw_block(&self.st_a_coeff, &self.st_a_idx)?;
             self.file_a_terms = self.file_a_terms.saturating_add(self.st_a_idx.len() as u64);
@@ -765,6 +774,12 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             sink.push_constraint_rows_block(&self.st_rows)?;
             self.file_rows = self.file_rows.saturating_add((self.st_rows.len() / 6) as u64);
             self.st_rows.clear();
+        }
+        if let Some(t0) = t0 {
+            let dt = t0.elapsed();
+            let mb = (bytes0 as f64) / (1024.0 * 1024.0);
+            let s = dt.as_secs_f64().max(1e-9);
+            eprintln!("[file_backed_stage] poseidon flush {:.1} MiB in {:.3}s ({:.2} GiB/s)", mb, s, (mb / 1024.0) / s);
         }
         Ok(())
     }
@@ -802,6 +817,8 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             debug_assert_eq!(sink.coeff_size(), 2, "tiny_u16_u32 expected");
 
             let a0 = self.file_a_terms + (self.st_a_idx.len() as u64);
+            self.st_a_coeff.reserve(a.len().saturating_mul(2));
+            self.st_a_idx.reserve(a.len());
             for (coef, idx) in a.iter() {
                 let bytes = sink.encode_coeff_u16_le_bytes(coef).expect("encode coeff failed");
                 self.st_a_coeff.extend_from_slice(&bytes);
@@ -810,6 +827,8 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             let a1 = a0 + (a.len() as u64);
 
             let b0 = self.file_b_terms + (self.st_b_idx.len() as u64);
+            self.st_b_coeff.reserve(b.len().saturating_mul(2));
+            self.st_b_idx.reserve(b.len());
             for (coef, idx) in b.iter() {
                 let bytes = sink.encode_coeff_u16_le_bytes(coef).expect("encode coeff failed");
                 self.st_b_coeff.extend_from_slice(&bytes);
@@ -818,6 +837,8 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             let b1 = b0 + (b.len() as u64);
 
             let c0 = self.file_c_terms + (self.st_c_idx.len() as u64);
+            self.st_c_coeff.reserve(c.len().saturating_mul(2));
+            self.st_c_idx.reserve(c.len());
             for (coef, idx) in c.iter() {
                 let bytes = sink.encode_coeff_u16_le_bytes(coef).expect("encode coeff failed");
                 self.st_c_coeff.extend_from_slice(&bytes);
@@ -825,6 +846,7 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             }
             let c1 = c0 + (c.len() as u64);
 
+            self.st_rows.reserve(6);
             self.st_rows.extend_from_slice(&[a0, a1, b0, b1, c0, c1]);
             self.maybe_flush_file_staging().expect("file-backed dr1cs flush failed");
         } else {
