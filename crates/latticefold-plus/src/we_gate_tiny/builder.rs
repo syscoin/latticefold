@@ -4684,6 +4684,7 @@ pub(super) fn build(
     );
 
     drop(pose_asg);
+    let merged_dir = dirs.merged_dir.clone();
     let out = finalize(
         pose_inst,
         pose_wiring,
@@ -4703,7 +4704,7 @@ pub(super) fn build(
         all_sum_coeffwise,
         all_sq_sum_digits,
         all_sq_sum_coeffwise,
-        dirs.merged_dir,
+        merged_dir.clone(),
     )?;
 
     // Disk hygiene: keep only the merged instance directory by default.
@@ -4721,7 +4722,7 @@ pub(super) fn build(
         if let Ok(rd) = std::fs::read_dir(&dirs.root) {
             for ent in rd.flatten() {
                 let p = ent.path();
-                if p == dirs.merged_dir {
+                if p == merged_dir {
                     continue;
                 }
                 // Don't delete non-directories (shouldn't exist, but be conservative).
