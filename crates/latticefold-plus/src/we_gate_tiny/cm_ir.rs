@@ -312,6 +312,28 @@ impl LoweredIr {
 pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> LoweredIr {
     let CmIr { local_asg, constraints, a_terms, b_terms, c_terms, stats } = ir;
     let base_nvars = gb.assignment.len();
+
+    // Count-only lowering fast path:
+    //
+    // In Pass0 we want exact var counts and exact row/term totals, but we do **not** want to
+    // spend wall time computing witness values or iterating millions of constraints to stream them.
+    //
+    // We can use the IR's precomputed `stats` to bump the builder's counters in one shot.
+    if gb.is_count_only() {
+        let mut local_to_var: Vec<usize> = Vec::with_capacity(local_asg.len());
+        local_to_var.push(0); // Local(0) unused
+        // Allocate locals with dummy witness values (shape-only).
+        for _ in 1..local_asg.len() {
+            local_to_var.push(gb.new_var(F257::ZERO));
+        }
+        let lowered = LoweredIr { base_nvars, local_to_var };
+        let rows = constraints.len() as u64;
+        gb.count_only_bump_counts(rows, stats.total_terms_a, stats.total_terms_b, stats.total_terms_c)
+            .expect("count_only_bump_counts failed");
+        let _ = (a_terms, b_terms, c_terms); // avoid unused warnings in this branch
+        return lowered;
+    }
+
     // File-backed builder path: stream constraints/terms instead of appending to giant Vec pools.
     //
     // This avoids the "term pool" RAM blow-ups at the cost of slower lowering (we can optimize

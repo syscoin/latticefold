@@ -304,6 +304,33 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         }
     }
 
+    /// Return true if this builder is in **count-only** mode (no pools/rows written).
+    #[inline]
+    pub fn is_count_only(&self) -> bool {
+        matches!(self.file_sink, Some(Dr1csFileSink::Count))
+    }
+
+    /// Count-only fast path: bump row/term counters without constructing any row/term buffers.
+    ///
+    /// This is intended for structural counting (Pass0) where the *shape* is known but we want
+    /// to avoid building/streaming millions of constraints.
+    pub fn count_only_bump_counts(
+        &mut self,
+        rows: u64,
+        a_terms: u64,
+        b_terms: u64,
+        c_terms: u64,
+    ) -> Result<(), String> {
+        if !self.is_count_only() {
+            return Err("count_only_bump_counts called on non-count-only builder".to_string());
+        }
+        self.file_rows = self.file_rows.saturating_add(rows);
+        self.file_a_terms = self.file_a_terms.saturating_add(a_terms);
+        self.file_b_terms = self.file_b_terms.saturating_add(b_terms);
+        self.file_c_terms = self.file_c_terms.saturating_add(c_terms);
+        Ok(())
+    }
+
     /// File-backed: append a block of A-terms (tiny format, u32 indices).
     pub fn file_push_a_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u32]) -> Result<(), String> {
         let sink = self
