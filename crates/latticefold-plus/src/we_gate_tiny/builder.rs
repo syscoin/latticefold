@@ -909,8 +909,10 @@ fn compute_cm_x_targets_for_decomp(
         }
 
         // Snapshot assignment for parallel IR building.
-        let base_asg_addr: usize = glue.gb.assignment.as_ptr() as usize;
-        let base_asg_len: usize = glue.gb.assignment.len();
+        //
+        // IMPORTANT: keep this as a normal shared slice borrow so Rust prevents concurrent mutation
+        // of `glue.gb.assignment` while Rayon threads are reading witness values.
+        let base_asg: &[F257] = &glue.gb.assignment;
 
         use super::cm_ir::{lower_ir_into_builder, ring_mul_negacyclic_ntt_goldilocks_d64_ir, IrBuilder, VarRef as IrVarRef};
         #[inline]
@@ -931,8 +933,6 @@ fn compute_cm_x_targets_for_decomp(
         let frags: Vec<(MulKind, super::cm_ir::CmIr, [[IrVarRef; 17]; 64])> = tasks
             .into_par_iter()
             .map(|kind| -> Result<_, String> {
-                let base_asg_ptr: *const F257 = base_asg_addr as *const F257;
-                let base_asg: &[F257] = unsafe { core::slice::from_raw_parts(base_asg_ptr, base_asg_len) };
                 let mut ib = IrBuilder::new(base_asg);
 
                 let (lhs, rhs): (&RingDigits, &RingDigits) = match kind {
@@ -2051,8 +2051,9 @@ fn compute_cm_shared_precomp_base(
                             // converting back to bal16 only once per coefficient at the end.
                             //
                             // This avoids the very expensive builder-level `ring_add_digits` chain.
-                            let base_asg_addr: usize = glue.gb.assignment.as_ptr() as usize;
-                            let base_asg_len: usize = glue.gb.assignment.len();
+                            // IMPORTANT: use a normal shared slice borrow so Rust prevents concurrent
+                            // mutation of `glue.gb.assignment` while Rayon threads are reading witnesses.
+                            let base_asg: &[F257] = &glue.gb.assignment;
 
                             // Determine shard size for this row.
                             let batch_size: usize = if let Some(v) = env_batch {
@@ -2077,10 +2078,7 @@ fn compute_cm_shared_precomp_base(
                                 .collect::<Vec<_>>()
                                 .into_par_iter()
                                 .map(|chunk| -> Result<_, String> {
-                                    let base_asg_ptr: *const F257 = base_asg_addr as *const F257;
-                                    let base_asg_ir: &[F257] =
-                                        unsafe { core::slice::from_raw_parts(base_asg_ptr, base_asg_len) };
-                                    let mut ib = IrBuilder::new(base_asg_ir);
+                                    let mut ib = IrBuilder::new(base_asg);
 
                                     // Local helper: allocate a reusable 0 constant inside this IR.
                                     // (We can't call cm_ir's `alloc_zero_const_ir` since it's private.)
@@ -2133,8 +2131,6 @@ fn compute_cm_shared_precomp_base(
 
                             // Reduce in bal4 using a tree of bal4 ring additions (pairwise).
                             // Build IRs in parallel, lower sequentially (single builder).
-                            let base_asg_addr2: usize = glue.gb.assignment.as_ptr() as usize;
-                            let base_asg_len2: usize = glue.gb.assignment.len();
                             while cur4.len() > 1 {
                                 let pairs: Vec<[Ring4; 2]> = cur4
                                     .chunks(2)
@@ -2142,13 +2138,12 @@ fn compute_cm_shared_precomp_base(
                                     .collect();
                                 let carry: Option<Ring4> = if (cur4.len() & 1) == 1 { Some(*cur4.last().unwrap()) } else { None };
 
+                                // Snapshot assignment for this reduction layer.
+                                let base_asg2: &[F257] = &glue.gb.assignment;
                                 let reduce_frags: Vec<(_, [[IrVarRef; 33]; 64])> = pairs
                                     .into_par_iter()
                                     .map(|[a, b]| -> Result<_, String> {
-                                        let base_asg_ptr: *const F257 = base_asg_addr2 as *const F257;
-                                        let base_asg_ir: &[F257] =
-                                            unsafe { core::slice::from_raw_parts(base_asg_ptr, base_asg_len2) };
-                                        let mut ib = IrBuilder::new(base_asg_ir);
+                                        let mut ib = IrBuilder::new(base_asg2);
                                         let mut out: [[IrVarRef; 33]; 64] = [[IrVarRef::Base(0); 33]; 64];
                                         for i in 0..64 {
                                             let a4: [IrVarRef; 33] = core::array::from_fn(|k| IrVarRef::Base(a[i][k]));
@@ -2180,8 +2175,7 @@ fn compute_cm_shared_precomp_base(
                                 .unwrap_or_else(|| core::array::from_fn(|_| core::array::from_fn(|_| glue.gb.one())));
 
                             // Convert the final accumulator to bal16 once per coefficient.
-                            let base_asg_ptr: *const F257 = base_asg_addr as *const F257;
-                            let base_asg_ir: &[F257] = unsafe { core::slice::from_raw_parts(base_asg_ptr, base_asg_len) };
+                            let base_asg_ir: &[F257] = &glue.gb.assignment;
                             let (ir_conv, out16_ir): (_, [[IrVarRef; 17]; 64]) = {
                                 let mut ib = IrBuilder::new(base_asg_ir);
                                 let mut out: [[IrVarRef; 17]; 64] = [[IrVarRef::Base(0); 17]; 64];
@@ -3873,24 +3867,17 @@ fn build_cm_glue_for_which(
                             }
                         }
 
-                        // Snapshot by *borrowing* after allocating `comh_terms` vars (needed for witness reads).
-                        // This avoids a giant `assignment.clone()` while still ensuring the slice includes the
-                        // newly allocated vars.
-                        // Avoid holding an immutable borrow of `glue.gb` across lowering by snapshotting via raw pointer.
-                        // Safety: `glue.gb.assignment` is not mutated while building `frags` (lowering happens after
-                        // `collect`), so pointer/len remain valid during the parallel shard build.
-                        // NOTE: use `usize` address so it is `Sync` for rayon closures.
-                        let base_asg_addr: usize = glue.gb.assignment.as_ptr() as usize;
-                        let base_asg_len: usize = glue.gb.assignment.len();
+                        // Snapshot assignment for parallel IR building.
+                        //
+                        // IMPORTANT: keep this as a normal shared slice borrow so Rust prevents concurrent mutation
+                        // of `glue.gb.assignment` while Rayon threads are reading witness values.
+                        let base_asg: &[F257] = &glue.gb.assignment;
 
                         // Build shards for this batch in parallel (indexed order preserved).
                         let frags: Vec<(_, [[IrVarRef; 17]; 64], [[IrVarRef; 17]; 64])> = (0..batch_len)
                             .into_par_iter()
                             .map(|l_local| -> Result<_, String> {
-                                let base_asg_ptr: *const F257 = base_asg_addr as *const F257;
-                                let base_asg_ir: &[F257] =
-                                    unsafe { core::slice::from_raw_parts(base_asg_ptr, base_asg_len) };
-                                let mut ib = IrBuilder::new(base_asg_ir);
+                                let mut ib = IrBuilder::new(base_asg);
                                 // zero digits in bal4: fixed const-0 var replicated.
                                 let z = ib.new_var(F257::ZERO);
                                 ib.ir.enforce_var_eq_const(z, F257::ZERO);
@@ -4046,22 +4033,15 @@ fn build_cm_glue_for_which(
 
                                 for chunk in terms.chunks(batch_size) {
                                     // Build IR fragments in parallel (no access to glue.gb mutably).
-                                    // Snapshot `assignment` via raw pointer to avoid cloning and to avoid holding an
-                                    // immutable borrow across lowering.
-                                    // Safety: `glue.gb.assignment` is not mutated while building `frags` (lowering
-                                    // happens after `collect` completes), so pointer/len remain valid.
-                                    // NOTE: use `usize` address so it is `Sync` for rayon closures.
-                                    let base_asg_addr: usize = glue.gb.assignment.as_ptr() as usize;
-                                    let base_asg_len: usize = glue.gb.assignment.len();
+                                    // IMPORTANT: normal shared borrow so Rust prevents concurrent mutation of
+                                    // `glue.gb.assignment` while Rayon threads are reading witness values.
+                                    let base_asg: &[F257] = &glue.gb.assignment;
                                     let frags: Vec<(_, [[IrVarRef; 17]; 64])> = chunk
                                         .par_iter()
                                         .map(|(uij_local, sp_idx)| -> Result<_, String> {
                                             let u_ir = ringdigits64_to_ir(uij_local)?;
                                             let s_ir = ringdigits64_to_ir(&sp_ring[*sp_idx])?;
-                                            let base_asg_ptr: *const F257 = base_asg_addr as *const F257;
-                                            let base_asg_ir: &[F257] =
-                                                unsafe { core::slice::from_raw_parts(base_asg_ptr, base_asg_len) };
-                                            let mut ib = IrBuilder::new(base_asg_ir);
+                                            let mut ib = IrBuilder::new(base_asg);
                                             let out_ir = ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &u_ir, &s_ir);
                                             // Keep op-mix accounting consistent even when ring-muls are built via IR shards.
                                             super::op_counts::tiny_cm_bump(|c| c.ring_mul_negacyclic += 1);
@@ -4104,11 +4084,11 @@ fn build_cm_glue_for_which(
                         };
                         let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
 
-                        // Snapshot assignment via raw pointer to avoid clone and to avoid holding an immutable borrow
-                        // across lowering. Safety: we do not mutate `glue.gb.assignment` while building `frags`
-                        // (lowering happens after `collect` completes).
-                        let base_asg_addr: usize = glue.gb.assignment.as_ptr() as usize;
-                        let base_asg_len: usize = glue.gb.assignment.len();
+                        // Snapshot assignment for parallel IR building.
+                        //
+                        // IMPORTANT: keep this as a normal shared slice borrow so Rust prevents concurrent mutation
+                        // of `glue.gb.assignment` while Rayon threads are reading witness values.
+                        let base_asg: &[F257] = &glue.gb.assignment;
 
                         #[inline]
                         fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
@@ -4123,10 +4103,7 @@ fn build_cm_glue_for_which(
                             .map(|(l, data)| -> Result<_, String> {
                                 let l = *l;
                                 debug_assert_eq!(data.l_idx, l * (4 + 4 * (params.mlen as usize)));
-
-                                let base_asg_ptr: *const F257 = base_asg_addr as *const F257;
-                                let base_asg_ir: &[F257] = unsafe { core::slice::from_raw_parts(base_asg_ptr, base_asg_len) };
-                                let mut ib = IrBuilder::new(base_asg_ir);
+                                let mut ib = IrBuilder::new(base_asg);
 
                                 // Zero digits: fixed const-0 var replicated.
                                 let z = ib.new_var(F257::ZERO);
@@ -4475,11 +4452,11 @@ fn build_cm_glue_for_which(
 
             let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
 
-            // Fresh snapshot including the precompute vars (no clone, and no borrow held across lowering).
-            // Safety: `glue.gb.assignment` is not mutated while building `frags` (lowering happens after `collect`).
-            // NOTE: use `usize` address so it is `Sync` for rayon closures.
-            let base_asg_addr: usize = glue.gb.assignment.as_ptr() as usize;
-            let base_asg_len: usize = glue.gb.assignment.len();
+            // Snapshot assignment for parallel IR building.
+            //
+            // IMPORTANT: keep this as a normal shared slice borrow so Rust prevents concurrent mutation
+            // of `glue.gb.assignment` while Rayon threads are reading witness values.
+            let base_asg: &[F257] = &glue.gb.assignment;
 
             let frags: Vec<(_, [[IrVarRef; 17]; 64])> = e00s
                 .par_iter()
@@ -4496,8 +4473,6 @@ fn build_cm_glue_for_which(
                     let rcz4: [IrVarRef; 33] = core::array::from_fn(|k| IrVarRef::Base(rcz4_base[k]));
                     let rcz14: [IrVarRef; 33] = core::array::from_fn(|k| IrVarRef::Base(rcz14_base[k]));
 
-                    let base_asg_ptr: *const F257 = base_asg_addr as *const F257;
-                    let base_asg: &[F257] = unsafe { core::slice::from_raw_parts(base_asg_ptr, base_asg_len) };
                     let mut ib = IrBuilder::new(base_asg);
                     let e00_4: [[IrVarRef; 33]; 64] = core::array::from_fn(|i| ib.bal16_to_bal4_digits_cached(&e00_16[i]));
 
