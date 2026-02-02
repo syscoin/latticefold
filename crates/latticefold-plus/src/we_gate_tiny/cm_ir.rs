@@ -102,6 +102,10 @@ pub(crate) struct CmIrStats {
 /// in parallel across many shards and then lowered once.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CmIr {
+    /// Count-only mode: do not retain term pools / constraint ranges.
+    ///
+    /// Still computes witnesses (local_asg) and exact `stats` so Pass0 can be structural-ish.
+    pub(crate) count_only: bool,
     /// Witness values for local vars. Index 0 is reserved as ONE.
     pub(crate) local_asg: Vec<F257>,
     pub(crate) constraints: Vec<IrConstraint>,
@@ -120,6 +124,7 @@ impl CmIr {
         // Reserve term 0 on B/C as the constant-one and constant-zero "atoms" so linear constraints
         // can reference them without allocating new vectors.
         Self {
+            count_only: false,
             local_asg: vec![F257::ONE],
             constraints: Vec::new(),
             a_terms: Vec::new(),
@@ -127,6 +132,20 @@ impl CmIr {
             c_terms: vec![(F257::ZERO, VarRef::Base(0))],
             stats: CmIrStats::default(),
         }
+    }
+
+    #[inline]
+    pub(crate) fn new_count_only() -> Self {
+        let mut s = Self::new();
+        s.count_only = true;
+        s
+    }
+
+    #[inline]
+    pub(crate) fn nconstraints(&self) -> u64 {
+        self.stats.linear_constraints
+            + self.stats.mul_constraints
+            + self.stats.other_non_linear_constraints
     }
 
     /// Allocate a new local var with the given witness value.
@@ -147,6 +166,9 @@ impl CmIr {
         self.stats.max_terms_a = self.stats.max_terms_a.max(lc.len() as u32);
         self.stats.max_terms_b = self.stats.max_terms_b.max(1);
         self.stats.max_terms_c = self.stats.max_terms_c.max(1);
+        if self.count_only {
+            return;
+        }
         let a0 = self.a_terms.len();
         self.a_terms.extend(lc);
         let a1 = self.a_terms.len();
@@ -174,6 +196,9 @@ impl CmIr {
         self.stats.max_terms_a = self.stats.max_terms_a.max(1);
         self.stats.max_terms_b = self.stats.max_terms_b.max(1);
         self.stats.max_terms_c = self.stats.max_terms_c.max(1);
+        if self.count_only {
+            return;
+        }
         let a0 = self.a_terms.len();
         self.a_terms.push((F257::ONE, a));
         let a1 = self.a_terms.len();
@@ -204,6 +229,9 @@ impl CmIr {
         self.stats.max_terms_a = self.stats.max_terms_a.max(a.len() as u32);
         self.stats.max_terms_b = self.stats.max_terms_b.max(b.len() as u32);
         self.stats.max_terms_c = self.stats.max_terms_c.max(c.len() as u32);
+        if self.count_only {
+            return;
+        }
         let a0 = self.a_terms.len();
         self.a_terms.extend(a);
         let a1 = self.a_terms.len();
@@ -238,7 +266,10 @@ impl CmIr {
         base_inst: &mut SparseDr1csInstance<F257>,
         base_asg: &mut Vec<F257>,
     ) -> Result<(), String> {
-        let CmIr { local_asg, constraints, a_terms, b_terms, c_terms, stats } = self;
+        if self.count_only {
+            return Err("CmIr::lower_into called on count-only IR".to_string());
+        }
+        let CmIr { local_asg, constraints, a_terms, b_terms, c_terms, stats, .. } = self;
         let base_nvars = base_asg.len();
         // Big win for wall-time: avoid repeated reallocations during append.
         base_asg.reserve(local_asg.len().saturating_sub(1));
@@ -310,7 +341,7 @@ impl LoweredIr {
 /// - all local witnesses as new vars
 /// - all constraints as R1CS constraints over concrete var indices
 pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> LoweredIr {
-    let CmIr { local_asg, constraints, a_terms, b_terms, c_terms, stats } = ir;
+    let CmIr { local_asg, constraints, a_terms, b_terms, c_terms, stats, .. } = ir;
     let base_nvars = gb.assignment.len();
 
     // Count-only lowering fast path:
@@ -330,7 +361,7 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
             local_to_var.push(gb.new_var(v));
         }
         let lowered = LoweredIr { base_nvars, local_to_var };
-        let rows = constraints.len() as u64;
+        let rows = stats.linear_constraints + stats.mul_constraints + stats.other_non_linear_constraints;
         gb.count_only_bump_counts(rows, stats.total_terms_a, stats.total_terms_b, stats.total_terms_c)
             .expect("count_only_bump_counts failed");
         let _ = (a_terms, b_terms, c_terms); // avoid unused warnings in this branch
@@ -799,6 +830,13 @@ impl<'a> IrBuilder<'a> {
             bal4_to_bal16_cache: HashMap::new(),
             bal4_const_mul_cache: HashMap::new(),
         }
+    }
+
+    #[inline]
+    pub(crate) fn new_count_only(base_asg: &'a [F257]) -> Self {
+        let mut s = Self::new(base_asg);
+        s.ir = CmIr::new_count_only();
+        s
     }
 
     /// Read the witness value for a var ref.

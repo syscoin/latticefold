@@ -1437,7 +1437,11 @@ fn compute_cm_x_targets_for_decomp(
         let frags: Vec<(MulKind, super::cm_ir::CmIr, [[IrVarRef; 17]; 64])> = tasks
             .into_par_iter()
             .map(|kind| -> Result<_, String> {
-                let mut ib = IrBuilder::new(base_asg);
+                let mut ib = if glue.gb.is_count_only() {
+                    IrBuilder::new_count_only(base_asg)
+                } else {
+                    IrBuilder::new(base_asg)
+                };
 
                 let (lhs, rhs): (&RingDigits, &RingDigits) = match kind {
                     MulKind::Cmg { j, term: 0 } => (&s_rings[0], &fc.c_mf[j]),
@@ -1729,7 +1733,11 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
             // Avoid cloning the full assignment: build IR using an immutable slice, then lower after borrow ends.
             let (ir, prod_ir) = {
                 let base_asg: &[F257] = glue.gb.assignment.as_slice();
-                let mut ib = IrBuilder::new(base_asg);
+                let mut ib = if glue.gb.is_count_only() {
+                    IrBuilder::new_count_only(base_asg)
+                } else {
+                    IrBuilder::new(base_asg)
+                };
                 let va_ir = ringdigits64_to_ir(va)?;
                 let vb_ir = ringdigits64_to_ir(vb)?;
                 let prod_ir = ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &va_ir, &vb_ir);
@@ -1752,7 +1760,11 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                 // then lower after the borrow ends.
                 let ir = {
                     let base_asg: &[F257] = glue.gb.assignment.as_slice();
-                    let mut ib = IrBuilder::new(base_asg);
+                    let mut ib = if glue.gb.is_count_only() {
+                        IrBuilder::new_count_only(base_asg)
+                    } else {
+                        IrBuilder::new(base_asg)
+                    };
                     let e16: [IrVarRef; 17] = core::array::from_fn(|k| IrVarRef::Base(e[k]));
                     let e4 = ib.bal16_to_bal4_digits_cached(&e16);
                     let diff_ir = ringdigits64_to_ir(&diff)?;
@@ -2101,7 +2113,11 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
         // then lower after the borrow ends (no giant `assignment.clone()`).
         let (ir, out_ir): (super::cm_ir::CmIr, Vec<[IrVarRef; 33]>) = {
             let base_asg: &[F257] = glue.gb.assignment.as_slice();
-            let mut ib = IrBuilder::new(base_asg);
+            let mut ib = if glue.gb.is_count_only() {
+                IrBuilder::new_count_only(base_asg)
+            } else {
+                IrBuilder::new(base_asg)
+            };
             let mut out: Vec<[IrVarRef; 33]> = Vec::with_capacity(dppow.len());
             for s in &dppow {
                 let s16: [IrVarRef; 17] = core::array::from_fn(|k| IrVarRef::Base(s[k]));
@@ -2224,12 +2240,17 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                 let c1 = (c0 + col_batch).min(cols);
                 let batch_len = c1 - c0;
                 let base_asg: &[F257] = &glue.gb.assignment;
+                let count_only = glue.gb.is_count_only();
 
                 let frags: Vec<(_, [IrVarRef; 17], usize)> = (0..batch_len)
                     .into_par_iter()
                     .map(|c_local| -> Result<_, String> {
                         let col = c0 + c_local;
-                        let mut ib = IrBuilder::new(base_asg);
+                        let mut ib = if count_only {
+                            IrBuilder::new_count_only(base_asg)
+                        } else {
+                            IrBuilder::new(base_asg)
+                        };
                         let z = ib.new_var(F257::ZERO);
                         ib.ir.enforce_var_eq_const(z, F257::ZERO);
                         let z4: [IrVarRef; 33] = [z; 33];
@@ -2582,7 +2603,11 @@ fn compute_cm_shared_precomp_base(
                                 .collect::<Vec<_>>()
                                 .into_par_iter()
                                 .map(|chunk| -> Result<_, String> {
-                                    let mut ib = IrBuilder::new(base_asg);
+                                    let mut ib = if glue.gb.is_count_only() {
+                                        IrBuilder::new_count_only(base_asg)
+                                    } else {
+                                        IrBuilder::new(base_asg)
+                                    };
 
                                     // Local helper: allocate a reusable 0 constant inside this IR.
                                     // (We can't call cm_ir's `alloc_zero_const_ir` since it's private.)
@@ -4317,7 +4342,11 @@ fn build_cm_glue_for_which(
                         // then lower after the borrow ends.
                         let (ir, s0_4_ir, s1_4_ir): (super::cm_ir::CmIr, Vec<[IrVarRef; 33]>, Vec<[IrVarRef; 33]>) = {
                             let base_asg: &[F257] = glue.gb.assignment.as_slice();
-                            let mut ib = IrBuilder::new(base_asg);
+                            let mut ib = if glue.gb.is_count_only() {
+                                IrBuilder::new_count_only(base_asg)
+                            } else {
+                                IrBuilder::new(base_asg)
+                            };
                             let mut s0_4_ir: Vec<[IrVarRef; 33]> = Vec::with_capacity(kappa);
                             let mut s1_4_ir: Vec<[IrVarRef; 33]> = Vec::with_capacity(kappa);
                             for j in 0..kappa {
@@ -4375,12 +4404,17 @@ fn build_cm_glue_for_which(
                         // IMPORTANT: keep this as a normal shared slice borrow so Rust prevents concurrent mutation
                         // of `glue.gb.assignment` while Rayon threads are reading witness values.
                         let base_asg: &[F257] = &glue.gb.assignment;
+                        let count_only = glue.gb.is_count_only();
 
                         // Build shards for this batch in parallel (indexed order preserved).
                         let frags: Vec<(_, [[IrVarRef; 17]; 64], [[IrVarRef; 17]; 64])> = (0..batch_len)
                             .into_par_iter()
                             .map(|l_local| -> Result<_, String> {
-                                let mut ib = IrBuilder::new(base_asg);
+                                let mut ib = if count_only {
+                                    IrBuilder::new_count_only(base_asg)
+                                } else {
+                                    IrBuilder::new(base_asg)
+                                };
                                 // zero digits in bal4: fixed const-0 var replicated.
                                 let z = ib.new_var(F257::ZERO);
                                 ib.ir.enforce_var_eq_const(z, F257::ZERO);
@@ -4539,12 +4573,17 @@ fn build_cm_glue_for_which(
                                     // IMPORTANT: normal shared borrow so Rust prevents concurrent mutation of
                                     // `glue.gb.assignment` while Rayon threads are reading witness values.
                                     let base_asg: &[F257] = &glue.gb.assignment;
+                                    let count_only = glue.gb.is_count_only();
                                     let frags: Vec<(_, [[IrVarRef; 17]; 64])> = chunk
                                         .par_iter()
                                         .map(|(uij_local, sp_idx)| -> Result<_, String> {
                                             let u_ir = ringdigits64_to_ir(uij_local)?;
                                             let s_ir = ringdigits64_to_ir(&sp_ring[*sp_idx])?;
-                                            let mut ib = IrBuilder::new(base_asg);
+                                            let mut ib = if count_only {
+                                                IrBuilder::new_count_only(base_asg)
+                                            } else {
+                                                IrBuilder::new(base_asg)
+                                            };
                                             let out_ir = ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &u_ir, &s_ir);
                                             // Keep op-mix accounting consistent even when ring-muls are built via IR shards.
                                             super::op_counts::tiny_cm_bump(|c| c.ring_mul_negacyclic += 1);
@@ -4592,6 +4631,7 @@ fn build_cm_glue_for_which(
                         // IMPORTANT: keep this as a normal shared slice borrow so Rust prevents concurrent mutation
                         // of `glue.gb.assignment` while Rayon threads are reading witness values.
                         let base_asg: &[F257] = &glue.gb.assignment;
+                        let count_only = glue.gb.is_count_only();
 
                         #[inline]
                         fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
@@ -4606,7 +4646,11 @@ fn build_cm_glue_for_which(
                             .map(|(l, data)| -> Result<_, String> {
                                 let l = *l;
                                 debug_assert_eq!(data.l_idx, l * (4 + 4 * (params.mlen as usize)));
-                                let mut ib = IrBuilder::new(base_asg);
+                                let mut ib = if count_only {
+                                    IrBuilder::new_count_only(base_asg)
+                                } else {
+                                    IrBuilder::new(base_asg)
+                                };
 
                                 // Zero digits: fixed const-0 var replicated.
                                 let z = ib.new_var(F257::ZERO);
@@ -4800,7 +4844,11 @@ fn build_cm_glue_for_which(
             // Avoid borrowing `glue.gb.assignment` across lowering (which needs `&mut glue.gb`).
             let (ir, eq4_ir): (super::cm_ir::CmIr, [IrVarRef; 33]) = {
                 let base_asg: &[F257] = glue.gb.assignment.as_slice();
-                let mut ib = IrBuilder::new(base_asg);
+                let mut ib = if glue.gb.is_count_only() {
+                    IrBuilder::new_count_only(base_asg)
+                } else {
+                    IrBuilder::new(base_asg)
+                };
                 let eq16: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(eq[j]));
                 let eq4 = ib.bal16_to_bal4_digits_cached(&eq16);
                 (ib.ir, eq4)
@@ -4852,6 +4900,7 @@ fn build_cm_glue_for_which(
 
                 let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
                 let base_asg: &[F257] = &glue.gb.assignment;
+                let count_only = glue.gb.is_count_only();
                 let eq4_ir: [IrVarRef; 33] = core::array::from_fn(|k| IrVarRef::Base(eq4_base[k]));
 
                 let frags: Vec<(super::cm_ir::CmIr, [[IrVarRef; 17]; 64])> = (0..batch_len)
@@ -4862,7 +4911,11 @@ fn build_cm_glue_for_which(
                         let terms = &batch_terms[l_local];
                         debug_assert_eq!(terms.len(), rows_per_l * 4);
 
-                        let mut ib = IrBuilder::new(base_asg);
+                        let mut ib = if count_only {
+                            IrBuilder::new_count_only(base_asg)
+                        } else {
+                            IrBuilder::new(base_asg)
+                        };
                         // zero digits in bal4: fixed const-0 var replicated.
                         let z = ib.new_var(F257::ZERO);
                         ib.ir.enforce_var_eq_const(z, F257::ZERO);
@@ -4942,7 +4995,11 @@ fn build_cm_glue_for_which(
                 let rcz116: [IrVarRef; 17] = core::array::from_fn(|k| IrVarRef::Base(rc_pows[z_idx + 1][k]));
                 let (ir, rcz4_ir, rcz14_ir) = {
                     let base_asg = glue.gb.assignment.as_slice();
-                    let mut ib = IrBuilder::new(base_asg);
+                    let mut ib = if glue.gb.is_count_only() {
+                        IrBuilder::new_count_only(base_asg)
+                    } else {
+                        IrBuilder::new(base_asg)
+                    };
                     let rcz4 = ib.bal16_to_bal4_digits_cached(&rcz16);
                     let rcz14 = ib.bal16_to_bal4_digits_cached(&rcz116);
                     (ib.ir, rcz4, rcz14)
@@ -4960,6 +5017,7 @@ fn build_cm_glue_for_which(
             // IMPORTANT: keep this as a normal shared slice borrow so Rust prevents concurrent mutation
             // of `glue.gb.assignment` while Rayon threads are reading witness values.
             let base_asg: &[F257] = &glue.gb.assignment;
+            let count_only = glue.gb.is_count_only();
 
             let frags: Vec<(_, [[IrVarRef; 17]; 64])> = e00s
                 .par_iter()
@@ -4976,7 +5034,11 @@ fn build_cm_glue_for_which(
                     let rcz4: [IrVarRef; 33] = core::array::from_fn(|k| IrVarRef::Base(rcz4_base[k]));
                     let rcz14: [IrVarRef; 33] = core::array::from_fn(|k| IrVarRef::Base(rcz14_base[k]));
 
-                    let mut ib = IrBuilder::new(base_asg);
+                    let mut ib = if count_only {
+                        IrBuilder::new_count_only(base_asg)
+                    } else {
+                        IrBuilder::new(base_asg)
+                    };
                     let e00_4: [[IrVarRef; 33]; 64] = core::array::from_fn(|i| ib.bal16_to_bal4_digits_cached(&e00_16[i]));
 
                     let out0_4 = ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir(&mut ib, &t0_4, &e00_4);
