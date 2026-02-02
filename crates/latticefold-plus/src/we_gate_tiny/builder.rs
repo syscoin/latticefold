@@ -1964,9 +1964,10 @@ fn compute_cm_shared_precomp_base(
             let out_e_base = setchk_out_e_vars_for_cm.as_ref().unwrap().as_ref();
             if out_e_base.len() != rows_per_l {
                 None
-            } else {
+                } else {
                     use super::cm_ir::{
-                        lower_ir_into_builder, ring_mul_negacyclic_ntt_goldilocks_d64_ir, IrBuilder,
+                        alloc_zero_const_ir, bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir,
+                        lower_ir_into_builder, ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir, IrBuilder,
                         VarRef as IrVarRef,
                     };
 
@@ -1995,7 +1996,6 @@ fn compute_cm_shared_precomp_base(
                     for l in 0..l_instances_expected {
                         let mut u_l: Vec<RingDigits> = Vec::with_capacity(rows_per_l);
                         for ni in 0..rows_per_l {
-                            let mut acc_ring = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
                             // Collect term refs for this (l,ni).
                             let mut terms: Vec<(&RingDigits, usize)> = Vec::with_capacity(k_decomp * ring_dim);
                             for blk in 0..k_decomp {
@@ -2013,43 +2013,87 @@ fn compute_cm_shared_precomp_base(
                                 }
                             }
 
-                            for chunk in terms.chunks(batch_size) {
-                                // IMPORTANT: take a fresh snapshot before lowering allocates new vars.
-                                // Avoid `assignment.clone()` (huge) and also avoid holding an immutable borrow of
-                                // `glue.gb` across lowering by snapshotting the slice via a raw pointer.
-                                // Safety: `glue.gb.assignment` is not mutated while building `frags` (we only lower
-                                // after `collect` completes), so the pointer/len remain valid for the duration of
-                                // the parallel shard build.
-                                // NOTE: use `usize` address so it is `Sync` for rayon closures.
-                                let base_asg_addr: usize = glue.gb.assignment.as_ptr() as usize;
-                                let base_asg_len: usize = glue.gb.assignment.len();
-                                let t_build = Instant::now();
-                                let frags: Vec<(_, [[IrVarRef; 17]; 64])> = chunk
-                                    .par_iter()
-                                    .map(|(uij, sp_idx)| -> Result<_, String> {
-                                        let u_ir = ringdigits64_to_ir(uij)?;
-                                        let s_ir = ringdigits64_to_ir(&sflat[*sp_idx])?;
-                                        let base_asg_ptr: *const F257 = base_asg_addr as *const F257;
-                                        let base_asg_ir: &[F257] =
-                                            unsafe { core::slice::from_raw_parts(base_asg_ptr, base_asg_len) };
-                                        let mut ib = IrBuilder::new(base_asg_ir);
-                                        let out_ir = ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &u_ir, &s_ir);
-                                        // Keep op-mix accounting consistent even when ring-muls are built via IR shards.
-                                        super::op_counts::tiny_cm_bump(|c| c.ring_mul_negacyclic += 1);
-                                        Ok((ib.ir, out_ir))
-                                    })
-                                    .collect::<Result<Vec<_>, _>>()?;
-                                u_ir_build_time = u_ir_build_time.saturating_add(t_build.elapsed());
-                                u_frag_count = u_frag_count.saturating_add(frags.len());
+                            // Compute in shards: each shard sums `batch_size` products internally in **bal4**,
+                            // converting back to bal16 only once per coefficient at the end.
+                            //
+                            // This avoids the very expensive builder-level `ring_add_digits` chain.
+                            let base_asg_addr: usize = glue.gb.assignment.as_ptr() as usize;
+                            let base_asg_len: usize = glue.gb.assignment.len();
 
-                                let t_lower = Instant::now();
-                                for (ir, out_ir) in frags {
-                                    let lowered = lower_ir_into_builder(&mut glue.gb, ir);
-                                    let prod = map_ring_out(&out_ir, &lowered);
-                                    acc_ring = ring_add_digits(&mut glue.gb, &acc_ring, &prod);
-                                }
-                                u_lower_time = u_lower_time.saturating_add(t_lower.elapsed());
+                            // Build shard IRs in parallel.
+                            let t_build = Instant::now();
+                            let frags: Vec<(_, [[IrVarRef; 17]; 64])> = terms
+                                .chunks(batch_size)
+                                .collect::<Vec<_>>()
+                                .into_par_iter()
+                                .map(|chunk| -> Result<_, String> {
+                                    let base_asg_ptr: *const F257 = base_asg_addr as *const F257;
+                                    let base_asg_ir: &[F257] =
+                                        unsafe { core::slice::from_raw_parts(base_asg_ptr, base_asg_len) };
+                                    let mut ib = IrBuilder::new(base_asg_ir);
+
+                                    let zero_digit = alloc_zero_const_ir(&mut ib);
+                                    let zero4: [IrVarRef; 33] = [zero_digit; 33];
+                                    let mut acc4: [[IrVarRef; 33]; 64] = [zero4; 64];
+
+                                    for (uij, sp_idx) in chunk {
+                                        let u16 = ringdigits64_to_ir(uij)?;
+                                        let s16 = ringdigits64_to_ir(&sflat[*sp_idx])?;
+                                        // Convert to bal4 once, then do NTT ringmul in bal4 domain.
+                                        let mut u4: [[IrVarRef; 33]; 64] = [zero4; 64];
+                                        let mut s4: [[IrVarRef; 33]; 64] = [zero4; 64];
+                                        for i in 0..64 {
+                                            u4[i] = ib.bal16_to_bal4_digits_cached(&u16[i]);
+                                            s4[i] = ib.bal16_to_bal4_digits_cached(&s16[i]);
+                                        }
+                                        let prod4 = ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir(&mut ib, &u4, &s4);
+                                        for i in 0..64 {
+                                            acc4[i] = goldilocks_add_mod_p_digits_bal4_ir(
+                                                &mut ib,
+                                                &acc4[i],
+                                                &prod4[i],
+                                                gl_ntt64::GOLDILOCKS_P_U64,
+                                            );
+                                        }
+                                        // Keep op-mix accounting consistent: one ring-mul per term.
+                                        super::op_counts::tiny_cm_bump(|c| c.ring_mul_negacyclic += 1);
+                                    }
+
+                                    // Convert back to bal16 once per coefficient.
+                                    let mut out16: [[IrVarRef; 17]; 64] = [[zero_digit; 17]; 64];
+                                    for i in 0..64 {
+                                        out16[i] = bal4_to_bal16_digits_ir(&mut ib, &acc4[i]);
+                                    }
+                                    Ok((ib.ir, out16))
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+
+                            u_ir_build_time = u_ir_build_time.saturating_add(t_build.elapsed());
+                            u_frag_count = u_frag_count.saturating_add(frags.len());
+
+                            // Lower shards and reduce their outputs with a tree of ring additions.
+                            let t_lower = Instant::now();
+                            let mut partials: Vec<RingDigits> = Vec::with_capacity(frags.len());
+                            for (ir, out_ir) in frags {
+                                let lowered = lower_ir_into_builder(&mut glue.gb, ir);
+                                partials.push(map_ring_out(&out_ir, &lowered));
                             }
+                            // Tree reduction (pairwise) to keep addition depth logarithmic.
+                            let mut cur = partials;
+                            while cur.len() > 1 {
+                                let mut next: Vec<RingDigits> = Vec::with_capacity((cur.len() + 1) / 2);
+                                for pair in cur.chunks(2) {
+                                    if pair.len() == 1 {
+                                        next.push(pair[0].clone());
+                                    } else {
+                                        next.push(ring_add_digits(&mut glue.gb, &pair[0], &pair[1]));
+                                    }
+                                }
+                                cur = next;
+                            }
+                            let acc_ring = cur.pop().unwrap_or_else(|| super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim));
+                            u_lower_time = u_lower_time.saturating_add(t_lower.elapsed());
+
                             u_l.push(acc_ring);
                         }
                         u_all.push(u_l);
