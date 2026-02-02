@@ -496,9 +496,9 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
             let mut a_coeffs: Vec<u8> = vec![0u8; total_a.saturating_mul(coeff_size)];
             let mut b_coeffs: Vec<u8> = vec![0u8; total_b.saturating_mul(coeff_size)];
             let mut c_coeffs: Vec<u8> = vec![0u8; total_c.saturating_mul(coeff_size)];
-            let mut a_idx: Vec<u64> = vec![0u64; total_a];
-            let mut b_idx: Vec<u64> = vec![0u64; total_b];
-            let mut c_idx: Vec<u64> = vec![0u64; total_c];
+            let mut a_idx: Vec<u32> = vec![0u32; total_a];
+            let mut b_idx: Vec<u32> = vec![0u32; total_b];
+            let mut c_idx: Vec<u32> = vec![0u32; total_c];
 
             #[derive(Copy, Clone)]
             struct SyncPtr<T>(*mut T);
@@ -510,9 +510,17 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
                     core::ptr::write(self.0.add(off), v);
                 }
             }
-            let out_a_idx: SyncPtr<u64> = SyncPtr(a_idx.as_mut_ptr());
-            let out_b_idx: SyncPtr<u64> = SyncPtr(b_idx.as_mut_ptr());
-            let out_c_idx: SyncPtr<u64> = SyncPtr(c_idx.as_mut_ptr());
+            let out_a_idx: SyncPtr<u32> = SyncPtr(a_idx.as_mut_ptr());
+            let out_b_idx: SyncPtr<u32> = SyncPtr(b_idx.as_mut_ptr());
+            let out_c_idx: SyncPtr<u32> = SyncPtr(c_idx.as_mut_ptr());
+            #[inline]
+            fn map_var_fast_u32(base_nvars: usize, local_to_var: &[usize], v: VarRef) -> u32 {
+                let m = map_var_fast(base_nvars, local_to_var, v);
+                if m > (u32::MAX as u64) {
+                    panic!("file-backed lowering: mapped var idx overflow u32");
+                }
+                m as u32
+            }
             let a_bytes_ptr: usize = a_coeffs.as_mut_ptr() as usize;
             let b_bytes_ptr: usize = b_coeffs.as_mut_ptr() as usize;
             let c_bytes_ptr: usize = c_coeffs.as_mut_ptr() as usize;
@@ -523,7 +531,7 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
                 let a_dst0 = a_offs[i];
                 for (k, &(coef, v)) in a_terms[ic.a.clone()].iter().enumerate() {
                     let pos = a_dst0 + k;
-                    out_a_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, v));
+                    out_a_idx.write(pos, map_var_fast_u32(base_nvars_local, local_to_var, v));
                     let dst = (a_bytes_ptr as *mut u8).add(pos * coeff_size);
                     let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
                     let vv = coeff_idx_f257(coef);
@@ -533,7 +541,7 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
                 let b_dst0 = b_offs[i];
                 for (k, &(coef, v)) in b_terms[ic.b.clone()].iter().enumerate() {
                     let pos = b_dst0 + k;
-                    out_b_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, v));
+                    out_b_idx.write(pos, map_var_fast_u32(base_nvars_local, local_to_var, v));
                     let dst = (b_bytes_ptr as *mut u8).add(pos * coeff_size);
                     let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
                     let vv = coeff_idx_f257(coef);
@@ -543,7 +551,7 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
                 let c_dst0 = c_offs[i];
                 for (k, &(coef, v)) in c_terms[ic.c.clone()].iter().enumerate() {
                     let pos = c_dst0 + k;
-                    out_c_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, v));
+                    out_c_idx.write(pos, map_var_fast_u32(base_nvars_local, local_to_var, v));
                     let dst = (c_bytes_ptr as *mut u8).add(pos * coeff_size);
                     let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
                     let vv = coeff_idx_f257(coef);

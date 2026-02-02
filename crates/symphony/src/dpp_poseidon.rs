@@ -659,6 +659,12 @@ struct Dr1csBuilder<F: PrimeField> {
 }
 
 impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
+    #[inline]
+    fn idx_u32(idx: usize) -> u32 {
+        idx.try_into()
+            .unwrap_or_else(|_| panic!("file-backed dr1cs: var idx overflow u32 (idx={idx})"))
+    }
+
     fn new() -> Self {
         // var 0 is the constant-1 slot
         Self {
@@ -709,7 +715,7 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         if let Some(sink) = self.file_sink.as_mut() {
             let a0 = self.file_a_terms;
             for (coef, idx) in a.iter() {
-                sink.push_a_term(coef, *idx as u64)
+                sink.push_a_term(coef, Self::idx_u32(*idx))
                     .expect("file-backed dr1cs write failed (a_term)");
             }
             let a1 = a0 + (a.len() as u64);
@@ -717,7 +723,7 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
 
             let b0 = self.file_b_terms;
             for (coef, idx) in b.iter() {
-                sink.push_b_term(coef, *idx as u64)
+                sink.push_b_term(coef, Self::idx_u32(*idx))
                     .expect("file-backed dr1cs write failed (b_term)");
             }
             let b1 = b0 + (b.len() as u64);
@@ -725,7 +731,7 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
 
             let c0 = self.file_c_terms;
             for (coef, idx) in c.iter() {
-                sink.push_c_term(coef, *idx as u64)
+                sink.push_c_term(coef, Self::idx_u32(*idx))
                     .expect("file-backed dr1cs write failed (c_term)");
             }
             let c1 = c0 + (c.len() as u64);

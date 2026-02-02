@@ -74,6 +74,11 @@ pub struct Dr1csBuilder<F: PrimeField> {
 }
 
 impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
+    #[inline]
+    fn idx_u32(idx: usize) -> u32 {
+        idx.try_into()
+            .unwrap_or_else(|_| panic!("file-backed dr1cs: var idx overflow u32 (idx={idx})"))
+    }
     pub fn new() -> Self {
         let profile_enabled = match std::env::var("LF_PROFILE_DR1CS") {
             Ok(v) => v != "0",
@@ -135,8 +140,8 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         }
     }
 
-    /// File-backed: append a block of A-terms.
-    pub fn file_push_a_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u64]) -> Result<(), String> {
+    /// File-backed: append a block of A-terms (tiny format, u32 indices).
+    pub fn file_push_a_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u32]) -> Result<(), String> {
         let sink = self
             .file_sink
             .as_mut()
@@ -146,8 +151,8 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         Ok(())
     }
 
-    /// File-backed: append a block of B-terms.
-    pub fn file_push_b_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u64]) -> Result<(), String> {
+    /// File-backed: append a block of B-terms (tiny format, u32 indices).
+    pub fn file_push_b_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u32]) -> Result<(), String> {
         let sink = self
             .file_sink
             .as_mut()
@@ -157,8 +162,8 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         Ok(())
     }
 
-    /// File-backed: append a block of C-terms.
-    pub fn file_push_c_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u64]) -> Result<(), String> {
+    /// File-backed: append a block of C-terms (tiny format, u32 indices).
+    pub fn file_push_c_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u32]) -> Result<(), String> {
         let sink = self
             .file_sink
             .as_mut()
@@ -241,7 +246,7 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             let a0 = self.file_a_terms;
             let mut a_n: u64 = 0;
             for (coef, idx) in a.into_iter() {
-                sink.push_a_term(&coef, idx as u64)
+                sink.push_a_term(&coef, Self::idx_u32(idx))
                     .expect("file-backed dr1cs write failed (a_term)");
                 a_n += 1;
             }
@@ -251,7 +256,7 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             let b0 = self.file_b_terms;
             let mut b_n: u64 = 0;
             for (coef, idx) in b.into_iter() {
-                sink.push_b_term(&coef, idx as u64)
+                sink.push_b_term(&coef, Self::idx_u32(idx))
                     .expect("file-backed dr1cs write failed (b_term)");
                 b_n += 1;
             }
@@ -261,7 +266,7 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             let c0 = self.file_c_terms;
             let mut c_n: u64 = 0;
             for (coef, idx) in c.into_iter() {
-                sink.push_c_term(&coef, idx as u64)
+                sink.push_c_term(&coef, Self::idx_u32(idx))
                     .expect("file-backed dr1cs write failed (c_term)");
                 c_n += 1;
             }
@@ -306,7 +311,7 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             // Stream to disk.
             let a0 = self.file_a_terms;
             for (coef, idx) in a.iter() {
-                sink.push_a_term(coef, *idx as u64)
+                sink.push_a_term(coef, Self::idx_u32(*idx))
                     .expect("file-backed dr1cs write failed (a_term)");
             }
             let a1 = self.file_a_terms + (a.len() as u64);
@@ -314,7 +319,7 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
 
             let b0 = self.file_b_terms;
             for (coef, idx) in b.iter() {
-                sink.push_b_term(coef, *idx as u64)
+                sink.push_b_term(coef, Self::idx_u32(*idx))
                     .expect("file-backed dr1cs write failed (b_term)");
             }
             let b1 = self.file_b_terms + (b.len() as u64);
@@ -322,7 +327,7 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
 
             let c0 = self.file_c_terms;
             for (coef, idx) in c.iter() {
-                sink.push_c_term(coef, *idx as u64)
+                sink.push_c_term(coef, Self::idx_u32(*idx))
                     .expect("file-backed dr1cs write failed (c_term)");
             }
             let c1 = self.file_c_terms + (c.len() as u64);
