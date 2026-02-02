@@ -630,11 +630,22 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
     #[inline]
     fn write_coeff_cached(&mut self, coef: &F) -> Result<(), String> {
         // Tiny format: encode coefficient as u16 little-endian of the canonical representative in [0, p-1].
-        let big = coef.into_bigint();
-        let limbs = big.as_ref();
-        debug_assert!(!limbs.is_empty());
-        debug_assert_eq!(limbs.len(), 1, "tiny_u16_u32 expects single-limb field");
-        let v = limbs[0];
+        //
+        // Hot-path micro-optimization: most coefficients are 0/±1; avoid `into_bigint()` there.
+        let v: u64 = if coef.is_zero() {
+            0
+        } else if *coef == F::ONE {
+            1
+        } else if *coef == -F::ONE {
+            // canonical representative of -1 is p-1 (fits since p <= 65535 in this format)
+            self.modulus.saturating_sub(1)
+        } else {
+            let big = (*coef).into_bigint();
+            let limbs = big.as_ref();
+            debug_assert!(!limbs.is_empty());
+            debug_assert_eq!(limbs.len(), 1, "tiny_u16_u32 expects single-limb field");
+            limbs[0]
+        };
         let vv: u16 = v.try_into().map_err(|_| "coef overflow u16".to_string())?;
         self.coeff_buf.copy_from_slice(&vv.to_le_bytes());
         Ok(())

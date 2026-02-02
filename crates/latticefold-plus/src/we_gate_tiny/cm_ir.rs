@@ -419,6 +419,21 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
         debug_assert_eq!(table.0, coeff_size, "unexpected coeff_size mismatch for F257 table");
         let coeff_bytes = &table.1;
 
+        #[inline]
+        fn coeff_idx_f257(coef: F257) -> usize {
+            // Fast-path the common coefficients to avoid `into_bigint()` in hot loops.
+            if coef.is_zero() {
+                0
+            } else if coef == F257::ONE {
+                1
+            } else if coef == -F257::ONE {
+                256
+            } else {
+                // F257 is a 1-limb field; this is still cheap (no heap), but rarer.
+                coef.into_bigint().as_ref()[0] as usize
+            }
+        }
+
         // Capture map pieces for fast remap.
         let base_nvars_local = lowered.base_nvars;
         let local_to_var = &lowered.local_to_var;
@@ -511,8 +526,7 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
                     out_a_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, v));
                     let dst = (a_bytes_ptr as *mut u8).add(pos * coeff_size);
                     let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
-                    let limbs = coef.into_bigint();
-                    let vv = limbs.as_ref()[0] as usize;
+                    let vv = coeff_idx_f257(coef);
                     dst_slice.copy_from_slice(&coeff_bytes[vv * coeff_size..(vv + 1) * coeff_size]);
                 }
                 // B
@@ -522,8 +536,7 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
                     out_b_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, v));
                     let dst = (b_bytes_ptr as *mut u8).add(pos * coeff_size);
                     let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
-                    let limbs = coef.into_bigint();
-                    let vv = limbs.as_ref()[0] as usize;
+                    let vv = coeff_idx_f257(coef);
                     dst_slice.copy_from_slice(&coeff_bytes[vv * coeff_size..(vv + 1) * coeff_size]);
                 }
                 // C
@@ -533,8 +546,7 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
                     out_c_idx.write(pos, map_var_fast(base_nvars_local, local_to_var, v));
                     let dst = (c_bytes_ptr as *mut u8).add(pos * coeff_size);
                     let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
-                    let limbs = coef.into_bigint();
-                    let vv = limbs.as_ref()[0] as usize;
+                    let vv = coeff_idx_f257(coef);
                     dst_slice.copy_from_slice(&coeff_bytes[vv * coeff_size..(vv + 1) * coeff_size]);
                 }
             });
