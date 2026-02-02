@@ -14,6 +14,7 @@ use std::io::{BufReader, BufWriter, Read as IoRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::io::Seek;
 use std::io::SeekFrom;
+use std::sync::OnceLock;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(unix)]
