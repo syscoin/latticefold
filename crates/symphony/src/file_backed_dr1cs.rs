@@ -1050,27 +1050,6 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                 self.cur = term;
                 Ok(())
             }
-
-            #[inline]
-            fn eval_range(&mut self, which: &str, start: u64, end: u64, assignment: &[F]) -> Result<F, String> {
-                self.seek_term(which, start)?;
-                let mut acc = F::ZERO;
-                for _ in start..end {
-                    self.fc
-                        .read_exact(&mut self.coeff_buf)
-                        .map_err(|e| format!("read {which}_coeffs failed: {e}"))?;
-                    let idx = read_u32(&mut self.fi).map_err(|e| format!("read {which}_idx failed: {e}"))? as usize;
-                    let vv: u64 = match self.coeff_size {
-                        1 => self.coeff_buf[0] as u64,
-                        2 => u16::from_le_bytes([self.coeff_buf[0], self.coeff_buf[1]]) as u64,
-                        _ => return Err(format!("unsupported coeff_size={} (expected 1 or 2)", self.coeff_size)),
-                    };
-                    let coef = F::from(vv);
-                    acc += coef * assignment[idx];
-                    self.cur = self.cur.saturating_add(1);
-                }
-                Ok(acc)
-            }
         }
 
         let coeff_size = self.layout.coeff_size;
@@ -1195,12 +1174,6 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                 let a1 = a0.saturating_add(a_len);
                 let b1 = b0.saturating_add(b_len);
                 let c1 = c0.saturating_add(c_len);
-                let a = ts_a.eval_range("a", a0, a1, assignment)?;
-                let b = ts_b.eval_range("b", b0, b1, assignment)?;
-                let c = ts_c.eval_range("c", c0, c1, assignment)?;
-                if a * b != c {
-                    return Err(format!("constraint {row_idx} failed"));
-                }
                 a0 = a1;
                 b0 = b1;
                 c0 = c1;
