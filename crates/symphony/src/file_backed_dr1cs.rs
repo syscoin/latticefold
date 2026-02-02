@@ -161,6 +161,29 @@ pub(crate) fn fast_prepare_out_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Best-effort fast deletion for huge dirs: rename then delete in background.
+///
+/// Unlike `fast_prepare_out_dir`, this does **not** recreate the directory.
+pub(crate) fn fast_remove_dir_best_effort(dir: &Path) {
+    if !dir.exists() {
+        return;
+    }
+    let pid = std::process::id();
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let trash = dir.with_extension(format!("trash.{pid}.{ts}"));
+    if std::fs::rename(dir, &trash).is_ok() {
+        std::thread::spawn(move || {
+            let _ = std::fs::remove_dir_all(trash);
+        });
+    } else {
+        // Fallback: try removing in-place (may block).
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 fn serialize_fixed<F: CanonicalSerialize>(x: &F, out: &mut [u8]) -> Result<(), SerializationError> {
     // CanonicalSerialize writes to a std::io::Write. Avoid allocating a Vec per coefficient:
     // write directly into the fixed-size output buffer.

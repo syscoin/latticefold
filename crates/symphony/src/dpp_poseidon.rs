@@ -13,7 +13,8 @@ use crate::poseidon_trace::{permute_in_place, permute_with_round_trace, Poseidon
 use crate::poseidon_trace::{replay_ops, PoseidonReplayError as ReplayErr, PoseidonSpongeReplayResult};
 use crate::transcript::PoseidonTraceOp;
 use crate::file_backed_dr1cs::{
-    fast_prepare_out_dir, merge_file_backed_sparse_dr1cs_share_one, FileBackedSparseDr1csInstance, SparseDr1csFileWriter,
+    fast_prepare_out_dir, fast_remove_dir_best_effort, merge_file_backed_sparse_dr1cs_share_one, FileBackedSparseDr1csInstance,
+    SparseDr1csFileWriter,
 };
 
 #[derive(Debug)]
@@ -1556,6 +1557,14 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
             merged_inst.layout.nconstraints
         );
     }
+
+
+    // Best-effort: even if deletion fails, the merged instance is still valid.
+    for shard_idx in 0..plans.len() {
+        let shard_dir = out_dir.join(format!("poseidon_shard_{shard_idx:04}"));
+        fast_remove_dir_best_effort(&shard_dir);
+    }
+    
     Ok((merged_inst, merged_asg, replay, bytes_all, wiring, bw))
 }
 
