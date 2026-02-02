@@ -156,12 +156,14 @@ pub(crate) fn fast_prepare_out_dir(dir: &Path) -> Result<(), String> {
             //
             // Best effort "survive Ctrl-C": put deleter in a new session.
             // We try (in order): setsid+ionice+nice, setsid+nice, setsid+rm, then nohup variants.
-            let null = Stdio::null();
-            let try_spawn = |prog: &str, args: &[&std::ffi::OsStr]| -> bool {
+            fn try_spawn(prog: &str, args: &[&std::ffi::OsStr]) -> bool {
                 let mut c = std::process::Command::new(prog);
-                c.args(args).stdin(null).stdout(Stdio::null()).stderr(Stdio::null());
+                c.args(args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
                 c.spawn().is_ok()
-            };
+            }
 
             use std::ffi::OsStr;
             let rm = OsStr::new("rm");
