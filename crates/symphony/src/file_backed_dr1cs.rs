@@ -375,7 +375,7 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             ));
         }
         let modulus = limbs[0];
-        // coeff_size=2 (u16 little-endian), idx_size=4 (u32 little-endian)
+        // coeff_size=2 (u16 little-endian canonical representative in [0, p-1]), idx_size=4 (u32 little-endian)
         let coeff_size: usize = 2;
         let idx_size: usize = 4;
 
@@ -886,10 +886,20 @@ pub fn dump_sparse_to_dir<F: PrimeField + CanonicalSerialize>(
         let mut fc = BufWriter::new(File::create(p_coeffs).map_err(|e| format!("create {which}_coeffs failed: {e}"))?);
         let mut fi = BufWriter::new(File::create(p_idx).map_err(|e| format!("create {which}_idx failed: {e}"))?);
         for (coef, idx) in terms.iter() {
-            let big = coef.into_bigint();
-            let vv = big.as_ref()[0];
-            let vv16: u16 = vv.try_into().map_err(|_| "dump_sparse_to_dir: coef overflow u16".to_string())?;
-            fc.write_all(&vv16.to_le_bytes()).map_err(|e| e.to_string())?;
+            let v: u64 = if *coef == F::ZERO {
+                0
+            } else if *coef == F::ONE {
+                1
+            } else if *coef == -F::ONE {
+                modulus.saturating_sub(1)
+            } else {
+                let big = (*coef).into_bigint();
+                let limbs = big.as_ref();
+                debug_assert!(!limbs.is_empty());
+                limbs[0]
+            };
+            let vv: u16 = v.try_into().map_err(|_| "dump_sparse_to_dir: coef overflow u16".to_string())?;
+            fc.write_all(&vv.to_le_bytes()).map_err(|e| e.to_string())?;
             let idx32: u32 = (*idx as u64)
                 .try_into()
                 .map_err(|_| "dump_sparse_to_dir: idx overflow u32".to_string())?;
@@ -1055,7 +1065,11 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                         .read_exact(&mut self.coeff_buf)
                         .map_err(|e| format!("read {which}_coeffs failed: {e}"))?;
                     let idx = read_u32(&mut self.fi).map_err(|e| format!("read {which}_idx failed: {e}"))? as usize;
-                    let vv = u16::from_le_bytes([self.coeff_buf[0], self.coeff_buf[1]]) as u64;
+                    let vv: u64 = match self.coeff_size {
+                        1 => self.coeff_buf[0] as u64,
+                        2 => u16::from_le_bytes([self.coeff_buf[0], self.coeff_buf[1]]) as u64,
+                        _ => return Err(format!("unsupported coeff_size={} (expected 1 or 2)", self.coeff_size)),
+                    };
                     let coef = F::from(vv);
                     acc += coef * assignment[idx];
                     self.cur = self.cur.saturating_add(1);
@@ -1493,13 +1507,22 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
             // Append equality constraints at the tail (write_at into pre-sized file ranges).
             if !extra_eqs.is_empty() {
                 let t_eq = std::time::Instant::now();
-                // Coeff encoding: u16 little-endian (canonical representative).
-                let one_u16: u16 = F::ONE.into_bigint().as_ref()[0] as u16;
-                let neg_one_u16: u16 = (-F::ONE).into_bigint().as_ref()[0] as u16;
-                let zero_u16: u16 = 0;
-                let one_bytes = one_u16.to_le_bytes();
-                let neg_one_bytes = neg_one_u16.to_le_bytes();
-                let zero_bytes = zero_u16.to_le_bytes();
+                // Coeff encoding: tiny_u16_u32.
+                let modulus_bigint = F::MODULUS;
+                let limbs = modulus_bigint.as_ref();
+                let modulus_u64 = limbs.get(0).copied().unwrap_or(0);
+                let one_bytes: Vec<u8> = match coeff_size {
+                    2 => (1u16).to_le_bytes().to_vec(),
+                    _ => return Err("merge_file_backed: unsupported coeff_size (expected 1 or 2)".to_string()),
+                };
+                let neg_one_bytes: Vec<u8> = match coeff_size {
+                    2 => ((modulus_u64.saturating_sub(1) as u16)).to_le_bytes().to_vec(),
+                    _ => unreachable!(),
+                };
+                let zero_bytes: Vec<u8> = match coeff_size {
+                    2 => (0u16).to_le_bytes().to_vec(),
+                    _ => unreachable!(),
+                };
 
                 let base_a_terms = cur_a;
                 let base_b_terms = cur_b;
