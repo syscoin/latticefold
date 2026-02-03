@@ -5183,8 +5183,32 @@ fn build_direct_to_merged_unix(
     // be unique and this should succeed. If it doesn't, we'd retain *two* full copies of the
     // witness in memory (one in `pose_asg`, one in `merged_asg`), which is exactly what we want
     // to avoid.
-    let pose_asg = Arc::try_unwrap(pose_asg)
-        .map_err(|_| "tiny gate: internal error: pose assignment still shared at finalize".to_string())?;
+    // In principle `pose_asg` should be uniquely owned here.
+    //
+    // In practice, if any Rayon task still holds an `Arc` clone (or a drop is delayed until after a
+    // parallel scope completes), `try_unwrap` can fail transiently. We spin briefly to let any
+    // outstanding work finish and drops run, then fail with a useful diagnostic if it persists.
+    let pose_asg = {
+        let mut cur = pose_asg;
+        let mut spins: usize = 0;
+        loop {
+            match Arc::try_unwrap(cur) {
+                Ok(v) => break v,
+                Err(a) => {
+                    cur = a;
+                    spins += 1;
+                    if spins >= 1000 {
+                        let sc = Arc::strong_count(&cur);
+                        return Err(format!(
+                            "tiny gate: internal error: pose assignment still shared at finalize (strong_count={sc})"
+                        ));
+                    }
+                    // Yield to allow other worker threads to make progress and drop their `Arc`s.
+                    std::thread::yield_now();
+                }
+            }
+        }
+    };
 
     // Exact offsets from Pass1 assignments (computed before we move/drop large assignment vectors).
     let pose_tail_len = pose_asg.len().saturating_sub(1);
