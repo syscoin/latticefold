@@ -154,8 +154,6 @@ fn build_short_coeff_digits_ir(
     p_u64: u64,
     p_d_const: &[i8; 17],
 ) -> (super::cm_ir::CmIr, Vec<[[super::cm_ir::VarRef; 17]; 64]>) {
-    // `ShortCoeffBits` is fixed-width at 64 coefficients.
-    debug_assert_eq!(64usize, 64usize);
     let base_asg: &[F257] = &gb.assignment;
     let mut ib = if gb.is_count_only() {
         super::cm_ir::IrBuilder::new_count_only(base_asg)
@@ -613,26 +611,34 @@ fn build_count_plan(
     pairs: &[(usize, usize)],
     extra_witness: &TinyExtraWitness,
 ) -> Result<TinyGatePlan, String> {
+    let t_all = Instant::now();
     // Poseidon (count-only sharded, no disk writes).
+    let t = Instant::now();
     let shard_permutes = tiny_gate_poseidon_shard_permutes(cfg, ops);
     let (pose_asg, pose_wiring, pose_counts) =
         poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_count_sharded::<F257>(cfg, ops, shard_permutes)
             .map_err(|e| format!("poseidon(F257) count-only sharded arith failed: {e}"))?;
     let pose_asg = pose_asg;
+    lf_profile_log(&format!("Pass0 poseidon_count elapsed={:?}", t.elapsed()));
 
+    let t = Instant::now();
     let short_ranges =
         squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.short_squeeze_ops)?;
     let u32_ranges =
         squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.u32_squeeze_ops)?;
     validate_pairs(pairs, short_ranges.len(), u32_ranges.len())?;
     validate_params_and_short_schedule(ring_dim, params, short_ranges.len())?;
+    lf_profile_log(&format!("Pass0 ranges+validate elapsed={:?}", t.elapsed()));
 
     // Base glue in count-only mode.
+    let t = Instant::now();
     let mut glue = GlueCtx::new(&TinyGateBuildMode::Count, pose_asg.as_slice(), PathBuf::new(), 0, None)?;
+    lf_profile_log(&format!("Pass0 base_glue_init elapsed={:?}", t.elapsed()));
 
     // Canonicality constraints: count-only shards.
     // NOTE: the function expects BuildDirs for naming only; in Count mode it does not write.
     let dirs_dummy = build_dirs("/dev/null");
+    let t = Instant::now();
     let canonical_glues = build_canonicality_shards(
         &TinyGateBuildMode::Count,
         2,
@@ -642,7 +648,13 @@ fn build_count_plan(
         &pose_wiring,
         &dirs_dummy,
     )?;
+    lf_profile_log(&format!(
+        "Pass0 canonicality_shards elapsed={:?} parts={}",
+        t.elapsed(),
+        canonical_glues.len()
+    ));
 
+    let t = Instant::now();
     validate_cm_u32_schedule(params, wiring)?;
     let (n_comh_ring_elems, coeff_bytes) = count_comh_ring_elements(ops, &pose_wiring, ring_dim, wiring)?;
     if ring_dim > 0 && n_comh_ring_elems > 0 && coeff_bytes != 8 {
@@ -655,16 +667,30 @@ fn build_count_plan(
         return Err("tiny gate: comh ring element count not divisible by kappa".to_string());
     }
     let l_instances_expected = if kappa == 0 { 0 } else { n_comh_ring_elems / kappa };
+    lf_profile_log(&format!(
+        "Pass0 cm_schedule+comh_count elapsed={:?} l_instances_expected={}",
+        t.elapsed(),
+        l_instances_expected
+    ));
 
+    let t = Instant::now();
     let short_locals = build_short_blocks(&mut glue, &pose_wiring, ring_dim, &short_ranges)?;
     let (u32_locals, goldilocks_locals) =
         build_u32_and_goldilocks_blocks(&mut glue, &pose_wiring, &wiring.u32_squeeze_ops)?;
+    lf_profile_log(&format!(
+        "Pass0 build_short/u32/goldilocks elapsed={:?} short_locals={} u32_locals={} goldilocks_locals={}",
+        t.elapsed(),
+        short_locals.len(),
+        u32_locals.len(),
+        goldilocks_locals.len()
+    ));
 
     let mut setchk_out_e_vars_for_cm: Option<Vec<Vec<Vec<RingDigits>>>> = None;
     let mut dcom_evals_for_cm: Option<Vec<DcomEvalDigits>> = None;
     let mut fcoms_for_cm: Option<Vec<FComsDigits>> = None;
     let mut setchk_r_point_for_cm: Option<Arc<Vec<GoldilocksScalar>>> = None;
 
+    let t = Instant::now();
     arithmetize_pi_lin_setchk_rgchk_prefix(
         &mut glue,
         ops,
@@ -680,7 +706,9 @@ fn build_count_plan(
         &mut fcoms_for_cm,
         &mut setchk_r_point_for_cm,
     )?;
+    lf_profile_log(&format!("Pass0 pi/lin/setchk/rgchk_prefix elapsed={:?}", t.elapsed()));
 
+    let t = Instant::now();
     let (comh_absorbs, sc_msg_absorbs, eval_absorbs) = parse_and_enforce_cm_after_short(
         &mut glue,
         ops,
@@ -691,9 +719,11 @@ fn build_count_plan(
         l_instances_expected,
         &goldilocks_locals,
     )?;
+    lf_profile_log(&format!("Pass0 parse+enforce_cm_after_short elapsed={:?}", t.elapsed()));
 
     let setchk_out_e_vars_for_cm = setchk_out_e_vars_for_cm.map(Arc::new);
     let dcom_evals_for_cm = dcom_evals_for_cm.map(Arc::new);
+    let t = Instant::now();
     let cm_shared_base: Arc<CmSharedPrecompBase> = compute_cm_shared_precomp_base(
         &mut glue,
         ring_dim,
@@ -705,8 +735,10 @@ fn build_count_plan(
         &setchk_out_e_vars_for_cm,
         &setchk_r_point_for_cm,
     )?;
+    lf_profile_log(&format!("Pass0 cm_shared_precomp_base elapsed={:?}", t.elapsed()));
 
     // CM modules: count-only shards.
+    let t = Instant::now();
     let cm_extra_glues = build_cm_shards(
         &TinyGateBuildMode::Count,
         2 + canonical_glues.len(),
@@ -727,6 +759,11 @@ fn build_count_plan(
         &goldilocks_locals,
         &dirs_dummy,
     )?;
+    lf_profile_log(&format!(
+        "Pass0 cm_shards elapsed={:?} parts={}",
+        t.elapsed(),
+        cm_extra_glues.len()
+    ));
 
     // Decomp verifier math (LinB2X + DecompProof) — algebraic-only checks.
     //
@@ -743,6 +780,7 @@ fn build_count_plan(
         &eval_absorbs,
         &fcoms_for_cm,
     )?;
+    lf_profile_log(&format!("Pass0 cm_x_targets_for_decomp elapsed={:?}", t_all.elapsed()));
     add_decomp_linb2x_constraints(
         &mut glue,
         ring_dim,
@@ -4751,6 +4789,7 @@ fn build_direct_to_merged_unix(
         dirs.root.display(),
         rayon::current_num_threads().max(1)
     ));
+    let t_all = Instant::now();
 
     let default_cfg;
     let poseidon_cfg = match cfg {
@@ -4762,8 +4801,10 @@ fn build_direct_to_merged_unix(
     };
 
     // Pass 0: count plan for the entire tiny-gate (exact sizes + eq_pairs + var offsets).
+    let t = Instant::now();
     let plan0 = build_count_plan(poseidon_cfg, ops, ring_dim, params, wiring, pairs, extra_witness)?;
     let plan = Arc::new(plan0);
+    lf_profile_log(&format!("Pass0 total elapsed={:?}", t.elapsed()));
 
     // Op-mix counters should reflect the *final circuit* (Pass1), not Pass0 structural counting.
     if tiny_opmix_on() {
@@ -4792,8 +4833,10 @@ fn build_direct_to_merged_unix(
         plan: plan.clone(),
         part_base: 0,
     };
+    lf_profile_log(&format!("Pass1 prealloc merged elapsed={:?}", t_all.elapsed()));
 
     // Pass 1a: Poseidon sharded into merged ranges (part 0).
+    let t = Instant::now();
     let shard_permutes = tiny_gate_poseidon_shard_permutes(poseidon_cfg, ops);
     let (pose_asg, pose_wiring, pose_range) =
         poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_range_sharded_into_files::<F257>(
@@ -4814,6 +4857,11 @@ fn build_direct_to_merged_unix(
             0,
         )
         .map_err(|e| format!("poseidon(F257) range-write sharded failed: {e}"))?;
+    lf_profile_log(&format!(
+        "Pass1 poseidon_range elapsed={:?} shard_permutes={}",
+        t.elapsed(),
+        shard_permutes
+    ));
     // Validate poseidon counts match Pass0.
     let exp_pose_rows = plan.row_off.get(1).copied().unwrap_or(0);
     let exp_pose_a = plan.a_off.get(1).copied().unwrap_or(0);
@@ -4840,6 +4888,7 @@ fn build_direct_to_merged_unix(
     )?;
 
     // Canonicality constraints: parallel shards (parts 2..).
+    let t = Instant::now();
     let canonical_glues = build_canonicality_shards(
         &TinyGateBuildMode::RangeBase,
         2,
@@ -4849,7 +4898,13 @@ fn build_direct_to_merged_unix(
         &pose_wiring,
         &dirs,
     )?;
+    lf_profile_log(&format!(
+        "Pass1 canonicality_shards elapsed={:?} parts={}",
+        t.elapsed(),
+        canonical_glues.len()
+    ));
 
+    let t = Instant::now();
     validate_cm_u32_schedule(params, wiring)?;
     let (n_comh_ring_elems, coeff_bytes) = count_comh_ring_elements(ops, &pose_wiring, ring_dim, wiring)?;
     if ring_dim > 0 && n_comh_ring_elems > 0 && coeff_bytes != 8 {
@@ -4862,23 +4917,39 @@ fn build_direct_to_merged_unix(
         return Err("tiny gate: comh ring element count not divisible by kappa".to_string());
     }
     let l_instances_expected = if kappa == 0 { 0 } else { n_comh_ring_elems / kappa };
+    lf_profile_log(&format!(
+        "Pass1 cm_schedule+comh_count elapsed={:?} l_instances_expected={}",
+        t.elapsed(),
+        l_instances_expected
+    ));
 
+    let t = Instant::now();
     let short_ranges =
         squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.short_squeeze_ops)?;
     let u32_ranges =
         squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.u32_squeeze_ops)?;
     validate_pairs(pairs, short_ranges.len(), u32_ranges.len())?;
     validate_params_and_short_schedule(ring_dim, params, short_ranges.len())?;
+    lf_profile_log(&format!("Pass1 ranges+validate elapsed={:?}", t.elapsed()));
 
+    let t = Instant::now();
     let short_locals = build_short_blocks(&mut glue, &pose_wiring, ring_dim, &short_ranges)?;
     let (u32_locals, goldilocks_locals) =
         build_u32_and_goldilocks_blocks(&mut glue, &pose_wiring, &wiring.u32_squeeze_ops)?;
+    lf_profile_log(&format!(
+        "Pass1 build_short/u32/goldilocks elapsed={:?} short_locals={} u32_locals={} goldilocks_locals={}",
+        t.elapsed(),
+        short_locals.len(),
+        u32_locals.len(),
+        goldilocks_locals.len()
+    ));
 
     // Values parsed/allocated during SetChk/RgChk that the CM verifier math needs later.
     let mut setchk_out_e_vars_for_cm: Option<Vec<Vec<Vec<RingDigits>>>> = None;
     let mut dcom_evals_for_cm: Option<Vec<DcomEvalDigits>> = None;
     let mut fcoms_for_cm: Option<Vec<FComsDigits>> = None;
     let mut setchk_r_point_for_cm: Option<Arc<Vec<GoldilocksScalar>>> = None;
+    let t = Instant::now();
     arithmetize_pi_lin_setchk_rgchk_prefix(
         &mut glue,
         ops,
@@ -4894,6 +4965,8 @@ fn build_direct_to_merged_unix(
         &mut fcoms_for_cm,
         &mut setchk_r_point_for_cm,
     )?;
+    lf_profile_log(&format!("Pass1 pi/lin/setchk/rgchk_prefix elapsed={:?}", t.elapsed()));
+    let t = Instant::now();
     let (comh_absorbs, sc_msg_absorbs, eval_absorbs) = parse_and_enforce_cm_after_short(
         &mut glue,
         ops,
@@ -4904,6 +4977,7 @@ fn build_direct_to_merged_unix(
         l_instances_expected,
         &goldilocks_locals,
     )?;
+    lf_profile_log(&format!("Pass1 parse+enforce_cm_after_short elapsed={:?}", t.elapsed()));
 
     // Capture a lightweight absorb breakdown summary for optional op-mix reporting.
     let absorb_counts = TinyAbsorbBreakdownCounts {
@@ -4921,6 +4995,7 @@ fn build_direct_to_merged_unix(
 
     let setchk_out_e_vars_for_cm = setchk_out_e_vars_for_cm.map(Arc::new);
     let dcom_evals_for_cm = dcom_evals_for_cm.map(Arc::new);
+    let t = Instant::now();
     let cm_shared_base: Arc<CmSharedPrecompBase> = compute_cm_shared_precomp_base(
         &mut glue,
         ring_dim,
@@ -4932,8 +5007,10 @@ fn build_direct_to_merged_unix(
         &setchk_out_e_vars_for_cm,
         &setchk_r_point_for_cm,
     )?;
+    lf_profile_log(&format!("Pass1 cm_shared_precomp_base elapsed={:?}", t.elapsed()));
 
     // CM modules: parts (2+canon_len) and (2+canon_len+1).
+    let t = Instant::now();
     let cm_extra_glues = build_cm_shards(
         &TinyGateBuildMode::RangeBase,
         2 + canonical_glues.len(),
@@ -4954,6 +5031,11 @@ fn build_direct_to_merged_unix(
         &goldilocks_locals,
         &dirs,
     )?;
+    lf_profile_log(&format!(
+        "Pass1 cm_shards elapsed={:?} parts={}",
+        t.elapsed(),
+        cm_extra_glues.len()
+    ));
 
     // Decomp verifier math.
     let (cm_g_target, vo_a_target, vo_b_target) = compute_cm_x_targets_for_decomp(
