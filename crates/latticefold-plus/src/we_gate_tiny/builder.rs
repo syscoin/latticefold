@@ -597,7 +597,12 @@ struct TinyGatePlan {
 fn tiny_gate_poseidon_shard_permutes(cfg: &PoseidonConfig<F257>, ops: &[PoseidonTraceOp<F257>]) -> usize {
     let n_threads = rayon::current_num_threads().max(1);
     let total_permutes = count_permutes_for_ops(cfg, ops);
-    let target_shards = n_threads.min(16).max(2);
+    // Important for throughput: do NOT cap shard count at a small constant.
+    // We want Poseidon (Pass0 count + Pass1 range-write) to scale with available cores.
+    //
+    // Shards are further implicitly capped by the `max(1024)` below, so tiny traces won't spawn
+    // a silly number of shards.
+    let target_shards = n_threads.min(256).max(2);
     let shard_permutes = (total_permutes + target_shards - 1) / target_shards;
     shard_permutes.max(1024)
 }
@@ -619,7 +624,11 @@ fn build_count_plan(
         poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_count_sharded::<F257>(cfg, ops, shard_permutes)
             .map_err(|e| format!("poseidon(F257) count-only sharded arith failed: {e}"))?;
     let pose_asg = pose_asg;
-    lf_profile_log(&format!("Pass0 poseidon_count elapsed={:?}", t.elapsed()));
+    lf_profile_log(&format!(
+        "Pass0 poseidon_count elapsed={:?} shard_permutes={}",
+        t.elapsed(),
+        shard_permutes
+    ));
 
     let t = Instant::now();
     let short_ranges =
@@ -1618,6 +1627,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
     if ring_dim == 0 || wiring.short_squeeze_ops.is_empty() {
         return Ok(());
     }
+    let t_all = Instant::now();
     let first_short_op = *wiring
         .short_squeeze_ops
         .iter()
@@ -1642,6 +1652,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
     let n_lin_proofs = l_instances_expected;
     let mut cur = n_public_inputs;
     {
+        let t_pi = Instant::now();
         use super::cm_ir::{lower_ir_into_builder, ring_mul_negacyclic_ntt_goldilocks_d64_ir, IrBuilder, VarRef as IrVarRef};
 
         #[inline]
@@ -1808,6 +1819,12 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                 let _lowered = super::cm_ir::lower_ir_into_builder(&mut glue.gb, ir);
             }
         }
+        lf_profile_log(&format!(
+            "prefix Π_lin elapsed={:?} nvars_setchk={} ring_elem_bytes={}",
+            t_pi.elapsed(),
+            nvars_setchk,
+            ring_elem_bytes
+        ));
     }
 
     // Dcom witness commitments: cm_f, C_Mf, cm_mtau (in that order, per instance).
@@ -1817,6 +1834,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
     let kappa = params.kappa as usize;
     let l_instances = l_instances_expected;
     let mut fcoms: Vec<FComsDigits> = Vec::with_capacity(l_instances);
+    let t_dcom = Instant::now();
     for l in 0..l_instances {
         let mut cm_f: Vec<RingDigits> = Vec::with_capacity(kappa);
         let mut c_mf: Vec<RingDigits> = Vec::with_capacity(kappa);
@@ -1887,8 +1905,15 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
         fcoms.push(FComsDigits { cm_f, c_mf, cm_mtau });
     }
     *fcoms_for_cm = Some(fcoms);
+    lf_profile_log(&format!(
+        "prefix dcom_fcoms elapsed={:?} L={} kappa={}",
+        t_dcom.elapsed(),
+        l_instances,
+        kappa
+    ));
 
     // Next in the prefix payload is the SetChk sumcheck header (nvars, degree=3).
+    let t_setchk = Instant::now();
     let start = cur;
     if start + 2 > prefix_payload.len() {
         return Err("tiny gate: prefix too short for SetChk header".to_string());
@@ -2147,8 +2172,15 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
     }
     let ver_ring = ring_const_coeff_digits(&mut glue.gb, &ver, ring_dim);
     ring_eq_digits(&mut glue.gb, &ver_ring, &v_sc);
+    lf_profile_log(&format!(
+        "prefix setchk_total elapsed={:?} nvars_setchk={} mlen={}",
+        t_setchk.elapsed(),
+        nvars_setchk,
+        params.mlen
+    ));
 
     // rgchk::Dcom::verify checks + absorb(dcom.evals).
+    let t_rg = Instant::now();
     let dcom_eval_vec_len = 1usize + (params.mlen as usize);
     let rem = prefix_payload.len().saturating_sub(cur);
     let per_eval = 2usize
@@ -2222,6 +2254,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
         }
         goldilocks_bytes_to_digits(&mut glue.gb, bytes)
     }
+    // Remaining rgchk/dcom checks are below.
 
     let mut dcom_evals_local: Vec<DcomEvalDigits> = Vec::with_capacity(l_evals);
     for l in 0..l_evals {
@@ -2391,6 +2424,13 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
             c: eval_c,
         });
     }
+
+    lf_profile_log(&format!(
+        "prefix rgchk+dcom_evals elapsed={:?} L_evals={}",
+        t_rg.elapsed(),
+        l_evals
+    ));
+    lf_profile_log(&format!("prefix total elapsed={:?}", t_all.elapsed()));
 
     *setchk_out_e_vars_for_cm = Some(out_e_vars);
     *dcom_evals_for_cm = Some(dcom_evals_local);
