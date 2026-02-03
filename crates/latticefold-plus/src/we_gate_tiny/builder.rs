@@ -1761,7 +1761,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
     let kappa = params.kappa as usize;
     let l_instances = l_instances_expected;
     let mut fcoms: Vec<FComsDigits> = Vec::with_capacity(l_instances);
-    for _l in 0..l_instances {
+    for l in 0..l_instances {
         let mut cm_f: Vec<RingDigits> = Vec::with_capacity(kappa);
         let mut c_mf: Vec<RingDigits> = Vec::with_capacity(kappa);
         let mut cm_mtau: Vec<RingDigits> = Vec::with_capacity(kappa);
@@ -1774,6 +1774,42 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
             let rb = parse_ring_elem_absorb_as_ringbytes(glue, pose_wiring, ring_dim, st, ln)?;
             cm_f.push(ring_bytes_to_digits(&mut glue.gb, &rb));
         }
+
+        // Prefix binding: when L=1, bind the first `min(8, kappa)` witness-commitment rows of `cm_f`
+        // to the first `min(8, kappa)` public inputs absorbed in the transcript prefix.
+        //
+        // This matches the LF+ verifier behavior in `we_gate_arith.rs` (commit-before-challenge).
+        const EXPOSE_MAX: usize = 8;
+        let expose_rows = EXPOSE_MAX.min(kappa);
+        if expose_rows > 0 {
+            if l_instances != 1 {
+                return Err(format!(
+                    "tiny gate: dcom/rgchk prefix binding requires L=1 (got L={})",
+                    l_instances
+                ));
+            }
+            if n_public_inputs < expose_rows {
+                return Err(format!(
+                    "tiny gate: expected at least {expose_rows} public inputs for prefix binding (got {n_public_inputs})"
+                ));
+            }
+            if l == 0 {
+                for j in 0..expose_rows {
+                    let (pst, pln) = prefix_payload[j];
+                    if pln != 8 {
+                        return Err("tiny gate: expected 8-byte public input absorbs in prefix (binding)".to_string());
+                    }
+                    let bytes_le: [usize; 8] = core::array::from_fn(|i| {
+                        let gv = pose_wiring.absorb_vars[pst + i];
+                        glue.copy_digit(gv)
+                    });
+                    let pv_digits = super::cm_math::goldilocks_bytes_to_digits(&mut glue.gb, bytes_le);
+                    let pv_ring = super::cm_math::ring_const_coeff_digits(&mut glue.gb, &pv_digits, ring_dim);
+                    super::cm_math::ring_eq_digits(&mut glue.gb, &cm_f[j], &pv_ring);
+                }
+            }
+        }
+
         for _ in 0..kappa {
             let (st, ln) = *prefix_payload.get(cur).ok_or("tiny gate: dcom C_Mf absorb oob")?;
             cur += 1;
