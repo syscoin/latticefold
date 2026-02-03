@@ -53,14 +53,35 @@ where
 
     fn absorb(&mut self, v: &R) {
         let bytes = ring_to_bytes_le_fixed::<R>(v);
-        self.sponge
-            .absorb(&bytes.iter().map(|b| F257::from(*b as u64)).collect::<Vec<_>>());
+        // Avoid allocating a Vec<F257> per absorb.
+        const CHUNK: usize = 256;
+        let mut buf = [F257::ZERO; CHUNK];
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let n = (bytes.len() - i).min(CHUNK);
+            for j in 0..n {
+                buf[j] = F257::from(bytes[i + j] as u64);
+            }
+            let slice: &[F257] = &buf[..n];
+            self.sponge.absorb(&slice);
+            i += n;
+        }
     }
 
     fn absorb_field_element(&mut self, v: &R::BaseRing) {
         let bytes = field_to_bytes_le_fixed::<R::BaseRing>(v);
-        self.sponge
-            .absorb(&bytes.iter().map(|b| F257::from(*b as u64)).collect::<Vec<_>>());
+        const CHUNK: usize = 256;
+        let mut buf = [F257::ZERO; CHUNK];
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let n = (bytes.len() - i).min(CHUNK);
+            for j in 0..n {
+                buf[j] = F257::from(bytes[i + j] as u64);
+            }
+            let slice: &[F257] = &buf[..n];
+            self.sponge.absorb(&slice);
+            i += n;
+        }
     }
 
     fn get_challenge(&mut self) -> R::BaseRing {

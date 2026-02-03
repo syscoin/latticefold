@@ -62,6 +62,26 @@ pub struct PoseidonTranscript<R: OverField> {
     _marker: PhantomData<R>,
 }
 
+#[inline(always)]
+fn poseidon_absorb_bytes_as_f257(
+    sponge: &mut PoseidonSponge<F257>,
+    bytes: &[u8],
+) {
+    // Avoid allocating a Vec<F257> per absorb() call. Absorb in small stack chunks.
+    const CHUNK: usize = 256;
+    let mut buf = [F257::from(0u64); CHUNK];
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let n = (bytes.len() - i).min(CHUNK);
+        for j in 0..n {
+            buf[j] = F257::from(bytes[i + j] as u64);
+        }
+        let slice: &[F257] = &buf[..n];
+        sponge.absorb(&slice);
+        i += n;
+    }
+}
+
 impl<R: OverField> PoseidonTranscript<R>
 where
     R::BaseRing: PrimeField,
@@ -109,15 +129,13 @@ where
     fn absorb(&mut self, v: &R) {
         let bytes = ring_to_bytes_le_fixed::<R>(v);
         self.metrics.absorbed_elems += bytes.len() as u64;
-        self.sponge
-            .absorb(&bytes.iter().map(|b| F257::from(*b as u64)).collect::<Vec<_>>());
+        poseidon_absorb_bytes_as_f257(&mut self.sponge, &bytes);
     }
 
     fn absorb_field_element(&mut self, v: &R::BaseRing) {
         let bytes = prime_field_to_bytes_le_fixed::<R::BaseRing>(v);
         self.metrics.absorbed_elems += bytes.len() as u64;
-        self.sponge
-            .absorb(&bytes.iter().map(|b| F257::from(*b as u64)).collect::<Vec<_>>());
+        poseidon_absorb_bytes_as_f257(&mut self.sponge, &bytes);
     }
 
     fn get_challenge(&mut self) -> R::BaseRing {
