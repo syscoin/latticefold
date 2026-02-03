@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use core::ops::MulAssign;
 use latticefold::transcript::Transcript;
 use latticefold::utils::sumcheck::prover::ProverMsg;
 use latticefold::utils::sumcheck::Proof;
@@ -13,6 +14,18 @@ use stark_rings_linalg::{Matrix, SparseMatrix};
 use crate::setchk::DigitsMatrix;
 use crate::utils::maybe_print_rss;
 use core::mem::MaybeUninit;
+
+/// Multiply a ring element by a base-field scalar without invoking ring×ring multiplication.
+#[inline(always)]
+fn mul_by_base<R: PolyRing>(mut x: R, s: R::BaseRing) -> R
+where
+    R::BaseRing: Copy + MulAssign,
+{
+    for c in x.coeffs_mut() {
+        *c *= s;
+    }
+    x
+}
 
 // A small per-thread direct-mapped cache for streaming-h evaluations `h[idx]` when
 // `h` is represented as `HFromMfDigitsConstCol0`. This targets repeated column indices
@@ -1216,7 +1229,7 @@ where
                 }
                 let mut sum = R::ZERO;
                 for (coeff0, col_idx) in &matrix0.coeffs[index] {
-                    sum += witness_mle.eval_at_index(*col_idx) * R::from(*coeff0);
+                    sum += mul_by_base(witness_mle.eval_at_index(*col_idx), *coeff0);
                 }
                 sum
             }

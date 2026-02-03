@@ -1,4 +1,5 @@
 use ark_std::log2;
+use core::ops::MulAssign;
 
 /// Fixed seed for the setchk out.e/out.b aggregate commitment.
 use latticefold::{
@@ -17,6 +18,21 @@ use crate::utils::maybe_print_rss;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
+
+/// Multiply a ring element by a base-field scalar **without** invoking ring×ring multiplication.
+///
+/// This is critical for rings like `GoldilocksRing64` where `Mul<R>` is an NTT-based convolution:
+/// in many prover hot paths we only need coefficient-wise scaling by a base-field scalar.
+#[inline(always)]
+fn mul_by_base<R: PolyRing>(mut x: R, s: R::BaseRing) -> R
+where
+    R::BaseRing: Copy + MulAssign,
+{
+    for c in x.coeffs_mut() {
+        *c *= s;
+    }
+    x
+}
 
 #[inline]
 fn is_const_coeff_ring<R: PolyRing>(x: &R) -> bool {
@@ -731,7 +747,7 @@ impl<R: OverField + PolyRing> In<R> {
                     .map(|col| {
                         let mut acc = R::ZERO;
                         for row in 0..nrows {
-                            acc += Md.vals[row][col] * R::from(eq_at(row));
+                            acc += mul_by_base(Md.vals[row][col], eq_at(row));
                         }
                         acc
                     })
@@ -827,7 +843,7 @@ impl<R: OverField + PolyRing> In<R> {
                                             let w0 = eq_at(row);
                                             sum_w0 += w0;
                                             let dix = col0.get(row).copied().unwrap_or(*zero_idx) as usize;
-                                            acc0 += Md.exp_table[dix] * R::from(w0);
+                                            acc0 += mul_by_base(Md.exp_table[dix], w0);
                                             (acc0, sum_w0)
                                         },
                                     )
@@ -835,7 +851,7 @@ impl<R: OverField + PolyRing> In<R> {
                                         || (R::ZERO, R::BaseRing::ZERO),
                                         |(a0, aw), (b0, bw)| (a0 + b0, aw + bw),
                                     );
-                                let common = s0 * R::from(sum_w0);
+                                let common = mul_by_base(s0, sum_w0);
                                 let mut out = vec![common; ncols];
                                 out[0] = acc0;
                                 out
@@ -848,9 +864,9 @@ impl<R: OverField + PolyRing> In<R> {
                                     let w0 = eq_at(row);
                                     sum_w0 += w0;
                                     let dix = col0.get(row).copied().unwrap_or(*zero_idx) as usize;
-                                    acc0 += Md.exp_table[dix] * R::from(w0);
+                                    acc0 += mul_by_base(Md.exp_table[dix], w0);
                                 }
-                                let common = s0 * R::from(sum_w0);
+                                let common = mul_by_base(s0, sum_w0);
                                 let mut out = vec![common; ncols];
                                 out[0] = acc0;
                                 out
@@ -886,7 +902,7 @@ impl<R: OverField + PolyRing> In<R> {
                                     .map(|col| {
                                         let mut acc = R::ZERO;
                                         for row in 0..nrows {
-                                            acc += Md.get(row, col) * R::from(eq_at(row));
+                                            acc += mul_by_base(Md.get(row, col), eq_at(row));
                                         }
                                         acc
                                     })
@@ -908,7 +924,7 @@ impl<R: OverField + PolyRing> In<R> {
                             .map(|row| {
                                 let mut acc = R::ZERO;
                                 for &(rij, idx) in row {
-                                    acc += rij * R::from(eq_at(idx));
+                                    acc += mul_by_base(rij, eq_at(idx));
                                 }
                                 acc
                             })
@@ -927,7 +943,7 @@ impl<R: OverField + PolyRing> In<R> {
                             .map(|row| {
                                 let mut acc = R::ZERO;
                                 for &(rij, idx) in row {
-                                    acc += rij * R::from(eq_at(idx));
+                                    acc += mul_by_base(rij, eq_at(idx));
                                 }
                                 acc
                             })
@@ -1002,7 +1018,7 @@ impl<R: OverField + PolyRing> In<R> {
                                                 let wy0 = ys[mi][row];
                                                 sum_wy0 += wy0;
                                                 let dix = col0.get(row).copied().unwrap_or(*zero_idx) as usize;
-                                                acc0 += Md.exp_table[dix] * R::from(wy0);
+                                                acc0 += mul_by_base(Md.exp_table[dix], wy0);
                                                 (acc0, sum_wy0)
                                             },
                                         )
@@ -1010,7 +1026,7 @@ impl<R: OverField + PolyRing> In<R> {
                                             || (R::ZERO, R::BaseRing::ZERO),
                                             |(a0, aw), (b0, bw)| (a0 + b0, aw + bw),
                                         );
-                                    let common = s0 * R::from(sum_wy0);
+                                    let common = mul_by_base(s0, sum_wy0);
                                     let mut out = vec![common; ncols];
                                     out[0] = acc0;
                                     out
@@ -1023,9 +1039,9 @@ impl<R: OverField + PolyRing> In<R> {
                                         let wy0 = ys[mi][row];
                                         sum_wy0 += wy0;
                                         let dix = col0.get(row).copied().unwrap_or(*zero_idx) as usize;
-                                        acc0 += Md.exp_table[dix] * R::from(wy0);
+                                        acc0 += mul_by_base(Md.exp_table[dix], wy0);
                                     }
-                                    let common = s0 * R::from(sum_wy0);
+                                    let common = mul_by_base(s0, sum_wy0);
                                     let mut out = vec![common; ncols];
                                     out[0] = acc0;
                                     out
@@ -1183,11 +1199,11 @@ impl<R: OverField + PolyRing> In<R> {
                 // Parallelize over the vector length (nrows) instead.
                 VecSet::Dense(m) => (0..m.len())
                     .into_par_iter()
-                    .map(|i| m[i] * R::from(eq_at(i)))
+                    .map(|i| mul_by_base(m[i], eq_at(i)))
                     .reduce(|| R::ZERO, |a, b| a + b),
                 VecSet::Digits { digits, exp_table } => (0..digits.len())
                     .into_par_iter()
-                    .map(|i| exp_table[digits[i] as usize] * R::from(eq_at(i)))
+                    .map(|i| mul_by_base(exp_table[digits[i] as usize], eq_at(i)))
                     .reduce(|| R::ZERO, |a, b| a + b),
             })
             .collect();
@@ -1199,12 +1215,12 @@ impl<R: OverField + PolyRing> In<R> {
                 match mset {
                     VecSet::Dense(m) => {
                         for (i, &mi) in m.iter().enumerate() {
-                            acc += mi * R::from(eq_at(i));
+                            acc += mul_by_base(mi, eq_at(i));
                         }
                     }
                     VecSet::Digits { digits, exp_table } => {
                         for (i, &dix) in digits.iter().enumerate() {
-                            acc += exp_table[dix as usize] * R::from(eq_at(i));
+                            acc += mul_by_base(exp_table[dix as usize], eq_at(i));
                         }
                     }
                 }

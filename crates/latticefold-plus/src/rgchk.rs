@@ -1,4 +1,5 @@
 use ark_std::iter::once;
+use core::ops::MulAssign;
 use latticefold::transcript::Transcript;
 use latticefold::commitment::AjtaiCommitmentScheme;
 use stark_rings::{
@@ -13,6 +14,33 @@ use crate::{
     setchk::{DigitsMatrix, In, MonomialSet, Out, SetCheckError},
     utils::split,
 };
+
+/// Multiply a ring element by a base-ring scalar without invoking ring×ring multiplication.
+///
+/// This matters a lot for rings where `Mul<R>` is NTT-based: many hot loops only need
+/// coefficient-wise scaling by a base scalar.
+#[inline(always)]
+fn mul_by_base_owned<R: PolyRing>(mut x: R, s: R::BaseRing) -> R
+where
+    R::BaseRing: Copy + MulAssign,
+{
+    for c in x.coeffs_mut() {
+        *c *= s;
+    }
+    x
+}
+
+#[inline(always)]
+fn mul_by_base_ref<R: PolyRing + Clone>(x: &R, s: R::BaseRing) -> R
+where
+    R::BaseRing: Copy + MulAssign,
+{
+    let mut out = x.clone();
+    for c in out.coeffs_mut() {
+        *c *= s;
+    }
+    out
+}
 
 #[inline]
 fn absorb_fcoms_one<R: OverField + PolyRing>(f: &FComs<R>, transcript: &mut impl Transcript<R>) {
@@ -1771,8 +1799,8 @@ where
 
 fn dot_ring_streaming<R>(v: &[R], r: &[R::BaseRing], one_minus_r: &[R::BaseRing]) -> R
 where
-    R: PolyRing + From<R::BaseRing>,
-    R::BaseRing: Ring,
+    R: PolyRing + From<R::BaseRing> + Clone,
+    R::BaseRing: Ring + Copy + MulAssign,
 {
     debug_assert_eq!(r.len(), one_minus_r.len());
     let nvars = r.len();
@@ -1796,7 +1824,7 @@ where
                         break;
                     }
                     let w = scale * low[i];
-                    acc += v[idx] * R::from(w);
+                    acc += mul_by_base_ref(&v[idx], w);
                 }
                 acc
             })
@@ -1814,7 +1842,7 @@ where
                     break;
                 }
                 let w = scale * low[i];
-                acc += v[idx] * R::from(w);
+                acc += mul_by_base_ref(&v[idx], w);
             }
         }
         acc
@@ -2032,8 +2060,8 @@ fn sparse_mat_vec_eval_ring_streaming<R>(
     one_minus_r: &[R::BaseRing],
 ) -> R
 where
-    R: PolyRing + From<R::BaseRing>,
-    R::BaseRing: Ring,
+    R: PolyRing + From<R::BaseRing> + Clone,
+    R::BaseRing: Ring + Copy + MulAssign,
 {
     debug_assert_eq!(r.len(), one_minus_r.len());
     let nvars = r.len();
@@ -2064,7 +2092,7 @@ where
                             row_dot += *coeff * witness[*col_idx];
                         }
                     }
-                    acc += row_dot * R::from(w_row);
+                    acc += mul_by_base_owned(row_dot, w_row);
                 }
                 acc
             })
@@ -2081,7 +2109,7 @@ where
                 if row_idx >= n {
                     break;
                 }
-                let w_row = R::from(scale * low[i]);
+                let w_row = scale * low[i];
                 let row = &m.coeffs[row_idx];
                 let mut row_dot = R::ZERO;
                 for (coeff, col_idx) in row {
@@ -2089,7 +2117,7 @@ where
                         row_dot += *coeff * witness[*col_idx];
                     }
                 }
-                acc += row_dot * w_row;
+                acc += mul_by_base_owned(row_dot, w_row);
             }
         }
         acc
@@ -2103,8 +2131,8 @@ fn sparse_mat0_vec_eval_ring_streaming<R>(
     one_minus_r: &[R::BaseRing],
 ) -> R
 where
-    R: PolyRing + From<R::BaseRing>,
-    R::BaseRing: Ring,
+    R: PolyRing + From<R::BaseRing> + Clone,
+    R::BaseRing: Ring + Copy + MulAssign,
 {
     debug_assert_eq!(r.len(), one_minus_r.len());
     let nvars = r.len();
@@ -2132,10 +2160,10 @@ where
                     let mut row_dot = R::ZERO;
                     for (coeff0, col_idx) in row {
                         if *col_idx < witness.len() {
-                            row_dot += witness[*col_idx] * R::from(*coeff0);
+                            row_dot += mul_by_base_ref(&witness[*col_idx], *coeff0);
                         }
                     }
-                    acc += row_dot * R::from(w_row0);
+                    acc += mul_by_base_owned(row_dot, w_row0);
                 }
                 acc
             })
@@ -2152,7 +2180,7 @@ where
                 if row_idx >= n {
                     break;
                 }
-                let w_row = R::from(scale * low[i]);
+                let w_row = scale * low[i];
                 let row = &m0.coeffs[row_idx];
                 let mut row_dot = R::ZERO;
                 for (coeff0, col_idx) in row {
@@ -2160,7 +2188,7 @@ where
                         row_dot += witness[*col_idx] * *coeff0;
                     }
                 }
-                acc += row_dot * w_row;
+                acc += mul_by_base_owned(row_dot, w_row);
             }
         }
         acc
@@ -2175,8 +2203,8 @@ fn sparse_mat_vec_eval_ring_streaming_monomial_digits<R>(
     one_minus_r: &[R::BaseRing],
 ) -> R
 where
-    R: PolyRing + From<R::BaseRing>,
-    R::BaseRing: Ring,
+    R: PolyRing + From<R::BaseRing> + Clone,
+    R::BaseRing: Ring + Copy + MulAssign,
 {
     debug_assert_eq!(r.len(), one_minus_r.len());
     let nvars = r.len();
@@ -2208,7 +2236,7 @@ where
                             row_dot += *coeff * exp_table[digits[cj] as usize];
                         }
                     }
-                    acc += row_dot * R::from(w_row);
+                    acc += mul_by_base_owned(row_dot, w_row);
                 }
                 acc
             })
@@ -2225,7 +2253,7 @@ where
                 if row_idx >= n {
                     break;
                 }
-                let w_row = R::from(scale * low[i]);
+                let w_row = scale * low[i];
                 let row = &m.coeffs[row_idx];
                 let mut row_dot = R::ZERO;
                 for (coeff, col_idx) in row {
@@ -2234,7 +2262,7 @@ where
                         row_dot += *coeff * exp_table[digits[cj] as usize];
                     }
                 }
-                acc += row_dot * w_row;
+                acc += mul_by_base_owned(row_dot, w_row);
             }
         }
         acc
@@ -2249,8 +2277,8 @@ fn sparse_mat0_vec_eval_ring_streaming_monomial_digits<R>(
     one_minus_r: &[R::BaseRing],
 ) -> R
 where
-    R: PolyRing + From<R::BaseRing>,
-    R::BaseRing: Ring,
+    R: PolyRing + From<R::BaseRing> + Clone,
+    R::BaseRing: Ring + Copy + MulAssign,
 {
     debug_assert_eq!(r.len(), one_minus_r.len());
     let nvars = r.len();
@@ -2279,10 +2307,10 @@ where
                     for (coeff0, col_idx) in row {
                         let cj = *col_idx;
                         if cj < digits.len() {
-                            row_dot += exp_table[digits[cj] as usize] * R::from(*coeff0);
+                            row_dot += mul_by_base_ref(&exp_table[digits[cj] as usize], *coeff0);
                         }
                     }
-                    acc += row_dot * R::from(w_row0);
+                    acc += mul_by_base_owned(row_dot, w_row0);
                 }
                 acc
             })
@@ -2299,7 +2327,7 @@ where
                 if row_idx >= n {
                     break;
                 }
-                let w_row = R::from(scale * low[i]);
+                let w_row = scale * low[i];
                 let row = &m0.coeffs[row_idx];
                 let mut row_dot = R::ZERO;
                 for (coeff0, col_idx) in row {
@@ -2308,7 +2336,7 @@ where
                         row_dot += exp_table[digits[cj] as usize] * *coeff0;
                     }
                 }
-                acc += row_dot * w_row;
+                acc += mul_by_base_owned(row_dot, w_row);
             }
         }
         acc
