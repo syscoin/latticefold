@@ -1222,16 +1222,79 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
             let (row0, mut a0, mut b0, mut c0) = ckpt_lookup(&ckpts, c_start);
             debug_assert!(row0 <= c_start);
 
+            #[inline]
+            fn read_u16(r: &mut impl std::io::Read) -> Result<u16, std::io::Error> {
+                let mut buf = [0u8; 2];
+                r.read_exact(&mut buf)?;
+                Ok(u16::from_le_bytes(buf))
+            }
+
             let mut fr = File::open(constraints_path(&dir)).map_err(|e| format!("open constraints failed: {e}"))?;
             fr.seek(std::io::SeekFrom::Start(row0.saturating_mul(ROW_LENS_SIZE as u64)))
                 .map_err(|e| format!("seek constraints failed: {e}"))?;
             let mut rows = BufReader::with_capacity(8 * 1024 * 1024, fr);
 
-            // Advance from row0 to c_start (skip evaluation) to compute starting offsets.
+            // Open term pools and seek to the checkpoint offsets.
+            //
+            // Coeff encoding is the tiny_u16_u32 format: u16 LE canonical reps in [0,p-1].
+            let mut fa_c = File::open(dir.join("a_coeffs.bin"))
+                .map_err(|e| format!("open a_coeffs failed: {e}"))?;
+            let mut fa_i =
+                File::open(dir.join("a_idx.bin")).map_err(|e| format!("open a_idx failed: {e}"))?;
+            let mut fb_c =
+                File::open(dir.join("b_coeffs.bin")).map_err(|e| format!("open b_coeffs failed: {e}"))?;
+            let mut fb_i =
+                File::open(dir.join("b_idx.bin")).map_err(|e| format!("open b_idx failed: {e}"))?;
+            let mut fc_c =
+                File::open(dir.join("c_coeffs.bin")).map_err(|e| format!("open c_coeffs failed: {e}"))?;
+            let mut fc_i =
+                File::open(dir.join("c_idx.bin")).map_err(|e| format!("open c_idx failed: {e}"))?;
+
+            fa_c
+                .seek(std::io::SeekFrom::Start(a0.saturating_mul(2)))
+                .map_err(|e| format!("seek a_coeffs failed: {e}"))?;
+            fa_i
+                .seek(std::io::SeekFrom::Start(a0.saturating_mul(4)))
+                .map_err(|e| format!("seek a_idx failed: {e}"))?;
+            fb_c
+                .seek(std::io::SeekFrom::Start(b0.saturating_mul(2)))
+                .map_err(|e| format!("seek b_coeffs failed: {e}"))?;
+            fb_i
+                .seek(std::io::SeekFrom::Start(b0.saturating_mul(4)))
+                .map_err(|e| format!("seek b_idx failed: {e}"))?;
+            fc_c
+                .seek(std::io::SeekFrom::Start(c0.saturating_mul(2)))
+                .map_err(|e| format!("seek c_coeffs failed: {e}"))?;
+            fc_i
+                .seek(std::io::SeekFrom::Start(c0.saturating_mul(4)))
+                .map_err(|e| format!("seek c_idx failed: {e}"))?;
+
+            let mut a_coeffs = BufReader::with_capacity(8 * 1024 * 1024, fa_c);
+            let mut a_idx = BufReader::with_capacity(8 * 1024 * 1024, fa_i);
+            let mut b_coeffs = BufReader::with_capacity(8 * 1024 * 1024, fb_c);
+            let mut b_idx = BufReader::with_capacity(8 * 1024 * 1024, fb_i);
+            let mut c_coeffs = BufReader::with_capacity(8 * 1024 * 1024, fc_c);
+            let mut c_idx = BufReader::with_capacity(8 * 1024 * 1024, fc_i);
+
+            // Advance from row0 to c_start (skip evaluation) to compute starting offsets,
+            // while also consuming the corresponding term bytes so the term readers stay aligned.
             for _ in row0..c_start {
                 let a_len = read_u32(&mut rows).map_err(|e| format!("read row lens failed: {e}"))? as u64;
                 let b_len = read_u32(&mut rows).map_err(|e| format!("read row lens failed: {e}"))? as u64;
                 let c_len = read_u32(&mut rows).map_err(|e| format!("read row lens failed: {e}"))? as u64;
+                // Consume terms for A/B/C to keep file cursors aligned.
+                for _ in 0..a_len {
+                    let _ = read_u16(&mut a_coeffs).map_err(|e| format!("read a_coeff failed: {e}"))?;
+                    let _ = read_u32(&mut a_idx).map_err(|e| format!("read a_idx failed: {e}"))?;
+                }
+                for _ in 0..b_len {
+                    let _ = read_u16(&mut b_coeffs).map_err(|e| format!("read b_coeff failed: {e}"))?;
+                    let _ = read_u32(&mut b_idx).map_err(|e| format!("read b_idx failed: {e}"))?;
+                }
+                for _ in 0..c_len {
+                    let _ = read_u16(&mut c_coeffs).map_err(|e| format!("read c_coeff failed: {e}"))?;
+                    let _ = read_u32(&mut c_idx).map_err(|e| format!("read c_idx failed: {e}"))?;
+                }
                 a0 = a0.saturating_add(a_len);
                 b0 = b0.saturating_add(b_len);
                 c0 = c0.saturating_add(c_len);
@@ -1242,12 +1305,45 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                 let a_len = read_u32(&mut rows).map_err(|e| format!("read row lens failed: {e}"))? as u64;
                 let b_len = read_u32(&mut rows).map_err(|e| format!("read row lens failed: {e}"))? as u64;
                 let c_len = read_u32(&mut rows).map_err(|e| format!("read row lens failed: {e}"))? as u64;
-                let a1 = a0.saturating_add(a_len);
-                let b1 = b0.saturating_add(b_len);
-                let c1 = c0.saturating_add(c_len);
-                a0 = a1;
-                b0 = b1;
-                c0 = c1;
+                let mut aval = F::ZERO;
+                let mut bval = F::ZERO;
+                let mut cval = F::ZERO;
+
+                for _ in 0..a_len {
+                    let cu16 = read_u16(&mut a_coeffs).map_err(|e| format!("read a_coeff failed: {e}"))?;
+                    let idx = read_u32(&mut a_idx).map_err(|e| format!("read a_idx failed: {e}"))? as usize;
+                    if idx >= assignment.len() {
+                        return Err(format!("check: a_idx oob at row={row_idx} idx={idx}"));
+                    }
+                    aval += F::from(cu16 as u64) * assignment[idx];
+                }
+                for _ in 0..b_len {
+                    let cu16 = read_u16(&mut b_coeffs).map_err(|e| format!("read b_coeff failed: {e}"))?;
+                    let idx = read_u32(&mut b_idx).map_err(|e| format!("read b_idx failed: {e}"))? as usize;
+                    if idx >= assignment.len() {
+                        return Err(format!("check: b_idx oob at row={row_idx} idx={idx}"));
+                    }
+                    bval += F::from(cu16 as u64) * assignment[idx];
+                }
+                for _ in 0..c_len {
+                    let cu16 = read_u16(&mut c_coeffs).map_err(|e| format!("read c_coeff failed: {e}"))?;
+                    let idx = read_u32(&mut c_idx).map_err(|e| format!("read c_idx failed: {e}"))? as usize;
+                    if idx >= assignment.len() {
+                        return Err(format!("check: c_idx oob at row={row_idx} idx={idx}"));
+                    }
+                    cval += F::from(cu16 as u64) * assignment[idx];
+                }
+
+                if aval * bval != cval {
+                    return Err(format!(
+                        "constraint not satisfied at row={row_idx}: A={:?} B={:?} C={:?}",
+                        aval, bval, cval
+                    ));
+                }
+
+                a0 = a0.saturating_add(a_len);
+                b0 = b0.saturating_add(b_len);
+                c0 = c0.saturating_add(c_len);
                 row_idx = row_idx.saturating_add(1);
             }
             Ok(())
