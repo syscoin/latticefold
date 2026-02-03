@@ -4862,8 +4862,7 @@ fn build_direct_to_merged_unix(
     };
 
     // Pass 0: count plan for the entire tiny-gate (exact sizes + eq_pairs + var offsets).
-    let (_pose_asg0, _pose_wiring0, _glue0, _extra0, plan0) =
-        build_count_plan(poseidon_cfg, ops, ring_dim, params, wiring, pairs, extra_witness)?;
+    let (_, _, _, _, plan0) = build_count_plan(poseidon_cfg, ops, ring_dim, params, wiring, pairs, extra_witness)?;
     let plan = Arc::new(plan0);
 
     // Op-mix counters should reflect the *final circuit* (Pass1), not Pass0 structural counting.
