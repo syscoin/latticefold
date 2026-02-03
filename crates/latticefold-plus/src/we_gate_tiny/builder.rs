@@ -89,7 +89,7 @@ struct CmSharedPrecompBase {
     // dpp = dp^i as ring-constant elements (length ell)
     dpp_ring: Vec<RingDigits>,
     // recovered SetChk verifier point r (length nvars_setchk)
-    r_point_digits: Vec<GoldilocksScalar>,
+    r_point_digits: Arc<Vec<GoldilocksScalar>>,
     // u[l][ni] (length L × (1+mlen))
     u: Vec<Vec<RingDigits>>,
 }
@@ -594,7 +594,7 @@ fn build_count_plan(
     let mut setchk_out_e_vars_for_cm: Option<Vec<Vec<Vec<RingDigits>>>> = None;
     let mut dcom_evals_for_cm: Option<Vec<DcomEvalDigits>> = None;
     let mut fcoms_for_cm: Option<Vec<FComsDigits>> = None;
-    let mut setchk_r_point_for_cm: Option<Vec<GoldilocksScalar>> = None;
+    let mut setchk_r_point_for_cm: Option<Arc<Vec<GoldilocksScalar>>> = None;
 
     arithmetize_pi_lin_setchk_rgchk_prefix(
         &mut glue,
@@ -625,7 +625,6 @@ fn build_count_plan(
 
     let setchk_out_e_vars_for_cm = setchk_out_e_vars_for_cm.map(Arc::new);
     let dcom_evals_for_cm = dcom_evals_for_cm.map(Arc::new);
-    let setchk_r_point_for_cm = setchk_r_point_for_cm.map(Arc::new);
     let cm_shared_base: Option<Arc<CmSharedPrecompBase>> = compute_cm_shared_precomp_base(
         &mut glue,
         ring_dim,
@@ -1550,7 +1549,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
     setchk_out_e_vars_for_cm: &mut Option<Vec<Vec<Vec<RingDigits>>>>,
     dcom_evals_for_cm: &mut Option<Vec<DcomEvalDigits>>,
     fcoms_for_cm: &mut Option<Vec<FComsDigits>>,
-    setchk_r_point_for_cm: &mut Option<Vec<GoldilocksScalar>>,
+    setchk_r_point_for_cm: &mut Option<Arc<Vec<GoldilocksScalar>>>,
 ) -> Result<(), String> {
     // Mirrors the corresponding block in `build()`; keep verifier-math constraints identical.
     if ring_dim == 0 || wiring.short_squeeze_ops.is_empty() {
@@ -1864,9 +1863,12 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
         rs_digits.push(goldilocks_bytes_to_digits(&mut glue.gb, bytes));
     }
     // Plumb the setchk verifier point `r` forward for CM `eq(r, ro)`.
+    // Avoid copying: move into an Arc and share.
+    let rs_digits = Arc::new(rs_digits);
     *setchk_r_point_for_cm = Some(rs_digits.clone());
     let claimed0 = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
-    let v_sc = super::cm_math::sumcheck_verify_degree3_ring_digits(&mut glue.gb, claimed0, &msgs_digits, &rs_digits)?;
+    let v_sc =
+        super::cm_math::sumcheck_verify_degree3_ring_digits(&mut glue.gb, claimed0, &msgs_digits, rs_digits.as_ref())?;
 
     let k_rg = params.k as usize;
     let out_e0_len = k_rg;
@@ -1963,7 +1965,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
 
     let mut ver = zero;
     for i in 0..out_e0_len {
-        let eq = eq_eval_goldilocks_digits(&mut glue.gb, &c_vars[i], &rs_digits)?;
+        let eq = eq_eval_goldilocks_digits(&mut glue.gb, &c_vars[i], rs_digits.as_ref())?;
         let beta = beta_vars[i];
         let alpha = alpha_vars[i];
         let beta2 = goldilocks_mul_mod_p_digits(&mut glue.gb, &beta, &beta);
@@ -2030,7 +2032,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
     for bi in 0..out_b_len {
         let offset = out_e0_len;
         let idx2 = bi + offset;
-        let eq = eq_eval_goldilocks_digits(&mut glue.gb, &c_vars[idx2], &rs_digits)?;
+        let eq = eq_eval_goldilocks_digits(&mut glue.gb, &c_vars[idx2], rs_digits.as_ref())?;
         let alpha = alpha_vars[idx2];
         let beta = beta_vars[idx2];
         let beta2 = goldilocks_mul_mod_p_digits(&mut glue.gb, &beta, &beta);
@@ -2463,7 +2465,7 @@ fn compute_cm_shared_precomp_base(
                     glue.gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, a[i]), (-F257::ONE, b[i])]);
                 }
             }
-            let rdig: Vec<GoldilocksScalar> = rp.as_ref().clone();
+            let rdig: Arc<Vec<GoldilocksScalar>> = rp.clone();
 
             // Compute u[l][ni] once (heavy): Σ out.e * s_prime_flat.
             let out_e_base = setchk_out_e_vars_for_cm.as_ref().unwrap().as_ref();
@@ -4972,7 +4974,7 @@ fn build_direct_to_merged_unix(
     let mut setchk_out_e_vars_for_cm: Option<Vec<Vec<Vec<RingDigits>>>> = None;
     let mut dcom_evals_for_cm: Option<Vec<DcomEvalDigits>> = None;
     let mut fcoms_for_cm: Option<Vec<FComsDigits>> = None;
-    let mut setchk_r_point_for_cm: Option<Vec<GoldilocksScalar>> = None;
+    let mut setchk_r_point_for_cm: Option<Arc<Vec<GoldilocksScalar>>> = None;
     arithmetize_pi_lin_setchk_rgchk_prefix(
         &mut glue,
         ops,
@@ -5015,7 +5017,6 @@ fn build_direct_to_merged_unix(
 
     let setchk_out_e_vars_for_cm = setchk_out_e_vars_for_cm.map(Arc::new);
     let dcom_evals_for_cm = dcom_evals_for_cm.map(Arc::new);
-    let setchk_r_point_for_cm = setchk_r_point_for_cm.map(Arc::new);
     let cm_shared_base: Option<Arc<CmSharedPrecompBase>> = compute_cm_shared_precomp_base(
         &mut glue,
         ring_dim,
@@ -5176,30 +5177,54 @@ fn build_direct_to_merged_unix(
         });
     }
 
-    // Reconstruct merged assignment and verify var offset plan matches.
-    let mut merged_asg: Vec<F257> = Vec::with_capacity(1);
-    merged_asg.push(F257::ONE);
-    merged_asg.extend_from_slice(&pose_asg[1..]);
-    merged_asg.extend_from_slice(&base_asg[1..]);
-    for eo in &extra_out {
-        merged_asg.extend_from_slice(&eo.asg[1..]);
-    }
-    if merged_asg.len().saturating_sub(1) != *plan.var_tail_off.last().unwrap_or(&0) + extra_out.last().map(|x| x.asg.len().saturating_sub(1)).unwrap_or(0) {
-        // soft check only; exact check below
-    }
-    // Exact offsets from Pass1 assignments.
+    // Recover the owned Poseidon assignment (avoid cloning).
+    //
+    // IMPORTANT: `pose_asg` is shared across glue shards via `Arc`. At this point we've already
+    // consumed/dropped all `GlueCtx` instances (we destructured them above), so the `Arc` should
+    // be unique and this should succeed. If it doesn't, we'd retain *two* full copies of the
+    // witness in memory (one in `pose_asg`, one in `merged_asg`), which is exactly what we want
+    // to avoid.
+    let pose_asg = Arc::try_unwrap(pose_asg)
+        .map_err(|_| "tiny gate: internal error: pose assignment still shared at finalize".to_string())?;
+
+    // Exact offsets from Pass1 assignments (computed before we move/drop large assignment vectors).
+    let pose_tail_len = pose_asg.len().saturating_sub(1);
+    let base_tail_len = base_asg.len().saturating_sub(1);
+    let extra_tail_lens: Vec<usize> = extra_out.iter().map(|eo| eo.asg.len().saturating_sub(1)).collect();
     let mut offsets: Vec<usize> = Vec::with_capacity(2 + extra_out.len());
     let mut cur = 0usize;
     offsets.push(cur);
-    cur += pose_asg.len().saturating_sub(1);
+    cur += pose_tail_len;
     offsets.push(cur);
-    cur += base_asg.len().saturating_sub(1);
-    for eo in &extra_out {
+    cur += base_tail_len;
+    for &len in &extra_tail_lens {
         offsets.push(cur);
-        cur += eo.asg.len().saturating_sub(1);
+        cur += len;
     }
     if offsets != plan.var_tail_off {
         return Err("tiny gate: Pass1 var offsets diverged from Pass0 plan".to_string());
+    }
+
+    // Reconstruct merged assignment by **moving** tails (avoid duplicating large Vecs).
+    let mut merged_asg: Vec<F257> = Vec::with_capacity(1usize.saturating_add(cur));
+    merged_asg.push(F257::ONE);
+    {
+        let mut pose_asg = pose_asg;
+        let mut tail = pose_asg.split_off(1);
+        merged_asg.append(&mut tail);
+        drop(pose_asg);
+    }
+    {
+        let mut base_asg = base_asg;
+        let mut tail = base_asg.split_off(1);
+        merged_asg.append(&mut tail);
+        drop(base_asg);
+    }
+    for eo in extra_out.iter_mut() {
+        let mut asg = std::mem::take(&mut eo.asg);
+        let mut tail = asg.split_off(1);
+        merged_asg.append(&mut tail);
+        // drop `asg` to free the backing allocation
     }
     let remap = |part: usize, local: usize, offsets: &[usize]| -> usize {
         if local == 0 { 0 } else { local + offsets[part] }

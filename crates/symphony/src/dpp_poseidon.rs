@@ -1565,22 +1565,26 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_count_sharded<
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Merge assignments (share var0, append tails).
+    let n_shards = shard_metas.len();
+
+    // Merge assignment, stitch wiring, and sum counts in a single pass.
+    //
+    // This lets us drop each shard assignment immediately after appending its tail, reducing peak RSS.
     let mut merged_asg: Vec<F> = Vec::new();
     merged_asg.push(F::ONE);
-    for sm in &shard_metas {
-        if sm.asg.is_empty() || sm.asg[0] != F::ONE {
-            return Err(ReplayErr::Invalid("count-only shard assignment missing var0=1".to_string()));
-        }
-        merged_asg.extend_from_slice(&sm.asg[1..]);
-    }
-
-    // Stitch wiring by offsetting per-shard var indices.
     let mut wiring = PoseidonDr1csWiring::default();
     let mut var_tail_off: usize = 0;
     let mut absorb_off: usize = 0;
     let mut squeeze_off: usize = 0;
-    for sm in shard_metas.iter() {
+    let mut tot_rows: u64 = 0;
+    let mut tot_a: u64 = 0;
+    let mut tot_b: u64 = 0;
+    let mut tot_c: u64 = 0;
+    for mut sm in shard_metas.into_iter() {
+        if sm.asg.is_empty() || sm.asg[0] != F::ONE {
+            return Err(ReplayErr::Invalid("count-only shard assignment missing var0=1".to_string()));
+        }
+        // Stitch wiring by offsetting per-shard var indices.
         let map_var = |idx: usize| -> usize { if idx == 0 { 0 } else { idx + var_tail_off } };
         for &v in &sm.wiring.absorb_vars {
             wiring.absorb_vars.push(map_var(v));
@@ -1596,21 +1600,19 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_count_sharded<
             wiring.squeeze_field_ranges.push((squeeze_off + st, ln));
         }
         squeeze_off += sm.wiring.squeeze_field_vars.len();
-        var_tail_off = var_tail_off.saturating_add(sm.asg.len().saturating_sub(1));
-    }
 
-    // Total counts include boundary equalities (t per boundary).
-    let mut tot_rows: u64 = 0;
-    let mut tot_a: u64 = 0;
-    let mut tot_b: u64 = 0;
-    let mut tot_c: u64 = 0;
-    for sm in &shard_metas {
+        // Counts.
         tot_rows = tot_rows.saturating_add(sm.counts.rows);
         tot_a = tot_a.saturating_add(sm.counts.a_terms);
         tot_b = tot_b.saturating_add(sm.counts.b_terms);
         tot_c = tot_c.saturating_add(sm.counts.c_terms);
+
+        // Append tail vars by move (avoid keeping multiple full copies alive).
+        var_tail_off = var_tail_off.saturating_add(sm.asg.len().saturating_sub(1));
+        let mut tail = sm.asg.split_off(1);
+        merged_asg.append(&mut tail);
     }
-    let eq_rows = (shard_metas.len().saturating_sub(1) as u64).saturating_mul(t as u64);
+    let eq_rows = (n_shards.saturating_sub(1) as u64).saturating_mul(t as u64);
     let counts = RangeWriteResult {
         ckpts: Vec::new(),
         rows: tot_rows.saturating_add(eq_rows),
@@ -2131,7 +2133,7 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_range_sharded_into_fi
         wiring: PoseidonDr1csWiring,
         ckpts: Vec<(u64, u64, u64, u64)>,
     }
-    let shard_built: Vec<ShardBuilt<F>> = plans
+    let mut shard_built: Vec<ShardBuilt<F>> = plans
         .par_iter()
         .enumerate()
         .map(|(shard_idx, p)| -> Result<ShardBuilt<F>, ReplayErr> {
@@ -2216,11 +2218,16 @@ rows got {} exp {}, a_terms got {} exp {}, b_terms got {} exp {}, c_terms got {}
     // Merge assignment by concatenating shard assignments (share var0).
     let mut merged_asg: Vec<F> = Vec::new();
     merged_asg.push(F::ONE);
-    for sb in &shard_built {
+    let mut tail_lens: Vec<usize> = Vec::with_capacity(shard_built.len());
+    for sb in shard_built.iter_mut() {
         if sb.asg.is_empty() || sb.asg[0] != F::ONE {
             return Err(ReplayErr::Invalid("shard assignment missing var0=1".to_string()));
         }
-        merged_asg.extend_from_slice(&sb.asg[1..]);
+        let tail_len = sb.asg.len().saturating_sub(1);
+        tail_lens.push(tail_len);
+        let mut asg = core::mem::take(&mut sb.asg);
+        let mut tail = asg.split_off(1);
+        merged_asg.append(&mut tail);
     }
 
     // Stitch wiring by offsetting per-shard var indices (Poseidon-local).
@@ -2228,7 +2235,7 @@ rows got {} exp {}, a_terms got {} exp {}, b_terms got {} exp {}, c_terms got {}
     let mut var_tail_local: usize = 0;
     let mut absorb_off: usize = 0;
     let mut squeeze_off: usize = 0;
-    for sb in &shard_built {
+    for (i, sb) in shard_built.iter().enumerate() {
         let map_var = |idx: usize| -> usize { if idx == 0 { 0 } else { idx + var_tail_local } };
         for &v in &sb.wiring.absorb_vars {
             wiring.absorb_vars.push(map_var(v));
@@ -2244,7 +2251,7 @@ rows got {} exp {}, a_terms got {} exp {}, b_terms got {} exp {}, c_terms got {}
             wiring.squeeze_field_ranges.push((squeeze_off + st, ln));
         }
         squeeze_off += sb.wiring.squeeze_field_vars.len();
-        var_tail_local = var_tail_local.saturating_add(sb.asg.len().saturating_sub(1));
+        var_tail_local = var_tail_local.saturating_add(*tail_lens.get(i).unwrap_or(&0));
     }
 
     // Boundary equalities: final_state(shard i) == init_state(shard i+1) (in merged-file var space).
