@@ -179,7 +179,8 @@ where
     let out_dir = out_dir.as_ref();
     let mut b_params = Dr1csBuilder::<F257>::new_file_backed(out_dir.join("params_prefix"))
         .map_err(|e| format!("tiny gate: params prefix new_file_backed failed: {e}"))?;
-    // var0 is already the constant-1 slot; no need to add a constraint here.
+    // Make the constant-1 slot explicit for standalone soundness.
+    b_params.enforce_var_eq_const(b_params.one(), F257::ONE);
     for &x in &params.to_field_vec::<F257>() {
         b_params.new_var(x);
     }
@@ -1013,7 +1014,8 @@ where
     // Public statement prefix: [ONE] || [10×WeParams] || [public_inputs...]
     let mut b_params = Dr1csBuilder::<F257>::new_file_backed(out_dir.join("params_prefix"))
         .map_err(|e| format!("tiny witness(from_proof): params prefix new_file_backed failed: {e}"))?;
-    // var0 is already the constant-1 slot; no need to add a constraint here.
+    // Make the constant-1 slot explicit for standalone soundness.
+    b_params.enforce_var_eq_const(b_params.one(), F257::ONE);
     for &x in &params.to_field_vec::<F257>() {
         b_params.new_var(x);
     }
