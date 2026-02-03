@@ -7139,7 +7139,7 @@ mod tests {
         type FSmall = <BR as ark_ff::Field>::BasePrimeField;
         let sp1_digest_bits: Vec<FSmall> = {
             let d: [u8; 32] = Sha256::digest(b"LFP_SP1_PUBLIC_INPUT_DIGEST_V1").into();
-            digest32_to_bits_field::<FSmall>(d)
+            crate::we_statement::digest32_to_bits_field::<FSmall>(d)
         };
 
         let run_one = |label: &str, sp1_digest_bits: &[FSmall]| {
