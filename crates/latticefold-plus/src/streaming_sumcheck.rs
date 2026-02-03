@@ -1302,6 +1302,8 @@ where
         assert!(nv > 0);
         let half_dom = 1usize << (nv - 1);
         let one_minus0 = R::BaseRing::ONE - r0;
+        // Some arms still delegate to `fix_variable` which takes an `R`.
+        // Keep this embedding, but make sure scalar multiplication is handled efficiently.
         let r_ring = R::from(r0);
         match self {
             StreamingMleEnum::DenseOwned { evals, num_vars } => {
@@ -1309,12 +1311,14 @@ where
                 // After fixing one variable, the stored support shrinks to `ceil(len/2)`.
                 let cur_len = evals.len();
                 let new_len = ((cur_len + 1) >> 1).min(half_dom);
-                let one_minus = R::ONE - r_ring;
                 for i in 0..new_len {
                     // Allow implicit zero-padding (table shorter than 2^num_vars).
                     let a = evals.get(i << 1).copied().unwrap_or(R::ZERO);
                     let b = evals.get((i << 1) | 1).copied().unwrap_or(R::ZERO);
-                    evals[i] = one_minus * a + r_ring * b;
+                    // Multiply by a *constant* base-ring scalar. Do NOT use ring×ring multiplication
+                    // (`R::from(r0) * b`) since for coefficient-form rings (e.g. GoldilocksRing64)
+                    // that triggers an expensive NTT convolution.
+                    evals[i] = mul_by_base(a, one_minus0) + mul_by_base(b, r0);
                 }
                 evals.truncate(new_len);
                 *num_vars -= 1;
@@ -1328,11 +1332,10 @@ where
                     Ok(mut owned) => {
                         let cur_len = owned.len();
                         let new_len = ((cur_len + 1) >> 1).min(half_dom);
-                        let one_minus = R::ONE - r_ring;
                         for i in 0..new_len {
                             let a = owned.get(i << 1).copied().unwrap_or(R::ZERO);
                             let b = owned.get((i << 1) | 1).copied().unwrap_or(R::ZERO);
-                            owned[i] = one_minus * a + r_ring * b;
+                            owned[i] = mul_by_base(a, one_minus0) + mul_by_base(b, r0);
                         }
                         owned.truncate(new_len);
                         *self = StreamingMleEnum::DenseOwned {
@@ -1345,13 +1348,12 @@ where
                         let src: &[R] = a.as_ref();
                         let cur_len = src.len();
                         let new_len = ((cur_len + 1) >> 1).min(half_dom);
-                        let one_minus = R::ONE - r_ring;
                         #[cfg(feature = "parallel")]
                         {
                             let out = alloc_init_par(new_len, |i| {
                                 let aa = src.get(i << 1).copied().unwrap_or(R::ZERO);
                                 let bb = src.get((i << 1) | 1).copied().unwrap_or(R::ZERO);
-                                one_minus * aa + r_ring * bb
+                                mul_by_base(aa, one_minus0) + mul_by_base(bb, r0)
                             });
                             *self = StreamingMleEnum::DenseOwned {
                                 evals: out,
@@ -1365,7 +1367,7 @@ where
                             for i in 0..new_len {
                                 let aa = src.get(i << 1).copied().unwrap_or(R::ZERO);
                                 let bb = src.get((i << 1) | 1).copied().unwrap_or(R::ZERO);
-                                out[i] = one_minus * aa + r_ring * bb;
+                                out[i] = mul_by_base(aa, one_minus0) + mul_by_base(bb, r0);
                             }
                             *self = StreamingMleEnum::DenseOwned {
                                 evals: out,
@@ -1694,11 +1696,10 @@ where
                     let new_len = ((*tensor_len) + 1) >> 1;
                     let new_len = new_len.min(half_dom);
                     let mut out = vec![R::ZERO; new_len];
-                    let one_minus = R::ONE - r_ring;
                     for i in 0..new_len {
                         let a = self.eval_at_index(i << 1);
                         let b = self.eval_at_index((i << 1) | 1);
-                        out[i] = one_minus * a + r_ring * b;
+                        out[i] = mul_by_base(a, one_minus0) + mul_by_base(b, r0);
                     }
                     *self = StreamingMleEnum::DenseOwned {
                         evals: out,
@@ -1823,24 +1824,63 @@ where
         let nv = self.num_vars();
         assert!(nv > 0);
         let half = 1usize << (nv - 1);
+        // Fast path: if `r` is a constant-coefficient ring element (the common case when
+        // challenges live in the base ring and are embedded as constants), then fixing a
+        // variable only needs coefficient-wise scaling by the base scalar.
+        //
+        // This avoids invoking ring×ring multiplication for coefficient-form rings like
+        // `GoldilocksRing64`, where `Mul` is an NTT convolution.
+        let r0_opt: Option<R::BaseRing> = {
+            let cs = r.coeffs();
+            if cs.iter()
+                .skip(1)
+                .all(|c| *c == <R::BaseRing as ark_ff::Field>::ZERO)
+            {
+                Some(cs[0])
+            } else {
+                None
+            }
+        };
         match self {
             StreamingMleEnum::DenseOwned { evals, .. } => {
-                let new_evals: Vec<R> = (0..half)
-                    .map(|i| (R::ONE - r) * evals[i << 1] + r * evals[(i << 1) | 1])
-                    .collect();
+                let new_evals: Vec<R> = if let Some(r0) = r0_opt {
+                    let one_minus0 = R::BaseRing::ONE - r0;
+                    (0..half)
+                        .map(|i| {
+                            let a = evals[i << 1];
+                            let b = evals[(i << 1) | 1];
+                            mul_by_base(a, one_minus0) + mul_by_base(b, r0)
+                        })
+                        .collect()
+                } else {
+                    (0..half)
+                        .map(|i| (R::ONE - r) * evals[i << 1] + r * evals[(i << 1) | 1])
+                        .collect()
+                };
                 StreamingMleEnum::DenseOwned {
                     evals: new_evals,
                     num_vars: nv - 1,
                 }
             }
             StreamingMleEnum::DenseArc { evals, .. } => {
-                let new_evals: Vec<R> = (0..half)
-                    .map(|i| {
-                        let a = evals.get(i << 1).copied().unwrap_or(R::ZERO);
-                        let b = evals.get((i << 1) | 1).copied().unwrap_or(R::ZERO);
-                        (R::ONE - r) * a + r * b
-                    })
-                    .collect();
+                let new_evals: Vec<R> = if let Some(r0) = r0_opt {
+                    let one_minus0 = R::BaseRing::ONE - r0;
+                    (0..half)
+                        .map(|i| {
+                            let a = evals.get(i << 1).copied().unwrap_or(R::ZERO);
+                            let b = evals.get((i << 1) | 1).copied().unwrap_or(R::ZERO);
+                            mul_by_base(a, one_minus0) + mul_by_base(b, r0)
+                        })
+                        .collect()
+                } else {
+                    (0..half)
+                        .map(|i| {
+                            let a = evals.get(i << 1).copied().unwrap_or(R::ZERO);
+                            let b = evals.get((i << 1) | 1).copied().unwrap_or(R::ZERO);
+                            (R::ONE - r) * a + r * b
+                        })
+                        .collect()
+                };
                 StreamingMleEnum::DenseOwned {
                     evals: new_evals,
                     num_vars: nv - 1,
@@ -1891,8 +1931,39 @@ where
                 #[cfg(feature = "parallel")]
                 let new_evals: Vec<R> = {
                     use rayon::prelude::*;
+                    if let Some(r0) = r0_opt {
+                        let one_minus0 = R::BaseRing::ONE - r0;
+                        (0..half)
+                            .into_par_iter()
+                            .map(|i| {
+                                let v0 = self.eval_at_index(i << 1);
+                                let v1 = self.eval_at_index((i << 1) | 1);
+                                mul_by_base(v0, one_minus0) + mul_by_base(v1, r0)
+                            })
+                            .collect()
+                    } else {
+                        (0..half)
+                            .into_par_iter()
+                            .map(|i| {
+                                let v0 = self.eval_at_index(i << 1);
+                                let v1 = self.eval_at_index((i << 1) | 1);
+                                (R::ONE - r) * v0 + r * v1
+                            })
+                            .collect()
+                    }
+                };
+                #[cfg(not(feature = "parallel"))]
+                let new_evals: Vec<R> = if let Some(r0) = r0_opt {
+                    let one_minus0 = R::BaseRing::ONE - r0;
                     (0..half)
-                        .into_par_iter()
+                        .map(|i| {
+                            let v0 = self.eval_at_index(i << 1);
+                            let v1 = self.eval_at_index((i << 1) | 1);
+                            mul_by_base(v0, one_minus0) + mul_by_base(v1, r0)
+                        })
+                        .collect()
+                } else {
+                    (0..half)
                         .map(|i| {
                             let v0 = self.eval_at_index(i << 1);
                             let v1 = self.eval_at_index((i << 1) | 1);
@@ -1900,14 +1971,6 @@ where
                         })
                         .collect()
                 };
-                #[cfg(not(feature = "parallel"))]
-                let new_evals: Vec<R> = (0..half)
-                    .map(|i| {
-                        let v0 = self.eval_at_index(i << 1);
-                        let v1 = self.eval_at_index((i << 1) | 1);
-                        (R::ONE - r) * v0 + r * v1
-                    })
-                    .collect();
                 StreamingMleEnum::DenseOwned {
                     evals: new_evals,
                     num_vars: nv - 1,
