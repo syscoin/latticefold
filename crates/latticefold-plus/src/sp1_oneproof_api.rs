@@ -265,17 +265,25 @@ pub fn run_sp1_oneproof_we_gate_from_files(
 
     let pairs: Vec<(usize, usize)> = vec![(0, 0)];
 
-    // Map statement public inputs into F257 (expected to be small integers, typically 0/1 bits).
-    let public_inputs_f257: Vec<F257> = public_inputs
+    // Map statement public inputs into F257 for the tiny gate.
+    //
+    // IMPORTANT: do NOT decode from the Goldilocks-field `public_inputs` above. Those elements come
+    // from a *centered* embedding of BabyBear residues and may appear "large"/negative in the host
+    // field representation even when the original u64 witness values are small.
+    //
+    // The tiny-gate lift path requires that all absorbed elements are integers in [0,256].
+    // Therefore we derive the tiny-gate public prefix directly from the original exported u64
+    // witness values.
+    let public_inputs_f257: Vec<F257> = w_u64[1..1 + l_pub]
         .iter()
-        .map(|x| {
-            let bytes = x.into_bigint().to_bytes_le();
-            let v = (bytes.get(0).copied().unwrap_or(0) as u16)
-                | ((bytes.get(1).copied().unwrap_or(0) as u16) << 8);
-            if v > 256 {
-                return Err(format!("public input out of range for tiny gate: {v}"));
+        .enumerate()
+        .map(|(i, &x)| {
+            if x > 256 {
+                return Err(format!(
+                    "public input out of range for tiny gate at index {i}: {x} (expected 0..=256)"
+                ));
             }
-            Ok(F257::from(v as u64))
+            Ok(F257::from(x))
         })
         .collect::<Result<Vec<_>, String>>()?;
 
