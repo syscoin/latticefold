@@ -2564,22 +2564,11 @@ fn compute_cm_shared_precomp_base(
                     for l in 0..l_instances_expected {
                         let mut u_l: Vec<RingDigits> = Vec::with_capacity(rows_per_l);
                         for ni in 0..rows_per_l {
-                            // Collect term refs for this (l,ni).
-                            let mut terms: Vec<(&RingDigits, usize)> = Vec::with_capacity(k_decomp * ring_dim);
-                            for blk in 0..k_decomp {
-                                let idx = l
-                                    .checked_mul(k_decomp)
-                                    .and_then(|x| x.checked_add(blk))
-                                    .ok_or_else(|| "tiny gate: u index overflow (base cm)".to_string())?;
-                                if idx >= out_e_base[ni].len() {
-                                    return Err("tiny gate: out.e too short for base CM u computation".to_string());
-                                }
-                                for col in 0..ring_dim {
-                                    let uij = &out_e_base[ni][idx][col];
-                                    let sp_idx = blk * ring_dim + col;
-                                    terms.push((uij, sp_idx));
-                                }
-                            }
+                            // Number of terms in the u_shared sum for one (l, ni):
+                            // Σ_{blk,col} out.e[ni][l*k + blk][col] * s_prime_flat[blk*ring_dim + col].
+                            let terms_len: usize = k_decomp
+                                .checked_mul(ring_dim)
+                                .ok_or_else(|| "tiny gate: u term count overflow".to_string())?;
 
                             // Compute in shards: each shard sums `batch_size` products internally in **bal4**,
                             // converting back to bal16 only once per coefficient at the end.
@@ -2597,21 +2586,23 @@ fn compute_cm_shared_precomp_base(
                                 // Now that we do the shard reduction in **bal4** (and convert to bal16 only once at the end),
                                 // we can safely target more shards to saturate wide machines without multiplying conversion work.
                                 let target_frags = (threads.saturating_mul(4)).min(256).max(1);
-                                let raw = (terms.len() + target_frags - 1) / target_frags;
+                                let raw = (terms_len + target_frags - 1) / target_frags;
                                 // Keep shards reasonably coarse to avoid overwhelming IR/lowering overhead,
                                 // but do not artificially cap parallelism on large instances.
-                                let min_batch = if terms.len() >= 512 { 16 } else { 8 };
+                                let min_batch = if terms_len >= 512 { 16 } else { 8 };
                                 raw.clamp(min_batch, 256)
                             };
                             u_batch_used = batch_size;
 
                             // Build shard IRs in parallel.
                             let t_build = Instant::now();
-                            let frags: Vec<(_, [[IrVarRef; 33]; 64])> = terms
-                                .chunks(batch_size)
-                                .collect::<Vec<_>>()
+                            let shard_ranges: Vec<(usize, usize)> = (0..terms_len)
+                                .step_by(batch_size)
+                                .map(|s| (s, (s + batch_size).min(terms_len)))
+                                .collect();
+                            let frags: Vec<(_, [[IrVarRef; 33]; 64])> = shard_ranges
                                 .into_par_iter()
-                                .map(|chunk| -> Result<_, String> {
+                                .map(|(t0, t1)| -> Result<_, String> {
                                     let mut ib = if glue.gb.is_count_only() {
                                         IrBuilder::new_count_only(base_asg)
                                     } else {
@@ -2628,9 +2619,25 @@ fn compute_cm_shared_precomp_base(
                                     let zero4: [IrVarRef; 33] = [zero_digit; 33];
                                     let mut acc4: [[IrVarRef; 33]; 64] = [zero4; 64];
 
-                                    for (uij, sp_idx) in chunk {
+                                    // IMPORTANT: avoid building a per-(l,ni) `terms: Vec<(&RingDigits, usize)>`.
+                                    // The pointer-chasing + allocation shows up as a big serial "setup" slice on
+                                    // large instances, before the shard build/lower timings start.
+                                    //
+                                    // Map flat term index t -> (blk, col) -> (out.e cell, s_prime_flat idx).
+                                    for t in t0..t1 {
+                                        let blk = t / ring_dim;
+                                        let col = t - blk * ring_dim;
+                                        let idx = l
+                                            .checked_mul(k_decomp)
+                                            .and_then(|x| x.checked_add(blk))
+                                            .ok_or_else(|| "tiny gate: u index overflow (base cm)".to_string())?;
+                                        if idx >= out_e_base[ni].len() {
+                                            return Err("tiny gate: out.e too short for base CM u computation".to_string());
+                                        }
+                                        let uij: &RingDigits = &out_e_base[ni][idx][col];
+                                        let sp_idx: usize = t; // blk*ring_dim + col
                                         let u16 = ringdigits64_to_ir(uij)?;
-                                        let s16 = ringdigits64_to_ir(&sflat[*sp_idx])?;
+                                        let s16 = ringdigits64_to_ir(&sflat[sp_idx])?;
                                         // Convert to bal4 once, then do NTT ringmul in bal4 domain.
                                         let mut u4: [[IrVarRef; 33]; 64] = [zero4; 64];
                                         let mut s4: [[IrVarRef; 33]; 64] = [zero4; 64];

@@ -7,7 +7,6 @@ use cyclotomic_rings::rings::goldilocks_ntt64 as gl_ntt64;
 
 use std::collections::HashMap;
 use core::ops::Range;
-use rayon::prelude::*;
 
 use super::digits::{f257_to_i32_bal, i32_to_f257};
 use super::params::{DIGITS_PER_TRY, LIMB_BITS, LIMBS_U32};
@@ -314,7 +313,7 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
     //
     // This avoids the "term pool" RAM blow-ups at the cost of slower lowering (we can optimize
     // streaming writes later).
-    if gb.is_file_backed() {
+    if gb.is_file_backed() { 
         // Keep deterministic single-step streaming when constraint debugging is enabled.
         if std::env::var("LF_DEBUG_CONSTRAINT_AT").ok().is_some() {
             let mut local_to_var: Vec<usize> = Vec::with_capacity(local_asg.len());
@@ -339,33 +338,11 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
             return lowered;
         }
 
-        // Parallel file-backed lowering (CPU-side remap + buffered block append / optional pwrite).
-        //
-        // This is the only way to use many cores while staying file-backed: build big contiguous
-        // blocks in memory in parallel, then append them.
-        let n_threads = rayon::current_num_threads().max(1);
-        let use_parallel = constraints.len() >= 50_000 && n_threads > 1;
-        if !use_parallel {
-            let mut local_to_var: Vec<usize> = Vec::with_capacity(local_asg.len());
-            local_to_var.push(0); // Local(0) unused
-            for &v in local_asg.iter().skip(1) {
-                local_to_var.push(gb.new_var(v));
-            }
-            let lowered = LoweredIr { base_nvars, local_to_var };
-            for ic in constraints {
-                gb.add_constraint_terms_iter(
-                    a_terms[ic.a.clone()]
-                        .iter()
-                        .map(|(coef, v)| (*coef, lowered.map_var(*v))),
-                    b_terms[ic.b.clone()]
-                        .iter()
-                        .map(|(coef, v)| (*coef, lowered.map_var(*v))),
-                    c_terms[ic.c.clone()]
-                        .iter()
-                        .map(|(coef, v)| (*coef, lowered.map_var(*v))),
-                );
-            }
-            return lowered;
+        // Canonical tiny-gate path: file-backed lowering must be **range-backed** (direct-to-merged)
+        // so lowering can be parallel (disjoint `pwrite`s) without a single-writer bottleneck.
+        #[cfg(not(unix))]
+        {
+            panic!("tiny gate: file-backed lowering is unix-only (range-backed direct-merged)");
         }
 
         let coeff_size = gb
@@ -449,71 +426,73 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
         {
             gb.file_backed_flush()
                 .unwrap_or_else(|e| panic!("file-backed lowering: flush before range snapshot failed: {e}"));
-            if let Some(range) = gb
+            let range = gb
                 .file_range_snapshot()
                 .unwrap_or_else(|e| panic!("file-backed lowering: range snapshot failed: {e}"))
-            {
-                use rayon::prelude::*;
-                use std::fs::File;
-                use std::os::unix::fs::FileExt;
+                .unwrap_or_else(|| {
+                    panic!("tiny gate: file-backed lowering requires a range-backed builder (direct-to-merged)")
+                });
+            use rayon::prelude::*;
+            use std::fs::File;
+            use std::os::unix::fs::FileExt;
 
-                #[inline]
-                fn pwrite_all(f: &File, mut off: u64, mut buf: &[u8]) -> Result<(), String> {
-                    while !buf.is_empty() {
-                        let n = f
-                            .write_at(buf, off)
-                            .map_err(|e| format!("pwrite failed: {e}"))?;
-                        if n == 0 {
-                            return Err("pwrite failed: wrote 0 bytes".to_string());
-                        }
-                        off = off.saturating_add(n as u64);
-                        buf = &buf[n..];
+            #[inline]
+            fn pwrite_all(f: &File, mut off: u64, mut buf: &[u8]) -> Result<(), String> {
+                while !buf.is_empty() {
+                    let n = f
+                        .write_at(buf, off)
+                        .map_err(|e| format!("pwrite failed: {e}"))?;
+                    if n == 0 {
+                        return Err("pwrite failed: wrote 0 bytes".to_string());
                     }
-                    Ok(())
+                    off = off.saturating_add(n as u64);
+                    buf = &buf[n..];
                 }
+                Ok(())
+            }
 
-                #[inline]
-                fn as_u8_slice_u32(v: &[u32]) -> &[u8] {
-                    unsafe { core::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
+            #[inline]
+            fn as_u8_slice_u32(v: &[u32]) -> &[u8] {
+                unsafe { core::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
+            }
+
+            const ROW_LENS_BYTES_PER_ROW: u64 = 12; // 3 * u32
+            const ROW_CKPT_STRIDE: u64 = 1 << 20;
+
+            let n_total = constraints.len();
+            let n_threads = rayon::current_num_threads().max(1);
+            let target_chunks = (n_threads.saturating_mul(4)).clamp(1, 512);
+            let mut chunk_constraints = (n_total + target_chunks - 1) / target_chunks;
+            // Keep chunks large enough for throughput but numerous enough to feed many cores.
+            chunk_constraints = chunk_constraints.clamp(50_000, 500_000);
+
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
+            let mut s = 0usize;
+            while s < n_total {
+                let e = (s + chunk_constraints).min(n_total);
+                ranges.push((s, e));
+                s = e;
+            }
+
+            // Determine exact term counts per chunk (cheap, no field math).
+            let mut rows_per: Vec<u64> = Vec::with_capacity(ranges.len());
+            let mut a_terms_per: Vec<u64> = Vec::with_capacity(ranges.len());
+            let mut b_terms_per: Vec<u64> = Vec::with_capacity(ranges.len());
+            let mut c_terms_per: Vec<u64> = Vec::with_capacity(ranges.len());
+            for &(cs, ce) in &ranges {
+                let mut ta: u64 = 0;
+                let mut tb: u64 = 0;
+                let mut tc: u64 = 0;
+                for ic in &constraints[cs..ce] {
+                    ta = ta.saturating_add((ic.a.end - ic.a.start) as u64);
+                    tb = tb.saturating_add((ic.b.end - ic.b.start) as u64);
+                    tc = tc.saturating_add((ic.c.end - ic.c.start) as u64);
                 }
-
-                const ROW_LENS_BYTES_PER_ROW: u64 = 12; // 3 * u32
-                const ROW_CKPT_STRIDE: u64 = 1 << 20;
-
-                let n_total = constraints.len();
-                let n_threads = rayon::current_num_threads().max(1);
-                let target_chunks = (n_threads.saturating_mul(4)).clamp(1, 512);
-                let mut chunk_constraints = (n_total + target_chunks - 1) / target_chunks;
-                // Keep chunks large enough for throughput but numerous enough to feed many cores.
-                chunk_constraints = chunk_constraints.clamp(50_000, 500_000);
-
-                let mut ranges: Vec<(usize, usize)> = Vec::new();
-                let mut s = 0usize;
-                while s < n_total {
-                    let e = (s + chunk_constraints).min(n_total);
-                    ranges.push((s, e));
-                    s = e;
-                }
-
-                // Determine exact term counts per chunk (cheap, no field math).
-                let mut rows_per: Vec<u64> = Vec::with_capacity(ranges.len());
-                let mut a_terms_per: Vec<u64> = Vec::with_capacity(ranges.len());
-                let mut b_terms_per: Vec<u64> = Vec::with_capacity(ranges.len());
-                let mut c_terms_per: Vec<u64> = Vec::with_capacity(ranges.len());
-                for &(cs, ce) in &ranges {
-                    let mut ta: u64 = 0;
-                    let mut tb: u64 = 0;
-                    let mut tc: u64 = 0;
-                    for ic in &constraints[cs..ce] {
-                        ta = ta.saturating_add((ic.a.end - ic.a.start) as u64);
-                        tb = tb.saturating_add((ic.b.end - ic.b.start) as u64);
-                        tc = tc.saturating_add((ic.c.end - ic.c.start) as u64);
-                    }
-                    rows_per.push((ce - cs) as u64);
-                    a_terms_per.push(ta);
-                    b_terms_per.push(tb);
-                    c_terms_per.push(tc);
-                }
+                rows_per.push((ce - cs) as u64);
+                a_terms_per.push(ta);
+                b_terms_per.push(tb);
+                c_terms_per.push(tc);
+            }
 
                 // Prefix sums -> per-chunk output offsets (in rows/terms).
                 let mut row_start: Vec<u64> = Vec::with_capacity(ranges.len());
@@ -688,145 +667,27 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
                 gb.file_range_commit_parallel_write(total_rows, total_a, total_b, total_c, all_ckpts)
                     .unwrap_or_else(|e| panic!("file-backed range commit failed: {e}"));
 
-                return lowered;
-            }
+            return lowered;
         }
-
-        // Fallback: chunked build+append (works for append-backed file sinks).
-        //
-        // This avoids allocating enormous flat buffers for the whole fragment at once.
-        const CHUNK_CONSTRAINTS: usize = 500_000;
-        let chunk_constraints: usize = CHUNK_CONSTRAINTS;
-
-        let (mut rows0, mut a0, mut b0, mut c0) =
-            gb.file_counts().expect("file_counts must be Some in file-backed mode");
-        debug_assert_eq!(rows0, gb.file_counts().unwrap().0);
-        let n_total = constraints.len();
-        let mut start = 0usize;
-        while start < n_total {
-            let end = (start + chunk_constraints).min(n_total);
-            let chunk = &constraints[start..end];
-            let n = chunk.len();
-
-            // Per-chunk counts and prefix sums.
-            let mut a_counts: Vec<usize> = Vec::with_capacity(n);
-            let mut b_counts: Vec<usize> = Vec::with_capacity(n);
-            let mut c_counts: Vec<usize> = Vec::with_capacity(n);
-            for ic in chunk {
-                a_counts.push(ic.a.end - ic.a.start);
-                b_counts.push(ic.b.end - ic.b.start);
-                c_counts.push(ic.c.end - ic.c.start);
-            }
-            let mut a_offs: Vec<usize> = Vec::with_capacity(n + 1);
-            let mut b_offs: Vec<usize> = Vec::with_capacity(n + 1);
-            let mut c_offs: Vec<usize> = Vec::with_capacity(n + 1);
-            a_offs.push(0);
-            b_offs.push(0);
-            c_offs.push(0);
-            for i in 0..n {
-                a_offs.push(a_offs[i] + a_counts[i]);
-                b_offs.push(b_offs[i] + b_counts[i]);
-                c_offs.push(c_offs[i] + c_counts[i]);
-            }
-            let total_a = *a_offs.last().unwrap_or(&0);
-            let total_b = *b_offs.last().unwrap_or(&0);
-            let total_c = *c_offs.last().unwrap_or(&0);
-
-            let mut a_coeffs: Vec<u8> = vec![0u8; total_a.saturating_mul(coeff_size)];
-            let mut b_coeffs: Vec<u8> = vec![0u8; total_b.saturating_mul(coeff_size)];
-            let mut c_coeffs: Vec<u8> = vec![0u8; total_c.saturating_mul(coeff_size)];
-            let mut a_idx: Vec<u32> = vec![0u32; total_a];
-            let mut b_idx: Vec<u32> = vec![0u32; total_b];
-            let mut c_idx: Vec<u32> = vec![0u32; total_c];
-
-            #[derive(Copy, Clone)]
-            struct SyncPtr<T>(*mut T);
-            unsafe impl<T> Send for SyncPtr<T> {}
-            unsafe impl<T> Sync for SyncPtr<T> {}
-            impl<T> SyncPtr<T> {
-                #[inline]
-                unsafe fn write(&self, off: usize, v: T) {
-                    core::ptr::write(self.0.add(off), v);
-                }
-            }
-            let out_a_idx: SyncPtr<u32> = SyncPtr(a_idx.as_mut_ptr());
-            let out_b_idx: SyncPtr<u32> = SyncPtr(b_idx.as_mut_ptr());
-            let out_c_idx: SyncPtr<u32> = SyncPtr(c_idx.as_mut_ptr());
-            let a_bytes_ptr: usize = a_coeffs.as_mut_ptr() as usize;
-            let b_bytes_ptr: usize = b_coeffs.as_mut_ptr() as usize;
-            let c_bytes_ptr: usize = c_coeffs.as_mut_ptr() as usize;
-
-            use rayon::prelude::*;
-            chunk.par_iter().enumerate().for_each(|(i, ic)| unsafe {
-                // A
-                let a_dst0 = a_offs[i];
-                for (k, &(coef, v)) in a_terms[ic.a.clone()].iter().enumerate() {
-                    let pos = a_dst0 + k;
-                    out_a_idx.write(pos, map_var_fast_u32(base_nvars_local, local_to_var, v));
-                    let dst = (a_bytes_ptr as *mut u8).add(pos * coeff_size);
-                    let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
-                    let vv = coeff_idx_f257(coef);
-                    dst_slice.copy_from_slice(&coeff_bytes[vv * coeff_size..(vv + 1) * coeff_size]);
-                }
-                // B
-                let b_dst0 = b_offs[i];
-                for (k, &(coef, v)) in b_terms[ic.b.clone()].iter().enumerate() {
-                    let pos = b_dst0 + k;
-                    out_b_idx.write(pos, map_var_fast_u32(base_nvars_local, local_to_var, v));
-                    let dst = (b_bytes_ptr as *mut u8).add(pos * coeff_size);
-                    let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
-                    let vv = coeff_idx_f257(coef);
-                    dst_slice.copy_from_slice(&coeff_bytes[vv * coeff_size..(vv + 1) * coeff_size]);
-                }
-                // C
-                let c_dst0 = c_offs[i];
-                for (k, &(coef, v)) in c_terms[ic.c.clone()].iter().enumerate() {
-                    let pos = c_dst0 + k;
-                    out_c_idx.write(pos, map_var_fast_u32(base_nvars_local, local_to_var, v));
-                    let dst = (c_bytes_ptr as *mut u8).add(pos * coeff_size);
-                    let dst_slice = core::slice::from_raw_parts_mut(dst, coeff_size);
-                    let vv = coeff_idx_f257(coef);
-                    dst_slice.copy_from_slice(&coeff_bytes[vv * coeff_size..(vv + 1) * coeff_size]);
-                }
-            });
-
-            // Append blocks, then append row ranges for this chunk using the *pre-append* bases.
-            gb.file_push_a_terms_raw_block(&a_coeffs, &a_idx)
-                .unwrap_or_else(|e| panic!("file-backed append A block failed: {e}"));
-            gb.file_push_b_terms_raw_block(&b_coeffs, &b_idx)
-                .unwrap_or_else(|e| panic!("file-backed append B block failed: {e}"));
-            gb.file_push_c_terms_raw_block(&c_coeffs, &c_idx)
-                .unwrap_or_else(|e| panic!("file-backed append C block failed: {e}"));
-
-            let mut row_lens: Vec<u32> = vec![0u32; n.saturating_mul(3)];
-            for i in 0..n {
-                let a_len: u32 = a_counts[i]
-                    .try_into()
-                    .unwrap_or_else(|_| panic!("file-backed row a_len overflow u32 (a_len={})", a_counts[i]));
-                let b_len: u32 = b_counts[i]
-                    .try_into()
-                    .unwrap_or_else(|_| panic!("file-backed row b_len overflow u32 (b_len={})", b_counts[i]));
-                let c_len: u32 = c_counts[i]
-                    .try_into()
-                    .unwrap_or_else(|_| panic!("file-backed row c_len overflow u32 (c_len={})", c_counts[i]));
-                let w0 = i * 3;
-                row_lens[w0 + 0] = a_len;
-                row_lens[w0 + 1] = b_len;
-                row_lens[w0 + 2] = c_len;
-            }
-            gb.file_push_constraint_lens_block(&row_lens)
-                .unwrap_or_else(|e| panic!("file-backed append row lens block failed: {e}"));
-
-            // Advance bases for the next chunk.
-            rows0 = rows0.saturating_add(n as u64);
-            a0 = a0.saturating_add(total_a as u64);
-            b0 = b0.saturating_add(total_b as u64);
-            c0 = c0.saturating_add(total_c as u64);
-            start = end;
-        }
-
-        return lowered;
     }
+    // Non-file-backed builder path (used by unit tests / small in-memory callers).
+    //
+    // Keep it out of the hot path: the canonical tiny-gate build uses file-backed range writers.
+    lower_ir_into_builder_in_memory(gb, base_nvars, local_asg, constraints, a_terms, b_terms, c_terms, stats)
+}
+
+#[cold]
+#[inline(never)]
+fn lower_ir_into_builder_in_memory(
+    gb: &mut Dr1csBuilder<F257>,
+    base_nvars: usize,
+    local_asg: Vec<F257>,
+    constraints: Vec<IrConstraint>,
+    a_terms: Vec<(F257, VarRef)>,
+    b_terms: Vec<(F257, VarRef)>,
+    c_terms: Vec<(F257, VarRef)>,
+    stats: CmIrStats,
+) -> LoweredIr {
     // Big win for wall-time: avoid repeated reallocations during append.
     gb.assignment.reserve(local_asg.len().saturating_sub(1));
     gb.rows.reserve(constraints.len());
@@ -873,6 +734,8 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
             gb.rows.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
         }
     } else {
+        use rayon::prelude::*;
+
         let n = constraints.len();
         let mut a_counts: Vec<usize> = Vec::with_capacity(n);
         let mut b_counts: Vec<usize> = Vec::with_capacity(n);
