@@ -463,8 +463,13 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
             let n_threads = rayon::current_num_threads().max(1);
             let target_chunks = (n_threads.saturating_mul(4)).clamp(1, 512);
             let mut chunk_constraints = (n_total + target_chunks - 1) / target_chunks;
-            // Keep chunks large enough for throughput but numerous enough to feed many cores.
-            chunk_constraints = chunk_constraints.clamp(50_000, 500_000);
+            // Keep chunks large enough for throughput but small enough to bound per-thread peak
+            // memory during parallel range-write lowering.
+            //
+            // `lower_ir_into_builder` materializes per-chunk raw term/index buffers before `pwrite`,
+            // so peak memory is ~O(threads × chunk_constraints). A too-large upper bound can spike
+            // RSS/HWM on large machines.
+            chunk_constraints = chunk_constraints.clamp(25_000, 200_000);
 
             let mut ranges: Vec<(usize, usize)> = Vec::new();
             let mut s = 0usize;
