@@ -632,7 +632,7 @@ fn build_count_plan(
 
     let setchk_out_e_vars_for_cm = setchk_out_e_vars_for_cm.map(Arc::new);
     let dcom_evals_for_cm = dcom_evals_for_cm.map(Arc::new);
-    let cm_shared_base: Option<Arc<CmSharedPrecompBase>> = compute_cm_shared_precomp_base(
+    let cm_shared_base: Arc<CmSharedPrecompBase> = compute_cm_shared_precomp_base(
         &mut glue,
         ring_dim,
         params,
@@ -649,8 +649,6 @@ fn build_count_plan(
         &TinyGateBuildMode::Count,
         2 + canonical_glues.len(),
         None,
-        Some(cfg),
-        ops,
         &pose_wiring,
         ring_dim,
         params,
@@ -664,8 +662,6 @@ fn build_count_plan(
         cm_shared_base.clone(),
         glue.pose_asg,
         glue.gb.assignment.as_slice(),
-        &short_locals,
-        &u32_locals,
         &goldilocks_locals,
         &dirs_dummy,
     )?;
@@ -1130,8 +1126,6 @@ fn build_cm_shards<'p>(
     mode: &TinyGateBuildMode,
     part_base: usize,
     range: Option<&TinyGateRangeBase>,
-    cfg: Option<&PoseidonConfig<F257>>,
-    ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
     ring_dim: usize,
     params: &WeParams,
@@ -1142,11 +1136,9 @@ fn build_cm_shards<'p>(
     eval_absorbs: &[Vec<(usize, usize)>],
     setchk_out_e_vars_for_cm: Option<Arc<Vec<Vec<Vec<RingDigits>>>>>,
     dcom_evals_for_cm: Option<Arc<Vec<DcomEvalDigits>>>,
-    cm_shared_base: Option<Arc<CmSharedPrecompBase>>,
+    cm_shared_base: Arc<CmSharedPrecompBase>,
     pose_asg: &'p [F257],
     base_asg: &[F257],
-    short_locals: &[ShortChallengeWiring],
-    u32_locals: &[BoundedU32ChallengeWiring],
     goldilocks_locals: &[GoldilocksChallengeWiring],
     dirs: &BuildDirs,
 ) -> Result<Vec<GlueCtx<'p>>, String> {
@@ -1159,8 +1151,6 @@ fn build_cm_shards<'p>(
                 mode,
                 part_base + 0,
                 range,
-                cfg,
-                ops,
                 pose_wiring,
                 ring_dim,
                 params,
@@ -1175,8 +1165,6 @@ fn build_cm_shards<'p>(
                 0,
                 pose_asg,
                 base_asg,
-                short_locals,
-                u32_locals,
                 goldilocks_locals,
                 dirs.cm0_dir.as_path(),
             )
@@ -1186,8 +1174,6 @@ fn build_cm_shards<'p>(
                 mode,
                 part_base + 1,
                 range,
-                cfg,
-                ops,
                 pose_wiring,
                 ring_dim,
                 params,
@@ -1202,8 +1188,6 @@ fn build_cm_shards<'p>(
                 1,
                 pose_asg,
                 base_asg,
-                short_locals,
-                u32_locals,
                 goldilocks_locals,
                 dirs.cm1_dir.as_path(),
             )
@@ -2351,18 +2335,21 @@ fn compute_cm_shared_precomp_base(
     u32_locals: &[BoundedU32ChallengeWiring],
     setchk_out_e_vars_for_cm: &Option<Arc<Vec<Vec<Vec<RingDigits>>>>>,
     setchk_r_point_for_cm: &Option<Arc<Vec<GoldilocksScalar>>>,
-) -> Result<Option<Arc<CmSharedPrecompBase>>, String> {
+) -> Result<Arc<CmSharedPrecompBase>, String> {
     // Exact logic previously inlined in `build()`. Keep it in one place so both in-memory and
     // file-backed builds share the *same* precompute logic and op-mix behavior.
     assert_eq!(ring_dim, 64);
     assert_eq!(l_instances_expected, 1, "unexpected number of CM instances");
-    let cm_shared_base: Option<Arc<CmSharedPrecompBase>> = if l_instances_expected > 0
+    let can_precompute = l_instances_expected > 0
         && params.kappa > 0
         && (params.kappa as usize).is_power_of_two()
         && ((params.k as usize) * ring_dim).is_power_of_two()
         && (params.l as usize).is_power_of_two()
         && setchk_out_e_vars_for_cm.is_some()
-        && setchk_r_point_for_cm.is_some()
+        && setchk_r_point_for_cm.is_some();
+    if !can_precompute {
+        return Err("tiny gate: cm_shared_base required (expected pow2 regime + setchk outputs)".to_string());
+    }
     {
         let kappa = params.kappa as usize;
         let log_kappa = ark_std::log2(kappa.next_power_of_two()) as usize;
@@ -2565,7 +2552,7 @@ fn compute_cm_shared_precomp_base(
                 .checked_add(nvars_lin)
                 .ok_or_else(|| "tiny gate: r_end overflow".to_string())?;
             if u32_locals.len() < r_end {
-                return Ok(None);
+                return Err("tiny gate: not enough u32 challenges to recover setchk r-point".to_string());
             }
             let mut rdig_cursor: Vec<GoldilocksScalar> = Vec::with_capacity(nvars_lin);
             for u in &u32_locals[r_start..r_end] {
@@ -2576,7 +2563,7 @@ fn compute_cm_shared_precomp_base(
                 rdig_cursor.push(goldilocks_bytes_to_digits(&mut glue.gb, bytes));
             }
             if rp.len() != rdig_cursor.len() {
-                return Ok(None);
+                return Err("tiny gate: setchk r-point length mismatch".to_string());
             }
             for (a, b) in rp.iter().zip(rdig_cursor.iter()) {
                 for i in 0..17 {
@@ -2588,8 +2575,8 @@ fn compute_cm_shared_precomp_base(
             // Compute u[l][ni] once (heavy): Σ out.e * s_prime_flat.
             let out_e_base = setchk_out_e_vars_for_cm.as_ref().unwrap().as_ref();
             if out_e_base.len() != rows_per_l {
-                None
-                } else {
+                return Err("tiny gate: setchk out.e rows_per_l mismatch".to_string());
+            } else {
                     use super::cm_ir::{
                         bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir, lower_ir_into_builder,
                         ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir, IrBuilder, VarRef as IrVarRef,
@@ -2828,21 +2815,17 @@ fn compute_cm_shared_precomp_base(
                         );
                     }
 
-                Some(Arc::new(CmSharedPrecompBase {
+                return Ok(Arc::new(CmSharedPrecompBase {
                     tensor_c0_ring,
                     tensor_c1_ring,
                     s_prime_flat_ring: sflat,
                     dpp_ring: dpp,
                     r_point_digits: rdig,
                     u: u_all,
-                }))
+                }));
             }
         }
-    } else {
-        None
-    };
-
-    Ok(cm_shared_base)
+    }
 }
 
 fn validate_pairs(pairs: &[(usize, usize)], short_len: usize, u32_len: usize) -> Result<(), String> {
@@ -3888,8 +3871,6 @@ fn build_cm_glue_for_which<'p>(
     mode: &TinyGateBuildMode,
     part_idx: usize,
     range: Option<&TinyGateRangeBase>,
-    _cfg: Option<&PoseidonConfig<F257>>,
-    _ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
     ring_dim: usize,
     params: &WeParams,
@@ -3903,12 +3884,10 @@ fn build_cm_glue_for_which<'p>(
     setchk_out_e_vars_base: Option<Arc<Vec<Vec<Vec<RingDigits>>>>>,
     dcom_evals_base: Option<Arc<Vec<DcomEvalDigits>>>,
     // Shared CM precomputations built once in the base glue module (u, s_prime_flat, etc).
-    cm_shared_base: Option<Arc<CmSharedPrecompBase>>,
+    cm_shared_base: Arc<CmSharedPrecompBase>,
     which: usize,
     pose_asg: &'p [F257],
     base_asg: &[F257],
-    short_locals: &[ShortChallengeWiring],
-    u32_locals: &[BoundedU32ChallengeWiring],
     goldilocks_locals: &[GoldilocksChallengeWiring],
     out_dir: &Path,
 ) -> Result<GlueCtx<'p>, String> {
@@ -3956,147 +3935,45 @@ fn build_cm_glue_for_which<'p>(
     let kappa = params.kappa as usize;
     let log_kappa = ark_std::log2(kappa.next_power_of_two()) as usize;
     let nvars_cm = params.nvars_cm as usize;
-    let k_decomp = params.k as usize;
-    let ell = params.l as usize;
 
     // CM challenges after absorb_comh: c0/c1, then for each sumcheck: rc, r_sc[0..nvars_cm]
     // These are transcript `get_challenge()` values in the Goldilocks base field (8 bytes).
-    let c0_gl = &goldilocks_locals[cm_coin_start..cm_coin_start + log_kappa];
-    let c1_gl = &goldilocks_locals[cm_coin_start + log_kappa..cm_coin_start + 2 * log_kappa];
-
-    // Precompute the ring-constant tables needed for t(z) evaluation.
-    let mut tensor_c0_ring: Option<Vec<RingDigits>> = None;
-    let mut tensor_c1_ring: Option<Vec<RingDigits>> = None;
-    let mut s_prime_flat_ring: Option<Vec<RingDigits>> = None;
-    let mut dpp_ring: Option<Vec<RingDigits>> = None;
-    let mut r_point_digits: Option<Vec<GoldilocksScalar>> = None;
-    if cm_shared_base.is_none()
-        && kappa.is_power_of_two()
-        && (k_decomp * ring_dim).is_power_of_two()
-        && ell.is_power_of_two()
-    {
-        // c0/c1 as Goldilocks scalars (digit encoding), then tensor-expand.
-        let c0_digits: Vec<_> = c0_gl
-            .iter()
-            .map(|u| {
-                let bytes: [usize; 8] = core::array::from_fn(|i| glue.import_base_var(base_asg, u.byte_vars[i]));
-                goldilocks_bytes_to_digits(&mut glue.gb, bytes)
-            })
-            .collect();
-        let c1_digits: Vec<_> = c1_gl
-            .iter()
-            .map(|u| {
-                let bytes: [usize; 8] = core::array::from_fn(|i| glue.import_base_var(base_asg, u.byte_vars[i]));
-                goldilocks_bytes_to_digits(&mut glue.gb, bytes)
-            })
-            .collect();
-        let t0 = tensor_goldilocks_scalars_digits(&mut glue.gb, &c0_digits);
-        let t1 = tensor_goldilocks_scalars_digits(&mut glue.gb, &c1_digits);
-        tensor_c0_ring = Some(tensor_goldilocks_ringconst_digits(&mut glue.gb, &t0, ring_dim));
-        tensor_c1_ring = Some(tensor_goldilocks_ringconst_digits(&mut glue.gb, &t1, ring_dim));
-
-        // dpp: dp^i as constant-coeff ring elements.
-        let dp = (ring_dim / 2) as u64;
-        let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
-        let mut acc: u64 = 1;
-        let mut dpp: Vec<RingDigits> = Vec::with_capacity(ell);
-        for _ in 0..ell {
-            let s_bytes = super::cm_math::alloc_const_goldilocks_u64(&mut glue.gb, acc);
-            let s = goldilocks_bytes_to_digits(&mut glue.gb, s_bytes);
-            dpp.push(super::cm_math::ring_const_coeff_digits(&mut glue.gb, &s, ring_dim));
-            acc = ((acc as u128) * (dp as u128) % (p as u128)) as u64;
-        }
-        dpp_ring = Some(dpp);
-
-        // s_prime_flat: k*d short challenges; each entry is a ring element whose coefficients are
-        // derived via the short-challenge rule (byte % u) - (u/2), NOT a centered byte.
-        let need_sprime = k_decomp
-            .checked_mul(ring_dim)
-            .ok_or_else(|| "tiny gate: k*ring_dim overflow (s_prime_flat)".to_string())?;
-        if short_locals.len() < 3 + need_sprime {
-            return Err("tiny gate: short_locals too short for s_prime_flat".to_string());
-        }
-        let z = glue.gb.new_var(F257::ZERO);
-        glue.gb.enforce_var_eq_const(z, F257::ZERO);
-        let exp = (128usize / ring_dim) as usize;
-        let u = 1u64 << (exp as u32);
-        debug_assert!(u.is_power_of_two() && u <= 256);
-        let half = u / 2;
-        let half_bytes = alloc_const_goldilocks_u64(&mut glue.gb, half);
-        let half_digits = goldilocks_bytes_to_digits(&mut glue.gb, half_bytes);
-        let mut sflat: Vec<RingDigits> = Vec::with_capacity(need_sprime);
-        for blk in 0..need_sprime {
-            let sb = &short_locals[3 + blk];
-            if sb.byte_vars.len() != ring_dim {
-                return Err("tiny gate: short byte_vars len mismatch (s_prime_flat)".to_string());
-            }
-            let mut re: RingDigits = Vec::with_capacity(ring_dim);
-            for &bv_base in &sb.byte_vars {
-                let bv = glue.import_base_var(base_asg, bv_base);
-                re.push(short_challenge_coeff_digits_from_byte_var_128(
-                    &mut glue.gb,
-                    bv,
-                    exp,
-                    u,
-                    &half_digits,
-                    z,
-                ));
-            }
-            sflat.push(re);
-        }
-        s_prime_flat_ring = Some(sflat);
-
-        // Recover the SetChk verifier point `r` used in eq(r, ro).
-        let nvars_lin = params.nvars_setchk as usize;
-        let n_lin_proofs = l_instances_expected;
-        let lin_chals = n_lin_proofs
-            .checked_mul(2usize.saturating_mul(nvars_lin))
-            .ok_or_else(|| "tiny gate: lin_chals overflow".to_string())?;
-        let nclaims = k_decomp
-            .checked_add(1)
-            .ok_or_else(|| "tiny gate: nclaims overflow".to_string())?;
-        let out_coin_total = nclaims
-            .checked_mul(nvars_lin + 2)
-            .and_then(|x| x.checked_add(if k_decomp > 1 { 1 } else { 0 }))
-            .ok_or_else(|| "tiny gate: out_coin_total overflow".to_string())?;
-        let r_start = lin_chals
-            .checked_add(out_coin_total)
-            .ok_or_else(|| "tiny gate: r_start overflow".to_string())?;
-        let r_end = r_start
-            .checked_add(nvars_lin)
-            .ok_or_else(|| "tiny gate: r_end overflow".to_string())?;
-        if u32_locals.len() < r_end {
-            return Err("tiny gate: not enough u32 challenges to recover setchk r-point".to_string());
-        }
-        let mut rdig: Vec<GoldilocksScalar> = Vec::with_capacity(nvars_lin);
-        for u in &u32_locals[r_start..r_end] {
-            let b0 = glue.import_base_var(base_asg, u.byte_vars[0]);
-            let b1 = glue.import_base_var(base_asg, u.byte_vars[1]);
-            let b2 = glue.import_base_var(base_asg, u.byte_vars[2]);
-            let b3 = glue.import_base_var(base_asg, u.byte_vars[3]);
-            let bytes = goldilocks_bytes_from_u32_le_bytes(&mut glue.gb, &[b0, b1, b2, b3]);
-            rdig.push(goldilocks_bytes_to_digits(&mut glue.gb, bytes));
-        }
-        r_point_digits = Some(rdig);
+    // Canonical tiny-gate path: CM shared precomputations are built once in the base glue module
+    // and imported here (no recomputation fallbacks).
+    #[inline]
+    fn import_scalar(glue: &mut GlueCtx, base_asg: &[F257], s: &GoldilocksScalar) -> GoldilocksScalar {
+        core::array::from_fn(|i| glue.import_base_var(base_asg, s[i]))
+    }
+    #[inline]
+    fn import_ring(glue: &mut GlueCtx, base_asg: &[F257], r: &RingDigits) -> RingDigits {
+        r.iter().map(|s| import_scalar(glue, base_asg, s)).collect()
     }
 
-    // If shared precomputations were provided by the base glue module, import them now.
-    if let Some(shared) = cm_shared_base.as_ref() {
-        #[inline]
-        fn import_scalar(glue: &mut GlueCtx, base_asg: &[F257], s: &GoldilocksScalar) -> GoldilocksScalar {
-            core::array::from_fn(|i| glue.import_base_var(base_asg, s[i]))
-        }
-        #[inline]
-        fn import_ring(glue: &mut GlueCtx, base_asg: &[F257], r: &RingDigits) -> RingDigits {
-            r.iter().map(|s| import_scalar(glue, base_asg, s)).collect()
-        }
-
-        tensor_c0_ring = Some(shared.tensor_c0_ring.iter().map(|r| import_ring(&mut glue, base_asg, r)).collect());
-        tensor_c1_ring = Some(shared.tensor_c1_ring.iter().map(|r| import_ring(&mut glue, base_asg, r)).collect());
-        s_prime_flat_ring = Some(shared.s_prime_flat_ring.iter().map(|r| import_ring(&mut glue, base_asg, r)).collect());
-        dpp_ring = Some(shared.dpp_ring.iter().map(|r| import_ring(&mut glue, base_asg, r)).collect());
-        r_point_digits = Some(shared.r_point_digits.iter().map(|s| import_scalar(&mut glue, base_asg, s)).collect());
-    }
+    let tensor_c0_ring: Vec<RingDigits> = cm_shared_base
+        .tensor_c0_ring
+        .iter()
+        .map(|r| import_ring(&mut glue, base_asg, r))
+        .collect();
+    let tensor_c1_ring: Vec<RingDigits> = cm_shared_base
+        .tensor_c1_ring
+        .iter()
+        .map(|r| import_ring(&mut glue, base_asg, r))
+        .collect();
+    let s_prime_flat_ring: Vec<RingDigits> = cm_shared_base
+        .s_prime_flat_ring
+        .iter()
+        .map(|r| import_ring(&mut glue, base_asg, r))
+        .collect();
+    let dpp_ring: Vec<RingDigits> = cm_shared_base
+        .dpp_ring
+        .iter()
+        .map(|r| import_ring(&mut glue, base_asg, r))
+        .collect();
+    let r_point_digits: Vec<GoldilocksScalar> = cm_shared_base
+        .r_point_digits
+        .iter()
+        .map(|s| import_scalar(&mut glue, base_asg, s))
+        .collect();
 
     // Select the Goldilocks `get_challenge()` window for this sumcheck:
     // rc, then nvars_cm per-round r's.
@@ -4143,19 +4020,10 @@ fn build_cm_glue_for_which<'p>(
     // satisfiable (but underconstrained).
     let mut claimed_sum_opt: Option<RingDigits> = None;
     if let (Some(out_e_base), Some(dcom_evals_base)) = (setchk_out_e_vars_base.as_ref(), dcom_evals_base.as_ref()) {
-        if let (Some(t0_ring), Some(t1_ring), Some(sp_ring), Some(_dpp), Some(_rpt)) = (
-            tensor_c0_ring.as_ref(),
-            tensor_c1_ring.as_ref(),
-            s_prime_flat_ring.as_ref(),
-            dpp_ring.as_ref(),
-            r_point_digits.as_ref(),
-        ) {
-            // Only implement the pow2 fast path (same assumptions as `eval_t_z_optimized_ring_digits_pair`).
-            let out_e_blocks = 1usize + (params.mlen as usize);
-            let rows_per_l = 1usize + (params.mlen as usize);
-            if dcom_evals_base.len() == l_instances_expected
-                && out_e_base.len() == out_e_blocks
-            {
+        // Only implement the pow2 fast path (same assumptions as `eval_t_z_optimized_ring_digits_pair`).
+        let out_e_blocks = 1usize + (params.mlen as usize);
+        let rows_per_l = 1usize + (params.mlen as usize);
+        if dcom_evals_base.len() == l_instances_expected && out_e_base.len() == out_e_blocks {
                 #[inline]
                 fn import_scalar(glue: &mut GlueCtx, base_asg: &[F257], s: &GoldilocksScalar) -> GoldilocksScalar {
                     core::array::from_fn(|i| glue.import_base_var(base_asg, s[i]))
@@ -4175,15 +4043,15 @@ fn build_cm_glue_for_which<'p>(
                 let mut tcch1: Vec<RingDigits> = Vec::with_capacity(l_instances_expected);
                 if comh_absorbs.len() == l_instances_expected * kappa {
                     // tensor_c{0,1} are constant-coeff rings; coefficient-0 holds the scalar digits.
-                    let tensor_c0_scalars: Vec<GoldilocksScalar> = t0_ring.iter().map(|r| r[0]).collect();
-                    let tensor_c1_scalars: Vec<GoldilocksScalar> = t1_ring.iter().map(|r| r[0]).collect();
+                    let tensor_c0_scalars: Vec<GoldilocksScalar> = tensor_c0_ring.iter().map(|r| r[0]).collect();
+                    let tensor_c1_scalars: Vec<GoldilocksScalar> = tensor_c1_ring.iter().map(|r| r[0]).collect();
 
                     // Optional debug sanity: ensure tensor rings are truly constant-coeff (coeff>0 == 0),
                     // so extracting `r[0]` is semantically valid.
                     //
                     // Enable with `LFP_WE_GATE_OPMIX=1`.
                     if std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1") {
-                        for (ti, (r0, r1)) in t0_ring.iter().zip(t1_ring.iter()).enumerate() {
+                        for (ti, (r0, r1)) in tensor_c0_ring.iter().zip(tensor_c1_ring.iter()).enumerate() {
                             for coeff in 1..ring_dim.min(64) {
                                 for d in 0..17 {
                                     let v0 = glue.gb.assignment[r0[coeff][d]];
@@ -4382,101 +4250,14 @@ fn build_cm_glue_for_which<'p>(
                         // IMPORTANT: In the full WE gate, `u` is computed once and reused across the two CM
                         // sumchecks. The tiny gate has two per-`which` CM modules; to avoid duplicating the
                         // heavy negacyclic ring-muls, we import a base-glue precomputation when available.
-                        let u_l: Vec<RingDigits> = if let Some(shared) = cm_shared_base.as_ref() {
-                            let rows = shared
-                                .u
-                                .get(l)
-                                .ok_or_else(|| "tiny gate: cm_shared_base.u missing l row".to_string())?;
-                            if rows.len() != rows_per_l {
-                                return Err("tiny gate: cm_shared_base.u rows_per_l mismatch".to_string());
-                            }
-                            rows.iter().map(|r| import_ring(&mut glue, base_asg, r)).collect()
-                        } else {
-                            let mut u_l: Vec<RingDigits> = Vec::with_capacity(rows_per_l);
-                            for ni in 0..rows_per_l {
-                                // NOTE: this is a huge independent workload (k*d negacyclic ring-muls per row).
-                                // Build the ring-muls as IR shards in parallel, then lower sequentially in batches.
-                                use super::cm_ir::{
-                                    lower_ir_into_builder, ring_mul_negacyclic_ntt_goldilocks_d64_ir, IrBuilder,
-                                    VarRef as IrVarRef,
-                                };
-
-                                #[inline]
-                                fn ringdigits64_to_ir(a: &RingDigits) -> Result<[[IrVarRef; 17]; 64], String> {
-                                    if a.len() != 64 {
-                                        return Err("tiny gate: expected ring element with 64 coeffs (IR ring-mul)".to_string());
-                                    }
-                                    Ok(core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j]))))
-                                }
-
-                                #[inline]
-                                fn map_ring_out(out_ir: &[[IrVarRef; 17]; 64], lowered: &super::cm_ir::LoweredIr) -> RingDigits {
-                                    let out: [GoldilocksScalar; 64] = core::array::from_fn(|i| {
-                                        core::array::from_fn(|j| lowered.map_var(out_ir[i][j]))
-                                    });
-                                    out.into_iter().collect()
-                                }
-
-                                let mut acc = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
-
-                                // Collect/import the `uij` rings we need for this (l, ni) slice.
-                                // We keep `sij` by index into `sp_ring` to avoid cloning it.
-                                let mut terms: Vec<(RingDigits, usize)> = Vec::with_capacity(k_decomp * ring_dim);
-                                for blk in 0..k_decomp {
-                                    let idx = l
-                                        .checked_mul(k_decomp)
-                                        .and_then(|x| x.checked_add(blk))
-                                        .ok_or_else(|| "tiny gate: u index overflow (cm)".to_string())?;
-                                    if idx >= out_e_base[ni].len() {
-                                        return Err("tiny gate: out.e too short for CM u computation".to_string());
-                                    }
-                                    for col in 0..ring_dim {
-                                        let uij = &out_e_base[ni][idx][col];
-                                        // Import uij ring from base glue.
-                                        let uij_local = import_ring(&mut glue, base_asg, uij);
-                                        let sp_idx = blk * ring_dim + col;
-                                        terms.push((uij_local, sp_idx));
-                                    }
-                                }
-
-                                // Batch size for IR shards (controls peak memory).
-                                let batch_size: usize = 64;
-
-                                for chunk in terms.chunks(batch_size) {
-                                    // Build IR fragments in parallel (no access to glue.gb mutably).
-                                    // IMPORTANT: normal shared borrow so Rust prevents concurrent mutation of
-                                    // `glue.gb.assignment` while Rayon threads are reading witness values.
-                                    let base_asg: &[F257] = &glue.gb.assignment;
-                                    let count_only = glue.gb.is_count_only();
-                                    let frags: Vec<(_, [[IrVarRef; 17]; 64])> = chunk
-                                        .par_iter()
-                                        .map(|(uij_local, sp_idx)| -> Result<_, String> {
-                                            let u_ir = ringdigits64_to_ir(uij_local)?;
-                                            let s_ir = ringdigits64_to_ir(&sp_ring[*sp_idx])?;
-                                            let mut ib = if count_only {
-                                                IrBuilder::new_count_only(base_asg)
-                                            } else {
-                                                IrBuilder::new(base_asg)
-                                            };
-                                            let out_ir = ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut ib, &u_ir, &s_ir);
-                                            // Keep op-mix accounting consistent even when ring-muls are built via IR shards.
-                                            super::op_counts::tiny_cm_bump(|c| c.ring_mul_negacyclic += 1);
-                                            Ok((ib.ir, out_ir))
-                                        })
-                                        .collect::<Result<Vec<_>, _>>()?;
-
-                                    // Lower sequentially and accumulate.
-                                    for (ir, out_ir) in frags {
-                                        let lowered = lower_ir_into_builder(&mut glue.gb, ir);
-                                        let prod = map_ring_out(&out_ir, &lowered);
-                                        acc = ring_add_digits(&mut glue.gb, &acc, &prod);
-                                    }
-                                }
-
-                                u_l.push(acc);
-                            }
-                            u_l
-                        };
+                        let rows = cm_shared_base
+                            .u
+                            .get(l)
+                            .ok_or_else(|| "tiny gate: cm_shared_base.u missing l row".to_string())?;
+                        if rows.len() != rows_per_l {
+                            return Err("tiny gate: cm_shared_base.u rows_per_l mismatch".to_string());
+                        }
+                        let u_l: Vec<RingDigits> = rows.iter().map(|r| import_ring(&mut glue, base_asg, r)).collect();
 
                         per_l.push((l, ClaimedSumLData {
                             l_idx,
@@ -4649,7 +4430,6 @@ fn build_cm_glue_for_which<'p>(
 
                     claimed_sum_opt = Some(claimed_sum);
                 }
-            }
         }
     }
 
@@ -4666,13 +4446,7 @@ fn build_cm_glue_for_which<'p>(
     }
 
     // Recombination check (requires the pow2 regime + recovered setchk r-point).
-    if let (Some(tc0_ring), Some(tc1_ring), Some(sp_ring), Some(dpp), Some(rpt)) = (
-        tensor_c0_ring.as_ref(),
-        tensor_c1_ring.as_ref(),
-        s_prime_flat_ring.as_ref(),
-        dpp_ring.as_ref(),
-        r_point_digits.as_ref(),
-    ) {
+    {
         // rc powers (need up to z_idx+1).
         let z_idx = l_instances_expected * (4 + 4 * (params.mlen as usize));
         let max_pow = z_idx + 1;
@@ -4680,15 +4454,15 @@ fn build_cm_glue_for_which<'p>(
         let rc_pows = goldilocks_pow_table_digits(&mut glue.gb, &rc_d, max_pow);
 
         // eq(r, ro) where r is the transcript-derived SetChk point (recovered above).
-        let eq = eq_eval_goldilocks_digits(&mut glue.gb, rpt, &rs_digits)?;
+        let eq = eq_eval_goldilocks_digits(&mut glue.gb, &r_point_digits, &rs_digits)?;
 
         // Evaluate t0(ro), t1(ro) directly as **bal4** digits (avoids bal16->bal4 conversion later).
         let (t0_4_base, t1_4_base) = eval_t_z_optimized_ring_digits_pair(
             &mut glue.gb,
-            tc0_ring,
-            tc1_ring,
-            sp_ring,
-            dpp,
+            &tensor_c0_ring,
+            &tensor_c1_ring,
+            &s_prime_flat_ring,
+            &dpp_ring,
             ring_dim,
             &rs_digits,
         )?;
@@ -5145,7 +4919,7 @@ fn build_direct_to_merged_unix(
 
     let setchk_out_e_vars_for_cm = setchk_out_e_vars_for_cm.map(Arc::new);
     let dcom_evals_for_cm = dcom_evals_for_cm.map(Arc::new);
-    let cm_shared_base: Option<Arc<CmSharedPrecompBase>> = compute_cm_shared_precomp_base(
+    let cm_shared_base: Arc<CmSharedPrecompBase> = compute_cm_shared_precomp_base(
         &mut glue,
         ring_dim,
         params,
@@ -5162,8 +4936,6 @@ fn build_direct_to_merged_unix(
         &TinyGateBuildMode::RangeBase,
         2 + canonical_glues.len(),
         Some(&rb),
-        cfg,
-        ops,
         &pose_wiring,
         ring_dim,
         params,
@@ -5177,8 +4949,6 @@ fn build_direct_to_merged_unix(
         cm_shared_base.clone(),
         glue.pose_asg,
         glue.gb.assignment.as_slice(),
-        &short_locals,
-        &u32_locals,
         &goldilocks_locals,
         &dirs,
     )?;
