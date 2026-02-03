@@ -6872,8 +6872,12 @@ mod tests {
         };
 
         // Choose a nontrivial public input pattern (digest-like bits).
+        //
+        // IMPORTANT: for kappa=1 the tiny gate's prefix binding enforces `cm_f[0]` matches
+        // public_inputs[0] (constant-coefficient). Our dummy proof/trace uses `cm_f[0]=0`,
+        // so keep public_inputs[0]=0 in this test; the flip below must still break satisfaction.
         let public_inputs: Vec<F257> = (0..public_inputs_len)
-            .map(|i| if (i % 3) == 0 { F257::ONE } else { F257::ZERO })
+            .map(|i| if (i % 3) == 1 { F257::ONE } else { F257::ZERO })
             .collect();
         let public_inputs_bf: Vec<BF0> = public_inputs
             .iter()
