@@ -6021,7 +6021,7 @@ mod tests {
     use latticefold::transcript::Transcript;
     use ark_ff::{Fp384, MontBackend, MontConfig};
     use stark_rings::balanced_decomposition::GadgetDecompose;
-    use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as R;
+    use cyclotomic_rings::rings::GoldilocksRing64 as R;
     use stark_rings_linalg::{Matrix, SparseMatrix};
 
     use crate::lin::Linearize;
