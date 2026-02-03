@@ -275,25 +275,13 @@ impl CmIr {
         self.stats.max_terms_b = self.stats.max_terms_b.max(other.stats.max_terms_b);
         self.stats.max_terms_c = self.stats.max_terms_c.max(other.stats.max_terms_c);
 
-        // Move local witnesses (skip index 0 = ONE). Avoid cloning large `local_asg` vectors.
-        self.local_asg.extend(other.local_asg.into_iter().skip(1));
+        // Merge local witnesses (skip index 0 = ONE).
+        self.local_asg.extend_from_slice(other.local_asg.get(1..).unwrap_or(&[]));
 
         if self.count_only {
             // In count-only mode we don't retain term pools or constraints.
             return local_shift;
         }
-
-        // After moving `local_asg`, we must destructure the rest of `other` explicitly.
-        // (We only reach here when `count_only=false`, so all pools are present and meaningful.)
-        let CmIr {
-            count_only: _,
-            local_asg: _,
-            constraints,
-            a_terms,
-            b_terms,
-            c_terms,
-            stats: _,
-        } = other;
 
         #[inline]
         fn remap_var(v: VarRef, shift: usize) -> VarRef {
@@ -311,12 +299,15 @@ impl CmIr {
         let c_shift = c_off.saturating_sub(1);
 
         // Append terms, remapping locals. Keep the shared constant ONE/ZERO atoms at (0..1).
-        self.a_terms.extend(a_terms.into_iter().map(|(c, v)| (c, remap_var(v, local_shift))));
-        self.b_terms.extend(b_terms.into_iter().skip(1).map(|(c, v)| (c, remap_var(v, local_shift))));
-        self.c_terms.extend(c_terms.into_iter().skip(1).map(|(c, v)| (c, remap_var(v, local_shift))));
+        self.a_terms
+            .extend(other.a_terms.into_iter().map(|(c, v)| (c, remap_var(v, local_shift))));
+        self.b_terms
+            .extend(other.b_terms.into_iter().skip(1).map(|(c, v)| (c, remap_var(v, local_shift))));
+        self.c_terms
+            .extend(other.c_terms.into_iter().skip(1).map(|(c, v)| (c, remap_var(v, local_shift))));
 
         // Append constraints, shifting their term ranges into the now-extended pools.
-        for r in constraints {
+        for r in other.constraints {
             let a = (r.a.start + a_off)..(r.a.end + a_off);
             let b = if r.b.start == 0 && r.b.end == 1 {
                 0..1
