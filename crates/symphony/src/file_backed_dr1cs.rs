@@ -233,8 +233,8 @@ impl FileBackedRangeWriter {
         pwrite_all(fc, coeff_off, coeff_bytes)?;
         let idx_bytes = unsafe { core::slice::from_raw_parts(idx.as_ptr() as *const u8, idx.len() * 4) };
         pwrite_all(fi, idx_off, idx_bytes)?;
-        Ok(())
-    }
+            Ok(())
+        }
 
     pub fn push_a_terms_raw_block(&mut self, coeff_bytes: &[u8], idx: &[u32]) -> Result<(), String> {
         self.write_terms_block(
@@ -313,8 +313,8 @@ impl FileBackedRangeWriter {
             row_idx = row_idx.saturating_add(1);
         }
         self.rows_written = self.rows_written.saturating_add((lens.len() / 3) as u64);
-        Ok(())
-    }
+    Ok(())
+}
 
     /// Clone all underlying output files for parallel `pwrite` usage.
     ///
@@ -825,7 +825,7 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             self.modulus.saturating_sub(1)
         } else {
             let big = (*coef).into_bigint();
-            let limbs = big.as_ref();
+        let limbs = big.as_ref();
             debug_assert!(!limbs.is_empty());
             debug_assert_eq!(limbs.len(), 1, "tiny_u16_u32 expects single-limb field");
             limbs[0]
@@ -1296,10 +1296,10 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                 Ok(u16::from_le_bytes(buf))
             }
 
-            let mut fr = File::open(constraints_path(&dir)).map_err(|e| format!("open constraints failed: {e}"))?;
+                let mut fr = File::open(constraints_path(&dir)).map_err(|e| format!("open constraints failed: {e}"))?;
             fr.seek(std::io::SeekFrom::Start(row0.saturating_mul(ROW_LENS_SIZE as u64)))
-                .map_err(|e| format!("seek constraints failed: {e}"))?;
-            let mut rows = BufReader::with_capacity(8 * 1024 * 1024, fr);
+                    .map_err(|e| format!("seek constraints failed: {e}"))?;
+                let mut rows = BufReader::with_capacity(8 * 1024 * 1024, fr);
 
             // Open term pools and seek to the checkpoint offsets.
             //
@@ -1412,9 +1412,9 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                 b0 = b0.saturating_add(b_len);
                 c0 = c0.saturating_add(c_len);
                 row_idx = row_idx.saturating_add(1);
-            }
-            Ok(())
-        })
+                }
+                Ok(())
+            })
     }
 }
 

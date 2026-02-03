@@ -3,9 +3,44 @@
 //! Goal: make transcript IO bytes-first and deterministic across prover/verifier.
 //! We use fixed-width little-endian encodings for prime fields.
 
-use ark_ff::{BigInteger, Field, PrimeField};
+use ark_ff::{Field, PrimeField};
 use ark_std::vec::Vec;
 use stark_rings::OverField;
+
+/// Append fixed-width little-endian encoding of a prime-field element into `out`.
+///
+/// Width is `ceil(MODULUS_BIT_SIZE/8)` bytes.
+///
+/// This avoids allocating an intermediate `Vec<u8>` (unlike `to_bytes_le()`).
+#[inline]
+fn push_prime_field_le_fixed<F: PrimeField>(x: &F, out: &mut Vec<u8>) {
+    let nbytes = ((F::MODULUS_BIT_SIZE as usize) + 7) / 8;
+    let start = out.len();
+    out.resize(start + nbytes, 0u8);
+
+    // BigInteger is stored in little-endian u64 limbs.
+    let bi = x.into_bigint();
+    let limbs = bi.as_ref();
+    let mut written = 0usize;
+    for &limb in limbs {
+        if written >= nbytes {
+            break;
+        }
+        let b = limb.to_le_bytes();
+        let take = (nbytes - written).min(8);
+        out[start + written..start + written + take].copy_from_slice(&b[..take]);
+        written += take;
+    }
+}
+
+/// Append fixed-width little-endian encoding of an (extension) field element into `out`
+/// via its base prime field elements.
+#[inline]
+fn push_field_le_fixed<F: Field>(x: &F, out: &mut Vec<u8>) {
+    for bp in x.to_base_prime_field_elements() {
+        push_prime_field_le_fixed(&bp, out);
+    }
+}
 
 /// Fixed-width little-endian encoding of a field element via its base prime field elements.
 ///
@@ -13,8 +48,11 @@ use stark_rings::OverField;
 /// For an extension field `F`, this encodes `to_base_prime_field_elements()` in order.
 #[inline]
 pub fn field_to_bytes_le_fixed<F: Field>(x: &F) -> Vec<u8> {
-    let bp = x.to_base_prime_field_elements().collect::<Vec<<F as Field>::BasePrimeField>>();
-    prime_field_slice_to_bytes_le_fixed::<<F as Field>::BasePrimeField>(&bp)
+    let nbytes = ((<<F as Field>::BasePrimeField as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8;
+    let ext_deg = <F as Field>::extension_degree() as usize;
+    let mut out = Vec::with_capacity(ext_deg * nbytes);
+    push_field_le_fixed::<F>(x, &mut out);
+    out
 }
 
 /// Fixed-width little-endian encoding of a prime-field element.
@@ -22,11 +60,8 @@ pub fn field_to_bytes_le_fixed<F: Field>(x: &F) -> Vec<u8> {
 /// Width is `ceil(MODULUS_BIT_SIZE/8)` bytes.
 #[inline]
 pub fn prime_field_to_bytes_le_fixed<F: PrimeField>(x: &F) -> Vec<u8> {
-    let nbytes = ((F::MODULUS_BIT_SIZE as usize) + 7) / 8;
-    let mut out = vec![0u8; nbytes];
-    let le = x.into_bigint().to_bytes_le();
-    let m = le.len().min(nbytes);
-    out[..m].copy_from_slice(&le[..m]);
+    let mut out = Vec::new();
+    push_prime_field_le_fixed::<F>(x, &mut out);
     out
 }
 
@@ -36,7 +71,7 @@ pub fn prime_field_slice_to_bytes_le_fixed<F: PrimeField>(xs: &[F]) -> Vec<u8> {
     let nbytes = ((F::MODULUS_BIT_SIZE as usize) + 7) / 8;
     let mut out = Vec::with_capacity(xs.len() * nbytes);
     for x in xs {
-        out.extend_from_slice(&prime_field_to_bytes_le_fixed::<F>(x));
+        push_prime_field_le_fixed::<F>(x, &mut out);
     }
     out
 }
@@ -49,7 +84,7 @@ pub fn prime_field_matrix_to_bytes_le_fixed<F: PrimeField>(rows: &[Vec<F>]) -> V
     for row in rows {
         out.reserve(row.len() * nbytes);
         for x in row {
-            out.extend_from_slice(&prime_field_to_bytes_le_fixed::<F>(x));
+            push_prime_field_le_fixed::<F>(x, &mut out);
         }
     }
     out
@@ -67,7 +102,7 @@ where
     let ext_deg = <R::BaseRing as Field>::extension_degree() as usize;
     let mut out = Vec::with_capacity(r.coeffs().len() * ext_deg * nbytes_bp);
     for c in r.coeffs() {
-        out.extend_from_slice(&field_to_bytes_le_fixed::<R::BaseRing>(c));
+        push_field_le_fixed::<R::BaseRing>(c, &mut out);
     }
     out
 }
