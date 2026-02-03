@@ -265,7 +265,7 @@ fn maybe_print_tiny_opmix_common(
     pose_constraints: usize,
     glue_constraints: usize,
     tag: &str,
-    glue: &GlueCtx,
+    glue: &GlueCtx<'_>,
     absorb_counts: &TinyAbsorbBreakdownCounts,
     pairs_len: usize,
     mul_surfaces_len: usize,
@@ -435,9 +435,9 @@ fn maybe_print_tiny_opmix_common(
     eprintln!("==============================================================");
 }
 
-struct GlueCtx {
+struct GlueCtx<'a> {
     gb: Dr1csBuilder<F257>,
-    pose_asg: Arc<Vec<F257>>,
+    pose_asg: &'a [F257],
     local_map: BTreeMap<usize, usize>,
     // Cache for imported base-glue vars so we don't allocate redundant copies.
     // Key: base-glue var index, Value: local var index in this module.
@@ -550,13 +550,13 @@ fn build_count_plan(
     wiring: &TinyCoinOpWiring,
     pairs: &[(usize, usize)],
     extra_witness: &TinyExtraWitness,
-) -> Result<(Arc<Vec<F257>>, PoseidonDr1csWiring, GlueCtx, Vec<GlueCtx>, TinyGatePlan), String> {
+) -> Result<TinyGatePlan, String> {
     // Poseidon (count-only sharded, no disk writes).
     let shard_permutes = tiny_gate_poseidon_shard_permutes(cfg, ops);
     let (pose_asg, pose_wiring, pose_counts) =
         poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_count_sharded::<F257>(cfg, ops, shard_permutes)
             .map_err(|e| format!("poseidon(F257) count-only sharded arith failed: {e}"))?;
-    let pose_asg = Arc::new(pose_asg);
+    let pose_asg = pose_asg;
 
     let short_ranges =
         squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.short_squeeze_ops)?;
@@ -566,13 +566,20 @@ fn build_count_plan(
     validate_params_and_short_schedule(ring_dim, params, short_ranges.len())?;
 
     // Base glue in count-only mode.
-    let mut glue = GlueCtx::new(&TinyGateBuildMode::Count, pose_asg.clone(), PathBuf::new(), 0, None)?;
+    let mut glue = GlueCtx::new(&TinyGateBuildMode::Count, pose_asg.as_slice(), PathBuf::new(), 0, None)?;
 
     // Canonicality constraints: count-only shards.
     // NOTE: the function expects BuildDirs for naming only; in Count mode it does not write.
     let dirs_dummy = build_dirs("/dev/null");
-    let canonical_glues =
-        build_canonicality_shards(&TinyGateBuildMode::Count, 2, None, &pose_asg, ops, &pose_wiring, &dirs_dummy)?;
+    let canonical_glues = build_canonicality_shards(
+        &TinyGateBuildMode::Count,
+        2,
+        None,
+        pose_asg.as_slice(),
+        ops,
+        &pose_wiring,
+        &dirs_dummy,
+    )?;
 
     validate_cm_u32_schedule(params, wiring)?;
     let (n_comh_ring_elems, coeff_bytes) = count_comh_ring_elements(ops, &pose_wiring, ring_dim, wiring)?;
@@ -655,7 +662,7 @@ fn build_count_plan(
         setchk_out_e_vars_for_cm.clone(),
         dcom_evals_for_cm.clone(),
         cm_shared_base.clone(),
-        glue.pose_asg.clone(),
+        glue.pose_asg,
         glue.gb.assignment.as_slice(),
         &short_locals,
         &u32_locals,
@@ -692,7 +699,7 @@ fn build_count_plan(
     let _ = build_surfaces_with_shared_arcs(&mut glue, ring_dim, pairs, &short_locals, &u32_locals)?;
 
     // Assemble the list of "extra glues" in canonical order: canonical shards + cm shards.
-    let mut extra_glues: Vec<GlueCtx> = Vec::new();
+    let mut extra_glues: Vec<GlueCtx<'_>> = Vec::new();
     extra_glues.extend(canonical_glues);
     extra_glues.extend(cm_extra_glues);
 
@@ -815,7 +822,7 @@ fn build_count_plan(
         total_c_terms,
     };
 
-    Ok((pose_asg, pose_wiring, glue, extra_glues, plan))
+    Ok(plan)
 }
 
 #[cfg(unix)]
@@ -882,10 +889,10 @@ fn prealloc_merged_files(
     Ok((fc_a, fi_a, fc_b, fi_b, fc_c, fi_c, f_rows))
 }
 
-impl GlueCtx {
+impl<'a> GlueCtx<'a> {
     fn new(
         mode: &TinyGateBuildMode,
-        pose_asg: Arc<Vec<F257>>,
+        pose_asg: &'a [F257],
         _out_dir: impl AsRef<Path>,
         part_idx: usize,
         range: Option<&TinyGateRangeBase>,
@@ -987,11 +994,11 @@ fn build_canonicality_shards(
     mode: &TinyGateBuildMode,
     part_base: usize,
     range: Option<&TinyGateRangeBase>,
-    pose_asg: &Arc<Vec<F257>>,
+    pose_asg: &[F257],
     ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
     dirs: &BuildDirs,
-) -> Result<Vec<GlueCtx>, String> {
+) -> Result<Vec<GlueCtx<'_>>, String> {
     let canonical_ranges = collect_nonreabsorb_absorb_ranges(ops, pose_wiring)?;
     if canonical_ranges.is_empty() {
         return Ok(Vec::new());
@@ -1013,9 +1020,9 @@ fn build_canonicality_shards(
         .enumerate()
         .collect::<Vec<_>>()
         .into_par_iter()
-        .map(|(idx, chunk)| -> Result<GlueCtx, String> {
+        .map(|(idx, chunk)| -> Result<GlueCtx<'_>, String> {
             let dir = dirs.root.join(format!("canon_{idx}"));
-            let mut g = GlueCtx::new(mode, pose_asg.clone(), dir, part_base + idx, range)?;
+            let mut g = GlueCtx::new(mode, pose_asg, dir, part_base + idx, range)?;
             enforce_canonical_goldilocks_for_ranges(&mut g, pose_wiring, chunk)?;
             Ok(g)
         })
@@ -1136,13 +1143,13 @@ fn build_cm_shards(
     setchk_out_e_vars_for_cm: Option<Arc<Vec<Vec<Vec<RingDigits>>>>>,
     dcom_evals_for_cm: Option<Arc<Vec<DcomEvalDigits>>>,
     cm_shared_base: Option<Arc<CmSharedPrecompBase>>,
-    pose_asg: Arc<Vec<F257>>,
+    pose_asg: &[F257],
     base_asg: &[F257],
     short_locals: &[ShortChallengeWiring],
     u32_locals: &[BoundedU32ChallengeWiring],
     goldilocks_locals: &[GoldilocksChallengeWiring],
     dirs: &BuildDirs,
-) -> Result<Vec<GlueCtx>, String> {
+) -> Result<Vec<GlueCtx<'_>>, String> {
     if !(ring_dim > 0 && l_instances_expected > 0 && !comh_absorbs.is_empty()) {
         return Ok(Vec::new());
     }
@@ -1166,7 +1173,7 @@ fn build_cm_shards(
                 dcom_evals_for_cm.clone(),
                 cm_shared_base.clone(),
                 0,
-                pose_asg.clone(),
+                pose_asg,
                 base_asg,
                 short_locals,
                 u32_locals,
@@ -1193,7 +1200,7 @@ fn build_cm_shards(
                 dcom_evals_for_cm.clone(),
                 cm_shared_base.clone(),
                 1,
-                pose_asg.clone(),
+                pose_asg,
                 base_asg,
                 short_locals,
                 u32_locals,
@@ -3781,13 +3788,13 @@ fn build_cm_glue_for_which(
     // Shared CM precomputations built once in the base glue module (u, s_prime_flat, etc).
     cm_shared_base: Option<Arc<CmSharedPrecompBase>>,
     which: usize,
-    pose_asg: Arc<Vec<F257>>,
+    pose_asg: &[F257],
     base_asg: &[F257],
     short_locals: &[ShortChallengeWiring],
     u32_locals: &[BoundedU32ChallengeWiring],
     goldilocks_locals: &[GoldilocksChallengeWiring],
     out_dir: &Path,
-) -> Result<GlueCtx, String> {
+) -> Result<GlueCtx<'_>, String> {
     let mut glue = GlueCtx::new(mode, pose_asg, out_dir, part_idx, range)?;
     if ring_dim == 0 || l_instances_expected == 0 {
         return Ok(glue);
@@ -4862,7 +4869,7 @@ fn build_direct_to_merged_unix(
     };
 
     // Pass 0: count plan for the entire tiny-gate (exact sizes + eq_pairs + var offsets).
-    let (_, _, _, _, plan0) = build_count_plan(poseidon_cfg, ops, ring_dim, params, wiring, pairs, extra_witness)?;
+    let plan0 = build_count_plan(poseidon_cfg, ops, ring_dim, params, wiring, pairs, extra_witness)?;
     let plan = Arc::new(plan0);
 
     // Op-mix counters should reflect the *final circuit* (Pass1), not Pass0 structural counting.
@@ -4931,28 +4938,24 @@ fn build_direct_to_merged_unix(
     }
 
     // Base glue (part 1) and all submodules write directly into merged ranges.
-    let pose_asg = Arc::new(pose_asg);
-    #[inline]
-    fn dbg_pose_sc(tag: &str, a: &Arc<Vec<F257>>) {
-        if std::env::var("LFP_DEBUG_POSE_ASG_SC").ok().as_deref() == Some("1") {
-            eprintln!("tiny_gate: pose_asg strong_count @ {tag} = {}", Arc::strong_count(a));
-        }
-    }
-    dbg_pose_sc("after_poseidon", &pose_asg);
-    let mut glue = GlueCtx::new(&TinyGateBuildMode::RangeBase, pose_asg.clone(), &dirs.base_glue_dir, 1, Some(&rb))?;
-    dbg_pose_sc("after_base_glue_new", &pose_asg);
+    let mut glue = GlueCtx::new(
+        &TinyGateBuildMode::RangeBase,
+        pose_asg.as_slice(),
+        &dirs.base_glue_dir,
+        1,
+        Some(&rb),
+    )?;
 
     // Canonicality constraints: parallel shards (parts 2..).
     let canonical_glues = build_canonicality_shards(
         &TinyGateBuildMode::RangeBase,
         2,
         Some(&rb),
-        &pose_asg,
+        pose_asg.as_slice(),
         ops,
         &pose_wiring,
         &dirs,
     )?;
-    dbg_pose_sc("after_canonicality_shards", &pose_asg);
 
     validate_cm_u32_schedule(params, wiring)?;
     let (n_comh_ring_elems, coeff_bytes) = count_comh_ring_elements(ops, &pose_wiring, ring_dim, wiring)?;
@@ -5055,14 +5058,13 @@ fn build_direct_to_merged_unix(
         setchk_out_e_vars_for_cm.clone(),
         dcom_evals_for_cm.clone(),
         cm_shared_base.clone(),
-        glue.pose_asg.clone(),
+        glue.pose_asg,
         glue.gb.assignment.as_slice(),
         &short_locals,
         &u32_locals,
         &goldilocks_locals,
         &dirs,
     )?;
-    dbg_pose_sc("after_cm_shards", &pose_asg);
 
     // Decomp verifier math.
     let (cm_g_target, vo_a_target, vo_b_target) = compute_cm_x_targets_for_decomp(
@@ -5136,7 +5138,6 @@ fn build_direct_to_merged_unix(
         base_eqs: base_base_eqs,
         ..
     } = glue;
-    dbg_pose_sc("after_base_glue_drop", &pose_asg);
     debug_assert!(base_base_eqs.is_empty(), "base glue should not contain base_eqs");
     let (base_asg, base_range) = gb.into_range_result()?;
     let exp_base_rows = expect_part_delta(&plan.row_off, 1, plan.part_rows);
@@ -5186,41 +5187,7 @@ fn build_direct_to_merged_unix(
             range,
         });
     }
-    dbg_pose_sc("after_all_extra_glues_drop", &pose_asg);
 
-    // Recover the owned Poseidon assignment (avoid cloning).
-    //
-    // IMPORTANT: `pose_asg` is shared across glue shards via `Arc`. At this point we've already
-    // consumed/dropped all `GlueCtx` instances (we destructured them above), so the `Arc` should
-    // be unique and this should succeed. If it doesn't, we'd retain *two* full copies of the
-    // witness in memory (one in `pose_asg`, one in `merged_asg`), which is exactly what we want
-    // to avoid.
-    // In principle `pose_asg` should be uniquely owned here.
-    //
-    // In practice, if any Rayon task still holds an `Arc` clone (or a drop is delayed until after a
-    // parallel scope completes), `try_unwrap` can fail transiently. We spin briefly to let any
-    // outstanding work finish and drops run, then fail with a useful diagnostic if it persists.
-    let pose_asg = {
-        let mut cur = pose_asg;
-        let mut spins: usize = 0;
-        loop {
-            match Arc::try_unwrap(cur) {
-                Ok(v) => break v,
-                Err(a) => {
-                    cur = a;
-                    spins += 1;
-                    if spins >= 1000 {
-                        let sc = Arc::strong_count(&cur);
-                        return Err(format!(
-                            "tiny gate: internal error: pose assignment still shared at finalize (strong_count={sc})"
-                        ));
-                    }
-                    // Yield to allow other worker threads to make progress and drop their `Arc`s.
-                    std::thread::yield_now();
-                }
-            }
-        }
-    };
 
     // Exact offsets from Pass1 assignments (computed before we move/drop large assignment vectors).
     let pose_tail_len = pose_asg.len().saturating_sub(1);
