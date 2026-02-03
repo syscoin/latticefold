@@ -604,9 +604,7 @@ fn tiny_gate_poseidon_shard_permutes(cfg: &PoseidonConfig<F257>, ops: &[Poseidon
     // a silly number of shards.
     let target_shards = n_threads.min(256).max(2);
     let shard_permutes = (total_permutes + target_shards - 1) / target_shards;
-    // Keep shards reasonably coarse, but allow enough shards to actually use many cores even
-    // for medium traces (permutes ~ 5k..50k).
-    shard_permutes.max(256)
+    shard_permutes.max(1024)
 }
 
 fn build_count_plan(
@@ -2115,7 +2113,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                 .collect();
 
             let base_asg_ir: &[F257] = &glue.gb.assignment;
-            let frags: Vec<(super::cm_ir::CmIr, [IrVarRef; 17])> = lane_chunks
+            let frags = lane_chunks
                 .par_iter()
                 .map(|r| -> Result<_, String> {
                     let mut ib = IrBuilder::new(base_asg_ir);
@@ -2145,23 +2143,8 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
-            // Merge fragments and lower once to avoid serializing dozens of tiny range-writes.
-            let mut merged = if glue.gb.is_count_only() {
-                super::cm_ir::CmIr::new_count_only()
-            } else {
-                super::cm_ir::CmIr::new()
-            };
-            let mut partials_merged: Vec<[IrVarRef; 17]> = Vec::with_capacity(frags.len());
             for (ir, partial_ir) in frags {
-                let shift = merged.append_remap_locals(ir);
-                let partial_ir = core::array::from_fn(|j| match partial_ir[j] {
-                    IrVarRef::Base(i) => IrVarRef::Base(i),
-                    IrVarRef::Local(k) => IrVarRef::Local(k + shift),
-                });
-                partials_merged.push(partial_ir);
-            }
-            let lowered = lower_ir_into_builder(&mut glue.gb, merged);
-            for partial_ir in partials_merged {
+                let lowered = lower_ir_into_builder(&mut glue.gb, ir);
                 let partial_d: GoldilocksScalar = core::array::from_fn(|j| lowered.map_var(partial_ir[j]));
                 e_sum = goldilocks_add_mod_p_digits(&mut glue.gb, &e_sum, &partial_d);
             }
@@ -2357,7 +2340,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                 let base_asg: &[F257] = &glue.gb.assignment;
                 let count_only = glue.gb.is_count_only();
 
-                let frags: Vec<(super::cm_ir::CmIr, [IrVarRef; 17], usize)> = (0..batch_len)
+                let frags: Vec<(_, [IrVarRef; 17], usize)> = (0..batch_len)
                     .into_par_iter()
                     .map(|c_local| -> Result<_, String> {
                         let col = c0 + c_local;
@@ -2413,23 +2396,8 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
-                // Merge fragments and lower once (avoids 64 tiny lowers per batch).
-                let mut merged = if count_only {
-                    super::cm_ir::CmIr::new_count_only()
-                } else {
-                    super::cm_ir::CmIr::new()
-                };
-                let mut outs_merged: Vec<([IrVarRef; 17], usize)> = Vec::with_capacity(frags.len());
                 for (ir, ct16_ir, col) in frags {
-                    let shift = merged.append_remap_locals(ir);
-                    let ct16_ir: [IrVarRef; 17] = core::array::from_fn(|k| match ct16_ir[k] {
-                        IrVarRef::Base(i) => IrVarRef::Base(i),
-                        IrVarRef::Local(j) => IrVarRef::Local(j + shift),
-                    });
-                    outs_merged.push((ct16_ir, col));
-                }
-                let lowered = lower_ir_into_builder(&mut glue.gb, merged);
-                for (ct16_ir, col) in outs_merged {
+                    let lowered = lower_ir_into_builder(&mut glue.gb, ir);
                     let ct: GoldilocksScalar = core::array::from_fn(|k| lowered.map_var(ct16_ir[k]));
                     let expected = if ni == 0 {
                         eval_v[col]
