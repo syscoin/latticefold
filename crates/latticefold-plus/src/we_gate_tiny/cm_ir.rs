@@ -381,36 +381,22 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
         let lowered = LoweredIr { base_nvars, local_to_var };
 
         // Precompute coefficient bytes for F257 (0..=256) once per process.
+        //
+        // IMPORTANT: this must exactly match the tiny-field on-disk encoding used by
+        // `SparseDr1csFileWriter` / `Dr1csBuilder` file-backed mode:
+        // - coeff_size == 2: u16 little-endian of the canonical representative (0..=256).
+        //
+        // Avoid arkworks serialization here: it's slower and (depending on backend) easy to get
+        // wrong if encoding conventions drift.
         static COEFF_TABLE: std::sync::OnceLock<(usize, Vec<u8>)> = std::sync::OnceLock::new();
         let table = COEFF_TABLE.get_or_init(|| {
+            if coeff_size != 2 {
+                panic!("file-backed lowering: unsupported coeff_size={coeff_size} (expected 2 for F257 tiny format)");
+            }
             let mut bytes = vec![0u8; 257usize.saturating_mul(coeff_size)];
-            for v in 0u64..=256u64 {
-                let f = F257::from(v);
+            for v in 0u16..=256u16 {
                 let off = (v as usize) * coeff_size;
-                // Use arkworks canonical uncompressed encoding into fixed slice.
-                // This is a one-time cost and is amortized heavily.
-                {
-                    use ark_serialize::{CanonicalSerialize, Compress};
-                    struct SliceWriter<'a> {
-                        buf: &'a mut [u8],
-                        pos: usize,
-                    }
-                    impl<'a> std::io::Write for SliceWriter<'a> {
-                        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-                            let rem = self.buf.len().saturating_sub(self.pos);
-                            if data.len() > rem {
-                                return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "SliceWriter overflow"));
-                            }
-                            self.buf[self.pos..self.pos + data.len()].copy_from_slice(data);
-                            self.pos += data.len();
-                            Ok(data.len())
-                        }
-                        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
-                    }
-                    let mut w = SliceWriter { buf: &mut bytes[off..off + coeff_size], pos: 0 };
-                    f.serialize_with_mode(&mut w, Compress::No).expect("serialize coeff table");
-                    debug_assert_eq!(w.pos, coeff_size);
-                }
+                bytes[off..off + 2].copy_from_slice(&v.to_le_bytes());
             }
             (coeff_size, bytes)
         });
