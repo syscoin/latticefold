@@ -86,6 +86,12 @@ struct CmSharedPrecompBase {
     tensor_c1_ring: Vec<RingDigits>,
     // flattened s_prime (length k*d), each entry is a ring element
     s_prime_flat_ring: Vec<RingDigits>,
+    // s[0..3] short-challenge ring elements (length 3), each entry is a ring element.
+    //
+    // These are used for:
+    // - building CM reduced instance targets (cm_g, v_o) for Decomp checks
+    // and should be computed once and reused.
+    s_rings: [RingDigits; 3],
     // dpp = dp^i as ring-constant elements (length ell)
     dpp_ring: Vec<RingDigits>,
     // recovered SetChk verifier point r (length nvars_setchk)
@@ -94,44 +100,100 @@ struct CmSharedPrecompBase {
     u: Vec<Vec<RingDigits>>,
 }
 
+// -----------------------------------------------------------------------------
+// Small helpers (keep big functions readable)
+// -----------------------------------------------------------------------------
+
 #[inline]
-fn short_challenge_coeff_digits_from_byte_var_128(
+fn import_scalar_from_base(glue: &mut GlueCtx, base_asg: &[F257], s: &GoldilocksScalar) -> GoldilocksScalar {
+    core::array::from_fn(|i| glue.import_base_var(base_asg, s[i]))
+}
+
+#[inline]
+fn import_ring_from_base(glue: &mut GlueCtx, base_asg: &[F257], r: &RingDigits) -> RingDigits {
+    r.iter().map(|s| import_scalar_from_base(glue, base_asg, s)).collect()
+}
+
+/// Byte-bit layout for a short-challenge coefficient, expressed as 8 bytes (each 8 bits).
+///
+/// For our short-challenge regime, only byte 0 can be nonzero; bytes 1..7 are all zero.
+type ShortCoeffBits = [[[usize; 8]; 8]; 64];
+
+fn collect_short_coeff_bits(
     gb: &mut Dr1csBuilder<F257>,
-    byte_var: usize,
+    ring_dim: usize,
     exp: usize,
-    u: u64,
-    half_digits: &GoldilocksScalar,
-    zero_byte: usize,
-) -> GoldilocksScalar {
-    debug_assert!(u.is_power_of_two() && u <= 256);
-    debug_assert!(exp <= 8);
-
-    // low = byte % u (u is power-of-two): low is the low `exp` bits.
-    let bits = decompose_existing_byte_var_to_bits::<F257>(gb, byte_var);
-    let limb0: u64 = gb.assignment[byte_var]
-        .into_bigint()
-        .as_ref()
-        .get(0)
-        .copied()
-        .unwrap_or(0);
-    let byte0 = (limb0 & 0xFF) as u64;
-    let low_u64 = byte0 & (u - 1);
-    let low_var = gb.new_var(F257::from(low_u64));
-
-    // Enforce low_var = Σ_{i<exp} 2^i * bits[i]
-    let mut lc = vec![(F257::ONE, low_var)];
-    let mut p2 = F257::ONE;
-    for i in 0..exp {
-        lc.push((-p2, bits[i]));
-        p2 = p2.double();
+    zero_bits: [usize; 8],
+    n_blocks: usize,
+    mut get_byte_var: impl FnMut(usize, usize) -> usize,
+) -> Result<Vec<ShortCoeffBits>, String> {
+    if ring_dim != 64 {
+        return Err("tiny gate: short coeff helper requires ring_dim=64".to_string());
     }
-    gb.enforce_lc_times_one_eq_const(lc);
+    let mut blocks_bits: Vec<ShortCoeffBits> = Vec::with_capacity(n_blocks);
+    for blk in 0..n_blocks {
+        let mut out_blk_bits: ShortCoeffBits = [[[0usize; 8]; 8]; 64];
+        for col in 0..ring_dim {
+            let bv = get_byte_var(blk, col);
+            let bb = decompose_existing_byte_var_to_bits::<F257>(gb, bv);
+            if bb.len() != 8 {
+                return Err("tiny gate: internal error: byte bits len mismatch (short coeff)".to_string());
+            }
+            let byte0_bits: [usize; 8] = core::array::from_fn(|i| if i < exp { bb[i] } else { zero_bits[i] });
+            out_blk_bits[col] = core::array::from_fn(|bi| if bi == 0 { byte0_bits } else { zero_bits });
+        }
+        blocks_bits.push(out_blk_bits);
+    }
+    Ok(blocks_bits)
+}
 
-    // Interpret low as a u64 and compute (low - half) mod Goldilocks p in digit domain.
-    let mut low_bytes = [zero_byte; 8];
-    low_bytes[0] = low_var;
-    let low_digits = goldilocks_bytes_to_digits(gb, low_bytes);
-    goldilocks_sub_mod_p_digits(gb, &low_digits, half_digits)
+fn build_short_coeff_digits_ir(
+    gb: &mut Dr1csBuilder<F257>,
+    blocks_bits: &[ShortCoeffBits],
+    half_ir: &[super::cm_ir::VarRef; 17],
+    p_u64: u64,
+    p_d_const: &[i8; 17],
+) -> (super::cm_ir::CmIr, Vec<[[super::cm_ir::VarRef; 17]; 64]>) {
+    // `ShortCoeffBits` is fixed-width at 64 coefficients.
+    debug_assert_eq!(64usize, 64usize);
+    let base_asg: &[F257] = &gb.assignment;
+    let mut ib = if gb.is_count_only() {
+        super::cm_ir::IrBuilder::new_count_only(base_asg)
+    } else {
+        super::cm_ir::IrBuilder::new(base_asg)
+    };
+    let mut outs: Vec<[[super::cm_ir::VarRef; 17]; 64]> = Vec::with_capacity(blocks_bits.len());
+    for out_blk_bits in blocks_bits {
+        let mut out_blk: [[super::cm_ir::VarRef; 17]; 64] = [[super::cm_ir::VarRef::Base(gb.one()); 17]; 64];
+        for col in 0..64 {
+            let bytes_bits_ir: [[super::cm_ir::VarRef; 8]; 8] = core::array::from_fn(|bi| {
+                core::array::from_fn(|j| super::cm_ir::VarRef::Base(out_blk_bits[col][bi][j]))
+            });
+            let low_digits_ir = super::cm_ir::u64_bytes_to_bal16_digits_from_bits_ir(&mut ib, &bytes_bits_ir);
+            let coeff_ir =
+                super::cm_ir::goldilocks_sub_mod_p_digits_ir(&mut ib, &low_digits_ir, half_ir, p_u64, p_d_const);
+            out_blk[col] = coeff_ir;
+        }
+        outs.push(out_blk);
+    }
+    (ib.ir, outs)
+}
+
+fn map_short_coeff_digits_blocks_to_rings(
+    lowered: &super::cm_ir::LoweredIr,
+    outs: Vec<[[super::cm_ir::VarRef; 17]; 64]>,
+    ring_dim: usize,
+) -> Vec<RingDigits> {
+    debug_assert_eq!(ring_dim, 64, "tiny gate: short coeff mapping assumes ring_dim=64");
+    let mut out: Vec<RingDigits> = Vec::with_capacity(outs.len());
+    for out_blk in outs {
+        let mut ring: RingDigits = Vec::with_capacity(ring_dim);
+        for col in 0..ring_dim {
+            ring.push(core::array::from_fn(|j| lowered.map_var(out_blk[col][j])));
+        }
+        out.push(ring);
+    }
+    out
 }
 
 /// Extra (non-transcript) witness values needed to make the tiny gate satisfiable for a **real** proof.
@@ -675,7 +737,7 @@ fn build_count_plan(
         ring_dim,
         params,
         l_instances_expected,
-        &short_locals,
+        &cm_shared_base,
         &pose_wiring,
         &comh_absorbs,
         &eval_absorbs,
@@ -1223,7 +1285,7 @@ fn compute_cm_x_targets_for_decomp(
     ring_dim: usize,
     params: &WeParams,
     l_instances_expected: usize,
-    short_locals: &[ShortChallengeWiring],
+    cm_shared_base: &Arc<CmSharedPrecompBase>,
     pose_wiring: &PoseidonDr1csWiring,
     comh_absorbs: &[(usize, usize)],
     eval_absorbs: &[Vec<(usize, usize)>],
@@ -1252,39 +1314,11 @@ fn compute_cm_x_targets_for_decomp(
     if comh_absorbs.len() != l_instances_expected * kappa {
         return Err("tiny gate: comh_absorbs length mismatch (cm x targets)".to_string());
     }
-    if short_locals.len() < 3 {
-        return Err("tiny gate: short_locals too short for s[0..3] (cm x targets)".to_string());
-    }
+    let s_rings: &[RingDigits; 3] = &cm_shared_base.s_rings;
     for i in 0..3 {
-        if short_locals[i].byte_vars.len() != ring_dim {
-            return Err("tiny gate: short byte_vars len mismatch (cm x targets)".to_string());
+        if s_rings[i].len() != ring_dim {
+            return Err("tiny gate: cm_shared_base.s_rings len mismatch".to_string());
         }
-    }
-
-    // Build s[0..3] ring elements in digit-domain from the transcript byte view.
-    let exp = (128usize / ring_dim) as usize;
-    let u = 1u64 << (exp as u32);
-    debug_assert!(u.is_power_of_two() && u <= 256);
-    let half = u / 2;
-    let z = glue.gb.new_var(F257::ZERO);
-    glue.gb.enforce_var_eq_const(z, F257::ZERO);
-    let half_bytes = alloc_const_goldilocks_u64(&mut glue.gb, half);
-    let half_digits = goldilocks_bytes_to_digits(&mut glue.gb, half_bytes);
-
-    let mut s_rings: [RingDigits; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    for si in 0..3 {
-        let mut ring: RingDigits = Vec::with_capacity(ring_dim);
-        for &bv in &short_locals[si].byte_vars {
-            ring.push(short_challenge_coeff_digits_from_byte_var_128(
-                &mut glue.gb,
-                bv,
-                exp,
-                u,
-                &half_digits,
-                z,
-            ));
-        }
-        s_rings[si] = ring;
     }
 
     // Accumulate folded (over l) cm_g and vo.
@@ -2446,6 +2480,32 @@ fn compute_cm_shared_precomp_base(
             let half_ir: [super::cm_ir::VarRef; 17] =
                 core::array::from_fn(|j| super::cm_ir::VarRef::Base(half_digits[j]));
 
+            // Also build s[0..3] once (only 3 rings) using a single batched IR + one lowering.
+            //
+            // This replaces the old per-coefficient `short_challenge_coeff_digits_from_byte_var_128` path.
+            let s_rings: [RingDigits; 3] = {
+                for i in 0..3 {
+                    if short_locals[i].byte_vars.len() != ring_dim {
+                        return Err("tiny gate: short byte_vars len mismatch (base s[0..3])".to_string());
+                    }
+                }
+                let blocks_bits = collect_short_coeff_bits(
+                    &mut glue.gb,
+                    ring_dim,
+                    exp,
+                    zero_bits,
+                    3,
+                    |si, col| short_locals[si].byte_vars[col],
+                )?;
+                let (ir, outs) = build_short_coeff_digits_ir(&mut glue.gb, &blocks_bits, &half_ir, p_u64, &p_d_const);
+                let lowered = super::cm_ir::lower_ir_into_builder(&mut glue.gb, ir);
+                let mut it = map_short_coeff_digits_blocks_to_rings(&lowered, outs, ring_dim).into_iter();
+                let r0 = it.next().expect("s_rings: missing ring 0");
+                let r1 = it.next().expect("s_rings: missing ring 1");
+                let r2 = it.next().expect("s_rings: missing ring 2");
+                [r0, r1, r2]
+            };
+
             const SFLAT_CHUNK_BLOCKS: usize = 16;
             let mut sflat: Vec<RingDigits> = Vec::with_capacity(need_sprime);
             let mut blk0 = 0usize;
@@ -2454,71 +2514,23 @@ fn compute_cm_shared_precomp_base(
 
                 // Collect bit references first (needs `&mut glue.gb`), then build IR without holding
                 // an immutable borrow of `glue.gb.assignment`.
-                let mut blocks_bits: Vec<[[[usize; 8]; 8]; 64]> = Vec::with_capacity(blk1 - blk0);
                 for blk in blk0..blk1 {
                     let sb = &short_locals[3 + blk];
                     if sb.byte_vars.len() != ring_dim {
                         return Err("tiny gate: short byte_vars len mismatch (base s_prime_flat)".to_string());
                     }
-                    let mut out_blk_bits: [[[usize; 8]; 8]; 64] = [[[0usize; 8]; 8]; 64];
-                    for col in 0..ring_dim {
-                        let bv = sb.byte_vars[col];
-                        let bb = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, bv);
-                        if bb.len() != 8 {
-                            return Err(
-                                "tiny gate: internal error: byte bits len mismatch (base s_prime_flat)".to_string(),
-                            );
-                        }
-                        let byte0_bits: [usize; 8] =
-                            core::array::from_fn(|i| if i < exp { bb[i] } else { zero_bits[i] });
-                        out_blk_bits[col] = core::array::from_fn(|bi| if bi == 0 { byte0_bits } else { zero_bits });
-                    }
-                    blocks_bits.push(out_blk_bits);
                 }
-
-                let (ir, outs): (super::cm_ir::CmIr, Vec<[[super::cm_ir::VarRef; 17]; 64]>) = {
-                    let base_asg: &[F257] = &glue.gb.assignment;
-                    let mut ib = if glue.gb.is_count_only() {
-                        super::cm_ir::IrBuilder::new_count_only(base_asg)
-                    } else {
-                        super::cm_ir::IrBuilder::new(base_asg)
-                    };
-
-                    // IR outputs: per block, 64 coeffs each as 17 digits.
-                    let mut outs: Vec<[[super::cm_ir::VarRef; 17]; 64]> = Vec::with_capacity(blk1 - blk0);
-                    for out_blk_bits in &blocks_bits {
-                        let mut out_blk: [[super::cm_ir::VarRef; 17]; 64] =
-                            [[super::cm_ir::VarRef::Base(glue.gb.one()); 17]; 64];
-                        for col in 0..ring_dim {
-                            let bytes_bits_ir: [[super::cm_ir::VarRef; 8]; 8] = core::array::from_fn(|bi| {
-                                core::array::from_fn(|j| super::cm_ir::VarRef::Base(out_blk_bits[col][bi][j]))
-                            });
-
-                            let low_digits_ir =
-                                super::cm_ir::u64_bytes_to_bal16_digits_from_bits_ir(&mut ib, &bytes_bits_ir);
-                            let coeff_ir = super::cm_ir::goldilocks_sub_mod_p_digits_ir(
-                                &mut ib,
-                                &low_digits_ir,
-                                &half_ir,
-                                p_u64,
-                                &p_d_const,
-                            );
-                            out_blk[col] = coeff_ir;
-                        }
-                        outs.push(out_blk);
-                    }
-                    (ib.ir, outs)
-                };
-
+                let blocks_bits = collect_short_coeff_bits(
+                    &mut glue.gb,
+                    ring_dim,
+                    exp,
+                    zero_bits,
+                    blk1 - blk0,
+                    |i, col| short_locals[3 + blk0 + i].byte_vars[col],
+                )?;
+                let (ir, outs) = build_short_coeff_digits_ir(&mut glue.gb, &blocks_bits, &half_ir, p_u64, &p_d_const);
                 let lowered = super::cm_ir::lower_ir_into_builder(&mut glue.gb, ir);
-                for out_blk in outs {
-                    let mut re: RingDigits = Vec::with_capacity(ring_dim);
-                    for col in 0..ring_dim {
-                        let digits = core::array::from_fn(|j| lowered.map_var(out_blk[col][j]));
-                        re.push(digits);
-                    }
-                    sflat.push(re);
-                }
+                sflat.extend(map_short_coeff_digits_blocks_to_rings(&lowered, outs, ring_dim));
                 blk0 = blk1;
             }
             if timing_u {
@@ -2819,6 +2831,7 @@ fn compute_cm_shared_precomp_base(
                     tensor_c0_ring,
                     tensor_c1_ring,
                     s_prime_flat_ring: sflat,
+                    s_rings,
                     dpp_ring: dpp,
                     r_point_digits: rdig,
                     u: u_all,
@@ -3938,41 +3951,30 @@ fn build_cm_glue_for_which<'p>(
 
     // CM challenges after absorb_comh: c0/c1, then for each sumcheck: rc, r_sc[0..nvars_cm]
     // These are transcript `get_challenge()` values in the Goldilocks base field (8 bytes).
-    // Canonical tiny-gate path: CM shared precomputations are built once in the base glue module
-    // and imported here (no recomputation fallbacks).
-    #[inline]
-    fn import_scalar(glue: &mut GlueCtx, base_asg: &[F257], s: &GoldilocksScalar) -> GoldilocksScalar {
-        core::array::from_fn(|i| glue.import_base_var(base_asg, s[i]))
-    }
-    #[inline]
-    fn import_ring(glue: &mut GlueCtx, base_asg: &[F257], r: &RingDigits) -> RingDigits {
-        r.iter().map(|s| import_scalar(glue, base_asg, s)).collect()
-    }
-
     let tensor_c0_ring: Vec<RingDigits> = cm_shared_base
         .tensor_c0_ring
         .iter()
-        .map(|r| import_ring(&mut glue, base_asg, r))
+        .map(|r| import_ring_from_base(&mut glue, base_asg, r))
         .collect();
     let tensor_c1_ring: Vec<RingDigits> = cm_shared_base
         .tensor_c1_ring
         .iter()
-        .map(|r| import_ring(&mut glue, base_asg, r))
+        .map(|r| import_ring_from_base(&mut glue, base_asg, r))
         .collect();
     let s_prime_flat_ring: Vec<RingDigits> = cm_shared_base
         .s_prime_flat_ring
         .iter()
-        .map(|r| import_ring(&mut glue, base_asg, r))
+        .map(|r| import_ring_from_base(&mut glue, base_asg, r))
         .collect();
     let dpp_ring: Vec<RingDigits> = cm_shared_base
         .dpp_ring
         .iter()
-        .map(|r| import_ring(&mut glue, base_asg, r))
+        .map(|r| import_ring_from_base(&mut glue, base_asg, r))
         .collect();
     let r_point_digits: Vec<GoldilocksScalar> = cm_shared_base
         .r_point_digits
         .iter()
-        .map(|s| import_scalar(&mut glue, base_asg, s))
+        .map(|s| import_scalar_from_base(&mut glue, base_asg, s))
         .collect();
 
     // Select the Goldilocks `get_challenge()` window for this sumcheck:
@@ -4959,7 +4961,7 @@ fn build_direct_to_merged_unix(
         ring_dim,
         params,
         l_instances_expected,
-        &short_locals,
+        &cm_shared_base,
         &pose_wiring,
         &comh_absorbs,
         &eval_absorbs,
