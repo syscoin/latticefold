@@ -1,7 +1,9 @@
 use super::*;
 
 use ark_ff::{BigInteger, Field, PrimeField};
+use latticefold::transcript::poseidon::f257_poseidon_config;
 use latticefold::transcript::poseidon::F257;
+use symphony::dpp_poseidon::poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 use symphony::transcript::PoseidonTraceOp;
 
@@ -74,21 +76,16 @@ fn test_poseidon_f257_ops_arithmetization_satisfies() {
     let mut tr = symphony::transcript::TracePoseidonTranscript::<GoldilocksRing>::empty::<()>();
     tr.absorb_field_element(&<GoldilocksRing as stark_rings::PolyRing>::BaseRing::from(123u64));
     let _c = tr.get_challenge(); // SqueezeField(8) + Absorb(8)
-    let _b = tr.squeeze_bytes(17); // SqueezeBytes(17) (no reabsorb)
+    // IMPORTANT: tiny-gate canonical Poseidon arith does **not** arithmetize `SqueezeBytes`.
+    // Keep this test in the no-bytes regime.
 
     let ops: Vec<PoseidonTraceOp<F257>> = tr.trace().ops.clone();
 
-    let out_dir = {
-        let mut p = std::env::temp_dir();
-        p.push("lfplus_test_poseidon_f257_ops_arithmetization");
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).expect("create temp out_dir");
-        p
-    };
-    let (inst, asg, _wiring, _byte_wiring) =
-        poseidon_f257_arithmetize(None, &ops, &out_dir).expect("poseidon_f257_arithmetize");
-    inst.check(&asg).expect("poseidon(F257) dR1CS satisfied");
-    let _ = std::fs::remove_dir_all(&out_dir);
+    let cfg = f257_poseidon_config();
+    let (inst, asg, _wiring) =
+        poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes::<F257>(&cfg, &ops)
+            .expect("poseidon(F257) no-bytes arithmetize");
+    inst.check(&asg).expect("poseidon(F257) no-bytes dR1CS satisfied");
 }
 
 #[test]

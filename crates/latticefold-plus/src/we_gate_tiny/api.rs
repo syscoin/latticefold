@@ -11,7 +11,6 @@ use super::builder;
 
 pub use super::challenges::{infer_cm_coin_op_wiring_from_ops, BoundedU32ChallengeWiring, GoldilocksChallengeWiring, ShortChallengeWiring, TinyCoinOpWiring};
 pub use super::lift::lift_recording_trace_ops_to_f257;
-pub use super::poseidon::poseidon_f257_arithmetize;
 pub use super::surfaces::{CmDigitMulSqSurfaceWiring, CmDigitMulSurfaceWiring};
 pub use super::builder::TinyExtraWitness;
 

@@ -7082,6 +7082,7 @@ mod tests {
     fn test_plus_poseidon_schedule_lifts_to_f257_and_satisfies() {
         use cyclotomic_rings::rings::GoldilocksRing64 as RR;
         use stark_rings::PolyRing;
+        use symphony::dpp_poseidon::poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes;
 
         // Small-ish params; we only care about schedule validity.
         let params = WeParams {
@@ -7105,17 +7106,15 @@ mod tests {
                 .expect("poseidon_trace_schedule_for_plus");
         let ops_f257 = crate::we_gate_tiny::lift_recording_trace_ops_to_f257::<BF<RR>>(&trace.ops)
             .expect("lift trace ops to f257");
-        let out_dir = {
-            let mut p = std::env::temp_dir();
-            p.push("lfplus_test_poseidon_f257_arithmetize");
-            let _ = std::fs::remove_dir_all(&p);
-            std::fs::create_dir_all(&p).expect("create temp out_dir");
-            p
-        };
-        let (inst, asg, _wiring, _byte_wiring) =
-            crate::we_gate_tiny::poseidon_f257_arithmetize(None, &ops_f257, &out_dir).expect("poseidon f257");
-        inst.check(&asg).expect("poseidon f257 schedule satisfiable");
-        let _ = std::fs::remove_dir_all(&out_dir);
+
+        let cfg = latticefold::transcript::poseidon::f257_poseidon_config();
+        let (inst, asg, _wiring) =
+            poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes::<latticefold::transcript::poseidon::F257>(
+                &cfg,
+                &ops_f257,
+            )
+            .expect("poseidon f257 no-bytes");
+        inst.check(&asg).expect("poseidon f257 schedule satisfiable (no-bytes)");
     }
 
     // Large-scale (n=2^20) end-to-end WE->DPP sanity + digest "before/after" metric.

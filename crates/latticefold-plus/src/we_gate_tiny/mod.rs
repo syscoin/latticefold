@@ -8,7 +8,6 @@ mod goldilocks;
 mod cm_math;
 mod cm_ir;
 mod surfaces;
-mod poseidon;
 mod builder;
 mod lift;
 mod api;
