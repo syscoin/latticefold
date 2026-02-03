@@ -597,14 +597,28 @@ struct TinyGatePlan {
 fn tiny_gate_poseidon_shard_permutes(cfg: &PoseidonConfig<F257>, ops: &[PoseidonTraceOp<F257>]) -> usize {
     let n_threads = rayon::current_num_threads().max(1);
     let total_permutes = count_permutes_for_ops(cfg, ops);
+    // Allow tuning sharding from the environment:
+    // - `LF_TINY_POSEIDON_TARGET_SHARDS`: desired shard count (clamped)
+    // - `LF_TINY_POSEIDON_MIN_SHARD_PERMUTES`: minimum permutes per shard (0 disables the minimum)
+    let target_shards_env: Option<usize> = std::env::var("LF_TINY_POSEIDON_TARGET_SHARDS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v > 0);
+    let min_permutes_env: Option<usize> = std::env::var("LF_TINY_POSEIDON_MIN_SHARD_PERMUTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
     // Important for throughput: do NOT cap shard count at a small constant.
     // We want Poseidon (Pass0 count + Pass1 range-write) to scale with available cores.
     //
-    // Shards are further implicitly capped by the `max(1024)` below, so tiny traces won't spawn
-    // a silly number of shards.
-    let target_shards = n_threads.min(256).max(2);
+    // Historically we also imposed a minimum permutes-per-shard to avoid oversharding on tiny traces.
+    // On very wide machines this can reduce utilization for large traces; tune via env vars above.
+    let target_shards = target_shards_env.unwrap_or_else(|| n_threads.min(256).max(2)).clamp(2, 4096);
     let shard_permutes = (total_permutes + target_shards - 1) / target_shards;
-    shard_permutes.max(1024)
+    match min_permutes_env {
+        Some(0) => shard_permutes.max(1),
+        Some(m) => shard_permutes.max(m.max(1)),
+        None => shard_permutes.max(1024),
+    }
 }
 
 fn build_count_plan(
@@ -1039,6 +1053,11 @@ impl<'a> GlueCtx<'a> {
                 Dr1csBuilder::<F257>::new_file_backed_range(writer, var_tail_off)
             }
         };
+        assert_eq!(
+            gb.is_count_only(),
+            matches!(mode, TinyGateBuildMode::Count),
+            "tiny gate: builder count-only mode mismatch"
+        );
         // var0 is the constant-1 slot
         gb.enforce_var_eq_const(gb.one(), F257::ONE);
         Ok(Self {
