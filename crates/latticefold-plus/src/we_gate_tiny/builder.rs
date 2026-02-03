@@ -4932,7 +4932,15 @@ fn build_direct_to_merged_unix(
 
     // Base glue (part 1) and all submodules write directly into merged ranges.
     let pose_asg = Arc::new(pose_asg);
+    #[inline]
+    fn dbg_pose_sc(tag: &str, a: &Arc<Vec<F257>>) {
+        if std::env::var("LFP_DEBUG_POSE_ASG_SC").ok().as_deref() == Some("1") {
+            eprintln!("tiny_gate: pose_asg strong_count @ {tag} = {}", Arc::strong_count(a));
+        }
+    }
+    dbg_pose_sc("after_poseidon", &pose_asg);
     let mut glue = GlueCtx::new(&TinyGateBuildMode::RangeBase, pose_asg.clone(), &dirs.base_glue_dir, 1, Some(&rb))?;
+    dbg_pose_sc("after_base_glue_new", &pose_asg);
 
     // Canonicality constraints: parallel shards (parts 2..).
     let canonical_glues = build_canonicality_shards(
@@ -4944,6 +4952,7 @@ fn build_direct_to_merged_unix(
         &pose_wiring,
         &dirs,
     )?;
+    dbg_pose_sc("after_canonicality_shards", &pose_asg);
 
     validate_cm_u32_schedule(params, wiring)?;
     let (n_comh_ring_elems, coeff_bytes) = count_comh_ring_elements(ops, &pose_wiring, ring_dim, wiring)?;
@@ -5053,6 +5062,7 @@ fn build_direct_to_merged_unix(
         &goldilocks_locals,
         &dirs,
     )?;
+    dbg_pose_sc("after_cm_shards", &pose_asg);
 
     // Decomp verifier math.
     let (cm_g_target, vo_a_target, vo_b_target) = compute_cm_x_targets_for_decomp(
@@ -5126,6 +5136,7 @@ fn build_direct_to_merged_unix(
         base_eqs: base_base_eqs,
         ..
     } = glue;
+    dbg_pose_sc("after_base_glue_drop", &pose_asg);
     debug_assert!(base_base_eqs.is_empty(), "base glue should not contain base_eqs");
     let (base_asg, base_range) = gb.into_range_result()?;
     let exp_base_rows = expect_part_delta(&plan.row_off, 1, plan.part_rows);
@@ -5175,6 +5186,7 @@ fn build_direct_to_merged_unix(
             range,
         });
     }
+    dbg_pose_sc("after_all_extra_glues_drop", &pose_asg);
 
     // Recover the owned Poseidon assignment (avoid cloning).
     //
