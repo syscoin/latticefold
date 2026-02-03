@@ -4844,9 +4844,6 @@ fn build_direct_to_merged_unix(
     use std::io::Write;
 
     let dirs = build_dirs(&out_dir);
-    if tiny_opmix_on() {
-        super::op_counts::tiny_cm_counts_reset();
-    }
     lf_profile_log(&format!(
         "start out_dir={} threads={}",
         dirs.root.display(),
@@ -4866,6 +4863,11 @@ fn build_direct_to_merged_unix(
     let (_pose_asg0, _pose_wiring0, _glue0, _extra0, plan0) =
         build_count_plan(poseidon_cfg, ops, ring_dim, params, wiring, pairs, extra_witness)?;
     let plan = Arc::new(plan0);
+
+    // Op-mix counters should reflect the *final circuit* (Pass1), not Pass0 structural counting.
+    if tiny_opmix_on() {
+        super::op_counts::tiny_cm_counts_reset();
+    }
 
     // Preallocate merged/* pools/rows.
     let (fc_a, fi_a, fc_b, fi_b, fc_c, fi_c, f_rows) = prealloc_merged_files(
