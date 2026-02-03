@@ -511,7 +511,8 @@ struct TinyGateRangeBase;
 
 #[derive(Clone, Debug)]
 struct TinyGatePlan {
-    // Part ordering matches finalize(): part0=poseidon, part1=base_glue, parts2..=extra glues.
+    // Part ordering matches the direct-to-merged plan:
+    // part0=poseidon, part1=base_glue, parts2..=extra glues (canonical shards + CM shards).
     // These offsets are in the merged variable space and exclude var0.
     var_tail_off: Vec<usize>,
     // Offsets into merged term pools and constraint rows (in counts, not bytes), per part.
@@ -691,7 +692,7 @@ fn build_count_plan(
     // Surfaces (small vs Poseidon/CM, but must be counted for exact Pass0 sizing).
     let _ = build_surfaces_with_shared_arcs(&mut glue, ring_dim, pairs, &short_locals, &u32_locals)?;
 
-    // Assemble the list of "extra glues" in the same order as finalize(): canonical shards + cm shards.
+    // Assemble the list of "extra glues" in canonical order: canonical shards + cm shards.
     let mut extra_glues: Vec<GlueCtx> = Vec::new();
     extra_glues.extend(canonical_glues);
     extra_glues.extend(cm_extra_glues);
@@ -712,7 +713,7 @@ fn build_count_plan(
         if local == 0 { 0 } else { local + offsets[part] }
     };
 
-    // Equality constraints: same construction as finalize().
+    // Equality constraints: same construction as in Pass1 direct-to-merged.
     let mut eq_pairs: Vec<(usize, usize)> = Vec::new();
     {
         let reabsorb = collect_fiat_shamir_reabsorb_eqs(ops, &pose_wiring)?;
@@ -3757,223 +3758,6 @@ fn enforce_canonical_goldilocks_for_ranges(
     Ok(())
 }
 
-// NOTE: The LF+ verifier computes `tcch0/tcch1` internally and uses them in `claimed_sum`, but does not
-// export them. The tiny gate follows that model: we do not export `tcch0/tcch1` surfaces.
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(any())] // legacy append+merge path (non-canonical)
-fn finalize(
-    pose_inst: FileBackedSparseDr1csInstance<F257>,
-    pose_wiring: PoseidonDr1csWiring,
-    ops: &[PoseidonTraceOp<F257>],
-    glue: GlueCtx,
-    extra_glues: Vec<GlueCtx>,
-    short_locals: Vec<ShortChallengeWiring>,
-    u32_locals: Vec<BoundedU32ChallengeWiring>,
-    goldilocks_locals: Vec<GoldilocksChallengeWiring>,
-    surfaces_mul_local: Vec<CmDigitMulSurfaceWiring>,
-    surfaces_sq_local: Vec<CmDigitMulSqSurfaceWiring>,
-    all_sum_digits: Arc<Vec<usize>>,
-    all_sum_coeffwise: Arc<Vec<Vec<usize>>>,
-    all_sq_sum_digits: Arc<Vec<usize>>,
-    all_sq_sum_coeffwise: Arc<Vec<Vec<usize>>>,
-    out_dir: impl AsRef<std::path::Path>,
-) -> Result<
-    (
-        FileBackedSparseDr1csInstance<F257>,
-        Vec<F257>,
-        Vec<ShortChallengeWiring>,
-        Vec<BoundedU32ChallengeWiring>,
-        Vec<GoldilocksChallengeWiring>,
-        Vec<CmDigitMulSurfaceWiring>,
-        Vec<CmDigitMulSqSurfaceWiring>,
-        PoseidonDr1csWiring,
-    ),
-    String,
-> {
-    let GlueCtx { gb, pose_asg, local_map: base_local_map, base_eqs: base_base_eqs, .. } = glue;
-    let (base_inst, base_asg) = gb
-        .into_file_backed_instance()
-        .map_err(|e| format!("tiny gate: base glue into_file_backed_instance failed: {e}"))?;
-    debug_assert!(base_base_eqs.is_empty(), "base glue should not contain base_eqs");
-
-    let mut extra_insts: Vec<(FileBackedSparseDr1csInstance<F257>, Vec<F257>)> = Vec::with_capacity(extra_glues.len());
-    let mut extra_maps: Vec<BTreeMap<usize, usize>> = Vec::with_capacity(extra_glues.len());
-    let mut extra_base_eqs: Vec<Vec<(usize, usize)>> = Vec::with_capacity(extra_glues.len());
-    for g in extra_glues {
-        let GlueCtx { gb, pose_asg: _pa, local_map, base_eqs, .. } = g;
-        let (inst, asg) = gb
-            .into_file_backed_instance()
-            .map_err(|e| format!("tiny gate: extra glue into_file_backed_instance failed: {e}"))?;
-        extra_insts.push((inst, asg));
-        extra_maps.push(local_map);
-        extra_base_eqs.push(base_eqs);
-    }
-
-    // Recover the owned pose assignment (avoid cloning).
-    let pose_asg = Arc::try_unwrap(pose_asg)
-        .map_err(|_| "tiny gate: internal error: pose assignment still shared at finalize")?;
-
-    // Compute part offsets in merged space (excluding var0).
-    // Part 0: poseidon, part 1: base glue, parts 2..: extra glue modules.
-    let mut offsets: Vec<usize> = Vec::with_capacity(2 + extra_insts.len());
-    let mut cur = 0usize;
-    offsets.push(cur);
-    cur += pose_asg.len().saturating_sub(1);
-    offsets.push(cur);
-    cur += base_asg.len().saturating_sub(1);
-    for (_inst, asg) in &extra_insts {
-        offsets.push(cur);
-        cur += asg.len().saturating_sub(1);
-    }
-    let remap = |part: usize, local: usize, offsets: &[usize]| -> usize {
-        if local == 0 { 0 } else { local + offsets[part] }
-    };
-
-    // Equality constraints:
-    // - Fiat–Shamir reabsorbs within Poseidon (part 0)
-    // - Glue links between copied pose vars and module-local vars
-    let mut eq_pairs: Vec<(usize, usize)> = Vec::new();
-    {
-        let reabsorb = collect_fiat_shamir_reabsorb_eqs(ops, &pose_wiring)?;
-        eq_pairs.reserve(reabsorb.len() + base_local_map.len());
-        for (v_ab, v_sq) in reabsorb {
-            eq_pairs.push((remap(0, v_ab, &offsets), remap(0, v_sq, &offsets)));
-        }
-    }
-    for (&gv, &lv) in base_local_map.iter() {
-        eq_pairs.push((remap(0, gv, &offsets), remap(1, lv, &offsets)));
-    }
-    for (i, m) in extra_maps.iter().enumerate() {
-        let part = 2 + i;
-        for (&gv, &lv) in m.iter() {
-            eq_pairs.push((remap(0, gv, &offsets), remap(part, lv, &offsets)));
-        }
-    }
-    for (i, v) in extra_base_eqs.iter().enumerate() {
-        let part = 2 + i;
-        for &(base_var, local_var) in v {
-            eq_pairs.push((remap(1, base_var, &offsets), remap(part, local_var, &offsets)));
-        }
-    }
-
-    // Merge all file-backed parts and append equality constraints.
-    let mut parts: Vec<(FileBackedSparseDr1csInstance<F257>, Vec<F257>)> = Vec::with_capacity(2 + extra_insts.len());
-    parts.push((pose_inst, pose_asg));
-    parts.push((base_inst, base_asg));
-    parts.extend(extra_insts);
-    let t_fb_merge = Instant::now();
-    let (inst, asg) = merge_file_backed_sparse_dr1cs_share_one::<F257>(parts, out_dir.as_ref(), &eq_pairs)
-        .map_err(|e| format!("tiny gate: file-backed merge failed: {e}"))?;
-    lf_profile_log(&format!(
-        "merge_done elapsed={:?} nvars={} constraints={}",
-        t_fb_merge.elapsed(),
-        inst.nvars,
-        inst.layout.nconstraints
-    ));
-
-    // All exported wiring is from the base glue module (part 1).
-    let to_glue_global = |glue_local: usize| -> usize { remap(1, glue_local, &offsets) };
-
-    let shorts_out = short_locals
-        .into_iter()
-        .map(|w| ShortChallengeWiring {
-            digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
-            byte_vars: w.byte_vars.into_iter().map(to_glue_global).collect(),
-            coeff_vars: w.coeff_vars.into_iter().map(to_glue_global).collect(),
-            coeff_bal16_digits: w
-                .coeff_bal16_digits
-                .into_iter()
-                .map(|a| a.map(to_glue_global))
-                .collect(),
-        })
-        .collect::<Vec<_>>();
-    let u32s_out = u32_locals
-        .into_iter()
-        .map(|w| BoundedU32ChallengeWiring {
-            digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
-            byte_vars: w.byte_vars.map(to_glue_global),
-            limbs: w.limbs.map(to_glue_global),
-            bal16_digits: w.bal16_digits.into_iter().map(to_glue_global).collect(),
-            bal16_sq_digits: w.bal16_sq_digits.into_iter().map(to_glue_global).collect(),
-        })
-        .collect::<Vec<_>>();
-    let goldilocks_out = goldilocks_locals
-        .into_iter()
-        .map(|w| GoldilocksChallengeWiring {
-            digit_vars: w.digit_vars.into_iter().map(to_glue_global).collect(),
-            byte_vars: w.byte_vars.map(to_glue_global),
-            q_bit: to_glue_global(w.q_bit),
-            limbs: w.limbs.map(to_glue_global),
-            res257: to_glue_global(w.res257),
-        })
-        .collect::<Vec<_>>();
-
-    let all_sum_digits_global: Arc<Vec<usize>> =
-        Arc::new(all_sum_digits.iter().copied().map(to_glue_global).collect());
-    let all_sum_coeffwise_global: Arc<Vec<Vec<usize>>> = Arc::new(
-        all_sum_coeffwise
-            .iter()
-            .map(|v| v.iter().copied().map(to_glue_global).collect())
-            .collect(),
-    );
-    let all_sq_sum_digits_global: Arc<Vec<usize>> =
-        Arc::new(all_sq_sum_digits.iter().copied().map(to_glue_global).collect());
-    let all_sq_sum_coeffwise_global: Arc<Vec<Vec<usize>>> = Arc::new(
-        all_sq_sum_coeffwise
-            .iter()
-            .map(|v| v.iter().copied().map(to_glue_global).collect())
-            .collect(),
-    );
-
-    let surfaces_out = surfaces_mul_local
-        .into_iter()
-        .map(|s| CmDigitMulSurfaceWiring {
-            short_block_idx: s.short_block_idx,
-            u32_idx: s.u32_idx,
-            products: s.products.into_iter().map(|p| p.map(to_glue_global)).collect(),
-            products13: s
-                .products13
-                .into_iter()
-                .map(|p| p.map(to_glue_global))
-                .collect(),
-            sum_digits: s.sum_digits.into_iter().map(to_glue_global).collect(),
-            sum_all_pairs_digits: all_sum_digits_global.clone(),
-            sum_all_pairs_coeffwise: all_sum_coeffwise_global.clone(),
-        })
-        .collect::<Vec<_>>();
-
-    let surfaces_sq_out = surfaces_sq_local
-        .into_iter()
-        .map(|s| CmDigitMulSqSurfaceWiring {
-            short_block_idx: s.short_block_idx,
-            u32_idx: s.u32_idx,
-            products21: s.products21.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
-            products22: s.products22.into_iter().map(|arr| arr.map(to_glue_global)).collect(),
-            sum_digits: s.sum_digits.into_iter().map(to_glue_global).collect(),
-            sum_all_pairs_digits: all_sq_sum_digits_global.clone(),
-            sum_all_pairs_coeffwise: all_sq_sum_coeffwise_global.clone(),
-        })
-        .collect::<Vec<_>>();
-        if tiny_opmix_on() {
-            eprintln!(
-                "tiny_gate: finalize done: nvars={} constraints={} (returning instance + wiring)",
-                inst.nvars,
-                inst.layout.nconstraints
-            );
-        }
-    Ok((
-        inst,
-        asg,
-        shorts_out,
-        u32s_out,
-        goldilocks_out,
-        surfaces_out,
-        surfaces_sq_out,
-        pose_wiring,
-    ))
-}
-
 fn build_cm_glue_for_which(
     mode: &TinyGateBuildMode,
     part_idx: usize,
@@ -5354,7 +5138,7 @@ fn build_direct_to_merged_unix(
         return Err("tiny gate: base glue Pass0/Pass1 count mismatch".to_string());
     }
 
-    // Extra glues: canonical shards then cm shards (same order as finalize()).
+    // Extra glues: canonical shards then cm shards.
     #[cfg(unix)]
     struct ExtraOut {
         local_map: BTreeMap<usize, usize>,
@@ -5419,7 +5203,7 @@ fn build_direct_to_merged_unix(
         if local == 0 { 0 } else { local + offsets[part] }
     };
 
-    // Equality pairs as in finalize().
+    // Equality pairs as in the canonical direct-to-merged pipeline.
     let mut eq_pairs: Vec<(usize, usize)> = Vec::new();
     {
         let reabsorb = collect_fiat_shamir_reabsorb_eqs(ops, &pose_wiring)?;
