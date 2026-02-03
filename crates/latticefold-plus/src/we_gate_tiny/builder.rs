@@ -2340,10 +2340,22 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                 let base_asg: &[F257] = &glue.gb.assignment;
                 let count_only = glue.gb.is_count_only();
 
-                let frags: Vec<(_, [IrVarRef; 17], usize)> = (0..batch_len)
+                // Key perf fix: build one IR per *group of columns* (still in parallel), then lower per group.
+                // This reduces the number of `lower_ir_into_builder` calls from ~64 -> ~O(16).
+                let n_threads = rayon::current_num_threads().max(1);
+                let target_groups = n_threads.min(batch_len.max(1)).min(16).max(1);
+                let col_group = (batch_len + target_groups - 1) / target_groups;
+                let mut groups: Vec<(usize, usize)> = Vec::new();
+                let mut g0 = 0usize;
+                while g0 < batch_len {
+                    let g1 = (g0 + col_group).min(batch_len);
+                    groups.push((g0, g1));
+                    g0 = g1;
+                }
+
+                let frags: Vec<(super::cm_ir::CmIr, Vec<([IrVarRef; 17], usize)>)> = groups
                     .into_par_iter()
-                    .map(|c_local| -> Result<_, String> {
-                        let col = c0 + c_local;
+                    .map(|(gs, ge)| -> Result<_, String> {
                         let mut ib = if count_only {
                             IrBuilder::new_count_only(base_asg)
                         } else {
@@ -2352,6 +2364,10 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                         let z = ib.new_var(F257::ZERO);
                         ib.ir.enforce_var_eq_const(z, F257::ZERO);
                         let z4: [IrVarRef; 33] = [z; 33];
+
+                        let mut outs: Vec<([IrVarRef; 17], usize)> = Vec::with_capacity(ge - gs);
+                        for c_local in gs..ge {
+                            let col = c0 + c_local;
 
                             // acc_ring in bal4 per coefficient.
                             let mut acc4: [[IrVarRef; 33]; 64] = [z4; 64];
@@ -2364,13 +2380,15 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                                 if ui_col.len() != 64 {
                                     return Err("tiny gate: expected ring element with 64 coeffs (rgchk)".to_string());
                                 }
-                                let s4: [IrVarRef; 33] = core::array::from_fn(|k| IrVarRef::Base(dppow4_base[i][k]));
+                                let s4: [IrVarRef; 33] =
+                                    core::array::from_fn(|k| IrVarRef::Base(dppow4_base[i][k]));
                                 for coeff in 0..64 {
                                     let ui16: [IrVarRef; 17] =
                                         core::array::from_fn(|k| IrVarRef::Base(ui_col[coeff][k]));
                                     let ui4 = ib.bal16_to_bal4_digits_cached(&ui16);
                                     let prod4 = goldilocks_mul_mod_p_digits_bal4_ir(&mut ib, &ui4, &s4, p_u64);
-                                    acc4[coeff] = goldilocks_add_mod_p_digits_bal4_ir(&mut ib, &acc4[coeff], &prod4, p_u64);
+                                    acc4[coeff] =
+                                        goldilocks_add_mod_p_digits_bal4_ir(&mut ib, &acc4[coeff], &prod4, p_u64);
                                 }
                             }
 
@@ -2392,27 +2410,31 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
                             }
 
                             let ct16 = ib.bal4_to_bal16_digits_cached(&ct4);
-                        Ok((ib.ir, ct16, col))
+                            outs.push((ct16, col));
+                        }
+                        Ok((ib.ir, outs))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
-                for (ir, ct16_ir, col) in frags {
+                for (ir, outs) in frags {
                     let lowered = lower_ir_into_builder(&mut glue.gb, ir);
-                    let ct: GoldilocksScalar = core::array::from_fn(|k| lowered.map_var(ct16_ir[k]));
-                    let expected = if ni == 0 {
-                        eval_v[col]
-                    } else {
-                        *eval_c
-                            .get(ni)
-                            .ok_or("tiny gate: eval.c length mismatch (rgchk)")?
-                            .get(col)
-                            .ok_or("tiny gate: eval.c coeff index oob (rgchk)")?
-                    };
-                    for di in 0..17 {
-                        glue.gb.enforce_lc_times_one_eq_const(vec![
-                            (F257::ONE, ct[di]),
-                            (-F257::ONE, expected[di]),
-                        ]);
+                    for (ct16_ir, col) in outs {
+                        let ct: GoldilocksScalar = core::array::from_fn(|k| lowered.map_var(ct16_ir[k]));
+                        let expected = if ni == 0 {
+                            eval_v[col]
+                        } else {
+                            *eval_c
+                                .get(ni)
+                                .ok_or("tiny gate: eval.c length mismatch (rgchk)")?
+                                .get(col)
+                                .ok_or("tiny gate: eval.c coeff index oob (rgchk)")?
+                        };
+                        for di in 0..17 {
+                            glue.gb.enforce_lc_times_one_eq_const(vec![
+                                (F257::ONE, ct[di]),
+                                (-F257::ONE, expected[di]),
+                            ]);
+                        }
                     }
                 }
             }
