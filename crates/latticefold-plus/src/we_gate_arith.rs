@@ -6747,19 +6747,22 @@ mod tests {
     #[test]
     #[ignore = "tiny-field gate coverage; run with `--release -- --ignored`"]
     fn test_we_plus_tiny_param_binding_mlen_changes_shape() {
-        use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as RR;
+        use cyclotomic_rings::rings::GoldilocksRing64 as RR;
         use stark_rings::PolyRing;
 
         // Choose params so the schedule meaningfully depends on `mlen` (mlen_mats).
         let ring_dim = RR::dimension() as u64;
         let pairs: Vec<(usize, usize)> = vec![(0, 0)];
-        let public_inputs_len = 0usize;
+        // Prefix binding requires at least `min(8, kappa)` public inputs in the transcript prefix.
+        // Here kappa=1 => need at least 1.
+        let public_inputs_len = 1usize;
         let n_lin_proofs = 1usize;
 
         let base = WeParams {
-            nvars_setchk: 1,
+            // For ring_dim=64, CM verifier math needs nvars_cm >= 12.
+            nvars_setchk: 12,
             degree_setchk: 3,
-            nvars_cm: 1,
+            nvars_cm: 12,
             degree_cm: 2,
             kappa: 1,
             ring_dim_d: ring_dim,
@@ -6842,7 +6845,7 @@ mod tests {
     #[test]
     #[ignore = "tiny-field gate coverage; run with `--release -- --ignored`"]
     fn test_we_plus_tiny_public_input_digest_unsat_on_flip() {
-        use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as RR;
+        use cyclotomic_rings::rings::GoldilocksRing64 as RR;
         use stark_rings::PolyRing;
         type BF0 = <<RR as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
 
@@ -6854,9 +6857,9 @@ mod tests {
         let pairs: Vec<(usize, usize)> = vec![(0, 0)];
 
         let params = WeParams {
-            nvars_setchk: 1,
+            nvars_setchk: 12,
             degree_setchk: 3,
-            nvars_cm: 1,
+            nvars_cm: 12,
             degree_cm: 2,
             kappa: 1,
             ring_dim_d: ring_dim,
@@ -6945,19 +6948,20 @@ mod tests {
     #[test]
     #[ignore = "tiny-field gate coverage; run with `--release -- --ignored`"]
     fn test_we_plus_tiny_unsat_on_constraint_var_flip() {
-        use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as RR;
+        use cyclotomic_rings::rings::GoldilocksRing64 as RR;
         use stark_rings::PolyRing;
 
         let ring_dim = RR::dimension() as u64;
-        let public_inputs_len = 0usize;
+        // Prefix binding requires at least `min(8, kappa)` public inputs; here kappa=1.
+        let public_inputs_len = 1usize;
         let n_lin_proofs = 1usize;
         let mlen_mats = 0usize;
         let pairs: Vec<(usize, usize)> = vec![(0, 0)];
 
         let params = WeParams {
-            nvars_setchk: 1,
+            nvars_setchk: 12,
             degree_setchk: 3,
-            nvars_cm: 1,
+            nvars_cm: 12,
             degree_cm: 2,
             kappa: 1,
             ring_dim_d: ring_dim,
@@ -6970,7 +6974,7 @@ mod tests {
         let trace =
             poseidon_trace_schedule_for_plus::<RR>(public_inputs_len, &params, n_lin_proofs, mlen_mats)
                 .expect("poseidon_trace_schedule_for_plus");
-        let public_inputs: Vec<F257> = Vec::new();
+        let public_inputs: Vec<F257> = vec![F257::ZERO; public_inputs_len];
 
         let out_dir_shape = {
             let mut p = std::env::temp_dir();
@@ -7070,7 +7074,7 @@ mod tests {
     #[test]
     #[ignore = "slow: builds full Π_plus transcript schedule into Poseidon(F257) dR1CS"]
     fn test_plus_poseidon_schedule_lifts_to_f257_and_satisfies() {
-        use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as RR;
+        use cyclotomic_rings::rings::GoldilocksRing64 as RR;
         use stark_rings::PolyRing;
 
         // Small-ish params; we only care about schedule validity.
