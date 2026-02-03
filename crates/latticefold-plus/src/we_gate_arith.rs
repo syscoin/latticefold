@@ -6154,11 +6154,15 @@ mod tests {
         use rand::{rngs::StdRng, SeedableRng};
 
         // Minimal-but-valid params to keep the schedule small.
+        //
+        // IMPORTANT: for ring_dim=64 the CM verifier math needs nvars_cm >= 12 (see also
+        // `test_tiny_gate_shape_builds_and_constraints_check_goldilocks`).
         let ring_dim = <R as PolyRing>::dimension() as u64;
+        let nvars_min = 12u64;
         let params = WeParams {
-            nvars_setchk: 1,
+            nvars_setchk: nvars_min,
             degree_setchk: 3,
-            nvars_cm: 1,
+            nvars_cm: nvars_min,
             degree_cm: 2,
             kappa: 1,
             ring_dim_d: ring_dim,
