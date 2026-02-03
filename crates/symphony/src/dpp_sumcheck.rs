@@ -128,12 +128,12 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
 
     fn stage_limit_bytes() -> usize {
         // Keep the existing knob name (historically introduced for Poseidon).
-        // Default: 64 MiB.
+        // Default: 512 MiB (favor throughput on large machines).
         let mb = std::env::var("LFP_POSEIDON_FILE_BACKED_STAGE_MB")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&v| v > 0)
-            .unwrap_or(64);
+            .unwrap_or(512);
         mb.saturating_mul(1024 * 1024)
     }
 

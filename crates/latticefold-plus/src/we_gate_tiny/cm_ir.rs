@@ -437,11 +437,11 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
         //
         // This is important for large merged IR fragments (e.g. `u_shared`), where full-fragment
         // buffers can reach tens of GB and become both RAM- and wall-time-dominant.
-        let chunk_constraints: usize = std::env::var("LFP_FILE_BACKED_LOWER_CHUNK_CONSTRAINTS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(100_000);
+        //
+        // Policy: use a larger fixed chunk size to reduce per-chunk overhead and keep Rayon
+        // workers busy on 96-core machines.
+        const CHUNK_CONSTRAINTS: usize = 500_000;
+        let chunk_constraints: usize = CHUNK_CONSTRAINTS;
 
         let (mut rows0, mut a0, mut b0, mut c0) =
             gb.file_counts().expect("file_counts must be Some in file-backed mode");

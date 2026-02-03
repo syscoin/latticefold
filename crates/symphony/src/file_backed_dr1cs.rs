@@ -92,21 +92,18 @@ fn write_u32_slice_le(w: &mut impl IoWrite, xs: &[u32]) -> Result<(), String> {
 
 #[inline]
 fn cfg_pwrite_enabled() -> bool {
-    // Enabled by default: file-backed builds want maximal parallelism.
-    // Disable explicitly with: LFP_FILE_BACKED_PWRITE=0/false/no
-    match std::env::var("LFP_FILE_BACKED_PWRITE").as_deref() {
-        Ok("0") | Ok("false") | Ok("no") => false,
-        _ => true,
-    }
+    // Production policy: always use `pwrite`/`write_at` on unix.
+    //
+    // This is the canonical tiny-gate build path and we want maximal throughput and parallelism
+    // without additional env knobs.
+    true
 }
 
 #[inline]
 fn cfg_pwrite_min_bytes() -> usize {
-    let mb: usize = std::env::var("LFP_FILE_BACKED_PWRITE_MIN_MB")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(16);
-    (mb.saturating_mul(1024 * 1024)).max(1 * 1024 * 1024)
+    // Avoid `pwrite` for tiny writes: small syscalls are faster via buffered sequential IO.
+    // For our workloads, raw-block flushes and merges are typically >> 1MiB.
+    1 * 1024 * 1024
 }
 
 fn term_paths(dir: &Path, which: &str) -> (PathBuf, PathBuf) {
