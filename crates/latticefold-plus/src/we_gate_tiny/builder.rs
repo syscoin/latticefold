@@ -2677,17 +2677,17 @@ fn compute_cm_shared_precomp_base(
                             // Reduce in bal4 using a tree of bal4 ring additions (pairwise).
                             // Build IRs in parallel, lower sequentially (single builder).
                             while cur4.len() > 1 {
-                                let pairs: Vec<[Ring4; 2]> = cur4
-                                    .chunks(2)
-                                    .filter_map(|p| if p.len() == 2 { Some([p[0], p[1]]) } else { None })
-                                    .collect();
-                                let carry: Option<Ring4> = if (cur4.len() & 1) == 1 { Some(*cur4.last().unwrap()) } else { None };
+                                let pairs_len: usize = cur4.len() / 2;
+                                let carry: Option<Ring4> =
+                                    if (cur4.len() & 1) == 1 { Some(*cur4.last().unwrap()) } else { None };
 
                                 // Snapshot assignment for this reduction layer.
                                 let base_asg2: &[F257] = &glue.gb.assignment;
-                                let reduce_frags: Vec<(_, [[IrVarRef; 33]; 64])> = pairs
+                                let reduce_frags: Vec<(_, [[IrVarRef; 33]; 64])> = (0..pairs_len)
                                     .into_par_iter()
-                                    .map(|[a, b]| -> Result<_, String> {
+                                    .map(|pi| -> Result<_, String> {
+                                        let a: &Ring4 = &cur4[2 * pi];
+                                        let b: &Ring4 = &cur4[2 * pi + 1];
                                         let mut ib = IrBuilder::new(base_asg2);
                                         let mut out: [[IrVarRef; 33]; 64] = [[IrVarRef::Base(0); 33]; 64];
                                         for i in 0..64 {
