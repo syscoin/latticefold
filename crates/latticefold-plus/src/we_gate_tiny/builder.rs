@@ -604,7 +604,7 @@ fn tiny_gate_poseidon_shard_permutes(cfg: &PoseidonConfig<F257>, ops: &[Poseidon
     // a silly number of shards.
     let target_shards = n_threads.min(256).max(2);
     let shard_permutes = (total_permutes + target_shards - 1) / target_shards;
-    shard_permutes.max(1024)
+    shard_permutes.max(256)
 }
 
 fn build_count_plan(
