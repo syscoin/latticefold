@@ -2340,13 +2340,17 @@ where
                 for l in 0..L {
                     let l_idx = 1 + l * stride;
                     let tau = eval_at(which, l_idx);
+                    // `eq` and `tau` are base-scalar lifted into the ring (constant coefficient).
+                    // Avoid ring×ring multiplication for coefficient-form rings like `GoldilocksRing64`.
+                    let eq0 = eq.coeffs()[0];
+                    let tau0 = tau.coeffs()[0];
                     let mut lin = R::ZERO;
                     for j in l_idx..(l_idx + stride) {
                         lin += eval_at(which, j) * rcps[j - 1];
                     }
-                    out += eq * lin;
-                    out += (tau * t0) * w_t0;
-                    out += (tau * t1) * w_t1;
+                    out += scale_by_base_owned(lin, eq0);
+                    out += scale_by_base_ref(&t0, tau0) * w_t0;
+                    out += scale_by_base_ref(&t1, tau0) * w_t1;
                 }
                 out
             };
