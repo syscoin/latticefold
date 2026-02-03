@@ -150,7 +150,11 @@ pub(super) fn select_first_ok_u32_try_digits(
     assert_eq!(digits_by_try.len(), tries * DIGITS_PER_TRY);
     let (ir, out_ir, found_ir) = {
         let base_asg: &[F257] = &b.assignment;
-        let mut ib = CmIrBuilder::new(base_asg);
+        let mut ib = if b.is_count_only() {
+            CmIrBuilder::new_count_only(base_asg)
+        } else {
+            CmIrBuilder::new(base_asg)
+        };
         let digits_ir: Vec<CmVarRef> = digits_by_try.iter().copied().map(CmVarRef::Base).collect();
         let (out_ir, found_ir) = select_first_ok_u32_try_digits_ir(&mut ib, &digits_ir, tries);
         (ib.ir, out_ir, found_ir)
@@ -230,7 +234,11 @@ pub(super) fn digit_to_byte_var(b: &mut Dr1csBuilder<F257>, d: usize) -> usize {
     // Keep byte bit-decomposition/caching in the builder layer.
     let (ir, byte_ir) = {
         let base_asg: &[F257] = &b.assignment;
-        let mut ib = CmIrBuilder::new(base_asg);
+        let mut ib = if b.is_count_only() {
+            CmIrBuilder::new_count_only(base_asg)
+        } else {
+            CmIrBuilder::new(base_asg)
+        };
         let byte_ir = digit_to_byte_ir(&mut ib, CmVarRef::Base(d));
         (ib.ir, byte_ir)
     };
@@ -276,7 +284,11 @@ pub(super) fn bounded_u32_from_8_digits_base128(
     let limbs: [usize; LIMBS_U32] = {
         let (ir, limbs_ir) = {
             let base_asg: &[F257] = &b.assignment;
-            let mut ib = CmIrBuilder::new(base_asg);
+            let mut ib = if b.is_count_only() {
+                CmIrBuilder::new_count_only(base_asg)
+            } else {
+                CmIrBuilder::new(base_asg)
+            };
             let bits_ir: [CmVarRef; 32] = core::array::from_fn(|i| CmVarRef::Base(bits32[i]));
             let limbs_ir = u32_bits_to_base128_limbs_ir(&mut ib, &bits_ir);
             (ib.ir, limbs_ir)

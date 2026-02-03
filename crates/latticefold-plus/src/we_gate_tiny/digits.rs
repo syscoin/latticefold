@@ -20,7 +20,11 @@ use super::cm_ir::{
 #[inline]
 fn enforce_var_eq_const_ir(b: &mut Dr1csBuilder<F257>, x: usize, c: F257) {
     let base_asg: &[F257] = &b.assignment;
-    let mut ib = CmIrBuilder::new(base_asg);
+    let mut ib = if b.is_count_only() {
+        CmIrBuilder::new_count_only(base_asg)
+    } else {
+        CmIrBuilder::new(base_asg)
+    };
     ib.ir.enforce_var_eq_const(CmVarRef::Base(x), c);
     let _lowered = lower_ir_into_builder(b, ib.ir);
 }
@@ -48,7 +52,11 @@ pub(crate) fn alloc_bal16_digit(b: &mut Dr1csBuilder<F257>, d: i8) -> usize {
     // IR is the source of truth; lower a tiny IR fragment into this builder.
     let base_one = b.assignment[b.one()];
     let base_asg = [base_one];
-    let mut ib = CmIrBuilder::new(&base_asg);
+    let mut ib = if b.is_count_only() {
+        CmIrBuilder::new_count_only(&base_asg)
+    } else {
+        CmIrBuilder::new(&base_asg)
+    };
     let out_ir = alloc_bal16_digit_ir(&mut ib, d);
     let lowered = lower_ir_into_builder(b, ib.ir);
     lowered.map_var(out_ir)
@@ -118,7 +126,11 @@ pub(crate) fn add_bal16_same_len(
     let _prev = b.profile_enter("digits::add_bal16_same_len");
     let (ir, out_ir, carry_ir) = {
         let base_asg: &[F257] = &b.assignment;
-        let mut ib = CmIrBuilder::new(base_asg);
+        let mut ib = if b.is_count_only() {
+            CmIrBuilder::new_count_only(base_asg)
+        } else {
+            CmIrBuilder::new(base_asg)
+        };
         let a_ir = CmBal16CheckedIr(a.as_slice().iter().copied().map(CmVarRef::Base).collect());
         let c_ir = CmBal16CheckedIr(c.as_slice().iter().copied().map(CmVarRef::Base).collect());
         let (out_ir, carry_ir) = add_bal16_same_len_ir(&mut ib, &a_ir, &c_ir);
@@ -161,7 +173,11 @@ fn add_bal16_loose_in_place(b: &mut Dr1csBuilder<F257>, acc: &mut Bal16Loose, sr
     debug_assert_eq!(acc.len(), src.len());
     let (ir, out_ir) = {
         let base_asg: &[F257] = &b.assignment;
-        let mut ib = CmIrBuilder::new(base_asg);
+        let mut ib = if b.is_count_only() {
+            CmIrBuilder::new_count_only(base_asg)
+        } else {
+            CmIrBuilder::new(base_asg)
+        };
         let acc_ir = CmBal16LooseIr {
             digits: acc.digits.iter().copied().map(CmVarRef::Base).collect(),
             abs_bound: acc.abs_bound,
@@ -191,7 +207,11 @@ fn normalize_bal16_loose_same_len_with_bound(
     // Delegate to the IR "source of truth" implementation, then lower into this builder.
     let (ir, out_ir, carry_ir) = {
         let base_asg: &[F257] = &b.assignment;
-        let mut ib = CmIrBuilder::new(base_asg);
+        let mut ib = if b.is_count_only() {
+            CmIrBuilder::new_count_only(base_asg)
+        } else {
+            CmIrBuilder::new(base_asg)
+        };
         let loose_ir = CmBal16LooseIr {
             digits: loose.digits.iter().copied().map(CmVarRef::Base).collect(),
             abs_bound: loose.abs_bound,
@@ -267,7 +287,11 @@ pub(crate) fn scale_short_coeffs_by_digits18(
 pub(crate) fn rebalance_tail_pm11_to_pm2(b: &mut Dr1csBuilder<F257>, digits: &[usize]) -> Vec<usize> {
     let (ir, out_ir) = {
         let base_asg: &[F257] = &b.assignment;
-        let mut ib = CmIrBuilder::new(base_asg);
+        let mut ib = if b.is_count_only() {
+            CmIrBuilder::new_count_only(base_asg)
+        } else {
+            CmIrBuilder::new(base_asg)
+        };
         let digits_ir: Vec<CmVarRef> = digits.iter().copied().map(CmVarRef::Base).collect();
         let out_ir = rebalance_tail_pm11_to_pm2_ir(&mut ib, &digits_ir);
         (ib.ir, out_ir)
@@ -554,7 +578,11 @@ pub(crate) fn mul_bal16_small(b: &mut Dr1csBuilder<F257>, a: &[usize], bb: &[usi
     let _prev = b.profile_enter("digits::mul_bal16_small");
     let (ir, out_ir) = {
         let base_asg: &[F257] = &b.assignment;
-        let mut ib = CmIrBuilder::new(base_asg);
+        let mut ib = if b.is_count_only() {
+            CmIrBuilder::new_count_only(base_asg)
+        } else {
+            CmIrBuilder::new(base_asg)
+        };
         let a_ir: Vec<CmVarRef> = a.iter().copied().map(CmVarRef::Base).collect();
         let b_ir: Vec<CmVarRef> = bb.iter().copied().map(CmVarRef::Base).collect();
         let out_ir = mul_bal16_small_ir(&mut ib, &a_ir, &b_ir);
@@ -583,7 +611,11 @@ pub(crate) fn u32_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
 
     let (ir, out_ir) = {
         let base_asg: &[F257] = &b.assignment;
-        let mut ib = CmIrBuilder::new(base_asg);
+        let mut ib = if b.is_count_only() {
+            CmIrBuilder::new_count_only(base_asg)
+        } else {
+            CmIrBuilder::new(base_asg)
+        };
         let bits_ir: [[CmVarRef; 8]; 4] =
             core::array::from_fn(|i| core::array::from_fn(|j| CmVarRef::Base(bytes_bits[i][j])));
         let out_ir = u32_bytes_to_bal16_digits_from_bits_ir(&mut ib, &bits_ir);
@@ -610,7 +642,11 @@ pub(crate) fn u64_bytes_to_bal16_digits(b: &mut Dr1csBuilder<F257>, bytes_le: [u
 
     let (ir, out_ir) = {
         let base_asg: &[F257] = &b.assignment;
-        let mut ib = CmIrBuilder::new(base_asg);
+        let mut ib = if b.is_count_only() {
+            CmIrBuilder::new_count_only(base_asg)
+        } else {
+            CmIrBuilder::new(base_asg)
+        };
         let bits_ir: [[CmVarRef; 8]; 8] =
             core::array::from_fn(|i| core::array::from_fn(|j| CmVarRef::Base(bytes_bits[i][j])));
         let out_ir = u64_bytes_to_bal16_digits_from_bits_ir(&mut ib, &bits_ir);

@@ -189,10 +189,15 @@ pub(crate) fn ring_add_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &R
     // Scalar ops come overwhelmingly from ring ops; build per-coefficient shards in parallel.
     tiny_cm_bump(|c| c.scalar_add += a.len() as u64);
     let base_asg: &[F257] = &gb.assignment;
+    let count_only = gb.is_count_only();
     let frags: Vec<(_, [IrVarRef; 17])> = (0..a.len())
         .into_par_iter()
         .map(|i| {
-            let mut ib = IrBuilder::new(base_asg);
+            let mut ib = if count_only {
+                IrBuilder::new_count_only(base_asg)
+            } else {
+                IrBuilder::new(base_asg)
+            };
             let ai: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(a[i][j]));
             let bi: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(b[i][j]));
             let out = goldilocks_add_mod_p_digits_ir(
@@ -224,10 +229,15 @@ pub(crate) fn ring_sub_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, b: &R
     debug_assert_eq!(a.len(), b.len());
     tiny_cm_bump(|c| c.scalar_sub += a.len() as u64);
     let base_asg: &[F257] = &gb.assignment;
+    let count_only = gb.is_count_only();
     let frags: Vec<(_, [IrVarRef; 17])> = (0..a.len())
         .into_par_iter()
         .map(|i| {
-            let mut ib = IrBuilder::new(base_asg);
+            let mut ib = if count_only {
+                IrBuilder::new_count_only(base_asg)
+            } else {
+                IrBuilder::new(base_asg)
+            };
             let ai: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(a[i][j]));
             let bi: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(b[i][j]));
             let out = goldilocks_sub_mod_p_digits_ir(
@@ -258,12 +268,17 @@ pub(crate) fn ring_scale_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, s: 
     tiny_cm_bump(|c| c.ring_scale += 1);
     tiny_cm_bump(|c| c.scalar_mul += a.len() as u64);
     let base_asg: &[F257] = &gb.assignment;
+    let count_only = gb.is_count_only();
     let s_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(s[j]));
     // Build a single IR fragment for the whole ring-scaling, so the IR-side caches (notably
     // `bal16_to_bal4_digits_cached`) can reuse the scalar `s` decomposition across all coefficients.
     let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
     let p_d = goldilocks_p_bal16_digits_le_const();
-    let mut ib = IrBuilder::new(base_asg);
+    let mut ib = if count_only {
+        IrBuilder::new_count_only(base_asg)
+    } else {
+        IrBuilder::new(base_asg)
+    };
     let mut out_ir: Vec<[IrVarRef; 17]> = Vec::with_capacity(a.len());
     for i in 0..a.len() {
         let ai: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(a[i][j]));
@@ -296,7 +311,11 @@ pub(crate) fn goldilocks_add_mod_p_digits(
     let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
     let p_d = goldilocks_p_bal16_digits_le_const();
     let base_asg: &[F257] = &gb.assignment;
-    let mut ib = IrBuilder::new(base_asg);
+    let mut ib = if gb.is_count_only() {
+        IrBuilder::new_count_only(base_asg)
+    } else {
+        IrBuilder::new(base_asg)
+    };
     let a_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(a[j]));
     let c_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(c[j]));
     let out_ir = goldilocks_add_mod_p_digits_ir(&mut ib, &a_ir, &c_ir, p_u64, &p_d);
@@ -317,7 +336,11 @@ pub(crate) fn goldilocks_sub_mod_p_digits(
     let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
     let p_d = goldilocks_p_bal16_digits_le_const();
     let base_asg: &[F257] = &gb.assignment;
-    let mut ib = IrBuilder::new(base_asg);
+    let mut ib = if gb.is_count_only() {
+        IrBuilder::new_count_only(base_asg)
+    } else {
+        IrBuilder::new(base_asg)
+    };
     let a_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(a[j]));
     let c_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(c[j]));
     let out_ir = goldilocks_sub_mod_p_digits_ir(&mut ib, &a_ir, &c_ir, p_u64, &p_d);
@@ -338,7 +361,11 @@ pub(crate) fn goldilocks_mul_mod_p_digits(
     let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
     let p_d = goldilocks_p_bal16_digits_le_const();
     let base_asg: &[F257] = &gb.assignment;
-    let mut ib = IrBuilder::new(base_asg);
+    let mut ib = if gb.is_count_only() {
+        IrBuilder::new_count_only(base_asg)
+    } else {
+        IrBuilder::new(base_asg)
+    };
     let a_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(a[j]));
     let c_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(c[j]));
     let out_ir = goldilocks_mul_mod_p_digits_ir(&mut ib, &a_ir, &c_ir, p_u64, &p_d);
@@ -359,7 +386,11 @@ pub(crate) fn goldilocks_mul_const_mod_p_digits(
     let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
     debug_assert!(k < p_u64);
     let base_asg: &[F257] = &gb.assignment;
-    let mut ib = IrBuilder::new(base_asg);
+    let mut ib = if gb.is_count_only() {
+        IrBuilder::new_count_only(base_asg)
+    } else {
+        IrBuilder::new(base_asg)
+    };
     let a_ir: [IrVarRef; 17] = core::array::from_fn(|j| IrVarRef::Base(a[j]));
     let a4 = ib.bal16_to_bal4_digits_cached(&a_ir);
     let r4 = goldilocks_mul_const_mod_p_digits_bal4_ir(&mut ib, &a4, k, p_u64);
@@ -853,7 +884,12 @@ pub(crate) fn eval_t_z_optimized_ring_digits_pair(
         let v11_16 = ringdigits64_to_ir(&v11)?;
         let pad16: [IrVarRef; 17] = core::array::from_fn(|k| IrVarRef::Base(pad[k]));
 
-        let mut ib = IrBuilder::new(gb.assignment.as_slice());
+        let base_asg: &[F257] = gb.assignment.as_slice();
+        let mut ib = if gb.is_count_only() {
+            IrBuilder::new_count_only(base_asg)
+        } else {
+            IrBuilder::new(base_asg)
+        };
 
         let v2_4: [[IrVarRef; 33]; 64] = core::array::from_fn(|i| ib.bal16_to_bal4_digits_cached(&v2_16[i]));
         let v3_4: [[IrVarRef; 33]; 64] = core::array::from_fn(|i| ib.bal16_to_bal4_digits_cached(&v3_16[i]));
