@@ -597,14 +597,12 @@ struct TinyGatePlan {
 fn tiny_gate_poseidon_shard_permutes(cfg: &PoseidonConfig<F257>, ops: &[PoseidonTraceOp<F257>]) -> usize {
     let n_threads = rayon::current_num_threads().max(1);
     let total_permutes = count_permutes_for_ops(cfg, ops);
-    // Poseidon arith uses **file-backed staging buffers per shard**.
+    // Important for throughput: do NOT cap shard count at a small constant.
+    // We want Poseidon (Pass0 count + Pass1 range-write) to scale with available cores.
     //
-    // If we spawn ~O(threads) shards on large machines, total in-flight staging can explode
-    // (e.g. 96 shards × 512MiB default staging ≈ 48GiB), which hurts performance due to memory
-    // pressure and IO contention.
-    //
-    // Empirically, ~32 shards is enough to saturate CPU while keeping staging bounded.
-    let target_shards = n_threads.min(32).max(2);
+    // Shards are further implicitly capped by the `max(1024)` below, so tiny traces won't spawn
+    // a silly number of shards.
+    let target_shards = n_threads.min(256).max(2);
     let shard_permutes = (total_permutes + target_shards - 1) / target_shards;
     shard_permutes.max(256)
 }
