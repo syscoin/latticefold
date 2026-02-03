@@ -990,15 +990,15 @@ fn build_dirs(out_dir: impl AsRef<Path>) -> BuildDirs {
     }
 }
 
-fn build_canonicality_shards(
+fn build_canonicality_shards<'p>(
     mode: &TinyGateBuildMode,
     part_base: usize,
     range: Option<&TinyGateRangeBase>,
-    pose_asg: &[F257],
+    pose_asg: &'p [F257],
     ops: &[PoseidonTraceOp<F257>],
     pose_wiring: &PoseidonDr1csWiring,
     dirs: &BuildDirs,
-) -> Result<Vec<GlueCtx<'_>>, String> {
+) -> Result<Vec<GlueCtx<'p>>, String> {
     let canonical_ranges = collect_nonreabsorb_absorb_ranges(ops, pose_wiring)?;
     if canonical_ranges.is_empty() {
         return Ok(Vec::new());
@@ -1020,7 +1020,7 @@ fn build_canonicality_shards(
         .enumerate()
         .collect::<Vec<_>>()
         .into_par_iter()
-        .map(|(idx, chunk)| -> Result<GlueCtx<'_>, String> {
+        .map(|(idx, chunk)| -> Result<GlueCtx<'p>, String> {
             let dir = dirs.root.join(format!("canon_{idx}"));
             let mut g = GlueCtx::new(mode, pose_asg, dir, part_base + idx, range)?;
             enforce_canonical_goldilocks_for_ranges(&mut g, pose_wiring, chunk)?;
@@ -1126,7 +1126,7 @@ fn add_decomp_linb2x_constraints(
     Ok(())
 }
 
-fn build_cm_shards(
+fn build_cm_shards<'p>(
     mode: &TinyGateBuildMode,
     part_base: usize,
     range: Option<&TinyGateRangeBase>,
@@ -1143,13 +1143,13 @@ fn build_cm_shards(
     setchk_out_e_vars_for_cm: Option<Arc<Vec<Vec<Vec<RingDigits>>>>>,
     dcom_evals_for_cm: Option<Arc<Vec<DcomEvalDigits>>>,
     cm_shared_base: Option<Arc<CmSharedPrecompBase>>,
-    pose_asg: &[F257],
+    pose_asg: &'p [F257],
     base_asg: &[F257],
     short_locals: &[ShortChallengeWiring],
     u32_locals: &[BoundedU32ChallengeWiring],
     goldilocks_locals: &[GoldilocksChallengeWiring],
     dirs: &BuildDirs,
-) -> Result<Vec<GlueCtx<'_>>, String> {
+) -> Result<Vec<GlueCtx<'p>>, String> {
     if !(ring_dim > 0 && l_instances_expected > 0 && !comh_absorbs.is_empty()) {
         return Ok(Vec::new());
     }
@@ -3767,7 +3767,7 @@ fn enforce_canonical_goldilocks_for_ranges(
     Ok(())
 }
 
-fn build_cm_glue_for_which(
+fn build_cm_glue_for_which<'p>(
     mode: &TinyGateBuildMode,
     part_idx: usize,
     range: Option<&TinyGateRangeBase>,
@@ -3788,13 +3788,13 @@ fn build_cm_glue_for_which(
     // Shared CM precomputations built once in the base glue module (u, s_prime_flat, etc).
     cm_shared_base: Option<Arc<CmSharedPrecompBase>>,
     which: usize,
-    pose_asg: &[F257],
+    pose_asg: &'p [F257],
     base_asg: &[F257],
     short_locals: &[ShortChallengeWiring],
     u32_locals: &[BoundedU32ChallengeWiring],
     goldilocks_locals: &[GoldilocksChallengeWiring],
     out_dir: &Path,
-) -> Result<GlueCtx<'_>, String> {
+) -> Result<GlueCtx<'p>, String> {
     let mut glue = GlueCtx::new(mode, pose_asg, out_dir, part_idx, range)?;
     if ring_dim == 0 || l_instances_expected == 0 {
         return Ok(glue);
