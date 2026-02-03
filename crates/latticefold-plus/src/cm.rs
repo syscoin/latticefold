@@ -42,6 +42,34 @@ fn is_const_coeff_sparse_matrix<R: PolyRing>(m: &SparseMatrix<R>) -> bool {
     true
 }
 
+/// Scale a ring element by a base-ring scalar without invoking ring×ring multiplication.
+///
+/// Important for coefficient-form rings (e.g. `GoldilocksRing64`) where `Mul<R>` is an NTT
+/// convolution: when the multiplier is a **constant-coefficient** ring element, the correct
+/// operation is coefficient-wise scaling.
+#[inline(always)]
+fn scale_by_base_owned<R: OverField + PolyRing>(mut x: R, s: R::BaseRing) -> R
+where
+    R::BaseRing: Copy + core::ops::MulAssign,
+{
+    for c in x.coeffs_mut() {
+        *c *= s;
+    }
+    x
+}
+
+#[inline(always)]
+fn scale_by_base_ref<R: OverField + PolyRing + Clone>(x: &R, s: R::BaseRing) -> R
+where
+    R::BaseRing: Copy + core::ops::MulAssign,
+{
+    let mut out = x.clone();
+    for c in out.coeffs_mut() {
+        *c *= s;
+    }
+    out
+}
+
 fn try_as_base_scalars<R: PolyRing>(v: &[R]) -> Option<Vec<R::BaseRing>> {
     let mut out = Vec::with_capacity(v.len());
     for x in v {
@@ -1387,19 +1415,22 @@ where
 
             let eval_point = |which: u8| -> R {
                 let eq = eval_at(which, 0);
+                let eq0 = eq.coeffs()[0];
                 let t0 = eval_at(which, n - 2);
                 let t1 = eval_at(which, n - 1);
                 let mut out = R::ZERO;
                 for l in 0..L {
                     let l_idx = 1 + l * stride;
                     let tau = eval_at(which, l_idx);
+                    // `tau` is also base-scalar lifted (constant coefficient).
+                    let tau0 = tau.coeffs()[0];
                     let mut lin = R::ZERO;
                     for j in l_idx..(l_idx + stride) {
                         lin += eval_at(which, j) * rcps[j - 1];
                     }
-                    out += eq * lin;
-                    out += (tau * t0) * w_t0;
-                    out += (tau * t1) * w_t1;
+                    out += scale_by_base_owned(lin, eq0);
+                    out += scale_by_base_ref(&t0, tau0) * w_t0;
+                    out += scale_by_base_ref(&t1, tau0) * w_t1;
                 }
                 out
             };
@@ -1854,9 +1885,13 @@ where
                     for j in l_idx..(l_idx + stride) {
                         lin += eval_at(which, j) * rcps[j - 1];
                     }
-                    out += eq * lin;
-                    out += (tau * t0) * w_t0;
-                    out += (tau * t1) * w_t1;
+                    // `eq` and `tau` are base-scalar lifted into the ring (constant coefficient).
+                    // Avoid ring×ring multiplication for coefficient-form rings like `GoldilocksRing64`.
+                    let eq0 = eq.coeffs()[0];
+                    let tau0 = tau.coeffs()[0];
+                    out += scale_by_base_owned(lin, eq0);
+                    out += scale_by_base_ref(&t0, tau0) * w_t0;
+                    out += scale_by_base_ref(&t1, tau0) * w_t1;
                 }
                 out
             };
