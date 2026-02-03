@@ -1778,7 +1778,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
         // Prefix binding: when L=1, bind the first `min(8, kappa)` witness-commitment rows of `cm_f`
         // to the first `min(8, kappa)` public inputs absorbed in the transcript prefix.
         //
-        // This matches the LF+ verifier behavior in `we_gate_arith.rs` (commit-before-challenge).
+        // This matches the LF+ verifier behavior (commit-before-challenge).
         const EXPOSE_MAX: usize = 8;
         let expose_rows = EXPOSE_MAX.min(kappa);
         if expose_rows > 0 {

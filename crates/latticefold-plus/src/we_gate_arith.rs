@@ -87,6 +87,7 @@ fn collect_get_challenge_squeeze_field_indices(
 
 #[cfg(feature = "we_gate")]
 fn build_we_dr1cs_for_plus_proof_shape_tiny<R>(
+    trace: &PoseidonTranscriptTrace<BF<R>>,
     params: &WeParams,
     public_inputs: &[BF<R>],
     n_lin_proofs: usize,
@@ -108,8 +109,11 @@ where
     let extra = tiny_extra_witness_from_plus_proof::<R>(params, &proof, mlen_mats)?;
     let ring_dim = R::dimension();
 
-    let trace =
-        poseidon_trace_schedule_for_plus_with_public_inputs::<R>(public_inputs, params, n_lin_proofs, mlen_mats)?;
+    // IMPORTANT: to guarantee shape == witness builder, use the *caller-provided* recorded trace
+    // (rather than regenerating it here). This prevents any accidental schedule drift between the
+    // arm-time and witness-time builders.
+    //
+    // The caller is responsible for ensuring `trace` corresponds to `public_inputs` and params.
     let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<R>>(&trace.ops)?;
 
     let k = params.k as usize;
@@ -6069,7 +6073,9 @@ mod tests {
         let pairs: Vec<(usize, usize)> = vec![(0, 0)];
 
         // Build a self-consistent trace and arithmetize the tiny gate.
-        let trace = super::poseidon_trace_schedule_for_plus::<RR>(0, &params, 1, 0)
+        // Prefix binding requires at least `min(8,kappa)` public inputs absorbed before challenges.
+        // Here kappa=1, so include exactly 1 dummy public input absorb in the trace.
+        let trace = super::poseidon_trace_schedule_for_plus::<RR>(1, &params, 1, 0)
             .expect("poseidon_trace_schedule_for_plus");
         let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<RR>>(&trace.ops)
             .expect("lift_recording_trace_ops_to_f257");
@@ -6215,6 +6221,7 @@ mod tests {
             p
         };
         let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
+            &trace,
             &params,
             &public_inputs_bf,
             n_lin_proofs,
@@ -6779,18 +6786,38 @@ mod tests {
             std::fs::create_dir_all(&p).expect("create temp out_dir1");
             p
         };
-        let s0 = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
+        let public_inputs0 =
+            vec![<<RR as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField::ZERO; public_inputs_len];
+        let trace0 = poseidon_trace_schedule_for_plus_with_public_inputs::<RR>(
+            &public_inputs0,
             &base,
-            &vec![<<RR as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField::ZERO; public_inputs_len],
+            n_lin_proofs,
+            0,
+        )
+        .expect("poseidon_trace_schedule_for_plus_with_public_inputs(base)");
+        let s0 = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
+            &trace0,
+            &base,
+            &public_inputs0,
             n_lin_proofs,
             0,
             &pairs,
             &out_dir0,
         )
         .expect("shape(base)");
-        let s1 = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
+        let public_inputs1 =
+            vec![<<RR as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField::ZERO; public_inputs_len];
+        let trace1 = poseidon_trace_schedule_for_plus_with_public_inputs::<RR>(
+            &public_inputs1,
             &alt,
-            &vec![<<RR as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField::ZERO; public_inputs_len],
+            n_lin_proofs,
+            1,
+        )
+        .expect("poseidon_trace_schedule_for_plus_with_public_inputs(alt)");
+        let s1 = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
+            &trace1,
+            &alt,
+            &public_inputs1,
             n_lin_proofs,
             1,
             &pairs,
@@ -6868,6 +6895,7 @@ mod tests {
             p
         };
         let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
+            &trace,
             &params,
             &public_inputs_bf,
             n_lin_proofs,
@@ -6951,9 +6979,11 @@ mod tests {
             std::fs::create_dir_all(&p).expect("create temp out_dir_shape");
             p
         };
+        let public_inputs_bf: Vec<BF::<RR>> = vec![BF::<RR>::ZERO; public_inputs_len];
         let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
+            &trace,
             &params,
-            &vec![BF::<RR>::ZERO; public_inputs_len],
+            &public_inputs_bf,
             n_lin_proofs,
             mlen_mats,
             &pairs,
