@@ -6167,25 +6167,37 @@ mod tests {
             l: 1,
             mlen: 0,
         };
-        let public_inputs_len = 0usize;
+        let public_inputs_len = 8usize;
         let n_lin_proofs = 1usize; // schedule builder currently assumes L=1
         let mlen_mats = 0usize;
         // Mirror the SP1 oneproof path: use the canonical tiny-gate builders.
-        // (For now we keep `public_inputs_len=0`, so this is the minimal end-to-end roundtrip.)
+        // Include an SP1-style exposed-prefix public input vector (len=8) so we exercise
+        // prefix binding at arming/proving time.
         //
         // NOTE: `pairs` indices are interpreted over the full `u32_squeeze_ops` wiring, which
         // includes any prefix `get_challenge()` u32 squeezes.
         let pairs: Vec<(usize, usize)> = vec![(0, 0)];
-        let public_inputs_f257: Vec<F257> = vec![F257::from(0u64); public_inputs_len];
+        let public_inputs_f257: Vec<F257> = (0..public_inputs_len)
+            .map(|i| if (i % 3) == 0 { F257::ONE } else { F257::ZERO })
+            .collect();
+        type BF0 = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
+        let public_inputs_bf: Vec<BF0> = public_inputs_f257
+            .iter()
+            .map(|x| {
+                // F257 is a small prime field; lift via canonical u64 rep.
+                let u = x.into_bigint().as_ref().get(0).copied().unwrap_or(0);
+                BF0::from(u)
+            })
+            .collect();
 
-        // Build a concrete trace that is self-consistent (squeeze values are re-absorbed).
-        let trace = super::poseidon_trace_schedule_for_plus::<R>(
-            public_inputs_len,
+        // Build a self-consistent schedule trace whose initial absorbs match `public_inputs_f257`.
+        let trace = super::poseidon_trace_schedule_for_plus_with_public_inputs::<R>(
+            &public_inputs_bf,
             &params,
             n_lin_proofs,
             mlen_mats,
         )
-        .expect("poseidon_trace_schedule_for_plus");
+        .expect("poseidon_trace_schedule_for_plus_with_public_inputs");
 
         // Armer builds the shape.
         let t_shape = Instant::now();
@@ -6259,6 +6271,7 @@ mod tests {
         let ctx = arm_lfplus_we_gate_tiny_ringlwe_streaming::<R>(
             shape,
             &params,
+            &public_inputs_f257,
             stmt_digest,
             armer_seed,
             lock_j,
@@ -6274,7 +6287,7 @@ mod tests {
             ctx.proof_len()
         );
 
-        let x = encode_public_x::<F257>(&params, &[]);
+        let x = encode_public_x::<F257>(&params, &public_inputs_f257);
         assert_eq!(x.len(), public_len);
         assert_eq!(&asg[..public_len], x.as_slice(), "satisfying assignment public prefix mismatch");
         let z_w = asg[public_len..].to_vec();
@@ -6295,6 +6308,12 @@ mod tests {
         let mut pi_bad = pi.clone();
         pi_bad[0] += F257::from(1u64);
         assert!(ctx.lock.decap_answer(&x, &pi_bad).is_err());
+
+        // Negative check: flip a public input and ensure decap fails with the same proof.
+        let mut x_bad = x.clone();
+        let first_pi = 1usize + 10usize; // [ONE] || [10×WeParams] || [public_inputs...]
+        x_bad[first_pi] += F257::ONE;
+        assert!(ctx.lock.decap_answer(&x_bad, &pi).is_err());
     }
 
     #[derive(MontConfig)]

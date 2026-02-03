@@ -157,12 +157,13 @@ pub(crate) fn arm_we_ringlwe_from_dr1cs_streaming<F: PrimeField + FftField>(
 ///
 /// Notes:
 /// - The statement binding is carried by `stmt_digest` via `c_stmt` inside `arm_theorem43_from_statement`.
-/// - `x` is currently a minimal public prefix (typically just `[1]`) unless/until the tiny gate
-///   exports additional public inputs.
+/// - `x` is the canonical public statement encoding:
+///   `x = [ONE] || [10×WeParams] || [public_inputs...]`.
 #[cfg(feature = "we_gate")]
 pub(crate) fn arm_lfplus_we_gate_tiny_ringlwe_streaming<R>(
     shape: we_gate_arith::WeDr1csShape<F257>,
     params: &WeParams,
+    public_inputs: &[F257],
     stmt_digest: [u8; 32],
     armer_seed: [u8; 32],
     lock_j: u64,
@@ -175,16 +176,14 @@ where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + ark_ff::Field + ark_ff::PrimeField,
 {
-    let x: Vec<F257> = match shape.public_len {
-        1 => vec![F257::from(1u64)],
-        // If/when the tiny gate includes the standard params prefix, use the canonical encoding.
-        11 => crate::we_statement::encode_public_x::<F257>(params, &[]),
-        other => {
-            return Err(format!(
-                "arm_lfplus_we_gate_tiny_ringlwe_streaming: unsupported public_len={other}"
-            ))
-        }
-    };
+    let x = crate::we_statement::encode_public_x::<F257>(params, public_inputs);
+    if x.len() != shape.public_len {
+        return Err(format!(
+            "arm_lfplus_we_gate_tiny_ringlwe_streaming: public_len mismatch (shape={} vs x={})",
+            shape.public_len,
+            x.len()
+        ));
+    }
 
     arm_we_ringlwe_from_dr1cs_streaming::<F257>(
         shape.inst,
