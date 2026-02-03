@@ -924,6 +924,162 @@ where
         }
         Some(sum0)
     }
+
+    /// Like `eval4_at_row`, but instead of returning `[R;4]`, it adds the result scaled by a
+    /// base-ring weight `w` into the provided accumulator `acc`.
+    ///
+    /// This is performance-critical for `LazyFixed`: it avoids materializing/copying `[R;4]`
+    /// and avoids creating temporaries like `v[i] * w` for large rings (e.g. d=64 coeff rings).
+    #[inline]
+    pub(crate) fn eval4_at_row_weighted_into(
+        &self,
+        row: usize,
+        w: R::BaseRing,
+        acc: &mut [R; 4],
+        hfrom_cache: &mut Option<HFromIndexCache<R>>,
+    ) {
+        if w == R::BaseRing::ZERO {
+            return;
+        }
+        if row >= self.matrix0.coeffs.len() {
+            return;
+        }
+
+        match (&self.w0, &self.w1, &self.w2, &self.w3) {
+            (
+                CmMatVecWitness::Base(w0),
+                CmMatVecWitness::MonomialDigitsMonomial { digits, mono_idx, mono_coeff },
+                CmMatVecWitness::Base(w2),
+                CmMatVecWitness::Mle(w3),
+            ) => {
+                let w0s: &[R::BaseRing] = w0.as_ref();
+                let w2s: &[R::BaseRing] = w2.as_ref();
+                let digs: &[u16] = digits.as_ref();
+                let mono_idx: &[u16] = mono_idx.as_ref();
+                let mono_coeff: &[R::BaseRing] = mono_coeff.as_ref();
+
+                // Peel `LazyFixed` layers with empty `fixed` (identity) so we can hit the dense/HFrom fast paths.
+                let mut w3m: &StreamingMleEnum<R> = w3.as_ref();
+                loop {
+                    match w3m {
+                        StreamingMleEnum::LazyFixed { inner, fixed, .. } if fixed.is_empty() => {
+                            w3m = inner.as_ref();
+                        }
+                        _ => break,
+                    }
+                }
+
+                enum W3Fast<'a, Rr: OverField + PolyRing>
+                where
+                    Rr::BaseRing: Ring,
+                {
+                    Dense(&'a [Rr]),
+                    HFrom {
+                        rest_sum: &'a Rr,
+                        groups: &'a [HFromGroup<Rr>],
+                        h_id: usize,
+                    },
+                    Other(&'a StreamingMleEnum<Rr>),
+                }
+                let w3fast = match w3m {
+                    StreamingMleEnum::DenseArc { evals, .. } => W3Fast::Dense(evals.as_ref()),
+                    StreamingMleEnum::DenseOwned { evals, .. } => W3Fast::Dense(evals.as_ref()),
+                    StreamingMleEnum::HFromMfDigitsConstCol0 { groups, rest_sum, .. } => {
+                        W3Fast::HFrom {
+                            rest_sum,
+                            groups: groups.as_ref(),
+                            h_id: Arc::as_ptr(groups) as usize,
+                        }
+                    }
+                    _ => W3Fast::Other(w3m),
+                };
+
+                // Prepare streamed-h cache once per row.
+                let mut hcache: Option<&mut HFromIndexCache<R>> = None;
+                if let W3Fast::HFrom { h_id, .. } = &w3fast {
+                    if hfrom_cache.as_ref().map(|c| c.id) != Some(*h_id) {
+                        *hfrom_cache = Some(HFromIndexCache::<R>::new(*h_id));
+                    }
+                    hcache = Some(hfrom_cache.as_mut().unwrap());
+                }
+
+                // Accumulate into constant-coeff outputs directly.
+                // Split borrows to keep the borrow checker happy.
+                let (a01, a23) = acc.split_at_mut(2);
+                let (a0, a1) = a01.split_at_mut(1);
+                let (a2, a3) = a23.split_at_mut(1);
+                let acc0c0 = &mut a0[0].coeffs_mut()[0];
+                let acc1_coeffs = a1[0].coeffs_mut();
+                let acc2c0 = &mut a2[0].coeffs_mut()[0];
+                let acc3 = &mut a3[0];
+
+                // Collapse 3 bounds checks (w0/w2/digs) into one fast-path where possible.
+                let len0 = w0s.len();
+                let len2 = w2s.len();
+                let len_d = digs.len();
+                let len_fast = len0.min(len2).min(len_d);
+
+                for (coeff0, col_idx) in &self.matrix0.coeffs[row] {
+                    let c0 = *coeff0;
+                    let cj = *col_idx;
+                    let c0w = c0 * w;
+
+                    if cj < len_fast {
+                        unsafe {
+                            *acc0c0 += c0w * *w0s.get_unchecked(cj);
+                            *acc2c0 += c0w * *w2s.get_unchecked(cj);
+                            let d = *digs.get_unchecked(cj) as usize;
+                            acc1_coeffs[*mono_idx.get_unchecked(d) as usize] +=
+                                *mono_coeff.get_unchecked(d) * c0w;
+                        }
+                    } else {
+                        if cj < len0 {
+                            *acc0c0 += c0w * w0s[cj];
+                        }
+                        if cj < len2 {
+                            *acc2c0 += c0w * w2s[cj];
+                        }
+                        if cj < len_d {
+                            let d = digs[cj] as usize;
+                            acc1_coeffs[mono_idx[d] as usize] += mono_coeff[d] * c0w;
+                        }
+                    }
+
+                    // `w3` is an MLE; scale its contribution by `c0*w`.
+                    match &w3fast {
+                        W3Fast::Dense(v) => {
+                            if let Some(hv) = v.get(cj) {
+                                Self::add_scaled(acc3, hv, c0w);
+                            }
+                        }
+                        W3Fast::HFrom { groups, rest_sum, .. } => {
+                            let cache = hcache.as_mut().unwrap();
+                            let hv = cache.get_or_compute(cj, || {
+                                let mut hv = (*rest_sum).clone();
+                                for g in groups.iter() {
+                                    hv += &g.table[g.packed_at(cj)];
+                                }
+                                hv
+                            });
+                            Self::add_scaled(acc3, &hv, c0w);
+                        }
+                        W3Fast::Other(m) => {
+                            let hv = m.eval_at_index(cj);
+                            Self::add_scaled(acc3, &hv, c0w);
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Fallback: materialize then scale.
+                let v = self.eval4_at_row(row, hfrom_cache);
+                acc[0] += v[0] * w;
+                acc[1] += v[1] * w;
+                acc[2] += v[2] * w;
+                acc[3] += v[3] * w;
+            }
+        }
+    }
 }
 
 impl<R: OverField + PolyRing> StreamingMleEnum<R>
@@ -2518,11 +2674,7 @@ impl StreamingSumcheck {
                         if w == R::BaseRing::ZERO {
                             continue;
                         }
-                        let v = shared.eval4_at_row(base | b, hfrom_cache);
-                        acc[0] += v[0] * w;
-                        acc[1] += v[1] * w;
-                        acc[2] += v[2] * w;
-                        acc[3] += v[3] * w;
+                        shared.eval4_at_row_weighted_into(base | b, w, &mut acc, hfrom_cache);
                     }
                     match lazy_cache.as_mut() {
                         Some((csid, cbase, ck, vals)) => {
