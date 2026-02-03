@@ -99,7 +99,8 @@ where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + Field + PrimeField,
 {
-    let public_inputs_len = public_inputs.len();
+    // Public inputs are absorbed as fixed-width base-field bytes in the transcript.
+    let public_inputs_elems = public_inputs.len();
 
     // Shape-only must still build the **full faithful** tiny-gate relation.
     //
@@ -184,8 +185,12 @@ where
     for &x in &params.to_field_vec::<F257>() {
         b_params.new_var(x);
     }
-    // Reserve slots for public inputs (statement-defined); values are provided at proof time.
-    for _ in 0..public_inputs_len {
+    // Reserve slots for public input **bytes** (statement-defined); values are provided at proof time.
+    let coeff_bytes = ((<R::BaseRing as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8;
+    let public_inputs_bytes_len = public_inputs_elems
+        .checked_mul(coeff_bytes)
+        .ok_or_else(|| "tiny gate: public input byte length overflow".to_string())?;
+    for _ in 0..public_inputs_bytes_len {
         b_params.new_var(F257::from(0u64));
     }
     let (params_inst, params_asg) = b_params
@@ -200,9 +205,8 @@ where
     let mut parts: Vec<(FileBackedSparseDr1csInstance<F257>, Vec<F257>)> =
         vec![(params_inst, params_asg), (inst_pose, asg_pose)];
 
-    if public_inputs_len > 0 {
-        let coeff_bytes = ((<R::BaseRing as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8;
-        if pose_wiring.absorb_ranges.len() < public_inputs_len {
+    if public_inputs_elems > 0 {
+        if pose_wiring.absorb_ranges.len() < public_inputs_elems {
             return Err("tiny gate: not enough Absorb ops for public inputs".to_string());
         }
 
@@ -218,17 +222,16 @@ where
             .map_err(|e| format!("tiny gate: public_inputs_glue new_file_backed failed: {e}"))?;
         gb_pub.enforce_var_eq_const(gb_pub.one(), F257::ONE);
 
-        // Allocate module-local copies of the public vars (one per public input).
-        let mut pub_locals: Vec<usize> = Vec::with_capacity(public_inputs_len);
-        for _ in 0..public_inputs_len {
+        // Allocate module-local copies of the public vars (one per public input byte).
+        let mut pub_locals: Vec<usize> = Vec::with_capacity(public_inputs_bytes_len);
+        for _ in 0..public_inputs_bytes_len {
             pub_locals.push(gb_pub.new_var(F257::ZERO));
         }
 
         // Allocate module-local copies of absorb-byte vars as needed.
         let mut absorb_local_map: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
 
-        for i in 0..public_inputs_len {
-            let pub_var = 1usize + 10usize + i;
+        for i in 0..public_inputs_elems {
             let (ab_start, ab_len) = pose_wiring.absorb_ranges[i];
             if ab_len != coeff_bytes {
                 return Err(format!(
@@ -241,20 +244,20 @@ where
                     continue;
                 }
                 let ab_local = *absorb_local_map.entry(v_ab_local).or_insert_with(|| gb_pub.new_var(tiny_asg[v_ab_local]));
-                if j == 0 {
-                    // ab_local == pub_local
-                    gb_pub.enforce_lc_times_one_eq_const(vec![
-                        (F257::ONE, ab_local),
-                        (-F257::ONE, pub_locals[i]),
-                    ]);
-                } else {
-                    // ab_local == 0
-                    gb_pub.enforce_var_eq_const(ab_local, F257::ZERO);
-                }
+                // Bind each absorbed byte to the corresponding statement public byte var.
+                let pub_idx = i * coeff_bytes + j;
+                gb_pub.enforce_lc_times_one_eq_const(vec![
+                    (F257::ONE, ab_local),
+                    (-F257::ONE, pub_locals[pub_idx]),
+                ]);
             }
 
-            // Glue pub_local[i] to params prefix pub_var.
-            extra_eqs.push((remap(0, pub_var, &offsets), remap(2, pub_locals[i], &offsets)));
+            // Glue pub_locals byte vars to params prefix vars.
+            for j in 0..coeff_bytes {
+                let pub_idx = i * coeff_bytes + j;
+                let pub_var = 1usize + 10usize + pub_idx;
+                extra_eqs.push((remap(0, pub_var, &offsets), remap(2, pub_locals[pub_idx], &offsets)));
+            }
         }
 
         // Glue absorb-byte locals to tiny-gate absorb-byte vars.
@@ -273,7 +276,7 @@ where
         out_dir.join("merged"),
         &extra_eqs,
     )?;
-    Ok(WeDr1csShape { inst, public_len: 1 + 10 + public_inputs_len })
+    Ok(WeDr1csShape { inst, public_len: 1 + 10 + public_inputs_bytes_len })
 }
 
 fn escape_json_str(input: &str) -> String {
@@ -947,7 +950,7 @@ where
 pub fn build_we_plus_tiny_dr1cs<R>(
     trace: &PoseidonTranscriptTrace<BF<R>>,
     params: &WeParams,
-    public_inputs: &[F257],
+    public_inputs: &[F257], // statement public **bytes** in F257
     proof: &crate::plus::PlusProof<R, crate::r1cs::ComR1CSProof<R>>,
     mlen_mats: usize,
     pairs: &[(usize, usize)],
@@ -1031,9 +1034,13 @@ where
         vec![(params_inst, params_asg), (inst_pose, asg_pose)];
 
     if !public_inputs.is_empty() {
-        let public_inputs_len = public_inputs.len();
+        let public_inputs_bytes_len = public_inputs.len();
         let coeff_bytes = ((<R::BaseRing as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8;
-        if pose_wiring.absorb_ranges.len() < public_inputs_len {
+        if (public_inputs_bytes_len % coeff_bytes) != 0 {
+            return Err("tiny witness(from_proof): public input byte len not divisible by coeff_bytes".to_string());
+        }
+        let public_inputs_elems = public_inputs_bytes_len / coeff_bytes;
+        if pose_wiring.absorb_ranges.len() < public_inputs_elems {
             return Err("tiny witness(from_proof): not enough Absorb ops for public inputs".to_string());
         }
 
@@ -1055,14 +1062,13 @@ where
             .map_err(|e| format!("tiny witness(from_proof): public_inputs_glue new_file_backed failed: {e}"))?;
         gb_pub.enforce_var_eq_const(gb_pub.one(), F257::ONE);
 
-        let mut pub_locals: Vec<usize> = Vec::with_capacity(public_inputs_len);
+        let mut pub_locals: Vec<usize> = Vec::with_capacity(public_inputs_bytes_len);
         for &pi in public_inputs {
             pub_locals.push(gb_pub.new_var(pi));
         }
         let mut absorb_local_map: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
 
-        for i in 0..public_inputs_len {
-            let pub_var = 1usize + 10usize + i;
+        for i in 0..public_inputs_elems {
             let (ab_start, ab_len) = pose_wiring.absorb_ranges[i];
             if ab_len != coeff_bytes {
                 return Err(format!(
@@ -1077,16 +1083,17 @@ where
                 let ab_local = *absorb_local_map
                     .entry(v_ab_local)
                     .or_insert_with(|| gb_pub.new_var(tiny_asg[v_ab_local]));
-                if j == 0 {
-                    gb_pub.enforce_lc_times_one_eq_const(vec![
-                        (F257::ONE, ab_local),
-                        (-F257::ONE, pub_locals[i]),
-                    ]);
-                } else {
-                    gb_pub.enforce_var_eq_const(ab_local, F257::ZERO);
-                }
+                let pub_idx = i * coeff_bytes + j;
+                gb_pub.enforce_lc_times_one_eq_const(vec![
+                    (F257::ONE, ab_local),
+                    (-F257::ONE, pub_locals[pub_idx]),
+                ]);
             }
-            extra_eqs.push((remap(0, pub_var, &offsets), remap(2, pub_locals[i], &offsets)));
+            for j in 0..coeff_bytes {
+                let pub_idx = i * coeff_bytes + j;
+                let pub_var = 1usize + 10usize + pub_idx;
+                extra_eqs.push((remap(0, pub_var, &offsets), remap(2, pub_locals[pub_idx], &offsets)));
+            }
         }
         for (v_ab_local, ab_local) in absorb_local_map {
             extra_eqs.push((remap(1, v_ab_local, &offsets), remap(2, ab_local, &offsets)));
@@ -7355,11 +7362,14 @@ mod tests {
                 std::fs::create_dir_all(&p).expect("create temp out_dir");
                 p
             };
+            // Public inputs for the tiny gate are absorbed as bytes (8 bytes per base-field element).
+            // In this benchmark the public inputs are digest bits (0/1), so byte-encoding is trivial.
             let public_inputs_f257: Vec<F257> = sp1_digest_bits
                 .iter()
-                .map(|x| {
-                    let u = x.into_bigint().as_ref().get(0).copied().unwrap_or(0);
-                    F257::from(u)
+                .flat_map(|x| {
+                    let u = x.into_bigint().as_ref().get(0).copied().unwrap_or(0) as u8;
+                    // 8-byte little-endian encoding of a small integer.
+                    [u, 0, 0, 0, 0, 0, 0, 0].into_iter().map(|b| F257::from(b as u64))
                 })
                 .collect();
             let (shape, tiny_asg) = build_we_plus_tiny_dr1cs::<RR>(

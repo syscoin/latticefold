@@ -265,27 +265,18 @@ pub fn run_sp1_oneproof_we_gate_from_files(
 
     let pairs: Vec<(usize, usize)> = vec![(0, 0)];
 
-    // Map statement public inputs into F257 for the tiny gate.
+    // Map statement public inputs into tiny-gate public prefix bytes (F257).
     //
-    // IMPORTANT: do NOT decode from the Goldilocks-field `public_inputs` above. Those elements come
-    // from a *centered* embedding of BabyBear residues and may appear "large"/negative in the host
-    // field representation even when the original u64 witness values are small.
+    // IMPORTANT: Transcript public inputs are absorbed as fixed-width base-field byte strings
+    // (`prime_field_to_bytes_le_fixed`), i.e. 8 bytes per Goldilocks base-field element.
     //
-    // The tiny-gate lift path requires that all absorbed elements are integers in [0,256].
-    // Therefore we derive the tiny-gate public prefix directly from the original exported u64
-    // witness values.
+    // Therefore, the tiny gate's statement public prefix must be these bytes, not the field
+    // elements themselves, and certainly not the centered BabyBear embedding.
+    let coeff_bytes: usize = ((<F as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8;
     let public_inputs_f257: Vec<F257> = w_u64[1..1 + l_pub]
         .iter()
-        .enumerate()
-        .map(|(i, &x)| {
-            if x > 256 {
-                return Err(format!(
-                    "public input out of range for tiny gate at index {i}: {x} (expected 0..=256)"
-                ));
-            }
-            Ok(F257::from(x))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+        .flat_map(|&x| x.to_le_bytes().into_iter().take(coeff_bytes).map(|b| F257::from(b as u64)))
+        .collect();
 
     let (shape, assignment) = crate::we_gate_arith::build_we_plus_tiny_dr1cs::<R>(
         &trace,
