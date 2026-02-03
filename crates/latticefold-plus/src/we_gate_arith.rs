@@ -88,7 +88,7 @@ fn collect_get_challenge_squeeze_field_indices(
 #[cfg(feature = "we_gate")]
 fn build_we_dr1cs_for_plus_proof_shape_tiny<R>(
     params: &WeParams,
-    public_inputs_len: usize,
+    public_inputs: &[BF<R>],
     n_lin_proofs: usize,
     mlen_mats: usize,
     pairs: &[(usize, usize)],
@@ -98,6 +98,8 @@ where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + Field + PrimeField,
 {
+    let public_inputs_len = public_inputs.len();
+
     // Shape-only must still build the **full faithful** tiny-gate relation.
     //
     // We therefore supply a dummy proof-shaped `TinyExtraWitness` (all zeros) so the instance
@@ -107,7 +109,7 @@ where
     let ring_dim = R::dimension();
 
     let trace =
-        poseidon_trace_schedule_for_plus::<R>(public_inputs_len, params, n_lin_proofs, mlen_mats)?;
+        poseidon_trace_schedule_for_plus_with_public_inputs::<R>(public_inputs, params, n_lin_proofs, mlen_mats)?;
     let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<R>>(&trace.ops)?;
 
     let k = params.k as usize;
@@ -6214,7 +6216,7 @@ mod tests {
         };
         let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
             &params,
-            public_inputs_len,
+            &public_inputs_bf,
             n_lin_proofs,
             mlen_mats,
             &pairs,
@@ -6779,7 +6781,7 @@ mod tests {
         };
         let s0 = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
             &base,
-            public_inputs_len,
+            &vec![<<RR as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField::ZERO; public_inputs_len],
             n_lin_proofs,
             0,
             &pairs,
@@ -6788,7 +6790,7 @@ mod tests {
         .expect("shape(base)");
         let s1 = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
             &alt,
-            public_inputs_len,
+            &vec![<<RR as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField::ZERO; public_inputs_len],
             n_lin_proofs,
             1,
             &pairs,
@@ -6867,7 +6869,7 @@ mod tests {
         };
         let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
             &params,
-            public_inputs_len,
+            &public_inputs_bf,
             n_lin_proofs,
             mlen_mats,
             &pairs,
@@ -6951,7 +6953,7 @@ mod tests {
         };
         let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
             &params,
-            public_inputs_len,
+            &vec![BF::<RR>::ZERO; public_inputs_len],
             n_lin_proofs,
             mlen_mats,
             &pairs,
