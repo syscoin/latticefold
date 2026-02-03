@@ -6188,7 +6188,7 @@ mod tests {
             l: 1,
             mlen: 0,
         };
-        let public_inputs_len = 8usize;
+        let public_inputs_len = 8usize; // number of public **field elements**
         let n_lin_proofs = 1usize; // schedule builder currently assumes L=1
         let mlen_mats = 0usize;
         // Mirror the SP1 oneproof path: use the canonical tiny-gate builders.
@@ -6198,11 +6198,20 @@ mod tests {
         // NOTE: `pairs` indices are interpreted over the full `u32_squeeze_ops` wiring, which
         // includes any prefix `get_challenge()` u32 squeezes.
         let pairs: Vec<(usize, usize)> = vec![(0, 0)];
-        let public_inputs_f257: Vec<F257> = (0..public_inputs_len)
+        // Public inputs as field elements (used for schedule trace generation).
+        let public_inputs_elems_f257: Vec<F257> = (0..public_inputs_len)
             .map(|i| if (i % 3) == 0 { F257::ONE } else { F257::ZERO })
             .collect();
+        // Tiny-gate statement public prefix uses the byte encoding (8 bytes per base-field element).
+        let public_inputs_bytes_f257: Vec<F257> = public_inputs_elems_f257
+            .iter()
+            .flat_map(|x| {
+                let u = x.into_bigint().as_ref().get(0).copied().unwrap_or(0) as u8;
+                [u, 0, 0, 0, 0, 0, 0, 0].into_iter().map(|b| F257::from(b as u64))
+            })
+            .collect();
         type BF0 = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
-        let public_inputs_bf: Vec<BF0> = public_inputs_f257
+        let public_inputs_bf: Vec<BF0> = public_inputs_elems_f257
             .iter()
             .map(|x| {
                 // F257 is a small prime field; lift via canonical u64 rep.
@@ -6239,7 +6248,7 @@ mod tests {
             &out_dir_shape,
         )
         .expect("build_we_dr1cs_for_plus_proof_shape_tiny");
-        assert_eq!(shape.public_len, 1 + 10 + public_inputs_len);
+        assert_eq!(shape.public_len, 1 + 10 + 8 * public_inputs_len);
 
         // Prover builds a satisfying assignment for *that same shape* from the recorded trace.
         let out_dir_witness = {
@@ -6254,7 +6263,7 @@ mod tests {
         let (_shape2, asg) = build_we_plus_tiny_dr1cs::<R>(
             &trace,
             &params,
-            &public_inputs_f257,
+            &public_inputs_bytes_f257,
             &proof,
             mlen_mats,
             &pairs,
@@ -6293,7 +6302,7 @@ mod tests {
         let ctx = arm_lfplus_we_gate_tiny_ringlwe_streaming::<R>(
             shape,
             &params,
-            &public_inputs_f257,
+            &public_inputs_bytes_f257,
             stmt_digest,
             armer_seed,
             lock_j,
@@ -6309,7 +6318,7 @@ mod tests {
             ctx.proof_len()
         );
 
-        let x = encode_public_x::<F257>(&params, &public_inputs_f257);
+        let x = encode_public_x::<F257>(&params, &public_inputs_bytes_f257);
         assert_eq!(x.len(), public_len);
         assert_eq!(&asg[..public_len], x.as_slice(), "satisfying assignment public prefix mismatch");
         let z_w = asg[public_len..].to_vec();
@@ -6333,7 +6342,7 @@ mod tests {
 
         // Negative check: flip a public input and ensure decap fails with the same proof.
         let mut x_bad = x.clone();
-        let first_pi = 1usize + 10usize; // [ONE] || [10×WeParams] || [public_inputs...]
+        let first_pi = 1usize + 10usize; // [ONE] || [10×WeParams] || [public_input_bytes...]
         x_bad[first_pi] += F257::ONE;
         assert!(ctx.lock.decap_answer(&x_bad, &pi).is_err());
     }
@@ -6860,7 +6869,7 @@ mod tests {
 
         // Keep this small: we only need to cover "public input is bound into transcript absorbs".
         let ring_dim = RR::dimension() as u64;
-        let public_inputs_len = 32usize; // lighter than 256-bit SP1 digest, but covers the binding mechanism
+        let public_inputs_len = 32usize; // number of public **field elements** (lighter than full SP1 digest)
         let n_lin_proofs = 1usize;
         let mlen_mats = 0usize;
         let pairs: Vec<(usize, usize)> = vec![(0, 0)];
@@ -6883,10 +6892,18 @@ mod tests {
         // IMPORTANT: for kappa=1 the tiny gate's prefix binding enforces `cm_f[0]` matches
         // public_inputs[0] (constant-coefficient). Our dummy proof/trace uses `cm_f[0]=0`,
         // so keep public_inputs[0]=0 in this test; the flip below must still break satisfaction.
-        let public_inputs: Vec<F257> = (0..public_inputs_len)
+        let public_inputs_elems: Vec<F257> = (0..public_inputs_len)
             .map(|i| if (i % 3) == 1 { F257::ONE } else { F257::ZERO })
             .collect();
-        let public_inputs_bf: Vec<BF0> = public_inputs
+        // Tiny-gate statement public prefix uses byte encoding (8 bytes per base-field element).
+        let public_inputs_bytes: Vec<F257> = public_inputs_elems
+            .iter()
+            .flat_map(|x| {
+                let u = x.into_bigint().as_ref().get(0).copied().unwrap_or(0) as u8;
+                [u, 0, 0, 0, 0, 0, 0, 0].into_iter().map(|b| F257::from(b as u64))
+            })
+            .collect();
+        let public_inputs_bf: Vec<BF0> = public_inputs_elems
             .iter()
             .map(|x| {
                 let d = x.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u64;
@@ -6933,7 +6950,7 @@ mod tests {
         let (shape2, asg) = build_we_plus_tiny_dr1cs::<RR>(
             &trace,
             &params,
-            &public_inputs,
+            &public_inputs_bytes,
             &proof,
             mlen_mats,
             &pairs,
@@ -6987,7 +7004,11 @@ mod tests {
         let trace =
             poseidon_trace_schedule_for_plus::<RR>(public_inputs_len, &params, n_lin_proofs, mlen_mats)
                 .expect("poseidon_trace_schedule_for_plus");
-        let public_inputs: Vec<F257> = vec![F257::ZERO; public_inputs_len];
+        let public_inputs_elems: Vec<F257> = vec![F257::ZERO; public_inputs_len];
+        let public_inputs_bytes: Vec<F257> = public_inputs_elems
+            .iter()
+            .flat_map(|_x| [0u8, 0, 0, 0, 0, 0, 0, 0].into_iter().map(|b| F257::from(b as u64)))
+            .collect();
 
         let out_dir_shape = {
             let mut p = std::env::temp_dir();
@@ -7018,7 +7039,7 @@ mod tests {
         let (_shape2, asg) = build_we_plus_tiny_dr1cs::<RR>(
             &trace,
             &params,
-            &public_inputs,
+            &public_inputs_bytes,
             &proof,
             mlen_mats,
             &pairs,
