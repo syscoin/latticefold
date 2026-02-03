@@ -726,10 +726,10 @@ impl<R: OverField + PolyRing> In<R> {
                     .fold(
                         || vec![R::ZERO; ncols],
                         |mut acc, row| {
-                            let w = R::from(eq_at(row));
+                            let w0 = eq_at(row);
                             let row_vals = &Md.vals[row];
                             for col in 0..ncols {
-                                acc[col] += row_vals[col] * w;
+                                acc[col] += mul_by_base(row_vals[col], w0);
                             }
                             acc
                         },
@@ -783,11 +783,10 @@ impl<R: OverField + PolyRing> In<R> {
                             || vec![R::ZERO; md_count],
                             |mut accs, row| {
                                 let w0 = eq_at(row);
-                                let rw = R::from(w0);
                                 for (k, md) in Ms_digits.iter().enumerate() {
                                     let DigitsBacking::ConstCol0 { col0, zero_idx } = &md.digits else { unreachable!() };
                                     let dix = col0.get(row).copied().unwrap_or(*zero_idx) as usize;
-                                    accs[k] += md.exp_table[dix] * rw;
+                                    accs[k] += mul_by_base(md.exp_table[dix], w0);
                                 }
                                 accs
                             },
@@ -806,11 +805,10 @@ impl<R: OverField + PolyRing> In<R> {
                     let mut accs = vec![R::ZERO; md_count];
                     for row in 0..nrows {
                         let w0 = eq_at(row);
-                        let rw = R::from(w0);
                         for (k, md) in Ms_digits.iter().enumerate() {
                             let DigitsBacking::ConstCol0 { col0, zero_idx } = &md.digits else { unreachable!() };
                             let dix = col0.get(row).copied().unwrap_or(*zero_idx) as usize;
-                            accs[k] += md.exp_table[dix] * rw;
+                            accs[k] += mul_by_base(md.exp_table[dix], w0);
                         }
                     }
                     accs
@@ -819,7 +817,7 @@ impl<R: OverField + PolyRing> In<R> {
                 for (k, md) in Ms_digits.iter().enumerate() {
                     let DigitsBacking::ConstCol0 { zero_idx, .. } = &md.digits else { unreachable!() };
                     let exp0 = md.exp_table[*zero_idx as usize];
-                    let common = exp0 * R::from(sum_w0);
+                    let common = mul_by_base(exp0, sum_w0);
                     let mut out = vec![common; ncols];
                     out[0] = acc0s[k];
                     e0.push(out);
