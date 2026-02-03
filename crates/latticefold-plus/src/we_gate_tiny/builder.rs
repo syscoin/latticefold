@@ -5122,7 +5122,7 @@ fn build_direct_to_merged_unix(
     // Base glue range result (part 1).
     let GlueCtx {
         gb,
-        pose_asg: _pa,
+        pose_asg: _,
         local_map: base_local_map,
         base_eqs: base_base_eqs,
         ..
@@ -5155,7 +5155,7 @@ fn build_direct_to_merged_unix(
         .chain(cm_extra_glues.into_iter())
         .enumerate()
     {
-        let GlueCtx { gb, pose_asg: _pa, local_map, base_eqs, .. } = g;
+        let GlueCtx { gb, pose_asg: _, local_map, base_eqs, .. } = g;
         let (asg, range) = gb.into_range_result()?;
         let part = 2 + i;
         let exp_rows = expect_part_delta(&plan.row_off, part, plan.part_rows);
