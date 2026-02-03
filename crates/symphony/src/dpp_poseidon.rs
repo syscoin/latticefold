@@ -712,7 +712,9 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .filter(|&v| v > 0)
-                .unwrap_or(512);
+                // Default lower than `dpp_sumcheck` because Poseidon is often sharded and would
+                // otherwise multiply staging memory by ~#shards.
+                .unwrap_or(128);
             mb.saturating_mul(1024 * 1024)
         }
         // For file-backed mode we only support small prime fields; compute modulus once.
