@@ -114,6 +114,30 @@ pub struct Dr1csRangeResult {
     pub ckpts: Vec<(u64, u64, u64, u64)>,
 }
 
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct Dr1csRangeSnapshot {
+    pub out_fc_a: std::fs::File,
+    pub out_fi_a: std::fs::File,
+    pub out_fc_b: std::fs::File,
+    pub out_fi_b: std::fs::File,
+    pub out_fc_c: std::fs::File,
+    pub out_fi_c: std::fs::File,
+    pub out_rows: std::fs::File,
+    // Base offsets (global terms/rows).
+    pub base_a_terms: u64,
+    pub base_b_terms: u64,
+    pub base_c_terms: u64,
+    pub base_rows: u64,
+    // Already-written counts by this range writer (local to this shard).
+    pub a_terms_written: u64,
+    pub b_terms_written: u64,
+    pub c_terms_written: u64,
+    pub rows_written: u64,
+    /// Variable tail offset applied when writing term indices into the merged instance.
+    pub var_tail_off: u32,
+}
+
 impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
     #[inline]
     fn map_idx_u32(&self, idx: usize) -> u32 {
@@ -192,6 +216,14 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         self.fb_row_lens.clear();
         self.fb_stage_bytes = 0;
         Ok(())
+    }
+
+    /// Flush any staged file-backed buffers immediately.
+    ///
+    /// This is primarily used by parallel lowering code that needs a stable notion of
+    /// "current end offsets" before doing direct range `pwrite`s.
+    pub fn file_backed_flush(&mut self) -> Result<(), String> {
+        self.fb_flush()
     }
     pub fn new() -> Self {
         let profile_enabled = match std::env::var("LF_PROFILE_DR1CS") {
@@ -284,6 +316,68 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         } else {
             None
         }
+    }
+
+    /// Unix-only: if this is a range-backed builder, return a snapshot with cloned files and offsets.
+    ///
+    /// This is used by parallel lowering code which `pwrite`s into disjoint ranges directly.
+    #[cfg(unix)]
+    pub fn file_range_snapshot(&self) -> Result<Option<Dr1csRangeSnapshot>, String> {
+        let Some(sink) = self.file_sink.as_ref() else {
+            return Ok(None);
+        };
+        let Dr1csFileSink::Range(w) = sink else {
+            return Ok(None);
+        };
+        let (out_fc_a, out_fi_a, out_fc_b, out_fi_b, out_fc_c, out_fi_c, out_rows) = w.try_clone_all_files()?;
+        let (base_a_terms, base_b_terms, base_c_terms, base_rows) = w.base_offsets();
+        let (a_terms_written, b_terms_written, c_terms_written, rows_written) = w.written_counts();
+        Ok(Some(Dr1csRangeSnapshot {
+            out_fc_a,
+            out_fi_a,
+            out_fc_b,
+            out_fi_b,
+            out_fc_c,
+            out_fi_c,
+            out_rows,
+            base_a_terms,
+            base_b_terms,
+            base_c_terms,
+            base_rows,
+            a_terms_written,
+            b_terms_written,
+            c_terms_written,
+            rows_written,
+            var_tail_off: self.file_var_tail_off,
+        }))
+    }
+
+    /// Unix-only: commit externally `pwrite`d range output into this builder's counters and ckpts.
+    #[cfg(unix)]
+    pub fn file_range_commit_parallel_write(
+        &mut self,
+        rows: u64,
+        a_terms: u64,
+        b_terms: u64,
+        c_terms: u64,
+        ckpts: Vec<(u64, u64, u64, u64)>,
+    ) -> Result<(), String> {
+        // Flush any staged sequential buffers so all offsets match the snapshot.
+        self.fb_flush()?;
+        let sink = self
+            .file_sink
+            .as_mut()
+            .ok_or_else(|| "file_range_commit_parallel_write called on non-file-backed builder".to_string())?;
+        let Dr1csFileSink::Range(w) = sink else {
+            return Err("file_range_commit_parallel_write called on non-range builder".to_string());
+        };
+        w.bump_written_counts(rows, a_terms, b_terms, c_terms);
+        w.extend_ckpts(ckpts);
+        self.file_rows = self.file_rows.saturating_add(rows);
+        self.file_a_terms = self.file_a_terms.saturating_add(a_terms);
+        self.file_b_terms = self.file_b_terms.saturating_add(b_terms);
+        self.file_c_terms = self.file_c_terms.saturating_add(c_terms);
+        Ok(())
     }
 
     /// Return true if this builder is in **count-only** mode (no pools/rows written).

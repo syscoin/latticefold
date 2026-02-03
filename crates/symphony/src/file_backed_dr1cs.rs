@@ -316,6 +316,76 @@ impl FileBackedRangeWriter {
         Ok(())
     }
 
+    /// Clone all underlying output files for parallel `pwrite` usage.
+    ///
+    /// This is used by parallel lowering code that writes into disjoint ranges concurrently.
+    pub(crate) fn try_clone_all_files(&self) -> Result<(File, File, File, File, File, File, File), String> {
+        Ok((
+            self.out_fc_a
+                .try_clone()
+                .map_err(|e| format!("FileBackedRangeWriter: clone out_fc_a failed: {e}"))?,
+            self.out_fi_a
+                .try_clone()
+                .map_err(|e| format!("FileBackedRangeWriter: clone out_fi_a failed: {e}"))?,
+            self.out_fc_b
+                .try_clone()
+                .map_err(|e| format!("FileBackedRangeWriter: clone out_fc_b failed: {e}"))?,
+            self.out_fi_b
+                .try_clone()
+                .map_err(|e| format!("FileBackedRangeWriter: clone out_fi_b failed: {e}"))?,
+            self.out_fc_c
+                .try_clone()
+                .map_err(|e| format!("FileBackedRangeWriter: clone out_fc_c failed: {e}"))?,
+            self.out_fi_c
+                .try_clone()
+                .map_err(|e| format!("FileBackedRangeWriter: clone out_fi_c failed: {e}"))?,
+            self.out_rows
+                .try_clone()
+                .map_err(|e| format!("FileBackedRangeWriter: clone out_rows failed: {e}"))?,
+        ))
+    }
+
+    /// Return (base_a_terms, base_b_terms, base_c_terms, base_rows).
+    #[inline]
+    pub(crate) fn base_offsets(&self) -> (u64, u64, u64, u64) {
+        (self.base_a_terms, self.base_b_terms, self.base_c_terms, self.base_rows)
+    }
+
+    /// Return (a_terms_written, b_terms_written, c_terms_written, rows_written).
+    #[inline]
+    pub(crate) fn written_counts(&self) -> (u64, u64, u64, u64) {
+        (
+            self.a_terms_written,
+            self.b_terms_written,
+            self.c_terms_written,
+            self.rows_written,
+        )
+    }
+
+    /// Extend checkpoint entries (global row_idx, global a0,b0,c0).
+    pub(crate) fn extend_ckpts(&mut self, mut entries: Vec<(u64, u64, u64, u64)>) {
+        if entries.is_empty() {
+            return;
+        }
+        // Keep checkpoints stable-sorted by row index for nicer debugging and deterministic merges.
+        entries.sort_by_key(|(row, _a0, _b0, _c0)| *row);
+        self.ckpt_entries.extend(entries);
+    }
+
+    /// Bump the internal written counters without writing.
+    ///
+    /// This is used when some other component has already `pwrite`d the disjoint ranges in parallel,
+    /// and we only need to advance the range-writer cursors so later writes use the correct offsets.
+    pub(crate) fn bump_written_counts(&mut self, rows: u64, a_terms: u64, b_terms: u64, c_terms: u64) {
+        self.rows_written = self.rows_written.saturating_add(rows);
+        self.a_terms_written = self.a_terms_written.saturating_add(a_terms);
+        self.b_terms_written = self.b_terms_written.saturating_add(b_terms);
+        self.c_terms_written = self.c_terms_written.saturating_add(c_terms);
+        self.a0 = self.a0.saturating_add(a_terms);
+        self.b0 = self.b0.saturating_add(b_terms);
+        self.c0 = self.c0.saturating_add(c_terms);
+    }
+
     pub fn take_ckpts(&mut self) -> Vec<(u64, u64, u64, u64)> {
         core::mem::take(&mut self.ckpt_entries)
     }

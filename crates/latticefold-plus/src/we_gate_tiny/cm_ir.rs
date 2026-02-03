@@ -433,13 +433,268 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
             }
         }
 
-        // Chunked build+append: avoids allocating enormous flat buffers for the whole fragment at once.
+        #[inline]
+        fn map_var_fast_u32(base_nvars: usize, local_to_var: &[usize], v: VarRef) -> u32 {
+            let m = map_var_fast(base_nvars, local_to_var, v);
+            if m > (u32::MAX as u64) {
+                panic!("file-backed lowering: mapped var idx overflow u32");
+            }
+            m as u32
+        }
+
+        // Big win: if this is a **range-backed** builder (direct-to-merged), write each chunk into
+        // a precomputed disjoint file range and do the whole lowering in parallel (no single-writer
+        // append bottleneck).
+        #[cfg(unix)]
+        {
+            gb.file_backed_flush()
+                .unwrap_or_else(|e| panic!("file-backed lowering: flush before range snapshot failed: {e}"));
+            if let Some(range) = gb
+                .file_range_snapshot()
+                .unwrap_or_else(|e| panic!("file-backed lowering: range snapshot failed: {e}"))
+            {
+                use rayon::prelude::*;
+                use std::fs::File;
+                use std::os::unix::fs::FileExt;
+
+                #[inline]
+                fn pwrite_all(f: &File, mut off: u64, mut buf: &[u8]) -> Result<(), String> {
+                    while !buf.is_empty() {
+                        let n = f
+                            .write_at(buf, off)
+                            .map_err(|e| format!("pwrite failed: {e}"))?;
+                        if n == 0 {
+                            return Err("pwrite failed: wrote 0 bytes".to_string());
+                        }
+                        off = off.saturating_add(n as u64);
+                        buf = &buf[n..];
+                    }
+                    Ok(())
+                }
+
+                #[inline]
+                fn as_u8_slice_u32(v: &[u32]) -> &[u8] {
+                    unsafe { core::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
+                }
+
+                const ROW_LENS_BYTES_PER_ROW: u64 = 12; // 3 * u32
+                const ROW_CKPT_STRIDE: u64 = 1 << 20;
+
+                let n_total = constraints.len();
+                let n_threads = rayon::current_num_threads().max(1);
+                let target_chunks = (n_threads.saturating_mul(4)).clamp(1, 512);
+                let mut chunk_constraints = (n_total + target_chunks - 1) / target_chunks;
+                // Keep chunks large enough for throughput but numerous enough to feed many cores.
+                chunk_constraints = chunk_constraints.clamp(50_000, 500_000);
+
+                let mut ranges: Vec<(usize, usize)> = Vec::new();
+                let mut s = 0usize;
+                while s < n_total {
+                    let e = (s + chunk_constraints).min(n_total);
+                    ranges.push((s, e));
+                    s = e;
+                }
+
+                // Determine exact term counts per chunk (cheap, no field math).
+                let mut rows_per: Vec<u64> = Vec::with_capacity(ranges.len());
+                let mut a_terms_per: Vec<u64> = Vec::with_capacity(ranges.len());
+                let mut b_terms_per: Vec<u64> = Vec::with_capacity(ranges.len());
+                let mut c_terms_per: Vec<u64> = Vec::with_capacity(ranges.len());
+                for &(cs, ce) in &ranges {
+                    let mut ta: u64 = 0;
+                    let mut tb: u64 = 0;
+                    let mut tc: u64 = 0;
+                    for ic in &constraints[cs..ce] {
+                        ta = ta.saturating_add((ic.a.end - ic.a.start) as u64);
+                        tb = tb.saturating_add((ic.b.end - ic.b.start) as u64);
+                        tc = tc.saturating_add((ic.c.end - ic.c.start) as u64);
+                    }
+                    rows_per.push((ce - cs) as u64);
+                    a_terms_per.push(ta);
+                    b_terms_per.push(tb);
+                    c_terms_per.push(tc);
+                }
+
+                // Prefix sums -> per-chunk output offsets (in rows/terms).
+                let mut row_start: Vec<u64> = Vec::with_capacity(ranges.len());
+                let mut a_start: Vec<u64> = Vec::with_capacity(ranges.len());
+                let mut b_start: Vec<u64> = Vec::with_capacity(ranges.len());
+                let mut c_start: Vec<u64> = Vec::with_capacity(ranges.len());
+                let mut cur_r: u64 = 0;
+                let mut cur_a: u64 = 0;
+                let mut cur_b: u64 = 0;
+                let mut cur_c: u64 = 0;
+                for i in 0..ranges.len() {
+                    row_start.push(cur_r);
+                    a_start.push(cur_a);
+                    b_start.push(cur_b);
+                    c_start.push(cur_c);
+                    cur_r = cur_r.saturating_add(rows_per[i]);
+                    cur_a = cur_a.saturating_add(a_terms_per[i]);
+                    cur_b = cur_b.saturating_add(b_terms_per[i]);
+                    cur_c = cur_c.saturating_add(c_terms_per[i]);
+                }
+
+                let start_a_terms_global = range.base_a_terms.saturating_add(range.a_terms_written);
+                let start_b_terms_global = range.base_b_terms.saturating_add(range.b_terms_written);
+                let start_c_terms_global = range.base_c_terms.saturating_add(range.c_terms_written);
+                let start_rows_global = range.base_rows.saturating_add(range.rows_written);
+
+                #[derive(Default)]
+                struct ChunkRes {
+                    ckpts: Vec<(u64, u64, u64, u64)>,
+                }
+
+                let results: Vec<ChunkRes> = ranges
+                    .par_iter()
+                    .enumerate()
+                    .map(|(ci, &(cs, ce))| {
+                        let chunk = &constraints[cs..ce];
+                        let n = chunk.len();
+                        let total_a = a_terms_per[ci] as usize;
+                        let total_b = b_terms_per[ci] as usize;
+                        let total_c = c_terms_per[ci] as usize;
+
+                        let mut a_coeffs: Vec<u8> = vec![0u8; total_a.saturating_mul(coeff_size)];
+                        let mut b_coeffs: Vec<u8> = vec![0u8; total_b.saturating_mul(coeff_size)];
+                        let mut c_coeffs: Vec<u8> = vec![0u8; total_c.saturating_mul(coeff_size)];
+                        let mut a_idx: Vec<u32> = vec![0u32; total_a];
+                        let mut b_idx: Vec<u32> = vec![0u32; total_b];
+                        let mut c_idx: Vec<u32> = vec![0u32; total_c];
+                        let mut row_lens: Vec<u32> = vec![0u32; n.saturating_mul(3)];
+
+                        let mut out = ChunkRes::default();
+                        // At most ~1 ckpt per ~1M rows; chunks are <= 500k rows.
+                        out.ckpts.reserve(2);
+
+                        let mut a_pos: usize = 0;
+                        let mut b_pos: usize = 0;
+                        let mut c_pos: usize = 0;
+
+                        let mut row_idx: u64 = start_rows_global.saturating_add(row_start[ci]);
+                        let mut a0: u64 = start_a_terms_global.saturating_add(a_start[ci]);
+                        let mut b0: u64 = start_b_terms_global.saturating_add(b_start[ci]);
+                        let mut c0: u64 = start_c_terms_global.saturating_add(c_start[ci]);
+
+                        for (i, ic) in chunk.iter().enumerate() {
+                            if (row_idx % ROW_CKPT_STRIDE) == 0 {
+                                out.ckpts.push((row_idx, a0, b0, c0));
+                            }
+                            // A terms
+                            let a_slice = &a_terms[ic.a.clone()];
+                            let a_len = a_slice.len();
+                            for &(coef, v) in a_slice {
+                                let mv = map_var_fast_u32(base_nvars_local, local_to_var, v);
+                                a_idx[a_pos] = if mv == 0 { 0 } else { mv.saturating_add(range.var_tail_off) };
+                                let vv = coeff_idx_f257(coef);
+                                let dst0 = a_pos * coeff_size;
+                                a_coeffs[dst0..dst0 + coeff_size]
+                                    .copy_from_slice(&coeff_bytes[vv * coeff_size..(vv + 1) * coeff_size]);
+                                a_pos += 1;
+                            }
+                            // B terms
+                            let b_slice = &b_terms[ic.b.clone()];
+                            let b_len = b_slice.len();
+                            for &(coef, v) in b_slice {
+                                let mv = map_var_fast_u32(base_nvars_local, local_to_var, v);
+                                b_idx[b_pos] = if mv == 0 { 0 } else { mv.saturating_add(range.var_tail_off) };
+                                let vv = coeff_idx_f257(coef);
+                                let dst0 = b_pos * coeff_size;
+                                b_coeffs[dst0..dst0 + coeff_size]
+                                    .copy_from_slice(&coeff_bytes[vv * coeff_size..(vv + 1) * coeff_size]);
+                                b_pos += 1;
+                            }
+                            // C terms
+                            let c_slice = &c_terms[ic.c.clone()];
+                            let c_len = c_slice.len();
+                            for &(coef, v) in c_slice {
+                                let mv = map_var_fast_u32(base_nvars_local, local_to_var, v);
+                                c_idx[c_pos] = if mv == 0 { 0 } else { mv.saturating_add(range.var_tail_off) };
+                                let vv = coeff_idx_f257(coef);
+                                let dst0 = c_pos * coeff_size;
+                                c_coeffs[dst0..dst0 + coeff_size]
+                                    .copy_from_slice(&coeff_bytes[vv * coeff_size..(vv + 1) * coeff_size]);
+                                c_pos += 1;
+                            }
+
+                            // Row lens (u32) and advance row pointers for ckpt accounting.
+                            let w0 = i * 3;
+                            let a_len_u32: u32 = a_len
+                                .try_into()
+                                .unwrap_or_else(|_| panic!("file-backed row a_len overflow u32 (a_len={a_len})"));
+                            let b_len_u32: u32 = b_len
+                                .try_into()
+                                .unwrap_or_else(|_| panic!("file-backed row b_len overflow u32 (b_len={b_len})"));
+                            let c_len_u32: u32 = c_len
+                                .try_into()
+                                .unwrap_or_else(|_| panic!("file-backed row c_len overflow u32 (c_len={c_len})"));
+                            row_lens[w0 + 0] = a_len_u32;
+                            row_lens[w0 + 1] = b_len_u32;
+                            row_lens[w0 + 2] = c_len_u32;
+                            a0 = a0.saturating_add(a_len as u64);
+                            b0 = b0.saturating_add(b_len as u64);
+                            c0 = c0.saturating_add(c_len as u64);
+                            row_idx = row_idx.saturating_add(1);
+                        }
+
+                        debug_assert_eq!(a_pos, total_a);
+                        debug_assert_eq!(b_pos, total_b);
+                        debug_assert_eq!(c_pos, total_c);
+
+                        // Write this chunk into its disjoint file ranges.
+                        let a_terms_off = start_a_terms_global.saturating_add(a_start[ci]);
+                        let b_terms_off = start_b_terms_global.saturating_add(b_start[ci]);
+                        let c_terms_off = start_c_terms_global.saturating_add(c_start[ci]);
+                        let rows_off = start_rows_global.saturating_add(row_start[ci]);
+
+                        let a_coeff_off = (a_terms_off as u128).saturating_mul(2u128).min(u64::MAX as u128) as u64;
+                        let a_idx_off = (a_terms_off as u128).saturating_mul(4u128).min(u64::MAX as u128) as u64;
+                        let b_coeff_off = (b_terms_off as u128).saturating_mul(2u128).min(u64::MAX as u128) as u64;
+                        let b_idx_off = (b_terms_off as u128).saturating_mul(4u128).min(u64::MAX as u128) as u64;
+                        let c_coeff_off = (c_terms_off as u128).saturating_mul(2u128).min(u64::MAX as u128) as u64;
+                        let c_idx_off = (c_terms_off as u128).saturating_mul(4u128).min(u64::MAX as u128) as u64;
+                        let row_bytes_off = (rows_off as u128)
+                            .saturating_mul(ROW_LENS_BYTES_PER_ROW as u128)
+                            .min(u64::MAX as u128) as u64;
+
+                        pwrite_all(&range.out_fc_a, a_coeff_off, &a_coeffs)
+                            .unwrap_or_else(|e| panic!("file-backed range write A coeffs failed: {e}"));
+                        pwrite_all(&range.out_fi_a, a_idx_off, as_u8_slice_u32(&a_idx))
+                            .unwrap_or_else(|e| panic!("file-backed range write A idx failed: {e}"));
+                        pwrite_all(&range.out_fc_b, b_coeff_off, &b_coeffs)
+                            .unwrap_or_else(|e| panic!("file-backed range write B coeffs failed: {e}"));
+                        pwrite_all(&range.out_fi_b, b_idx_off, as_u8_slice_u32(&b_idx))
+                            .unwrap_or_else(|e| panic!("file-backed range write B idx failed: {e}"));
+                        pwrite_all(&range.out_fc_c, c_coeff_off, &c_coeffs)
+                            .unwrap_or_else(|e| panic!("file-backed range write C coeffs failed: {e}"));
+                        pwrite_all(&range.out_fi_c, c_idx_off, as_u8_slice_u32(&c_idx))
+                            .unwrap_or_else(|e| panic!("file-backed range write C idx failed: {e}"));
+                        pwrite_all(&range.out_rows, row_bytes_off, as_u8_slice_u32(&row_lens))
+                            .unwrap_or_else(|e| panic!("file-backed range write row lens failed: {e}"));
+
+                        out
+                    })
+                    .collect();
+
+                let mut all_ckpts: Vec<(u64, u64, u64, u64)> = Vec::new();
+                for r in results {
+                    all_ckpts.extend(r.ckpts);
+                }
+
+                let total_rows: u64 = rows_per.into_iter().sum();
+                let total_a: u64 = a_terms_per.into_iter().sum();
+                let total_b: u64 = b_terms_per.into_iter().sum();
+                let total_c: u64 = c_terms_per.into_iter().sum();
+                gb.file_range_commit_parallel_write(total_rows, total_a, total_b, total_c, all_ckpts)
+                    .unwrap_or_else(|e| panic!("file-backed range commit failed: {e}"));
+
+                return lowered;
+            }
+        }
+
+        // Fallback: chunked build+append (works for append-backed file sinks).
         //
-        // This is important for large merged IR fragments (e.g. `u_shared`), where full-fragment
-        // buffers can reach tens of GB and become both RAM- and wall-time-dominant.
-        //
-        // Policy: use a larger fixed chunk size to reduce per-chunk overhead and keep Rayon
-        // workers busy on 96-core machines.
+        // This avoids allocating enormous flat buffers for the whole fragment at once.
         const CHUNK_CONSTRAINTS: usize = 500_000;
         let chunk_constraints: usize = CHUNK_CONSTRAINTS;
 
@@ -497,14 +752,6 @@ pub(crate) fn lower_ir_into_builder(gb: &mut Dr1csBuilder<F257>, ir: CmIr) -> Lo
             let out_a_idx: SyncPtr<u32> = SyncPtr(a_idx.as_mut_ptr());
             let out_b_idx: SyncPtr<u32> = SyncPtr(b_idx.as_mut_ptr());
             let out_c_idx: SyncPtr<u32> = SyncPtr(c_idx.as_mut_ptr());
-            #[inline]
-            fn map_var_fast_u32(base_nvars: usize, local_to_var: &[usize], v: VarRef) -> u32 {
-                let m = map_var_fast(base_nvars, local_to_var, v);
-                if m > (u32::MAX as u64) {
-                    panic!("file-backed lowering: mapped var idx overflow u32");
-                }
-                m as u32
-            }
             let a_bytes_ptr: usize = a_coeffs.as_mut_ptr() as usize;
             let b_bytes_ptr: usize = b_coeffs.as_mut_ptr() as usize;
             let c_bytes_ptr: usize = c_coeffs.as_mut_ptr() as usize;
