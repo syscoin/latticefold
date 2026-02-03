@@ -2443,24 +2443,99 @@ fn compute_cm_shared_precomp_base(
             let half_digits = goldilocks_bytes_to_digits(&mut glue.gb, half_bytes);
             let zero_byte = glue.gb.new_var(F257::ZERO);
             glue.gb.enforce_var_eq_const(zero_byte, F257::ZERO);
+            // build `s_prime_flat` in **batched IR** and lower in coarse chunks.
+            //
+            // Count-only friendliness: in Pass0 we build the IR in count-only mode and the lowerer
+            // bumps counts via `stats` (no term streaming).
+            let timing_u = tiny_opmix_on();
+            let t_sflat = Instant::now();
+            let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+            let p_d_const = super::goldilocks::goldilocks_p_bal16_digits_le_const();
+            let zb = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, zero_byte);
+            if zb.len() != 8 {
+                return Err("tiny gate: internal error: zero_byte bits len mismatch".to_string());
+            }
+            let zero_bits: [usize; 8] = core::array::from_fn(|i| zb[i]);
+            let half_ir: [super::cm_ir::VarRef; 17] =
+                core::array::from_fn(|j| super::cm_ir::VarRef::Base(half_digits[j]));
+
+            const SFLAT_CHUNK_BLOCKS: usize = 16;
             let mut sflat: Vec<RingDigits> = Vec::with_capacity(need_sprime);
-            for blk in 0..need_sprime {
-                let sb = &short_locals[3 + blk];
-                if sb.byte_vars.len() != ring_dim {
-                    return Err("tiny gate: short byte_vars len mismatch (base s_prime_flat)".to_string());
+            let mut blk0 = 0usize;
+            while blk0 < need_sprime {
+                let blk1 = (blk0 + SFLAT_CHUNK_BLOCKS).min(need_sprime);
+
+                // Collect bit references first (needs `&mut glue.gb`), then build IR without holding
+                // an immutable borrow of `glue.gb.assignment`.
+                let mut blocks_bits: Vec<[[[usize; 8]; 8]; 64]> = Vec::with_capacity(blk1 - blk0);
+                for blk in blk0..blk1 {
+                    let sb = &short_locals[3 + blk];
+                    if sb.byte_vars.len() != ring_dim {
+                        return Err("tiny gate: short byte_vars len mismatch (base s_prime_flat)".to_string());
+                    }
+                    let mut out_blk_bits: [[[usize; 8]; 8]; 64] = [[[0usize; 8]; 8]; 64];
+                    for col in 0..ring_dim {
+                        let bv = sb.byte_vars[col];
+                        let bb = decompose_existing_byte_var_to_bits::<F257>(&mut glue.gb, bv);
+                        if bb.len() != 8 {
+                            return Err(
+                                "tiny gate: internal error: byte bits len mismatch (base s_prime_flat)".to_string(),
+                            );
+                        }
+                        let byte0_bits: [usize; 8] =
+                            core::array::from_fn(|i| if i < exp { bb[i] } else { zero_bits[i] });
+                        out_blk_bits[col] = core::array::from_fn(|bi| if bi == 0 { byte0_bits } else { zero_bits });
+                    }
+                    blocks_bits.push(out_blk_bits);
                 }
-                let mut re: RingDigits = Vec::with_capacity(ring_dim);
-                for &bv in &sb.byte_vars {
-                    re.push(short_challenge_coeff_digits_from_byte_var_128(
-                        &mut glue.gb,
-                        bv,
-                        exp,
-                        u,
-                        &half_digits,
-                        zero_byte,
-                    ));
+
+                let (ir, outs): (super::cm_ir::CmIr, Vec<[[super::cm_ir::VarRef; 17]; 64]>) = {
+                    let base_asg: &[F257] = &glue.gb.assignment;
+                    let mut ib = if glue.gb.is_count_only() {
+                        super::cm_ir::IrBuilder::new_count_only(base_asg)
+                    } else {
+                        super::cm_ir::IrBuilder::new(base_asg)
+                    };
+
+                    // IR outputs: per block, 64 coeffs each as 17 digits.
+                    let mut outs: Vec<[[super::cm_ir::VarRef; 17]; 64]> = Vec::with_capacity(blk1 - blk0);
+                    for out_blk_bits in &blocks_bits {
+                        let mut out_blk: [[super::cm_ir::VarRef; 17]; 64] =
+                            [[super::cm_ir::VarRef::Base(glue.gb.one()); 17]; 64];
+                        for col in 0..ring_dim {
+                            let bytes_bits_ir: [[super::cm_ir::VarRef; 8]; 8] = core::array::from_fn(|bi| {
+                                core::array::from_fn(|j| super::cm_ir::VarRef::Base(out_blk_bits[col][bi][j]))
+                            });
+
+                            let low_digits_ir =
+                                super::cm_ir::u64_bytes_to_bal16_digits_from_bits_ir(&mut ib, &bytes_bits_ir);
+                            let coeff_ir = super::cm_ir::goldilocks_sub_mod_p_digits_ir(
+                                &mut ib,
+                                &low_digits_ir,
+                                &half_ir,
+                                p_u64,
+                                &p_d_const,
+                            );
+                            out_blk[col] = coeff_ir;
+                        }
+                        outs.push(out_blk);
+                    }
+                    (ib.ir, outs)
+                };
+
+                let lowered = super::cm_ir::lower_ir_into_builder(&mut glue.gb, ir);
+                for out_blk in outs {
+                    let mut re: RingDigits = Vec::with_capacity(ring_dim);
+                    for col in 0..ring_dim {
+                        let digits = core::array::from_fn(|j| lowered.map_var(out_blk[col][j]));
+                        re.push(digits);
+                    }
+                    sflat.push(re);
                 }
-                sflat.push(re);
+                blk0 = blk1;
+            }
+            if timing_u {
+                eprintln!("tiny_gate: CM s_prime_flat timing: elapsed={:?} blocks={} coeffs={}", t_sflat.elapsed(), need_sprime, need_sprime.saturating_mul(ring_dim));
             }
 
             // SetChk verifier point `r` used in eq(r, ro).
@@ -2541,7 +2616,6 @@ fn compute_cm_shared_precomp_base(
                         core::array::from_fn(|i| core::array::from_fn(|j| lowered.map_var(out_ir[i][j])))
                     }
 
-                    let timing_u = tiny_opmix_on();
                     let mut u_ir_build_time = Duration::ZERO;
                     let mut u_lower_time = Duration::ZERO;
                     let mut u_frag_count: usize = 0;
