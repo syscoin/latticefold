@@ -15,7 +15,7 @@ use super::goldilocks::{
 use super::cm_ir::{
     bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_ir, goldilocks_mul_const_mod_p_digits_bal4_ir,
     goldilocks_mul_mod_p_digits_bal4_ir, goldilocks_mul_mod_p_digits_ir, goldilocks_sub_mod_p_digits_ir, lower_ir_into_builder,
-    ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir, ring_mul_negacyclic_ntt_goldilocks_d64_ir, IrBuilder, VarRef as IrVarRef,
+    ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir, IrBuilder, VarRef as IrVarRef,
 };
 use cyclotomic_rings::rings::GoldilocksRing64 as GR64;
 use stark_rings::{psi, unit_monomial, CoeffRing};
@@ -277,37 +277,6 @@ pub(crate) fn ring_scale_digits(gb: &mut Dr1csBuilder<F257>, a: &RingDigits, s: 
         let digits: GoldilocksScalar = core::array::from_fn(|j| lowered.map_var(oi[j]));
         out.push(digits);
     }
-    gb.profile_exit(_prev);
-    out
-}
-
-/// Negacyclic ring multiplication for ring_dim=64 over Goldilocks (digit-domain).
-pub(crate) fn ring_mul_negacyclic_digits_d64(
-    gb: &mut Dr1csBuilder<F257>,
-    a: &RingDigits,
-    b: &RingDigits,
-) -> Result<RingDigits, String> {
-    let _prev = gb.profile_enter("cm_math::ring_mul_negacyclic_digits_d64");
-    tiny_cm_bump(|c| c.ring_mul_negacyclic += 1);
-    if a.len() != 64 || b.len() != 64 {
-        return Err("ring_mul_negacyclic_digits_d64: expected ring_dim=64".to_string());
-    }
-
-    // Build an IR fragment for the ring-mul using only the current base assignment (read-only),
-    // then lower into the mutable builder.
-    //
-    // This is the key decoupling needed to later build many ring-muls in parallel as IR shards.
-    let a_ir: [[IrVarRef; 17]; 64] = core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j])));
-    let b_ir: [[IrVarRef; 17]; 64] = core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(b[i][j])));
-
-    let mut irb = IrBuilder::new(&gb.assignment);
-    let out_ir = ring_mul_negacyclic_ntt_goldilocks_d64_ir(&mut irb, &a_ir, &b_ir);
-    let lowered = lower_ir_into_builder(gb, irb.ir);
-
-    let out: [GoldilocksScalar; 64] = core::array::from_fn(|i| {
-        core::array::from_fn(|j| lowered.map_var(out_ir[i][j]))
-    });
-    let out = Ok(out.into_iter().collect());
     gb.profile_exit(_prev);
     out
 }
@@ -751,18 +720,6 @@ pub(crate) fn ring_const_coeff_digits(gb: &mut Dr1csBuilder<F257>, c0: &Goldiloc
 }
 
 #[inline]
-pub(crate) fn ring_unit_monomial_digits(gb: &mut Dr1csBuilder<F257>, idx: usize, d: usize) -> RingDigits {
-    let _prev = gb.profile_enter("cm_math::ring_unit_monomial_digits");
-    let z = goldilocks_const_u64_digits(gb, 0u64);
-    let one = goldilocks_const_u64_digits(gb, 1u64);
-    let mut out = vec![z; d];
-    if idx < d {
-        out[idx] = one;
-    }
-    gb.profile_exit(_prev);
-    out
-}
-
 /// Evaluate a small MLE table (ring-valued) at point `r` (LSB-first variable order).
 ///
 /// `table.len()` must be a power of two, and `r.len() == log2(table.len())`.

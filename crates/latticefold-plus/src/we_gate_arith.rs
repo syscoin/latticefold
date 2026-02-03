@@ -7064,13 +7064,6 @@ mod tests {
         use cyclotomic_rings::rings::GoldilocksRing64 as RR;
         use stark_rings::PolyRing;
 
-        use crate::we_statement::{digest32_to_bits_field, we_statement_hash_lf_plus, LFP_WE_GATE_DIGEST_V1};
-        use dpp::dr1cs_flpcp::Dr1csInstanceSparse as DppInst;
-        use dpp::sparse::SparseVec;
-        use dpp::pipeline::build_rev2_dpp_sparse_boolean_auto;
-        use dpp::packing::{centered_bigint_to_field, field_to_centered_bigint, sample_packing_weights, FlpcpPredicate, PackedDppQuerySparse};
-        use dpp::BoundedFlpcpSparse;
-
         use ark_ff::PrimeField;
         use rand::{rngs::StdRng, RngCore, SeedableRng};
         #[cfg(feature = "parallel")]
@@ -7279,7 +7272,7 @@ mod tests {
             //
             // Build the full tiny gate from the **real proof trace** and check satisfaction.
             // This gives the closest estimate of the eventual F257 verifier-gate size.
-            let t_tiny = std::time::Instant::now();
+            let _t_tiny = std::time::Instant::now();
             let ring_dim = RR::dimension();
             if ring_dim != 64 {
                 panic!("test_large_trace: tiny gate only supports ring_dim=64");

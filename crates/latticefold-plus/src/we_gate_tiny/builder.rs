@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::transcript::DEFAULT_REJECTION_TRIES;
-use crate::fs_cleanup::fast_remove_dir_best_effort;
 
 use rayon::join;
 use rayon::prelude::*;
@@ -14,13 +13,12 @@ use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
 use latticefold::transcript::poseidon::{f257_poseidon_config, F257};
 use symphony::dpp_poseidon::{
     poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_count_sharded, PoseidonDr1csWiring,
-    RangeWriteResult as PoseidonCounts,
 };
 #[cfg(unix)]
 use symphony::dpp_poseidon::poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_range_sharded_into_files;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 use symphony::file_backed_dr1cs::{
-    FileBackedLayout, FileBackedSparseDr1csInstance, merge_file_backed_sparse_dr1cs_share_one,
+    FileBackedLayout, FileBackedSparseDr1csInstance,
 };
 #[cfg(unix)]
 use symphony::file_backed_dr1cs::FileBackedRangeWriter;
@@ -47,7 +45,6 @@ use super::goldilocks::{
 };
 use super::gadgets::{alloc_byte, decompose_existing_byte_var_to_bits};
 use super::params::DIGITS_PER_TRY;
-use super::poseidon::poseidon_f257_arithmetize;
 use super::surfaces::{CmDigitMulSqSurfaceWiring, CmDigitMulSurfaceWiring};
 
 use super::cm_math::{
@@ -453,8 +450,6 @@ struct GlueCtx {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TinyGateBuildMode {
     Count,
-    #[cfg(unix)]
-    Append,
     #[cfg(unix)]
     RangeBase,
 }
@@ -891,16 +886,12 @@ impl GlueCtx {
     fn new(
         mode: &TinyGateBuildMode,
         pose_asg: Arc<Vec<F257>>,
-        out_dir: impl AsRef<Path>,
+        _out_dir: impl AsRef<Path>,
         part_idx: usize,
         range: Option<&TinyGateRangeBase>,
     ) -> Result<Self, String> {
         let mut gb = match mode {
             TinyGateBuildMode::Count => Dr1csBuilder::<F257>::new_count_only(),
-            #[cfg(unix)]
-            TinyGateBuildMode::Append => Dr1csBuilder::<F257>::new_file_backed(out_dir)?,
-            #[cfg(not(unix))]
-            TinyGateBuildMode::Append => Dr1csBuilder::<F257>::new_file_backed(out_dir)?,
             #[cfg(unix)]
             TinyGateBuildMode::RangeBase => {
                 let rb = range.ok_or("tiny gate: missing range base for RangeBase mode")?;
@@ -975,7 +966,6 @@ impl GlueCtx {
 #[derive(Clone, Debug)]
 struct BuildDirs {
     root: PathBuf,
-    poseidon_dir: PathBuf,
     base_glue_dir: PathBuf,
     merged_dir: PathBuf,
     cm0_dir: PathBuf,
@@ -985,23 +975,12 @@ struct BuildDirs {
 fn build_dirs(out_dir: impl AsRef<Path>) -> BuildDirs {
     let root: PathBuf = out_dir.as_ref().to_path_buf();
     BuildDirs {
-        poseidon_dir: root.join("poseidon"),
         base_glue_dir: root.join("base_glue"),
         merged_dir: root.join("merged"),
         cm0_dir: root.join("cm0"),
         cm1_dir: root.join("cm1"),
         root,
     }
-}
-
-fn build_poseidon(
-    cfg: Option<&PoseidonConfig<F257>>,
-    ops: &[PoseidonTraceOp<F257>],
-    dirs: &BuildDirs,
-) -> Result<(FileBackedSparseDr1csInstance<F257>, Vec<F257>, PoseidonDr1csWiring), String> {
-    let (pose_inst, pose_asg, pose_wiring, _byte_wiring) =
-        poseidon_f257_arithmetize(cfg, ops, &dirs.poseidon_dir)?;
-    Ok((pose_inst, pose_asg, pose_wiring))
 }
 
 fn build_canonicality_shards(
@@ -1085,22 +1064,6 @@ fn add_decomp_linb2x_constraints(
             r.push(alloc_witness_goldilocks_u64_digits(gb, u));
         }
         r
-    }
-
-    #[inline]
-    fn alloc_witness_ring_digits_like(gb: &mut Dr1csBuilder<F257>, target: &RingDigits) -> RingDigits {
-        // Allocate a fresh witness ring whose digit-vars are initialized to the same assignment values
-        // as `target` (no extra constraints). This is used to keep the statement-only builder
-        // satisfiable by choosing a trivial decomposition (r0=target, r1=0).
-        let mut out: RingDigits = Vec::with_capacity(target.len());
-        for coeff in target {
-            let digits: GoldilocksScalar = core::array::from_fn(|j| {
-                let v = gb.assignment[coeff[j]];
-                gb.new_var(v)
-            });
-            out.push(digits);
-        }
-        out
     }
 
     #[inline]
@@ -2229,7 +2192,7 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
             // This removes the repeated bal16<->bal4 conversions inside `ring_scale_digits` and
             // inside `ct_psi_mul_ring_digits_d64` for each intermediate ring value.
             use super::cm_ir::{
-                bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir, goldilocks_mul_const_mod_p_digits_bal4_ir,
+                goldilocks_add_mod_p_digits_bal4_ir, goldilocks_mul_const_mod_p_digits_bal4_ir,
                 goldilocks_mul_mod_p_digits_bal4_ir, goldilocks_sub_mod_p_digits_bal4_ir, lower_ir_into_builder,
                 IrBuilder, VarRef as IrVarRef,
             };
@@ -3798,6 +3761,7 @@ fn enforce_canonical_goldilocks_for_ranges(
 // export them. The tiny gate follows that model: we do not export `tcch0/tcch1` surfaces.
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(any())] // legacy append+merge path (non-canonical)
 fn finalize(
     pose_inst: FileBackedSparseDr1csInstance<F257>,
     pose_wiring: PoseidonDr1csWiring,
@@ -4369,7 +4333,7 @@ fn build_cm_glue_for_which(
 
                     // Build per-l IR shards in parallel, but stream inputs in **batches** to bound peak memory.
                     use super::cm_ir::{
-                        bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir, goldilocks_mul_mod_p_digits_bal4_ir,
+                        goldilocks_add_mod_p_digits_bal4_ir, goldilocks_mul_mod_p_digits_bal4_ir,
                         lower_ir_into_builder, IrBuilder, VarRef as IrVarRef,
                     };
                     let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
@@ -4621,7 +4585,7 @@ fn build_cm_glue_for_which(
                     // bal16<->bal4 conversions inside tight loops and to match the other optimized CM paths.
                     {
                         use super::cm_ir::{
-                            bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir, goldilocks_mul_mod_p_digits_bal4_ir,
+                            goldilocks_add_mod_p_digits_bal4_ir, goldilocks_mul_mod_p_digits_bal4_ir,
                             lower_ir_into_builder, IrBuilder, VarRef as IrVarRef,
                         };
                         let p_u64 = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
@@ -4886,7 +4850,7 @@ fn build_cm_glue_for_which(
 
                 let frags = {
                 use super::cm_ir::{
-                    bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir, goldilocks_mul_mod_p_digits_bal4_ir,
+                    goldilocks_add_mod_p_digits_bal4_ir, goldilocks_mul_mod_p_digits_bal4_ir,
                     IrBuilder, VarRef as IrVarRef,
                 };
 
@@ -4967,7 +4931,7 @@ fn build_cm_glue_for_which(
         // then lower sequentially into this module's builder.
         {
             use super::cm_ir::{
-                bal4_to_bal16_digits_ir, goldilocks_add_mod_p_digits_bal4_ir, goldilocks_mul_mod_p_digits_bal4_ir,
+                goldilocks_add_mod_p_digits_bal4_ir, goldilocks_mul_mod_p_digits_bal4_ir,
                 lower_ir_into_builder, ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir, IrBuilder, VarRef as IrVarRef,
             };
 
@@ -5096,6 +5060,14 @@ fn build_direct_to_merged_unix(
     use std::io::Write;
 
     let dirs = build_dirs(&out_dir);
+    if tiny_opmix_on() {
+        super::op_counts::tiny_cm_counts_reset();
+    }
+    lf_profile_log(&format!(
+        "start out_dir={} threads={}",
+        dirs.root.display(),
+        rayon::current_num_threads().max(1)
+    ));
 
     let default_cfg;
     let poseidon_cfg = match cfg {
@@ -5241,6 +5213,20 @@ fn build_direct_to_merged_unix(
         &goldilocks_locals,
     )?;
 
+    // Capture a lightweight absorb breakdown summary for optional op-mix reporting.
+    let absorb_counts = TinyAbsorbBreakdownCounts {
+        comh_ops: comh_absorbs.len(),
+        comh_bytes_total: sum_absorb_bytes(&comh_absorbs),
+        sc_msgs_ops_0: sc_msg_absorbs.get(0).map(|v| v.len()).unwrap_or(0),
+        sc_msgs_bytes_total_0: sc_msg_absorbs.get(0).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
+        sc_msgs_ops_1: sc_msg_absorbs.get(1).map(|v| v.len()).unwrap_or(0),
+        sc_msgs_bytes_total_1: sc_msg_absorbs.get(1).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
+        eval_ops_0: eval_absorbs.get(0).map(|v| v.len()).unwrap_or(0),
+        eval_bytes_total_0: eval_absorbs.get(0).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
+        eval_ops_1: eval_absorbs.get(1).map(|v| v.len()).unwrap_or(0),
+        eval_bytes_total_1: eval_absorbs.get(1).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
+    };
+
     let setchk_out_e_vars_for_cm = setchk_out_e_vars_for_cm.map(Arc::new);
     let dcom_evals_for_cm = dcom_evals_for_cm.map(Arc::new);
     let setchk_r_point_for_cm = setchk_r_point_for_cm.map(Arc::new);
@@ -5313,6 +5299,26 @@ fn build_direct_to_merged_unix(
         all_sq_sum_digits,
         all_sq_sum_coeffwise,
     ) = build_surfaces_with_shared_arcs(&mut glue, ring_dim, pairs, &short_locals, &u32_locals)?;
+
+    // Optional: print an op-mix breakdown for tiny-field porting estimates (direct-to-merged build).
+    //
+    // Enable with: `LFP_WE_GATE_OPMIX=1 ...`
+    maybe_print_tiny_opmix_common(
+        cfg,
+        ops,
+        pose_range.rows as usize,
+        glue.gb.nconstraints() as usize,
+        "[direct-merged]",
+        &glue,
+        &absorb_counts,
+        pairs.len(),
+        surfaces_mul_local.len(),
+        surfaces_sq_local.len(),
+        all_sum_digits.len(),
+        all_sum_coeffwise.len(),
+        all_sq_sum_digits.len(),
+        all_sq_sum_coeffwise.len(),
+    );
 
     // ---------------------------------------------------------------------
     // Collect parts: assignments + ckpts + local maps for equality tail.
@@ -5578,6 +5584,11 @@ fn build_direct_to_merged_unix(
             c_terms: plan.total_c_terms,
         },
     );
+    lf_profile_log(&format!(
+        "finish nvars={} constraints={}",
+        inst.nvars,
+        inst.layout.nconstraints
+    ));
 
     // All exported wiring is from the base glue module (part 1).
     let to_glue_global = |glue_local: usize| -> usize { remap(1, glue_local, &offsets) };
@@ -5695,257 +5706,11 @@ pub(super) fn build(
 > {
     #[cfg(unix)]
     {
-        // Default: direct-to-merged (two-pass) on unix.
-        let direct = match std::env::var("LFP_TINY_GATE_DIRECT_MERGED").as_deref() {
-            Ok("0") | Ok("false") | Ok("no") => false,
-            _ => true,
-        };
-        if direct {
-            return build_direct_to_merged_unix(cfg, ops, ring_dim, params, wiring, pairs, extra_witness, out_dir);
-        }
+        return build_direct_to_merged_unix(cfg, ops, ring_dim, params, wiring, pairs, extra_witness, out_dir);
     }
-    let dirs = build_dirs(out_dir);
-    lf_profile_log(&format!(
-        "start out_dir={} threads={}",
-        dirs.root.display(),
-        rayon::current_num_threads().max(1)
-    ));
-    if tiny_opmix_on() {
-        super::op_counts::tiny_cm_counts_reset();
+    #[cfg(not(unix))]
+    {
+        let _ = (cfg, ops, ring_dim, params, wiring, pairs, extra_witness, out_dir);
+        Err("tiny gate: direct-to-merged build requires unix".to_string())
     }
-
-    // Build Poseidon as a file-backed instance + assignment (deterministic from ops schedule).
-    let (pose_inst, pose_asg, pose_wiring) = build_poseidon(cfg, ops, &dirs)?;
-
-    let short_ranges =
-        squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.short_squeeze_ops)?;
-    let u32_ranges =
-        squeeze_field_ranges_by_op_index(&pose_wiring.squeeze_field_ranges, &wiring.u32_squeeze_ops)?;
-    validate_pairs(pairs, short_ranges.len(), u32_ranges.len())?;
-    validate_params_and_short_schedule(ring_dim, params, short_ranges.len())?;
-
-    let pose_asg = Arc::new(pose_asg);
-    let mut glue = GlueCtx::new(&TinyGateBuildMode::Append, pose_asg.clone(), &dirs.base_glue_dir, 1, None)?;
-
-    // Canonicality constraints: build parallel file-backed glue shards.
-    let canonical_glues = build_canonicality_shards(&TinyGateBuildMode::Append, 2, None, &pose_asg, ops, &pose_wiring, &dirs)?;
-
-    validate_cm_u32_schedule(params, wiring)?;
-    let (n_comh_ring_elems, coeff_bytes) = count_comh_ring_elements(ops, &pose_wiring, ring_dim, wiring)?;
-    if ring_dim > 0 && n_comh_ring_elems > 0 && coeff_bytes != 8 {
-        return Err(format!(
-            "tiny gate: expected Goldilocks base-field coeff_bytes=8, got {coeff_bytes}"
-        ));
-    }
-    let kappa = params.kappa as usize;
-    if kappa > 0 && (n_comh_ring_elems % kappa) != 0 {
-        return Err("tiny gate: comh ring element count not divisible by kappa".to_string());
-    }
-    let l_instances_expected = if kappa == 0 { 0 } else { n_comh_ring_elems / kappa };
-
-    let short_locals = build_short_blocks(&mut glue, &pose_wiring, ring_dim, &short_ranges)?;
-    let (u32_locals, goldilocks_locals) =
-        build_u32_and_goldilocks_blocks(&mut glue, &pose_wiring, &wiring.u32_squeeze_ops)?;
-
-    // Values parsed/allocated during SetChk/RgChk that the CM verifier math needs later.
-    // Stored as base-glue vars and passed (by Arc) into CM submodules for import/glue.
-    let mut setchk_out_e_vars_for_cm: Option<Vec<Vec<Vec<RingDigits>>>> = None;
-    let mut dcom_evals_for_cm: Option<Vec<DcomEvalDigits>> = None;
-    let mut fcoms_for_cm: Option<Vec<FComsDigits>> = None;
-    let mut setchk_r_point_for_cm: Option<Vec<GoldilocksScalar>> = None;
-
-    arithmetize_pi_lin_setchk_rgchk_prefix(
-        &mut glue,
-        ops,
-        &pose_wiring,
-        ring_dim,
-        params,
-        wiring,
-        l_instances_expected,
-        &u32_locals,
-        extra_witness,
-        &mut setchk_out_e_vars_for_cm,
-        &mut dcom_evals_for_cm,
-        &mut fcoms_for_cm,
-        &mut setchk_r_point_for_cm,
-    )?;
-
-    // Parse and constrain the CM segment after short challenges.
-    let (comh_absorbs, sc_msg_absorbs, eval_absorbs) = parse_and_enforce_cm_after_short(
-        &mut glue,
-        ops,
-        &pose_wiring,
-        ring_dim,
-        params,
-        wiring,
-        l_instances_expected,
-        &goldilocks_locals,
-    )?;
-
-    // Capture a lightweight absorb breakdown summary for optional op-mix reporting.
-    let absorb_counts = TinyAbsorbBreakdownCounts {
-        comh_ops: comh_absorbs.len(),
-        comh_bytes_total: sum_absorb_bytes(&comh_absorbs),
-        sc_msgs_ops_0: sc_msg_absorbs.get(0).map(|v| v.len()).unwrap_or(0),
-        sc_msgs_bytes_total_0: sc_msg_absorbs.get(0).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
-        sc_msgs_ops_1: sc_msg_absorbs.get(1).map(|v| v.len()).unwrap_or(0),
-        sc_msgs_bytes_total_1: sc_msg_absorbs.get(1).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
-        eval_ops_0: eval_absorbs.get(0).map(|v| v.len()).unwrap_or(0),
-        eval_bytes_total_0: eval_absorbs.get(0).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
-        eval_ops_1: eval_absorbs.get(1).map(|v| v.len()).unwrap_or(0),
-        eval_bytes_total_1: eval_absorbs.get(1).map(|v| sum_absorb_bytes(v)).unwrap_or(0),
-    };
-
-    // CM modules: build as file-backed glue shards.
-    let setchk_out_e_vars_for_cm = setchk_out_e_vars_for_cm.map(Arc::new);
-    let dcom_evals_for_cm = dcom_evals_for_cm.map(Arc::new);
-    let setchk_r_point_for_cm = setchk_r_point_for_cm.map(Arc::new);
-
-    let cm_shared_base: Option<Arc<CmSharedPrecompBase>> = compute_cm_shared_precomp_base(
-        &mut glue,
-        ring_dim,
-        params,
-        wiring,
-        l_instances_expected,
-        &short_locals,
-        &u32_locals,
-        &setchk_out_e_vars_for_cm,
-        &setchk_r_point_for_cm,
-    )?;
-    let cm_extra_glues = build_cm_shards(
-        &TinyGateBuildMode::Append,
-        2 + canonical_glues.len(),
-        None,
-        cfg,
-        ops,
-        &pose_wiring,
-        ring_dim,
-        params,
-        wiring,
-        l_instances_expected,
-        &comh_absorbs,
-        &sc_msg_absorbs,
-        &eval_absorbs,
-        setchk_out_e_vars_for_cm.clone(),
-        dcom_evals_for_cm.clone(),
-        cm_shared_base.clone(),
-        glue.pose_asg.clone(),
-        glue.gb.assignment.as_slice(),
-        &short_locals,
-        &u32_locals,
-        &goldilocks_locals,
-        &dirs,
-    )?;
-
-    // Decomp verifier math (LinB2X + DecompProof) — algebraic-only checks.
-    //
-    // IMPORTANT: bind these checks to the CM-derived reduced instance x = (cm_g, r_o, v_o),
-    // not to a prover-supplied copy.
-    let (cm_g_target, vo_a_target, vo_b_target) = compute_cm_x_targets_for_decomp(
-        &mut glue,
-        ring_dim,
-        params,
-        l_instances_expected,
-        &short_locals,
-        &pose_wiring,
-        &comh_absorbs,
-        &eval_absorbs,
-        &fcoms_for_cm,
-    )?;
-    add_decomp_linb2x_constraints(
-        &mut glue,
-        ring_dim,
-        params,
-        extra_witness,
-        &cm_g_target,
-        &vo_a_target,
-        &vo_b_target,
-    )?;
-
-    // Surfaces (same as `build()`; these are comparatively small vs Poseidon/CM).
-    let (
-        surfaces_mul_local,
-        surfaces_sq_local,
-        all_sum_digits,
-        all_sum_coeffwise,
-        all_sq_sum_digits,
-        all_sq_sum_coeffwise,
-    ) = build_surfaces_with_shared_arcs(&mut glue, ring_dim, pairs, &short_locals, &u32_locals)?;
-
-    // Optional: print an op-mix breakdown for tiny-field porting estimates (file-backed build).
-    //
-    // Enable with: `LFP_WE_GATE_OPMIX=1 ...`
-    maybe_print_tiny_opmix_common(
-        cfg,
-        ops,
-        pose_inst.layout.nconstraints as usize,
-        glue.gb.nconstraints() as usize,
-        "[file-backed]",
-        &glue,
-        &absorb_counts,
-        pairs.len(),
-        surfaces_mul_local.len(),
-        surfaces_sq_local.len(),
-        all_sum_digits.len(),
-        all_sum_coeffwise.len(),
-        all_sq_sum_digits.len(),
-        all_sq_sum_coeffwise.len(),
-    );
-
-    drop(pose_asg);
-    let merged_dir = dirs.merged_dir.clone();
-    let out = finalize(
-        pose_inst,
-        pose_wiring,
-        ops,
-        glue,
-        {
-            let mut extra = canonical_glues;
-            extra.extend(cm_extra_glues);
-            extra
-        },
-        short_locals,
-        u32_locals,
-        goldilocks_locals,
-        surfaces_mul_local,
-        surfaces_sq_local,
-        all_sum_digits,
-        all_sum_coeffwise,
-        all_sq_sum_digits,
-        all_sq_sum_coeffwise,
-        merged_dir.clone(),
-    )?;
-
-    // Disk hygiene: keep only the merged instance directory by default.
-    //
-    // The tiny gate build uses multiple file-backed intermediate sub-instances under `dirs.root`
-    // (poseidon/, base_glue/, cm0/, cm1/, canon_*, ...). These are no longer needed after `merged/`
-    // exists, but leaving them around keeps /tmp usage huge and makes repeated runs painful.
-    //
-    // Opt-out with: LFP_TINY_GATE_KEEP_PARTS=1/true/yes
-    let keep_parts = match std::env::var("LFP_TINY_GATE_KEEP_PARTS").as_deref() {
-        Ok("1") | Ok("true") | Ok("yes") => true,
-        _ => false,
-    };
-    if !keep_parts {
-        if let Ok(rd) = std::fs::read_dir(&dirs.root) {
-            for ent in rd.flatten() {
-                let p = ent.path();
-                if p == merged_dir {
-                    continue;
-                }
-                // Don't delete non-directories (shouldn't exist, but be conservative).
-                if p.is_dir() {
-                    fast_remove_dir_best_effort(&p);
-                }
-            }
-        }
-    }
-
-    lf_profile_log(&format!(
-        "finish nvars={} constraints={}",
-        out.0.nvars,
-        out.0.layout.nconstraints
-    ));
-    Ok(out)
 }

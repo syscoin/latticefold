@@ -21,7 +21,7 @@ use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ark_ff::PrimeField;
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, SerializationError};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 
 use crate::dpp_poseidon::SparseDr1csInstance;
 
@@ -73,25 +73,6 @@ fn read_u32(r: &mut impl IoRead) -> std::io::Result<u32> {
 }
 
 #[inline]
-fn write_u64_slice_le(w: &mut impl IoWrite, xs: &[u64]) -> Result<(), String> {
-    #[cfg(target_endian = "little")]
-    {
-        // SAFETY: u64 is POD. We encode indices/rows as little-endian u64 words.
-        let nbytes = xs.len().saturating_mul(8);
-        let ptr = xs.as_ptr() as *const u8;
-        let bytes = unsafe { core::slice::from_raw_parts(ptr, nbytes) };
-        w.write_all(bytes).map_err(|e| e.to_string())
-    }
-    #[cfg(not(target_endian = "little"))]
-    {
-        for &x in xs {
-            w.write_all(&x.to_le_bytes()).map_err(|e| e.to_string())?;
-        }
-        Ok(())
-    }
-}
-
-#[inline]
 fn write_u32_slice_le(w: &mut impl IoWrite, xs: &[u32]) -> Result<(), String> {
     #[cfg(target_endian = "little")]
     {
@@ -120,15 +101,6 @@ fn cfg_pwrite_enabled() -> bool {
 }
 
 #[inline]
-fn cfg_pwrite_chunk_bytes() -> usize {
-    let mb: usize = std::env::var("LFP_FILE_BACKED_PWRITE_CHUNK_MB")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(128);
-    (mb.saturating_mul(1024 * 1024)).max(1 * 1024 * 1024)
-}
-
-#[inline]
 fn cfg_pwrite_min_bytes() -> usize {
     let mb: usize = std::env::var("LFP_FILE_BACKED_PWRITE_MIN_MB")
         .ok()
@@ -153,7 +125,6 @@ fn rows_ckpt_path(dir: &Path) -> PathBuf {
 // - rows_ckpt.bin stores periodic checkpoints for parallel/seek:
 //     (row_idx u64, a0 u64, b0 u64, c0 u64) => 32 bytes/entry
 const ROW_LENS_SIZE: usize = 12;
-const ROW_CKPT_ENTRY_SIZE: usize = 32;
 const ROW_CKPT_STRIDE: u64 = 1 << 20; // 1,048,576 rows (~32KB checkpoints per 1B constraints)
 
 #[cfg(unix)]
@@ -514,43 +485,6 @@ pub(crate) fn fast_remove_dir_best_effort(dir: &Path) {
         // Fallback: try removing in-place (may block).
         let _ = std::fs::remove_dir_all(dir);
     }
-}
-
-fn serialize_fixed<F: CanonicalSerialize>(x: &F, out: &mut [u8]) -> Result<(), SerializationError> {
-    // CanonicalSerialize writes to a std::io::Write. Avoid allocating a Vec per coefficient:
-    // write directly into the fixed-size output buffer.
-    struct SliceWriter<'a> {
-        buf: &'a mut [u8],
-        pos: usize,
-    }
-    impl<'a> IoWrite for SliceWriter<'a> {
-        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-            let rem = self.buf.len().saturating_sub(self.pos);
-            if data.len() > rem {
-                return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "SliceWriter overflow"));
-            }
-            self.buf[self.pos..self.pos + data.len()].copy_from_slice(data);
-            self.pos += data.len();
-            Ok(data.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let mut w = SliceWriter { buf: out, pos: 0 };
-    // Use uncompressed encoding for speed (bigger files, fewer bit-level operations).
-    x.serialize_with_mode(&mut w, Compress::No)?;
-    if w.pos != out.len() {
-        return Err(SerializationError::InvalidData);
-    }
-    Ok(())
-}
-
-fn deserialize_fixed<F: CanonicalDeserialize>(buf: &[u8]) -> Result<F, SerializationError> {
-    let mut r = BufReader::new(buf);
-    // Skip validation for speed (inputs are self-produced file-backed artifacts).
-    F::deserialize_with_mode(&mut r, Compress::No, ark_serialize::Validate::No)
 }
 
 #[derive(Debug)]

@@ -5,7 +5,7 @@ use symphony::dpp_sumcheck::Dr1csBuilder;
 
 use super::gadgets::decompose_existing_byte_var_to_bits;
 use super::cm_ir::{
-    alloc_bal16_digit_ir, alloc_carry_pm2_ir, lower_ir_into_builder, IrBuilder as CmIrBuilder,
+    alloc_bal16_digit_ir, lower_ir_into_builder, IrBuilder as CmIrBuilder,
     add_bal16_loose_same_len_ir, add_bal16_same_len_ir, mul_bal16_small_ir, rebalance_tail_pm11_to_pm2_ir,
     u32_bytes_to_bal16_digits_from_bits_ir, u64_bytes_to_bal16_digits_from_bits_ir, VarRef as CmVarRef,
     Bal16CheckedIr as CmBal16CheckedIr,
@@ -55,17 +55,6 @@ pub(crate) fn alloc_bal16_digit(b: &mut Dr1csBuilder<F257>, d: i8) -> usize {
 }
 
 
-/// Allocate a signed carry `c ∈ [-2,2]` as an F257 variable, with a tight boolean decomposition.
-pub(crate) fn alloc_carry_pm2(b: &mut Dr1csBuilder<F257>, c: i32) -> usize {
-    let base_one = b.assignment[b.one()];
-    let base_asg = [base_one];
-    let mut ib = CmIrBuilder::new(&base_asg);
-    let c_ir = alloc_carry_pm2_ir(&mut ib, c);
-    let lowered = lower_ir_into_builder(b, ib.ir);
-    lowered.map_var(c_ir)
-}
-
-
 // -----------------------------------------------------------------------------
 // Fox #1 (maintainable): explicit checked vs loose digit types
 // -----------------------------------------------------------------------------
@@ -112,16 +101,6 @@ pub(crate) struct Bal16Loose {
 }
 
 impl Bal16Loose {
-    #[inline]
-    pub(crate) fn as_slice(&self) -> &[usize] {
-        &self.digits
-    }
-
-    #[inline]
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [usize] {
-        &mut self.digits
-    }
-
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.digits.len()

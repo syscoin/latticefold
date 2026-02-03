@@ -48,7 +48,6 @@ pub struct Dr1csBuilder<F: PrimeField> {
     /// Global var idx = 0 if local==0 else local + file_var_tail_off.
     file_var_tail_off: u32,
     // File-backed staging: accumulate large blocks and flush via raw-block APIs.
-    fb_modulus: u16,
     fb_stage_bytes: usize,
     fb_stage_limit_bytes: usize,
     fb_a_coeffs: Vec<u8>,
@@ -117,12 +116,6 @@ pub struct Dr1csRangeResult {
 
 impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
     #[inline]
-    fn idx_u32(idx: usize) -> u32 {
-        idx.try_into()
-            .unwrap_or_else(|_| panic!("file-backed dr1cs: var idx overflow u32 (idx={idx})"))
-    }
-
-    #[inline]
     fn map_idx_u32(&self, idx: usize) -> u32 {
         if idx == 0 {
             return 0;
@@ -142,16 +135,6 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             .filter(|&v| v > 0)
             .unwrap_or(64);
         mb.saturating_mul(1024 * 1024)
-    }
-
-    fn init_fb_modulus() -> u16 {
-        let modulus_big = F::MODULUS;
-        let limbs = modulus_big.as_ref();
-        if limbs.len() == 1 && limbs[0] > 1 && limbs[0] <= 65535 {
-            limbs[0] as u16
-        } else {
-            0
-        }
     }
 
     #[inline]
@@ -227,7 +210,6 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
             file_b_terms: 0,
             file_c_terms: 0,
             file_var_tail_off: 0,
-            fb_modulus: Self::init_fb_modulus(),
             fb_stage_bytes: 0,
             fb_stage_limit_bytes: Self::stage_limit_bytes(),
             fb_a_coeffs: Vec::new(),

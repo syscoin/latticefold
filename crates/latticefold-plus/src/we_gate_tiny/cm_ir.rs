@@ -1,6 +1,6 @@
 use ark_ff::{Field, PrimeField};
 use latticefold::transcript::poseidon::F257;
-use symphony::dpp_poseidon::{Constraint, SparseDr1csInstance};
+use symphony::dpp_poseidon::Constraint;
 use symphony::dpp_sumcheck::Dr1csBuilder;
 
 use cyclotomic_rings::rings::goldilocks_ntt64 as gl_ntt64;
@@ -141,13 +141,6 @@ impl CmIr {
         s
     }
 
-    #[inline]
-    pub(crate) fn nconstraints(&self) -> u64 {
-        self.stats.linear_constraints
-            + self.stats.mul_constraints
-            + self.stats.other_non_linear_constraints
-    }
-
     /// Allocate a new local var with the given witness value.
     #[inline]
     pub(crate) fn new_var(&mut self, v: F257) -> VarRef {
@@ -258,57 +251,6 @@ impl CmIr {
         self.constraints.push(IrConstraint { a: a0..a1, b: b_rng, c: c_rng });
     }
 
-    /// Lower this IR fragment into an existing sparse DR1CS instance/assignment in-place.
-    ///
-    /// Local variables are appended to `base_asg`, and constraints are appended to `base_inst`.
-    pub(crate) fn lower_into(
-        self,
-        base_inst: &mut SparseDr1csInstance<F257>,
-        base_asg: &mut Vec<F257>,
-    ) -> Result<(), String> {
-        if self.count_only {
-            return Err("CmIr::lower_into called on count-only IR".to_string());
-        }
-        let CmIr { local_asg, constraints, a_terms, b_terms, c_terms, stats, .. } = self;
-        let base_nvars = base_asg.len();
-        // Big win for wall-time: avoid repeated reallocations during append.
-        base_asg.reserve(local_asg.len().saturating_sub(1));
-        base_inst.constraints.reserve(constraints.len());
-        base_inst.a_terms.reserve(stats.total_terms_a as usize);
-        base_inst.b_terms.reserve(stats.total_terms_b as usize);
-        base_inst.c_terms.reserve(stats.total_terms_c as usize);
-        // Append local vars (skip local_asg[0]=ONE).
-        base_asg.extend_from_slice(&local_asg[1..]);
-        let map = |v: VarRef, base_nvars: usize| -> usize {
-            match v {
-                VarRef::Base(i) => i,
-                VarRef::Local(j) => {
-                    // Local(1) becomes base_nvars, Local(2) base_nvars+1, ...
-                    base_nvars + (j - 1)
-                }
-            }
-        };
-        for ic in constraints {
-            let a0 = base_inst.a_terms.len();
-            for &(coef, v) in &a_terms[ic.a.clone()] {
-                base_inst.a_terms.push((coef, map(v, base_nvars)));
-            }
-            let a1 = base_inst.a_terms.len();
-            let b0 = base_inst.b_terms.len();
-            for &(coef, v) in &b_terms[ic.b.clone()] {
-                base_inst.b_terms.push((coef, map(v, base_nvars)));
-            }
-            let b1 = base_inst.b_terms.len();
-            let c0 = base_inst.c_terms.len();
-            for &(coef, v) in &c_terms[ic.c.clone()] {
-                base_inst.c_terms.push((coef, map(v, base_nvars)));
-            }
-            let c1 = base_inst.c_terms.len();
-            base_inst.constraints.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
-        }
-        base_inst.nvars = base_asg.len();
-        Ok(())
-    }
 }
 
 /// Lowering context returned by `lower_ir_into_builder`.
@@ -1552,52 +1494,6 @@ pub(crate) fn rebalance_tail_pm11_to_pm2_ir(b: &mut IrBuilder<'_>, digits: &[Var
     out.push(rem_digit);
     out.push(carry2_var);
     out
-}
-
-/// Negate a balanced base-16 digit vector (little-endian), producing digits in [-8,7].
-pub(crate) fn neg_bal16_digits_ir(b: &mut IrBuilder<'_>, x: &Bal16CheckedIr) -> (Bal16CheckedIr, VarRef) {
-    let n = x.len();
-    let mut out: Vec<VarRef> = Vec::with_capacity(n);
-    let mut carry_i32: i32 = 0;
-    // carry starts at 0; do NOT allocate a var for it.
-    let mut carry: Option<VarRef> = None;
-
-    for i in 0..n {
-        let xi = f257_to_i32_bal(b.val(x[i]));
-        let sum = (-xi) + carry_i32;
-        let mut carry_next = if sum >= 0 { (sum + 8) / 16 } else { -(((-sum) + 8) / 16) };
-        let mut rem = sum - 16 * carry_next;
-        while rem > 7 {
-            carry_next += 1;
-            rem -= 16;
-        }
-        while rem < -8 {
-            carry_next -= 1;
-            rem += 16;
-        }
-        debug_assert!((-1..=1).contains(&carry_next));
-        debug_assert!((-8..=7).contains(&rem));
-
-        let out_digit = alloc_bal16_digit_ir(b, rem as i8);
-        let carry_next_var = alloc_carry_pm1_ir(b, carry_next);
-
-        // carry - x_i - out_i - 16*carry_next = 0
-        let mut lc = vec![
-            (-F257::ONE, x[i]),
-            (-F257::ONE, out_digit),
-            (-F257::from(16u64), carry_next_var),
-        ];
-        if let Some(carry_var) = carry {
-            lc.insert(0, (F257::ONE, carry_var));
-        }
-        b.enforce_lc_eq_zero(lc);
-
-        out.push(out_digit);
-        carry_i32 = carry_next;
-        carry = Some(carry_next_var);
-    }
-
-    (Bal16CheckedIr(out), carry.expect("neg_bal16_digits_ir: non-empty input must produce carry var"))
 }
 
 /// Compute the balanced-digit carry-out bit for a nibble.

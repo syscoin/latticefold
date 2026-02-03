@@ -837,15 +837,6 @@ impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
         self.file_sink.is_some()
     }
 
-    #[inline]
-    fn nconstraints(&self) -> usize {
-        if self.file_sink.is_some() {
-            self.file_rows as usize
-        } else {
-            self.rows.len()
-        }
-    }
-
     fn one(&self) -> usize {
         0
     }
@@ -1540,8 +1531,6 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_count_sharded<
         wiring: PoseidonDr1csWiring,
         counts: RangeWriteResult,
         asg: Vec<F>,
-        init_state_vars: Vec<usize>,
-        final_state_vars: Vec<usize>,
     }
 
     // Build each shard in parallel (count-only sink).
@@ -1550,7 +1539,7 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_count_sharded<
         .map(|p| -> Result<ShardMeta<F>, ReplayErr> {
             let slice = &ops[p.start..p.end];
             let prebuilt = Some(Dr1csBuilder::<F>::new_count_only());
-            let (inst_any, asg, _replay, _bytes, wiring, _bw, init_state_vars, final_state_vars, counts) =
+            let (inst_any, asg, _replay, _bytes, wiring, _bw, _init_state_vars, _final_state_vars, counts) =
                 poseidon_sponge_dr1cs_from_trace_impl_any_internal(
                     cfg,
                     slice,
@@ -1572,8 +1561,6 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_count_sharded<
                 wiring,
                 counts,
                 asg,
-                init_state_vars,
-                final_state_vars,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1668,14 +1655,6 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_range_sharded_into_fi
 ) -> Result<(Vec<F>, PoseidonDr1csWiring, RangeWriteResult), ReplayErr> {
     use ark_crypto_primitives::sponge::DuplexSpongeMode;
 
-    // Tiny-gate sharded build does not support byte squeezing.
-    for op in ops {
-        if matches!(op, PoseidonTraceOp::SqueezeBytes { .. }) {
-            return Err(ReplayErr::Invalid(
-                "PoseidonTraceOp::SqueezeBytes is not supported in the sharded no-bytes range-write path".to_string(),
-            ));
-        }
-    }
     let t = cfg.rate + cfg.capacity;
     if t == 0 {
         return Err(ReplayErr::Invalid("invalid poseidon t=0".to_string()));
@@ -1766,7 +1745,11 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_range_sharded_into_fi
                     };
                 }
             }
-            PoseidonTraceOp::SqueezeBytes { .. } => unreachable!(),
+            PoseidonTraceOp::SqueezeBytes { .. } => {
+                return Err(ReplayErr::Invalid(
+                    "PoseidonTraceOp::SqueezeBytes is not supported in the sharded no-bytes range-write path".to_string(),
+                ));
+            }
         }
 
         if permutes_since_start >= shard_permutes && op_idx + 1 < ops.len() {
@@ -2385,15 +2368,6 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
     use std::io::{Seek, SeekFrom};
     use std::io::Write;
 
-    // Tiny-gate sharded build does not support byte squeezing.
-    for op in ops {
-        if matches!(op, PoseidonTraceOp::SqueezeBytes { .. }) {
-            return Err(ReplayErr::Invalid(
-                "PoseidonTraceOp::SqueezeBytes is not supported in the sharded file-backed (tiny-gate) path".to_string(),
-            ));
-        }
-    }
-
     #[derive(Clone, Copy, Debug, Default)]
     struct ShardCounts {
         nvars: u64,
@@ -2477,11 +2451,6 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
         #[inline]
         fn enforce_var_eq_const(&mut self, _x: usize) {
             // x * 1 = c  (C is a const term on var0)
-            self.add_constraint_lens(1, 1, 1);
-        }
-        #[inline]
-        fn enforce_var_eq_var(&mut self, _x: usize, _y: usize) {
-            // (1*x) * 1 = (1*y)
             self.add_constraint_lens(1, 1, 1);
         }
 
@@ -3029,7 +2998,7 @@ fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes_file_backed_sharded<F: P
     }
     #[cfg(unix)]
     let (fc_a, fi_a, fc_b, fi_b, fc_c, fi_c, f_rows) = {
-        let mut open_rw = |p: std::path::PathBuf| -> Result<std::fs::File, ReplayErr> {
+        let open_rw = |p: std::path::PathBuf| -> Result<std::fs::File, ReplayErr> {
             OpenOptions::new()
                 .create(true)
                 .read(true)
