@@ -1447,12 +1447,13 @@ where
             let eq0_0 = v0[0].coeffs()[0];
             let eq0_1 = v1[0].coeffs()[0];
             let eq0_2 = eq0_1 + (eq0_1 - eq0_0);
-            let two = R::BaseRing::ONE + R::BaseRing::ONE;
 
             let t0_0 = v0[n - 2];
             let t0_1 = v1[n - 2];
+            let t0_2 = at2::<R>(v0, v1, n - 2);
             let t1_0 = v0[n - 1];
             let t1_1 = v1[n - 1];
+            let t1_2 = at2::<R>(v0, v1, n - 1);
 
             let mut out0 = R::ZERO;
             let mut out1 = R::ZERO;
@@ -1474,30 +1475,20 @@ where
                     add_scaled_by_base(&mut lin0, &v0[j], w);
                     add_scaled_by_base(&mut lin1, &v1[j], w);
                 }
+                let lin2 = lin1 + (lin1 - lin0);
 
                 add_scaled_by_base(&mut out0, &lin0, eq0_0);
                 add_scaled_by_base(&mut out1, &lin1, eq0_1);
-                // out2 uses linear extrapolation: lin2 = 2*lin1 - lin0.
-                // Avoid materializing `lin2` (saves coefficient passes).
-                let eq2_twice = eq0_2 * two;
-                let neg_eq2 = R::BaseRing::ZERO - eq0_2;
-                add_scaled_by_base(&mut out2, &lin1, eq2_twice);
-                add_scaled_by_base(&mut out2, &lin0, neg_eq2);
+                add_scaled_by_base(&mut out2, &lin2, eq0_2);
 
                 // (tau * t) * w  ==  t * (tau0 * w)  since tau is constant-coeff.
                 add_scaled_by_base(&mut out0, &t0_0, tau0_0 * w_t0);
                 add_scaled_by_base(&mut out1, &t0_1, tau0_1 * w_t0);
-                // t0_2 = 2*t0_1 - t0_0.
-                let wt0 = tau0_2 * w_t0;
-                add_scaled_by_base(&mut out2, &t0_1, wt0 * two);
-                add_scaled_by_base(&mut out2, &t0_0, R::BaseRing::ZERO - wt0);
+                add_scaled_by_base(&mut out2, &t0_2, tau0_2 * w_t0);
 
                 add_scaled_by_base(&mut out0, &t1_0, tau0_0 * w_t1);
                 add_scaled_by_base(&mut out1, &t1_1, tau0_1 * w_t1);
-                // t1_2 = 2*t1_1 - t1_0.
-                let wt1 = tau0_2 * w_t1;
-                add_scaled_by_base(&mut out2, &t1_1, wt1 * two);
-                add_scaled_by_base(&mut out2, &t1_0, R::BaseRing::ZERO - wt1);
+                add_scaled_by_base(&mut out2, &t1_2, tau0_2 * w_t1);
             }
 
             [out0, out1, out2]
@@ -1936,12 +1927,13 @@ where
             let eq0_0 = v0[0].coeffs()[0];
             let eq0_1 = v1[0].coeffs()[0];
             let eq0_2 = eq0_1 + (eq0_1 - eq0_0);
-            let two = R::BaseRing::ONE + R::BaseRing::ONE;
 
             let t0_0 = v0[n - 2];
             let t0_1 = v1[n - 2];
+            let t0_2 = at2::<R>(v0, v1, n - 2);
             let t1_0 = v0[n - 1];
             let t1_1 = v1[n - 1];
+            let t1_2 = at2::<R>(v0, v1, n - 1);
 
             let mut out0 = R::ZERO;
             let mut out1 = R::ZERO;
@@ -1961,25 +1953,19 @@ where
                     add_scaled_by_base(&mut lin0, &v0[j], w);
                     add_scaled_by_base(&mut lin1, &v1[j], w);
                 }
+                let lin2 = lin1 + (lin1 - lin0);
 
                 add_scaled_by_base(&mut out0, &lin0, eq0_0);
                 add_scaled_by_base(&mut out1, &lin1, eq0_1);
-                let eq2_twice = eq0_2 * two;
-                let neg_eq2 = R::BaseRing::ZERO - eq0_2;
-                add_scaled_by_base(&mut out2, &lin1, eq2_twice);
-                add_scaled_by_base(&mut out2, &lin0, neg_eq2);
+                add_scaled_by_base(&mut out2, &lin2, eq0_2);
 
                 add_scaled_by_base(&mut out0, &t0_0, tau0_0 * w_t0);
                 add_scaled_by_base(&mut out1, &t0_1, tau0_1 * w_t0);
-                let wt0 = tau0_2 * w_t0;
-                add_scaled_by_base(&mut out2, &t0_1, wt0 * two);
-                add_scaled_by_base(&mut out2, &t0_0, R::BaseRing::ZERO - wt0);
+                add_scaled_by_base(&mut out2, &t0_2, tau0_2 * w_t0);
 
                 add_scaled_by_base(&mut out0, &t1_0, tau0_0 * w_t1);
                 add_scaled_by_base(&mut out1, &t1_1, tau0_1 * w_t1);
-                let wt1 = tau0_2 * w_t1;
-                add_scaled_by_base(&mut out2, &t1_1, wt1 * two);
-                add_scaled_by_base(&mut out2, &t1_0, R::BaseRing::ZERO - wt1);
+                add_scaled_by_base(&mut out2, &t1_2, tau0_2 * w_t1);
             }
 
             [out0, out1, out2]
