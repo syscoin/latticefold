@@ -42,6 +42,36 @@ where
     out
 }
 
+/// Dense mat-vec where the vector is base scalars (treated as constant-coeff ring elements),
+/// implemented as coefficient-wise scaling to avoid ring×ring multiplication.
+///
+/// This is critical for coefficient-form rings with NTT-based multiplication (e.g. `GoldilocksRing64`):
+/// `A_ij * R::from(s)` would otherwise invoke a full negacyclic convolution.
+#[inline]
+fn mat_vec_mul_base_scalars<R: PolyRing>(a: &Matrix<R>, v0: &[R::BaseRing]) -> Vec<R>
+where
+    R::BaseRing: Ring + Copy,
+{
+    assert_eq!(a.ncols, v0.len(), "mat_vec_mul_base_scalars: dimension mismatch");
+    let mut out = vec![R::ZERO; a.nrows];
+    for i in 0..a.nrows {
+        let mut acc = R::ZERO;
+        let accc = acc.coeffs_mut();
+        for j in 0..a.ncols {
+            let s = v0[j];
+            if s == R::BaseRing::ZERO {
+                continue;
+            }
+            let aij = &a.vals[i][j];
+            for (k, &ck) in aij.coeffs().iter().enumerate() {
+                accc[k] += ck * s;
+            }
+        }
+        out[i] = acc;
+    }
+    out
+}
+
 #[inline]
 fn absorb_fcoms_one<R: OverField + PolyRing>(f: &FComs<R>, transcript: &mut impl Transcript<R>) {
     // Commit-before-challenge: bind witness-dependent commitments into the transcript
@@ -1043,9 +1073,8 @@ where
 
         let t = std::time::Instant::now();
         let cm_f = A.try_mul_vec(&f).unwrap();
-        let C_Mf = A
-            .try_mul_vec(&tau.iter().map(|z| R::from(*z)).collect::<Vec<R>>())
-            .unwrap();
+        // `tau` is base scalars; avoid `try_mul_vec` (which does ring×ring mul) on Goldilocks.
+        let C_Mf = mat_vec_mul_base_scalars::<R>(A, &tau);
         let cm_mtau = A.try_mul_vec(&m_tau).unwrap();
         if profile {
             println!("[LF+ RgInstance::from_f] commit f/tau/m_tau: {:?}", t.elapsed());
