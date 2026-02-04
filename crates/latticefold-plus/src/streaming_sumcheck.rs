@@ -2602,6 +2602,9 @@ impl StreamingSumcheck {
             vals: Vec<Rr>,
             levals: Vec<Rr>,
             hfrom_cache: Option<HFromIndexCache<Rr>>,
+            // Cache monomial-like precomp for `MonomialDigitsArc` exp tables to speed up LazyFixed:
+            // (exp_table_id, mono_idx, mono_coeff). Only valid when `mono_ok=true` for that table.
+            mono_tab_cache: Option<(usize, Box<[u16]>, Box<[Rr::BaseRing]>)>,
             // CM optimization: cache one fused mat-vec row scan for the "even" and "odd" indices
             // within the current hypercube vertex pair.
             // NOTE: store cached `[R;4]` on the heap to avoid huge per-thread stack frames when
@@ -2625,6 +2628,7 @@ impl StreamingSumcheck {
             vals: vec![R::ZERO; num_polys],
             levals: vec![R::ZERO; degree + 1],
             hfrom_cache: None,
+            mono_tab_cache: None,
             cm_cache_even: None,
             cm_cache_odd: None,
             cm_lazy_cache_even: None,
@@ -2638,6 +2642,7 @@ impl StreamingSumcheck {
             cache: &mut Option<(usize, usize, Box<[R; 4]>)>,
             lazy_cache: &mut Option<(usize, usize, usize, Box<[R; 4]>)>,
             hfrom_cache: &mut Option<HFromIndexCache<R>>,
+            mono_tab_cache: &mut Option<(usize, Box<[u16]>, Box<[R::BaseRing]>)>,
         ) -> R
         where
             R::BaseRing: Ring,
@@ -2653,7 +2658,90 @@ impl StreamingSumcheck {
                         cache,
                         lazy_cache,
                         hfrom_cache,
+                        mono_tab_cache,
                     );
+                }
+                // Fast path: LazyFixed over monomial-digit MLE.
+                // Avoid materializing `inner.eval_at_index(..)` (a full ring element) and then scaling it.
+                if let StreamingMleEnum::MonomialDigitsArc { digits, exp_table, .. } = inner.as_ref()
+                {
+                    let k = fixed.len();
+                    let base = index << k;
+                    let tab_id = Arc::as_ptr(exp_table) as usize;
+
+                    // Build monomial-like precomp once per table (per thread).
+                    let (mono_idx, mono_coeff) = match mono_tab_cache.as_ref() {
+                        Some((cid, idx, coeff)) if *cid == tab_id => (&idx[..], &coeff[..]),
+                        _ => {
+                            // Attempt to build monomial-like precomp (<=1 nonzero coeff per table entry).
+                            let mut idx = Vec::<u16>::with_capacity(exp_table.len());
+                            let mut coeff = Vec::<R::BaseRing>::with_capacity(exp_table.len());
+                            let mut ok = true;
+                            for r in exp_table.iter() {
+                                let mut found: Option<(usize, R::BaseRing)> = None;
+                                for (j, &cj) in r.coeffs().iter().enumerate() {
+                                    if cj != R::BaseRing::ZERO {
+                                        if found.is_some() {
+                                            ok = false;
+                                            break;
+                                        }
+                                        found = Some((j, cj));
+                                    }
+                                }
+                                if !ok {
+                                    break;
+                                }
+                                match found {
+                                    None => {
+                                        idx.push(0u16);
+                                        coeff.push(R::BaseRing::ZERO);
+                                    }
+                                    Some((j, c)) => {
+                                        idx.push(j as u16);
+                                        coeff.push(c);
+                                    }
+                                }
+                            }
+                            if ok {
+                                *mono_tab_cache = Some((tab_id, idx.into_boxed_slice(), coeff.into_boxed_slice()));
+                                let (cid, idxb, coeffb) = mono_tab_cache.as_ref().unwrap();
+                                debug_assert_eq!(*cid, tab_id);
+                                (&idxb[..], &coeffb[..])
+                            } else {
+                                // Not monomial-like; fall back to generic LazyFixed.
+                                let mut acc = R::ZERO;
+                                for (b, &w) in weights.iter().enumerate() {
+                                    if w == R::BaseRing::ZERO {
+                                        continue;
+                                    }
+                                    acc += inner.eval_at_index(base | b) * w;
+                                }
+                                return acc;
+                            }
+                        }
+                    };
+
+                    let digs: &[u16] = digits.as_ref();
+                    let mut out = R::ZERO;
+                    let out_coeffs = out.coeffs_mut();
+                    for (b, &w) in weights.iter().enumerate() {
+                        if w == R::BaseRing::ZERO {
+                            continue;
+                        }
+                        let cj = base | b;
+                        if cj >= digs.len() {
+                            continue;
+                        }
+                        let d = digs[cj] as usize;
+                        let c = mono_coeff[d];
+                        if c == R::BaseRing::ZERO {
+                            continue;
+                        }
+                        let j = mono_idx[d] as usize;
+                        // exp_table[d] is `c * X^j`; scale by `w` and add.
+                        out_coeffs[j] += c * w;
+                    }
+                    return out;
                 }
                 if let StreamingMleEnum::CmMatVec4Part { shared, which, .. } = inner.as_ref() {
                     let k = fixed.len();
@@ -2728,6 +2816,7 @@ impl StreamingSumcheck {
                         &mut s.cm_cache_even,
                         &mut s.cm_lazy_cache_even,
                         &mut s.hfrom_cache,
+                        &mut s.mono_tab_cache,
                     );
                     s.vals1[i] = eval_mle_with_cm_cache(
                         mle,
@@ -2735,6 +2824,7 @@ impl StreamingSumcheck {
                         &mut s.cm_cache_odd,
                         &mut s.cm_lazy_cache_odd,
                         &mut s.hfrom_cache,
+                        &mut s.mono_tab_cache,
                     );
                 }
                 s.levals[0] = comb_fn(&s.vals0);
