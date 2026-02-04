@@ -6281,13 +6281,20 @@ mod tests {
         type BF0 = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
         // Public inputs as base-field elements (used for schedule trace generation).
         //
-        // IMPORTANT: the tiny-gate public prefix is the transcript encoding of these field
+        // the tiny-gate public prefix is the transcript encoding of these field
         // elements: fixed-width little-endian bytes, lifted into F257 (0..=255). We must NOT
         // synthesize "bytes" from arbitrary F257 elements, since 256 is a valid F257 element but
         // is a special base-257 digit (sentinel) in the transcript's byte-view map.
-        let public_inputs_bf: Vec<BF0> = (0..public_inputs_len)
+        let mut public_inputs_bf: Vec<BF0> = (0..public_inputs_len)
             .map(|i| if (i % 3) == 0 { BF0::ONE } else { BF0::ZERO })
             .collect();
+        // for kappa=1, the tiny gate's prefix binding constrains `cm_f[0]` to match the
+        // first public input absorbed in the transcript prefix. Our dummy proof uses `cm_f[0]=0`,
+        // so ensure the first public input is 0 to keep the roundtrip test focused on shape↔witness
+        // consistency (not on statement/proof mismatch).
+        if !public_inputs_bf.is_empty() {
+            public_inputs_bf[0] = BF0::ZERO;
+        }
         // Tiny-gate statement public prefix uses the byte encoding (8 bytes per base-field element).
         let public_inputs_bytes_f257: Vec<F257> = public_inputs_bf
             .iter()
