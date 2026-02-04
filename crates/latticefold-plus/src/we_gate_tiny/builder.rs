@@ -595,7 +595,6 @@ struct TinyGatePlan {
 }
 
 fn tiny_gate_poseidon_shard_permutes(cfg: &PoseidonConfig<F257>, ops: &[PoseidonTraceOp<F257>]) -> usize {
-    let n_threads = rayon::current_num_threads().max(1);
     let total_permutes = count_permutes_for_ops(cfg, ops);
     // Allow tuning sharding from the environment:
     // - `LF_TINY_POSEIDON_TARGET_SHARDS`: desired shard count (clamped)
@@ -607,12 +606,16 @@ fn tiny_gate_poseidon_shard_permutes(cfg: &PoseidonConfig<F257>, ops: &[Poseidon
     let min_permutes_env: Option<usize> = std::env::var("LF_TINY_POSEIDON_MIN_SHARD_PERMUTES")
         .ok()
         .and_then(|s| s.parse::<usize>().ok());
-    // Important for throughput: do NOT cap shard count at a small constant.
-    // We want Poseidon (Pass0 count + Pass1 range-write) to scale with available cores.
+    // IMPORTANT (determinism): shard planning must not depend on the runtime thread pool size.
     //
-    // Historically we also imposed a minimum permutes-per-shard to avoid oversharding on tiny traces.
-    // On very wide machines this can reduce utilization for large traces; tune via env vars above.
-    let target_shards = target_shards_env.unwrap_or_else(|| n_threads.min(256).max(2)).clamp(2, 4096);
+    // The WE tiny-gate build is invoked in multiple places (shape + witness builders), and the
+    // resulting file-backed instance must have a stable variable layout across invocations.
+    // Any dependence on `rayon::current_num_threads()` here can make the layout drift (even within
+    // a single process if the global pool is initialized lazily), which breaks the "shape == witness"
+    // roundtrip check.
+    //
+    // For performance tuning, callers can still override via `LF_TINY_POSEIDON_TARGET_SHARDS`.
+    let target_shards = target_shards_env.unwrap_or(256).clamp(2, 4096);
     let shard_permutes = (total_permutes + target_shards - 1) / target_shards;
     match min_permutes_env {
         Some(0) => shard_permutes.max(1),
@@ -1127,7 +1130,6 @@ fn build_canonicality_shards<'p>(
     if canonical_ranges.is_empty() {
         return Ok(Vec::new());
     }
-    let n_threads = rayon::current_num_threads().max(1);
     let n_chunks = std::env::var("LFP_TINY_CANON_CHUNKS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -1135,7 +1137,8 @@ fn build_canonicality_shards<'p>(
         .unwrap_or_else(|| {
             let target_chunk_ranges: usize = 256;
             let by_work = (canonical_ranges.len() + target_chunk_ranges - 1) / target_chunk_ranges;
-            by_work.max(1).min((n_threads * 2).min(256).max(1))
+            // Deterministic default: depend only on work size, not thread count.
+            by_work.clamp(1, 256)
         })
         .min(canonical_ranges.len().max(1));
     let chunk_size = (canonical_ranges.len() + n_chunks - 1) / n_chunks;
@@ -2355,7 +2358,12 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
             };
 
             let cols = ring_dim;
-            let col_batch: usize = (8 * rayon::current_num_threads().max(1)).max(1);
+            // Deterministic layout: batching must not depend on thread count.
+            let col_batch: usize = std::env::var("LFP_RGCHK_COL_BATCH")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or(64);
             for c0 in (0..cols).step_by(col_batch) {
                 let c1 = (c0 + col_batch).min(cols);
                 let batch_len = c1 - c0;
@@ -2364,8 +2372,12 @@ fn arithmetize_pi_lin_setchk_rgchk_prefix(
 
                 // Key perf fix: build one IR per *group of columns* (still in parallel), then lower per group.
                 // This reduces the number of `lower_ir_into_builder` calls from ~64 -> ~O(16).
-                let n_threads = rayon::current_num_threads().max(1);
-                let target_groups = n_threads.min(batch_len.max(1)).min(16).max(1);
+                let target_groups: usize = std::env::var("LFP_RGCHK_COL_GROUPS")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|&v| v > 0)
+                    .unwrap_or(16)
+                    .clamp(1, batch_len.max(1));
                 let col_group = (batch_len + target_groups - 1) / target_groups;
                 let mut groups: Vec<(usize, usize)> = Vec::new();
                 let mut g0 = 0usize;
@@ -2777,10 +2789,9 @@ fn compute_cm_shared_precomp_base(
                             let batch_size: usize = if let Some(v) = env_batch {
                                 v
                             } else {
-                                let threads = rayon::current_num_threads().max(1);
-                                // Now that we do the shard reduction in **bal4** (and convert to bal16 only once at the end),
-                                // we can safely target more shards to saturate wide machines without multiplying conversion work.
-                                let target_frags = (threads.saturating_mul(4)).min(256).max(1);
+                                // Deterministic default: target a fixed shard count.
+                                // (Override with `LFP_CM_U_SHARED_BATCH` for tuning.)
+                                let target_frags: usize = 64;
                                 let raw = (terms_len + target_frags - 1) / target_frags;
                                 // Keep shards reasonably coarse to avoid overwhelming IR/lowering overhead,
                                 // but do not artificially cap parallelism on large instances.
@@ -4256,7 +4267,12 @@ fn build_cm_glue_for_which<'p>(
                         Ok(core::array::from_fn(|i| core::array::from_fn(|j| IrVarRef::Base(a[i][j]))))
                     }
 
-                    let l_batch: usize = (8 * rayon::current_num_threads().max(1)).max(1);
+                    // Deterministic layout: batching must not depend on thread count.
+                    let l_batch: usize = std::env::var("LFP_TCCH_L_BATCH")
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .filter(|&v| v > 0)
+                        .unwrap_or(64);
                     for l0 in (0..l_instances_expected).step_by(l_batch) {
                         let l1 = (l0 + l_batch).min(l_instances_expected);
                         let batch_len = l1 - l0;
@@ -4359,7 +4375,12 @@ fn build_cm_glue_for_which<'p>(
                     }
 
                     // Build claimed_sum in batches to bound peak memory.
-                    let l_batch: usize = (4 * rayon::current_num_threads().max(1)).max(1);
+                    // Deterministic layout: batching must not depend on thread count.
+                    let l_batch: usize = std::env::var("LFP_DCOM_CLAIMED_SUM_L_BATCH")
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .filter(|&v| v > 0)
+                        .unwrap_or(32);
                     let mut claimed_sum = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
 
                     for l0 in (0..l_instances_expected).step_by(l_batch) {
@@ -4616,7 +4637,12 @@ fn build_cm_glue_for_which<'p>(
         let mut eval_acc = super::cm_math::ring_zero_digits(&mut glue.gb, ring_dim);
 
         // We'll batch over `l` so we don't materialize all eval table ring elements at once.
-        let l_batch: usize = (8 * rayon::current_num_threads().max(1)).max(1);
+        // Deterministic layout: batching must not depend on thread count.
+        let l_batch: usize = std::env::var("LFP_CM_RECOMB_L_BATCH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(64);
 
         // Precompute `eq` in bal4 once (shared across all per-l shards).
         let eq4_base: [usize; 33] = {

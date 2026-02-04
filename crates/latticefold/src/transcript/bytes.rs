@@ -110,6 +110,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ark_ff::BigInteger;
     use cyclotomic_rings::rings::GoldilocksRingNTT;
     use stark_rings::cyclotomic_ring::Flatten;
     use stark_rings::PolyRing;
