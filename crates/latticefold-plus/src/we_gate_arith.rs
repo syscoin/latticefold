@@ -206,8 +206,49 @@ where
         vec![(params_inst, params_asg), (inst_pose, asg_pose)];
 
     if public_inputs_elems > 0 {
-        if pose_wiring.absorb_ranges.len() < public_inputs_elems {
-            return Err("tiny gate: not enough Absorb ops for public inputs".to_string());
+        // IMPORTANT: The transcript trace includes **Fiat–Shamir re-absorbs** for each
+        // `get_challenge()` (SqueezeField(len=CHALLENGE_DIGITS) then Absorb(len=CHALLENGE_DIGITS)).
+        // Those absorb ops contain **base-257 digits** in 0..=256 and must NOT be mistaken for
+        // "byte absorbs" that correspond to statement/public-input prefix absorption.
+        //
+        // Therefore, bind public-input bytes to the first `public_inputs_elems` **non-reabsorb**
+        // Absorb ops.
+        let canonical_absorb_ranges: Vec<(usize, usize)> = {
+            let mut out: Vec<(usize, usize)> = Vec::new();
+            let mut absorb_idx = 0usize;
+            let mut expect_reabsorb = false;
+            for (op_i, op) in ops_f257.iter().enumerate() {
+                match op {
+                    symphony::transcript::PoseidonTraceOp::SqueezeField(v) => {
+                        expect_reabsorb = v.len() == crate::transcript::CHALLENGE_DIGITS
+                            && matches!(
+                                ops_f257.get(op_i + 1),
+                                Some(symphony::transcript::PoseidonTraceOp::Absorb(a))
+                                    if a.len() == crate::transcript::CHALLENGE_DIGITS
+                            );
+                    }
+                    symphony::transcript::PoseidonTraceOp::Absorb(_v) => {
+                        let (ab_start, ab_len) = *pose_wiring
+                            .absorb_ranges
+                            .get(absorb_idx)
+                            .ok_or("tiny gate: pose_wiring.absorb_ranges oob (public inputs)")?;
+                        absorb_idx += 1;
+                        let is_reabsorb = expect_reabsorb;
+                        expect_reabsorb = false;
+                        if is_reabsorb {
+                            continue;
+                        }
+                        out.push((ab_start, ab_len));
+                    }
+                    symphony::transcript::PoseidonTraceOp::SqueezeBytes { .. } => {
+                        expect_reabsorb = false;
+                    }
+                }
+            }
+            out
+        };
+        if canonical_absorb_ranges.len() < public_inputs_elems {
+            return Err("tiny gate: not enough non-reabsorb Absorb ops for public inputs".to_string());
         }
 
         let (params_asg, tiny_asg) = (&parts[0].1, &parts[1].1);
@@ -232,7 +273,7 @@ where
         let mut absorb_local_map: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
 
         for i in 0..public_inputs_elems {
-            let (ab_start, ab_len) = pose_wiring.absorb_ranges[i];
+            let (ab_start, ab_len) = canonical_absorb_ranges[i];
             if ab_len != coeff_bytes {
                 return Err(format!(
                     "tiny gate: public input absorb len mismatch (got {ab_len}, expected {coeff_bytes})"
@@ -1043,6 +1084,45 @@ where
         if pose_wiring.absorb_ranges.len() < public_inputs_elems {
             return Err("tiny witness(from_proof): not enough Absorb ops for public inputs".to_string());
         }
+        // Same rationale as in the arm/shape builder: skip `get_challenge()` re-absorbs (digits
+        // in 0..=256) when binding statement/public-input prefix bytes.
+        let canonical_absorb_ranges: Vec<(usize, usize)> = {
+            let mut out: Vec<(usize, usize)> = Vec::new();
+            let mut absorb_idx = 0usize;
+            let mut expect_reabsorb = false;
+            for (op_i, op) in ops_f257.iter().enumerate() {
+                match op {
+                    symphony::transcript::PoseidonTraceOp::SqueezeField(v) => {
+                        expect_reabsorb = v.len() == crate::transcript::CHALLENGE_DIGITS
+                            && matches!(
+                                ops_f257.get(op_i + 1),
+                                Some(symphony::transcript::PoseidonTraceOp::Absorb(a))
+                                    if a.len() == crate::transcript::CHALLENGE_DIGITS
+                            );
+                    }
+                    symphony::transcript::PoseidonTraceOp::Absorb(_v) => {
+                        let (ab_start, ab_len) = *pose_wiring
+                            .absorb_ranges
+                            .get(absorb_idx)
+                            .ok_or("tiny witness(from_proof): pose_wiring.absorb_ranges oob (public inputs)")?;
+                        absorb_idx += 1;
+                        let is_reabsorb = expect_reabsorb;
+                        expect_reabsorb = false;
+                        if is_reabsorb {
+                            continue;
+                        }
+                        out.push((ab_start, ab_len));
+                    }
+                    symphony::transcript::PoseidonTraceOp::SqueezeBytes { .. } => {
+                        expect_reabsorb = false;
+                    }
+                }
+            }
+            out
+        };
+        if canonical_absorb_ranges.len() < public_inputs_elems {
+            return Err("tiny witness(from_proof): not enough non-reabsorb Absorb ops for public inputs".to_string());
+        }
 
         let (params_asg, tiny_asg) = (&parts[0].1, &parts[1].1);
         let params_nvars = params_asg.len();
@@ -1069,7 +1149,7 @@ where
         let mut absorb_local_map: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
 
         for i in 0..public_inputs_elems {
-            let (ab_start, ab_len) = pose_wiring.absorb_ranges[i];
+            let (ab_start, ab_len) = canonical_absorb_ranges[i];
             if ab_len != coeff_bytes {
                 return Err(format!(
                     "tiny witness(from_proof): public input absorb len mismatch (got {ab_len}, expected {coeff_bytes})"
