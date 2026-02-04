@@ -1376,6 +1376,26 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                 let mut bval = F::ZERO;
                 let mut cval = F::ZERO;
 
+                let debug_terms = match std::env::var("LF_DR1CS_CHECK_DEBUG").as_deref() {
+                    Ok("1") | Ok("true") | Ok("yes") => true,
+                    _ => false,
+                };
+                let mut a_dbg: Vec<(u16, usize, F)> = if debug_terms {
+                    Vec::with_capacity((a_len as usize).min(16))
+                } else {
+                    Vec::new()
+                };
+                let mut b_dbg: Vec<(u16, usize, F)> = if debug_terms {
+                    Vec::with_capacity((b_len as usize).min(16))
+                } else {
+                    Vec::new()
+                };
+                let mut c_dbg: Vec<(u16, usize, F)> = if debug_terms {
+                    Vec::with_capacity((c_len as usize).min(16))
+                } else {
+                    Vec::new()
+                };
+
                 for _ in 0..a_len {
                     let cu16 = read_u16(&mut a_coeffs).map_err(|e| format!("read a_coeff failed: {e}"))?;
                     let idx = read_u32(&mut a_idx).map_err(|e| format!("read a_idx failed: {e}"))? as usize;
@@ -1383,6 +1403,9 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                         return Err(format!("check: a_idx oob at row={row_idx} idx={idx}"));
                     }
                     aval += F::from(cu16 as u64) * assignment[idx];
+                    if debug_terms && a_dbg.len() < 16 {
+                        a_dbg.push((cu16, idx, assignment[idx]));
+                    }
                 }
                 for _ in 0..b_len {
                     let cu16 = read_u16(&mut b_coeffs).map_err(|e| format!("read b_coeff failed: {e}"))?;
@@ -1391,6 +1414,9 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                         return Err(format!("check: b_idx oob at row={row_idx} idx={idx}"));
                     }
                     bval += F::from(cu16 as u64) * assignment[idx];
+                    if debug_terms && b_dbg.len() < 16 {
+                        b_dbg.push((cu16, idx, assignment[idx]));
+                    }
                 }
                 for _ in 0..c_len {
                     let cu16 = read_u16(&mut c_coeffs).map_err(|e| format!("read c_coeff failed: {e}"))?;
@@ -1399,9 +1425,18 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                         return Err(format!("check: c_idx oob at row={row_idx} idx={idx}"));
                     }
                     cval += F::from(cu16 as u64) * assignment[idx];
+                    if debug_terms && c_dbg.len() < 16 {
+                        c_dbg.push((cu16, idx, assignment[idx]));
+                    }
                 }
 
                 if aval * bval != cval {
+                    if debug_terms {
+                        return Err(format!(
+                            "constraint not satisfied at row={row_idx}: A={:?} B={:?} C={:?}\n  A_terms(first16)={:?}\n  B_terms(first16)={:?}\n  C_terms(first16)={:?}\n  NOTE: set LF_DR1CS_CHECK_DEBUG=0 to disable term debug",
+                            aval, bval, cval, a_dbg, b_dbg, c_dbg
+                        ));
+                    }
                     return Err(format!(
                         "constraint not satisfied at row={row_idx}: A={:?} B={:?} C={:?}",
                         aval, bval, cval
