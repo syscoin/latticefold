@@ -1164,6 +1164,8 @@ where
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(4);
+        let stride_mask: usize = 4 + 4 * m_arcs.len();
+        let mut base_masks: Vec<u64> = Vec::with_capacity(L);
         for (i, inst) in self.rg.instances.iter().enumerate() {
             // Build the base-scalar tables once and share them across:
             // - the direct MLEs for (tau, m_tau, f, h), and
@@ -1200,6 +1202,35 @@ where
             let mtau_cc = mats_const && mtau0_arc.is_some();
             let f_cc = mats_const && f0_arc.is_some();
             let h_cc = mats_const && h0_arc.is_some();
+
+            // Record which offsets in this instance's stride are constant-coeff.
+            // This must match the actual MLE variants chosen below (BaseScalarArc / SparseMatVecConstCoeff).
+            let mut mask: u64 = 0;
+            if stride_mask <= 64 {
+                for off in 0..stride_mask {
+                    let is_base = if off < 4 {
+                        match off {
+                            0 => true, // tau is base scalar by construction
+                            1 => mtau_cc,
+                            2 => f_cc,
+                            3 => h_cc,
+                            _ => unreachable!(),
+                        }
+                    } else {
+                        match (off - 4) & 3 {
+                            0 => tau_cc,
+                            1 => mtau_cc,
+                            2 => f_cc,
+                            3 => h_cc,
+                            _ => unreachable!(),
+                        }
+                    };
+                    if is_base {
+                        mask |= 1u64 << off;
+                    }
+                }
+            }
+            base_masks.push(mask);
 
             // Direct tables (tau, m_tau, f, h):
             // Use BaseScalarArc whenever available; otherwise use DenseArc.
@@ -1477,6 +1508,7 @@ where
             let w_t0 = rcps[n - 3];
             let w_t1 = rcps[n - 2];
             let stride = 4 + 4 * Mlen;
+            let use_masks = stride <= 64;
 
             // Many costs in this combiner are *linear* in the MLE values, so we compute at x=0 and x=1
             // once and extrapolate x=2 via linearity (saves ~3× work vs recomputing the whole lin-sum).
@@ -1515,12 +1547,11 @@ where
                 let mut lin1_ring = R::ZERO;
                 let mut lin0_c0 = R::BaseRing::ZERO;
                 let mut lin1_c0 = R::BaseRing::ZERO;
+                let base_mask = if use_masks { base_masks[l] } else { 0 };
                 for off in 0..stride {
                     let j = l_idx + off;
                     let w = rcps[j - 1];
-                    let is_base = off == 0
-                        || off == 2
-                        || (off >= 4 && ((off - 4) & 3 == 0 || (off - 4) & 3 == 2));
+                    let is_base = use_masks && (((base_mask >> off) & 1) != 0);
                     if is_base {
                         lin0_c0 += v0[j].coeffs()[0] * w;
                         lin1_c0 += v1[j].coeffs()[0] * w;
