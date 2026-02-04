@@ -5016,11 +5016,6 @@ fn build_direct_to_merged_unix(
         &pose_wiring,
         &dirs,
     )?;
-    lf_profile_log(&format!(
-        "Pass1 canonicality_shards elapsed={:?} parts={}",
-        t.elapsed(),
-        canonical_glues.len()
-    ));
 
     let t = Instant::now();
     validate_cm_u32_schedule(params, wiring)?;
@@ -5149,11 +5144,6 @@ fn build_direct_to_merged_unix(
         &goldilocks_locals,
         &dirs,
     )?;
-    lf_profile_log(&format!(
-        "Pass1 cm_shards elapsed={:?} parts={}",
-        t.elapsed(),
-        cm_extra_glues.len()
-    ));
 
     // Decomp verifier math.
     let (cm_g_target, vo_a_target, vo_b_target) = compute_cm_x_targets_for_decomp(
