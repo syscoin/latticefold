@@ -1414,7 +1414,8 @@ where
             let w_t1 = rcps[n - 2];
             let stride = 4 + 4 * Mlen;
 
-            #[inline]
+            // Degree-2 "x=2" extrapolation (linear): at2 = 2*v1 - v0.
+            #[inline(always)]
             fn at2<Rr: OverField + PolyRing>(v0: &[Rr], v1: &[Rr], idx: usize) -> Rr
             where
                 Rr::BaseRing: Ring,
@@ -1422,37 +1423,56 @@ where
                 v1[idx] + (v1[idx] - v0[idx])
             }
 
-            let eval_at = |which: u8, idx: usize| -> R {
-                match which {
-                    0 => v0[idx],
-                    1 => v1[idx],
-                    2 => at2::<R>(v0, v1, idx),
-                    _ => unreachable!(),
-                }
-            };
+            // Many costs in this combiner are *linear* in the MLE values, so we compute at x=0 and x=1
+            // once and extrapolate x=2 via linearity (saves ~3× work vs recomputing the whole lin-sum).
+            let eq0_0 = v0[0].coeffs()[0];
+            let eq0_1 = v1[0].coeffs()[0];
+            let eq0_2 = eq0_1 + (eq0_1 - eq0_0);
 
-            let eval_point = |which: u8| -> R {
-                let eq = eval_at(which, 0);
-                let eq0 = eq.coeffs()[0];
-                let t0 = eval_at(which, n - 2);
-                let t1 = eval_at(which, n - 1);
-                let mut out = R::ZERO;
-                for l in 0..L {
-                    let l_idx = 1 + l * stride;
-                    let tau = eval_at(which, l_idx);
-                    // `tau` is also base-scalar lifted (constant coefficient).
-                    let tau0 = tau.coeffs()[0];
-                    let mut lin = R::ZERO;
-                    for j in l_idx..(l_idx + stride) {
-                        lin += eval_at(which, j) * rcps[j - 1];
-                    }
-                    out += scale_by_base_owned(lin, eq0);
-                    out += scale_by_base_ref(&t0, tau0) * w_t0;
-                    out += scale_by_base_ref(&t1, tau0) * w_t1;
+            let t0_0 = v0[n - 2];
+            let t0_1 = v1[n - 2];
+            let t0_2 = at2::<R>(v0, v1, n - 2);
+            let t1_0 = v0[n - 1];
+            let t1_1 = v1[n - 1];
+            let t1_2 = at2::<R>(v0, v1, n - 1);
+
+            let mut out0 = R::ZERO;
+            let mut out1 = R::ZERO;
+            let mut out2 = R::ZERO;
+
+            for l in 0..L {
+                let l_idx = 1 + l * stride;
+
+                let tau0_0 = v0[l_idx].coeffs()[0];
+                let tau0_1 = v1[l_idx].coeffs()[0];
+                let tau0_2 = tau0_1 + (tau0_1 - tau0_0);
+
+                // lin(which) = Σ_j rcps[j-1] * eval_at(which,j) is linear in the MLE values,
+                // so compute lin0/lin1 and extrapolate lin2.
+                let mut lin0 = R::ZERO;
+                let mut lin1 = R::ZERO;
+                for j in l_idx..(l_idx + stride) {
+                    let w = rcps[j - 1];
+                    lin0 += v0[j] * w;
+                    lin1 += v1[j] * w;
                 }
-                out
-            };
-            [eval_point(0), eval_point(1), eval_point(2)]
+                let lin2 = lin1 + (lin1 - lin0);
+
+                out0 += scale_by_base_owned(lin0, eq0_0);
+                out1 += scale_by_base_owned(lin1, eq0_1);
+                out2 += scale_by_base_owned(lin2, eq0_2);
+
+                // (tau * t) * w  ==  t * (tau0 * w)  since tau is constant-coeff.
+                out0 += scale_by_base_ref(&t0_0, tau0_0 * w_t0);
+                out1 += scale_by_base_ref(&t0_1, tau0_1 * w_t0);
+                out2 += scale_by_base_ref(&t0_2, tau0_2 * w_t0);
+
+                out0 += scale_by_base_ref(&t1_0, tau0_0 * w_t1);
+                out1 += scale_by_base_ref(&t1_1, tau0_1 * w_t1);
+                out2 += scale_by_base_ref(&t1_2, tau0_2 * w_t1);
+            }
+
+            [out0, out1, out2]
         };
 
         let t_sc = Instant::now();
@@ -1874,7 +1894,8 @@ where
             let w_t1 = rcps[n - 2];
             let stride = 4 + 4 * Mlen;
 
-            #[inline]
+            // Degree-2 "x=2" extrapolation (linear): at2 = 2*v1 - v0.
+            #[inline(always)]
             fn at2<Rr: OverField + PolyRing>(v0: &[Rr], v1: &[Rr], idx: usize) -> Rr
             where
                 Rr::BaseRing: Ring,
@@ -1882,38 +1903,53 @@ where
                 v1[idx] + (v1[idx] - v0[idx])
             }
 
-            let eval_at = |which: u8, idx: usize| -> R {
-                match which {
-                    0 => v0[idx],
-                    1 => v1[idx],
-                    2 => at2::<R>(v0, v1, idx),
-                    _ => unreachable!(),
-                }
-            };
+            // Many costs in this combiner are *linear* in the MLE values, so we compute at x=0 and x=1
+            // once and extrapolate x=2 via linearity (saves ~3× work vs recomputing the whole lin-sum).
+            let eq0_0 = v0[0].coeffs()[0];
+            let eq0_1 = v1[0].coeffs()[0];
+            let eq0_2 = eq0_1 + (eq0_1 - eq0_0);
 
-            let eval_point = |which: u8| -> R {
-                let eq = eval_at(which, 0);
-                let t0 = eval_at(which, n - 2);
-                let t1 = eval_at(which, n - 1);
-                let mut out = R::ZERO;
-                for l in 0..L {
-                    let l_idx = 1 + l * stride;
-                    let tau = eval_at(which, l_idx);
-                    let mut lin = R::ZERO;
-                    for j in l_idx..(l_idx + stride) {
-                        lin += eval_at(which, j) * rcps[j - 1];
-                    }
-                    // `eq` and `tau` are base-scalar lifted into the ring (constant coefficient).
-                    // Avoid ring×ring multiplication for coefficient-form rings like `GoldilocksRing64`.
-                    let eq0 = eq.coeffs()[0];
-                    let tau0 = tau.coeffs()[0];
-                    out += scale_by_base_owned(lin, eq0);
-                    out += scale_by_base_ref(&t0, tau0) * w_t0;
-                    out += scale_by_base_ref(&t1, tau0) * w_t1;
+            let t0_0 = v0[n - 2];
+            let t0_1 = v1[n - 2];
+            let t0_2 = at2::<R>(v0, v1, n - 2);
+            let t1_0 = v0[n - 1];
+            let t1_1 = v1[n - 1];
+            let t1_2 = at2::<R>(v0, v1, n - 1);
+
+            let mut out0 = R::ZERO;
+            let mut out1 = R::ZERO;
+            let mut out2 = R::ZERO;
+
+            for l in 0..L {
+                let l_idx = 1 + l * stride;
+
+                let tau0_0 = v0[l_idx].coeffs()[0];
+                let tau0_1 = v1[l_idx].coeffs()[0];
+                let tau0_2 = tau0_1 + (tau0_1 - tau0_0);
+
+                let mut lin0 = R::ZERO;
+                let mut lin1 = R::ZERO;
+                for j in l_idx..(l_idx + stride) {
+                    let w = rcps[j - 1];
+                    lin0 += v0[j] * w;
+                    lin1 += v1[j] * w;
                 }
-                out
-            };
-            [eval_point(0), eval_point(1), eval_point(2)]
+                let lin2 = lin1 + (lin1 - lin0);
+
+                out0 += scale_by_base_owned(lin0, eq0_0);
+                out1 += scale_by_base_owned(lin1, eq0_1);
+                out2 += scale_by_base_owned(lin2, eq0_2);
+
+                out0 += scale_by_base_ref(&t0_0, tau0_0 * w_t0);
+                out1 += scale_by_base_ref(&t0_1, tau0_1 * w_t0);
+                out2 += scale_by_base_ref(&t0_2, tau0_2 * w_t0);
+
+                out0 += scale_by_base_ref(&t1_0, tau0_0 * w_t1);
+                out1 += scale_by_base_ref(&t1_1, tau0_1 * w_t1);
+                out2 += scale_by_base_ref(&t1_2, tau0_2 * w_t1);
+            }
+
+            [out0, out1, out2]
         };
 
         let t_sc = Instant::now();
