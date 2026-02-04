@@ -6,6 +6,7 @@ use stark_rings::cyclotomic_ring::Flatten;
 use stark_rings::traits::FromRandomBytes;
 use stark_rings::traits::MulUnchecked;
 use stark_rings::{OverField, PolyRing, Ring};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::OnceLock;
 
 use super::SuitableRing;
@@ -30,6 +31,55 @@ use crate::{
 pub struct GoldilocksRing64(
     pub stark_rings::cyclotomic_ring::CyclotomicPolyRingGeneral<Goldilocks64Config, 1, 64>,
 );
+
+// -----------------------------------------------------------------------------
+// Optional ring×ring mul stats (debugging / profiling)
+// -----------------------------------------------------------------------------
+//
+// Enable by setting `LF_GL64_MUL_STATS=1` in the environment.
+//
+// This counts *ring×ring* multiplications (the NTT/convolution path in `Mul<GoldilocksRing64>`),
+// which are the operations we want to avoid in hot loops when one operand is effectively a base scalar.
+static GL64_MUL_STATS_FLAG: AtomicU8 = AtomicU8::new(0); // 0=uninit, 1=disabled, 2=enabled
+static GL64_RING_MUL_CALLS: AtomicU64 = AtomicU64::new(0);
+
+#[inline(always)]
+fn gl64_mul_stats_enabled_fast() -> bool {
+    match GL64_MUL_STATS_FLAG.load(Ordering::Relaxed) {
+        2 => true,
+        1 => false,
+        _ => {
+            let en = std::env::var("LF_GL64_MUL_STATS").ok().as_deref() == Some("1");
+            GL64_MUL_STATS_FLAG.store(if en { 2 } else { 1 }, Ordering::Relaxed);
+            en
+        }
+    }
+}
+
+#[inline(always)]
+fn gl64_ring_mul_stats_inc() {
+    if gl64_mul_stats_enabled_fast() {
+        GL64_RING_MUL_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Returns whether GL64 ring×ring mul stats are enabled (`LF_GL64_MUL_STATS=1`).
+#[inline]
+pub fn goldilocks64_ring_mul_stats_enabled() -> bool {
+    gl64_mul_stats_enabled_fast()
+}
+
+/// Returns the total number of `GoldilocksRing64 * GoldilocksRing64` calls since process start.
+#[inline]
+pub fn goldilocks64_ring_mul_count() -> u64 {
+    GL64_RING_MUL_CALLS.load(Ordering::Relaxed)
+}
+
+/// Atomically resets and returns the previous ring×ring mul count.
+#[inline]
+pub fn goldilocks64_ring_mul_count_reset() -> u64 {
+    GL64_RING_MUL_CALLS.swap(0, Ordering::Relaxed)
+}
 
 /// Parameters for \( \mathbb{F}_p[X]/(X^{64}+1) \) over Goldilocks' base prime field.
 pub struct Goldilocks64Config;
@@ -131,6 +181,7 @@ impl core::ops::Mul for GoldilocksRing64 {
     type Output = Self;
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
+        gl64_ring_mul_stats_inc();
         const N: usize = 64;
 
         #[derive(Clone)]
