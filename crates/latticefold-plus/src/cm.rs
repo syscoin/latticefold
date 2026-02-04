@@ -378,7 +378,12 @@ where
                                 }
                             };
                             let r_h = h[i][j];
-                            (s[0] * R::from(r_tau)) + (s[1] * r_mtau) + (s[2] * r_f) + r_h
+                            // `s[0], s[1], s[2]` are short challenges (constant-coeff lifts).
+                            // Avoid ring×ring multiplication for coefficient-form rings like `GoldilocksRing64`.
+                            scale_by_base_ref(&R::from(r_tau), s[0].coeffs()[0])
+                                + scale_by_base_ref(&r_mtau, s[1].coeffs()[0])
+                                + scale_by_base_ref(&r_f, s[2].coeffs()[0])
+                                + r_h
                     })
                     .collect::<Vec<R>>()
                 }
@@ -395,7 +400,10 @@ where
                                 }
                             };
                             let r_h = h[i][j];
-                            (s[0] * R::from(r_tau)) + (s[1] * r_mtau) + (s[2] * r_f) + r_h
+                            scale_by_base_ref(&R::from(r_tau), s[0].coeffs()[0])
+                                + scale_by_base_ref(&r_mtau, s[1].coeffs()[0])
+                                + scale_by_base_ref(&r_f, s[2].coeffs()[0])
+                                + r_h
                         })
                         .collect::<Vec<R>>()
                 }
