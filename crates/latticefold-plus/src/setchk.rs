@@ -1469,7 +1469,8 @@ impl<R: OverField> Out<R> {
                     (ev1 * ev1 - ev2) * alpha_pows[j]
                 })
                 .sum::<R>();
-            ver += eq * e_sum * R::from(rc_pow);
+            // `rc_pow` is a base scalar; avoid ring×ring multiplication for coefficient-form rings.
+            ver += mul_by_base(eq * e_sum, rc_pow);
             if let Some(rc) = rc {
                 rc_pow *= rc;
             }
@@ -1485,7 +1486,7 @@ impl<R: OverField> Out<R> {
                 let ev2 = R::from(ev(b, *beta * *beta));
                 ev1 * ev1 - ev2
             };
-            ver += eq * *alpha * b_claim * R::from(rc_pow);
+            ver += mul_by_base(eq * (*alpha) * b_claim, rc_pow);
             if let Some(rc) = rc {
                 rc_pow *= rc;
             }

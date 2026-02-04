@@ -925,14 +925,18 @@ where
                             .map(|j| {
                                 let r_tau = inst.tau[j];
                                 let r_mtau = inst.m_tau.get(j);
-                                let r_f = match &inst.f {
-                                    WitnessVec::Ring(vr) => vr[j],
-                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
-                                        R::from(v0.get(j).copied().unwrap_or(R::BaseRing::ZERO))
-                                    }
-                                };
                                 let r_h = h_mle.eval_at_index(j);
-                                (s[0] * R::from(r_tau)) + (s[1] * r_mtau) + (s[2] * r_f) + r_h
+                                // `s[0..2]` are short challenges; `r_tau` (and often `r_f`) are base scalars.
+                                // Avoid ring×ring multiplication for coefficient-form rings like `GoldilocksRing64`.
+                                let mut acc = scale_by_base_ref(&s[0], r_tau) + (s[1] * r_mtau) + r_h;
+                                match &inst.f {
+                                    WitnessVec::Ring(vr) => acc += s[2] * vr[j],
+                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
+                                        let f0 = v0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
+                                        acc += scale_by_base_ref(&s[2], f0);
+                                    }
+                                }
+                                acc
                             })
                             .collect::<Vec<R>>()
                     }
@@ -942,14 +946,16 @@ where
                             .map(|j| {
                                 let r_tau = inst.tau[j];
                                 let r_mtau = inst.m_tau.get(j);
-                                let r_f = match &inst.f {
-                                    WitnessVec::Ring(vr) => vr[j],
-                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
-                                        R::from(v0.get(j).copied().unwrap_or(R::BaseRing::ZERO))
-                                    }
-                                };
                                 let r_h = h_mle.eval_at_index(j);
-                                (s[0] * R::from(r_tau)) + (s[1] * r_mtau) + (s[2] * r_f) + r_h
+                                let mut acc = scale_by_base_ref(&s[0], r_tau) + (s[1] * r_mtau) + r_h;
+                                match &inst.f {
+                                    WitnessVec::Ring(vr) => acc += s[2] * vr[j],
+                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
+                                        let f0 = v0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
+                                        acc += scale_by_base_ref(&s[2], f0);
+                                    }
+                                }
+                                acc
                             })
                             .collect::<Vec<R>>()
                     }
@@ -992,14 +998,16 @@ where
                             .map(|j| {
                                 let r_tau = inst.tau[j];
                                 let r_mtau = inst.m_tau.get(j);
-                                let r_f = match &inst.f {
-                                    WitnessVec::Ring(vr) => vr[j],
-                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
-                                        R::from(v0.get(j).copied().unwrap_or(R::BaseRing::ZERO))
-                                    }
-                                };
                                 let r_h = h[i][j];
-                                (s[0] * R::from(r_tau)) + (s[1] * r_mtau) + (s[2] * r_f) + r_h
+                                let mut acc = scale_by_base_ref(&s[0], r_tau) + (s[1] * r_mtau) + r_h;
+                                match &inst.f {
+                                    WitnessVec::Ring(vr) => acc += s[2] * vr[j],
+                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
+                                        let f0 = v0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
+                                        acc += scale_by_base_ref(&s[2], f0);
+                                    }
+                                }
+                                acc
                             })
                             .collect::<Vec<R>>()
                     }
@@ -1009,14 +1017,16 @@ where
                             .map(|j| {
                                 let r_tau = inst.tau[j];
                                 let r_mtau = inst.m_tau.get(j);
-                                let r_f = match &inst.f {
-                                    WitnessVec::Ring(vr) => vr[j],
-                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
-                                        R::from(v0.get(j).copied().unwrap_or(R::BaseRing::ZERO))
-                                    }
-                                };
                                 let r_h = h[i][j];
-                                (s[0] * R::from(r_tau)) + (s[1] * r_mtau) + (s[2] * r_f) + r_h
+                                let mut acc = scale_by_base_ref(&s[0], r_tau) + (s[1] * r_mtau) + r_h;
+                                match &inst.f {
+                                    WitnessVec::Ring(vr) => acc += s[2] * vr[j],
+                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
+                                        let f0 = v0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
+                                        acc += scale_by_base_ref(&s[2], f0);
+                                    }
+                                }
+                                acc
                             })
                             .collect::<Vec<R>>()
                     }
@@ -2557,14 +2567,14 @@ where
                     .map(|(l, eval)| {
                         let l_idx = l * (4 + 4 * mlen);
 
-                        R::from(eval.a[0]) * rc_pows[l_idx]
+                        scale_by_base_ref(&rc_pows[l_idx], eval.a[0])
                             + eval.b[0] * rc_pows[l_idx + 1]
                             + eval.c[0] * rc_pows[l_idx + 2]
                             + u[l][0] * rc_pows[l_idx + 3]
                             + (0..mlen)
                                 .map(|i| {
                                     let idx = l_idx + 4 + i * 4;
-                                    R::from(eval.a[1 + i]) * rc_pows[idx]
+                                    scale_by_base_ref(&rc_pows[idx], eval.a[1 + i])
                                         + eval.b[1 + i] * rc_pows[idx + 1]
                                         + eval.c[1 + i] * rc_pows[idx + 2]
                                         + u[l][1 + i] * rc_pows[idx + 3]
