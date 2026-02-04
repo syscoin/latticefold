@@ -3463,6 +3463,12 @@ impl StreamingSumcheck {
         R::BaseRing: Ring,
     {
         let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
+        let gl64_stats = cyclotomic_rings::rings::goldilocks64_ring_mul_stats_enabled();
+        let gl64_start = if gl64_stats {
+            cyclotomic_rings::rings::goldilocks64_ring_mul_count()
+        } else {
+            0u64
+        };
         let t_total = std::time::Instant::now();
         let degree: usize = 2;
 
@@ -3527,6 +3533,14 @@ impl StreamingSumcheck {
         let t_final_elapsed = t_final.elapsed();
 
         if profile {
+            if gl64_stats {
+                let gl64_end = cyclotomic_rings::rings::goldilocks64_ring_mul_count();
+                println!(
+                    "[LF+ streaming_sumcheck] gl64_mul: total_delta={} total_now={}",
+                    gl64_end.saturating_sub(gl64_start),
+                    gl64_end
+                );
+            }
             println!(
                 "[LF+ streaming_sumcheck] totals: rounds={:?} absorb_msgs={:?} get_chal={:?} absorb_chal={:?} fix_last={:?} final_evals={:?} total={:?}",
                 t_rounds,
