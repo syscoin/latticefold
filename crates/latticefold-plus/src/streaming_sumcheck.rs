@@ -2690,23 +2690,13 @@ impl StreamingSumcheck {
     where
         R::BaseRing: Ring,
     {
-        let gl64_stats = cyclotomic_rings::rings::goldilocks64_ring_mul_stats_enabled();
         if let Some(r) = v_msg {
             assert!(state.round > 0);
             state.randomness.push(r);
             // The first "fix" (right after round 1) is where the biggest allocations typically happen
             // (e.g. DenseArc -> DenseOwned half-table, mat-vec MLEs materializing, etc).
             if state.round == 1 {
-                let gl64_before = if gl64_stats {
-                    Some(cyclotomic_rings::rings::goldilocks64_ring_mul_count())
-                } else {
-                    None
-                };
                 crate::utils::maybe_print_rss("streaming_sumcheck: fix(start)");
-                if let Some(b) = gl64_before {
-                    // Snapshot before materialization/fix (useful for attributing ring×ring muls).
-                    println!("[LF+ streaming_sumcheck] gl64_mul: fix1_start now={}", b);
-                }
             }
             // This step is often O(total_table_size) and can dominate wall time if left serial,
             // especially when some MLE variants need to materialize on first fix.
@@ -2725,10 +2715,6 @@ impl StreamingSumcheck {
             }
             if state.round == 1 {
                 crate::utils::maybe_print_rss("streaming_sumcheck: fix(done)");
-                if gl64_stats {
-                    let after = cyclotomic_rings::rings::goldilocks64_ring_mul_count();
-                    println!("[LF+ streaming_sumcheck] gl64_mul: fix1_done now={}", after);
-                }
             }
         } else {
             assert!(state.round == 0);
@@ -3430,17 +3416,6 @@ impl StreamingSumcheck {
         R::BaseRing: Ring,
     {
         let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
-        let gl64_stats = cyclotomic_rings::rings::goldilocks64_ring_mul_stats_enabled();
-        let (gl64_start, gl64_ntt_start, gl64_const_start, gl64_mono_start) = if gl64_stats {
-            (
-                cyclotomic_rings::rings::goldilocks64_ring_mul_count(),
-                cyclotomic_rings::rings::goldilocks64_ring_mul_ntt_count(),
-                cyclotomic_rings::rings::goldilocks64_ring_mul_fast_const_count(),
-                cyclotomic_rings::rings::goldilocks64_ring_mul_fast_mono_count(),
-            )
-        } else {
-            (0u64, 0u64, 0u64, 0u64)
-        };
         let t_total = std::time::Instant::now();
 
         transcript.absorb_field_element(&R::BaseRing::from(nvars as u128));
@@ -3506,20 +3481,6 @@ impl StreamingSumcheck {
         let t_final_elapsed = t_final.elapsed();
 
         if profile {
-            if gl64_stats {
-                let gl64_end = cyclotomic_rings::rings::goldilocks64_ring_mul_count();
-                let gl64_ntt_end = cyclotomic_rings::rings::goldilocks64_ring_mul_ntt_count();
-                let gl64_const_end = cyclotomic_rings::rings::goldilocks64_ring_mul_fast_const_count();
-                let gl64_mono_end = cyclotomic_rings::rings::goldilocks64_ring_mul_fast_mono_count();
-                println!(
-                    "[LF+ streaming_sumcheck] gl64_mul: total_delta={} ntt_delta={} const_delta={} mono_delta={} total_now={}",
-                    gl64_end.saturating_sub(gl64_start),
-                    gl64_ntt_end.saturating_sub(gl64_ntt_start),
-                    gl64_const_end.saturating_sub(gl64_const_start),
-                    gl64_mono_end.saturating_sub(gl64_mono_start),
-                    gl64_end
-                );
-            }
             println!(
                 "[LF+ streaming_sumcheck] totals: rounds={:?} absorb_msgs={:?} get_chal={:?} absorb_chal={:?} fix_last={:?} final_evals={:?} total={:?}",
                 t_rounds,
