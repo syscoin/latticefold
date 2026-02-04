@@ -656,6 +656,13 @@ mod goldilocks64_tests {
     type Inner =
         stark_rings::cyclotomic_ring::CyclotomicPolyRingGeneral<Goldilocks64Config, 1, 64>;
 
+    fn monomial(j: usize, c: Fq) -> GoldilocksRing64 {
+        assert!(j < 64);
+        let mut v = vec![<Fq as Field>::ZERO; 64];
+        v[j] = c;
+        GoldilocksRing64::from(v)
+    }
+
     #[test]
     fn test_goldilocks64_mul_matches_inner_generic() {
         let mut rng = test_rng();
@@ -669,6 +676,64 @@ mod goldilocks64_tests {
 
             assert_eq!(got.coeffs(), ref_out.coeffs());
         }
+    }
+
+    #[test]
+    fn test_goldilocks64_mul_by_constant_hits_fast_path_and_matches_inner() {
+        let mut rng = test_rng();
+        for _ in 0..256 {
+            let a = GoldilocksRing64::rand(&mut rng);
+            let c = Fq::rand(&mut rng);
+            let b = GoldilocksRing64::from_scalar(c);
+
+            // Reference: underlying generic ring multiplication.
+            let ref_out = Inner::from(a.into_coeffs()) * Inner::from(b.into_coeffs());
+            let got = a * b;
+            assert_eq!(got.coeffs(), ref_out.coeffs());
+        }
+    }
+
+    #[test]
+    fn test_goldilocks64_mul_by_monomial_hits_fast_path_and_matches_inner() {
+        let mut rng = test_rng();
+        for _ in 0..256 {
+            let a = GoldilocksRing64::rand(&mut rng);
+            let j = (rng.next_u64() as usize) & 63;
+            let c = Fq::rand(&mut rng);
+            let b = monomial(j, c);
+
+            // Reference: underlying generic ring multiplication.
+            let ref_out = Inner::from(a.into_coeffs()) * Inner::from(b.into_coeffs());
+            let got = a * b;
+            assert_eq!(got.coeffs(), ref_out.coeffs());
+
+            // Also exercise the other-direction monomial fast path.
+            let a2 = GoldilocksRing64::rand(&mut rng);
+            let ref_out2 = Inner::from(b.into_coeffs()) * Inner::from(a2.into_coeffs());
+            let got2 = b * a2;
+            assert_eq!(got2.coeffs(), ref_out2.coeffs());
+        }
+    }
+
+    #[test]
+    fn test_goldilocks64_mul_by_monomial_wrap_cases() {
+        // Deterministic wrap-around sanity checks for j near N.
+        // In R = Fq[X]/(X^64+1), X^64 = -1, so X^63 * X = -1.
+        let one = <Fq as Field>::ONE;
+        let x = monomial(1, one);
+        let x63 = monomial(63, one);
+        let got = x63 * x;
+
+        // Expect constant -1.
+        let mut exp = vec![<Fq as Field>::ZERO; 64];
+        exp[0] = -one;
+        assert_eq!(got.coeffs(), GoldilocksRing64::from(exp).coeffs());
+
+        // And X^63 * X^63 = X^126 = X^(64+62) = -X^62.
+        let got2 = x63 * x63;
+        let mut exp2 = vec![<Fq as Field>::ZERO; 64];
+        exp2[62] = -one;
+        assert_eq!(got2.coeffs(), GoldilocksRing64::from(exp2).coeffs());
     }
 
     #[test]
