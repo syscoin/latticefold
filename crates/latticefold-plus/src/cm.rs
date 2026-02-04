@@ -73,6 +73,57 @@ where
     }
 }
 
+/// Fused `acc0 += v0 * s; acc1 += v1 * s` with a single coefficient pass.
+#[inline(always)]
+fn add_scaled_by_base_pair<R: OverField + PolyRing>(
+    acc0: &mut R,
+    v0: &R,
+    acc1: &mut R,
+    v1: &R,
+    s: R::BaseRing,
+) where
+    R::BaseRing: Ring + Copy,
+{
+    if s == R::BaseRing::ZERO {
+        return;
+    }
+    let a0 = acc0.coeffs_mut();
+    let a1 = acc1.coeffs_mut();
+    let c0 = v0.coeffs();
+    let c1 = v1.coeffs();
+    debug_assert_eq!(a0.len(), c0.len());
+    debug_assert_eq!(a1.len(), c1.len());
+    debug_assert_eq!(a0.len(), a1.len());
+    for i in 0..a0.len() {
+        a0[i] += c0[i] * s;
+        a1[i] += c1[i] * s;
+    }
+}
+
+/// Fused `acc += v0*s0 + v1*s1` with a single coefficient pass.
+#[inline(always)]
+fn add_scaled2_by_base<R: OverField + PolyRing>(
+    acc: &mut R,
+    v0: &R,
+    s0: R::BaseRing,
+    v1: &R,
+    s1: R::BaseRing,
+) where
+    R::BaseRing: Ring + Copy,
+{
+    if s0 == R::BaseRing::ZERO && s1 == R::BaseRing::ZERO {
+        return;
+    }
+    let a = acc.coeffs_mut();
+    let c0 = v0.coeffs();
+    let c1 = v1.coeffs();
+    debug_assert_eq!(a.len(), c0.len());
+    debug_assert_eq!(a.len(), c1.len());
+    for i in 0..a.len() {
+        a[i] += c0[i] * s0 + c1[i] * s1;
+    }
+}
+
 fn try_as_base_scalars<R: PolyRing>(v: &[R]) -> Option<Vec<R::BaseRing>> {
     let mut out = Vec::with_capacity(v.len());
     for x in v {
@@ -1464,8 +1515,7 @@ where
                         lin0_c0 += v0[j].coeffs()[0] * w;
                         lin1_c0 += v1[j].coeffs()[0] * w;
                     } else {
-                        add_scaled_by_base(&mut lin0_ring, &v0[j], w);
-                        add_scaled_by_base(&mut lin1_ring, &v1[j], w);
+                        add_scaled_by_base_pair(&mut lin0_ring, &v0[j], &mut lin1_ring, &v1[j], w);
                     }
                 }
 
@@ -1479,8 +1529,7 @@ where
                 // Avoid materializing `lin2` (saves coefficient passes).
                 let eq2_twice = eq0_2 * two;
                 let neg_eq2 = R::BaseRing::ZERO - eq0_2;
-                add_scaled_by_base(&mut out2, &lin1_ring, eq2_twice);
-                add_scaled_by_base(&mut out2, &lin0_ring, neg_eq2);
+                add_scaled2_by_base(&mut out2, &lin1_ring, eq2_twice, &lin0_ring, neg_eq2);
                 out2.coeffs_mut()[0] += eq0_2 * (two * lin1_c0 - lin0_c0);
 
                 // (tau * t) * w  ==  t * (tau0 * w)  since tau is constant-coeff.
@@ -1488,15 +1537,25 @@ where
                 add_scaled_by_base(&mut out1, &t0_1, tau0_1 * w_t0);
                 // t0_2 = 2*t0_1 - t0_0.
                 let wt0 = tau0_2 * w_t0;
-                add_scaled_by_base(&mut out2, &t0_1, wt0 * two);
-                add_scaled_by_base(&mut out2, &t0_0, R::BaseRing::ZERO - wt0);
+                add_scaled2_by_base(
+                    &mut out2,
+                    &t0_1,
+                    wt0 * two,
+                    &t0_0,
+                    R::BaseRing::ZERO - wt0,
+                );
 
                 add_scaled_by_base(&mut out0, &t1_0, tau0_0 * w_t1);
                 add_scaled_by_base(&mut out1, &t1_1, tau0_1 * w_t1);
                 // t1_2 = 2*t1_1 - t1_0.
                 let wt1 = tau0_2 * w_t1;
-                add_scaled_by_base(&mut out2, &t1_1, wt1 * two);
-                add_scaled_by_base(&mut out2, &t1_0, R::BaseRing::ZERO - wt1);
+                add_scaled2_by_base(
+                    &mut out2,
+                    &t1_1,
+                    wt1 * two,
+                    &t1_0,
+                    R::BaseRing::ZERO - wt1,
+                );
             }
 
             [out0, out1, out2]
@@ -1967,8 +2026,7 @@ where
                         lin0_c0 += v0[j].coeffs()[0] * w;
                         lin1_c0 += v1[j].coeffs()[0] * w;
                     } else {
-                        add_scaled_by_base(&mut lin0_ring, &v0[j], w);
-                        add_scaled_by_base(&mut lin1_ring, &v1[j], w);
+                        add_scaled_by_base_pair(&mut lin0_ring, &v0[j], &mut lin1_ring, &v1[j], w);
                     }
                 }
 
@@ -1982,23 +2040,32 @@ where
                 // Avoid materializing `lin2` (saves coefficient passes).
                 let eq2_twice = eq0_2 * two;
                 let neg_eq2 = R::BaseRing::ZERO - eq0_2;
-                add_scaled_by_base(&mut out2, &lin1_ring, eq2_twice);
-                add_scaled_by_base(&mut out2, &lin0_ring, neg_eq2);
+                add_scaled2_by_base(&mut out2, &lin1_ring, eq2_twice, &lin0_ring, neg_eq2);
                 out2.coeffs_mut()[0] += eq0_2 * (two * lin1_c0 - lin0_c0);
 
                 add_scaled_by_base(&mut out0, &t0_0, tau0_0 * w_t0);
                 add_scaled_by_base(&mut out1, &t0_1, tau0_1 * w_t0);
                 // t0_2 = 2*t0_1 - t0_0.
                 let wt0 = tau0_2 * w_t0;
-                add_scaled_by_base(&mut out2, &t0_1, wt0 * two);
-                add_scaled_by_base(&mut out2, &t0_0, R::BaseRing::ZERO - wt0);
+                add_scaled2_by_base(
+                    &mut out2,
+                    &t0_1,
+                    wt0 * two,
+                    &t0_0,
+                    R::BaseRing::ZERO - wt0,
+                );
 
                 add_scaled_by_base(&mut out0, &t1_0, tau0_0 * w_t1);
                 add_scaled_by_base(&mut out1, &t1_1, tau0_1 * w_t1);
                 // t1_2 = 2*t1_1 - t1_0.
                 let wt1 = tau0_2 * w_t1;
-                add_scaled_by_base(&mut out2, &t1_1, wt1 * two);
-                add_scaled_by_base(&mut out2, &t1_0, R::BaseRing::ZERO - wt1);
+                add_scaled2_by_base(
+                    &mut out2,
+                    &t1_1,
+                    wt1 * two,
+                    &t1_0,
+                    R::BaseRing::ZERO - wt1,
+                );
             }
 
             [out0, out1, out2]
@@ -2467,8 +2534,7 @@ where
                         lin0_c0 += v0[j].coeffs()[0] * w;
                         lin1_c0 += v1[j].coeffs()[0] * w;
                     } else {
-                        add_scaled_by_base(&mut lin0_ring, &v0[j], w);
-                        add_scaled_by_base(&mut lin1_ring, &v1[j], w);
+                        add_scaled_by_base_pair(&mut lin0_ring, &v0[j], &mut lin1_ring, &v1[j], w);
                     }
                 }
 
@@ -2482,8 +2548,7 @@ where
                 // Avoid materializing `lin2` (saves coefficient passes).
                 let eq2_twice = eq0_2 * two;
                 let neg_eq2 = R::BaseRing::ZERO - eq0_2;
-                add_scaled_by_base(&mut out2, &lin1_ring, eq2_twice);
-                add_scaled_by_base(&mut out2, &lin0_ring, neg_eq2);
+                add_scaled2_by_base(&mut out2, &lin1_ring, eq2_twice, &lin0_ring, neg_eq2);
                 out2.coeffs_mut()[0] += eq0_2 * (two * lin1_c0 - lin0_c0);
 
                 // (tau * t) * w  ==  t * (tau0 * w)  since tau is constant-coeff.
@@ -2491,15 +2556,25 @@ where
                 add_scaled_by_base(&mut out1, &t0_1, tau0_1 * w_t0);
                 // t0_2 = 2*t0_1 - t0_0.
                 let wt0 = tau0_2 * w_t0;
-                add_scaled_by_base(&mut out2, &t0_1, wt0 * two);
-                add_scaled_by_base(&mut out2, &t0_0, R::BaseRing::ZERO - wt0);
+                add_scaled2_by_base(
+                    &mut out2,
+                    &t0_1,
+                    wt0 * two,
+                    &t0_0,
+                    R::BaseRing::ZERO - wt0,
+                );
 
                 add_scaled_by_base(&mut out0, &t1_0, tau0_0 * w_t1);
                 add_scaled_by_base(&mut out1, &t1_1, tau0_1 * w_t1);
                 // t1_2 = 2*t1_1 - t1_0.
                 let wt1 = tau0_2 * w_t1;
-                add_scaled_by_base(&mut out2, &t1_1, wt1 * two);
-                add_scaled_by_base(&mut out2, &t1_0, R::BaseRing::ZERO - wt1);
+                add_scaled2_by_base(
+                    &mut out2,
+                    &t1_1,
+                    wt1 * two,
+                    &t1_0,
+                    R::BaseRing::ZERO - wt1,
+                );
             }
 
             [out0, out1, out2]
