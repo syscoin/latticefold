@@ -68,6 +68,62 @@ fn collect_streamed_pi(
     pi
 }
 
+fn collect_streamed_pi0_and_tail(
+    dpp: &Theorem43Dpp<F257, ChunkedMulCodeDr1csNpFlpcpSparse<F257, TensorRsMulCode<F257>>>,
+    x: &[F257],
+    z_w: &[F257],
+    coins: &dpp::Theorem43Coins<F257>,
+    pi0_len: usize,
+) -> (Vec<F257>, Vec<F257>) {
+    let mut pi0 = Vec::with_capacity(pi0_len);
+    let mut tail = Vec::new();
+    let mut seen = 0usize;
+    dpp.prove_for_query_stream(x, z_w, coins, &mut |chunk| {
+        if seen < pi0_len {
+            let need = pi0_len - seen;
+            if chunk.len() <= need {
+                pi0.extend_from_slice(&chunk);
+                seen += chunk.len();
+            } else {
+                pi0.extend_from_slice(&chunk[..need]);
+                tail.extend_from_slice(&chunk[need..]);
+                seen = pi0_len;
+            }
+        } else {
+            tail.extend_from_slice(&chunk);
+        }
+    })
+    .expect("prove_for_query_stream");
+    assert_eq!(pi0.len(), pi0_len);
+    (pi0, tail)
+}
+
+fn collect_streamed_tail_only(
+    dpp: &Theorem43Dpp<F257, ChunkedMulCodeDr1csNpFlpcpSparse<F257, TensorRsMulCode<F257>>>,
+    x: &[F257],
+    z_w: &[F257],
+    coins: &dpp::Theorem43Coins<F257>,
+    pi0_len: usize,
+) -> Vec<F257> {
+    let mut tail = Vec::new();
+    let mut seen = 0usize;
+    dpp.prove_for_query_stream(x, z_w, coins, &mut |chunk| {
+        if seen < pi0_len {
+            let need = pi0_len - seen;
+            if chunk.len() <= need {
+                seen += chunk.len();
+            } else {
+                tail.extend_from_slice(&chunk[need..]);
+                seen = pi0_len;
+            }
+        } else {
+            tail.extend_from_slice(&chunk);
+        }
+    })
+    .expect("prove_for_query_stream");
+    tail
+}
+
 #[test]
 fn test_tensor_rs_eval_all_matches_row_stream_small() {
     // Sanity-check the separable F257 eval-all fast path against per-index row streaming.
@@ -152,3 +208,51 @@ fn test_theorem43_f257_arm_prove_split_roundtrip() {
     );
 }
 
+#[test]
+fn test_theorem43_f257_reuse_single_pi0_many_coin_tails() {
+    // Demonstrate the intended streaming optimization:
+    // - stream/compute π0 = (z_w || all w_eval blocks) once
+    // - for each additional (block_id, rep_id) coin instance, stream only the coin-dependent tail
+    //   and re-use the same π0 to form a full proof π = (π0 || tail).
+    let dpp = chunked_tiny_dpp();
+
+    // Satisfying assignment in F257.
+    let z0 = F257::from(2u64);
+    let z1 = F257::from(5u64);
+    let z2 = z0 * z1;
+    let x = vec![z0];
+    let z_w = vec![z1, z2];
+
+    let c_stmt = vec![F257::from(99u64)];
+    let armer_secret = vec![F257::from(7u64)];
+
+    // NOTE: this tiny fixture has only one block, so we vary rep_id only.
+    let art0 = dpp.arm(&c_stmt, &x, &armer_secret, 0, 0).expect("arm(0)");
+    let art1 = dpp.arm(&c_stmt, &x, &armer_secret, 0, 1).expect("arm(1)");
+
+    // For F257, proof_len = m + 2 + (p-3) and p=257.
+    let pi0_len = dpp.proof_len() - 2 - (257 - 3);
+    let tail_len = dpp.proof_len() - pi0_len;
+    assert_eq!(tail_len, 256, "expected tail length for F257");
+
+    // Stream π0 once (along with tail for the first coin instance).
+    let (pi0, tail0) = collect_streamed_pi0_and_tail(&dpp, &x, &z_w, &art0.coins, pi0_len);
+    assert_eq!(tail0.len(), tail_len);
+
+    // For a second coin instance, stream only the tail and reuse π0.
+    let tail1 = collect_streamed_tail_only(&dpp, &x, &z_w, &art1.coins, pi0_len);
+    assert_eq!(tail1.len(), tail_len);
+
+    // Verify both composed proofs are accepted for their respective arming artifacts.
+    let mut pi_for_0 = pi0.clone();
+    pi_for_0.extend_from_slice(&tail0);
+    assert_eq!(pi_for_0.len(), dpp.proof_len());
+    let a0 = dpp.answer_for_stream(&art0, &x, &pi_for_0).expect("answer_for_stream(0)");
+    assert!(dpp.accept_answer(&a0));
+
+    let mut pi_for_1 = pi0;
+    pi_for_1.extend_from_slice(&tail1);
+    assert_eq!(pi_for_1.len(), dpp.proof_len());
+    let a1 = dpp.answer_for_stream(&art1, &x, &pi_for_1).expect("answer_for_stream(1)");
+    assert!(dpp.accept_answer(&a1));
+}
