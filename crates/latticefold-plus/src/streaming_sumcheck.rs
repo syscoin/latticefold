@@ -3101,6 +3101,60 @@ impl StreamingSumcheck {
         let domain_half = 1usize << (nv - 1);
         let num_polys = state.mles.len();
 
+        // Fast EqBase evaluator: build a small low-bit table once per round, then compute high-bit
+        // scale per vertex-pair. This avoids O(nvars) multiplies per index for EqBase, which is
+        // catastrophic at nvars=27 (2^26 pairs).
+        //
+        // Works with the LSB-first convention used throughout sumcheck (EqBase uses bit i for r[i]).
+        #[inline(always)]
+        fn choose_t_eq(nv: usize) -> usize {
+            // 2^16 = 65536 entries (~512KiB for u64 fields), good tradeoff for nvars<=27.
+            nv.min(16)
+        }
+
+        #[inline(always)]
+        fn build_eq_low_table<BR: Ring + Copy>(r: &[BR], one_minus_r: &[BR]) -> Vec<BR> {
+            debug_assert_eq!(r.len(), one_minus_r.len());
+            let t = r.len();
+            let mut tab = vec![BR::ONE];
+            for i in 0..t {
+                let ri = r[i];
+                let omi = one_minus_r[i];
+                let old = tab.clone();
+                tab.resize(old.len() << 1, BR::ZERO);
+                for j in 0..old.len() {
+                    // bit i = 0
+                    tab[j] = old[j] * omi;
+                    // bit i = 1
+                    tab[j + old.len()] = old[j] * ri;
+                }
+            }
+            tab
+        }
+
+        #[inline(always)]
+        fn eq_high_scale<BR: Ring + Copy>(high: usize, r: &[BR], one_minus_r: &[BR], t: usize) -> BR {
+            debug_assert_eq!(r.len(), one_minus_r.len());
+            let mut prod = BR::ONE;
+            let mut h = high;
+            for i in t..r.len() {
+                let bit = (h & 1) == 1;
+                prod *= if bit { r[i] } else { one_minus_r[i] };
+                h >>= 1;
+            }
+            prod
+        }
+
+        // Precompute EqBase low table if present (it should be mle[0] for CM).
+        let eq_pre = match &state.mles[0] {
+            StreamingMleEnum::EqBase { scale, r, one_minus_r } => {
+                let t = choose_t_eq(r.len());
+                let low = build_eq_low_table::<R::BaseRing>(&r[..t], &one_minus_r[..t]);
+                Some((*scale, t, std::sync::Arc::new(low)))
+            }
+            _ => None,
+        };
+
         struct Scratch<Rr: OverField + PolyRing>
         where
             Rr::BaseRing: Ring,
@@ -3218,6 +3272,21 @@ impl StreamingSumcheck {
                 let idx0 = b << 1;
                 let idx1 = (b << 1) | 1;
                 for (i, mle) in state.mles.iter().enumerate() {
+                    // EqBase fast path: compute in base ring, then lift via `from_scalar`.
+                    if let (0, Some((scale, t, low))) = (i, eq_pre.as_ref()) {
+                        let mask = (1usize << *t) - 1;
+                        let low0 = idx0 & mask;
+                        let low1 = idx1 & mask;
+                        let high = idx0 >> *t;
+                        if let StreamingMleEnum::EqBase { r, one_minus_r, .. } = mle {
+                            let hs = eq_high_scale::<R::BaseRing>(high, r, one_minus_r, *t);
+                            let e0 = (*scale) * hs * low[low0];
+                            let e1 = (*scale) * hs * low[low1];
+                            s.vals0[i] = R::from_scalar(e0);
+                            s.vals1[i] = R::from_scalar(e1);
+                            continue;
+                        }
+                    }
                     s.vals0[i] = eval_mle_with_cm_cache(
                         mle,
                         idx0,
@@ -3256,6 +3325,20 @@ impl StreamingSumcheck {
                 let idx0 = b << 1;
                 let idx1 = (b << 1) | 1;
                 for (i, mle) in state.mles.iter().enumerate() {
+                    if let (0, Some((scale, t, low))) = (i, eq_pre.as_ref()) {
+                        let mask = (1usize << *t) - 1;
+                        let low0 = idx0 & mask;
+                        let low1 = idx1 & mask;
+                        let high = idx0 >> *t;
+                        if let StreamingMleEnum::EqBase { r, one_minus_r, .. } = mle {
+                            let hs = eq_high_scale::<R::BaseRing>(high, r, one_minus_r, *t);
+                            let e0 = (*scale) * hs * low[low0];
+                            let e1 = (*scale) * hs * low[low1];
+                            s.vals0[i] = R::from_scalar(e0);
+                            s.vals1[i] = R::from_scalar(e1);
+                            continue;
+                        }
+                    }
                     s.vals0[i] = eval_mle_with_cm_cache(
                         mle,
                         idx0,
