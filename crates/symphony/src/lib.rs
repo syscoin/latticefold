@@ -25,6 +25,7 @@ pub mod dpp_ajtai;
 pub mod we_gate_arith;
 pub mod dpp_sumcheck;
 pub mod dpp_pifold_math;
+pub mod file_backed_dr1cs;
 
 // SP1 R1CS integration
 pub mod sp1_r1cs_loader;

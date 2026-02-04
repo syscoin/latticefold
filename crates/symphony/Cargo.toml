@@ -34,6 +34,7 @@ stark-rings-linalg = { workspace = true, features = ["parallel"] }
 stark-rings-poly = { workspace = true, features = ["parallel"] }
 thiserror = { workspace = true }
 dpp = { path = "../dpp" }
+memmap2 = "0.9.9"
 
 [build-dependencies]
 proc-macro2 = { workspace = true }

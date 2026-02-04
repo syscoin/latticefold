@@ -13,6 +13,52 @@ use thiserror::Error;
 
 use crate::transcript::{PoseidonTraceOp, PoseidonTranscriptTrace};
 
+fn escape_json_str(input: &str) -> String {
+    input
+        .chars()
+        .flat_map(|c| match c {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            '\r' => "\\r".chars().collect::<Vec<_>>(),
+            '\t' => "\\t".chars().collect::<Vec<_>>(),
+            _ => vec![c],
+        })
+        .collect()
+}
+
+fn debug_log(hypothesis_id: &str, location: &str, message: &str, data_json: &str) {
+    use std::io::Write;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let id = format!(
+        "log_{}_{}",
+        timestamp,
+        location
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>()
+    );
+    let payload = format!(
+        "{{\"id\":\"{}\",\"timestamp\":{},\"location\":\"{}\",\"message\":\"{}\",\"data\":{},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"{}\"}}",
+        escape_json_str(&id),
+        timestamp,
+        escape_json_str(location),
+        escape_json_str(message),
+        data_json,
+        escape_json_str(hypothesis_id),
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/debug.log")
+    {
+        let _ = writeln!(f, "{payload}");
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum PoseidonReplayError {
     #[error("trace mismatch: {0}")]
@@ -93,10 +139,33 @@ pub fn replay_ops<F: PrimeField>(
     let mut state = vec![F::zero(); cfg.rate + cfg.capacity];
     let mut mode = DuplexSpongeMode::Absorbing { next_absorb_index: 0 };
     let mut permutes: Vec<PoseidonPermutationTrace<F>> = Vec::new();
+    // #region agent log
+    debug_log(
+        "H6",
+        "poseidon_trace.rs:replay_ops:entry",
+        "replay entry",
+        &format!(
+            "{{\"rate\":{},\"capacity\":{},\"ops_len\":{}}}",
+            cfg.rate,
+            cfg.capacity,
+            ops.len()
+        ),
+    );
+    // #endregion
 
     for (op_idx, op) in ops.iter().enumerate() {
         match op {
             PoseidonTraceOp::Absorb(elems) => {
+                if op_idx < 6 {
+                    // #region agent log
+                    debug_log(
+                        "H6",
+                        "poseidon_trace.rs:replay_ops:op",
+                        "absorb op",
+                        &format!("{{\"op_idx\":{},\"len\":{}}}", op_idx, elems.len()),
+                    );
+                    // #endregion
+                }
                 if elems.is_empty() {
                     continue;
                 }
@@ -119,6 +188,22 @@ pub fn replay_ops<F: PrimeField>(
                 };
             }
             PoseidonTraceOp::SqueezeField(out) => {
+                if op_idx < 6 {
+                    let head = out.iter().take(3).map(|v| format!("{}", v)).collect::<Vec<_>>();
+                    // #region agent log
+                    debug_log(
+                        "H6",
+                        "poseidon_trace.rs:replay_ops:op",
+                        "squeeze_field op",
+                        &format!(
+                            "{{\"op_idx\":{},\"len\":{},\"head\":[\"{}\"]}}",
+                            op_idx,
+                            out.len(),
+                            escape_json_str(&head.join("\",\""))
+                        ),
+                    );
+                    // #endregion
+                }
                 if out.is_empty() {
                     continue;
                 }
@@ -158,6 +243,22 @@ pub fn replay_ops<F: PrimeField>(
                 }
 
                 if &squeezed != out {
+                    let exp_head = out.iter().take(3).map(|v| format!("{}", v)).collect::<Vec<_>>();
+                    let got_head = squeezed.iter().take(3).map(|v| format!("{}", v)).collect::<Vec<_>>();
+                    // #region agent log
+                    debug_log(
+                        "H7",
+                        "poseidon_trace.rs:replay_ops:mismatch",
+                        "squeeze_field mismatch",
+                        &format!(
+                            "{{\"op_idx\":{},\"len\":{},\"expected_head\":[\"{}\"],\"got_head\":[\"{}\"]}}",
+                            op_idx,
+                            out.len(),
+                            escape_json_str(&exp_head.join("\",\"")),
+                            escape_json_str(&got_head.join("\",\""))
+                        ),
+                    );
+                    // #endregion
                     return Err(PoseidonReplayError::Mismatch(format!(
                         "SqueezeField mismatch at op #{op_idx}: expected {:?}, got {:?}",
                         out, squeezed
@@ -165,6 +266,16 @@ pub fn replay_ops<F: PrimeField>(
                 }
             }
             PoseidonTraceOp::SqueezeBytes { n, out } => {
+                if op_idx < 6 {
+                    // #region agent log
+                    debug_log(
+                        "H6",
+                        "poseidon_trace.rs:replay_ops:op",
+                        "squeeze_bytes op",
+                        &format!("{{\"op_idx\":{},\"n\":{},\"out_len\":{}}}", op_idx, n, out.len()),
+                    );
+                    // #endregion
+                }
                 // Ark implementation:
                 // - squeeze_native_field_elements(num_elements)
                 // - for each element, take usable_bytes = (MODULUS_BIT_SIZE-1)/8 from LE bigint
@@ -416,7 +527,7 @@ fn permute_in_place_with_record<F: PrimeField>(
     permutes.push(PoseidonPermutationTrace { before, after });
 }
 
-fn permute_in_place<F: PrimeField>(cfg: &PoseidonConfig<F>, state: &mut [F]) {
+pub(crate) fn permute_in_place<F: PrimeField>(cfg: &PoseidonConfig<F>, state: &mut [F]) {
     let full_rounds_over_2 = cfg.full_rounds / 2;
 
     for i in 0..full_rounds_over_2 {

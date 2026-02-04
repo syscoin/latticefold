@@ -264,13 +264,42 @@ where
         for lp in &proof.lproof {
             lp.verify(&mut self.transcript);
         }
-        proof
+
+        // CM verifier derives the reduced statement `x = (cm_g, r_o, v_o)` from transcript + proof.
+        // Bind the decomposition check to that derived `x` (not to a prover-supplied copy).
+        let com_x = proof
             .cmproof
             .verify_with_mlen(self.M.len(), &mut self.transcript, expected_prefix)
             .unwrap();
-        proof
-            .dproof
-            .verify(&proof.linb2x.cm_g, &proof.linb2x.vo, self.params.B);
+
+        // `CmProof::x` returns per-`l` values; fold them into the single `(cm_g, v_o)` that the rest of
+        // the protocol uses (mirrors `Mlin::mlin` accumulation logic).
+        let mut cmg_iter = com_x.cm_g.into_iter();
+        let mut cm_g = cmg_iter
+            .next()
+            .unwrap_or_else(|| vec![R::ZERO; self.params.lin.kappa]);
+        for cm in cmg_iter {
+            debug_assert_eq!(cm.len(), cm_g.len());
+            for (acc_r, cm_r) in cm_g.iter_mut().zip(cm.into_iter()) {
+                *acc_r += cm_r;
+            }
+        }
+
+        let mut vo_iter = com_x.vo.into_iter();
+        let mut vo = vo_iter.next().unwrap_or_else(|| Vec::<(R, R)>::new());
+        for v in vo_iter {
+            debug_assert_eq!(v.len(), vo.len());
+            for (acc, vv) in vo.iter_mut().zip(v.into_iter()) {
+                acc.0 += vv.0;
+                acc.1 += vv.1;
+            }
+        }
+
+        // Optional sanity: the proof-carried `linb2x` should match the transcript-derived `x`.
+        debug_assert_eq!(proof.linb2x.cm_g, cm_g);
+        debug_assert_eq!(proof.linb2x.vo, vo);
+
+        proof.dproof.verify(&cm_g, &vo, self.params.B);
         true
     }
 

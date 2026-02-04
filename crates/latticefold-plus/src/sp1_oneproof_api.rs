@@ -7,11 +7,13 @@
 
 #![cfg(feature = "we_gate")]
 
-use cyclotomic_rings::rings::{FrogPoseidonConfig as PC, GetPoseidonParams};
-use cyclotomic_rings::rings::FrogRing64 as R;
+use cyclotomic_rings::rings::{GetPoseidonParams, GoldilocksPoseidonConfig as PC};
+use cyclotomic_rings::rings::GoldilocksRing64 as R;
 use ark_ff::{BigInteger, PrimeField};
 use latticefold::commitment::AjtaiCommitmentScheme;
+use latticefold::transcript::poseidon::F257;
 use latticefold::transcript::Transcript;
+use latticefold::transcript::bytes::field_to_bytes_le_fixed;
 use stark_rings::PolyRing;
 use stark_rings_linalg::SparseMatrix;
 
@@ -93,7 +95,7 @@ pub fn run_sp1_oneproof_we_gate_from_files(
         .map_err(|e| format!("load_sp1_witness_any: {e}"))?;
     let (w_u64, _base_len, _aux_len) = (bundle.witness, bundle.base_len, bundle.aux_len);
 
-    // Map u64 witness -> Frog base field scalars once (centered embedding mod p_bb).
+    // Map u64 witness -> Goldilocks base field scalars once (centered embedding mod p_bb).
     let p_bb = cache.stats.p_bb;
     let mut w_host: Vec<F> = Vec::with_capacity(w_u64.len());
     for &x in &w_u64 {
@@ -223,7 +225,7 @@ pub fn run_sp1_oneproof_we_gate_from_files(
     // - arm the WE gate *shape* (instance depends only on params + sizes),
     // - compute a satisfying witness assignment for that armed instance,
     // - extract the witness tail for downstream lock scaffolding.
-    let poseidon_cfg = PC::get_poseidon_config();
+    let _poseidon_cfg = PC::get_poseidon_config();
     let mut rec = crate::recording_transcript::TracePoseidonTranscript::<R>::empty::<PC>();
     for b in &public_inputs {
         rec.absorb_field_element(b);
@@ -247,26 +249,51 @@ pub fn run_sp1_oneproof_we_gate_from_files(
         .map_err(|e| format!("cm proof verify: {e:?}"))?;
     let trace = rec.trace().clone();
 
-    let shape = crate::we_gate_arith::build_we_dr1cs_for_plus_proof_shape::<R>(
-        &poseidon_cfg,
-        &we_params,
-        public_inputs.len(),
-        proof.lproof.len(),
-        m0.len(),
-        b_decomp,
-    )
-    .map_err(|e| format!("build_we_dr1cs_for_plus_proof_shape: {e}"))?;
+    // -------------------------------------------------------------------------
+    // Tiny-field (F257) WE gate (Theorem 4.3 path)
+    // -------------------------------------------------------------------------
+    // File-backed instance artifacts (canonical tiny gate path).
+    //
+    // Use a fixed temp dir with best-effort cleanup so callers don't have to manage paths.
+    // If you need to inspect artifacts, set `LFP_KEEP_TINY_GATE_OUT_DIR=1`.
+    let out_dir = {
+        let mut p = std::env::temp_dir();
+        p.push("lfplus_sp1_oneproof_tiny_gate");
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).map_err(|e| format!("create temp out_dir failed: {e}"))?;
+        p
+    };
 
-    let assignment = crate::we_gate_arith::build_we_dr1cs_for_plus_proof_witness::<R>(
-        &poseidon_cfg,
+    let pairs: Vec<(usize, usize)> = vec![(0, 0)];
+
+    // Map statement public inputs into tiny-gate public prefix bytes (F257).
+    //
+    // IMPORTANT: Transcript public inputs are absorbed as fixed-width base-field byte strings
+    // (`prime_field_to_bytes_le_fixed`), i.e. 8 bytes per Goldilocks base-field element.
+    //
+    // Therefore, the tiny gate's statement public prefix must be these bytes, not the field
+    // elements themselves, and certainly not the centered BabyBear embedding.
+    // IMPORTANT: these must be the *exact bytes* absorbed into the recorded transcript:
+    // `PoseidonTranscript::absorb_field_element` encodes field elements using
+    // `field_to_bytes_le_fixed` (fixed width, little-endian).
+    //
+    // Therefore we derive bytes from the **Goldilocks field elements** `public_inputs`,
+    // not from the raw BabyBear u64 witness words.
+    let public_inputs_f257: Vec<F257> = public_inputs
+        .iter()
+        .flat_map(|x| field_to_bytes_le_fixed::<BFSmall>(x).into_iter().map(|b| F257::from(b as u64)))
+        .collect();
+
+    let (shape, assignment) = crate::we_gate_arith::build_we_plus_tiny_dr1cs::<R>(
         &trace,
         &we_params,
-        &public_inputs,
+        &public_inputs_f257,
         &proof,
         m0.len(),
-        b_decomp,
+        &pairs,
+        &out_dir,
     )
-    .map_err(|e| format!("build_we_dr1cs_for_plus_proof_witness: {e}"))?;
+    .map_err(|e| format!("build_we_plus_tiny_dr1cs: {e}"))?;
 
     // Optional sanity: the witness must satisfy the armed instance.
     // This can be expensive for large gates; enable only when debugging.
@@ -293,6 +320,10 @@ pub fn run_sp1_oneproof_we_gate_from_files(
 
     // Debug-only: keep deterministic footprints if you need to compare runs.
     let _ = hex32(&stmt_digest);
+
+    if std::env::var("LFP_KEEP_TINY_GATE_OUT_DIR").ok().as_deref() != Some("1") {
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
 
     Ok(Sp1OneProofWeGateOutput {
         stmt_digest,

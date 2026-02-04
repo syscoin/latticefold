@@ -14,6 +14,7 @@ pub mod streaming_sumcheck;
 pub mod tensor_eval;
 pub mod transcript;
 pub mod utils;
+pub mod fs_cleanup;
 
 // SP1 lift vacuity/soundness regression tests (WE-gate only).
 #[cfg(all(test, feature = "we_gate"))]
@@ -27,7 +28,13 @@ pub mod we_statement;
 #[cfg(feature = "we_gate")]
 pub mod we_gate_arith;
 #[cfg(feature = "we_gate")]
-pub mod we_frog_poseidon_f257;
+pub mod we_goldilocks_poseidon_f257;
+#[cfg(feature = "we_gate")]
+pub mod we_gate_tiny;
+#[cfg(feature = "we_gate")]
+pub mod we_tiny_lock;
+#[cfg(feature = "we_gate")]
+pub mod lockable_ringlwe;
 
 // SP1 shrink verifier R1LF loader helpers (feature-gated; research only).
 // We gate these under `we_gate` so the WE/DPP benches can reuse them.

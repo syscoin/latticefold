@@ -4,23 +4,95 @@
 //! we first arithmetize the Poseidon permutation(s) used by the transcript.
 
 use ark_ff::{BigInteger, PrimeField};
+use ark_serialize::CanonicalSerialize;
 use rayon::prelude::*;
+use core::ops::Range;
+use std::path::Path;
 
-use crate::poseidon_trace::{permute_with_round_trace, PoseidonReplayError};
+use crate::poseidon_trace::{permute_in_place, permute_with_round_trace, PoseidonReplayError};
 use crate::poseidon_trace::{replay_ops, PoseidonReplayError as ReplayErr, PoseidonSpongeReplayResult};
 use crate::transcript::PoseidonTraceOp;
+use crate::file_backed_dr1cs::{
+    fast_prepare_out_dir, FileBackedLayout, FileBackedSparseDr1csInstance, SparseDr1csFileWriter,
+};
+#[cfg(unix)]
+use crate::file_backed_dr1cs::FileBackedRangeWriter;
+
+#[derive(Debug)]
+enum PoseidonInstance<F: PrimeField> {
+    InMemory(SparseDr1csInstance<F>),
+    FileBacked(FileBackedSparseDr1csInstance<F>),
+}
+
+
+#[inline]
+fn poseidon_profile_on() -> bool {
+    match std::env::var("LF_PLUS_PROFILE") {
+        Ok(v) => v != "0",
+        Err(_) => false,
+    }
+}
+
+fn escape_json_str(input: &str) -> String {
+    input
+        .chars()
+        .flat_map(|c| match c {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            '\r' => "\\r".chars().collect::<Vec<_>>(),
+            '\t' => "\\t".chars().collect::<Vec<_>>(),
+            _ => vec![c],
+        })
+        .collect()
+}
+
+fn debug_log(hypothesis_id: &str, location: &str, message: &str, data_json: &str) {
+    use std::io::Write;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let id = format!(
+        "log_{}_{}",
+        timestamp,
+        location
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>()
+    );
+    let payload = format!(
+        "{{\"id\":\"{}\",\"timestamp\":{},\"location\":\"{}\",\"message\":\"{}\",\"data\":{},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"{}\"}}",
+        escape_json_str(&id),
+        timestamp,
+        escape_json_str(location),
+        escape_json_str(message),
+        data_json,
+        escape_json_str(hypothesis_id),
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/debug.log")
+    {
+        let _ = writeln!(f, "{payload}");
+    }
+}
 
 #[derive(Clone, Debug)]
-pub struct Constraint<F: PrimeField> {
-    pub a: Vec<(F, usize)>,
-    pub b: Vec<(F, usize)>,
-    pub c: Vec<(F, usize)>,
+pub struct Constraint {
+    pub a: Range<usize>,
+    pub b: Range<usize>,
+    pub c: Range<usize>,
 }
 
 #[derive(Clone, Debug)]
 pub struct SparseDr1csInstance<F: PrimeField> {
     pub nvars: usize,
-    pub constraints: Vec<Constraint<F>>,
+    pub constraints: Vec<Constraint>,
+    pub a_terms: Vec<(F, usize)>,
+    pub b_terms: Vec<(F, usize)>,
+    pub c_terms: Vec<(F, usize)>,
 }
 
 impl<F: PrimeField> SparseDr1csInstance<F> {
@@ -49,9 +121,9 @@ impl<F: PrimeField> SparseDr1csInstance<F> {
             .par_iter()
             .enumerate()
             .find_any(|(_, row)| {
-                let a = Self::eval_lc(&row.a, assignment);
-                let b = Self::eval_lc(&row.b, assignment);
-                let c = Self::eval_lc(&row.c, assignment);
+                let a = Self::eval_lc(&self.a_terms[row.a.clone()], assignment);
+                let b = Self::eval_lc(&self.b_terms[row.b.clone()], assignment);
+                let c = Self::eval_lc(&self.c_terms[row.c.clone()], assignment);
                 a * b != c
             });
 
@@ -70,13 +142,13 @@ impl<F: PrimeField> SparseDr1csInstance<F> {
             let mut ra = vec![F::ZERO; n];
             let mut rb = vec![F::ZERO; n];
             let mut rc = vec![F::ZERO; n];
-            for (coeff, idx) in &row.a {
+            for (coeff, idx) in &self.a_terms[row.a.clone()] {
                 ra[*idx] += *coeff;
             }
-            for (coeff, idx) in &row.b {
+            for (coeff, idx) in &self.b_terms[row.b.clone()] {
                 rb[*idx] += *coeff;
             }
-            for (coeff, idx) in &row.c {
+            for (coeff, idx) in &self.c_terms[row.c.clone()] {
                 rc[*idx] += *coeff;
             }
                 (ra, rb, rc)
@@ -101,17 +173,27 @@ impl<F: PrimeField> SparseDr1csInstance<F> {
 /// Each part is assumed to have `assignment[0] = 1`. In the merged instance:
 /// - var 0 is shared across all parts
 /// - all other variables are appended, and constraints are re-indexed accordingly
-pub fn merge_sparse_dr1cs_share_one<F: PrimeField>(
-    parts: &[(SparseDr1csInstance<F>, Vec<F>)],
+pub fn merge_sparse_dr1cs_share_one<F: PrimeField + Copy + Send + Sync>(
+    parts: Vec<(SparseDr1csInstance<F>, Vec<F>)>,
 ) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {
     if parts.is_empty() {
         return Err("merge_sparse_dr1cs_share_one: empty parts".to_string());
     }
 
-    let mut merged_assignment: Vec<F> = vec![F::ONE];
-    let mut merged_constraints: Vec<Constraint<F>> = Vec::new();
+    // First pass: validate parts + compute prefix offsets (so we can fill in parallel).
+    let mut total_constraints: usize = 0;
+    let mut total_assignment_tail: usize = 0; // excludes the shared var0
+    let mut total_terms_a: usize = 0;
+    let mut total_terms_b: usize = 0;
+    let mut total_terms_c: usize = 0;
 
-    for (inst, asg) in parts {
+    let mut var_offsets: Vec<usize> = Vec::with_capacity(parts.len());
+    let mut a_offsets: Vec<usize> = Vec::with_capacity(parts.len());
+    let mut b_offsets: Vec<usize> = Vec::with_capacity(parts.len());
+    let mut c_offsets: Vec<usize> = Vec::with_capacity(parts.len());
+    let mut row_offsets: Vec<usize> = Vec::with_capacity(parts.len());
+
+    for (inst, asg) in parts.iter() {
         if asg.is_empty() || asg[0] != F::ONE {
             return Err("merge_sparse_dr1cs_share_one: each part must have assignment[0]=1".to_string());
         }
@@ -119,29 +201,127 @@ pub fn merge_sparse_dr1cs_share_one<F: PrimeField>(
             return Err("merge_sparse_dr1cs_share_one: inst/assignment length mismatch".to_string());
         }
 
-        // Map part var0 -> merged var0, and shift the rest by current offset.
-        let offset = merged_assignment.len() - 1;
-        let remap_idx = |idx: usize| -> usize { if idx == 0 { 0 } else { idx + offset } };
+        var_offsets.push(total_assignment_tail);
+        a_offsets.push(total_terms_a);
+        b_offsets.push(total_terms_b);
+        c_offsets.push(total_terms_c);
+        row_offsets.push(total_constraints);
 
-        for row in &inst.constraints {
-            let remap_lc = |lc: &[(F, usize)]| -> Vec<(F, usize)> {
-                lc.iter().map(|(c, i)| (*c, remap_idx(*i))).collect()
-            };
-            merged_constraints.push(Constraint {
-                a: remap_lc(&row.a),
-                b: remap_lc(&row.b),
-                c: remap_lc(&row.c),
-            });
-        }
-
-        // Append assignment sans constant slot.
-        merged_assignment.extend_from_slice(&asg[1..]);
+        total_constraints = total_constraints
+            .checked_add(inst.constraints.len())
+            .ok_or_else(|| "merge_sparse_dr1cs_share_one: constraint count overflow".to_string())?;
+        total_assignment_tail = total_assignment_tail
+            .checked_add(asg.len().saturating_sub(1))
+            .ok_or_else(|| "merge_sparse_dr1cs_share_one: assignment size overflow".to_string())?;
+        total_terms_a = total_terms_a
+            .checked_add(inst.a_terms.len())
+            .ok_or_else(|| "merge_sparse_dr1cs_share_one: a_terms size overflow".to_string())?;
+        total_terms_b = total_terms_b
+            .checked_add(inst.b_terms.len())
+            .ok_or_else(|| "merge_sparse_dr1cs_share_one: b_terms size overflow".to_string())?;
+        total_terms_c = total_terms_c
+            .checked_add(inst.c_terms.len())
+            .ok_or_else(|| "merge_sparse_dr1cs_share_one: c_terms size overflow".to_string())?;
     }
+
+    let merged_nvars = 1usize
+        .checked_add(total_assignment_tail)
+        .ok_or_else(|| "merge_sparse_dr1cs_share_one: merged_nvars overflow".to_string())?;
+
+    // Allocate output buffers without initializing (we will write all entries).
+    let mut merged_assignment: Vec<F> = Vec::with_capacity(merged_nvars);
+    let mut merged_constraints: Vec<Constraint> = Vec::with_capacity(total_constraints);
+    let mut merged_a_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_a);
+    let mut merged_b_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_b);
+    let mut merged_c_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_c);
+    unsafe {
+        merged_assignment.set_len(merged_nvars);
+        merged_constraints.set_len(total_constraints);
+        merged_a_terms.set_len(total_terms_a);
+        merged_b_terms.set_len(total_terms_b);
+        merged_c_terms.set_len(total_terms_c);
+    }
+    merged_assignment[0] = F::ONE;
+
+    // Raw pointers for parallel, disjoint writes.
+    //
+    // Rayon requires captured state to be `Sync`; raw pointers are not `Sync` by default.
+    // We wrap them and assert (by construction) that each thread writes to disjoint ranges.
+    #[derive(Copy, Clone)]
+    struct SyncPtr<T>(*mut T);
+    unsafe impl<T> Send for SyncPtr<T> {}
+    unsafe impl<T> Sync for SyncPtr<T> {}
+    impl<T> SyncPtr<T> {
+        #[inline]
+        unsafe fn add(&self, off: usize) -> *mut T {
+            self.0.add(off)
+        }
+        #[inline]
+        unsafe fn write(&self, off: usize, v: T) {
+            core::ptr::write(self.0.add(off), v);
+        }
+    }
+
+    let out_asg: SyncPtr<F> = SyncPtr(merged_assignment.as_mut_ptr());
+    let out_rows: SyncPtr<Constraint> = SyncPtr(merged_constraints.as_mut_ptr());
+    let out_a: SyncPtr<(F, usize)> = SyncPtr(merged_a_terms.as_mut_ptr());
+    let out_b: SyncPtr<(F, usize)> = SyncPtr(merged_b_terms.as_mut_ptr());
+    let out_c: SyncPtr<(F, usize)> = SyncPtr(merged_c_terms.as_mut_ptr());
+
+    // Fill all output buffers in parallel, one part per task.
+    parts
+        .into_par_iter()
+        .enumerate()
+        .for_each(move |(i, (inst, asg))| unsafe {
+            // Assignment tail copy.
+            let vo = var_offsets[i];
+            let dst = out_asg.add(1 + vo);
+            core::ptr::copy_nonoverlapping(asg.as_ptr().add(1), dst, asg.len().saturating_sub(1));
+
+            // Terms with var-index remap.
+            let ao = a_offsets[i];
+            for (j, (coeff, idx)) in inst.a_terms.iter().copied().enumerate() {
+                let mut new_idx = idx;
+                if new_idx != 0 {
+                    new_idx += vo;
+                }
+                out_a.write(ao + j, (coeff, new_idx));
+            }
+            let bo = b_offsets[i];
+            for (j, (coeff, idx)) in inst.b_terms.iter().copied().enumerate() {
+                let mut new_idx = idx;
+                if new_idx != 0 {
+                    new_idx += vo;
+                }
+                out_b.write(bo + j, (coeff, new_idx));
+            }
+            let co = c_offsets[i];
+            for (j, (coeff, idx)) in inst.c_terms.iter().copied().enumerate() {
+                let mut new_idx = idx;
+                if new_idx != 0 {
+                    new_idx += vo;
+                }
+                out_c.write(co + j, (coeff, new_idx));
+            }
+
+            // Constraints with term-range remap.
+            let ro = row_offsets[i];
+            for (j, row) in inst.constraints.iter().enumerate() {
+                out_rows.write(ro + j, Constraint {
+                    a: (ao + row.a.start)..(ao + row.a.end),
+                    b: (bo + row.b.start)..(bo + row.b.end),
+                    c: (co + row.c.start)..(co + row.c.end),
+                });
+            }
+        });
 
     Ok((
         SparseDr1csInstance {
-            nvars: merged_assignment.len(),
+            nvars: merged_nvars,
             constraints: merged_constraints,
+            a_terms: merged_a_terms,
+            b_terms: merged_b_terms,
+            c_terms: merged_c_terms,
         },
         merged_assignment,
     ))
@@ -153,7 +333,7 @@ pub fn merge_sparse_dr1cs_share_one<F: PrimeField>(
 /// `glue` entries are `(part_a, var_a, part_b, var_b)` in **local** indices.
 /// The merged instance enforces `var_a == var_b` for each glue entry.
 pub fn merge_sparse_dr1cs_share_one_with_glue<F: PrimeField>(
-    parts: &[(SparseDr1csInstance<F>, Vec<F>)],
+    parts: Vec<(SparseDr1csInstance<F>, Vec<F>)>,
     glue: &[(usize, usize, usize, usize)],
 ) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {
     merge_sparse_dr1cs_share_one_with_glue_impl(parts, glue, true)
@@ -166,14 +346,14 @@ pub fn merge_sparse_dr1cs_share_one_with_glue<F: PrimeField>(
 /// instance (constraints + variable identification) is what matters, not the particular dummy
 /// assignment used during construction.
 pub fn merge_sparse_dr1cs_share_one_with_glue_relaxed<F: PrimeField>(
-    parts: &[(SparseDr1csInstance<F>, Vec<F>)],
+    parts: Vec<(SparseDr1csInstance<F>, Vec<F>)>,
     glue: &[(usize, usize, usize, usize)],
 ) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {
     merge_sparse_dr1cs_share_one_with_glue_impl(parts, glue, false)
 }
 
 fn merge_sparse_dr1cs_share_one_with_glue_impl<F: PrimeField>(
-    parts: &[(SparseDr1csInstance<F>, Vec<F>)],
+    parts: Vec<(SparseDr1csInstance<F>, Vec<F>)>,
     glue: &[(usize, usize, usize, usize)],
     check_assignment_consistency: bool,
 ) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {
@@ -189,7 +369,24 @@ fn merge_sparse_dr1cs_share_one_with_glue_impl<F: PrimeField>(
     // Compute offsets for each part (how much its non-const vars are shifted by in merged space).
     let mut offsets: Vec<usize> = Vec::with_capacity(parts.len());
     let mut merged_assignment: Vec<F> = vec![F::ONE];
-    for (inst, asg) in parts {
+    let total_constraints: usize = parts.iter().map(|(inst, _)| inst.constraints.len()).sum();
+    let total_assignment_len: usize = parts.iter().map(|(_, asg)| asg.len()).sum();
+    // #region agent log
+    debug_log(
+        "H1",
+        "dpp_poseidon.rs:merge_sparse_dr1cs_share_one_with_glue_impl:entry",
+        "merge entry",
+        &format!(
+            "{{\"parts_len\":{},\"glue_len\":{},\"check_assignment_consistency\":{},\"total_constraints\":{},\"total_assignment_len\":{}}}",
+            parts.len(),
+            glue.len(),
+            check_assignment_consistency,
+            total_constraints,
+            total_assignment_len
+        ),
+    );
+    // #endregion
+    for (inst, asg) in parts.iter() {
         if asg.is_empty() || asg[0] != F::ONE {
             return Err("merge_sparse_dr1cs_share_one_with_glue: each part must have assignment[0]=1".to_string());
         }
@@ -243,6 +440,19 @@ fn merge_sparse_dr1cs_share_one_with_glue_impl<F: PrimeField>(
         let ib = get_id(gb, &mut idx_map, &mut idxs);
         glue_pairs.push((ia, ib));
     }
+    // #region agent log
+    debug_log(
+        "H2",
+        "dpp_poseidon.rs:merge_sparse_dr1cs_share_one_with_glue_impl:glue_map",
+        "glue mapping built",
+        &format!(
+            "{{\"idxs_len\":{},\"glue_pairs_len\":{},\"offsets_len\":{}}}",
+            idxs.len(),
+            glue_pairs.len(),
+            offsets.len()
+        ),
+    );
+    // #endregion
 
     // Union-find over the glued variable set.
     let m = idxs.len();
@@ -315,6 +525,40 @@ fn merge_sparse_dr1cs_share_one_with_glue_impl<F: PrimeField>(
                 // For shape-only builds, callers may intentionally use arbitrary dummy values,
                 // so we optionally skip this check.
                 if check_assignment_consistency && merged_assignment[i] != merged_assignment[rep] {
+                    let locate = |g: usize| -> Option<(usize, usize)> {
+                        if g == 0 {
+                            return Some((0, 0));
+                        }
+                        for (pi, (inst, _asg)) in parts.iter().enumerate() {
+                            let off = offsets[pi];
+                            let start = off + 1;
+                            let end = off + inst.nvars;
+                            if g >= start && g < end {
+                                return Some((pi, g - off));
+                            }
+                        }
+                        None
+                    };
+                    let (li_part, li_local) = locate(i).unwrap_or((usize::MAX, usize::MAX));
+                    let (lr_part, lr_local) = locate(rep).unwrap_or((usize::MAX, usize::MAX));
+                    // #region agent log
+                    debug_log(
+                        "H3",
+                        "dpp_poseidon.rs:merge_sparse_dr1cs_share_one_with_glue_impl:inconsistent",
+                        "inconsistent glued assignment",
+                        &format!(
+                            "{{\"g\":{},\"rep\":{},\"g_part\":{},\"g_local\":{},\"rep_part\":{},\"rep_local\":{},\"g_val\":\"{}\",\"rep_val\":\"{}\"}}",
+                            i,
+                            rep,
+                            li_part,
+                            li_local,
+                            lr_part,
+                            lr_local,
+                            escape_json_str(&format!("{}", merged_assignment[i])),
+                            escape_json_str(&format!("{}", merged_assignment[rep]))
+                        ),
+                    );
+                    // #endregion
                     return Err(format!(
                         "merge_sparse_dr1cs_share_one_with_glue: inconsistent glued assignment ({} != {})",
                         i, rep
@@ -337,95 +581,260 @@ fn merge_sparse_dr1cs_share_one_with_glue_impl<F: PrimeField>(
     }
 
     let total_constraints: usize = parts.iter().map(|(inst, _)| inst.constraints.len()).sum::<usize>();
-    let mut merged_constraints: Vec<Constraint<F>> = Vec::with_capacity(total_constraints);
+    let total_terms_a: usize = parts.iter().map(|(inst, _)| inst.a_terms.len()).sum();
+    let total_terms_b: usize = parts.iter().map(|(inst, _)| inst.b_terms.len()).sum();
+    let total_terms_c: usize = parts.iter().map(|(inst, _)| inst.c_terms.len()).sum();
 
-    // Merge constraints with remapped indices.
-    //
-    // Default is a single-pass, allocation-friendly merge.
-    //
-    // For very large gates (multi-million constraints), this merge can become a wall-time
-    // bottleneck and appear “single-core bound” in system monitors. In that case, we allow a
-    // parallel remap that preserves constraint order and does not allocate *extra* constraints
-    // beyond the final merged list (it still must allocate the final `merged_constraints`).
-    let use_parallel_merge = total_constraints >= 2_000_000;
+    let mut merged_constraints: Vec<Constraint> = Vec::with_capacity(total_constraints);
+    let mut merged_a_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_a);
+    let mut merged_b_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_b);
+    let mut merged_c_terms: Vec<(F, usize)> = Vec::with_capacity(total_terms_c);
 
-    if use_parallel_merge {
-        let remapped_parts: Vec<Vec<Constraint<F>>> = parts
-            .par_iter()
-            .enumerate()
-            .map(|(part_idx, (inst, _asg))| {
-                let offset = offsets[part_idx];
-                let remap_idx = |idx: usize| -> usize {
-                    let g = if idx == 0 { 0 } else { idx + offset };
-                    new_index[g]
-                };
-                let remap_lc = |lc: &[(F, usize)]| -> Vec<(F, usize)> {
-                    let mut out = Vec::with_capacity(lc.len());
-                    for (c, i) in lc {
-                        out.push((*c, remap_idx(*i)));
-                    }
-                    out
-                };
-                inst.constraints
-                    .par_iter()
-                    .map(|row| Constraint {
-                        a: remap_lc(&row.a),
-                        b: remap_lc(&row.b),
-                        c: remap_lc(&row.c),
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-
-        for v in remapped_parts {
-            merged_constraints.extend(v);
-        }
-    } else {
-        for (part_idx, (inst, _asg)) in parts.iter().enumerate() {
-            let offset = offsets[part_idx];
-            let remap_idx = |idx: usize| -> usize {
-                let g = if idx == 0 { 0 } else { idx + offset };
-                new_index[g]
-            };
-            for row in &inst.constraints {
-                let remap_lc = |lc: &[(F, usize)]| -> Vec<(F, usize)> {
-                    let mut out = Vec::with_capacity(lc.len());
-                    for (c, i) in lc {
-                        out.push((*c, remap_idx(*i)));
-                    }
-                    out
-                };
-                merged_constraints.push(Constraint {
-                    a: remap_lc(&row.a),
-                    b: remap_lc(&row.b),
-                    c: remap_lc(&row.c),
-                });
+    // Merge constraints with remapped indices directly into pooled term arrays.
+    for (part_idx, (inst, _asg)) in parts.iter().enumerate() {
+        let offset = offsets[part_idx];
+        let remap_idx = |idx: usize| -> usize {
+            let g = if idx == 0 { 0 } else { idx + offset };
+            new_index[g]
+        };
+        for row in &inst.constraints {
+            let a0 = merged_a_terms.len();
+            for (c, i) in &inst.a_terms[row.a.clone()] {
+                merged_a_terms.push((*c, remap_idx(*i)));
             }
+            let a1 = merged_a_terms.len();
+
+            let b0 = merged_b_terms.len();
+            for (c, i) in &inst.b_terms[row.b.clone()] {
+                merged_b_terms.push((*c, remap_idx(*i)));
+            }
+            let b1 = merged_b_terms.len();
+
+            let c0 = merged_c_terms.len();
+            for (c, i) in &inst.c_terms[row.c.clone()] {
+                merged_c_terms.push((*c, remap_idx(*i)));
+            }
+            let c1 = merged_c_terms.len();
+
+            merged_constraints.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
         }
     }
 
+    // #region agent log
+    debug_log(
+        "H4",
+        "dpp_poseidon.rs:merge_sparse_dr1cs_share_one_with_glue_impl:exit",
+        "merge exit",
+        &format!(
+            "{{\"old_nvars\":{},\"new_nvars\":{},\"merged_constraints\":{}}}",
+            old_nvars,
+            new_assignment.len(),
+            merged_constraints.len()
+        ),
+    );
+    // #endregion
     Ok((
         SparseDr1csInstance {
             nvars: new_assignment.len(),
             constraints: merged_constraints,
+            a_terms: merged_a_terms,
+            b_terms: merged_b_terms,
+            c_terms: merged_c_terms,
         },
         new_assignment,
     ))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Dr1csBuilder<F: PrimeField> {
     assignment: Vec<F>,
-    rows: Vec<Constraint<F>>,
+    rows: Vec<Constraint>,
+    a_terms: Vec<(F, usize)>,
+    b_terms: Vec<(F, usize)>,
+    c_terms: Vec<(F, usize)>,
+    file_sink: Option<PoseidonFileSink<F>>,
+    file_rows: u64,
+    file_a_terms: u64,
+    file_b_terms: u64,
+    file_c_terms: u64,
+    // Var index remap for direct-to-merged sharded writing.
+    // Global var idx = 0 if local=0 else local + file_var_tail_off.
+    file_var_tail_off: u32,
+    // File-backed fast path: stage blocks in memory and flush via raw-block APIs.
+    fb_modulus: u16,
+    fb_stage_bytes: usize,
+    fb_stage_limit_bytes: usize,
+    fb_a_coeffs: Vec<u8>,
+    fb_a_idx: Vec<u32>,
+    fb_b_coeffs: Vec<u8>,
+    fb_b_idx: Vec<u32>,
+    fb_c_coeffs: Vec<u8>,
+    fb_c_idx: Vec<u32>,
+    fb_row_lens: Vec<u32>, // 3*u32 per row: a_len,b_len,c_len
 }
 
-impl<F: PrimeField> Dr1csBuilder<F> {
+#[derive(Debug)]
+enum PoseidonFileSink<F: PrimeField> {
+    Append(SparseDr1csFileWriter<F>),
+    #[cfg(unix)]
+    Range(FileBackedRangeWriter),
+    /// Count-only: maintain `file_*` counters but do not write pools/rows.
+    Count,
+}
+
+#[derive(Clone, Debug)]
+pub struct RangeWriteResult {
+    pub ckpts: Vec<(u64, u64, u64, u64)>,
+    pub rows: u64,
+    pub a_terms: u64,
+    pub b_terms: u64,
+    pub c_terms: u64,
+}
+
+impl<F: PrimeField + CanonicalSerialize> Dr1csBuilder<F> {
+    #[inline]
+    fn map_idx_u32(&self, idx: usize) -> u32 {
+        if idx == 0 {
+            return 0;
+        }
+        let add = self.file_var_tail_off as u64;
+        let v = (idx as u64).saturating_add(add);
+        v.try_into()
+            .unwrap_or_else(|_| panic!("file-backed dr1cs: mapped var idx overflow u32 (idx={idx} add={add})"))
+    }
+
     fn new() -> Self {
+        #[inline]
+        fn stage_limit_bytes() -> usize {
+            // Keep staging bounded to avoid huge memory spikes in sharded mode.
+            // Override with LFP_POSEIDON_FILE_BACKED_STAGE_MB.
+            let mb: usize = std::env::var("LFP_POSEIDON_FILE_BACKED_STAGE_MB")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or(512);
+            mb.saturating_mul(1024 * 1024)
+        }
+        // For file-backed mode we only support small prime fields; compute modulus once.
+        let modulus_big = F::MODULUS;
+        let limbs = modulus_big.as_ref();
+        let fb_modulus: u16 = limbs.get(0).copied().unwrap_or(0).min(u16::MAX as u64) as u16;
         // var 0 is the constant-1 slot
         Self {
             assignment: vec![F::ONE],
             rows: Vec::new(),
+            a_terms: Vec::new(),
+            b_terms: Vec::new(),
+            c_terms: Vec::new(),
+            file_sink: None,
+            file_rows: 0,
+            file_a_terms: 0,
+            file_b_terms: 0,
+            file_c_terms: 0,
+            file_var_tail_off: 0,
+            fb_modulus,
+            fb_stage_bytes: 0,
+            fb_stage_limit_bytes: stage_limit_bytes(),
+            fb_a_coeffs: Vec::new(),
+            fb_a_idx: Vec::new(),
+            fb_b_coeffs: Vec::new(),
+            fb_b_idx: Vec::new(),
+            fb_c_coeffs: Vec::new(),
+            fb_c_idx: Vec::new(),
+            fb_row_lens: Vec::new(),
         }
+    }
+
+    fn new_file_backed(dir: impl AsRef<std::path::Path>) -> Result<Self, String> {
+        let mut b = Self::new();
+        b.file_sink = Some(PoseidonFileSink::Append(SparseDr1csFileWriter::<F>::create(dir)?));
+        Ok(b)
+    }
+
+    #[cfg(unix)]
+    fn new_file_backed_range(writer: FileBackedRangeWriter, var_tail_off: u32) -> Self {
+        let mut b = Self::new();
+        b.file_var_tail_off = var_tail_off;
+        b.file_sink = Some(PoseidonFileSink::Range(writer));
+        b
+    }
+
+    fn new_count_only() -> Self {
+        let mut b = Self::new();
+        b.file_sink = Some(PoseidonFileSink::Count);
+        b
+    }
+
+    #[inline]
+    fn fb_coeff_u16(&self, coef: F) -> u16 {
+        // Same convention as file-backed writer: canonical integer representative in [0, p-1].
+        if coef == F::ZERO {
+            0
+        } else if coef == F::ONE {
+            1
+        } else if coef == -F::ONE {
+            self.fb_modulus.wrapping_sub(1)
+        } else {
+            let big = coef.into_bigint();
+            let limbs = big.as_ref();
+            limbs.get(0).copied().unwrap_or(0) as u16
+        }
+    }
+
+    fn fb_maybe_flush(&mut self) {
+        if self.file_sink.is_none() {
+            return;
+        }
+        if self.fb_stage_bytes < self.fb_stage_limit_bytes {
+            return;
+        }
+        self.fb_flush().expect("file-backed dr1cs flush failed");
+    }
+
+    fn fb_flush(&mut self) -> Result<(), String> {
+        let Some(sink) = self.file_sink.as_mut() else { return Ok(()); };
+        if self.fb_row_lens.is_empty() {
+            return Ok(());
+        }
+        // Write term pools first, then row lens block.
+        match sink {
+            PoseidonFileSink::Append(w) => {
+                w.push_a_terms_raw_block(&self.fb_a_coeffs, &self.fb_a_idx)?;
+                w.push_b_terms_raw_block(&self.fb_b_coeffs, &self.fb_b_idx)?;
+                w.push_c_terms_raw_block(&self.fb_c_coeffs, &self.fb_c_idx)?;
+                w.push_constraint_lens_block(&self.fb_row_lens)?;
+            }
+            #[cfg(unix)]
+            PoseidonFileSink::Range(w) => {
+                w.push_a_terms_raw_block(&self.fb_a_coeffs, &self.fb_a_idx)?;
+                w.push_b_terms_raw_block(&self.fb_b_coeffs, &self.fb_b_idx)?;
+                w.push_c_terms_raw_block(&self.fb_c_coeffs, &self.fb_c_idx)?;
+                w.push_constraint_lens_block(&self.fb_row_lens)?;
+            }
+            PoseidonFileSink::Count => {
+                // No-op: counters updated below.
+            }
+        }
+
+        self.file_a_terms = self.file_a_terms.saturating_add(self.fb_a_idx.len() as u64);
+        self.file_b_terms = self.file_b_terms.saturating_add(self.fb_b_idx.len() as u64);
+        self.file_c_terms = self.file_c_terms.saturating_add(self.fb_c_idx.len() as u64);
+        self.file_rows = self.file_rows.saturating_add((self.fb_row_lens.len() / 3) as u64);
+
+        self.fb_a_coeffs.clear();
+        self.fb_a_idx.clear();
+        self.fb_b_coeffs.clear();
+        self.fb_b_idx.clear();
+        self.fb_c_coeffs.clear();
+        self.fb_c_idx.clear();
+        self.fb_row_lens.clear();
+        self.fb_stage_bytes = 0;
+        Ok(())
+    }
+
+    #[inline]
+    fn is_file_backed(&self) -> bool {
+        self.file_sink.is_some()
     }
 
     fn one(&self) -> usize {
@@ -439,7 +848,62 @@ impl<F: PrimeField> Dr1csBuilder<F> {
     }
 
     fn add_constraint(&mut self, a: Vec<(F, usize)>, b: Vec<(F, usize)>, c: Vec<(F, usize)>) {
-        self.rows.push(Constraint { a, b, c });
+        if matches!(self.file_sink, Some(PoseidonFileSink::Count)) {
+            self.file_rows = self.file_rows.saturating_add(1);
+            self.file_a_terms = self.file_a_terms.saturating_add(a.len() as u64);
+            self.file_b_terms = self.file_b_terms.saturating_add(b.len() as u64);
+            self.file_c_terms = self.file_c_terms.saturating_add(c.len() as u64);
+            return;
+        }
+        if self.file_sink.is_some() {
+            // Stage term bytes/indices and row lengths, then flush in large blocks.
+            self.fb_row_lens
+                .extend_from_slice(&[(a.len() as u32), (b.len() as u32), (c.len() as u32)]);
+            self.fb_stage_bytes = self.fb_stage_bytes.saturating_add(12);
+
+            let a_len = a.len();
+            self.fb_a_coeffs.reserve(a_len * 2);
+            self.fb_a_idx.reserve(a_len);
+            for (coef, idx) in a.into_iter() {
+                let vv = self.fb_coeff_u16(coef);
+                self.fb_a_coeffs.extend_from_slice(&vv.to_le_bytes());
+                self.fb_a_idx.push(self.map_idx_u32(idx));
+            }
+            self.fb_stage_bytes = self.fb_stage_bytes.saturating_add(a_len * 6);
+
+            let b_len = b.len();
+            self.fb_b_coeffs.reserve(b_len * 2);
+            self.fb_b_idx.reserve(b_len);
+            for (coef, idx) in b.into_iter() {
+                let vv = self.fb_coeff_u16(coef);
+                self.fb_b_coeffs.extend_from_slice(&vv.to_le_bytes());
+                self.fb_b_idx.push(self.map_idx_u32(idx));
+            }
+            self.fb_stage_bytes = self.fb_stage_bytes.saturating_add(b_len * 6);
+
+            let c_len = c.len();
+            self.fb_c_coeffs.reserve(c_len * 2);
+            self.fb_c_idx.reserve(c_len);
+            for (coef, idx) in c.into_iter() {
+                let vv = self.fb_coeff_u16(coef);
+                self.fb_c_coeffs.extend_from_slice(&vv.to_le_bytes());
+                self.fb_c_idx.push(self.map_idx_u32(idx));
+            }
+            self.fb_stage_bytes = self.fb_stage_bytes.saturating_add(c_len * 6);
+
+            self.fb_maybe_flush();
+        } else {
+            let a0 = self.a_terms.len();
+            self.a_terms.extend(a);
+            let a1 = self.a_terms.len();
+            let b0 = self.b_terms.len();
+            self.b_terms.extend(b);
+            let b1 = self.b_terms.len();
+            let c0 = self.c_terms.len();
+            self.c_terms.extend(c);
+            let c1 = self.c_terms.len();
+            self.rows.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
+        }
     }
 
     fn enforce_lc_times_one_eq_var(&mut self, lc: Vec<(F, usize)>, out: usize) {
@@ -549,19 +1013,85 @@ impl<F: PrimeField> Dr1csBuilder<F> {
     }
 
     fn into_sparse_instance(self) -> (SparseDr1csInstance<F>, Vec<F>) {
+        if self.file_sink.is_some() {
+            panic!("into_sparse_instance called on file-backed Dr1csBuilder; use into_file_backed_instance");
+        }
         let nvars = self.assignment.len();
         let inst = SparseDr1csInstance {
             nvars,
             constraints: self.rows,
+            a_terms: self.a_terms,
+            b_terms: self.b_terms,
+            c_terms: self.c_terms,
         };
         (inst, self.assignment)
+    }
+
+    fn into_file_backed_instance(self) -> Result<(FileBackedSparseDr1csInstance<F>, Vec<F>), String> {
+        let mut me = self;
+        me.fb_flush()?;
+        let sink = me
+            .file_sink
+            .take()
+            .ok_or_else(|| "into_file_backed_instance called on in-memory Dr1csBuilder".to_string())?;
+        let PoseidonFileSink::Append(sink) = sink else {
+            return Err("into_file_backed_instance called on range-writer Dr1csBuilder".to_string());
+        };
+        let inst = sink.finish(me.assignment.len())?;
+        Ok((inst, me.assignment))
+    }
+
+    fn into_count_result(self) -> Result<(Vec<F>, RangeWriteResult), String> {
+        let mut me = self;
+        me.fb_flush()?;
+        let sink = me
+            .file_sink
+            .take()
+            .ok_or_else(|| "into_count_result called on in-memory Dr1csBuilder".to_string())?;
+        let PoseidonFileSink::Count = sink else {
+            return Err("into_count_result called on non-count Dr1csBuilder".to_string());
+        };
+        Ok((
+            me.assignment,
+            RangeWriteResult {
+                ckpts: Vec::new(),
+                rows: me.file_rows,
+                a_terms: me.file_a_terms,
+                b_terms: me.file_b_terms,
+                c_terms: me.file_c_terms,
+            },
+        ))
+    }
+
+    #[cfg(unix)]
+    fn into_range_result(self) -> Result<(Vec<F>, RangeWriteResult), String> {
+        let mut me = self;
+        me.fb_flush()?;
+        let sink = me
+            .file_sink
+            .take()
+            .ok_or_else(|| "into_range_result called on in-memory Dr1csBuilder".to_string())?;
+        let PoseidonFileSink::Range(mut w) = sink else {
+            return Err("into_range_result called on append-writer Dr1csBuilder".to_string());
+        };
+        let ckpts = w.take_ckpts();
+        Ok((
+            me.assignment,
+            RangeWriteResult {
+                ckpts,
+                rows: me.file_rows,
+                a_terms: me.file_a_terms,
+                b_terms: me.file_b_terms,
+                c_terms: me.file_c_terms,
+            },
+        ))
     }
 }
 
 /// Build a sparse dR1CS instance for a single Poseidon permutation, given an input state.
 ///
 /// Returns `(instance, assignment, out_state_var_indices)`.
-pub fn poseidon_permutation_dr1cs<F: PrimeField>(
+pub fn poseidon_permutation_dr1cs<F: PrimeField + CanonicalSerialize>(
     cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
     before_state: &[F],
 ) -> Result<(SparseDr1csInstance<F>, Vec<F>, Vec<usize>), PoseidonReplayError> {
@@ -703,7 +1233,7 @@ pub struct PoseidonByteWiring {
 ///
 /// For `SqueezeBytes`, we constrain the squeezed **field elements** and return `ByteSqueezeWitness`
 /// entries so byte-decomposition constraints can be added in a later step.
-pub fn poseidon_sponge_dr1cs_from_trace<F: PrimeField>(
+pub fn poseidon_sponge_dr1cs_from_trace<F: PrimeField + CanonicalSerialize>(
     cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
     ops: &[PoseidonTraceOp<F>],
 ) -> Result<
@@ -721,7 +1251,7 @@ pub fn poseidon_sponge_dr1cs_from_trace<F: PrimeField>(
 
 /// Same as `poseidon_sponge_dr1cs_from_trace`, but also returns `PoseidonDr1csWiring` describing
 /// where each `SqueezeField` output element lives in the dR1CS assignment vector.
-pub fn poseidon_sponge_dr1cs_from_trace_with_wiring<F: PrimeField>(
+pub fn poseidon_sponge_dr1cs_from_trace_with_wiring<F: PrimeField + CanonicalSerialize>(
     cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
     ops: &[PoseidonTraceOp<F>],
 ) -> Result<
@@ -745,7 +1275,7 @@ pub fn poseidon_sponge_dr1cs_from_trace_with_wiring<F: PrimeField>(
 ///
 /// This makes the dR1CS instance depend only on the operation schedule (lengths) and Poseidon
 /// parameters, not on a specific transcript realization.
-pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes<F: PrimeField>(
+pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes<F: PrimeField + CanonicalSerialize>(
     cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
     ops: &[PoseidonTraceOp<F>],
 ) -> Result<
@@ -766,7 +1296,7 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes<F: PrimeField>(
 ///
 /// This is useful for estimating the marginal constraint cost of the `SqueezeBytes` byte
 /// canonicalization gadget (which can be large).
-pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes<F: PrimeField>(
+pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes<F: PrimeField + CanonicalSerialize>(
     cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
     ops: &[PoseidonTraceOp<F>],
 ) -> Result<(SparseDr1csInstance<F>, Vec<F>, PoseidonDr1csWiring), ReplayErr> {
@@ -778,7 +1308,7 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes<F: PrimeField>(
 /// - allocates byte variables,
 /// - constrains each byte is 8-bit,
 /// - links bytes to the underlying squeezed field elements via radix-256 decomposition.
-pub fn poseidon_sponge_dr1cs_from_trace_with_wiring_and_bytes<F: PrimeField>(
+pub fn poseidon_sponge_dr1cs_from_trace_with_wiring_and_bytes<F: PrimeField + CanonicalSerialize>(
     cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
     ops: &[PoseidonTraceOp<F>],
 ) -> Result<
@@ -795,6 +1325,964 @@ pub fn poseidon_sponge_dr1cs_from_trace_with_wiring_and_bytes<F: PrimeField>(
     poseidon_sponge_dr1cs_from_trace_impl(cfg, ops, true, PoseidonArithMode::ReplayFixed)
 }
 
+/// Count-only sharded WE/arm-before-proof mode **without bytes**.
+///
+/// This computes the **exact Poseidon dR1CS variable layout** (assignment + wiring) and exact
+/// row/term counts, but does **not** write any constraints/term pools to disk.
+///
+/// This is used as Pass0 for whole-pipeline direct-to-merged builds.
+pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_count_sharded<
+    F: PrimeField + CanonicalSerialize,
+>(
+    cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+    ops: &[PoseidonTraceOp<F>],
+    shard_permutes: usize,
+) -> Result<(Vec<F>, PoseidonDr1csWiring, RangeWriteResult), ReplayErr> {
+    use ark_crypto_primitives::sponge::DuplexSpongeMode;
+
+    let t = cfg.rate + cfg.capacity;
+    if t == 0 {
+        return Err(ReplayErr::Invalid("invalid poseidon t=0".to_string()));
+    }
+    if shard_permutes == 0 {
+        return Err(ReplayErr::Invalid("shard_permutes must be >0".to_string()));
+    }
+
+    #[derive(Clone)]
+    struct ShardPlan<F: PrimeField> {
+        start: usize,
+        end: usize,
+        init_state: Vec<F>,
+        init_mode: DuplexSpongeMode,
+        constrain_init: bool,
+    }
+
+    // Pass 0 (cheap): simulate sponge schedule to pick shard boundaries and initial states.
+    let mut plans: Vec<ShardPlan<F>> = Vec::new();
+    let mut state: Vec<F> = vec![F::ZERO; t];
+    let mut mode: DuplexSpongeMode = DuplexSpongeMode::Absorbing { next_absorb_index: 0 };
+    let mut permutes_since_start: usize = 0;
+    plans.push(ShardPlan {
+        start: 0,
+        end: 0,
+        init_state: state.clone(),
+        init_mode: mode.clone(),
+        constrain_init: true,
+    });
+
+    #[inline]
+    fn permute_counted<F: PrimeField>(
+        cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+        state: &mut [F],
+        permutes_since_start: &mut usize,
+    ) {
+        permute_in_place(cfg, state);
+        *permutes_since_start = permutes_since_start.saturating_add(1);
+    }
+
+    for (op_idx, op) in ops.iter().enumerate() {
+        match op {
+            PoseidonTraceOp::Absorb(elems) => {
+                for &e in elems {
+                    let mut absorb_index = match mode {
+                        DuplexSpongeMode::Absorbing { next_absorb_index } => next_absorb_index,
+                        DuplexSpongeMode::Squeezing { .. } => {
+                            permute_counted(cfg, &mut state, &mut permutes_since_start);
+                            0
+                        }
+                    };
+                    if absorb_index == cfg.rate {
+                        permute_counted(cfg, &mut state, &mut permutes_since_start);
+                        absorb_index = 0;
+                    }
+                    let pos = cfg.capacity + absorb_index;
+                    state[pos] += e;
+                    mode = DuplexSpongeMode::Absorbing {
+                        next_absorb_index: absorb_index + 1,
+                    };
+                }
+            }
+            PoseidonTraceOp::SqueezeField(out) => {
+                if !out.is_empty() {
+                    let mut squeeze_index = match mode {
+                        DuplexSpongeMode::Absorbing { .. } => {
+                            permute_counted(cfg, &mut state, &mut permutes_since_start);
+                            0
+                        }
+                        DuplexSpongeMode::Squeezing { next_squeeze_index } => next_squeeze_index,
+                    };
+                    if squeeze_index == cfg.rate {
+                        permute_counted(cfg, &mut state, &mut permutes_since_start);
+                        squeeze_index = 0;
+                    }
+                    let mut produced = 0usize;
+                    while produced < out.len() {
+                        let take = core::cmp::min(cfg.rate - squeeze_index, out.len() - produced);
+                        produced += take;
+                        squeeze_index += take;
+                        if produced < out.len() && squeeze_index == cfg.rate {
+                            permute_counted(cfg, &mut state, &mut permutes_since_start);
+                            squeeze_index = 0;
+                        }
+                    }
+                    mode = DuplexSpongeMode::Squeezing {
+                        next_squeeze_index: squeeze_index,
+                    };
+                }
+            }
+            PoseidonTraceOp::SqueezeBytes { .. } => {
+                return Err(ReplayErr::Invalid(
+                    "PoseidonTraceOp::SqueezeBytes not supported in no-bytes count sharded path".to_string(),
+                ));
+            }
+        }
+
+        if permutes_since_start >= shard_permutes && op_idx + 1 < ops.len() {
+            plans.last_mut().unwrap().end = op_idx + 1;
+            plans.push(ShardPlan {
+                start: op_idx + 1,
+                end: op_idx + 1,
+                init_state: state.clone(),
+                init_mode: mode.clone(),
+                constrain_init: false,
+            });
+            permutes_since_start = 0;
+        }
+    }
+    plans.last_mut().unwrap().end = ops.len();
+    plans.retain(|p| p.start < p.end);
+    if plans.is_empty() {
+        return Err(ReplayErr::Invalid("poseidon shard plan produced empty result".to_string()));
+    }
+
+    #[derive(Clone)]
+    struct ShardMeta<F: PrimeField> {
+        wiring: PoseidonDr1csWiring,
+        counts: RangeWriteResult,
+        asg: Vec<F>,
+    }
+
+    // Build each shard in parallel (count-only sink).
+    let shard_metas: Vec<ShardMeta<F>> = plans
+        .par_iter()
+        .map(|p| -> Result<ShardMeta<F>, ReplayErr> {
+            let slice = &ops[p.start..p.end];
+            let prebuilt = Some(Dr1csBuilder::<F>::new_count_only());
+            let (inst_any, asg, _replay, _bytes, wiring, _bw, _init_state_vars, _final_state_vars, counts) =
+                poseidon_sponge_dr1cs_from_trace_impl_any_internal(
+                    cfg,
+                    slice,
+                    false,
+                    PoseidonArithMode::WeWitness,
+                    prebuilt,
+                    None,
+                    &p.init_state,
+                    p.init_mode.clone(),
+                    p.constrain_init,
+                )?;
+            if !matches!(inst_any, PoseidonInstance::InMemory(_)) {
+                return Err(ReplayErr::Invalid("expected in-memory placeholder in count-only shard".to_string()));
+            }
+            let Some(counts) = counts else {
+                return Err(ReplayErr::Invalid("count-only shard missing counts payload".to_string()));
+            };
+            Ok(ShardMeta::<F> {
+                wiring,
+                counts,
+                asg,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let n_shards = shard_metas.len();
+
+    // Merge assignment, stitch wiring, and sum counts in a single pass.
+    //
+    // This lets us drop each shard assignment immediately after appending its tail, reducing peak RSS.
+    let mut merged_asg: Vec<F> = Vec::new();
+    merged_asg.push(F::ONE);
+    let mut wiring = PoseidonDr1csWiring::default();
+    let mut var_tail_off: usize = 0;
+    let mut absorb_off: usize = 0;
+    let mut squeeze_off: usize = 0;
+    let mut tot_rows: u64 = 0;
+    let mut tot_a: u64 = 0;
+    let mut tot_b: u64 = 0;
+    let mut tot_c: u64 = 0;
+    for mut sm in shard_metas.into_iter() {
+        if sm.asg.is_empty() || sm.asg[0] != F::ONE {
+            return Err(ReplayErr::Invalid("count-only shard assignment missing var0=1".to_string()));
+        }
+        // Stitch wiring by offsetting per-shard var indices.
+        let map_var = |idx: usize| -> usize { if idx == 0 { 0 } else { idx + var_tail_off } };
+        for &v in &sm.wiring.absorb_vars {
+            wiring.absorb_vars.push(map_var(v));
+        }
+        for &(st, ln) in &sm.wiring.absorb_ranges {
+            wiring.absorb_ranges.push((absorb_off + st, ln));
+        }
+        absorb_off += sm.wiring.absorb_vars.len();
+        for &v in &sm.wiring.squeeze_field_vars {
+            wiring.squeeze_field_vars.push(map_var(v));
+        }
+        for &(st, ln) in &sm.wiring.squeeze_field_ranges {
+            wiring.squeeze_field_ranges.push((squeeze_off + st, ln));
+        }
+        squeeze_off += sm.wiring.squeeze_field_vars.len();
+
+        // Counts.
+        tot_rows = tot_rows.saturating_add(sm.counts.rows);
+        tot_a = tot_a.saturating_add(sm.counts.a_terms);
+        tot_b = tot_b.saturating_add(sm.counts.b_terms);
+        tot_c = tot_c.saturating_add(sm.counts.c_terms);
+
+        // Append tail vars by move (avoid keeping multiple full copies alive).
+        var_tail_off = var_tail_off.saturating_add(sm.asg.len().saturating_sub(1));
+        let mut tail = sm.asg.split_off(1);
+        merged_asg.append(&mut tail);
+    }
+    let eq_rows = (n_shards.saturating_sub(1) as u64).saturating_mul(t as u64);
+    let counts = RangeWriteResult {
+        ckpts: Vec::new(),
+        rows: tot_rows.saturating_add(eq_rows),
+        a_terms: tot_a.saturating_add(eq_rows),
+        b_terms: tot_b.saturating_add(eq_rows),
+        c_terms: tot_c.saturating_add(eq_rows),
+    };
+    Ok((merged_asg, wiring, counts))
+}
+
+/// Sharded Poseidon WE/arm-before-proof mode (**no bytes**), writing directly into preallocated
+/// merged files via `pwrite` ranges (unix only).
+///
+/// This is the Pass1 companion to `poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_count_sharded`.
+/// Callers must:
+/// - preallocate the destination files to at least the needed sizes
+/// - provide base offsets (in terms/rows) where this Poseidon part begins in the merged instance
+///
+/// Returns:
+/// - Poseidon-local assignment (var0 shared, then tail vars)
+/// - stitched Poseidon wiring (in Poseidon-local var indices)
+/// - `RangeWriteResult` containing **global** checkpoints and local counts
+#[cfg(unix)]
+pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_range_sharded_into_files<
+    F: PrimeField + CanonicalSerialize,
+>(
+    cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+    ops: &[PoseidonTraceOp<F>],
+    shard_permutes: usize,
+    out_fc_a: &std::fs::File,
+    out_fi_a: &std::fs::File,
+    out_fc_b: &std::fs::File,
+    out_fi_b: &std::fs::File,
+    out_fc_c: &std::fs::File,
+    out_fi_c: &std::fs::File,
+    out_rows: &std::fs::File,
+    base_a_terms: u64,
+    base_b_terms: u64,
+    base_c_terms: u64,
+    base_rows: u64,
+    base_var_tail_off: u32,
+) -> Result<(Vec<F>, PoseidonDr1csWiring, RangeWriteResult), ReplayErr> {
+    use ark_crypto_primitives::sponge::DuplexSpongeMode;
+
+    let t = cfg.rate + cfg.capacity;
+    if t == 0 {
+        return Err(ReplayErr::Invalid("invalid poseidon t=0".to_string()));
+    }
+    if shard_permutes == 0 {
+        return Err(ReplayErr::Invalid("shard_permutes must be >0".to_string()));
+    }
+
+    #[derive(Clone)]
+    struct ShardPlan<F: PrimeField> {
+        start: usize,
+        end: usize,
+        init_state: Vec<F>,
+        init_mode: DuplexSpongeMode,
+        constrain_init: bool,
+    }
+
+    // Pass 0a: simulate sponge schedule to pick shard boundaries and initial states.
+    let mut plans: Vec<ShardPlan<F>> = Vec::new();
+    let mut state: Vec<F> = vec![F::ZERO; t];
+    let mut mode: DuplexSpongeMode = DuplexSpongeMode::Absorbing { next_absorb_index: 0 };
+    let mut permutes_since_start: usize = 0;
+    plans.push(ShardPlan {
+        start: 0,
+        end: 0,
+        init_state: state.clone(),
+        init_mode: mode.clone(),
+        constrain_init: true,
+    });
+
+    #[inline]
+    fn permute_counted<F: PrimeField>(
+        cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+        state: &mut [F],
+        permutes_since_start: &mut usize,
+    ) {
+        permute_in_place(cfg, state);
+        *permutes_since_start = permutes_since_start.saturating_add(1);
+    }
+
+    for (op_idx, op) in ops.iter().enumerate() {
+        match op {
+            PoseidonTraceOp::Absorb(elems) => {
+                for &e in elems {
+                    let mut absorb_index = match mode {
+                        DuplexSpongeMode::Absorbing { next_absorb_index } => next_absorb_index,
+                        DuplexSpongeMode::Squeezing { .. } => {
+                            permute_counted(cfg, &mut state, &mut permutes_since_start);
+                            0
+                        }
+                    };
+                    if absorb_index == cfg.rate {
+                        permute_counted(cfg, &mut state, &mut permutes_since_start);
+                        absorb_index = 0;
+                    }
+                    let pos = cfg.capacity + absorb_index;
+                    state[pos] += e;
+                    mode = DuplexSpongeMode::Absorbing {
+                        next_absorb_index: absorb_index + 1,
+                    };
+                }
+            }
+            PoseidonTraceOp::SqueezeField(out) => {
+                if !out.is_empty() {
+                    let mut squeeze_index = match mode {
+                        DuplexSpongeMode::Absorbing { .. } => {
+                            permute_counted(cfg, &mut state, &mut permutes_since_start);
+                            0
+                        }
+                        DuplexSpongeMode::Squeezing { next_squeeze_index } => next_squeeze_index,
+                    };
+                    if squeeze_index == cfg.rate {
+                        permute_counted(cfg, &mut state, &mut permutes_since_start);
+                        squeeze_index = 0;
+                    }
+                    let mut produced = 0usize;
+                    while produced < out.len() {
+                        let take = core::cmp::min(cfg.rate - squeeze_index, out.len() - produced);
+                        produced += take;
+                        squeeze_index += take;
+                        if produced < out.len() && squeeze_index == cfg.rate {
+                            permute_counted(cfg, &mut state, &mut permutes_since_start);
+                            squeeze_index = 0;
+                        }
+                    }
+                    mode = DuplexSpongeMode::Squeezing {
+                        next_squeeze_index: squeeze_index,
+                    };
+                }
+            }
+            PoseidonTraceOp::SqueezeBytes { .. } => {
+                return Err(ReplayErr::Invalid(
+                    "PoseidonTraceOp::SqueezeBytes is not supported in the sharded no-bytes range-write path".to_string(),
+                ));
+            }
+        }
+
+        if permutes_since_start >= shard_permutes && op_idx + 1 < ops.len() {
+            plans.last_mut().unwrap().end = op_idx + 1;
+            plans.push(ShardPlan {
+                start: op_idx + 1,
+                end: op_idx + 1,
+                init_state: state.clone(),
+                init_mode: mode.clone(),
+                constrain_init: false,
+            });
+            permutes_since_start = 0;
+        }
+    }
+    plans.last_mut().unwrap().end = ops.len();
+    plans.retain(|p| p.start < p.end);
+    if plans.is_empty() {
+        return Err(ReplayErr::Invalid("poseidon shard plan produced empty result".to_string()));
+    }
+
+    // Pass 0b (structural): count each shard cheaply to compute exact disjoint write ranges.
+    //
+    // IMPORTANT: this must exactly match the WE/no-bytes arithmetizer shape, including absorb
+    // state-update constraints and the optimized full/partial round gadgets.
+    let total_rounds = cfg.full_rounds + cfg.partial_rounds;
+    let mut ark_is_zero: Vec<Vec<bool>> = vec![vec![false; t]; total_rounds];
+    for r in 0..total_rounds {
+        for i in 0..t {
+            ark_is_zero[r][i] = cfg.ark[r][i].is_zero();
+        }
+    }
+    let mut partial_const_is_zero: Vec<Vec<bool>> = vec![vec![true; t]; total_rounds];
+    let full_rounds_over_2 = cfg.full_rounds / 2;
+    for r in 0..total_rounds {
+        let is_full = r < full_rounds_over_2 || r >= (full_rounds_over_2 + cfg.partial_rounds);
+        if is_full {
+            continue;
+        }
+        for i in 0..t {
+            let mut const_term = F::ZERO;
+            for j in 1..t {
+                const_term += cfg.mds[i][j] * cfg.ark[r][j];
+            }
+            partial_const_is_zero[r][i] = const_term.is_zero();
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct ShardCounts {
+        nvars: u64,
+        nconstraints: u64,
+        a_terms: u64,
+        b_terms: u64,
+        c_terms: u64,
+    }
+
+    #[derive(Clone, Debug)]
+    struct PoseidonShardCounter<F: PrimeField> {
+        // var0 is the constant-1 slot
+        nvars: usize,
+        counts: ShardCounts,
+        mode: DuplexSpongeMode,
+        state_vars: Vec<usize>,
+        init_state_vars: Vec<usize>,
+        _pd: core::marker::PhantomData<F>,
+    }
+
+    impl<F: PrimeField> PoseidonShardCounter<F> {
+        fn new(t: usize, init_mode: DuplexSpongeMode, constrain_init: bool) -> Self {
+            let mut s = Self {
+                nvars: 1, // var0
+                counts: ShardCounts::default(),
+                mode: init_mode,
+                state_vars: Vec::with_capacity(t),
+                init_state_vars: Vec::with_capacity(t),
+                _pd: core::marker::PhantomData,
+            };
+            for _ in 0..t {
+                let v = s.new_var();
+                if constrain_init {
+                    s.enforce_var_eq_const(v);
+                }
+                s.state_vars.push(v);
+                s.init_state_vars.push(v);
+            }
+            s
+        }
+        #[inline]
+        fn new_var(&mut self) -> usize {
+            let v = self.nvars;
+            self.nvars += 1;
+            self.counts.nvars = self.nvars as u64;
+            v
+        }
+        #[inline]
+        fn add_constraint_lens(&mut self, a_len: usize, b_len: usize, c_len: usize) {
+            self.counts.nconstraints = self.counts.nconstraints.saturating_add(1);
+            self.counts.a_terms = self.counts.a_terms.saturating_add(a_len as u64);
+            self.counts.b_terms = self.counts.b_terms.saturating_add(b_len as u64);
+            self.counts.c_terms = self.counts.c_terms.saturating_add(c_len as u64);
+        }
+        #[inline]
+        fn enforce_mul(&mut self, _x: usize, _y: usize, _out: usize) {
+            self.add_constraint_lens(1, 1, 1);
+        }
+        #[inline]
+        fn enforce_lc_times_one_eq_var(&mut self, lc_len: usize, _out: usize) {
+            self.add_constraint_lens(lc_len, 1, 1);
+        }
+        #[inline]
+        fn enforce_var_eq_const(&mut self, _x: usize) {
+            self.add_constraint_lens(1, 1, 1);
+        }
+        fn enforce_pow_u64(&mut self, base: usize, alpha: u64) -> usize {
+            if alpha == 0 {
+                return self.new_var();
+            }
+            if alpha == 1 {
+                return base;
+            }
+            if alpha == 3 {
+                let x2 = self.new_var();
+                self.enforce_mul(base, base, x2);
+                let x3 = self.new_var();
+                self.enforce_mul(x2, base, x3);
+                return x3;
+            }
+            if alpha == 5 {
+                let x2 = self.new_var();
+                self.enforce_mul(base, base, x2);
+                let x4 = self.new_var();
+                self.enforce_mul(x2, x2, x4);
+                let x5 = self.new_var();
+                self.enforce_mul(x4, base, x5);
+                return x5;
+            }
+            if alpha == 7 {
+                let x2 = self.new_var();
+                self.enforce_mul(base, base, x2);
+                let x4 = self.new_var();
+                self.enforce_mul(x2, x2, x4);
+                let x6 = self.new_var();
+                self.enforce_mul(x4, x2, x6);
+                let x7 = self.new_var();
+                self.enforce_mul(x6, base, x7);
+                return x7;
+            }
+            // Fallback: square-and-multiply (shape only).
+            let mut cur_var = base;
+            let mut acc_var = self.new_var(); // acc = 1
+            let mut e = alpha;
+            while e > 0 {
+                if (e & 1) == 1 {
+                    let out_var = self.new_var();
+                    self.enforce_mul(acc_var, cur_var, out_var);
+                    acc_var = out_var;
+                }
+                e >>= 1;
+                if e == 0 {
+                    break;
+                }
+                let sq_var = self.new_var();
+                self.enforce_mul(cur_var, cur_var, sq_var);
+                cur_var = sq_var;
+            }
+            acc_var
+        }
+        fn apply_perm_counts(
+            &mut self,
+            cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+            ark_is_zero: &[Vec<bool>],
+            partial_const_is_zero: &[Vec<bool>],
+        ) {
+            let t = cfg.rate + cfg.capacity;
+            let full_rounds_over_2 = cfg.full_rounds / 2;
+            let total_rounds = cfg.full_rounds + cfg.partial_rounds;
+            for r in 0..total_rounds {
+                let is_full = r < full_rounds_over_2 || r >= (full_rounds_over_2 + cfg.partial_rounds);
+                let mut next_vars: Vec<usize> = Vec::with_capacity(t);
+                if is_full {
+                    let mut sbox_vars: Vec<usize> = Vec::with_capacity(t);
+                    for i in 0..t {
+                        let lc_len = if ark_is_zero[r][i] { 1 } else { 2 };
+                        let out = match cfg.alpha {
+                            3 => {
+                                let x2 = self.new_var();
+                                self.add_constraint_lens(lc_len, lc_len, 1);
+                                let x3 = self.new_var();
+                                self.add_constraint_lens(1, lc_len, 1);
+                                let _ = x2;
+                                x3
+                            }
+                            5 => {
+                                let x2 = self.new_var();
+                                self.add_constraint_lens(lc_len, lc_len, 1);
+                                let x4 = self.new_var();
+                                self.enforce_mul(x2, x2, x4);
+                                let x5 = self.new_var();
+                                self.add_constraint_lens(1, lc_len, 1);
+                                let _ = (x2, x4);
+                                x5
+                            }
+                            7 => {
+                                let x2 = self.new_var();
+                                self.add_constraint_lens(lc_len, lc_len, 1);
+                                let x4 = self.new_var();
+                                self.enforce_mul(x2, x2, x4);
+                                let x6 = self.new_var();
+                                self.enforce_mul(x4, x2, x6);
+                                let x7 = self.new_var();
+                                self.add_constraint_lens(1, lc_len, 1);
+                                let _ = (x2, x4, x6);
+                                x7
+                            }
+                            _ => {
+                                let v = self.new_var();
+                                self.enforce_lc_times_one_eq_var(2, v);
+                                self.enforce_pow_u64(v, cfg.alpha)
+                            }
+                        };
+                        sbox_vars.push(out);
+                    }
+                    for _i in 0..t {
+                        let v = self.new_var();
+                        self.enforce_lc_times_one_eq_var(t, v);
+                        next_vars.push(v);
+                    }
+                    let _ = sbox_vars;
+                } else {
+                    let ark0 = self.new_var();
+                    self.enforce_lc_times_one_eq_var(2, ark0);
+                    let sbox0 = self.enforce_pow_u64(ark0, cfg.alpha);
+                    for i in 0..t {
+                        let mut lc_len = 1 + (t - 1);
+                        if !partial_const_is_zero[r][i] {
+                            lc_len += 1;
+                        }
+                        let v = self.new_var();
+                        self.enforce_lc_times_one_eq_var(lc_len, v);
+                        next_vars.push(v);
+                    }
+                    let _ = sbox0;
+                }
+                self.state_vars = next_vars;
+            }
+        }
+    }
+
+    fn count_shard<F: PrimeField>(
+        cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+        ops: &[PoseidonTraceOp<F>],
+        init_mode: DuplexSpongeMode,
+        constrain_init: bool,
+        ark_is_zero: &[Vec<bool>],
+        partial_const_is_zero: &[Vec<bool>],
+    ) -> ShardCounts {
+        let t = cfg.rate + cfg.capacity;
+        let mut c = PoseidonShardCounter::<F>::new(t, init_mode, constrain_init);
+        for op in ops {
+            match op {
+                PoseidonTraceOp::Absorb(elems) => {
+                    if elems.is_empty() {
+                        continue;
+                    }
+                    for _e in elems {
+                        if matches!(c.mode, DuplexSpongeMode::Squeezing { .. }) {
+                            c.apply_perm_counts(cfg, ark_is_zero, partial_const_is_zero);
+                            c.mode = DuplexSpongeMode::Absorbing { next_absorb_index: 0 };
+                        }
+                        let mut absorb_index = match c.mode {
+                            DuplexSpongeMode::Absorbing { next_absorb_index } => next_absorb_index,
+                            _ => unreachable!(),
+                        };
+                        if absorb_index == cfg.rate {
+                            c.apply_perm_counts(cfg, ark_is_zero, partial_const_is_zero);
+                            absorb_index = 0;
+                        }
+                        // e_var
+                        let _e_var = c.new_var();
+                        // new state slot var + constraint: state[pos] + e == new
+                        let new_state = c.new_var();
+                        c.enforce_lc_times_one_eq_var(2, new_state);
+                        let pos = cfg.capacity + absorb_index;
+                        c.state_vars[pos] = new_state;
+                        c.mode = DuplexSpongeMode::Absorbing {
+                            next_absorb_index: absorb_index + 1,
+                        };
+                    }
+                }
+                PoseidonTraceOp::SqueezeField(out) => {
+                    if out.is_empty() {
+                        continue;
+                    }
+                    let mut squeeze_index = match c.mode {
+                        DuplexSpongeMode::Absorbing { .. } => {
+                            c.apply_perm_counts(cfg, ark_is_zero, partial_const_is_zero);
+                            0
+                        }
+                        DuplexSpongeMode::Squeezing { next_squeeze_index } => next_squeeze_index,
+                    };
+                    if squeeze_index == cfg.rate {
+                        c.apply_perm_counts(cfg, ark_is_zero, partial_const_is_zero);
+                        squeeze_index = 0;
+                    }
+                    let mut produced = 0usize;
+                    while produced < out.len() {
+                        let take = core::cmp::min(cfg.rate - squeeze_index, out.len() - produced);
+                        produced += take;
+                        squeeze_index += take;
+                        if produced < out.len() && squeeze_index == cfg.rate {
+                            c.apply_perm_counts(cfg, ark_is_zero, partial_const_is_zero);
+                            squeeze_index = 0;
+                        }
+                    }
+                    c.mode = DuplexSpongeMode::Squeezing {
+                        next_squeeze_index: squeeze_index,
+                    };
+                }
+                PoseidonTraceOp::SqueezeBytes { .. } => unreachable!(),
+            }
+        }
+        c.counts
+    }
+
+    let shard_counts: Vec<ShardCounts> = plans
+        .iter()
+        .map(|p| count_shard::<F>(
+            cfg,
+            &ops[p.start..p.end],
+            p.init_mode.clone(),
+            p.constrain_init,
+            &ark_is_zero,
+            &partial_const_is_zero,
+        ))
+        .collect();
+
+    // Prefix sums for shard var/row/term offsets (relative to part start).
+    let mut var_tail_off: Vec<u32> = Vec::with_capacity(plans.len());
+    let mut row_off: Vec<u64> = Vec::with_capacity(plans.len());
+    let mut a_off: Vec<u64> = Vec::with_capacity(plans.len());
+    let mut b_off: Vec<u64> = Vec::with_capacity(plans.len());
+    let mut c_off: Vec<u64> = Vec::with_capacity(plans.len());
+    let mut cur_var_tail: u64 = 0;
+    let mut cur_rows: u64 = 0;
+    let mut cur_a: u64 = 0;
+    let mut cur_b: u64 = 0;
+    let mut cur_c: u64 = 0;
+    for sc in &shard_counts {
+        var_tail_off.push(
+            (cur_var_tail + (base_var_tail_off as u64))
+                .try_into()
+                .map_err(|_| ReplayErr::Invalid("poseidon range: var_tail_off overflow u32".to_string()))?,
+        );
+        row_off.push(base_rows.saturating_add(cur_rows));
+        a_off.push(base_a_terms.saturating_add(cur_a));
+        b_off.push(base_b_terms.saturating_add(cur_b));
+        c_off.push(base_c_terms.saturating_add(cur_c));
+        cur_var_tail = cur_var_tail.saturating_add(sc.nvars.saturating_sub(1));
+        cur_rows = cur_rows.saturating_add(sc.nconstraints);
+        cur_a = cur_a.saturating_add(sc.a_terms);
+        cur_b = cur_b.saturating_add(sc.b_terms);
+        cur_c = cur_c.saturating_add(sc.c_terms);
+    }
+
+    // Boundary equality constraints: t per boundary, each adds 1 term to A/B/C and 1 row.
+    let n_boundaries = plans.len().saturating_sub(1);
+    let eq_rows: u64 = (n_boundaries as u64).saturating_mul(t as u64);
+    let total_rows = cur_rows.saturating_add(eq_rows);
+    let total_a_terms = cur_a.saturating_add(eq_rows);
+    let total_b_terms = cur_b.saturating_add(eq_rows);
+    let total_c_terms = cur_c.saturating_add(eq_rows);
+
+    // Pass 1: build shards in parallel, writing directly into provided merged files.
+    #[derive(Clone)]
+    struct ShardBuilt<F: PrimeField> {
+        asg: Vec<F>,
+        init_state_vars: Vec<usize>,
+        final_state_vars: Vec<usize>,
+        wiring: PoseidonDr1csWiring,
+        ckpts: Vec<(u64, u64, u64, u64)>,
+    }
+    let mut shard_built: Vec<ShardBuilt<F>> = plans
+        .par_iter()
+        .enumerate()
+        .map(|(shard_idx, p)| -> Result<ShardBuilt<F>, ReplayErr> {
+            let slice = &ops[p.start..p.end];
+            let writer = FileBackedRangeWriter::new(
+                out_fc_a
+                    .try_clone()
+                    .map_err(|e| ReplayErr::Invalid(format!("clone a_coeffs failed: {e}")))?,
+                out_fi_a
+                    .try_clone()
+                    .map_err(|e| ReplayErr::Invalid(format!("clone a_idx failed: {e}")))?,
+                out_fc_b
+                    .try_clone()
+                    .map_err(|e| ReplayErr::Invalid(format!("clone b_coeffs failed: {e}")))?,
+                out_fi_b
+                    .try_clone()
+                    .map_err(|e| ReplayErr::Invalid(format!("clone b_idx failed: {e}")))?,
+                out_fc_c
+                    .try_clone()
+                    .map_err(|e| ReplayErr::Invalid(format!("clone c_coeffs failed: {e}")))?,
+                out_fi_c
+                    .try_clone()
+                    .map_err(|e| ReplayErr::Invalid(format!("clone c_idx failed: {e}")))?,
+                out_rows
+                    .try_clone()
+                    .map_err(|e| ReplayErr::Invalid(format!("clone constraints failed: {e}")))?,
+                a_off[shard_idx],
+                b_off[shard_idx],
+                c_off[shard_idx],
+                row_off[shard_idx],
+            );
+            let prebuilt = Some(Dr1csBuilder::<F>::new_file_backed_range(writer, var_tail_off[shard_idx]));
+            let (inst_any, asg, _replay, _bytes, wiring, _bw, init_state_vars, final_state_vars, ckpts) =
+                poseidon_sponge_dr1cs_from_trace_impl_any_internal(
+                    cfg,
+                    slice,
+                    false,
+                    PoseidonArithMode::WeWitness,
+                    prebuilt,
+                    None,
+                    &p.init_state,
+                    p.init_mode.clone(),
+                    p.constrain_init,
+                )?;
+            if !matches!(inst_any, PoseidonInstance::InMemory(_)) {
+                return Err(ReplayErr::Invalid("expected range-writer build to return placeholder instance".to_string()));
+            }
+            let Some(range_res) = ckpts else {
+                return Err(ReplayErr::Invalid("range-writer build missing checkpoint payload".to_string()));
+            };
+            let exp = shard_counts
+                .get(shard_idx)
+                .ok_or_else(|| ReplayErr::Invalid("shard_counts index OOB".to_string()))?;
+            if range_res.rows != exp.nconstraints
+                || range_res.a_terms != exp.a_terms
+                || range_res.b_terms != exp.b_terms
+                || range_res.c_terms != exp.c_terms
+            {
+                return Err(ReplayErr::Invalid(format!(
+                    "poseidon range write: count mismatch for shard {shard_idx}: \
+rows got {} exp {}, a_terms got {} exp {}, b_terms got {} exp {}, c_terms got {} exp {}",
+                    range_res.rows,
+                    exp.nconstraints,
+                    range_res.a_terms,
+                    exp.a_terms,
+                    range_res.b_terms,
+                    exp.b_terms,
+                    range_res.c_terms,
+                    exp.c_terms
+                )));
+            }
+            Ok(ShardBuilt::<F> {
+                asg,
+                init_state_vars,
+                final_state_vars,
+                wiring,
+                ckpts: range_res.ckpts,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Merge assignment by concatenating shard assignments (share var0).
+    let mut merged_asg: Vec<F> = Vec::new();
+    merged_asg.push(F::ONE);
+    let mut tail_lens: Vec<usize> = Vec::with_capacity(shard_built.len());
+    for sb in shard_built.iter_mut() {
+        if sb.asg.is_empty() || sb.asg[0] != F::ONE {
+            return Err(ReplayErr::Invalid("shard assignment missing var0=1".to_string()));
+        }
+        let tail_len = sb.asg.len().saturating_sub(1);
+        tail_lens.push(tail_len);
+        let mut asg = core::mem::take(&mut sb.asg);
+        let mut tail = asg.split_off(1);
+        merged_asg.append(&mut tail);
+    }
+
+    // Stitch wiring by offsetting per-shard var indices (Poseidon-local).
+    let mut wiring = PoseidonDr1csWiring::default();
+    let mut var_tail_local: usize = 0;
+    let mut absorb_off: usize = 0;
+    let mut squeeze_off: usize = 0;
+    for (i, sb) in shard_built.iter().enumerate() {
+        let map_var = |idx: usize| -> usize { if idx == 0 { 0 } else { idx + var_tail_local } };
+        for &v in &sb.wiring.absorb_vars {
+            wiring.absorb_vars.push(map_var(v));
+        }
+        for &(st, ln) in &sb.wiring.absorb_ranges {
+            wiring.absorb_ranges.push((absorb_off + st, ln));
+        }
+        absorb_off += sb.wiring.absorb_vars.len();
+        for &v in &sb.wiring.squeeze_field_vars {
+            wiring.squeeze_field_vars.push(map_var(v));
+        }
+        for &(st, ln) in &sb.wiring.squeeze_field_ranges {
+            wiring.squeeze_field_ranges.push((squeeze_off + st, ln));
+        }
+        squeeze_off += sb.wiring.squeeze_field_vars.len();
+        var_tail_local = var_tail_local.saturating_add(*tail_lens.get(i).unwrap_or(&0));
+    }
+
+    // Boundary equalities: final_state(shard i) == init_state(shard i+1) (in merged-file var space).
+    let map_var_global = |shard_idx: usize, local: usize| -> u32 {
+        if local == 0 {
+            0
+        } else {
+            (local as u64)
+                .saturating_add(var_tail_off[shard_idx] as u64)
+                .try_into()
+                .unwrap()
+        }
+    };
+    let mut boundary_eqs: Vec<(u32, u32)> = Vec::new();
+    for i in 0..shard_built.len().saturating_sub(1) {
+        let left = &shard_built[i];
+        let right = &shard_built[i + 1];
+        for (x, y) in left.final_state_vars.iter().zip(right.init_state_vars.iter()) {
+            boundary_eqs.push((map_var_global(i, *x), map_var_global(i + 1, *y)));
+        }
+    }
+
+    // Append boundary equalities into the reserved tail range.
+    let mut eq_writer = FileBackedRangeWriter::new(
+        out_fc_a
+            .try_clone()
+            .map_err(|e| ReplayErr::Invalid(format!("clone a_coeffs failed: {e}")))?,
+        out_fi_a
+            .try_clone()
+            .map_err(|e| ReplayErr::Invalid(format!("clone a_idx failed: {e}")))?,
+        out_fc_b
+            .try_clone()
+            .map_err(|e| ReplayErr::Invalid(format!("clone b_coeffs failed: {e}")))?,
+        out_fi_b
+            .try_clone()
+            .map_err(|e| ReplayErr::Invalid(format!("clone b_idx failed: {e}")))?,
+        out_fc_c
+            .try_clone()
+            .map_err(|e| ReplayErr::Invalid(format!("clone c_coeffs failed: {e}")))?,
+        out_fi_c
+            .try_clone()
+            .map_err(|e| ReplayErr::Invalid(format!("clone c_idx failed: {e}")))?,
+        out_rows
+            .try_clone()
+            .map_err(|e| ReplayErr::Invalid(format!("clone constraints failed: {e}")))?,
+        base_a_terms.saturating_add(cur_a),
+        base_b_terms.saturating_add(cur_b),
+        base_c_terms.saturating_add(cur_c),
+        base_rows.saturating_add(cur_rows),
+    );
+    {
+        // each boundary eq is x*1==y (A:1,B:1,C:1) with tiny_u16_u32 coeff=1
+        let one_u16: u16 = 1;
+        let a_coeffs: Vec<u8> = (0..boundary_eqs.len())
+            .flat_map(|_| one_u16.to_le_bytes())
+            .collect();
+        let b_coeffs = a_coeffs.clone();
+        let c_coeffs = a_coeffs.clone();
+        let a_idx: Vec<u32> = boundary_eqs.iter().map(|(x, _)| *x).collect();
+        let b_idx: Vec<u32> = vec![0u32; boundary_eqs.len()];
+        let c_idx: Vec<u32> = boundary_eqs.iter().map(|(_, y)| *y).collect();
+        let lens: Vec<u32> = (0..boundary_eqs.len()).flat_map(|_| [1u32, 1u32, 1u32]).collect();
+        eq_writer.push_a_terms_raw_block(&a_coeffs, &a_idx).map_err(ReplayErr::Invalid)?;
+        eq_writer.push_b_terms_raw_block(&b_coeffs, &b_idx).map_err(ReplayErr::Invalid)?;
+        eq_writer.push_c_terms_raw_block(&c_coeffs, &c_idx).map_err(ReplayErr::Invalid)?;
+        eq_writer.push_constraint_lens_block(&lens).map_err(ReplayErr::Invalid)?;
+    }
+    if (boundary_eqs.len() as u64) != eq_rows {
+        return Err(ReplayErr::Invalid(format!(
+            "poseidon range write: boundary eq count mismatch (got {}, expected {})",
+            boundary_eqs.len(),
+            eq_rows
+        )));
+    }
+
+    // Gather checkpoints from shards + boundary eq tail.
+    let mut ckpts_all: Vec<(u64, u64, u64, u64)> = Vec::new();
+    for sb in &shard_built {
+        ckpts_all.extend_from_slice(&sb.ckpts);
+    }
+    ckpts_all.extend(eq_writer.take_ckpts().into_iter());
+    ckpts_all.sort_by_key(|(row_idx, _, _, _)| *row_idx);
+    ckpts_all.dedup_by_key(|(row_idx, _, _, _)| *row_idx);
+    // Ensure a checkpoint at the start of this part.
+    if ckpts_all.first().map(|x| x.0) != Some(base_rows) {
+        ckpts_all.insert(0, (base_rows, base_a_terms, base_b_terms, base_c_terms));
+    }
+
+    Ok((
+        merged_asg,
+        wiring,
+        RangeWriteResult {
+            ckpts: ckpts_all,
+            rows: total_rows,
+            a_terms: total_a_terms,
+            b_terms: total_b_terms,
+            c_terms: total_c_terms,
+        },
+    ))
+}
+
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PoseidonArithMode {
     /// “Replay mode”: enforce Absorb/Squeeze outputs match the recorded trace values and run
@@ -804,19 +2292,64 @@ enum PoseidonArithMode {
     WeWitness,
 }
 
-fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
+fn poseidon_sponge_dr1cs_from_trace_impl_any<F: PrimeField + CanonicalSerialize>(
     cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
     ops: &[PoseidonTraceOp<F>],
     with_bytes: bool,
     arith_mode: PoseidonArithMode,
+    out_dir: Option<&Path>,
 ) -> Result<
     (
-        SparseDr1csInstance<F>,
+        PoseidonInstance<F>,
         Vec<F>,
         PoseidonSpongeReplayResult<F>,
         Vec<ByteSqueezeWitness>,
         PoseidonDr1csWiring,
         PoseidonByteWiring,
+    ),
+    ReplayErr,
+> {
+    let t = cfg.rate + cfg.capacity;
+    let init_state = vec![F::ZERO; t];
+    let init_mode = ark_crypto_primitives::sponge::DuplexSpongeMode::Absorbing {
+        next_absorb_index: 0,
+    };
+    let (inst, asg, replay, bytes, wiring, bw, _init_state_vars, _final_state_vars, _ckpts) =
+        poseidon_sponge_dr1cs_from_trace_impl_any_internal(
+            cfg,
+            ops,
+            with_bytes,
+            arith_mode,
+            None,
+            out_dir,
+            &init_state,
+            init_mode,
+            true,
+        )?;
+    Ok((inst, asg, replay, bytes, wiring, bw))
+}
+
+fn poseidon_sponge_dr1cs_from_trace_impl_any_internal<F: PrimeField + CanonicalSerialize>(
+    cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+    ops: &[PoseidonTraceOp<F>],
+    with_bytes: bool,
+    arith_mode: PoseidonArithMode,
+    mut prebuilt: Option<Dr1csBuilder<F>>,
+    out_dir: Option<&Path>,
+    init_state: &[F],
+    init_mode: ark_crypto_primitives::sponge::DuplexSpongeMode,
+    constrain_init: bool,
+) -> Result<
+    (
+        PoseidonInstance<F>,
+        Vec<F>,
+        PoseidonSpongeReplayResult<F>,
+        Vec<ByteSqueezeWitness>,
+        PoseidonDr1csWiring,
+        PoseidonByteWiring,
+        Vec<usize>,
+        Vec<usize>,
+        Option<RangeWriteResult>,
     ),
     ReplayErr,
 > {
@@ -832,20 +2365,33 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
     };
 
     let t = cfg.rate + cfg.capacity;
-    let mut b = Dr1csBuilder::<F>::new();
+    if init_state.len() != t {
+        return Err(ReplayErr::Invalid(format!(
+            "init_state length mismatch: expected {t}, got {}",
+            init_state.len()
+        )));
+    }
+    let mut b = if let Some(b) = prebuilt.take() {
+        b
+    } else if let Some(dir) = out_dir {
+        Dr1csBuilder::<F>::new_file_backed(dir).map_err(ReplayErr::Invalid)?
+    } else {
+        Dr1csBuilder::<F>::new()
+    };
     let one = b.one();
 
-    // Initial state is all zeros.
+    // Initial state: either fixed zeros (single-shard) or carried-in witness state (sharded mode).
     let mut state_vars = Vec::with_capacity(t);
-    for _ in 0..t {
-        let v = b.new_var(F::ZERO);
-        b.enforce_var_eq_const(v, F::ZERO);
+    for i in 0..t {
+        let v = b.new_var(init_state[i]);
+        if constrain_init {
+            b.enforce_var_eq_const(v, init_state[i]);
+        }
         state_vars.push(v);
     }
+    let init_state_vars = state_vars.clone();
 
-    let mut mode = ark_crypto_primitives::sponge::DuplexSpongeMode::Absorbing {
-        next_absorb_index: 0,
-    };
+    let mut mode = init_mode;
 
     let mut byte_witnesses: Vec<ByteSqueezeWitness> = Vec::new();
     let mut wiring = PoseidonDr1csWiring::default();
@@ -1047,6 +2593,7 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
             }
         }
         permute_ptr += 1;
+
         Ok(())
     };
 
@@ -1486,8 +3033,83 @@ fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField>(
         )));
     }
 
-    let (inst, assignment) = b.into_sparse_instance();
-    Ok((inst, assignment, replay, byte_witnesses, wiring, byte_wiring))
+    let (inst_any, assignment, ckpts) = if b.is_file_backed() {
+        #[cfg(unix)]
+        {
+            if matches!(b.file_sink, Some(PoseidonFileSink::Range(_))) {
+                let (asg, ckpts) = b.into_range_result().map_err(ReplayErr::Invalid)?;
+                let inst = SparseDr1csInstance {
+                    nvars: asg.len(),
+                    constraints: Vec::new(),
+                    a_terms: Vec::new(),
+                    b_terms: Vec::new(),
+                    c_terms: Vec::new(),
+                };
+                (PoseidonInstance::InMemory(inst), asg, Some(ckpts))
+            } else if matches!(b.file_sink, Some(PoseidonFileSink::Count)) {
+                // Count-only: no IO, but we still computed full assignment (and counts in b.file_*).
+                let (asg, counts) = b.into_count_result().map_err(ReplayErr::Invalid)?;
+                let inst = SparseDr1csInstance {
+                    nvars: asg.len(),
+                    constraints: Vec::new(),
+                    a_terms: Vec::new(),
+                    b_terms: Vec::new(),
+                    c_terms: Vec::new(),
+                };
+                (PoseidonInstance::InMemory(inst), asg, Some(counts))
+            } else {
+                let (inst, asg) = b.into_file_backed_instance().map_err(ReplayErr::Invalid)?;
+                (PoseidonInstance::FileBacked(inst), asg, None)
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let (inst, asg) = b.into_file_backed_instance().map_err(ReplayErr::Invalid)?;
+            (PoseidonInstance::FileBacked(inst), asg, None)
+        }
+    } else {
+        let (inst, asg) = b.into_sparse_instance();
+        (PoseidonInstance::InMemory(inst), asg, None)
+    };
+    let final_state_vars = state_vars;
+
+    Ok((
+        inst_any,
+        assignment,
+        replay,
+        byte_witnesses,
+        wiring,
+        byte_wiring,
+        init_state_vars,
+        final_state_vars,
+        ckpts,
+    ))
+}
+
+fn poseidon_sponge_dr1cs_from_trace_impl<F: PrimeField + CanonicalSerialize>(
+    cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+    ops: &[PoseidonTraceOp<F>],
+    with_bytes: bool,
+    arith_mode: PoseidonArithMode,
+) -> Result<
+    (
+        SparseDr1csInstance<F>,
+        Vec<F>,
+        PoseidonSpongeReplayResult<F>,
+        Vec<ByteSqueezeWitness>,
+        PoseidonDr1csWiring,
+        PoseidonByteWiring,
+    ),
+    ReplayErr,
+> {
+    let (inst_any, asg, replay, bytes, wiring, bw) =
+        poseidon_sponge_dr1cs_from_trace_impl_any(cfg, ops, with_bytes, arith_mode, None)?;
+    match inst_any {
+        PoseidonInstance::InMemory(inst) => Ok((inst, asg, replay, bytes, wiring, bw)),
+        PoseidonInstance::FileBacked(_) => Err(ReplayErr::Invalid(
+            "expected in-memory instance, got file-backed".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]

@@ -21,7 +21,7 @@ getrandom = ["ark-std/getrandom"]
 dhat-heap = []
 
 # WE/DPP arithmetization helpers (bench/research only).
-we_gate = ["dep:dpp", "dep:symphony"]
+we_gate = ["dep:dpp", "dep:symphony", "parallel"]
 
 [dependencies]
 zstd = "0.13"
@@ -104,6 +104,10 @@ harness = false
 
 [[bench]]
 name = "lin"
+harness = false
+
+[[bench]]
+name = "ring64_mul"
 harness = false
 
 [[bench]]

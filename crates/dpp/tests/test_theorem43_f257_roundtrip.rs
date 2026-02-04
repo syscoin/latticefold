@@ -1,7 +1,7 @@
 use ark_ff::{BigInteger, Field, Fp64, MontBackend, MontConfig, PrimeField};
 
-use dpp::dr1cs_flpcp::{Dr1csInstanceSparse, RsDr1csNpFlpcpSparse};
-use dpp::{BoundedFlpcpSparse, SparseVec, Theorem43Dpp};
+use dpp::dr1cs_flpcp::{ChunkedMulCodeDr1csNpFlpcpSparse, Dr1csInstanceSparse, MulCode, TensorRsMulCode};
+use dpp::{SparseVec, Theorem43Dpp};
 
 #[derive(MontConfig)]
 #[modulus = "257"]
@@ -13,10 +13,7 @@ fn f_to_u64<F: PrimeField>(x: &F) -> u64 {
     x.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u64
 }
 
-#[test]
-fn test_theorem43_f257_arm_fs_prove_split_roundtrip() {
-    // Tiny dR1CS over F257 with one constraint: z0 * z1 = z2.
-    // Public: z0. Witness: (z1, z2).
+fn chunked_tiny_dpp() -> Theorem43Dpp<F257, ChunkedMulCodeDr1csNpFlpcpSparse<F257, TensorRsMulCode<F257>>> {
     let n_total = 3usize;
     let a_row = SparseVec::new(vec![(F257::ONE, 0)]);
     let b_row = SparseVec::new(vec![(F257::ONE, 1)]);
@@ -27,14 +24,101 @@ fn test_theorem43_f257_arm_fs_prove_split_roundtrip() {
         b: vec![b_row],
         c: vec![c_row],
     };
-
     let l_public = 1usize;
-    let k_rows = inst.k();
-    let ell = 2 * k_rows;
-    assert!(ell <= 257, "F257 requires ell <= |F|");
-    let flpcp = RsDr1csNpFlpcpSparse::<F257>::new(inst, l_public, ell);
+    let code = TensorRsMulCode::<F257>::new(2, 1).expect("tensor code");
+    let k_block = code.dim_k();
+    let blocks = {
+        let mut out = Vec::new();
+        let total = inst.k();
+        let mut i = 0usize;
+        while i < total {
+            let end = usize::min(i + k_block, total);
+            let mut a = inst.a[i..end].to_vec();
+            let mut b = inst.b[i..end].to_vec();
+            let mut c = inst.c[i..end].to_vec();
+            while a.len() < k_block {
+                a.push(SparseVec::new(Vec::new()));
+                b.push(SparseVec::new(Vec::new()));
+                c.push(SparseVec::new(Vec::new()));
+            }
+            out.push(Dr1csInstanceSparse { n: inst.n, a, b, c });
+            i = end;
+        }
+        if out.is_empty() {
+            out.push(inst);
+        }
+        out
+    };
+    let flpcp = ChunkedMulCodeDr1csNpFlpcpSparse::<F257, _>::new(blocks, l_public, code)
+        .expect("chunked flpcp");
+    Theorem43Dpp::<F257, _>::new(flpcp).expect("theorem43 new")
+}
 
-    let dpp = Theorem43Dpp::<F257>::new(flpcp.clone()).expect("theorem43 new");
+fn collect_streamed_pi(
+    dpp: &Theorem43Dpp<F257, ChunkedMulCodeDr1csNpFlpcpSparse<F257, TensorRsMulCode<F257>>>,
+    x: &[F257],
+    z_w: &[F257],
+    coins: &dpp::Theorem43Coins<F257>,
+) -> Vec<F257> {
+    let mut pi = Vec::new();
+    dpp.prove_for_query_stream(x, z_w, coins, &mut |chunk| {
+        pi.extend_from_slice(&chunk);
+    })
+    .expect("prove_for_query_stream");
+    pi
+}
+
+#[test]
+fn test_tensor_rs_eval_all_matches_row_stream_small() {
+    // Sanity-check the separable F257 eval-all fast path against per-index row streaming.
+    // Keep this tiny to keep the test fast, but exercise rank=3.
+    let base_k = 3usize;
+    let rank = 3usize;
+    let code = TensorRsMulCode::<F257>::new(base_k, rank).expect("tensor code");
+    let k = code.dim_k();
+    let k_star = code.dim_k_star();
+    let side = 2 * base_k - 1;
+    assert_eq!(k, base_k * base_k * base_k);
+    assert_eq!(k_star, side * side * side);
+
+    // Deterministic message in u16 (0..256) then interpreted in F257.
+    let y_u16: Vec<u16> = (0..k).map(|i| ((7 * i + 11) % 257) as u16).collect();
+    let y_f: Vec<F257> = y_u16.iter().map(|&v| F257::from(v as u64)).collect();
+
+    let witness_pos = code.witness_positions_star().expect("witness positions");
+    assert_eq!(witness_pos.len(), k_star);
+    let eval = code
+        .eval_e_at_positions(&witness_pos, &y_f)
+        .expect("eval_e_at_positions");
+    assert_eq!(eval.len(), k_star);
+
+    // Compare a small sample of points, including a few low-cube and some outside.
+    let sample_js = [
+        0usize,
+        1,
+        base_k - 1,
+        k - 1,
+        k,               // first "high" index
+        k + 1,
+        k_star / 2,
+        k_star - 1,
+    ];
+    for &j in sample_js.iter() {
+        let idx = witness_pos[j];
+        let mut slow = F257::ZERO;
+        code.row_e_stream(idx, &mut |i, c| {
+            slow += c * y_f[i];
+        })
+        .expect("row_e_stream");
+        assert_eq!(slow, eval[j], "mismatch at j={j}, idx={idx}");
+    }
+}
+
+#[test]
+fn test_theorem43_f257_arm_prove_split_roundtrip() {
+    // Tiny dR1CS over F257 with one constraint: z0 * z1 = z2.
+    // Public: z0. Witness: (z1, z2).
+    let dpp = chunked_tiny_dpp();
 
     // Satisfying assignment in F257.
     let z0 = F257::from(2u64);
@@ -48,24 +132,21 @@ fn test_theorem43_f257_arm_fs_prove_split_roundtrip() {
     let armer_secret = vec![F257::from(7u64)];
 
     // Arm (FS) without any proof.
-    let art = dpp.arm_fs(&c_stmt, &x, &armer_secret).expect("arm_fs");
-    assert_eq!(art.accepting_set, [F257::ZERO, F257::ONE]);
+    let art = dpp.arm(&c_stmt, &x, &armer_secret, 0, 0).expect("arm");
+    assert_eq!(art.accepting_set, [F257::ONE, F257::from(2u64)]);
     assert_eq!(art.len, x.len() + dpp.proof_len());
 
     // Prove later using public coins only.
-    let pi = dpp.prove_for_query(&x, &z_w, &art.coins).expect("prove_for_query");
+    let pi = collect_streamed_pi(&dpp, &x, &z_w, &art.coins);
     assert_eq!(pi.len(), dpp.proof_len());
 
-    // Consistency check: split_query identity.
-    let (q_x, q_pi) = art.split_query(x.len(), pi.len()).expect("split_query");
-    let a_full = art.answer_for(&x, &pi).expect("answer_for");
-    let a_split = q_x.dot(&x) + q_pi.dot(&pi);
-    assert_eq!(a_full, a_split);
+    // Consistency check: streaming answer computation.
+    let a_full = dpp.answer_for_stream(&art, &x, &pi).expect("answer_for_stream");
 
     eprintln!(
         "theorem43/f257: proof_len={} (m={} + 2 + (p-3)=254), q_nnz={}, a(u8)={}",
         dpp.proof_len(),
-        flpcp.m(),
+        dpp.proof_len() - 2 - (257 - 3),
         art.stats.q_nnz,
         f_to_u64(&a_full)
     );

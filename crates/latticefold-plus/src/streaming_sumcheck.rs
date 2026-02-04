@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use core::ops::MulAssign;
 use latticefold::transcript::Transcript;
 use latticefold::utils::sumcheck::prover::ProverMsg;
 use latticefold::utils::sumcheck::Proof;
@@ -13,6 +14,18 @@ use stark_rings_linalg::{Matrix, SparseMatrix};
 use crate::setchk::DigitsMatrix;
 use crate::utils::maybe_print_rss;
 use core::mem::MaybeUninit;
+
+/// Multiply a ring element by a base-field scalar without invoking ring×ring multiplication.
+#[inline(always)]
+fn mul_by_base<R: PolyRing>(mut x: R, s: R::BaseRing) -> R
+where
+    R::BaseRing: Copy + MulAssign,
+{
+    for c in x.coeffs_mut() {
+        *c *= s;
+    }
+    x
+}
 
 // A small per-thread direct-mapped cache for streaming-h evaluations `h[idx]` when
 // `h` is represented as `HFromMfDigitsConstCol0`. This targets repeated column indices
@@ -25,7 +38,7 @@ use core::mem::MaybeUninit;
 //
 // IMPORTANT (d-scaling):
 // `vals` stores full ring elements, so its footprint scales linearly with `R::dimension()`.
-// We size it to target ~4 MiB/thread for the *values* across different rings (e.g. Frog d=16 vs d=64)
+// We size it to target ~4 MiB/thread for the *values* across different rings (e.g. Goldilocks d=16 vs d=64)
 // to avoid a 4x memory jump when switching to d=64.
 const CM_HFROM_TARGET_VAL_BYTES: usize = 4 * 1024 * 1024;
 
@@ -911,12 +924,228 @@ where
         }
         Some(sum0)
     }
+
+    /// Like `eval4_at_row`, but instead of returning `[R;4]`, it adds the result scaled by a
+    /// base-ring weight `w` into the provided accumulator `acc`.
+    ///
+    /// This is performance-critical for `LazyFixed`: it avoids materializing/copying `[R;4]`
+    /// and avoids creating temporaries like `v[i] * w` for large rings (e.g. d=64 coeff rings).
+    #[inline]
+    pub(crate) fn eval4_at_row_weighted_into(
+        &self,
+        row: usize,
+        w: R::BaseRing,
+        acc: &mut [R; 4],
+        hfrom_cache: &mut Option<HFromIndexCache<R>>,
+    ) {
+        if w == R::BaseRing::ZERO {
+            return;
+        }
+        if row >= self.matrix0.coeffs.len() {
+            return;
+        }
+
+        match (&self.w0, &self.w1, &self.w2, &self.w3) {
+            (
+                CmMatVecWitness::Base(w0),
+                CmMatVecWitness::MonomialDigitsMonomial { digits, mono_idx, mono_coeff },
+                CmMatVecWitness::Base(w2),
+                CmMatVecWitness::Mle(w3),
+            ) => {
+                let w0s: &[R::BaseRing] = w0.as_ref();
+                let w2s: &[R::BaseRing] = w2.as_ref();
+                let digs: &[u16] = digits.as_ref();
+                let mono_idx: &[u16] = mono_idx.as_ref();
+                let mono_coeff: &[R::BaseRing] = mono_coeff.as_ref();
+
+                // Peel `LazyFixed` layers with empty `fixed` (identity) so we can hit the dense/HFrom fast paths.
+                let mut w3m: &StreamingMleEnum<R> = w3.as_ref();
+                loop {
+                    match w3m {
+                        StreamingMleEnum::LazyFixed { inner, fixed, .. } if fixed.is_empty() => {
+                            w3m = inner.as_ref();
+                        }
+                        _ => break,
+                    }
+                }
+
+                enum W3Fast<'a, Rr: OverField + PolyRing>
+                where
+                    Rr::BaseRing: Ring,
+                {
+                    Dense(&'a [Rr]),
+                    HFrom {
+                        rest_sum: &'a Rr,
+                        groups: &'a [HFromGroup<Rr>],
+                        h_id: usize,
+                    },
+                    Other(&'a StreamingMleEnum<Rr>),
+                }
+                let w3fast = match w3m {
+                    StreamingMleEnum::DenseArc { evals, .. } => W3Fast::Dense(evals.as_ref()),
+                    StreamingMleEnum::DenseOwned { evals, .. } => W3Fast::Dense(evals.as_ref()),
+                    StreamingMleEnum::HFromMfDigitsConstCol0 { groups, rest_sum, .. } => {
+                        W3Fast::HFrom {
+                            rest_sum,
+                            groups: groups.as_ref(),
+                            h_id: Arc::as_ptr(groups) as usize,
+                        }
+                    }
+                    _ => W3Fast::Other(w3m),
+                };
+
+                // Prepare streamed-h cache once per row.
+                let mut hcache: Option<&mut HFromIndexCache<R>> = None;
+                if let W3Fast::HFrom { h_id, .. } = &w3fast {
+                    if hfrom_cache.as_ref().map(|c| c.id) != Some(*h_id) {
+                        *hfrom_cache = Some(HFromIndexCache::<R>::new(*h_id));
+                    }
+                    hcache = Some(hfrom_cache.as_mut().unwrap());
+                }
+
+                // Accumulate into constant-coeff outputs directly.
+                // Split borrows to keep the borrow checker happy.
+                let (a01, a23) = acc.split_at_mut(2);
+                let (a0, a1) = a01.split_at_mut(1);
+                let (a2, a3) = a23.split_at_mut(1);
+                let acc0c0 = &mut a0[0].coeffs_mut()[0];
+                let acc1_coeffs = a1[0].coeffs_mut();
+                let acc2c0 = &mut a2[0].coeffs_mut()[0];
+                let acc3 = &mut a3[0];
+
+                // Collapse 3 bounds checks (w0/w2/digs) into one fast-path where possible.
+                let len0 = w0s.len();
+                let len2 = w2s.len();
+                let len_d = digs.len();
+                let len_fast = len0.min(len2).min(len_d);
+
+                for (coeff0, col_idx) in &self.matrix0.coeffs[row] {
+                    let c0 = *coeff0;
+                    let cj = *col_idx;
+                    let c0w = c0 * w;
+
+                    if cj < len_fast {
+                        unsafe {
+                            *acc0c0 += c0w * *w0s.get_unchecked(cj);
+                            *acc2c0 += c0w * *w2s.get_unchecked(cj);
+                            let d = *digs.get_unchecked(cj) as usize;
+                            acc1_coeffs[*mono_idx.get_unchecked(d) as usize] +=
+                                *mono_coeff.get_unchecked(d) * c0w;
+                        }
+                    } else {
+                        if cj < len0 {
+                            *acc0c0 += c0w * w0s[cj];
+                        }
+                        if cj < len2 {
+                            *acc2c0 += c0w * w2s[cj];
+                        }
+                        if cj < len_d {
+                            let d = digs[cj] as usize;
+                            acc1_coeffs[mono_idx[d] as usize] += mono_coeff[d] * c0w;
+                        }
+                    }
+
+                    // `w3` is an MLE; scale its contribution by `c0*w`.
+                    match &w3fast {
+                        W3Fast::Dense(v) => {
+                            if let Some(hv) = v.get(cj) {
+                                Self::add_scaled(acc3, hv, c0w);
+                            }
+                        }
+                        W3Fast::HFrom { groups, rest_sum, .. } => {
+                            let cache = hcache.as_mut().unwrap();
+                            let hv = cache.get_or_compute(cj, || {
+                                let mut hv = (*rest_sum).clone();
+                                for g in groups.iter() {
+                                    hv += &g.table[g.packed_at(cj)];
+                                }
+                                hv
+                            });
+                            Self::add_scaled(acc3, &hv, c0w);
+                        }
+                        W3Fast::Other(m) => {
+                            let hv = m.eval_at_index(cj);
+                            Self::add_scaled(acc3, &hv, c0w);
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Fallback: materialize then scale.
+                let v = self.eval4_at_row(row, hfrom_cache);
+                acc[0] += v[0] * w;
+                acc[1] += v[1] * w;
+                acc[2] += v[2] * w;
+                acc[3] += v[3] * w;
+            }
+        }
+    }
 }
 
 impl<R: OverField + PolyRing> StreamingMleEnum<R>
 where
     R::BaseRing: Ring,
 {
+    /// If `x` is a constant-coefficient ring element, return that base scalar.
+    #[inline(always)]
+    fn try_const_coeff0(x: &R) -> Option<R::BaseRing> {
+        let cs = x.coeffs();
+        // Common in LF+: many values are lifted from the base ring.
+        for &ci in cs.iter().skip(1) {
+            if ci != R::BaseRing::ZERO {
+                return None;
+            }
+        }
+        Some(cs[0])
+    }
+
+    /// If `x` is monomial-like (<=1 nonzero coeff), return (shift, coeff).
+    #[inline(always)]
+    fn try_monomial(x: &R) -> Option<(usize, R::BaseRing)> {
+        let cs = x.coeffs();
+        let mut found: Option<(usize, R::BaseRing)> = None;
+        for (i, &ci) in cs.iter().enumerate() {
+            if ci != R::BaseRing::ZERO {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some((i, ci));
+            }
+        }
+        found
+    }
+
+    /// Compute `a(X) * (scale * X^shift) mod (X^d+1)` in O(d) coefficient time.
+    ///
+    /// This avoids ring×ring multiplication (NTT) for coefficient-form rings.
+    #[inline(always)]
+    fn mul_negacyclic_by_monomial_scaled(a: &R, shift: usize, scale: R::BaseRing) -> R {
+        if scale == R::BaseRing::ZERO {
+            return R::ZERO;
+        }
+        let ac = a.coeffs();
+        let d = ac.len();
+        if shift == 0 && scale == R::BaseRing::ONE {
+            return *a;
+        }
+        let mut out = R::ZERO;
+        let outc = out.coeffs_mut();
+        for i in 0..d {
+            let v = ac[i] * scale;
+            if v == R::BaseRing::ZERO {
+                continue;
+            }
+            let j = i + shift;
+            if j < d {
+                outc[j] += v;
+            } else {
+                // X^d = -1
+                outc[j - d] -= v;
+            }
+        }
+        out
+    }
+
     #[inline]
     pub fn num_vars(&self) -> usize {
         match self {
@@ -1216,7 +1445,7 @@ where
                 }
                 let mut sum = R::ZERO;
                 for (coeff0, col_idx) in &matrix0.coeffs[index] {
-                    sum += witness_mle.eval_at_index(*col_idx) * R::from(*coeff0);
+                    sum += mul_by_base(witness_mle.eval_at_index(*col_idx), *coeff0);
                 }
                 sum
             }
@@ -1249,6 +1478,20 @@ where
                 let q = q / n3;
                 let i2 = q % n2;
                 let i1 = q / n2;
+                // Fast path for LF+ CM:
+                // - `t1` (tensor(c_z)) and `t3` (d_powers) are constant-coeff lifts.
+                // - `t4` (x_powers) is monomial.
+                //
+                // Instead of doing 3 ring×ring multiplies (each would still touch 64 coeffs even with
+                // scalar/monomial fast paths), fuse into a single negacyclic shift+scale loop over `t2`.
+                if let (Some(c1), Some(c3), Some((shift, cm))) = (
+                    Self::try_const_coeff0(&t1[i1]),
+                    Self::try_const_coeff0(&t3[i3]),
+                    Self::try_monomial(&t4[i4]),
+                ) {
+                    let scale = (c1 * c3) * cm;
+                    return Self::mul_negacyclic_by_monomial_scaled(&t2[i2], shift, scale);
+                }
                 t1[i1] * t2[i2] * t3[i3] * t4[i4]
             }
             StreamingMleEnum::LazyFixed {
@@ -1289,6 +1532,8 @@ where
         assert!(nv > 0);
         let half_dom = 1usize << (nv - 1);
         let one_minus0 = R::BaseRing::ONE - r0;
+        // Some arms still delegate to `fix_variable` which takes an `R`.
+        // Keep this embedding, but make sure scalar multiplication is handled efficiently.
         let r_ring = R::from(r0);
         match self {
             StreamingMleEnum::DenseOwned { evals, num_vars } => {
@@ -1296,12 +1541,14 @@ where
                 // After fixing one variable, the stored support shrinks to `ceil(len/2)`.
                 let cur_len = evals.len();
                 let new_len = ((cur_len + 1) >> 1).min(half_dom);
-                let one_minus = R::ONE - r_ring;
                 for i in 0..new_len {
                     // Allow implicit zero-padding (table shorter than 2^num_vars).
                     let a = evals.get(i << 1).copied().unwrap_or(R::ZERO);
                     let b = evals.get((i << 1) | 1).copied().unwrap_or(R::ZERO);
-                    evals[i] = one_minus * a + r_ring * b;
+                    // Multiply by a *constant* base-ring scalar. Do NOT use ring×ring multiplication
+                    // (`R::from(r0) * b`) since for coefficient-form rings (e.g. GoldilocksRing64)
+                    // that triggers an expensive NTT convolution.
+                    evals[i] = mul_by_base(a, one_minus0) + mul_by_base(b, r0);
                 }
                 evals.truncate(new_len);
                 *num_vars -= 1;
@@ -1315,11 +1562,10 @@ where
                     Ok(mut owned) => {
                         let cur_len = owned.len();
                         let new_len = ((cur_len + 1) >> 1).min(half_dom);
-                        let one_minus = R::ONE - r_ring;
                         for i in 0..new_len {
                             let a = owned.get(i << 1).copied().unwrap_or(R::ZERO);
                             let b = owned.get((i << 1) | 1).copied().unwrap_or(R::ZERO);
-                            owned[i] = one_minus * a + r_ring * b;
+                            owned[i] = mul_by_base(a, one_minus0) + mul_by_base(b, r0);
                         }
                         owned.truncate(new_len);
                         *self = StreamingMleEnum::DenseOwned {
@@ -1332,13 +1578,12 @@ where
                         let src: &[R] = a.as_ref();
                         let cur_len = src.len();
                         let new_len = ((cur_len + 1) >> 1).min(half_dom);
-                        let one_minus = R::ONE - r_ring;
                         #[cfg(feature = "parallel")]
                         {
                             let out = alloc_init_par(new_len, |i| {
                                 let aa = src.get(i << 1).copied().unwrap_or(R::ZERO);
                                 let bb = src.get((i << 1) | 1).copied().unwrap_or(R::ZERO);
-                                one_minus * aa + r_ring * bb
+                                mul_by_base(aa, one_minus0) + mul_by_base(bb, r0)
                             });
                             *self = StreamingMleEnum::DenseOwned {
                                 evals: out,
@@ -1352,7 +1597,7 @@ where
                             for i in 0..new_len {
                                 let aa = src.get(i << 1).copied().unwrap_or(R::ZERO);
                                 let bb = src.get((i << 1) | 1).copied().unwrap_or(R::ZERO);
-                                out[i] = one_minus * aa + r_ring * bb;
+                                out[i] = mul_by_base(aa, one_minus0) + mul_by_base(bb, r0);
                             }
                             *self = StreamingMleEnum::DenseOwned {
                                 evals: out,
@@ -1681,11 +1926,10 @@ where
                     let new_len = ((*tensor_len) + 1) >> 1;
                     let new_len = new_len.min(half_dom);
                     let mut out = vec![R::ZERO; new_len];
-                    let one_minus = R::ONE - r_ring;
                     for i in 0..new_len {
                         let a = self.eval_at_index(i << 1);
                         let b = self.eval_at_index((i << 1) | 1);
-                        out[i] = one_minus * a + r_ring * b;
+                        out[i] = mul_by_base(a, one_minus0) + mul_by_base(b, r0);
                     }
                     *self = StreamingMleEnum::DenseOwned {
                         evals: out,
@@ -1733,6 +1977,69 @@ where
                 let k = fixed.len();
                 let wtab = weights.clone(); // small (<= 2^max_lazy)
                 let inner_ref = inner.as_ref();
+
+                // CM fast path: if the inner is a fused mat-vec part, materialize using the
+                // optimized weighted 4-part evaluator (avoids the slow `eval_part_at_row` path).
+                if let StreamingMleEnum::CmMatVec4Part { shared, which, .. } = inner_ref {
+                    let shared = shared.clone();
+                    let which: usize = *which as usize;
+                    debug_assert!(which < 4);
+
+                    #[cfg(feature = "parallel")]
+                    let dense = {
+                        use rayon::prelude::*;
+                        (0..len)
+                            .into_par_iter()
+                            .map_init(|| None::<HFromIndexCache<R>>, |hfrom_cache, i| {
+                                let base = i << k;
+                                let mut acc4 = [R::ZERO; 4];
+                                for (b, &w) in wtab.iter().enumerate() {
+                                    if w == R::BaseRing::ZERO {
+                                        continue;
+                                    }
+                                    shared.eval4_at_row_weighted_into(
+                                        base | b,
+                                        w,
+                                        &mut acc4,
+                                        hfrom_cache,
+                                    );
+                                }
+                                acc4[which]
+                            })
+                            .collect::<Vec<R>>()
+                    };
+                    #[cfg(not(feature = "parallel"))]
+                    let dense = {
+                        let mut out = vec![R::ZERO; len];
+                        let mut hfrom_cache: Option<HFromIndexCache<R>> = None;
+                        for i in 0..len {
+                            let base = i << k;
+                            let mut acc4 = [R::ZERO; 4];
+                            for (b, &w) in wtab.iter().enumerate() {
+                                if w == R::BaseRing::ZERO {
+                                    continue;
+                                }
+                                shared.eval4_at_row_weighted_into(
+                                    base | b,
+                                    w,
+                                    &mut acc4,
+                                    &mut hfrom_cache,
+                                );
+                            }
+                            out[i] = acc4[which];
+                        }
+                        out
+                    };
+
+                    // Replace self with a dense table for the already-fixed function.
+                    *self = StreamingMleEnum::DenseOwned {
+                        evals: dense,
+                        num_vars: cur_nv,
+                    };
+                    // Now apply this fix to the dense table in-place.
+                    self.fix_variable_in_place_base(r0);
+                    return;
+                }
 
                 #[cfg(feature = "parallel")]
                 let dense = alloc_init_par(len, |i| {
@@ -1810,24 +2117,63 @@ where
         let nv = self.num_vars();
         assert!(nv > 0);
         let half = 1usize << (nv - 1);
+        // Fast path: if `r` is a constant-coefficient ring element (the common case when
+        // challenges live in the base ring and are embedded as constants), then fixing a
+        // variable only needs coefficient-wise scaling by the base scalar.
+        //
+        // This avoids invoking ring×ring multiplication for coefficient-form rings like
+        // `GoldilocksRing64`, where `Mul` is an NTT convolution.
+        let r0_opt: Option<R::BaseRing> = {
+            let cs = r.coeffs();
+            if cs.iter()
+                .skip(1)
+                .all(|c| *c == <R::BaseRing as ark_ff::Field>::ZERO)
+            {
+                Some(cs[0])
+            } else {
+                None
+            }
+        };
         match self {
             StreamingMleEnum::DenseOwned { evals, .. } => {
-                let new_evals: Vec<R> = (0..half)
-                    .map(|i| (R::ONE - r) * evals[i << 1] + r * evals[(i << 1) | 1])
-                    .collect();
+                let new_evals: Vec<R> = if let Some(r0) = r0_opt {
+                    let one_minus0 = R::BaseRing::ONE - r0;
+                    (0..half)
+                        .map(|i| {
+                            let a = evals[i << 1];
+                            let b = evals[(i << 1) | 1];
+                            mul_by_base(a, one_minus0) + mul_by_base(b, r0)
+                        })
+                        .collect()
+                } else {
+                    (0..half)
+                        .map(|i| (R::ONE - r) * evals[i << 1] + r * evals[(i << 1) | 1])
+                        .collect()
+                };
                 StreamingMleEnum::DenseOwned {
                     evals: new_evals,
                     num_vars: nv - 1,
                 }
             }
             StreamingMleEnum::DenseArc { evals, .. } => {
-                let new_evals: Vec<R> = (0..half)
-                    .map(|i| {
-                        let a = evals.get(i << 1).copied().unwrap_or(R::ZERO);
-                        let b = evals.get((i << 1) | 1).copied().unwrap_or(R::ZERO);
-                        (R::ONE - r) * a + r * b
-                    })
-                    .collect();
+                let new_evals: Vec<R> = if let Some(r0) = r0_opt {
+                    let one_minus0 = R::BaseRing::ONE - r0;
+                    (0..half)
+                        .map(|i| {
+                            let a = evals.get(i << 1).copied().unwrap_or(R::ZERO);
+                            let b = evals.get((i << 1) | 1).copied().unwrap_or(R::ZERO);
+                            mul_by_base(a, one_minus0) + mul_by_base(b, r0)
+                        })
+                        .collect()
+                } else {
+                    (0..half)
+                        .map(|i| {
+                            let a = evals.get(i << 1).copied().unwrap_or(R::ZERO);
+                            let b = evals.get((i << 1) | 1).copied().unwrap_or(R::ZERO);
+                            (R::ONE - r) * a + r * b
+                        })
+                        .collect()
+                };
                 StreamingMleEnum::DenseOwned {
                     evals: new_evals,
                     num_vars: nv - 1,
@@ -1878,8 +2224,39 @@ where
                 #[cfg(feature = "parallel")]
                 let new_evals: Vec<R> = {
                     use rayon::prelude::*;
+                    if let Some(r0) = r0_opt {
+                        let one_minus0 = R::BaseRing::ONE - r0;
+                        (0..half)
+                            .into_par_iter()
+                            .map(|i| {
+                                let v0 = self.eval_at_index(i << 1);
+                                let v1 = self.eval_at_index((i << 1) | 1);
+                                mul_by_base(v0, one_minus0) + mul_by_base(v1, r0)
+                            })
+                            .collect()
+                    } else {
+                        (0..half)
+                            .into_par_iter()
+                            .map(|i| {
+                                let v0 = self.eval_at_index(i << 1);
+                                let v1 = self.eval_at_index((i << 1) | 1);
+                                (R::ONE - r) * v0 + r * v1
+                            })
+                            .collect()
+                    }
+                };
+                #[cfg(not(feature = "parallel"))]
+                let new_evals: Vec<R> = if let Some(r0) = r0_opt {
+                    let one_minus0 = R::BaseRing::ONE - r0;
                     (0..half)
-                        .into_par_iter()
+                        .map(|i| {
+                            let v0 = self.eval_at_index(i << 1);
+                            let v1 = self.eval_at_index((i << 1) | 1);
+                            mul_by_base(v0, one_minus0) + mul_by_base(v1, r0)
+                        })
+                        .collect()
+                } else {
+                    (0..half)
                         .map(|i| {
                             let v0 = self.eval_at_index(i << 1);
                             let v1 = self.eval_at_index((i << 1) | 1);
@@ -1887,14 +2264,6 @@ where
                         })
                         .collect()
                 };
-                #[cfg(not(feature = "parallel"))]
-                let new_evals: Vec<R> = (0..half)
-                    .map(|i| {
-                        let v0 = self.eval_at_index(i << 1);
-                        let v1 = self.eval_at_index((i << 1) | 1);
-                        (R::ONE - r) * v0 + r * v1
-                    })
-                    .collect();
                 StreamingMleEnum::DenseOwned {
                     evals: new_evals,
                     num_vars: nv - 1,
@@ -2370,10 +2739,13 @@ impl StreamingSumcheck {
             vals: Vec<Rr>,
             levals: Vec<Rr>,
             hfrom_cache: Option<HFromIndexCache<Rr>>,
+            // Cache monomial-like precomp for `MonomialDigitsArc` exp tables to speed up LazyFixed:
+            // (exp_table_id, mono_idx, mono_coeff). Only valid when `mono_ok=true` for that table.
+            mono_tab_cache: Option<(usize, Box<[u16]>, Box<[Rr::BaseRing]>)>,
             // CM optimization: cache one fused mat-vec row scan for the "even" and "odd" indices
             // within the current hypercube vertex pair.
             // NOTE: store cached `[R;4]` on the heap to avoid huge per-thread stack frames when
-            // `R` is large (e.g. `FrogRing64`). Rayon's worker stack is limited and can overflow.
+            // `R` is large (e.g. `GoldilocksRing64`). Rayon's worker stack is limited and can overflow.
             cm_cache_even: Option<(usize, usize, Box<[Rr; 4]>)>, // (shared_id, row, vals)
             cm_cache_odd: Option<(usize, usize, Box<[Rr; 4]>)>,
             // CM optimization (LazyFixed): cache the *lazy-combined* value for a fused mat-vec
@@ -2393,6 +2765,7 @@ impl StreamingSumcheck {
             vals: vec![R::ZERO; num_polys],
             levals: vec![R::ZERO; degree + 1],
             hfrom_cache: None,
+            mono_tab_cache: None,
             cm_cache_even: None,
             cm_cache_odd: None,
             cm_lazy_cache_even: None,
@@ -2406,6 +2779,7 @@ impl StreamingSumcheck {
             cache: &mut Option<(usize, usize, Box<[R; 4]>)>,
             lazy_cache: &mut Option<(usize, usize, usize, Box<[R; 4]>)>,
             hfrom_cache: &mut Option<HFromIndexCache<R>>,
+            mono_tab_cache: &mut Option<(usize, Box<[u16]>, Box<[R::BaseRing]>)>,
         ) -> R
         where
             R::BaseRing: Ring,
@@ -2421,7 +2795,90 @@ impl StreamingSumcheck {
                         cache,
                         lazy_cache,
                         hfrom_cache,
+                        mono_tab_cache,
                     );
+                }
+                // Fast path: LazyFixed over monomial-digit MLE.
+                // Avoid materializing `inner.eval_at_index(..)` (a full ring element) and then scaling it.
+                if let StreamingMleEnum::MonomialDigitsArc { digits, exp_table, .. } = inner.as_ref()
+                {
+                    let k = fixed.len();
+                    let base = index << k;
+                    let tab_id = Arc::as_ptr(exp_table) as usize;
+
+                    // Build monomial-like precomp once per table (per thread).
+                    let (mono_idx, mono_coeff) = match mono_tab_cache.as_ref() {
+                        Some((cid, idx, coeff)) if *cid == tab_id => (&idx[..], &coeff[..]),
+                        _ => {
+                            // Attempt to build monomial-like precomp (<=1 nonzero coeff per table entry).
+                            let mut idx = Vec::<u16>::with_capacity(exp_table.len());
+                            let mut coeff = Vec::<R::BaseRing>::with_capacity(exp_table.len());
+                            let mut ok = true;
+                            for r in exp_table.iter() {
+                                let mut found: Option<(usize, R::BaseRing)> = None;
+                                for (j, &cj) in r.coeffs().iter().enumerate() {
+                                    if cj != R::BaseRing::ZERO {
+                                        if found.is_some() {
+                                            ok = false;
+                                            break;
+                                        }
+                                        found = Some((j, cj));
+                                    }
+                                }
+                                if !ok {
+                                    break;
+                                }
+                                match found {
+                                    None => {
+                                        idx.push(0u16);
+                                        coeff.push(R::BaseRing::ZERO);
+                                    }
+                                    Some((j, c)) => {
+                                        idx.push(j as u16);
+                                        coeff.push(c);
+                                    }
+                                }
+                            }
+                            if ok {
+                                *mono_tab_cache = Some((tab_id, idx.into_boxed_slice(), coeff.into_boxed_slice()));
+                                let (cid, idxb, coeffb) = mono_tab_cache.as_ref().unwrap();
+                                debug_assert_eq!(*cid, tab_id);
+                                (&idxb[..], &coeffb[..])
+                            } else {
+                                // Not monomial-like; fall back to generic LazyFixed.
+                                let mut acc = R::ZERO;
+                                for (b, &w) in weights.iter().enumerate() {
+                                    if w == R::BaseRing::ZERO {
+                                        continue;
+                                    }
+                                    acc += inner.eval_at_index(base | b) * w;
+                                }
+                                return acc;
+                            }
+                        }
+                    };
+
+                    let digs: &[u16] = digits.as_ref();
+                    let mut out = R::ZERO;
+                    let out_coeffs = out.coeffs_mut();
+                    for (b, &w) in weights.iter().enumerate() {
+                        if w == R::BaseRing::ZERO {
+                            continue;
+                        }
+                        let cj = base | b;
+                        if cj >= digs.len() {
+                            continue;
+                        }
+                        let d = digs[cj] as usize;
+                        let c = mono_coeff[d];
+                        if c == R::BaseRing::ZERO {
+                            continue;
+                        }
+                        let j = mono_idx[d] as usize;
+                        // exp_table[d] is `c * X^j`; scale by `w` and add.
+                        out_coeffs[j] += c * w;
+                    }
+                    return out;
                 }
                 if let StreamingMleEnum::CmMatVec4Part { shared, which, .. } = inner.as_ref() {
                     let k = fixed.len();
@@ -2442,11 +2899,7 @@ impl StreamingSumcheck {
                         if w == R::BaseRing::ZERO {
                             continue;
                         }
-                        let v = shared.eval4_at_row(base | b, hfrom_cache);
-                        acc[0] += v[0] * w;
-                        acc[1] += v[1] * w;
-                        acc[2] += v[2] * w;
-                        acc[3] += v[3] * w;
+                        shared.eval4_at_row_weighted_into(base | b, w, &mut acc, hfrom_cache);
                     }
                     match lazy_cache.as_mut() {
                         Some((csid, cbase, ck, vals)) => {
@@ -2500,6 +2953,7 @@ impl StreamingSumcheck {
                         &mut s.cm_cache_even,
                         &mut s.cm_lazy_cache_even,
                         &mut s.hfrom_cache,
+                        &mut s.mono_tab_cache,
                     );
                     s.vals1[i] = eval_mle_with_cm_cache(
                         mle,
@@ -2507,6 +2961,7 @@ impl StreamingSumcheck {
                         &mut s.cm_cache_odd,
                         &mut s.cm_lazy_cache_odd,
                         &mut s.hfrom_cache,
+                        &mut s.mono_tab_cache,
                     );
                 }
                 s.levals[0] = comb_fn(&s.vals0);
@@ -2640,7 +3095,7 @@ impl StreamingSumcheck {
             vals0: Vec<Rr>,
             vals1: Vec<Rr>,
             hfrom_cache: Option<HFromIndexCache<Rr>>,
-            // Heap-cached `[R;4]` to avoid large stack frames for big rings (e.g. `FrogRing64`).
+            // Heap-cached `[R;4]` to avoid large stack frames for big rings (e.g. `GoldilocksRing64`).
             cm_cache_even: Option<(usize, usize, Box<[Rr; 4]>)>,
             cm_cache_odd: Option<(usize, usize, Box<[Rr; 4]>)>,
             cm_lazy_cache_even: Option<(usize, usize, usize, Box<[Rr; 4]>)>,
@@ -3204,7 +3659,7 @@ impl StreamingSumcheck {
 mod tests {
     use super::*;
     use rand::RngCore;
-    use cyclotomic_rings::rings::FrogRing64 as R;
+    use cyclotomic_rings::rings::GoldilocksRing64 as R;
     use stark_rings::PolyRing;
     use stark_rings_linalg::SparseMatrix;
     use std::sync::Arc;

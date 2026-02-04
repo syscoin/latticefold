@@ -42,6 +42,88 @@ fn is_const_coeff_sparse_matrix<R: PolyRing>(m: &SparseMatrix<R>) -> bool {
     true
 }
 
+#[inline(always)]
+fn scale_by_base_ref<R: OverField + PolyRing + Clone>(x: &R, s: R::BaseRing) -> R
+where
+    R::BaseRing: Copy + core::ops::MulAssign,
+{
+    let mut out = x.clone();
+    for c in out.coeffs_mut() {
+        *c *= s;
+    }
+    out
+}
+
+/// Fused `acc += v * s` where `s` is a base scalar (constant coefficient).
+///
+/// Avoids allocating a temporary ring element for `v * s` and avoids an extra pass for `+=`.
+#[inline(always)]
+fn add_scaled_by_base<R: OverField + PolyRing>(acc: &mut R, v: &R, s: R::BaseRing)
+where
+    R::BaseRing: Ring + Copy,
+{
+    if s == R::BaseRing::ZERO {
+        return;
+    }
+    let ac = acc.coeffs_mut();
+    let vc = v.coeffs();
+    debug_assert_eq!(ac.len(), vc.len());
+    for i in 0..ac.len() {
+        ac[i] += vc[i] * s;
+    }
+}
+
+/// Fused `acc0 += v0 * s; acc1 += v1 * s` with a single coefficient pass.
+#[inline(always)]
+fn add_scaled_by_base_pair<R: OverField + PolyRing>(
+    acc0: &mut R,
+    v0: &R,
+    acc1: &mut R,
+    v1: &R,
+    s: R::BaseRing,
+) where
+    R::BaseRing: Ring + Copy,
+{
+    if s == R::BaseRing::ZERO {
+        return;
+    }
+    let a0 = acc0.coeffs_mut();
+    let a1 = acc1.coeffs_mut();
+    let c0 = v0.coeffs();
+    let c1 = v1.coeffs();
+    debug_assert_eq!(a0.len(), c0.len());
+    debug_assert_eq!(a1.len(), c1.len());
+    debug_assert_eq!(a0.len(), a1.len());
+    for i in 0..a0.len() {
+        a0[i] += c0[i] * s;
+        a1[i] += c1[i] * s;
+    }
+}
+
+/// Fused `acc += v0*s0 + v1*s1` with a single coefficient pass.
+#[inline(always)]
+fn add_scaled2_by_base<R: OverField + PolyRing>(
+    acc: &mut R,
+    v0: &R,
+    s0: R::BaseRing,
+    v1: &R,
+    s1: R::BaseRing,
+) where
+    R::BaseRing: Ring + Copy,
+{
+    if s0 == R::BaseRing::ZERO && s1 == R::BaseRing::ZERO {
+        return;
+    }
+    let a = acc.coeffs_mut();
+    let c0 = v0.coeffs();
+    let c1 = v1.coeffs();
+    debug_assert_eq!(a.len(), c0.len());
+    debug_assert_eq!(a.len(), c1.len());
+    for i in 0..a.len() {
+        a[i] += c0[i] * s0 + c1[i] * s1;
+    }
+}
+
 fn try_as_base_scalars<R: PolyRing>(v: &[R]) -> Option<Vec<R::BaseRing>> {
     let mut out = Vec::with_capacity(v.len());
     for x in v {
@@ -63,14 +145,17 @@ pub struct Cm<R: PolyRing> {
 pub struct InstanceEvals<R>(Vec<[R; 4]>);
 
 impl<R> InstanceEvals<R> {
-    pub fn new(rows: Vec<[R; 4]>) -> Self {
+    #[inline]
+    pub(crate) fn new(rows: Vec<[R; 4]>) -> Self {
         Self(rows)
     }
 
+    #[inline]
     pub(crate) fn rows(&self) -> &[[R; 4]] {
         &self.0
     }
 }
+
 
 #[derive(Clone, Debug)]
 pub struct CmProof<R: PolyRing> {
@@ -340,14 +425,24 @@ where
                         .map(|j| {
                             let r_tau = inst.tau[j];
                             let r_mtau = inst.m_tau.get(j);
-                            let r_f = match &inst.f {
-                                WitnessVec::Ring(vr) => vr[j],
+                            let (r_f, r_f0_opt) = match &inst.f {
+                                WitnessVec::Ring(vr) => (vr[j], None),
                                 WitnessVec::ConstCoeffBase { values: v0, .. } => {
-                                    R::from(v0.get(j).copied().unwrap_or(R::BaseRing::ZERO))
+                                    let f0 = v0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
+                                    (R::from(f0), Some(f0))
                                 }
                             };
                             let r_h = h[i][j];
-                            (s[0] * R::from(r_tau)) + (s[1] * r_mtau) + (s[2] * r_f) + r_h
+                            // `r_tau` is a base scalar lifted into the ring (constant-coeff).
+                            // Avoid ring×ring multiplication for coefficient-form rings like `GoldilocksRing64`.
+                            let mut acc = scale_by_base_ref(&s[0], r_tau);
+                            acc += s[1] * r_mtau;
+                            if let Some(f0) = r_f0_opt {
+                                acc += scale_by_base_ref(&s[2], f0);
+                            } else {
+                                acc += s[2] * r_f;
+                            }
+                            acc + r_h
                     })
                     .collect::<Vec<R>>()
                 }
@@ -357,14 +452,22 @@ where
                         .map(|j| {
                             let r_tau = inst.tau[j];
                             let r_mtau = inst.m_tau.get(j);
-                            let r_f = match &inst.f {
-                                WitnessVec::Ring(vr) => vr[j],
+                            let (r_f, r_f0_opt) = match &inst.f {
+                                WitnessVec::Ring(vr) => (vr[j], None),
                                 WitnessVec::ConstCoeffBase { values: v0, .. } => {
-                                    R::from(v0.get(j).copied().unwrap_or(R::BaseRing::ZERO))
+                                    let f0 = v0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
+                                    (R::from(f0), Some(f0))
                                 }
                             };
                             let r_h = h[i][j];
-                            (s[0] * R::from(r_tau)) + (s[1] * r_mtau) + (s[2] * r_f) + r_h
+                            let mut acc = scale_by_base_ref(&s[0], r_tau);
+                            acc += s[1] * r_mtau;
+                            if let Some(f0) = r_f0_opt {
+                                acc += scale_by_base_ref(&s[2], f0);
+                            } else {
+                                acc += s[2] * r_f;
+                            }
+                            acc + r_h
                         })
                         .collect::<Vec<R>>()
                 }
@@ -886,14 +989,18 @@ where
                             .map(|j| {
                                 let r_tau = inst.tau[j];
                                 let r_mtau = inst.m_tau.get(j);
-                                let r_f = match &inst.f {
-                                    WitnessVec::Ring(vr) => vr[j],
-                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
-                                        R::from(v0.get(j).copied().unwrap_or(R::BaseRing::ZERO))
-                                    }
-                                };
                                 let r_h = h_mle.eval_at_index(j);
-                                (s[0] * R::from(r_tau)) + (s[1] * r_mtau) + (s[2] * r_f) + r_h
+                                // `s[0..2]` are short challenges; `r_tau` (and often `r_f`) are base scalars.
+                                // Avoid ring×ring multiplication for coefficient-form rings like `GoldilocksRing64`.
+                                let mut acc = scale_by_base_ref(&s[0], r_tau) + (s[1] * r_mtau) + r_h;
+                                match &inst.f {
+                                    WitnessVec::Ring(vr) => acc += s[2] * vr[j],
+                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
+                                        let f0 = v0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
+                                        acc += scale_by_base_ref(&s[2], f0);
+                                    }
+                                }
+                                acc
                             })
                             .collect::<Vec<R>>()
                     }
@@ -903,14 +1010,16 @@ where
                             .map(|j| {
                                 let r_tau = inst.tau[j];
                                 let r_mtau = inst.m_tau.get(j);
-                                let r_f = match &inst.f {
-                                    WitnessVec::Ring(vr) => vr[j],
-                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
-                                        R::from(v0.get(j).copied().unwrap_or(R::BaseRing::ZERO))
-                                    }
-                                };
                                 let r_h = h_mle.eval_at_index(j);
-                                (s[0] * R::from(r_tau)) + (s[1] * r_mtau) + (s[2] * r_f) + r_h
+                                let mut acc = scale_by_base_ref(&s[0], r_tau) + (s[1] * r_mtau) + r_h;
+                                match &inst.f {
+                                    WitnessVec::Ring(vr) => acc += s[2] * vr[j],
+                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
+                                        let f0 = v0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
+                                        acc += scale_by_base_ref(&s[2], f0);
+                                    }
+                                }
+                                acc
                             })
                             .collect::<Vec<R>>()
                     }
@@ -953,14 +1062,16 @@ where
                             .map(|j| {
                                 let r_tau = inst.tau[j];
                                 let r_mtau = inst.m_tau.get(j);
-                                let r_f = match &inst.f {
-                                    WitnessVec::Ring(vr) => vr[j],
-                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
-                                        R::from(v0.get(j).copied().unwrap_or(R::BaseRing::ZERO))
-                                    }
-                                };
                                 let r_h = h[i][j];
-                                (s[0] * R::from(r_tau)) + (s[1] * r_mtau) + (s[2] * r_f) + r_h
+                                let mut acc = scale_by_base_ref(&s[0], r_tau) + (s[1] * r_mtau) + r_h;
+                                match &inst.f {
+                                    WitnessVec::Ring(vr) => acc += s[2] * vr[j],
+                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
+                                        let f0 = v0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
+                                        acc += scale_by_base_ref(&s[2], f0);
+                                    }
+                                }
+                                acc
                             })
                             .collect::<Vec<R>>()
                     }
@@ -970,14 +1081,16 @@ where
                             .map(|j| {
                                 let r_tau = inst.tau[j];
                                 let r_mtau = inst.m_tau.get(j);
-                                let r_f = match &inst.f {
-                                    WitnessVec::Ring(vr) => vr[j],
-                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
-                                        R::from(v0.get(j).copied().unwrap_or(R::BaseRing::ZERO))
-                                    }
-                                };
                                 let r_h = h[i][j];
-                                (s[0] * R::from(r_tau)) + (s[1] * r_mtau) + (s[2] * r_f) + r_h
+                                let mut acc = scale_by_base_ref(&s[0], r_tau) + (s[1] * r_mtau) + r_h;
+                                match &inst.f {
+                                    WitnessVec::Ring(vr) => acc += s[2] * vr[j],
+                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
+                                        let f0 = v0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
+                                        acc += scale_by_base_ref(&s[2], f0);
+                                    }
+                                }
+                                acc
                             })
                             .collect::<Vec<R>>()
                     }
@@ -1051,6 +1164,8 @@ where
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(4);
+        let stride_mask: usize = 4 + 4 * m_arcs.len();
+        let mut base_masks: Vec<u64> = Vec::with_capacity(L);
         for (i, inst) in self.rg.instances.iter().enumerate() {
             // Build the base-scalar tables once and share them across:
             // - the direct MLEs for (tau, m_tau, f, h), and
@@ -1087,6 +1202,35 @@ where
             let mtau_cc = mats_const && mtau0_arc.is_some();
             let f_cc = mats_const && f0_arc.is_some();
             let h_cc = mats_const && h0_arc.is_some();
+
+            // Record which offsets in this instance's stride are constant-coeff.
+            // This must match the actual MLE variants chosen below (BaseScalarArc / SparseMatVecConstCoeff).
+            let mut mask: u64 = 0;
+            if stride_mask <= 64 {
+                for off in 0..stride_mask {
+                    let is_base = if off < 4 {
+                        match off {
+                            0 => true, // tau is base scalar by construction
+                            1 => mtau_cc,
+                            2 => f_cc,
+                            3 => h_cc,
+                            _ => unreachable!(),
+                        }
+                    } else {
+                        match (off - 4) & 3 {
+                            0 => tau_cc,
+                            1 => mtau_cc,
+                            2 => f_cc,
+                            3 => h_cc,
+                            _ => unreachable!(),
+                        }
+                    };
+                    if is_base {
+                        mask |= 1u64 << off;
+                    }
+                }
+            }
+            base_masks.push(mask);
 
             // Direct tables (tau, m_tau, f, h):
             // Use BaseScalarArc whenever available; otherwise use DenseArc.
@@ -1364,43 +1508,98 @@ where
             let w_t0 = rcps[n - 3];
             let w_t1 = rcps[n - 2];
             let stride = 4 + 4 * Mlen;
+            let use_masks = stride <= 64;
 
-            #[inline]
-            fn at2<Rr: OverField + PolyRing>(v0: &[Rr], v1: &[Rr], idx: usize) -> Rr
-            where
-                Rr::BaseRing: Ring,
-            {
-                v1[idx] + (v1[idx] - v0[idx])
+            // Many costs in this combiner are *linear* in the MLE values, so we compute at x=0 and x=1
+            // once and extrapolate x=2 via linearity (saves ~3× work vs recomputing the whole lin-sum).
+            let eq0_0 = v0[0].coeffs()[0];
+            let eq0_1 = v1[0].coeffs()[0];
+            let eq0_2 = eq0_1 + (eq0_1 - eq0_0);
+            let two = R::BaseRing::ONE + R::BaseRing::ONE;
+
+            let t0_0 = v0[n - 2];
+            let t0_1 = v1[n - 2];
+            let t1_0 = v0[n - 1];
+            let t1_1 = v1[n - 1];
+
+            let mut out0 = R::ZERO;
+            let mut out1 = R::ZERO;
+            let mut out2 = R::ZERO;
+
+            for l in 0..L {
+                let l_idx = 1 + l * stride;
+
+                let tau0_0 = v0[l_idx].coeffs()[0];
+                let tau0_1 = v1[l_idx].coeffs()[0];
+                let tau0_2 = tau0_1 + (tau0_1 - tau0_0);
+
+                // lin(which) = Σ_j rcps[j-1] * eval_at(which,j) is linear in the MLE values,
+                // so compute lin0/lin1 and extrapolate lin2.
+                //
+                // Split the sum into:
+                // - base-scalar terms (constant-coeff): update only the constant term (cheap)
+                // - ring terms: do a full coefficient-wise add_scaled_by_base
+                //
+                // In the CM wiring, the base-scalar positions within each stride block are:
+                // - tau (offset 0), f (offset 2)
+                // - for each M_i: (M_i*tau) (offset 0) and (M_i*f) (offset 2)
+                let mut lin0_ring = R::ZERO;
+                let mut lin1_ring = R::ZERO;
+                let mut lin0_c0 = R::BaseRing::ZERO;
+                let mut lin1_c0 = R::BaseRing::ZERO;
+                let base_mask = if use_masks { base_masks[l] } else { 0 };
+                for off in 0..stride {
+                    let j = l_idx + off;
+                    let w = rcps[j - 1];
+                    let is_base = use_masks && (((base_mask >> off) & 1) != 0);
+                    if is_base {
+                        lin0_c0 += v0[j].coeffs()[0] * w;
+                        lin1_c0 += v1[j].coeffs()[0] * w;
+                    } else {
+                        add_scaled_by_base_pair(&mut lin0_ring, &v0[j], &mut lin1_ring, &v1[j], w);
+                    }
+                }
+
+                // out += eq0 * lin.
+                add_scaled_by_base(&mut out0, &lin0_ring, eq0_0);
+                out0.coeffs_mut()[0] += eq0_0 * lin0_c0;
+                add_scaled_by_base(&mut out1, &lin1_ring, eq0_1);
+                out1.coeffs_mut()[0] += eq0_1 * lin1_c0;
+
+                // out2 uses linear extrapolation: lin2 = 2*lin1 - lin0.
+                // Avoid materializing `lin2` (saves coefficient passes).
+                let eq2_twice = eq0_2 * two;
+                let neg_eq2 = R::BaseRing::ZERO - eq0_2;
+                add_scaled2_by_base(&mut out2, &lin1_ring, eq2_twice, &lin0_ring, neg_eq2);
+                out2.coeffs_mut()[0] += eq0_2 * (two * lin1_c0 - lin0_c0);
+
+                // (tau * t) * w  ==  t * (tau0 * w)  since tau is constant-coeff.
+                add_scaled_by_base(&mut out0, &t0_0, tau0_0 * w_t0);
+                add_scaled_by_base(&mut out1, &t0_1, tau0_1 * w_t0);
+                // t0_2 = 2*t0_1 - t0_0.
+                let wt0 = tau0_2 * w_t0;
+                add_scaled2_by_base(
+                    &mut out2,
+                    &t0_1,
+                    wt0 * two,
+                    &t0_0,
+                    R::BaseRing::ZERO - wt0,
+                );
+
+                add_scaled_by_base(&mut out0, &t1_0, tau0_0 * w_t1);
+                add_scaled_by_base(&mut out1, &t1_1, tau0_1 * w_t1);
+                // t1_2 = 2*t1_1 - t1_0.
+                let wt1 = tau0_2 * w_t1;
+                add_scaled2_by_base(
+                    &mut out2,
+                    &t1_1,
+                    wt1 * two,
+                    &t1_0,
+                    R::BaseRing::ZERO - wt1,
+                );
             }
 
-            let eval_at = |which: u8, idx: usize| -> R {
-                match which {
-                    0 => v0[idx],
-                    1 => v1[idx],
-                    2 => at2::<R>(v0, v1, idx),
-                    _ => unreachable!(),
-                }
-            };
-
-            let eval_point = |which: u8| -> R {
-                let eq = eval_at(which, 0);
-                let t0 = eval_at(which, n - 2);
-                let t1 = eval_at(which, n - 1);
-                let mut out = R::ZERO;
-                for l in 0..L {
-                    let l_idx = 1 + l * stride;
-                    let tau = eval_at(which, l_idx);
-                    let mut lin = R::ZERO;
-                    for j in l_idx..(l_idx + stride) {
-                        lin += eval_at(which, j) * rcps[j - 1];
-                    }
-                    out += eq * lin;
-                    out += (tau * t0) * w_t0;
-                    out += (tau * t1) * w_t1;
-                }
-                out
-            };
-            [eval_point(0), eval_point(1), eval_point(2)]
+            [out0, out1, out2]
         };
 
         let t_sc = Instant::now();
@@ -1822,42 +2021,95 @@ where
             let w_t1 = rcps[n - 2];
             let stride = 4 + 4 * Mlen;
 
-            #[inline]
-            fn at2<Rr: OverField + PolyRing>(v0: &[Rr], v1: &[Rr], idx: usize) -> Rr
-            where
-                Rr::BaseRing: Ring,
-            {
-                v1[idx] + (v1[idx] - v0[idx])
+            // Many costs in this combiner are *linear* in the MLE values, so we compute at x=0 and x=1
+            // once and extrapolate x=2 via linearity (saves ~3× work vs recomputing the whole lin-sum).
+            let eq0_0 = v0[0].coeffs()[0];
+            let eq0_1 = v1[0].coeffs()[0];
+            let eq0_2 = eq0_1 + (eq0_1 - eq0_0);
+            let two = R::BaseRing::ONE + R::BaseRing::ONE;
+
+            let t0_0 = v0[n - 2];
+            let t0_1 = v1[n - 2];
+            let t1_0 = v0[n - 1];
+            let t1_1 = v1[n - 1];
+
+            let mut out0 = R::ZERO;
+            let mut out1 = R::ZERO;
+            let mut out2 = R::ZERO;
+
+            for l in 0..L {
+                let l_idx = 1 + l * stride;
+
+                let tau0_0 = v0[l_idx].coeffs()[0];
+                let tau0_1 = v1[l_idx].coeffs()[0];
+                let tau0_2 = tau0_1 + (tau0_1 - tau0_0);
+
+                // lin(which) = Σ_j rcps[j-1] * eval_at(which,j) is linear in the MLE values.
+                //
+                // Split the sum into:
+                // - base-scalar terms (constant-coeff): update only the constant term (cheap)
+                // - ring terms: do a full coefficient-wise add_scaled_by_base
+                //
+                // In the CM wiring, the base-scalar positions within each stride block are:
+                // - tau (offset 0), f (offset 2)
+                // - for each M_i: (M_i*tau) (offset 0) and (M_i*f) (offset 2)
+                let mut lin0_ring = R::ZERO;
+                let mut lin1_ring = R::ZERO;
+                let mut lin0_c0 = R::BaseRing::ZERO;
+                let mut lin1_c0 = R::BaseRing::ZERO;
+                for off in 0..stride {
+                    let j = l_idx + off;
+                    let w = rcps[j - 1];
+                    let is_base = off == 0
+                        || off == 2
+                        || (off >= 4 && ((off - 4) & 3 == 0 || (off - 4) & 3 == 2));
+                    if is_base {
+                        lin0_c0 += v0[j].coeffs()[0] * w;
+                        lin1_c0 += v1[j].coeffs()[0] * w;
+                    } else {
+                        add_scaled_by_base_pair(&mut lin0_ring, &v0[j], &mut lin1_ring, &v1[j], w);
+                    }
+                }
+
+                // out += eq0 * lin.
+                add_scaled_by_base(&mut out0, &lin0_ring, eq0_0);
+                out0.coeffs_mut()[0] += eq0_0 * lin0_c0;
+                add_scaled_by_base(&mut out1, &lin1_ring, eq0_1);
+                out1.coeffs_mut()[0] += eq0_1 * lin1_c0;
+
+                // out2 uses linear extrapolation: lin2 = 2*lin1 - lin0.
+                // Avoid materializing `lin2` (saves coefficient passes).
+                let eq2_twice = eq0_2 * two;
+                let neg_eq2 = R::BaseRing::ZERO - eq0_2;
+                add_scaled2_by_base(&mut out2, &lin1_ring, eq2_twice, &lin0_ring, neg_eq2);
+                out2.coeffs_mut()[0] += eq0_2 * (two * lin1_c0 - lin0_c0);
+
+                add_scaled_by_base(&mut out0, &t0_0, tau0_0 * w_t0);
+                add_scaled_by_base(&mut out1, &t0_1, tau0_1 * w_t0);
+                // t0_2 = 2*t0_1 - t0_0.
+                let wt0 = tau0_2 * w_t0;
+                add_scaled2_by_base(
+                    &mut out2,
+                    &t0_1,
+                    wt0 * two,
+                    &t0_0,
+                    R::BaseRing::ZERO - wt0,
+                );
+
+                add_scaled_by_base(&mut out0, &t1_0, tau0_0 * w_t1);
+                add_scaled_by_base(&mut out1, &t1_1, tau0_1 * w_t1);
+                // t1_2 = 2*t1_1 - t1_0.
+                let wt1 = tau0_2 * w_t1;
+                add_scaled2_by_base(
+                    &mut out2,
+                    &t1_1,
+                    wt1 * two,
+                    &t1_0,
+                    R::BaseRing::ZERO - wt1,
+                );
             }
 
-            let eval_at = |which: u8, idx: usize| -> R {
-                match which {
-                    0 => v0[idx],
-                    1 => v1[idx],
-                    2 => at2::<R>(v0, v1, idx),
-                    _ => unreachable!(),
-                }
-            };
-
-            let eval_point = |which: u8| -> R {
-                let eq = eval_at(which, 0);
-                let t0 = eval_at(which, n - 2);
-                let t1 = eval_at(which, n - 1);
-                let mut out = R::ZERO;
-                for l in 0..L {
-                    let l_idx = 1 + l * stride;
-                    let tau = eval_at(which, l_idx);
-                    let mut lin = R::ZERO;
-                    for j in l_idx..(l_idx + stride) {
-                        lin += eval_at(which, j) * rcps[j - 1];
-                    }
-                    out += eq * lin;
-                    out += (tau * t0) * w_t0;
-                    out += (tau * t1) * w_t1;
-                }
-                out
-            };
-            [eval_point(0), eval_point(1), eval_point(2)]
+            [out0, out1, out2]
         };
 
         let t_sc = Instant::now();
@@ -2277,42 +2529,96 @@ where
             let w_t1 = rcps[n - 2];
             let stride = 4 + 4 * Mlen;
 
-            #[inline]
-            fn at2<Rr: OverField + PolyRing>(v0: &[Rr], v1: &[Rr], idx: usize) -> Rr
-            where
-                Rr::BaseRing: Ring,
-            {
-                v1[idx] + (v1[idx] - v0[idx])
+            // Many costs in this combiner are *linear* in the MLE values, so we compute at x=0 and x=1
+            // once and extrapolate x=2 via linearity (saves ~3× work vs recomputing the whole lin-sum).
+            let eq0_0 = v0[0].coeffs()[0];
+            let eq0_1 = v1[0].coeffs()[0];
+            let eq0_2 = eq0_1 + (eq0_1 - eq0_0);
+            let two = R::BaseRing::ONE + R::BaseRing::ONE;
+
+            let t0_0 = v0[n - 2];
+            let t0_1 = v1[n - 2];
+            let t1_0 = v0[n - 1];
+            let t1_1 = v1[n - 1];
+
+            let mut out0 = R::ZERO;
+            let mut out1 = R::ZERO;
+            let mut out2 = R::ZERO;
+
+            for l in 0..L {
+                let l_idx = 1 + l * stride;
+
+                let tau0_0 = v0[l_idx].coeffs()[0];
+                let tau0_1 = v1[l_idx].coeffs()[0];
+                let tau0_2 = tau0_1 + (tau0_1 - tau0_0);
+
+                // lin(which) = Σ_j rcps[j-1] * eval_at(which,j) is linear in the MLE values.
+                //
+                // Split the sum into:
+                // - base-scalar terms (constant-coeff): update only the constant term (cheap)
+                // - ring terms: do a full coefficient-wise add_scaled_by_base
+                //
+                // In the CM wiring, the base-scalar positions within each stride block are:
+                // - tau (offset 0), f (offset 2)
+                // - for each M_i: (M_i*tau) (offset 0) and (M_i*f) (offset 2)
+                let mut lin0_ring = R::ZERO;
+                let mut lin1_ring = R::ZERO;
+                let mut lin0_c0 = R::BaseRing::ZERO;
+                let mut lin1_c0 = R::BaseRing::ZERO;
+                for off in 0..stride {
+                    let j = l_idx + off;
+                    let w = rcps[j - 1];
+                    let is_base = off == 0
+                        || off == 2
+                        || (off >= 4 && ((off - 4) & 3 == 0 || (off - 4) & 3 == 2));
+                    if is_base {
+                        lin0_c0 += v0[j].coeffs()[0] * w;
+                        lin1_c0 += v1[j].coeffs()[0] * w;
+                    } else {
+                        add_scaled_by_base_pair(&mut lin0_ring, &v0[j], &mut lin1_ring, &v1[j], w);
+                    }
+                }
+
+                // out += eq0 * lin.
+                add_scaled_by_base(&mut out0, &lin0_ring, eq0_0);
+                out0.coeffs_mut()[0] += eq0_0 * lin0_c0;
+                add_scaled_by_base(&mut out1, &lin1_ring, eq0_1);
+                out1.coeffs_mut()[0] += eq0_1 * lin1_c0;
+
+                // out2 uses linear extrapolation: lin2 = 2*lin1 - lin0.
+                // Avoid materializing `lin2` (saves coefficient passes).
+                let eq2_twice = eq0_2 * two;
+                let neg_eq2 = R::BaseRing::ZERO - eq0_2;
+                add_scaled2_by_base(&mut out2, &lin1_ring, eq2_twice, &lin0_ring, neg_eq2);
+                out2.coeffs_mut()[0] += eq0_2 * (two * lin1_c0 - lin0_c0);
+
+                // (tau * t) * w  ==  t * (tau0 * w)  since tau is constant-coeff.
+                add_scaled_by_base(&mut out0, &t0_0, tau0_0 * w_t0);
+                add_scaled_by_base(&mut out1, &t0_1, tau0_1 * w_t0);
+                // t0_2 = 2*t0_1 - t0_0.
+                let wt0 = tau0_2 * w_t0;
+                add_scaled2_by_base(
+                    &mut out2,
+                    &t0_1,
+                    wt0 * two,
+                    &t0_0,
+                    R::BaseRing::ZERO - wt0,
+                );
+
+                add_scaled_by_base(&mut out0, &t1_0, tau0_0 * w_t1);
+                add_scaled_by_base(&mut out1, &t1_1, tau0_1 * w_t1);
+                // t1_2 = 2*t1_1 - t1_0.
+                let wt1 = tau0_2 * w_t1;
+                add_scaled2_by_base(
+                    &mut out2,
+                    &t1_1,
+                    wt1 * two,
+                    &t1_0,
+                    R::BaseRing::ZERO - wt1,
+                );
             }
 
-            let eval_at = |which: u8, idx: usize| -> R {
-                match which {
-                    0 => v0[idx],
-                    1 => v1[idx],
-                    2 => at2::<R>(v0, v1, idx),
-                    _ => unreachable!(),
-                }
-            };
-
-            let eval_point = |which: u8| -> R {
-                let eq = eval_at(which, 0);
-                let t0 = eval_at(which, n - 2);
-                let t1 = eval_at(which, n - 1);
-                let mut out = R::ZERO;
-                for l in 0..L {
-                    let l_idx = 1 + l * stride;
-                    let tau = eval_at(which, l_idx);
-                    let mut lin = R::ZERO;
-                    for j in l_idx..(l_idx + stride) {
-                        lin += eval_at(which, j) * rcps[j - 1];
-                    }
-                    out += eq * lin;
-                    out += (tau * t0) * w_t0;
-                    out += (tau * t1) * w_t1;
-                }
-                out
-            };
-            [eval_point(0), eval_point(1), eval_point(2)]
+            [out0, out1, out2]
         };
 
         let (sumcheck_proof, randomness, final_vals) =
@@ -2507,14 +2813,14 @@ where
                     .map(|(l, eval)| {
                         let l_idx = l * (4 + 4 * mlen);
 
-                        R::from(eval.a[0]) * rc_pows[l_idx]
+                        scale_by_base_ref(&rc_pows[l_idx], eval.a[0])
                             + eval.b[0] * rc_pows[l_idx + 1]
                             + eval.c[0] * rc_pows[l_idx + 2]
                             + u[l][0] * rc_pows[l_idx + 3]
                             + (0..mlen)
                                 .map(|i| {
                                     let idx = l_idx + 4 + i * 4;
-                                    R::from(eval.a[1 + i]) * rc_pows[idx]
+                                    scale_by_base_ref(&rc_pows[idx], eval.a[1 + i])
                                         + eval.b[1 + i] * rc_pows[idx + 1]
                                         + eval.c[1 + i] * rc_pows[idx + 2]
                                         + u[l][1 + i] * rc_pows[idx + 3]

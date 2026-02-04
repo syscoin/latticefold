@@ -340,7 +340,21 @@ impl<R: OverField + PolyRing> Linearize<R> for ComR1CS<R> {
             }
         };
 
-        let comb_fn = |vals: &[R]| -> R { vals[0] * (vals[1] * vals[2] - vals[3]) };
+        let comb_fn = match &self.f {
+            WitnessVec::ConstCoeffBase { .. } => {
+                // Constant-coefficient regime: all involved MLE evaluations are constant-coeff
+                // ring elements (i.e. lifts of base scalars). Avoid ring×ring multiplication:
+                // for coefficient-form rings like `GoldilocksRing64`, `Mul<R>` is an NTT convolution.
+                |vals: &[R]| -> R {
+                    let e0 = vals[0].coeffs()[0];
+                    let a0 = vals[1].coeffs()[0];
+                    let b0 = vals[2].coeffs()[0];
+                    let c0 = vals[3].coeffs()[0];
+                    R::from(e0 * (a0 * b0 - c0))
+                }
+            }
+            _ => |vals: &[R]| -> R { vals[0] * (vals[1] * vals[2] - vals[3]) },
+        };
 
         let (sumcheck_proof, randomness, final_vals) =
             StreamingSumcheck::prove_as_subprotocol(transcript, mles, nvars, 3, comb_fn);
@@ -422,7 +436,14 @@ impl<R: OverField + PolyRing> Linearize<R> for ComR1CSBase<R> {
             },
         ];
 
-        let comb_fn = |vals: &[R]| -> R { vals[0] * (vals[1] * vals[2] - vals[3]) };
+        // `ComR1CSBase` is strictly constant-coefficient.
+        let comb_fn = |vals: &[R]| -> R {
+            let e0 = vals[0].coeffs()[0];
+            let a0 = vals[1].coeffs()[0];
+            let b0 = vals[2].coeffs()[0];
+            let c0 = vals[3].coeffs()[0];
+            R::from(e0 * (a0 * b0 - c0))
+        };
 
         let (sumcheck_proof, randomness, final_vals) =
             StreamingSumcheck::prove_as_subprotocol(transcript, mles, nvars, 3, comb_fn);

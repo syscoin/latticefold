@@ -9,6 +9,7 @@ use stark_rings::OverField;
 use crate::ark_base::*;
 
 pub mod poseidon;
+pub mod bytes;
 
 pub trait Transcript<R: OverField> {
     type TranscriptConfig: Debug;

@@ -2,11 +2,14 @@ use ark_crypto_primitives::sponge::{
     poseidon::{PoseidonConfig, PoseidonSponge},
     CryptographicSponge,
 };
-use ark_ff::{Field, PrimeField};
-use cyclotomic_rings::rings::GetPoseidonParams;
+use ark_ff::{BigInteger, PrimeField};
+use ark_std::marker::PhantomData;
 use latticefold::transcript::Transcript;
+use latticefold::transcript::bytes::{prime_field_to_bytes_le_fixed, ring_to_bytes_le_fixed};
+use latticefold::transcript::poseidon::{f257_poseidon_config, F257};
 use stark_rings::OverField;
 
+use crate::transcript::{CHALLENGE_DIGITS, DEFAULT_REJECTION_TRIES};
 use crate::transcript::PoseidonTranscriptMetrics;
 
 /// Poseidon sponge transcript operation trace (in the sponge's base prime field).
@@ -26,96 +29,298 @@ pub struct PoseidonTranscriptTrace<BF: PrimeField> {
     pub squeezed_bytes: Vec<u8>,
 }
 
+impl<BF: PrimeField> PoseidonTranscriptTrace<BF> {
+    /// Reconstruct `get_challenge()` scalars from the recorded trace.
+    ///
+    /// The trace stores Poseidon sponge squeeze outputs as **F257 digits** (each digit is a BF
+    /// element in the range \(0..=256\)). Each `get_challenge()` consumes `digits_per_challenge`
+    /// digits (currently 8 in LF/LF+), interprets them in **byte view** (256 -> 0), and returns
+    /// the u32 formed by the first 4 bytes (little-endian).
+    ///
+    /// This helper extracts exactly the `SqueezeField` ops whose vector length equals
+    /// `digits_per_challenge`, combines them, and returns the first `n` reconstructed challenges.
+    pub fn challenge_scalars_base257(&self, digits_per_challenge: usize, n: usize) -> Vec<BF> {
+        // Fixed-tries rejection: each `get_challenge()` contributes `DEFAULT_REJECTION_TRIES`
+        // occurrences of `SqueezeField(len=digits_per_challenge)` in the trace.
+        //
+        // Acceptance predicate matches `crate::transcript::PoseidonTranscript::get_challenge`:
+        // accept first attempt whose first 4 digits are all != 256, then pack those 4 digits
+        // (as bytes) into a u32.
+        let mut out = Vec::with_capacity(n);
+        let mut buf: Vec<&[BF]> = Vec::with_capacity(DEFAULT_REJECTION_TRIES);
+        for op in &self.ops {
+            if let PoseidonTraceOp::SqueezeField(digits) = op {
+                if digits.len() != digits_per_challenge {
+                    continue;
+                }
+                buf.push(digits.as_slice());
+                if buf.len() == DEFAULT_REJECTION_TRIES {
+                    let mut chosen = [0u8; 4];
+                    let mut found = false;
+                    'tries: for cand in buf.drain(..) {
+                        let mut bs = [0u8; 4];
+                        for i in 0..4 {
+                            // BF digit in 0..=256; read full limb so we can detect 256.
+                            let du16 = cand[i]
+                                .into_bigint()
+                                .as_ref()
+                                .get(0)
+                                .copied()
+                                .unwrap_or(0) as u16;
+                            debug_assert!(du16 < 257u16);
+                            if du16 == 256 {
+                                continue 'tries;
+                            }
+                            bs[i] = du16 as u8;
+                        }
+                        chosen = bs;
+                        found = true;
+                        break;
+                    }
+                    assert!(
+                        found,
+                        "challenge_scalars_base257 exhausted {} rejection tries",
+                        DEFAULT_REJECTION_TRIES
+                    );
+                    let x = u32::from_le_bytes(chosen);
+                    out.push(BF::from(x as u64));
+                    if out.len() == n {
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Convenience: reconstruct **all** `get_challenge()` scalars present in the trace.
+    pub fn challenge_scalars_base257_all(&self, digits_per_challenge: usize) -> Vec<BF> {
+        let n_squeezes = self
+            .ops
+            .iter()
+            .filter(|op| matches!(op, PoseidonTraceOp::SqueezeField(v) if v.len() == digits_per_challenge))
+            .count();
+        assert!(
+            n_squeezes % DEFAULT_REJECTION_TRIES == 0,
+            "challenge_scalars_base257_all: squeeze count {} not divisible by DEFAULT_REJECTION_TRIES={}",
+            n_squeezes,
+            DEFAULT_REJECTION_TRIES
+        );
+        let n = n_squeezes / DEFAULT_REJECTION_TRIES;
+        self.challenge_scalars_base257(digits_per_challenge, n)
+    }
+}
+
 /// Poseidon transcript that records a full operation trace.
 ///
 /// This is intended for WE/DPP arithmetization frontends: the prover can record a trace and later
 /// provide it as part of a witness, with constraints enforcing that it matches the Poseidon
 /// permutation schedule.
 #[derive(Clone)]
-pub struct TracePoseidonTranscript<R: OverField> {
-    sponge: PoseidonSponge<<R::BaseRing as Field>::BasePrimeField>,
+pub struct TracePoseidonTranscript<R: OverField>
+where
+    R::BaseRing: PrimeField,
+{
+    sponge: PoseidonSponge<F257>,
     metrics: PoseidonTranscriptMetrics,
-    scratch: Vec<<R::BaseRing as Field>::BasePrimeField>,
-    trace: PoseidonTranscriptTrace<<R::BaseRing as Field>::BasePrimeField>,
+    scratch: Vec<F257>,
+    trace: PoseidonTranscriptTrace<R::BaseRing>,
+    _marker: PhantomData<R>,
 }
 
-impl<R: OverField> TracePoseidonTranscript<R> {
-    pub fn empty<P: GetPoseidonParams<<<R>::BaseRing as Field>::BasePrimeField>>() -> Self {
-        Self::new(&P::get_poseidon_config())
+impl<R: OverField> TracePoseidonTranscript<R>
+where
+    R::BaseRing: PrimeField,
+{
+    pub fn empty<P>() -> Self {
+        Self::new(&f257_poseidon_config())
     }
 
     pub fn metrics(&self) -> PoseidonTranscriptMetrics {
         self.metrics
     }
 
-    pub fn trace(&self) -> &PoseidonTranscriptTrace<<R::BaseRing as Field>::BasePrimeField> {
+    pub fn trace(&self) -> &PoseidonTranscriptTrace<R::BaseRing> {
         &self.trace
     }
 
-    fn absorb_base_prime_field_elems_vec(
+    /// Consume the recorder and return the accumulated trace without cloning.
+    #[inline]
+    pub fn into_trace(self) -> PoseidonTranscriptTrace<R::BaseRing> {
+        self.trace
+    }
+
+    #[inline]
+    fn lift_f257_to_base_ring(x: &F257) -> R::BaseRing {
+        // F257 elements are always in 0..=256; lift that integer into the transcript's base ring.
+        let bytes = x.into_bigint().to_bytes_le();
+        let lo = bytes.get(0).copied().unwrap_or(0) as u16;
+        let hi = bytes.get(1).copied().unwrap_or(0) as u16;
+        let d = (lo | (hi << 8)) as u64;
+        debug_assert!(d < 257u64);
+        R::BaseRing::from(d)
+    }
+
+    fn absorb_f257_elems_vec(
         &mut self,
-        elems: Vec<<R::BaseRing as Field>::BasePrimeField>,
+        elems: Vec<F257>,
     ) {
         self.metrics.absorbed_elems += elems.len() as u64;
         self.sponge.absorb(&elems);
-        self.trace.absorbed.extend_from_slice(&elems);
-        self.trace.ops.push(PoseidonTraceOp::Absorb(elems));
+        let lifted = elems
+            .iter()
+            .map(|e| Self::lift_f257_to_base_ring(e))
+            .collect::<Vec<_>>();
+        self.trace.absorbed.extend_from_slice(&lifted);
+        self.trace.ops.push(PoseidonTraceOp::Absorb(lifted));
     }
 }
 
-impl<R: OverField> Transcript<R> for TracePoseidonTranscript<R> {
-    type TranscriptConfig = PoseidonConfig<<R::BaseRing as Field>::BasePrimeField>;
+impl<R: OverField> Transcript<R> for TracePoseidonTranscript<R>
+where
+    R::BaseRing: PrimeField,
+{
+    type TranscriptConfig = PoseidonConfig<F257>;
 
     fn new(config: &Self::TranscriptConfig) -> Self {
-        let sponge = PoseidonSponge::<<R::BaseRing as Field>::BasePrimeField>::new(config);
+        let sponge = PoseidonSponge::<F257>::new(config);
         Self {
             sponge,
             metrics: PoseidonTranscriptMetrics::default(),
             scratch: Vec::with_capacity(64),
             trace: PoseidonTranscriptTrace::default(),
+            _marker: PhantomData,
         }
     }
 
     fn absorb(&mut self, v: &R) {
         self.scratch.clear();
-        for c in v.coeffs() {
-            self.scratch.extend(c.to_base_prime_field_elements());
-        }
+        let bytes = ring_to_bytes_le_fixed::<R>(v);
+        self.scratch.extend(bytes.iter().map(|b| F257::from(*b as u64)));
         let elems = self.scratch.clone();
-        self.absorb_base_prime_field_elems_vec(elems);
+        self.absorb_f257_elems_vec(elems);
     }
 
     fn absorb_field_element(&mut self, v: &R::BaseRing) {
-        // IMPORTANT (encoding):
-        // Absorb base-ring field elements directly (as base-prime-field elems), instead of
-        // converting to a constant-coeff ring element and absorbing `d` coefficients.
-        self.absorb_base_prime_field_elems_vec(v.to_base_prime_field_elements().collect());
+        let bytes = prime_field_to_bytes_le_fixed::<R::BaseRing>(v);
+        self.absorb_f257_elems_vec(bytes.iter().map(|b| F257::from(*b as u64)).collect());
     }
 
     fn get_challenge(&mut self) -> R::BaseRing {
-        let extension_degree = R::BaseRing::extension_degree();
-        let c = self
-            .sponge
-            .squeeze_field_elements(extension_degree as usize);
-        self.metrics.squeezed_field_elems += c.len() as u64;
-        self.trace.squeezed_field.extend_from_slice(&c);
-        self.trace.ops.push(PoseidonTraceOp::SqueezeField(c.clone()));
+        // Fixed schedule with rejection to avoid bias from the byte view map (256 -> 0).
+        let mut chosen = [0u8; 4];
+        let mut found = false;
+        for _ in 0..DEFAULT_REJECTION_TRIES {
+            let c = self.sponge.squeeze_field_elements::<F257>(CHALLENGE_DIGITS);
+            self.metrics.squeezed_field_elems += c.len() as u64;
+            let lifted = c
+                .iter()
+                .map(|e| Self::lift_f257_to_base_ring(e))
+                .collect::<Vec<_>>();
+            self.trace.squeezed_field.extend_from_slice(&lifted);
+            self.trace.ops.push(PoseidonTraceOp::SqueezeField(lifted));
 
-        // `get_challenge` re-absorbs the squeezed elements to evolve the sponge state.
-        self.absorb_base_prime_field_elems_vec(c.clone());
+            // `get_challenge` re-absorbs the squeezed elements to evolve the sponge state.
+            self.absorb_f257_elems_vec(c.clone());
 
-        <R::BaseRing as Field>::from_base_prime_field_elems(&c)
-            .expect("TracePoseidonTranscript: wrong extension_degree")
+            // Accept iff none of the first 4 digits is 256.
+            let mut ok = true;
+            let mut bs = [0u8; 4];
+            for i in 0..4 {
+                // F257 digit in 0..=256; read full limb so we can detect 256.
+                let d = c[i]
+                    .into_bigint()
+                    .as_ref()
+                    .get(0)
+                    .copied()
+                    .unwrap_or(0) as u16;
+                debug_assert!(d < 257u16);
+                if d == 256 {
+                    ok = false;
+                    break;
+                }
+                bs[i] = d as u8;
+            }
+            if !found && ok {
+                chosen = bs;
+                found = true;
+            }
+        }
+        assert!(
+            found,
+            "TracePoseidonTranscript::get_challenge exhausted {} rejection tries",
+            DEFAULT_REJECTION_TRIES
+        );
+        let x = u32::from_le_bytes(chosen);
+        R::BaseRing::from(x as u64)
     }
 
     fn squeeze_bytes(&mut self, n: usize) -> Vec<u8> {
         self.metrics.squeezed_bytes += n as u64;
-        let out = self.sponge.squeeze_bytes(n);
+        let elems = self.sponge.squeeze_field_elements::<F257>(n);
+        self.metrics.squeezed_field_elems += elems.len() as u64;
+        let lifted = elems
+            .iter()
+            .map(|e| Self::lift_f257_to_base_ring(e))
+            .collect::<Vec<_>>();
+        self.trace.squeezed_field.extend_from_slice(&lifted);
+        self.trace.ops.push(PoseidonTraceOp::SqueezeField(lifted));
+        let out = elems
+            .iter()
+            .map(|e| {
+                // Read full limb so 256 is represented as 256 (then map to 0).
+                let d = e.into_bigint().as_ref().get(0).copied().unwrap_or(0) as u16;
+                debug_assert!(d < 257u16);
+                if d == 256 { 0u8 } else { d as u8 }
+            })
+            .collect::<Vec<u8>>();
         self.trace.squeezed_bytes.extend_from_slice(&out);
-        self.trace
-            .ops
-            .push(PoseidonTraceOp::SqueezeBytes { n, out: out.clone() });
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transcript::PoseidonTranscript as PlainPoseidonTranscript;
+    use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as R;
+    use stark_rings::PolyRing;
+    use stark_rings::Ring;
+
+    type BR = <R as PolyRing>::BaseRing;
+
+    #[test]
+    fn test_trace_transcript_matches_plain_transcript() {
+        let mut plain = PlainPoseidonTranscript::<R>::empty::<()>();
+        let mut trace = TracePoseidonTranscript::<R>::empty::<()>();
+
+        // Mix ring and base-ring absorption.
+        plain.absorb(&R::ONE);
+        trace.absorb(&R::ONE);
+        plain.absorb_field_element(&BR::from(0xBEEFu64));
+        trace.absorb_field_element(&BR::from(0xBEEFu64));
+
+        // Challenges must match exactly.
+        for _ in 0..5 {
+            assert_eq!(plain.get_challenge(), trace.get_challenge());
+        }
+
+        // Squeezed bytes must match exactly.
+        let out_plain = plain.squeeze_bytes(64);
+        let out_trace = trace.squeeze_bytes(64);
+        assert_eq!(out_plain, out_trace);
+
+        // Metrics should match, and trace buffers should be consistent with metrics.
+        let m_plain = plain.metrics();
+        let m = trace.metrics();
+        assert_eq!(m_plain.absorbed_elems, m.absorbed_elems);
+        assert_eq!(m_plain.squeezed_field_elems, m.squeezed_field_elems);
+        assert_eq!(m_plain.squeezed_bytes, m.squeezed_bytes);
+
+        let tr = trace.trace();
+        assert_eq!(tr.absorbed.len() as u64, m.absorbed_elems);
+        assert_eq!(tr.squeezed_field.len() as u64, m.squeezed_field_elems);
+        assert_eq!(tr.squeezed_bytes.len() as u64, m.squeezed_bytes);
     }
 }
 

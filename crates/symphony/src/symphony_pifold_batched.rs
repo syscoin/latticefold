@@ -77,7 +77,7 @@ where
 {
     pub result: Result<(SymphonyInstance<R>, SymphonyBatchLin<R>), String>,
     pub metrics: PoseidonTranscriptMetrics,
-    pub trace: crate::transcript::PoseidonTranscriptTrace<<R::BaseRing as ark_ff::Field>::BasePrimeField>,
+    pub trace: crate::transcript::PoseidonTranscriptTrace<latticefold::transcript::poseidon::F257>,
 }
 
 

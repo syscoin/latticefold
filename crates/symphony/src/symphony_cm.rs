@@ -11,6 +11,7 @@
 //! - `verify_rg_fs_bound` recomputes the Fiat-Shamir coin stream externally and checks it matches
 //!   the statement coins, restoring ROM-style binding outside the relation.
 
+use ark_ff::PrimeField;
 use stark_rings::{balanced_decomposition::Decompose, CoeffRing, OverField, PolyRing, Zq};
 use stark_rings_linalg::Matrix;
 
@@ -162,7 +163,7 @@ pub fn prove_rg_fs<R: CoeffRing, PC>(
     params: RPParams,
 ) -> (SymphonyRgStatement<R>, SymphonyRgProof<R>)
 where
-    R::BaseRing: Zq + Decompose,
+    R::BaseRing: Zq + Decompose + PrimeField,
     PC: cyclotomic_rings::rings::GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
 {
     let cm_f = A.try_mul_vec(&f).unwrap();
@@ -199,7 +200,7 @@ pub fn verify_rg_fs_bound<R: CoeffRing, PC>(
     proof: &SymphonyRgProof<R>,
 ) -> bool
 where
-    R::BaseRing: Zq,
+    R::BaseRing: Zq + PrimeField,
     PC: cyclotomic_rings::rings::GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
 {
     // External Ajtai opening check (outside Pi_rg relation).
@@ -220,7 +221,7 @@ pub fn derive_pi_rg_fs_coins<R: CoeffRing, PC>(
     rp: &RPRangeProof<R>,
 ) -> SymphonyCoins<R>
 where
-    R::BaseRing: Zq,
+    R::BaseRing: Zq + PrimeField,
     PC: cyclotomic_rings::rings::GetPoseidonParams<<<R>::BaseRing as ark_ff::Field>::BasePrimeField>,
 {
     let ts = PoseidonTranscript::<R>::empty::<PC>();

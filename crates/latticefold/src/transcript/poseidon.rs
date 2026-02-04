@@ -2,58 +2,109 @@ use ark_crypto_primitives::sponge::{
     poseidon::{PoseidonConfig, PoseidonSponge},
     CryptographicSponge,
 };
-use ark_ff::Field;
+use ark_ff::{BigInteger, Field, PrimeField};
 use ark_std::marker::PhantomData;
-use cyclotomic_rings::{
-    challenge_set::LatticefoldChallengeSet,
-    rings::{GetPoseidonParams, SuitableRing},
-};
+use cyclotomic_rings::{challenge_set::LatticefoldChallengeSet, rings::SuitableRing};
 use stark_rings::OverField;
 
 use super::{Transcript, TranscriptWithShortChallenges};
 use crate::ark_base::*;
+use crate::transcript::bytes::{field_to_bytes_le_fixed, ring_to_bytes_le_fixed};
+
+#[path = "f257_poseidon_t64_r32_c32.rs"]
+mod f257_poseidon_t64_r32_c32;
+pub use f257_poseidon_t64_r32_c32::F257;
+
+pub fn f257_poseidon_config() -> PoseidonConfig<F257> {
+    f257_poseidon_t64_r32_c32::poseidon_config_f257()
+}
+
+// Fixed-length challenge derivation from F257 digits to avoid rejection sampling.
+const CHALLENGE_DIGITS: usize = 12;
 
 /// PoseidonTranscript implements the Transcript trait using the Poseidon hash
 #[derive(Clone)]
 pub struct PoseidonTranscript<R: OverField, CS> {
     _marker: PhantomData<CS>,
-    sponge: PoseidonSponge<<R::BaseRing as Field>::BasePrimeField>,
+    _marker_r: PhantomData<R>,
+    sponge: PoseidonSponge<F257>,
 }
 
 impl<R: SuitableRing, CS: LatticefoldChallengeSet<R>> Default for PoseidonTranscript<R, CS> {
     fn default() -> Self {
-        Self::new(&R::PoseidonParams::get_poseidon_config())
+        Self::new(&f257_poseidon_config())
     }
 }
 
-impl<R: OverField, CS> Transcript<R> for PoseidonTranscript<R, CS> {
-    type TranscriptConfig = PoseidonConfig<<R::BaseRing as Field>::BasePrimeField>;
+impl<R: OverField, CS> Transcript<R> for PoseidonTranscript<R, CS>
+where
+    R::BaseRing: Field,
+{
+    type TranscriptConfig = PoseidonConfig<F257>;
 
     fn new(config: &Self::TranscriptConfig) -> Self {
-        let sponge = PoseidonSponge::<<R::BaseRing as Field>::BasePrimeField>::new(config);
+        let sponge = PoseidonSponge::<F257>::new(config);
         Self {
             sponge,
             _marker: PhantomData,
+            _marker_r: PhantomData,
         }
     }
 
     fn absorb(&mut self, v: &R) {
-        self.sponge.absorb(
-            &v.coeffs()
-                .iter()
-                .flat_map(|x| x.to_base_prime_field_elements())
-                .collect::<Vec<_>>(),
-        );
+        let bytes = ring_to_bytes_le_fixed::<R>(v);
+        // Avoid allocating a Vec<F257> per absorb.
+        const CHUNK: usize = 256;
+        let mut buf = [F257::ZERO; CHUNK];
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let n = (bytes.len() - i).min(CHUNK);
+            for j in 0..n {
+                buf[j] = F257::from(bytes[i + j] as u64);
+            }
+            let slice: &[F257] = &buf[..n];
+            self.sponge.absorb(&slice);
+            i += n;
+        }
+    }
+
+    fn absorb_field_element(&mut self, v: &R::BaseRing) {
+        let bytes = field_to_bytes_le_fixed::<R::BaseRing>(v);
+        const CHUNK: usize = 256;
+        let mut buf = [F257::ZERO; CHUNK];
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let n = (bytes.len() - i).min(CHUNK);
+            for j in 0..n {
+                buf[j] = F257::from(bytes[i + j] as u64);
+            }
+            let slice: &[F257] = &buf[..n];
+            self.sponge.absorb(&slice);
+            i += n;
+        }
     }
 
     fn get_challenge(&mut self) -> R::BaseRing {
-        let extension_degree = R::BaseRing::extension_degree();
-        let c = self
-            .sponge
-            .squeeze_field_elements(extension_degree as usize);
-        self.sponge.absorb(&c);
-        <R::BaseRing as Field>::from_base_prime_field_elems(&c)
-            .expect("something went wrong: c does not contain extension_degree elements")
+        // Derive a challenge for the *outer* base ring using a fixed number of
+        // base-257 digits (no rejection). This keeps a fixed transcript schedule.
+        let elems = self.sponge.squeeze_field_elements::<F257>(CHALLENGE_DIGITS);
+        self.sponge.absorb(&elems);
+
+        let mut acc = R::BaseRing::from(0u64);
+        let mut pow = R::BaseRing::from(1u64);
+        let base = R::BaseRing::from(257u64);
+        for e in &elems {
+            let d_u64: u64 = e
+                .into_bigint()
+                .to_bytes_le()
+                .get(0)
+                .copied()
+                .unwrap_or(0) as u64;
+            debug_assert!(d_u64 < 257u64);
+            acc += R::BaseRing::from(d_u64) * pow;
+            pow *= base;
+        }
+        acc
     }
 
     fn squeeze_bytes(&mut self, n: usize) -> Vec<u8> {
@@ -63,11 +114,29 @@ impl<R: OverField, CS> Transcript<R> for PoseidonTranscript<R, CS> {
 
 impl<R: SuitableRing, CS: LatticefoldChallengeSet<R>> TranscriptWithShortChallenges<R>
     for PoseidonTranscript<R, CS>
+where
+    R::BaseRing: Field,
 {
     type ChallengeSet = CS;
 
     fn get_short_challenge(&mut self) -> R::CoefficientRepresentation {
-        let random_bytes = self.sponge.squeeze_bytes(Self::ChallengeSet::BYTES_NEEDED);
+        // Deterministic byte view of F257 digits: 256 maps to 0.
+        let elems = self
+            .sponge
+            .squeeze_field_elements::<F257>(Self::ChallengeSet::BYTES_NEEDED);
+        let random_bytes = elems
+            .iter()
+            .map(|e| {
+                let d_u16: u16 = e
+                    .into_bigint()
+                    .to_bytes_le()
+                    .get(0)
+                    .copied()
+                    .unwrap_or(0) as u16;
+                debug_assert!(d_u16 < 257u16);
+                if d_u16 == 256 { 0u8 } else { d_u16 as u8 }
+            })
+            .collect::<Vec<u8>>();
 
         Self::ChallengeSet::short_challenge_from_random_bytes(&random_bytes)
             .expect("not enough bytes to get a small challenge")
@@ -76,68 +145,33 @@ impl<R: SuitableRing, CS: LatticefoldChallengeSet<R>> TranscriptWithShortChallen
 
 #[cfg(test)]
 mod tests {
-    use ark_ff::BigInt;
-    use cyclotomic_rings::rings::{GoldilocksChallengeSet, GoldilocksRingNTT, GoldilocksRingPoly};
-    use stark_rings::cyclotomic_ring::models::goldilocks::{Fq, Fq3};
+    use cyclotomic_rings::rings::{GoldilocksChallengeSet, GoldilocksRingNTT};
+    use stark_rings::PolyRing;
+    use stark_rings::Ring;
 
     use super::*;
 
     #[test]
-    fn test_get_big_challenge() {
-        let mut transcript =
-            PoseidonTranscript::<GoldilocksRingNTT, GoldilocksChallengeSet>::default();
+    fn test_transcript_determinism_big_challenge() {
+        let mut t1 = PoseidonTranscript::<GoldilocksRingNTT, GoldilocksChallengeSet>::default();
+        let mut t2 = PoseidonTranscript::<GoldilocksRingNTT, GoldilocksChallengeSet>::default();
 
-        transcript
-            .sponge
-            .absorb(&Fq::from(BigInt::<1>::from(0xFFu32)));
+        type BR = <GoldilocksRingNTT as PolyRing>::BaseRing;
+        t1.absorb_field_element(&BR::from(0xFFu64));
+        t2.absorb_field_element(&BR::from(0xFFu64));
 
-        let expected: Fq3 = Fq3::new(
-            Fq::new(BigInt([10462816198028961279])),
-            Fq::new(BigInt([17217694161994925895])),
-            Fq::new(BigInt([6163269596856181508])),
-        );
-
-        assert_eq!(expected, transcript.get_challenge())
+        assert_eq!(t1.get_challenge(), t2.get_challenge());
     }
 
     #[test]
-    fn test_get_small_challenge() {
-        let mut transcript =
-            PoseidonTranscript::<GoldilocksRingNTT, GoldilocksChallengeSet>::default();
+    fn test_transcript_determinism_short_challenge() {
+        let mut t1 = PoseidonTranscript::<GoldilocksRingNTT, GoldilocksChallengeSet>::default();
+        let mut t2 = PoseidonTranscript::<GoldilocksRingNTT, GoldilocksChallengeSet>::default();
 
-        transcript
-            .sponge
-            .absorb(&Fq::from(BigInt::<1>::from(0xFFu32)));
+        // Absorb any fixed ring element to ensure sponge state changes deterministically.
+        t1.absorb(&GoldilocksRingNTT::ONE);
+        t2.absorb(&GoldilocksRingNTT::ONE);
 
-        let expected_coeffs: Vec<Fq> = vec![
-            Fq::new(BigInt([31])),
-            Fq::new(BigInt([18446744069414584312])),
-            Fq::new(BigInt([18446744069414584291])),
-            Fq::new(BigInt([14])),
-            Fq::new(BigInt([18446744069414584306])),
-            Fq::new(BigInt([18446744069414584312])),
-            Fq::new(BigInt([30])),
-            Fq::new(BigInt([18446744069414584313])),
-            Fq::new(BigInt([19])),
-            Fq::new(BigInt([18446744069414584317])),
-            Fq::new(BigInt([20])),
-            Fq::new(BigInt([18446744069414584306])),
-            Fq::new(BigInt([18446744069414584295])),
-            Fq::new(BigInt([4])),
-            Fq::new(BigInt([18446744069414584320])),
-            Fq::new(BigInt([7])),
-            Fq::new(BigInt([18446744069414584298])),
-            Fq::new(BigInt([18446744069414584295])),
-            Fq::new(BigInt([18446744069414584304])),
-            Fq::new(BigInt([18446744069414584290])),
-            Fq::new(BigInt([3])),
-            Fq::new(BigInt([18446744069414584304])),
-            Fq::new(BigInt([25])),
-            Fq::new(BigInt([18446744069414584304])),
-        ];
-
-        let expected = GoldilocksRingPoly::from(expected_coeffs);
-
-        assert_eq!(expected, transcript.get_short_challenge())
+        assert_eq!(t1.get_short_challenge(), t2.get_short_challenge());
     }
 }

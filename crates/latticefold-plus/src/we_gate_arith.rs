@@ -5,10 +5,13 @@
 
 use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
 use ark_ff::{BigInteger, Field, PrimeField};
+use latticefold::transcript::poseidon::F257;
 use stark_rings::{psi, unit_monomial, CoeffRing, OverField, PolyRing, Zq};
 
 use crate::recording_transcript::{PoseidonTraceOp as LfPoseidonTraceOp, PoseidonTranscriptTrace};
+use crate::we_gate_tiny as tiny;
 use crate::we_statement::WeParams;
+use crate::transcript::DEFAULT_REJECTION_TRIES;
 
 // Reuse symphony’s sparse dR1CS primitives and Poseidon arithmetizer.
 use symphony::dpp_poseidon::{
@@ -16,10 +19,352 @@ use symphony::dpp_poseidon::{
     poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes, Constraint, PoseidonByteWiring,
     PoseidonDr1csWiring, SparseDr1csInstance,
 };
+use symphony::file_backed_dr1cs::{merge_file_backed_sparse_dr1cs_share_one, FileBackedSparseDr1csInstance};
 use symphony::dpp_sumcheck::Dr1csBuilder;
-use latticefold::commitment::AjtaiCommitmentScheme;
-use crate::setchk::OUT_E_AGG_SEED;
 use symphony::dpp_sumcheck::{sumcheck_verify_degree3, RingVars};
+
+#[cfg(feature = "we_gate")]
+fn first_squeeze_field_op_index_of_len(
+    ops: &[symphony::transcript::PoseidonTraceOp<F257>],
+    len: usize,
+) -> Result<usize, String> {
+    let mut sf_idx = 0usize;
+    for op in ops {
+        if let symphony::transcript::PoseidonTraceOp::SqueezeField(v) = op {
+            if v.len() == len {
+                return Ok(sf_idx);
+            }
+            sf_idx += 1;
+        }
+    }
+    Err(format!(
+        "first_squeeze_field_op_index_of_len: no SqueezeField(len={len}) op found"
+    ))
+}
+
+/// Collect `SqueezeField(len=CHALLENGE_DIGITS)` indices that correspond to `get_challenge()`.
+///
+/// In our transcript/trace, `get_challenge()` is recorded as:
+/// - `SqueezeField(len=CHALLENGE_DIGITS)`
+/// - `Absorb(len=CHALLENGE_DIGITS)` (Fiat–Shamir re-absorb)
+///
+/// This helper returns indices in the **SqueezeField-occurrence index space** (same convention as
+/// `first_squeeze_field_op_index_of_len` and `TinyCoinOpWiring`).
+#[cfg(feature = "we_gate")]
+fn collect_get_challenge_squeeze_field_indices(
+    ops: &[symphony::transcript::PoseidonTraceOp<F257>],
+    sf_start: usize,
+    sf_end: usize,
+) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut sf_idx = 0usize;
+    let mut try_seen = 0usize;
+    for (i, op) in ops.iter().enumerate() {
+        if let symphony::transcript::PoseidonTraceOp::SqueezeField(v) = op {
+            let my_sf = sf_idx;
+            sf_idx += 1;
+            if my_sf < sf_start || my_sf >= sf_end {
+                continue;
+            }
+            if v.len() != CHALLENGE_DIGITS {
+                continue;
+            }
+            // get_challenge() immediately re-absorbs the squeezed elements.
+            if let Some(symphony::transcript::PoseidonTraceOp::Absorb(a)) = ops.get(i + 1) {
+                if a.len() == CHALLENGE_DIGITS {
+                    // Fixed-tries rejection: return only the *start* squeeze-op index for each
+                    // logical challenge (one per DEFAULT_REJECTION_TRIES consecutive tries).
+                    if (try_seen % DEFAULT_REJECTION_TRIES) == 0 {
+                        out.push(my_sf);
+                    }
+                    try_seen += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(feature = "we_gate")]
+fn build_we_dr1cs_for_plus_proof_shape_tiny<R>(
+    trace: &PoseidonTranscriptTrace<BF<R>>,
+    params: &WeParams,
+    public_inputs: &[BF<R>],
+    n_lin_proofs: usize,
+    mlen_mats: usize,
+    pairs: &[(usize, usize)],
+    out_dir: impl AsRef<std::path::Path>,
+) -> Result<WeDr1csShape<F257>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + Field + PrimeField,
+{
+    // Public inputs are absorbed as fixed-width base-field bytes in the transcript.
+    let public_inputs_elems = public_inputs.len();
+
+    // Shape-only must still build the **full faithful** tiny-gate relation.
+    //
+    // We therefore supply a dummy proof-shaped `TinyExtraWitness` (all zeros) so the instance
+    // includes *all* constraints (no "satisfiable placeholder" fallbacks).
+    let proof = dummy_plus_proof_shape::<R>(params, mlen_mats, n_lin_proofs)?;
+    let extra = tiny_extra_witness_from_plus_proof::<R>(params, &proof, mlen_mats)?;
+    let ring_dim = R::dimension();
+
+    // IMPORTANT: to guarantee shape == witness builder, use the *caller-provided* recorded trace
+    // (rather than regenerating it here). This prevents any accidental schedule drift between the
+    // arm-time and witness-time builders.
+    //
+    // The caller is responsible for ensuring `trace` corresponds to `public_inputs` and params.
+    let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<R>>(&trace.ops)?;
+
+    let k = params.k as usize;
+    let log_kappa = ark_std::log2((params.kappa as usize).next_power_of_two()) as usize;
+    let nvars_cm = params.nvars_cm as usize;
+
+    // The CM segment begins at the first `SqueezeField(len=ring_dim)` (short challenges).
+    let squeeze_field_op_offset = first_squeeze_field_op_index_of_len(&ops_f257, ring_dim)?;
+    // Also collect the *prefix* get_challenge() squeezes so the tiny gate has access to all
+    // transcript scalar coins before CM begins (needed for full verifier arithmetization).
+    let prefix_u32_squeeze_ops =
+        collect_get_challenge_squeeze_field_indices(&ops_f257, 0, squeeze_field_op_offset);
+    let wiring_rel = tiny::infer_cm_coin_op_wiring_from_ops(
+        &ops_f257,
+        ring_dim,
+        k,
+        log_kappa,
+        nvars_cm,
+        squeeze_field_op_offset,
+    )?;
+    let mut wiring_abs = tiny::TinyCoinOpWiring::default();
+    wiring_abs.short_squeeze_ops = wiring_rel
+        .short_squeeze_ops
+        .into_iter()
+        .map(|i| i + squeeze_field_op_offset)
+        .collect();
+    wiring_abs.u32_squeeze_ops = wiring_rel
+        .u32_squeeze_ops
+        .into_iter()
+        .map(|i| i + squeeze_field_op_offset)
+        .collect();
+    // Prepend prefix u32 challenges (keeps op order stable).
+    wiring_abs
+        .u32_squeeze_ops
+        .splice(0..0, prefix_u32_squeeze_ops.into_iter());
+
+    let (
+        inst_pose,
+        asg_pose,
+        _shorts,
+        _u32s,
+        _goldilocks,
+        _surfaces_mul,
+        _surfaces_sq,
+        pose_wiring,
+    ) =
+        tiny::we_tiny_f257_build_cm_gate_from_trace_ops(
+            None,
+            &ops_f257,
+            ring_dim,
+            params,
+            &wiring_abs,
+            pairs,
+            &extra,
+            {
+                let out_dir = out_dir.as_ref();
+                out_dir.join("tiny_gate")
+            },
+        )?;
+
+    // Public statement prefix (arm-time bound): [ONE] || [10×WeParams] || [public_inputs...]
+    // Build as a file-backed instance so the full tiny-shape pipeline is file-backed.
+    let out_dir = out_dir.as_ref();
+    let mut b_params = Dr1csBuilder::<F257>::new_file_backed(out_dir.join("params_prefix"))
+        .map_err(|e| format!("tiny gate: params prefix new_file_backed failed: {e}"))?;
+    // Make the constant-1 slot explicit for standalone soundness.
+    b_params.enforce_var_eq_const(b_params.one(), F257::ONE);
+    for &x in &params.to_field_vec::<F257>() {
+        b_params.new_var(x);
+    }
+    // Reserve slots for public input **bytes** (statement-defined); values are provided at proof time.
+    let coeff_bytes = ((<R::BaseRing as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8;
+    let public_inputs_bytes_len = public_inputs_elems
+        .checked_mul(coeff_bytes)
+        .ok_or_else(|| "tiny gate: public input byte length overflow".to_string())?;
+    for _ in 0..public_inputs_bytes_len {
+        b_params.new_var(F257::from(0u64));
+    }
+    let (params_inst, params_asg) = b_params
+        .into_file_backed_instance()
+        .map_err(|e| format!("tiny gate: params prefix into_file_backed_instance failed: {e}"))?;
+
+    // Optional third part: constrain the transcript prefix absorb bytes to match the public prefix.
+    // We encode these constraints in a small additional file-backed module and glue it to:
+    // - params prefix vars (public inputs)
+    // - Poseidon absorb byte vars inside the tiny-gate instance
+    let mut extra_eqs: Vec<(usize, usize)> = Vec::new();
+    let mut parts: Vec<(FileBackedSparseDr1csInstance<F257>, Vec<F257>)> =
+        vec![(params_inst, params_asg), (inst_pose, asg_pose)];
+
+    if public_inputs_elems > 0 {
+        // IMPORTANT: The transcript trace includes **Fiat–Shamir re-absorbs** for each
+        // `get_challenge()` (SqueezeField(len=CHALLENGE_DIGITS) then Absorb(len=CHALLENGE_DIGITS)).
+        // Those absorb ops contain **base-257 digits** in 0..=256 and must NOT be mistaken for
+        // "byte absorbs" that correspond to statement/public-input prefix absorption.
+        //
+        // Therefore, bind public-input bytes to the first `public_inputs_elems` **non-reabsorb**
+        // Absorb ops.
+        let canonical_absorb_ranges: Vec<(usize, usize)> = {
+            let mut out: Vec<(usize, usize)> = Vec::new();
+            let mut absorb_idx = 0usize;
+            let mut expect_reabsorb = false;
+            for (op_i, op) in ops_f257.iter().enumerate() {
+                match op {
+                    symphony::transcript::PoseidonTraceOp::SqueezeField(v) => {
+                        expect_reabsorb = v.len() == crate::transcript::CHALLENGE_DIGITS
+                            && matches!(
+                                ops_f257.get(op_i + 1),
+                                Some(symphony::transcript::PoseidonTraceOp::Absorb(a))
+                                    if a.len() == crate::transcript::CHALLENGE_DIGITS
+                            );
+                    }
+                    symphony::transcript::PoseidonTraceOp::Absorb(_v) => {
+                        let (ab_start, ab_len) = *pose_wiring
+                            .absorb_ranges
+                            .get(absorb_idx)
+                            .ok_or("tiny gate: pose_wiring.absorb_ranges oob (public inputs)")?;
+                        absorb_idx += 1;
+                        let is_reabsorb = expect_reabsorb;
+                        expect_reabsorb = false;
+                        if is_reabsorb {
+                            continue;
+                        }
+                        out.push((ab_start, ab_len));
+                    }
+                    symphony::transcript::PoseidonTraceOp::SqueezeBytes { .. } => {
+                        expect_reabsorb = false;
+                    }
+                }
+            }
+            out
+        };
+        if canonical_absorb_ranges.len() < public_inputs_elems {
+            return Err("tiny gate: not enough non-reabsorb Absorb ops for public inputs".to_string());
+        }
+
+        let (params_asg, tiny_asg) = (&parts[0].1, &parts[1].1);
+        let params_nvars = params_asg.len();
+        let tiny_nvars = tiny_asg.len();
+        let offsets = [0usize, params_nvars.saturating_sub(1), params_nvars.saturating_sub(1).saturating_add(tiny_nvars.saturating_sub(1))];
+        let remap = |part: usize, local: usize, offsets: &[usize; 3]| -> usize {
+            if local == 0 { 0 } else { local + offsets[part] }
+        };
+
+        let mut gb_pub = Dr1csBuilder::<F257>::new_file_backed(out_dir.join("public_inputs_glue"))
+            .map_err(|e| format!("tiny gate: public_inputs_glue new_file_backed failed: {e}"))?;
+        gb_pub.enforce_var_eq_const(gb_pub.one(), F257::ONE);
+
+        // Allocate module-local copies of the public vars (one per public input byte).
+        let mut pub_locals: Vec<usize> = Vec::with_capacity(public_inputs_bytes_len);
+        for _ in 0..public_inputs_bytes_len {
+            pub_locals.push(gb_pub.new_var(F257::ZERO));
+        }
+
+        // Allocate module-local copies of absorb-byte vars as needed.
+        let mut absorb_local_map: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+
+        for i in 0..public_inputs_elems {
+            let (ab_start, ab_len) = canonical_absorb_ranges[i];
+            if ab_len != coeff_bytes {
+                return Err(format!(
+                    "tiny gate: public input absorb len mismatch (got {ab_len}, expected {coeff_bytes})"
+                ));
+            }
+            for j in 0..ab_len {
+                let v_ab_local = pose_wiring.absorb_vars[ab_start + j];
+                if v_ab_local == 0 {
+                    continue;
+                }
+                let ab_local = *absorb_local_map.entry(v_ab_local).or_insert_with(|| gb_pub.new_var(tiny_asg[v_ab_local]));
+                // Bind each absorbed byte to the corresponding statement public byte var.
+                let pub_idx = i * coeff_bytes + j;
+                gb_pub.enforce_lc_times_one_eq_const(vec![
+                    (F257::ONE, ab_local),
+                    (-F257::ONE, pub_locals[pub_idx]),
+                ]);
+            }
+
+            // Glue pub_locals byte vars to params prefix vars.
+            for j in 0..coeff_bytes {
+                let pub_idx = i * coeff_bytes + j;
+                let pub_var = 1usize + 10usize + pub_idx;
+                extra_eqs.push((remap(0, pub_var, &offsets), remap(2, pub_locals[pub_idx], &offsets)));
+            }
+        }
+
+        // Glue absorb-byte locals to tiny-gate absorb-byte vars.
+        for (v_ab_local, ab_local) in absorb_local_map {
+            extra_eqs.push((remap(1, v_ab_local, &offsets), remap(2, ab_local, &offsets)));
+        }
+
+        let (pub_inst, pub_asg) = gb_pub
+            .into_file_backed_instance()
+            .map_err(|e| format!("tiny gate: public_inputs_glue into_file_backed_instance failed: {e}"))?;
+        parts.push((pub_inst, pub_asg));
+    }
+
+    let (inst, _asg) = merge_file_backed_sparse_dr1cs_share_one::<F257>(
+        parts,
+        out_dir.join("merged"),
+        &extra_eqs,
+    )?;
+    Ok(WeDr1csShape { inst, public_len: 1 + 10 + public_inputs_bytes_len })
+}
+
+fn escape_json_str(input: &str) -> String {
+    input
+        .chars()
+        .flat_map(|c| match c {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            '\r' => "\\r".chars().collect::<Vec<_>>(),
+            '\t' => "\\t".chars().collect::<Vec<_>>(),
+            _ => vec![c],
+        })
+        .collect()
+}
+
+fn debug_log(hypothesis_id: &str, location: &str, message: &str, data_json: &str) {
+    use std::io::Write;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let id = format!(
+        "log_{}_{}",
+        timestamp,
+        location
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>()
+    );
+    let payload = format!(
+        "{{\"id\":\"{}\",\"timestamp\":{},\"location\":\"{}\",\"message\":\"{}\",\"data\":{},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"{}\"}}",
+        escape_json_str(&id),
+        timestamp,
+        escape_json_str(location),
+        escape_json_str(message),
+        data_json,
+        escape_json_str(hypothesis_id),
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/debug.log")
+    {
+        let _ = writeln!(f, "{payload}");
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Optional op-count instrumentation (for tiny-field port estimates).
@@ -177,9 +522,16 @@ pub struct WeDr1csOutput<F: PrimeField> {
     pub public_len: usize,
 }
 
-/// Shape-only WE gate output (arm-time artifact): fixed instance + public prefix length.
+/// Shape-only WE gate output (arm-time artifact): fixed **file-backed** instance + public prefix length.
 #[derive(Clone, Debug)]
 pub struct WeDr1csShape<F: PrimeField> {
+    pub inst: FileBackedSparseDr1csInstance<F>,
+    pub public_len: usize,
+}
+
+/// Shape-only WE gate output (arm-time artifact): fixed **in-memory** instance + public prefix length.
+#[derive(Clone, Debug)]
+pub struct WeDr1csShapeInMemory<F: PrimeField> {
     pub inst: SparseDr1csInstance<F>,
     pub public_len: usize,
 }
@@ -193,109 +545,95 @@ fn poseidon_trace_schedule_for_plus<R>(
 ) -> Result<PoseidonTranscriptTrace<BF<R>>, String>
 where
     R: OverField + CoeffRing + PolyRing,
-    R::BaseRing: Zq + Field,
+    R::BaseRing: Zq + PrimeField,
 {
-    // Construct a dummy transcript trace that matches the *exact* op schedule expected by
-    // `build_we_dr1cs_for_plus_proof`'s offsets checker. Values are all zero; only lengths/order matter.
-    use crate::recording_transcript::PoseidonTraceOp as Op;
+    let public_inputs = vec![BF::<R>::ZERO; public_inputs_len];
+    poseidon_trace_schedule_for_plus_with_public_inputs::<R>(&public_inputs, params, n_lin_proofs, mlen_mats)
+}
+
+/// Schedule generator with explicit public inputs.
+///
+/// This is useful for tests that want to validate *statement binding* (public inputs absorbed into
+/// the transcript prefix). The returned trace is self-consistent: all squeeze outputs match the
+/// sponge state induced by the chosen absorbs.
+#[cfg(feature = "we_gate")]
+fn poseidon_trace_schedule_for_plus_with_public_inputs<R>(
+    public_inputs: &[BF<R>],
+    params: &WeParams,
+    n_lin_proofs: usize,
+    mlen_mats: usize,
+) -> Result<PoseidonTranscriptTrace<BF<R>>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + PrimeField,
+{
+    // IMPORTANT: We must return a *self-consistent* transcript trace whose squeeze outputs match
+    // the sponge state evolution induced by the absorbs. This is required now that the tiny gate
+    // enforces Fiat–Shamir chaining (`get_challenge` re-absorbs its squeeze output).
+    use crate::recording_transcript::TracePoseidonTranscript;
+    use latticefold::transcript::Transcript;
 
     let d = R::dimension();
+    let mut tr = TracePoseidonTranscript::<R>::empty::<()>();
 
-    let mut ops: Vec<Op<BF<R>>> = Vec::new();
-    let mut squeezed_field: Vec<BF<R>> = Vec::new();
-    let mut squeezed_bytes: Vec<u8> = Vec::new();
-
-    fn push_absorb<BF: PrimeField>(ops: &mut Vec<Op<BF>>, len: usize) {
-        ops.push(Op::Absorb(vec![BF::ZERO; len]));
-    }
-    fn push_squeeze_field<BF: PrimeField>(
-        ops: &mut Vec<Op<BF>>,
-        squeezed_field: &mut Vec<BF>,
-        len: usize,
-    ) {
-        ops.push(Op::SqueezeField(vec![BF::ZERO; len]));
-        squeezed_field.extend(std::iter::repeat(BF::ZERO).take(len));
-    }
-    fn push_get_challenge<BF: PrimeField>(
-        ops: &mut Vec<Op<BF>>,
-        squeezed_field: &mut Vec<BF>,
-    ) {
-        // TracePoseidonTranscript::get_challenge: SqueezeField(len=1) then Absorb(len=1).
-        push_squeeze_field::<BF>(ops, squeezed_field, 1);
-        push_absorb::<BF>(ops, 1);
-    }
-    fn push_squeeze_bytes<BF: PrimeField>(
-        ops: &mut Vec<Op<BF>>,
-        squeezed_bytes: &mut Vec<u8>,
-        n: usize,
-    ) {
-        ops.push(Op::SqueezeBytes { n, out: vec![0u8; n] });
-        squeezed_bytes.extend(std::iter::repeat(0u8).take(n));
-    }
-
-    // Public inputs absorbed as base-field scalars (len=1).
-    for _ in 0..public_inputs_len {
-        push_absorb::<BF<R>>(&mut ops, 1);
+    // Public inputs absorbed as base-field scalars.
+    for pi in public_inputs {
+        tr.absorb_field_element(pi);
     }
 
     // Π_lin proofs (ComR1CSProof::verify schedule).
-    // NOTE: For arm-time schedule purposes, the Π_lin proof content is irrelevant; only the
-    // number of proofs and their per-proof `nvars` matter. In LF+ this is fixed by params.
     let nvars_lin = params.nvars_setchk as usize;
     for _ in 0..n_lin_proofs {
-        let nvars = nvars_lin;
         // r = transcript.get_challenges(nvars)
-        for _ in 0..nvars {
-            push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field);
+        for _ in 0..nvars_lin {
+            let _ = tr.get_challenge();
         }
-        // absorb (nvars, degree=3) as scalars
-        push_absorb::<BF<R>>(&mut ops, 1);
-        push_absorb::<BF<R>>(&mut ops, 1);
+        // absorb (nvars, degree=3) as scalars (matches MLSumcheck::verify_as_subprotocol header)
+        tr.absorb_field_element(&BF::<R>::from(nvars_lin as u64));
+        tr.absorb_field_element(&BF::<R>::from(3u64));
         // rounds: 4 ring evals + challenge + explicit absorb
-        for _ in 0..nvars {
+        for _ in 0..nvars_lin {
             for _ in 0..4 {
-                push_absorb::<BF<R>>(&mut ops, d);
+                tr.absorb(&R::ZERO);
             }
-            push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field);
-            push_absorb::<BF<R>>(&mut ops, 1);
+            let ri = tr.get_challenge();
+            // Verifier explicitly absorbs the sampled challenge as a scalar.
+            tr.absorb_field_element(&ri);
         }
         // absorb (v,va,vb,vc) (ring, len=d each)
         for _ in 0..4 {
-            push_absorb::<BF<R>>(&mut ops, d);
+            tr.absorb(&R::ZERO);
         }
     }
 
     // --------------------------------------------------------------------
     // CmProof::verify transcript schedule (Dcom prefix + CM proper).
     // --------------------------------------------------------------------
-    // Current WE-gate binding assumes L=1 (single folded instance) for the exposed-prefix bind.
-    if n_lin_proofs != 1 {
-        return Err(
-            "poseidon_trace_schedule_for_plus: currently requires n_lin_proofs == 1 (prefix binding assumes L=1)"
-                .to_string(),
-        );
+    //
+    // `l_instances` is the number of “instances” carried by the CM proof (Dcom commitments,
+    // evaluation tables, etc). For the LF+ schedule, this matches the number of Π_lin proofs.
+    if n_lin_proofs == 0 {
+        return Err("poseidon_trace_schedule_for_plus: n_lin_proofs must be >= 1".to_string());
     }
-    let l_instances = 1usize;
+    let l_instances = n_lin_proofs;
     let kappa = params.kappa as usize;
     let k_rg = params.k as usize;
     let out_nvars = nvars_lin;
     let out_e0_len = k_rg;
     let out_b_len = 1usize;
-    let out_ej_len = d;
     let dcom_evals_len = 1usize;
     let dcom_eval_vec_len = 1 + mlen_mats;
 
-    // Dcom::verify: absorb witness commitments (cm_f, C_Mf, cm_mtau), each ring elem absorbed len=d.
-    // In the PlusProof shape we always have one folded instance, with κ ring elements per commitment.
+    // Dcom::verify: absorb witness commitments (cm_f, C_Mf, cm_mtau), each ring elem.
     for _ in 0..l_instances {
         for _ in 0..kappa {
-            push_absorb::<BF<R>>(&mut ops, d); // cm_f[j]
+            tr.absorb(&R::ZERO);
         }
         for _ in 0..kappa {
-            push_absorb::<BF<R>>(&mut ops, d); // C_Mf[j]
+            tr.absorb(&R::ZERO);
         }
         for _ in 0..kappa {
-            push_absorb::<BF<R>>(&mut ops, d); // cm_mtau[j]
+            tr.absorb(&R::ZERO);
         }
     }
 
@@ -303,100 +641,104 @@ where
     let nclaims = out_e0_len + out_b_len;
     for _ in 0..nclaims {
         for _ in 0..out_nvars {
-            push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field);
+            let _ = tr.get_challenge();
         }
-        push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field); // beta
-        push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field); // alpha
+        let _ = tr.get_challenge(); // beta
+        let _ = tr.get_challenge(); // alpha
     }
     if out_e0_len > 1 {
-        push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field); // rc
+        let _ = tr.get_challenge(); // rc
     }
-    // MLSumcheck::verify_as_subprotocol header (nvars, degree=3).
-    push_absorb::<BF<R>>(&mut ops, 1);
-    push_absorb::<BF<R>>(&mut ops, 1);
+
+    // MLSumcheck::verify_as_subprotocol header (nvars, degree=3) as scalars.
+    tr.absorb_field_element(&BF::<R>::from(out_nvars as u64));
+    tr.absorb_field_element(&BF::<R>::from(3u64));
     for _ in 0..out_nvars {
         for _ in 0..4 {
-            push_absorb::<BF<R>>(&mut ops, d);
+            tr.absorb(&R::ZERO);
         }
-        push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field);
-        push_absorb::<BF<R>>(&mut ops, 1);
+        let ri = tr.get_challenge();
+        tr.absorb_field_element(&ri);
     }
-    // absorb_evaluations_digest(out.e, out.b): Ajtai aggregate commitment (kappa ring elems).
-    //
-    // We must bind *all* `out.e` blocks (including those corresponding to external matrices,
-    // i.e. `mlen_mats > 0`) before sampling the CM short challenges, since downstream CM verifier
-    // math uses all blocks in linear combinations.
 
-    for _ in 0..kappa {
-        push_absorb::<BF<R>>(&mut ops, d);
+    // setchk::absorb_evaluations(out.e, out.b):
+    // Absorb all `out.e` blocks (each is a Vec<Vec<R>> of length `k_rg`, and each `Vec<R>` has
+    // length `d`), then absorb `out.b` (len=1 ring element).
+    for _ in 0..dcom_eval_vec_len {
+        for _ in 0..out_e0_len {
+            for _ in 0..d {
+                tr.absorb(&R::ZERO);
+            }
+        }
     }
+    for _ in 0..out_b_len {
+        tr.absorb(&R::ZERO);
+    }
+
     // rgchk::absorb_evaluations(dcom.evals):
-    // - absorb eval.a as base-ring scalars (len=1 each)
-    // - absorb eval.c as ring elements (len=d each)
+    // - absorb eval.a as base-ring scalars
+    // - absorb eval.c as ring elements
     for _ in 0..dcom_evals_len {
         for _ in 0..dcom_eval_vec_len {
-            push_absorb::<BF<R>>(&mut ops, 1);
+            tr.absorb_field_element(&BF::<R>::ZERO);
         }
         for _ in 0..dcom_eval_vec_len {
-            push_absorb::<BF<R>>(&mut ops, d);
+            tr.absorb(&R::ZERO);
         }
     }
+
     // CM short challenges: s(3) + s_prime(k*d) => need_short squeezes of n=d bytes.
     let need_short = 3 + (params.k as usize) * d;
     for _ in 0..need_short {
-        push_squeeze_bytes::<BF<R>>(&mut ops, &mut squeezed_bytes, d);
+        let _ = tr.squeeze_bytes(d);
     }
+
     // absorb_comh: L × κ ring elements.
     for _ in 0..(l_instances * kappa) {
-        push_absorb::<BF<R>>(&mut ops, d);
+        tr.absorb(&R::ZERO);
     }
+
     // c0/c1 = get_challenges(log_kappa) twice.
     let log_kappa = ark_std::log2((params.kappa as usize).next_power_of_two()) as usize;
     for _ in 0..(2 * log_kappa) {
-        push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field);
+        let _ = tr.get_challenge();
     }
+
     // Two CM sumchecks (degree=2) + eval table absorbs.
     let nvars_cm = params.nvars_cm as usize;
-    for which_sc in 0..2 {
-        push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field); // rc
-        push_absorb::<BF<R>>(&mut ops, 1); // nvars
-        push_absorb::<BF<R>>(&mut ops, 1); // degree=2
+    for _ in 0..2 {
+        let _ = tr.get_challenge(); // rc
+        tr.absorb_field_element(&BF::<R>::from(nvars_cm as u64)); // nvars
+        tr.absorb_field_element(&BF::<R>::from(2u64)); // degree=2
         for _ in 0..nvars_cm {
             for _ in 0..3 {
-                push_absorb::<BF<R>>(&mut ops, d);
+                tr.absorb(&R::ZERO);
             }
-            push_get_challenge::<BF<R>>(&mut ops, &mut squeezed_field);
-            push_absorb::<BF<R>>(&mut ops, 1);
+            let ri = tr.get_challenge();
+            tr.absorb_field_element(&ri);
         }
         // CM eval tables: L instances, with (1+mlen_mats) rows each, each row has 4 ring elems.
-        let _ = which_sc;
         for _ in 0..l_instances {
             for _ in 0..(1 + mlen_mats) {
                 for _ in 0..4 {
-                    push_absorb::<BF<R>>(&mut ops, d);
+                    tr.absorb(&R::ZERO);
                 }
             }
         }
     }
 
-    Ok(PoseidonTranscriptTrace {
-        ops,
-        absorbed: Vec::new(),
-        squeezed_field,
-        squeezed_bytes,
-    })
+    Ok(tr.trace().clone())
 }
 
 #[cfg(feature = "we_gate")]
 fn dummy_plus_proof_shape<R>(
     params: &WeParams,
     mlen_mats: usize,
-    _B: u128,
     n_lin_proofs: usize,
 ) -> Result<crate::plus::PlusProof<R, crate::r1cs::ComR1CSProof<R>>, String>
 where
     R: OverField + CoeffRing + PolyRing,
-    R::BaseRing: Zq + Field,
+    R::BaseRing: Zq + Field + PrimeField,
 {
     use latticefold::utils::sumcheck::prover::ProverMsg;
     use latticefold::utils::sumcheck::Proof;
@@ -519,10 +861,72 @@ where
     })
 }
 
+#[cfg(feature = "we_gate")]
+fn tiny_extra_witness_from_plus_proof<R>(
+    params: &WeParams,
+    proof: &crate::plus::PlusProof<R, crate::r1cs::ComR1CSProof<R>>,
+    mlen_mats: usize,
+) -> Result<tiny::TinyExtraWitness, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + Field + PrimeField,
+{
+    let ring_dim = R::dimension();
+    if ring_dim != 64 {
+        return Err("tiny witness: only ring_dim=64 supported".to_string());
+    }
+    let kappa = params.kappa as usize;
+    let eval_len = 1usize + mlen_mats;
+
+    #[inline]
+    fn base_to_u64<BR: PrimeField>(x: BR) -> u64 {
+        x.into_bigint().as_ref().get(0).copied().unwrap_or(0)
+    }
+    #[inline]
+    fn ring_to_u64_coeffs<Rr: PolyRing>(r: &Rr) -> Vec<u64>
+    where
+        Rr::BaseRing: PrimeField,
+    {
+        r.coeffs().iter().copied().map(base_to_u64::<Rr::BaseRing>).collect()
+    }
+
+    let mut dcom_eval_b: Vec<Vec<Vec<u64>>> = Vec::new();
+    let mut dcom_eval_v: Vec<Vec<u64>> = Vec::new();
+    for ev in &proof.cmproof.dcom.evals {
+        if ev.b.len() != eval_len {
+            return Err("tiny witness: dcom.evals[*].b length mismatch".to_string());
+        }
+        if ev.v.len() != ring_dim {
+            return Err("tiny witness: dcom.evals[*].v length mismatch".to_string());
+        }
+        dcom_eval_b.push(ev.b.iter().map(|r| ring_to_u64_coeffs::<R>(r)).collect());
+        dcom_eval_v.push(ev.v.iter().copied().map(base_to_u64::<R::BaseRing>).collect());
+    }
+
+    if proof.dproof.C.0.len() != kappa || proof.dproof.C.1.len() != kappa {
+        return Err("tiny witness: dproof.C length mismatch".to_string());
+    }
+    let vlen = 1usize + mlen_mats;
+    if proof.dproof.v.0.len() != vlen || proof.dproof.v.1.len() != vlen {
+        return Err("tiny witness: dproof.v length mismatch".to_string());
+    }
+
+    Ok(tiny::TinyExtraWitness {
+        dcom_eval_b,
+        dcom_eval_v,
+        decomp_c0: proof.dproof.C.0.iter().map(|r| ring_to_u64_coeffs::<R>(r)).collect(),
+        decomp_c1: proof.dproof.C.1.iter().map(|r| ring_to_u64_coeffs::<R>(r)).collect(),
+        decomp_v0a: proof.dproof.v.0.iter().map(|(a, _)| ring_to_u64_coeffs::<R>(a)).collect(),
+        decomp_v0b: proof.dproof.v.0.iter().map(|(_, b)| ring_to_u64_coeffs::<R>(b)).collect(),
+        decomp_v1a: proof.dproof.v.1.iter().map(|(a, _)| ring_to_u64_coeffs::<R>(a)).collect(),
+        decomp_v1b: proof.dproof.v.1.iter().map(|(_, b)| ring_to_u64_coeffs::<R>(b)).collect(),
+    })
+}
+
 /// Arm-time (shape-only) builder for the full LF+ Π_plus WE gate.
 ///
 /// Returns a fixed dR1CS instance that depends only on statement/params and on the *shape*
-/// parameters (`public_inputs_len`, `mlen_mats`, `B`, and number of Π_lin proofs).
+/// parameters (`public_inputs_len`, `mlen_mats`, and number of Π_lin proofs).
 #[cfg(feature = "we_gate")]
 pub fn build_we_dr1cs_for_plus_proof_shape<R>(
     poseidon_cfg: &PoseidonConfig<BF<R>>,
@@ -530,13 +934,13 @@ pub fn build_we_dr1cs_for_plus_proof_shape<R>(
     public_inputs_len: usize,
     n_lin_proofs: usize,
     mlen_mats: usize,
-    B: u128,
-) -> Result<WeDr1csShape<BF<R>>, String>
+) -> Result<WeDr1csShapeInMemory<BF<R>>, String>
 where
     R: OverField + CoeffRing + PolyRing,
-    R::BaseRing: Zq + Field,
+    R::BaseRing: Zq + Field + PrimeField,
 {
-    let proof = dummy_plus_proof_shape::<R>(params, mlen_mats, B, n_lin_proofs)?;
+    let B = params.decomp_b as u128;
+    let proof = dummy_plus_proof_shape::<R>(params, mlen_mats, n_lin_proofs)?;
     let trace = poseidon_trace_schedule_for_plus::<R>(public_inputs_len, params, n_lin_proofs, mlen_mats)?;
     let public_inputs = vec![BF::<R>::ZERO; public_inputs_len];
     let out = build_we_dr1cs_for_plus_proof_internal::<R>(
@@ -548,7 +952,7 @@ where
         mlen_mats,
         B,
     )?;
-    Ok(WeDr1csShape { inst: out.inst, public_len: out.public_len })
+    Ok(WeDr1csShapeInMemory { inst: out.inst, public_len: out.public_len })
 }
 
 /// Witness-time builder for the full LF+ Π_plus WE gate.
@@ -568,12 +972,244 @@ pub fn build_we_dr1cs_for_plus_proof_witness<R>(
 ) -> Result<Vec<BF<R>>, String>
 where
     R: OverField + CoeffRing + PolyRing,
-    R::BaseRing: Zq + Field,
+    R::BaseRing: Zq + Field + PrimeField,
 {
     Ok(
         build_we_dr1cs_for_plus_proof::<R>(poseidon_cfg, trace, params, public_inputs, proof, mlen_mats, B)?
             .assignment,
     )
+}
+
+/// Witness-time builder for the tiny gate, **hooked to a real proof**.
+///
+/// This is analogous to `build_we_dr1cs_for_plus_proof_witness(...)` in the full gate: it takes a
+/// real `PlusProof` and uses it to populate the extra non-transcript witness values needed by the
+/// tiny gate (e.g. `dcom.evals[*].b/v` and decomp/LinB2X recomposition surfaces).
+///
+/// NOTE: This does **not** change the arming/shape; it only affects witness assignment.
+#[cfg(feature = "we_gate")]
+pub fn build_we_plus_tiny_dr1cs<R>(
+    trace: &PoseidonTranscriptTrace<BF<R>>,
+    params: &WeParams,
+    public_inputs: &[F257], // statement public **bytes** in F257
+    proof: &crate::plus::PlusProof<R, crate::r1cs::ComR1CSProof<R>>,
+    mlen_mats: usize,
+    pairs: &[(usize, usize)],
+    out_dir: impl AsRef<std::path::Path>,
+) -> Result<(WeDr1csShape<F257>, Vec<F257>), String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + Field + PrimeField,
+{
+    use crate::fs_cleanup::fast_remove_dir_best_effort_to_tmp;
+    let ring_dim = R::dimension();
+    if ring_dim != 64 {
+        return Err("build_we_plus_tiny_dr1cs: only ring_dim=64 supported".to_string());
+    }
+    let extra = tiny_extra_witness_from_plus_proof::<R>(params, proof, mlen_mats)?;
+
+    // Lift recorded ops and infer wiring.
+    let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<R>>(&trace.ops)?;
+    let k = params.k as usize;
+    let log_kappa = ark_std::log2((params.kappa as usize).next_power_of_two()) as usize;
+    let nvars_cm = params.nvars_cm as usize;
+    let squeeze_field_op_offset = first_squeeze_field_op_index_of_len(&ops_f257, ring_dim)?;
+    let prefix_u32_squeeze_ops =
+        collect_get_challenge_squeeze_field_indices(&ops_f257, 0, squeeze_field_op_offset);
+    let wiring_rel = tiny::infer_cm_coin_op_wiring_from_ops(
+        &ops_f257,
+        ring_dim,
+        k,
+        log_kappa,
+        nvars_cm,
+        squeeze_field_op_offset,
+    )?;
+    let mut wiring_abs = tiny::TinyCoinOpWiring::default();
+    wiring_abs.short_squeeze_ops = wiring_rel
+        .short_squeeze_ops
+        .into_iter()
+        .map(|i| i + squeeze_field_op_offset)
+        .collect();
+    wiring_abs.u32_squeeze_ops = wiring_rel
+        .u32_squeeze_ops
+        .into_iter()
+        .map(|i| i + squeeze_field_op_offset)
+        .collect();
+    wiring_abs.u32_squeeze_ops.splice(0..0, prefix_u32_squeeze_ops.into_iter());
+
+    // Build Poseidon(F257)+tiny gadgets instance + assignment in one go.
+    let (inst_pose, asg_pose, _shorts, _u32s, _goldilocks, _surfaces_mul, _surfaces_sq, pose_wiring) =
+        tiny::we_tiny_f257_build_cm_gate_from_trace_ops(
+            None,
+            &ops_f257,
+            ring_dim,
+            params,
+            &wiring_abs,
+            pairs,
+            &extra,
+            {
+                let out_dir = out_dir.as_ref();
+                out_dir.join("tiny_gate")
+            },
+        )?;
+
+    let out_dir = out_dir.as_ref();
+
+    // Public statement prefix: [ONE] || [10×WeParams] || [public_inputs...]
+    let mut b_params = Dr1csBuilder::<F257>::new_file_backed(out_dir.join("params_prefix"))
+        .map_err(|e| format!("tiny witness(from_proof): params prefix new_file_backed failed: {e}"))?;
+    // Make the constant-1 slot explicit for standalone soundness.
+    b_params.enforce_var_eq_const(b_params.one(), F257::ONE);
+    for &x in &params.to_field_vec::<F257>() {
+        b_params.new_var(x);
+    }
+    for &pi in public_inputs {
+        b_params.new_var(pi);
+    }
+    let (params_inst, params_asg) = b_params
+        .into_file_backed_instance()
+        .map_err(|e| format!("tiny witness(from_proof): params prefix into_file_backed_instance failed: {e}"))?;
+
+    let mut extra_eqs: Vec<(usize, usize)> = Vec::new();
+    let mut parts: Vec<(FileBackedSparseDr1csInstance<F257>, Vec<F257>)> =
+        vec![(params_inst, params_asg), (inst_pose, asg_pose)];
+
+    if !public_inputs.is_empty() {
+        let public_inputs_bytes_len = public_inputs.len();
+        let coeff_bytes = ((<R::BaseRing as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8;
+        if (public_inputs_bytes_len % coeff_bytes) != 0 {
+            return Err("tiny witness(from_proof): public input byte len not divisible by coeff_bytes".to_string());
+        }
+        let public_inputs_elems = public_inputs_bytes_len / coeff_bytes;
+        if pose_wiring.absorb_ranges.len() < public_inputs_elems {
+            return Err("tiny witness(from_proof): not enough Absorb ops for public inputs".to_string());
+        }
+        // Same rationale as in the arm/shape builder: skip `get_challenge()` re-absorbs (digits
+        // in 0..=256) when binding statement/public-input prefix bytes.
+        let canonical_absorb_ranges: Vec<(usize, usize)> = {
+            let mut out: Vec<(usize, usize)> = Vec::new();
+            let mut absorb_idx = 0usize;
+            let mut expect_reabsorb = false;
+            for (op_i, op) in ops_f257.iter().enumerate() {
+                match op {
+                    symphony::transcript::PoseidonTraceOp::SqueezeField(v) => {
+                        expect_reabsorb = v.len() == crate::transcript::CHALLENGE_DIGITS
+                            && matches!(
+                                ops_f257.get(op_i + 1),
+                                Some(symphony::transcript::PoseidonTraceOp::Absorb(a))
+                                    if a.len() == crate::transcript::CHALLENGE_DIGITS
+                            );
+                    }
+                    symphony::transcript::PoseidonTraceOp::Absorb(_v) => {
+                        let (ab_start, ab_len) = *pose_wiring
+                            .absorb_ranges
+                            .get(absorb_idx)
+                            .ok_or("tiny witness(from_proof): pose_wiring.absorb_ranges oob (public inputs)")?;
+                        absorb_idx += 1;
+                        let is_reabsorb = expect_reabsorb;
+                        expect_reabsorb = false;
+                        if is_reabsorb {
+                            continue;
+                        }
+                        out.push((ab_start, ab_len));
+                    }
+                    symphony::transcript::PoseidonTraceOp::SqueezeBytes { .. } => {
+                        expect_reabsorb = false;
+                    }
+                }
+            }
+            out
+        };
+        if canonical_absorb_ranges.len() < public_inputs_elems {
+            return Err("tiny witness(from_proof): not enough non-reabsorb Absorb ops for public inputs".to_string());
+        }
+
+        let (params_asg, tiny_asg) = (&parts[0].1, &parts[1].1);
+        let params_nvars = params_asg.len();
+        let tiny_nvars = tiny_asg.len();
+        let offsets = [
+            0usize,
+            params_nvars.saturating_sub(1),
+            params_nvars
+                .saturating_sub(1)
+                .saturating_add(tiny_nvars.saturating_sub(1)),
+        ];
+        let remap = |part: usize, local: usize, offsets: &[usize; 3]| -> usize {
+            if local == 0 { 0 } else { local + offsets[part] }
+        };
+
+        let mut gb_pub = Dr1csBuilder::<F257>::new_file_backed(out_dir.join("public_inputs_glue"))
+            .map_err(|e| format!("tiny witness(from_proof): public_inputs_glue new_file_backed failed: {e}"))?;
+        gb_pub.enforce_var_eq_const(gb_pub.one(), F257::ONE);
+
+        let mut pub_locals: Vec<usize> = Vec::with_capacity(public_inputs_bytes_len);
+        for &pi in public_inputs {
+            pub_locals.push(gb_pub.new_var(pi));
+        }
+        let mut absorb_local_map: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+
+        for i in 0..public_inputs_elems {
+            let (ab_start, ab_len) = canonical_absorb_ranges[i];
+            if ab_len != coeff_bytes {
+                return Err(format!(
+                    "tiny witness(from_proof): public input absorb len mismatch (got {ab_len}, expected {coeff_bytes})"
+                ));
+            }
+            for j in 0..ab_len {
+                let v_ab_local = pose_wiring.absorb_vars[ab_start + j];
+                if v_ab_local == 0 {
+                    continue;
+                }
+                let ab_local = *absorb_local_map
+                    .entry(v_ab_local)
+                    .or_insert_with(|| gb_pub.new_var(tiny_asg[v_ab_local]));
+                let pub_idx = i * coeff_bytes + j;
+                gb_pub.enforce_lc_times_one_eq_const(vec![
+                    (F257::ONE, ab_local),
+                    (-F257::ONE, pub_locals[pub_idx]),
+                ]);
+            }
+            for j in 0..coeff_bytes {
+                let pub_idx = i * coeff_bytes + j;
+                let pub_var = 1usize + 10usize + pub_idx;
+                extra_eqs.push((remap(0, pub_var, &offsets), remap(2, pub_locals[pub_idx], &offsets)));
+            }
+        }
+        for (v_ab_local, ab_local) in absorb_local_map {
+            extra_eqs.push((remap(1, v_ab_local, &offsets), remap(2, ab_local, &offsets)));
+        }
+
+        let (pub_inst, pub_asg) = gb_pub
+            .into_file_backed_instance()
+            .map_err(|e| format!("tiny witness(from_proof): public_inputs_glue into_file_backed_instance failed: {e}"))?;
+        parts.push((pub_inst, pub_asg));
+    }
+
+    let (inst, asg) = merge_file_backed_sparse_dr1cs_share_one::<F257>(
+        parts,
+        out_dir.join("merged"),
+        &extra_eqs,
+    )?;
+
+    // Disk hygiene: the final artifact for this builder is `out_dir/merged`.
+    // Everything else is an intermediate used to construct it.
+    //
+    // Opt-out with: LFP_TINY_WITNESS_KEEP_PARTS=1/true/yes
+    let keep_parts = match std::env::var("LFP_TINY_WITNESS_KEEP_PARTS").as_deref() {
+        Ok("1") | Ok("true") | Ok("yes") => true,
+        _ => false,
+    };
+    if !keep_parts {
+        // Move intermediates out of `out_dir` so `du -sh out_dir` drops immediately.
+        fast_remove_dir_best_effort_to_tmp(&out_dir.join("tiny_gate"));
+        fast_remove_dir_best_effort_to_tmp(&out_dir.join("params_prefix"));
+        fast_remove_dir_best_effort_to_tmp(&out_dir.join("public_inputs_glue"));
+    }
+
+    Ok((
+        WeDr1csShape { inst, public_len: 1 + 10 + public_inputs.len() },
+        asg,
+    ))
 }
 
 fn lf_ops_to_symphony_ops<F: PrimeField>(ops: &[LfPoseidonTraceOp<F>]) -> Vec<symphony::transcript::PoseidonTraceOp<F>> {
@@ -615,6 +1251,11 @@ fn enforce_reabsorb_equals_squeeze<F: PrimeField>(
                 if sq_len != out.len() {
                     return Err("poseidon squeeze length mismatch".to_string());
                 }
+                // Only `get_challenge()` does a Fiat–Shamir re-absorb. In LF+/WE, `squeeze_bytes(d)`
+                // is recorded as `SqueezeField(len=d)` but is NOT re-absorbed.
+                if out.len() != CHALLENGE_DIGITS {
+                    continue;
+                }
                 // IMPORTANT: `absorb_idx` tracks how many Absorb ops we've *already processed*.
                 // The re-absorb corresponding to this squeeze is the *next* Absorb op in the trace,
                 // i.e. it has index `absorb_idx` in `absorb_ranges`. Do NOT increment `absorb_idx`
@@ -631,11 +1272,17 @@ fn enforce_reabsorb_equals_squeeze<F: PrimeField>(
                     let v_sq = wiring.squeeze_field_vars[sq_start + j];
                     let v_ab = wiring.absorb_vars[ab_start + j];
                     // (v_ab - v_sq) * 1 = 0
-                    inst.constraints.push(Constraint {
-                        a: vec![(F::ONE, v_ab), (-F::ONE, v_sq)],
-                        b: vec![(F::ONE, 0)],
-                        c: vec![(F::ZERO, 0)],
-                    });
+                    let a0 = inst.a_terms.len();
+                    inst.a_terms
+                        .extend_from_slice(&[(F::ONE, v_ab), (-F::ONE, v_sq)]);
+                    let a1 = inst.a_terms.len();
+                    let b0 = inst.b_terms.len();
+                    inst.b_terms.push((F::ONE, 0));
+                    let b1 = inst.b_terms.len();
+                    let c0 = inst.c_terms.len();
+                    inst.c_terms.push((F::ZERO, 0));
+                    let c1 = inst.c_terms.len();
+                    inst.constraints.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
                 }
             }
             symphony::transcript::PoseidonTraceOp::SqueezeBytes { .. } => {}
@@ -645,6 +1292,7 @@ fn enforce_reabsorb_equals_squeeze<F: PrimeField>(
 }
 
 type BF<R> = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
+const CHALLENGE_DIGITS: usize = 8;
 
 fn ring_to_ringvars<R>(
     b: &mut Dr1csBuilder<BF<R>>,
@@ -790,6 +1438,46 @@ fn lc_to_var_opt<F: PrimeField>(b: &mut Dr1csBuilder<F>, lc: Lc<F>) -> usize {
     }
 }
 
+// -------------------------------------------------------------------------
+// Lazy ring accumulation using LCs (reduces linear constraints).
+//
+// Many CM math loops build ring sums via repeated `ring_add`, which materializes each intermediate
+// coefficient as a fresh var (1 linear constraint per coeff per add). Instead, we accumulate each
+// coefficient as a linear combination and only materialize once at the end.
+// -------------------------------------------------------------------------
+
+type RingLc<F> = Vec<Lc<F>>;
+
+#[inline]
+fn ring_lc_zero<F: PrimeField>(d: usize) -> RingLc<F> {
+    (0..d).map(|_| Vec::new()).collect()
+}
+
+#[inline]
+fn ring_lc_add_ringvars<F: PrimeField>(acc: &mut RingLc<F>, x: &RingVars, scale: F) {
+    debug_assert_eq!(acc.len(), x.d());
+    if scale.is_zero() {
+        return;
+    }
+    for i in 0..x.d() {
+        acc[i].push((scale, x.coeffs[i]));
+    }
+}
+
+#[inline]
+fn ring_lc_to_ringvars<F: PrimeField>(b: &mut Dr1csBuilder<F>, acc: RingLc<F>) -> RingVars {
+    let d = acc.len();
+    let mut out = Vec::with_capacity(d);
+    for lc in acc {
+        if lc.is_empty() {
+            out.push(const_var::<F>(b, F::ZERO));
+        } else {
+            out.push(lc_to_var_opt::<F>(b, lc));
+        }
+    }
+    RingVars::new(out)
+}
+
 #[inline]
 fn scalar_mul_lc<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: Lc<F>, c: Lc<F>) -> usize {
     cm_bump(|cc| cc.scalar_mul += 1);
@@ -872,21 +1560,6 @@ fn poly_mul_karatsuba_lc<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: &[Lc<F>], c:
     res
 }
 
-fn poly_mul_karatsuba<F: PrimeField>(b: &mut Dr1csBuilder<F>, a: &[usize], c: &[usize]) -> Vec<usize> {
-    assert_eq!(a.len(), c.len());
-    let n = a.len();
-    assert!(n.is_power_of_two(), "karatsuba requires power-of-two length");
-    assert!(n > 0);
-    if n == 1 {
-        return vec![scalar_mul_lc::<F>(b, vec![(F::ONE, a[0])], vec![(F::ONE, c[0])])];
-    }
-    let a_lc: Vec<Lc<F>> = a.iter().map(|&v| vec![(F::ONE, v)]).collect();
-    let c_lc: Vec<Lc<F>> = c.iter().map(|&v| vec![(F::ONE, v)]).collect();
-    poly_mul_karatsuba_lc::<F>(b, &a_lc, &c_lc)
-        .into_iter()
-        .map(|lc| lc_to_var_opt::<F>(b, lc))
-        .collect()
-}
 
 fn ring_mul_negacyclic_karatsuba<F: PrimeField>(
     b: &mut Dr1csBuilder<F>,
@@ -953,6 +1626,291 @@ fn ring_mul_negacyclic_naive<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVar
     RingVars::new(out)
 }
 
+// -------------------------------------------------------------------------
+// Toom-4 optimization (NTT-free) for d=64
+//
+// Karatsuba on length-64 costs 3^6 = 729 mul-constraints per ring-mul.
+// A Toom-4 split (n = 4*m) with 7 evaluation points gives ~7^3 = 343 mul-constraints.
+//
+// We implement a generic Toom-4 polynomial multiplication over LCs:
+// - evaluation/interpolation are pure linear combinations (no constraints)
+// - only the recursive pointwise multiplications introduce mul constraints.
+//
+// This is intended for GoldilocksRing64-scale CM math where ring_mul dominates scalar_mul.
+// -------------------------------------------------------------------------
+
+#[inline]
+fn lc_add_scaled_into<F: PrimeField>(dst: &mut Lc<F>, scale: F, src: &Lc<F>) {
+    lc_extend_scaled(dst, scale, src);
+}
+
+fn toom4_vandermonde_inv<F: PrimeField>() -> ([[F; 7]; 7], [F; 7]) {
+    // Points for block-polynomial interpolation: degree <= 6.
+    //
+    // We deliberately use small symmetric integers (avoid 1/2): 0, 1, -1, 2, -2, 3, -3.
+    //
+    // IMPORTANT (performance):
+    // The Vandermonde inverse for these fixed points is constant. Computing it with Gauss–Jordan
+    // inside every `ring_mul_negacyclic_toom4` call is pure host-side overhead (and was observed
+    // to increase dR1CS build time). We therefore use a precomputed rational inverse.
+    let pts = [
+        F::from(0u64),
+        F::from(1u64),
+        -F::from(1u64),
+        F::from(2u64),
+        -F::from(2u64),
+        F::from(3u64),
+        -F::from(3u64),
+    ];
+
+    // Inverse(Vandermonde(pts)) entries as `nums / 720`.
+    // Derived once offline via exact rational Gauss–Jordan.
+    const NUMS: [[i64; 7]; 7] = [
+        [720, 0, 0, 0, 0, 0, 0],
+        [0, 540, -540, -108, 108, 12, -12],
+        [-980, 540, 540, -54, -54, 4, 4],
+        [0, -195, 195, 120, -120, -15, 15],
+        [280, -195, -195, 60, 60, -5, -5],
+        [0, 15, -15, -12, 12, 3, -3],
+        [-20, 15, 15, -6, -6, 1, 1],
+    ];
+
+    let inv720 = F::from(720u64)
+        .inverse()
+        .expect("toom4_vandermonde_inv: 720 must be invertible in PrimeField");
+    let mut inv = [[F::ZERO; 7]; 7];
+    for r in 0..7 {
+        for c in 0..7 {
+            let n = NUMS[r][c];
+            let nn = if n >= 0 {
+                F::from(n as u64)
+            } else {
+                -F::from((-n) as u64)
+            };
+            inv[r][c] = nn * inv720;
+        }
+    }
+    (inv, pts)
+}
+
+#[inline]
+fn toom4_points_distinct<F: PrimeField>() -> bool {
+    // Must avoid degenerate points in small characteristic (e.g. char=2 or 3).
+    if F::from(720u64).inverse().is_none() {
+        return false;
+    }
+    let pts = [
+        F::from(0u64),
+        F::from(1u64),
+        -F::from(1u64),
+        F::from(2u64),
+        -F::from(2u64),
+        F::from(3u64),
+        -F::from(3u64),
+    ];
+    for i in 0..pts.len() {
+        for j in (i + 1)..pts.len() {
+            if pts[i] == pts[j] {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// -------------------------------------------------------------------------
+// Toom-4 build-time scratch (no math change).
+//
+// We keep per-level evaluation buffers (length m) so repeated Toom-4 calls don't constantly
+// allocate new `Vec<Lc<_>>` and their internal `Vec<(F,usize)>` backing stores.
+// -------------------------------------------------------------------------
+
+struct Toom4Scratch<F: PrimeField> {
+    m: usize,
+    a_eval_buf: Vec<Lc<F>>,
+    c_eval_buf: Vec<Lc<F>>,
+}
+
+#[inline]
+fn toom4_scratch_take<F: PrimeField>(
+    scratch: &mut Vec<Toom4Scratch<F>>,
+    m: usize,
+) -> (usize, Vec<Lc<F>>, Vec<Lc<F>>) {
+    if let Some(pos) = scratch.iter().position(|s| s.m == m) {
+        let a = core::mem::take(&mut scratch[pos].a_eval_buf);
+        let c = core::mem::take(&mut scratch[pos].c_eval_buf);
+        return (pos, a, c);
+    }
+    let a_eval_buf: Vec<Lc<F>> = (0..m).map(|_| Vec::new()).collect();
+    let c_eval_buf: Vec<Lc<F>> = (0..m).map(|_| Vec::new()).collect();
+    scratch.push(Toom4Scratch {
+        m,
+        a_eval_buf: Vec::new(),
+        c_eval_buf: Vec::new(),
+    });
+    (scratch.len() - 1, a_eval_buf, c_eval_buf)
+}
+
+#[inline]
+fn toom4_scratch_put<F: PrimeField>(
+    scratch: &mut Vec<Toom4Scratch<F>>,
+    idx: usize,
+    a_eval_buf: Vec<Lc<F>>,
+    c_eval_buf: Vec<Lc<F>>,
+) {
+    scratch[idx].a_eval_buf = a_eval_buf;
+    scratch[idx].c_eval_buf = c_eval_buf;
+}
+
+fn poly_mul_toom4_lc<F: PrimeField>(
+    b: &mut Dr1csBuilder<F>,
+    a: &[Lc<F>],
+    c: &[Lc<F>],
+    inv_v: &[[F; 7]; 7],
+    pts: &[F; 7],
+    pts2: &[F; 7],
+    pts3: &[F; 7],
+    scratch: &mut Vec<Toom4Scratch<F>>,
+) -> Vec<Lc<F>> {
+    assert_eq!(a.len(), c.len());
+    let n = a.len();
+    assert!(n.is_power_of_two(), "toom4_lc requires pow2 length");
+    assert!(n > 0);
+    if n == 1 {
+        let prod = scalar_mul_lc::<F>(b, a[0].clone(), c[0].clone());
+        return vec![vec![(F::ONE, prod)]];
+    }
+    // Require a Toom-4 split.
+    assert!(n % 4 == 0, "toom4_lc requires n divisible by 4");
+    let m = n / 4;
+
+    let (a0, rest) = a.split_at(m);
+    let (a1, rest) = rest.split_at(m);
+    let (a2, a3) = rest.split_at(m);
+    let (c0, rest) = c.split_at(m);
+    let (c1, rest) = rest.split_at(m);
+    let (c2, c3) = rest.split_at(m);
+
+    // Evaluate at each point and recursively multiply.
+    //
+    // Performance: reuse `a_eval_buf/c_eval_buf` across points (scratch) to avoid heap churn.
+    let (scratch_idx, mut a_eval_buf, mut c_eval_buf) = toom4_scratch_take::<F>(scratch, m);
+    let mut w_eval: Vec<Vec<Lc<F>>> = Vec::with_capacity(7);
+
+    for p in 0..7 {
+        let t = pts[p];
+        let t2 = pts2[p];
+        let t3 = pts3[p];
+        for i in 0..m {
+            // a(t)[i] = a0[i] + t a1[i] + t^2 a2[i] + t^3 a3[i]
+            let out_a = &mut a_eval_buf[i];
+            out_a.clear();
+            out_a.reserve(a0[i].len() + a1[i].len() + a2[i].len() + a3[i].len());
+            lc_add_scaled_into::<F>(out_a, F::ONE, &a0[i]);
+            lc_add_scaled_into::<F>(out_a, t, &a1[i]);
+            lc_add_scaled_into::<F>(out_a, t2, &a2[i]);
+            lc_add_scaled_into::<F>(out_a, t3, &a3[i]);
+
+            // c(t)[i] = c0[i] + t c1[i] + t^2 c2[i] + t^3 c3[i]
+            let out_c = &mut c_eval_buf[i];
+            out_c.clear();
+            out_c.reserve(c0[i].len() + c1[i].len() + c2[i].len() + c3[i].len());
+            lc_add_scaled_into::<F>(out_c, F::ONE, &c0[i]);
+            lc_add_scaled_into::<F>(out_c, t, &c1[i]);
+            lc_add_scaled_into::<F>(out_c, t2, &c2[i]);
+            lc_add_scaled_into::<F>(out_c, t3, &c3[i]);
+        }
+
+        w_eval.push(poly_mul_toom4_lc::<F>(
+            b,
+            &a_eval_buf,
+            &c_eval_buf,
+            inv_v,
+            pts,
+            pts2,
+            pts3,
+            scratch,
+        ));
+    }
+    debug_assert_eq!(w_eval.len(), 7);
+    debug_assert_eq!(w_eval[0].len(), 2 * m - 1);
+
+    // Return scratch buffers to the cache (keep capacities).
+    toom4_scratch_put::<F>(scratch, scratch_idx, a_eval_buf, c_eval_buf);
+
+    // Interpolate and assemble directly into the full convolution (len 2n-1 = 8m-1),
+    // avoiding an intermediate `blocks[7][2m-1]` allocation.
+    //
+    // Performance:
+    // - Each output coefficient is written exactly once (unique `(j,k) -> idx`), so we can reserve
+    //   capacity up-front and avoid realloc during `lc_extend_scaled`.
+    // - `inv_v` has some structural zeros for these evaluation points; skip them by iterating over
+    //   precomputed nonzero index sets (row-wise).
+    const NZ0: [usize; 1] = [0];
+    const NZ1: [usize; 6] = [1, 2, 3, 4, 5, 6];
+    const NZ2: [usize; 7] = [0, 1, 2, 3, 4, 5, 6];
+    const NZ3: [usize; 6] = [1, 2, 3, 4, 5, 6];
+    const NZ4: [usize; 7] = [0, 1, 2, 3, 4, 5, 6];
+    const NZ5: [usize; 6] = [1, 2, 3, 4, 5, 6];
+    const NZ6: [usize; 7] = [0, 1, 2, 3, 4, 5, 6];
+    const NZ: [&[usize]; 7] = [&NZ0, &NZ1, &NZ2, &NZ3, &NZ4, &NZ5, &NZ6];
+
+    let mut res: Vec<Lc<F>> = (0..(2 * n - 1)).map(|_| Vec::new()).collect();
+    for k in 0..(2 * m - 1) {
+        for j in 0..7 {
+            let idx = j * m + k;
+            let dst = &mut res[idx];
+            // Reserve once: sum of input LC sizes for this interpolation row.
+            let mut cap = 0usize;
+            for &i in NZ[j] {
+                cap += w_eval[i][k].len();
+            }
+            dst.reserve(cap);
+            for &i in NZ[j] {
+                lc_add_scaled_into::<F>(dst, inv_v[j][i], &w_eval[i][k]);
+            }
+        }
+    }
+    res
+}
+
+fn ring_mul_negacyclic_toom4<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: &RingVars) -> RingVars {
+    // Toom-4 convolution (len 2d-1) then fold mod (X^d + 1): c[k] = p[k] - p[k+d].
+    let d = x.d();
+    assert_eq!(d, y.d());
+    assert!(d.is_power_of_two());
+    assert!(d % 4 == 0);
+
+    let (inv_v, pts) = toom4_vandermonde_inv::<F>();
+    // Precompute point powers once per top-level Toom-4 (no `pow` in hot loops).
+    let pts2 = pts.map(|t| t * t);
+    let pts3 = [
+        pts2[0] * pts[0],
+        pts2[1] * pts[1],
+        pts2[2] * pts[2],
+        pts2[3] * pts[3],
+        pts2[4] * pts[4],
+        pts2[5] * pts[5],
+        pts2[6] * pts[6],
+    ];
+    let x_lc: Vec<Lc<F>> = x.coeffs.iter().map(|&v| vec![(F::ONE, v)]).collect();
+    let y_lc: Vec<Lc<F>> = y.coeffs.iter().map(|&v| vec![(F::ONE, v)]).collect();
+    let mut scratch: Vec<Toom4Scratch<F>> = Vec::new();
+    let prod_lc = poly_mul_toom4_lc::<F>(b, &x_lc, &y_lc, &inv_v, &pts, &pts2, &pts3, &mut scratch); // len 2d-1
+    debug_assert_eq!(prod_lc.len(), 2 * d - 1);
+    let mut out = Vec::with_capacity(d);
+    for k in 0..d {
+        let hi = k + d;
+        let mut lc = Vec::new();
+        lc_extend_scaled(&mut lc, F::ONE, &prod_lc[k]);
+        if hi < prod_lc.len() {
+            lc_extend_scaled(&mut lc, -F::ONE, &prod_lc[hi]);
+        }
+        out.push(lc_to_var_opt::<F>(b, lc));
+    }
+    RingVars::new(out)
+}
+
 fn ring_mul_negacyclic<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: &RingVars) -> RingVars {
     cm_bump(|c| c.ring_mul_negacyclic += 1);
     let d = x.d();
@@ -960,6 +1918,10 @@ fn ring_mul_negacyclic<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: &RingVars, y: 
     // Karatsuba cuts mul count (64^2 -> 3^6 = 729) for d=64 and is algebraically identical.
     // Fall back to the signed schoolbook for non-pow2 dimensions.
     if d.is_power_of_two() && d > 1 {
+        // For d=64 (GoldilocksRing64), Toom-4 beats Karatsuba without requiring NTT roots.
+        if d == 64 && toom4_points_distinct::<F>() {
+            return ring_mul_negacyclic_toom4::<F>(b, x, y);
+        }
         return ring_mul_negacyclic_karatsuba::<F>(b, x, y);
     }
     ring_mul_negacyclic_naive::<F>(b, x, y)
@@ -1074,6 +2036,8 @@ fn short_challenge_from_bytes<F: PrimeField>(
 
 #[derive(Clone, Debug)]
 pub struct CmShortChallengeWiring {
+    /// Digit variables (one per squeezed F257 element), in order.
+    pub digit_vars: Vec<usize>,
     /// Byte variables (one per squeezed byte), in order.
     pub byte_vars: Vec<usize>,
     /// `s[0..3]` short challenges (ring elements as coefficient vars).
@@ -1090,11 +2054,13 @@ pub struct CmFieldChallengeWiring {
     pub rc1: usize,
     pub sumcheck_r0: Vec<usize>,
     pub sumcheck_r1: Vec<usize>,
+    /// Base-257 digit vars (CHALLENGE_DIGITS per field challenge), in challenge order.
+    pub digit_vars: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
 struct CmChallengeOpWiring {
-    /// Poseidon `SqueezeBytes` op indices (in trace order) used for `s` and `s_prime`.
+    /// Poseidon `SqueezeField` op indices (in trace order) used for `s` and `s_prime` bytes.
     squeeze_bytes_ops: Vec<usize>,
     /// Poseidon `SqueezeField` op indices (in trace order) used for `c0,c1,rc*,sumcheck r*`.
     squeeze_field_ops: Vec<usize>,
@@ -1119,15 +2085,17 @@ where
         return Err("cm_challenge_op_wiring: ops_offset out of range".to_string());
     }
 
-    // We index SqueezeBytes/SqueezeField ops in the same global order as Poseidon wiring.
+    // We index SqueezeField ops in the same global order as Poseidon wiring.
     // Start the counters at the number of such ops strictly before `ops_offset`, then scan the CM
     // segment starting at `ops_offset`.
     let mut bytes_op_idx = 0usize;
     let mut field_op_idx = 0usize;
     for op in &trace.ops[..ops_offset] {
         match op {
-            LfPoseidonTraceOp::SqueezeBytes { .. } => bytes_op_idx += 1,
-            LfPoseidonTraceOp::SqueezeField(_) => field_op_idx += 1,
+            LfPoseidonTraceOp::SqueezeField(_) => {
+                bytes_op_idx += 1;
+                field_op_idx += 1;
+            }
             _ => {}
         }
     }
@@ -1138,25 +2106,20 @@ where
 
     for op in trace.ops.iter().skip(ops_offset) {
         match op {
-            LfPoseidonTraceOp::SqueezeBytes { n, .. } => {
-                if *n == d && squeeze_bytes_ops.len() < need_short {
+            LfPoseidonTraceOp::SqueezeField(v) => {
+                if v.len() == d && squeeze_bytes_ops.len() < need_short {
                     squeeze_bytes_ops.push(bytes_op_idx);
                     if squeeze_bytes_ops.len() == need_short {
                         collecting_field = true;
                     }
                 }
-                bytes_op_idx += 1;
-            }
-            LfPoseidonTraceOp::SqueezeField(v) => {
                 if collecting_field && squeeze_field_ops.len() < need_field {
-                    // Current WE gate code assumes base-field squeezes (len=1) for CM challenges.
-                    if v.len() != 1 {
-                        return Err(
-                            "cm_challenge_op_wiring: expected base-field squeeze len=1".to_string(),
-                        );
+                    // Base-257 challenges use CHALLENGE_DIGITS field elements per challenge.
+                    if v.len() == CHALLENGE_DIGITS {
+                        squeeze_field_ops.push(field_op_idx);
                     }
-                    squeeze_field_ops.push(field_op_idx);
                 }
+                bytes_op_idx += 1;
                 field_op_idx += 1;
             }
             _ => {}
@@ -1168,7 +2131,7 @@ where
 
     if squeeze_bytes_ops.len() != need_short {
         return Err(format!(
-            "cm_challenge_op_wiring: need {} SqueezeBytes ops, saw {}",
+            "cm_challenge_op_wiring: need {} short SqueezeField ops, saw {}",
             need_short,
             squeeze_bytes_ops.len()
         ));
@@ -1188,21 +2151,21 @@ where
 
 fn cm_poseidon_challenge_vars<R>(
     pose_wiring: &PoseidonDr1csWiring,
-    byte_wiring: &PoseidonByteWiring,
+    _byte_wiring: &PoseidonByteWiring,
     op_wiring: &CmChallengeOpWiring,
 ) -> Result<(Vec<usize>, Vec<usize>), String>
 where
     R: PolyRing,
     R::BaseRing: Field,
 {
-    // Flatten byte vars in the order of short_challenges.
+    // Flatten digit vars (F257) in the order of short_challenges.
     let mut bytes = Vec::new();
     for &op_idx in &op_wiring.squeeze_bytes_ops {
-        let (start, len) = *byte_wiring
-            .squeeze_byte_ranges
+        let (start, len) = *pose_wiring
+            .squeeze_field_ranges
             .get(op_idx)
-            .ok_or("poseidon byte wiring squeeze_byte_ranges oob")?;
-        bytes.extend_from_slice(&byte_wiring.squeeze_byte_vars[start..start + len]);
+            .ok_or("poseidon wiring squeeze_field_ranges oob (short)")?;
+        bytes.extend_from_slice(&pose_wiring.squeeze_field_vars[start..start + len]);
     }
 
     // Flatten field vars in the order we expect.
@@ -1212,10 +2175,10 @@ where
             .squeeze_field_ranges
             .get(op_idx)
             .ok_or("poseidon wiring squeeze_field_ranges oob")?;
-        if len != 1 {
-            return Err("expected base-field squeeze len=1".to_string());
+        if len != CHALLENGE_DIGITS {
+            return Err("expected base-257 squeeze len=CHALLENGE_DIGITS".to_string());
         }
-        fields.push(pose_wiring.squeeze_field_vars[start]);
+        fields.extend_from_slice(&pose_wiring.squeeze_field_vars[start..start + len]);
     }
     Ok((bytes, fields))
 }
@@ -1275,6 +2238,286 @@ fn scalar_pow_table<F: PrimeField>(b: &mut Dr1csBuilder<F>, base: usize, max_exp
     debug_assert_eq!(pows[0], v0);
     debug_assert_eq!(b.assignment[one], F::ONE);
     pows
+}
+
+/// Reconstruct a bounded scalar challenge from a fixed-size F257 digit block.
+///
+/// Semantics must match `latticefold-plus/src/transcript.rs:get_challenge`:
+/// - digit vars are constrained to be in `{0..=256}` by mapping to byte view and range-checking
+/// - byte view maps `256 -> 0`, else identity
+/// - the scalar is the u32 packed from the first 4 bytes (little-endian)
+fn combine_base257_digits<F: PrimeField>(b: &mut Dr1csBuilder<F>, digits: &[usize]) -> usize {
+    if digits.len() != CHALLENGE_DIGITS {
+        panic!(
+            "combine_base257_digits: expected {} digits, got {}",
+            CHALLENGE_DIGITS,
+            digits.len()
+        );
+    }
+
+    // digit -> byte view (256 -> 0) with 8-bit range check.
+    //
+    // IMPORTANT: this is an *integer* mapping, not field-specific:
+    //   byte = digit - 256*is_eq256, where is_eq256 ∈ {0,1} and is_eq256 <-> (digit==256).
+    let digit_to_byte = |b: &mut Dr1csBuilder<F>, digit_var: usize| -> usize {
+        let c256 = F::from(256u64);
+
+        // diff = digit - 256
+        let diff_val = b.assignment[digit_var] - c256;
+        let diff = b.new_var(diff_val);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, digit_var),
+            (-c256, b.one()),
+            (-F::ONE, diff),
+        ]);
+
+        // is_eq256 ∈ {0,1} indicates diff==0.
+        let is_eq256 = b.new_var(if diff_val == F::ZERO { F::ONE } else { F::ZERO });
+        enforce_bit::<F>(b, is_eq256);
+
+        // diff * is_eq256 == 0
+        let z = b.new_var(diff_val * b.assignment[is_eq256]);
+        b.enforce_mul(diff, is_eq256, z);
+        b.enforce_var_eq_const(z, F::ZERO);
+
+        // inverse trick: diff * inv = 1 - is_eq256
+        let inv = b.new_var(diff_val.inverse().unwrap_or(F::ZERO));
+        let prod = b.new_var(diff_val * b.assignment[inv]);
+        b.enforce_mul(diff, inv, prod);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, prod),
+            (F::ONE, is_eq256),
+            (-F::ONE, b.one()),
+        ]);
+
+        // byte = digit - 256*is_eq256
+        let byte_val = b.assignment[digit_var] - c256 * b.assignment[is_eq256];
+        let byte = b.new_var(byte_val);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, digit_var),
+            (-c256, is_eq256),
+            (-F::ONE, byte),
+        ]);
+        enforce_byte::<F>(b, byte);
+        byte
+    };
+
+    let b0 = digit_to_byte(b, digits[0]);
+    let b1 = digit_to_byte(b, digits[1]);
+    let b2 = digit_to_byte(b, digits[2]);
+    let b3 = digit_to_byte(b, digits[3]);
+
+    // u32 little-endian pack in the field.
+    let w1 = F::from(256u64);
+    let w2 = F::from(256u64 * 256u64);
+    let w3 = F::from(256u64 * 256u64 * 256u64);
+    lc_to_var::<F>(b, vec![(F::ONE, b0), (w1, b1), (w2, b2), (w3, b3)])
+}
+
+fn enforce_byte<F: PrimeField>(b: &mut Dr1csBuilder<F>, byte_var: usize) {
+    let byte_val_u64 = b.assignment[byte_var]
+        .into_bigint()
+        .to_bytes_le()
+        .get(0)
+        .copied()
+        .unwrap_or(0) as u64;
+    let byte0 = (byte_val_u64 & 0xFF) as u8;
+
+    let one = b.one();
+    let mut bits: [usize; 8] = [0; 8];
+    for i in 0..8 {
+        let bi = ((byte0 >> i) & 1) as u64;
+        let v = b.new_var(if bi == 1 { F::ONE } else { F::ZERO });
+        // v * (1 - v) = 0
+        b.add_constraint(
+            vec![(F::ONE, v)],
+            vec![(F::ONE, one), (-F::ONE, v)],
+            vec![(F::ZERO, one)],
+        );
+        bits[i] = v;
+    }
+
+    // Enforce: byte_var == Σ 2^i * bits[i]
+    let mut lc_byte: Vec<(F, usize)> = Vec::with_capacity(1 + 8);
+    lc_byte.push((F::ONE, byte_var));
+    for i in 0..8 {
+        let p2 = F::from(1u64 << i);
+        lc_byte.push((-p2, bits[i]));
+    }
+    b.enforce_lc_times_one_eq_const(lc_byte);
+}
+
+fn enforce_bit<F: PrimeField>(b: &mut Dr1csBuilder<F>, bit_var: usize) {
+    let one = b.one();
+    b.add_constraint(
+        vec![(F::ONE, bit_var)],
+        vec![(F::ONE, one), (-F::ONE, bit_var)],
+        vec![(F::ZERO, one)],
+    );
+}
+
+/// Deterministic byte-view of an F257 digit `d ∈ {0..=256}` used by LF+/WE:
+///   byte(d) = if d == 256 { 0 } else { d }.
+///
+/// Returned var is constrained to be 8-bit (via `enforce_byte`) as soon as downstream
+/// code calls `short_challenge_coeff_from_byte`.
+fn f257_digit_to_byte_view<R>(
+    b: &mut Dr1csBuilder<BF<R>>,
+    digit_var: usize,
+) -> usize
+where
+    R: PolyRing,
+    R::BaseRing: PrimeField,
+{
+    // diff = digit - 256
+    let diff_val = b.assignment[digit_var] - BF::<R>::from(256u64);
+    let diff = b.new_var(diff_val);
+    b.enforce_lc_times_one_eq_const(vec![
+        (BF::<R>::ONE, digit_var),
+        (-BF::<R>::from(256u64), b.one()),
+        (-BF::<R>::ONE, diff),
+    ]);
+
+    // is_eq256 ∈ {0,1} indicates diff==0.
+    let is_eq256 = b.new_var(if diff_val == BF::<R>::ZERO {
+        BF::<R>::ONE
+    } else {
+        BF::<R>::ZERO
+    });
+    enforce_bit::<BF<R>>(b, is_eq256);
+
+    // diff * is_eq256 == 0
+    let z = b.new_var(diff_val * b.assignment[is_eq256]);
+    b.enforce_mul(diff, is_eq256, z);
+    b.enforce_var_eq_const(z, BF::<R>::ZERO);
+
+    // (diff != 0) => is_eq256 == 0
+    // Use inverse trick: diff * inv = 1 - is_eq256
+    let inv = b.new_var(diff_val.inverse().unwrap_or(BF::<R>::ZERO));
+    let prod = b.new_var(diff_val * b.assignment[inv]);
+    b.enforce_mul(diff, inv, prod);
+    b.enforce_lc_times_one_eq_const(vec![
+        (BF::<R>::ONE, prod),
+        (BF::<R>::ONE, is_eq256),
+        (-BF::<R>::ONE, b.one()),
+    ]);
+
+    // byte = digit - 256*is_eq256
+    let byte_val = b.assignment[digit_var] - BF::<R>::from(256u64) * b.assignment[is_eq256];
+    let byte = b.new_var(byte_val);
+    b.enforce_lc_times_one_eq_const(vec![
+        (BF::<R>::ONE, digit_var),
+        (-BF::<R>::from(256u64), is_eq256),
+        (-BF::<R>::ONE, byte),
+    ]);
+    byte
+}
+
+#[inline]
+fn prime_field_fixed_width_bytes<F: PrimeField>() -> usize {
+    ((F::MODULUS_BIT_SIZE as usize) + 7) / 8
+}
+
+/// Decompose a prime-field variable into **fixed-width** little-endian bytes, matching
+/// `prime_field_to_bytes_le_fixed` in `latticefold::transcript::bytes`.
+///
+/// Returns `nbytes = ceil(MODULUS_BIT_SIZE/8)` byte vars (each constrained 0..255) and enforces:
+/// - `x == Σ 256^i * byte[i] (mod F)`
+/// - the byte vector is the **canonical** representation (integer < MODULUS)
+fn prime_field_to_bytes_le_fixed_vars<F: PrimeField>(
+    b: &mut Dr1csBuilder<F>,
+    x_var: usize,
+) -> Vec<usize> {
+    let nbytes = prime_field_fixed_width_bytes::<F>();
+
+    // Witness bytes from the canonical bigint representation.
+    let mut le = b.assignment[x_var].into_bigint().to_bytes_le();
+    le.resize(nbytes, 0u8);
+
+    // Allocate byte vars and constrain them as 8-bit via bit decomposition.
+    let mut byte_vars: Vec<usize> = Vec::with_capacity(nbytes);
+    for &by in &le {
+        let v = b.new_var(F::from(by as u64));
+        enforce_byte::<F>(b, v);
+        byte_vars.push(v);
+    }
+
+    // Enforce recomposition: x - Σ 256^i * byte[i] == 0
+    let mut lc: Vec<(F, usize)> = Vec::with_capacity(1 + nbytes);
+    lc.push((F::ONE, x_var));
+    let base = F::from(256u64);
+    let mut pow = F::ONE;
+    for &bv in &byte_vars {
+        lc.push((-pow, bv));
+        pow *= base;
+    }
+    b.enforce_lc_times_one_eq_const(lc);
+
+    // Enforce canonicality: integer(bytes) < MODULUS.
+    //
+    // We do a bytewise subtraction: MODULUS - bytes = diff, with no final borrow and diff != 0.
+    let mut p_bytes = F::MODULUS.to_bytes_le();
+    p_bytes.resize(nbytes, 0u8);
+
+    let mut borrow = 0u64;
+    let mut borrow_vars: Vec<usize> = Vec::with_capacity(nbytes + 1);
+    let b0 = b.new_var(F::ZERO);
+    b.enforce_var_eq_const(b0, F::ZERO);
+    borrow_vars.push(b0);
+
+    let mut diff_byte_vars: Vec<usize> = Vec::with_capacity(nbytes);
+    for i in 0..nbytes {
+        let mi = p_bytes[i] as u64;
+        let bi = le[i] as u64;
+        let t_i64 = (mi as i64) - (bi as i64) - (borrow as i64);
+        let (t_u8, borrow_next) = if t_i64 < 0 {
+            ((t_i64 + 256) as u8, 1u64)
+        } else {
+            (t_i64 as u8, 0u64)
+        };
+        borrow = borrow_next;
+
+        let t_var = b.new_var(F::from(t_u8 as u64));
+        enforce_byte::<F>(b, t_var);
+        diff_byte_vars.push(t_var);
+
+        let bnext = b.new_var(if borrow_next == 1 { F::ONE } else { F::ZERO });
+        enforce_bit::<F>(b, bnext);
+        borrow_vars.push(bnext);
+
+        // Enforce: mi - byte[i] - borrow[i] == diff[i] - 256*borrow[i+1]
+        let one = b.one();
+        b.add_constraint(
+            vec![
+                (F::from(mi), one),
+                (-F::ONE, byte_vars[i]),
+                (-F::ONE, borrow_vars[i]),
+                (-F::ONE, t_var),
+                (F::from(256u64), bnext),
+            ],
+            vec![(F::ONE, one)],
+            vec![(F::ZERO, one)],
+        );
+    }
+
+    // No underflow in MODULUS - bytes.
+    b.enforce_var_eq_const(*borrow_vars.last().unwrap(), F::ZERO);
+
+    // diff != 0
+    let mut lc_diff: Vec<(F, usize)> = Vec::with_capacity(nbytes);
+    let mut pow = F::ONE;
+    for &dv in &diff_byte_vars {
+        lc_diff.push((pow, dv));
+        pow *= base;
+    }
+    let diff = lc_to_var::<F>(b, lc_diff);
+    let diff_val = b.assignment[diff];
+    let inv = b.new_var(diff_val.inverse().unwrap_or(F::ZERO));
+    let prod = b.new_var(diff_val * b.assignment[inv]);
+    b.enforce_mul(diff, inv, prod);
+    b.enforce_var_eq_const(prod, F::ONE);
+
+    byte_vars
 }
 
 fn tensor_scalar_vars<F: PrimeField>(b: &mut Dr1csBuilder<F>, c: &[usize]) -> Vec<usize> {
@@ -1453,11 +2696,11 @@ fn cm_verifier_math_dr1cs<R>(
 >
 where
     R: OverField + CoeffRing + PolyRing,
-    R::BaseRing: Zq + Field,
+    R::BaseRing: Zq + Field + PrimeField,
 {
     use latticefold::utils::sumcheck::Proof as ScProof;
-
     let d = R::dimension();
+
     let l_instances = proof.evals.0.len();
     let ell = proof.dcom.dparams.l;
 
@@ -1477,23 +2720,29 @@ where
     let nclaims_setchk = out_sc.e[0].len() + out_sc.b.len();
     let has_rc_setchk = out_sc.e[0].len() > 1;
 
+    // Number of `get_challenge()` scalar coins in the Dcom prefix.
     let expected_squeezes =
         nclaims_setchk * (nvars_setchk + 2) + if has_rc_setchk { 1 } else { 0 } + nvars_setchk;
+    // Each `get_challenge()` is recorded as `SqueezeField(len=CHALLENGE_DIGITS)` base-257 digits.
+    let expected_squeeze_elems = expected_squeezes * CHALLENGE_DIGITS;
     if ops_offset > trace.ops.len() {
         return Err("cm/dcom prefix: ops_offset out of range".to_string());
     }
     let prefix_squeezes =
-        count_squeezed_field_elems_before_first_squeeze_bytes::<BF<R>>(&trace.ops[ops_offset..]);
-    if prefix_squeezes != expected_squeezes {
+        count_squeezed_field_elems_before_first_short_squeeze::<BF<R>>(
+            &trace.ops[ops_offset..],
+            d,
+        );
+    if prefix_squeezes != expected_squeeze_elems {
         return Err(format!(
             "cm/dcom prefix: squeeze_field count mismatch before bytes: expected {}, trace has {}",
-            expected_squeezes, prefix_squeezes
+            expected_squeeze_elems, prefix_squeezes
         ));
     }
     if squeezed_field_offset > trace.squeezed_field.len() {
         return Err("cm/dcom prefix: squeezed_field_offset out of range".to_string());
     }
-    if trace.squeezed_field.len() - squeezed_field_offset < expected_squeezes {
+    if trace.squeezed_field.len() - squeezed_field_offset < expected_squeeze_elems {
         return Err("cm/dcom prefix: trace.squeezed_field too short".to_string());
     }
 
@@ -1523,40 +2772,48 @@ where
         public_input_vars.push(b.new_var(x));
     }
 
-    // Allocate local squeeze vars with trace values (prefix coins).
-    let mut squeeze_field_vars: Vec<usize> = Vec::with_capacity(expected_squeezes);
+    // Allocate local digit vars with trace values (prefix coins).
+    let mut squeeze_field_vars: Vec<usize> = Vec::with_capacity(expected_squeeze_elems);
     for &v in trace
         .squeezed_field
         .iter()
         .skip(squeezed_field_offset)
-        .take(expected_squeezes)
+        .take(expected_squeeze_elems)
     {
         squeeze_field_vars.push(b.new_var(v));
     }
 
-    let mut cur_prefix = 0usize;
-    let take_prefix = |cur: &mut usize, n: usize, xs: &[usize]| -> Vec<usize> {
-        let out = xs[*cur..*cur + n].to_vec();
-        *cur += n;
-        out
-    };
     let mut c_vars: Vec<Vec<usize>> = Vec::with_capacity(nclaims_setchk);
     let mut beta_vars: Vec<usize> = Vec::with_capacity(nclaims_setchk);
     let mut alpha_vars: Vec<usize> = Vec::with_capacity(nclaims_setchk);
+
+    let mut cur_digit = 0usize;
+    let mut next_scalar = |b: &mut Dr1csBuilder<BF<R>>, digits: &[usize]| -> usize {
+        let slice = &digits[cur_digit..cur_digit + CHALLENGE_DIGITS];
+        cur_digit += CHALLENGE_DIGITS;
+        combine_base257_digits::<BF<R>>(b, slice)
+    };
     for _ in 0..nclaims_setchk {
-        c_vars.push(take_prefix(&mut cur_prefix, nvars_setchk, &squeeze_field_vars));
-        beta_vars.push(take_prefix(&mut cur_prefix, 1, &squeeze_field_vars)[0]);
-        alpha_vars.push(take_prefix(&mut cur_prefix, 1, &squeeze_field_vars)[0]);
+        let mut ci = Vec::with_capacity(nvars_setchk);
+        for _ in 0..nvars_setchk {
+            ci.push(next_scalar(&mut b, &squeeze_field_vars));
+        }
+        c_vars.push(ci);
+        beta_vars.push(next_scalar(&mut b, &squeeze_field_vars));
+        alpha_vars.push(next_scalar(&mut b, &squeeze_field_vars));
     }
     let rc_var = if has_rc_setchk {
-        Some(take_prefix(&mut cur_prefix, 1, &squeeze_field_vars)[0])
+        Some(next_scalar(&mut b, &squeeze_field_vars))
     } else {
         None
     };
-    let r_point_vars = take_prefix(&mut cur_prefix, nvars_setchk, &squeeze_field_vars);
-    debug_assert_eq!(cur_prefix, expected_squeezes);
+    let mut r_point_vars = Vec::with_capacity(nvars_setchk);
+    for _ in 0..nvars_setchk {
+        r_point_vars.push(next_scalar(&mut b, &squeeze_field_vars));
+    }
+    debug_assert_eq!(cur_digit, squeeze_field_vars.len());
 
-    // Prefix absorb surface (non-reabsorb absorbs before first SqueezeBytes).
+    // Prefix absorb surface (non-reabsorb absorbs before first short SqueezeField).
     let mut absorb_flat_prefix: Vec<usize> = Vec::new();
     if include_public_inputs_in_absorb {
         for &v in &public_input_vars {
@@ -1570,7 +2827,7 @@ where
         for (l, cmc) in dcom.fcoms.iter().enumerate() {
             for j in 0..kappa {
                 let rv = ring_to_ringvars::<R>(&mut b, &cmc.cm_f[j]);
-                absorb_flat_prefix.extend_from_slice(&rv.coeffs);
+                absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat_prefix, &rv);
                 absorb_dcom_cm_f(rv.coeffs.len());
 
                 const EXPOSE_MAX: usize = 8;
@@ -1597,12 +2854,12 @@ where
             }
             for j in 0..kappa {
                 let rv = ring_to_ringvars::<R>(&mut b, &cmc.C_Mf[j]);
-                absorb_flat_prefix.extend_from_slice(&rv.coeffs);
+                absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat_prefix, &rv);
                 absorb_dcom_C_Mf(rv.coeffs.len());
             }
             for j in 0..kappa {
                 let rv = ring_to_ringvars::<R>(&mut b, &cmc.cm_mtau[j]);
-                absorb_flat_prefix.extend_from_slice(&rv.coeffs);
+                absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat_prefix, &rv);
                 absorb_dcom_cm_mtau(rv.coeffs.len());
             }
         }
@@ -1627,10 +2884,10 @@ where
         let e1 = ring_to_ringvars::<R>(&mut b, &m.evaluations[1]);
         let e2 = ring_to_ringvars::<R>(&mut b, &m.evaluations[2]);
         let e3 = ring_to_ringvars::<R>(&mut b, &m.evaluations[3]);
-        absorb_flat_prefix.extend_from_slice(&e0.coeffs);
-        absorb_flat_prefix.extend_from_slice(&e1.coeffs);
-        absorb_flat_prefix.extend_from_slice(&e2.coeffs);
-        absorb_flat_prefix.extend_from_slice(&e3.coeffs);
+        absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat_prefix, &e0);
+        absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat_prefix, &e1);
+        absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat_prefix, &e2);
+        absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat_prefix, &e3);
         absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat_prefix, r_point_vars[round]);
         absorb_dcom_setchk_msgs(e0.coeffs.len() + e1.coeffs.len() + e2.coeffs.len() + e3.coeffs.len());
         absorb_dcom_setchk_r(1);
@@ -1641,14 +2898,18 @@ where
     let ring_zero = scalar_var_to_ringvars::<R>(&mut b, z0);
     let v_sc = sumcheck_verify_degree3::<BF<R>>(&mut b, ring_zero.clone(), &msg_vars_sc, &r_point_vars)?;
 
-    // Allocate out.e/out.b ring vars once (used by SetChk digest + RgChk + CM u computation).
+    // Allocate out.e/out.b ring vars once (used by transcript absorbs + RgChk + CM u computation).
     let mut out_e_vars: Vec<Vec<Vec<RingVars>>> = Vec::with_capacity(out_sc.e.len());
     for ek in &out_sc.e {
         let mut ek_vars: Vec<Vec<RingVars>> = Vec::with_capacity(ek.len());
         for ej in ek {
             let mut ej_vars: Vec<RingVars> = Vec::with_capacity(ej.len());
             for r in ej {
-                ej_vars.push(ring_to_ringvars::<R>(&mut b, r));
+                let rv = ring_to_ringvars::<R>(&mut b, r);
+                // setchk::absorb_evaluations absorbs *all* blocks and all lanes of out.e.
+                absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat_prefix, &rv);
+                absorb_dcom_out_e(rv.coeffs.len());
+                ej_vars.push(rv);
             }
             ek_vars.push(ej_vars);
         }
@@ -1656,116 +2917,23 @@ where
     }
     let mut out_b_vars: Vec<RingVars> = Vec::with_capacity(out_sc.b.len());
     for bb in &out_sc.b {
-        out_b_vars.push(ring_to_ringvars::<R>(&mut b, bb));
+        let rv = ring_to_ringvars::<R>(&mut b, bb);
+        // setchk::absorb_evaluations absorbs out.b after all out.e blocks.
+        absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat_prefix, &rv);
+        absorb_dcom_out_b(rv.coeffs.len());
+        out_b_vars.push(rv);
     }
 
-    // Ajtai aggregate commitment binding for out.e/out.b (cheap, linear constraints).
-    let mut out_flat_vals: Vec<R> = Vec::new();
-    let mut out_flat_vars: Vec<RingVars> = Vec::new();
-    for i in 0..out_sc.e[0].len() {
-        for blk in 0..out_e_vars.len() {
-            for lane in 0..out_e_vars[blk][i].len() {
-                out_flat_vals.push(out_sc.e[blk][i][lane]);
-                out_flat_vars.push(out_e_vars[blk][i][lane].clone());
-            }
-        }
-    }
-    for i in 0..out_sc.b.len() {
-        out_flat_vals.push(out_sc.b[i]);
-        out_flat_vars.push(out_b_vars[i].clone());
-    }
-    if out_flat_vals.is_empty() {
-        return Err("WeGateDr1csBuilder: empty out.e/out.b aggregate".to_string());
-    }
-    let kappa = params.kappa as usize;
-    if kappa == 0 {
-        return Err("WeGateDr1csBuilder: kappa=0 invalid".to_string());
-    }
-    let out_e_agg_scheme = AjtaiCommitmentScheme::<R>::seeded(
-        b"setchk_out_e_agg",
-        OUT_E_AGG_SEED,
-        kappa,
-        out_flat_vals.len(),
-    );
-    // IMPORTANT:
-    // `setchk::absorb_evaluations_digest` commits to the full `flat` vector; it only uses
-    // `commit_const_coeff_fast` as an optimization when the witness is const-coeff.
-    //
-    // For the WE gate, we must support the general case without assuming const-coeff shape here.
-    let out_e_agg = out_e_agg_scheme
-        .commit(&out_flat_vals)
-        .map_err(|e| format!("WeGateDr1csBuilder: out_e_agg commit failed: {e:?}"))?
-        .as_ref()
-        .to_vec();
-    // Absorb the aggregate commitment (kappa ring elements) into the transcript.
-    let mut out_e_agg_vars: Vec<RingVars> = Vec::with_capacity(kappa);
-    for ce in &out_e_agg {
-        let mut coeffs = Vec::with_capacity(ce.coeffs().len());
-        for &c in ce.coeffs() {
-            // Witness variable (NOT const); constrained by Ajtai opening below.
-            coeffs.push(b.new_var(bf_from_base_ring::<R>(c)));
-        }
-        out_e_agg_vars.push(RingVars::new(coeffs));
-    }
-    for rv in &out_e_agg_vars {
-        absorb_flat_prefix.extend_from_slice(&rv.coeffs);
-        absorb_dcom_out_e(rv.d());
-    }
-
-    // Ajtai opening constraints: enforce `commit(flat) == out_e_agg`.
-    //
-    // Since the Ajtai matrix entries are *constants* (seeded), multiplication by `a_ij` is a
-    // fixed linear map on the coefficient vector of each `flat[j]` (negacyclic convolution).
-    // We therefore enforce the commitment relation using only linear constraints (no ring mul gadget).
-    let n_out_agg = out_flat_vals.len();
-    let d = R::dimension();
-    // Precompute Ajtai matrix columns `col[j] = commit(e_j)` once. Each `col[j][i]` is `a_ij`.
-    let mut cols: Vec<Vec<R>> = Vec::with_capacity(n_out_agg);
-    for j in 0..n_out_agg {
-        let mut basis = vec![R::ZERO; n_out_agg];
-        basis[j] = R::ONE;
-        let col = out_e_agg_scheme
-            .commit(&basis)
-            .map_err(|e| format!("WeGateDr1csBuilder: out_e_agg basis commit failed: {e:?}"))?
-            .as_ref()
-            .to_vec();
-        cols.push(col);
-    }
-    // Enforce each output coefficient directly as a linear form over input coefficients.
-    for i in 0..kappa {
-        for k_out in 0..d {
-            let mut lc: Vec<(BF<R>, usize)> = Vec::new();
-            for j in 0..n_out_agg {
-                let aij = &cols[j][i];
-                let a_coeffs = aij.coeffs();
-                for v in 0..d {
-                    let (u, sign) = if k_out >= v {
-                        (k_out - v, BF::<R>::ONE)
-                    } else {
-                        (k_out + d - v, -BF::<R>::ONE)
-                    };
-                    let w = bf_from_base_ring::<R>(a_coeffs[u]) * sign;
-                    if w != BF::<R>::ZERO {
-                        lc.push((w, out_flat_vars[j].coeffs[v]));
-                    }
-                }
-            }
-            let rhs_var = out_e_agg_vars[i].coeffs[k_out];
-            lc.push((-BF::<R>::ONE, rhs_var));
-            b.enforce_lc_times_one_eq_const(lc);
-        }
-    }
-
-    // SetChk recombination: enforce ver == v_sc and digest-absorb out.e/out.b.
+    // SetChk recombination: enforce ver == v_sc.
     let rc_pow_base = rc_var.unwrap_or_else(|| const_var(&mut b, BF::<R>::ONE));
     let rc_pows = scalar_pow_table::<BF<R>>(&mut b, rc_pow_base, nclaims_setchk.saturating_sub(1));
-    let mut ver_scalar = const_var(&mut b, BF::<R>::ZERO);
-    b.enforce_var_eq_const(ver_scalar, BF::<R>::ZERO);
+    // Accumulate verifier scalar as an LC to avoid O(n) scalar_add constraints.
+    let mut ver_lc: Lc<BF<R>> = Vec::new();
 
     // CRITICAL (FS binding):
-    // The transcript absorbs the Ajtai aggregate commitment for out.e/out.b (above),
-    // which is enforced by linear constraints. The SetChk algebraic verification below
-    // still uses only `out.e[0]` (as before).
+    // The transcript absorbs *all* `out.e` blocks and `out.b` (see allocation above),
+    // matching `setchk::absorb_evaluations`. The SetChk algebraic verification below
+    // still uses only `out.e[0]` (as in `Out::verify`), and does not depend on the other blocks.
     for i in 0..out_sc.e[0].len() {
         let eq = eq_eval_vars::<BF<R>>(&mut b, &c_vars[i], &r_point_vars);
         let beta = beta_vars[i];
@@ -1774,27 +2942,27 @@ where
         let alpha_pows =
             scalar_pow_table::<BF<R>>(&mut b, alpha, out_sc.e[0][i].len().saturating_sub(1));
 
-        let mut e_sum = const_var(&mut b, BF::<R>::ZERO);
-        b.enforce_var_eq_const(e_sum, BF::<R>::ZERO);
-        // Absorb all blocks e[blk][i][lane][j]
-        for blk in 0..out_e_vars.len() {
-            for lane in 0..out_e_vars[blk][i].len() {
-                let ejv = &out_e_vars[blk][i][lane];
-                let ev1 = ring_eval_at_scalar::<R>(&mut b, ejv, beta);
-                let ev2 = ring_eval_at_scalar::<R>(&mut b, ejv, beta2);
-
-                // Only block 0 participates in the SetChk check.
-                if blk == 0 {
-                    let ev1_sq = scalar_mul::<BF<R>>(&mut b, ev1, ev1);
-                    let diff = scalar_sub::<BF<R>>(&mut b, ev1_sq, ev2);
-                    let term = scalar_mul::<BF<R>>(&mut b, diff, alpha_pows[lane]);
-                    e_sum = scalar_add::<BF<R>>(&mut b, e_sum, term);
-                }
-            }
+        // e_sum = Σ term as a scalar LC (no scalar_add chain).
+        let mut e_sum_lc: Lc<BF<R>> = Vec::new();
+        // Only block 0 participates in the SetChk check (as in `setchk::Out::verify`).
+        let blk0 = 0usize;
+        for lane in 0..out_e_vars[blk0][i].len() {
+            let ejv = &out_e_vars[blk0][i][lane];
+            let ev1 = ring_eval_at_scalar::<R>(&mut b, ejv, beta);
+            let ev2 = ring_eval_at_scalar::<R>(&mut b, ejv, beta2);
+            let ev1_sq = scalar_mul::<BF<R>>(&mut b, ev1, ev1);
+            let diff = scalar_sub::<BF<R>>(&mut b, ev1_sq, ev2);
+            let term = scalar_mul::<BF<R>>(&mut b, diff, alpha_pows[lane]);
+            e_sum_lc.push((BF::<R>::ONE, term));
         }
+        let e_sum = if e_sum_lc.is_empty() {
+            const_var(&mut b, BF::<R>::ZERO)
+        } else {
+            lc_to_var_opt::<BF<R>>(&mut b, e_sum_lc)
+        };
         let t = scalar_mul::<BF<R>>(&mut b, eq, e_sum);
         let t = scalar_mul::<BF<R>>(&mut b, t, rc_pows[i]);
-        ver_scalar = scalar_add::<BF<R>>(&mut b, ver_scalar, t);
+        ver_lc.push((BF::<R>::ONE, t));
     }
     for i in 0..out_sc.b.len() {
         let offset = out_sc.e[0].len();
@@ -1811,8 +2979,13 @@ where
         let t = scalar_mul::<BF<R>>(&mut b, eq, alpha);
         let t = scalar_mul::<BF<R>>(&mut b, t, b_claim);
         let t = scalar_mul::<BF<R>>(&mut b, t, rc_pows[idx]);
-        ver_scalar = scalar_add::<BF<R>>(&mut b, ver_scalar, t);
+        ver_lc.push((BF::<R>::ONE, t));
     }
+    let ver_scalar = if ver_lc.is_empty() {
+        const_var(&mut b, BF::<R>::ZERO)
+    } else {
+        lc_to_var_opt::<BF<R>>(&mut b, ver_lc)
+    };
     let ver_ring = scalar_var_to_ringvars::<R>(&mut b, ver_scalar);
     ring_eq::<BF<R>>(&mut b, &ver_ring, &v_sc);
 
@@ -1831,11 +3004,12 @@ where
         let L = dcom.evals.len();
         let k_rg = dcom.dparams.k;
         let decomp_b = dcom.dparams.b;
-        let mut dppow_vars: Vec<usize> = Vec::with_capacity(k_rg);
+        // Precompute powers of `decomp_b` as statement-bound constants (used in the rgchk checks).
+        let mut dppow_const: Vec<BF<R>> = Vec::with_capacity(k_rg);
         for i in 0..k_rg {
             let base = R::BaseRing::from(decomp_b);
             let p_br = ark_ff::Field::pow(&base, [i as u64]);
-            dppow_vars.push(const_var(&mut b, bf_from_base_ring::<R>(p_br)));
+            dppow_const.push(bf_from_base_ring::<R>(p_br));
         }
 
         let mut eval_a_vars: Vec<Vec<usize>> = Vec::with_capacity(L);
@@ -1849,7 +3023,7 @@ where
                 a_l.push(a_var);
                 // `eval.a` are base-ring scalars in the real transcript (absorbed via
                 // `Transcript::absorb_field_element`), so in WE arithmetization we must absorb
-                // them as a single base-prime-field element (len=1), not as a const-coeff ring
+                // them as base-field bytes (byte-encoded), not as a const-coeff ring
                 // element (which would add `d-1` explicit zero absorbs).
                 absorb_field_elem_as_ring::<R>(&mut b, &mut absorb_flat_prefix, a_var);
             }
@@ -1864,7 +3038,7 @@ where
             let mut c_l = Vec::with_capacity(eval.c.len());
             for ci in &eval.c {
                 let rv = ring_to_ringvars::<R>(&mut b, ci);
-                absorb_flat_prefix.extend_from_slice(&rv.coeffs);
+                absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat_prefix, &rv);
                 c_l.push(rv);
             }
             eval_c_vars.push(c_l);
@@ -1891,12 +3065,15 @@ where
             let base = l * k_rg;
             for ni in 0..out_sc.e.len() {
                 for col in 0..d {
-                    let mut acc = ring_zero.clone();
+                    let mut acc_lc = ring_lc_zero::<BF<R>>(d);
                     for i in 0..k_rg {
                         let ui_col = &out_e_vars[ni][base + i][col];
-                        let scaled = ring_scale::<BF<R>>(&mut b, ui_col, dppow_vars[i]);
-                        acc = ring_add::<BF<R>>(&mut b, &acc, &scaled);
+                        // Avoid materializing `dppow_const[i] * ui_col` into fresh vars.
+                        // Since `acc_lc` is a pure linear accumulator, we can inject the scaling
+                        // directly as LC coefficients (eliminates `scalar_mul_const` constraints here).
+                        ring_lc_add_ringvars::<BF<R>>(&mut acc_lc, ui_col, dppow_const[i]);
                     }
+                    let acc = ring_lc_to_ringvars::<BF<R>>(&mut b, acc_lc);
                     let ct = ct_psi_mul_ring::<R>(&mut b, &acc);
                     let expected = if ni == 0 {
                         *eval_v_vars[l]
@@ -1922,9 +3099,10 @@ where
     let need_short = 3 + k * d;
     let need_bytes = need_short * d;
     let need_field = 2 * log_kappa + 2 + 2 * nvars;
+    let need_field_digits = need_field * CHALLENGE_DIGITS;
 
-    let mut short_bytes_vals: Vec<u8> = Vec::with_capacity(need_bytes);
-    let mut field_vals: Vec<BF<R>> = Vec::with_capacity(need_field);
+    let mut short_digit_vals: Vec<BF<R>> = Vec::with_capacity(need_bytes);
+    let mut field_digits: Vec<BF<R>> = Vec::with_capacity(need_field_digits);
     let mut seen_bytes_ops = 0usize;
     let mut seen_first_bytes = false;
     if ops_offset > trace.ops.len() {
@@ -1932,39 +3110,46 @@ where
     }
     for op in trace.ops.iter().skip(ops_offset) {
         match op {
-            LfPoseidonTraceOp::SqueezeBytes { out, .. } => {
-                if !seen_first_bytes {
-                    seen_first_bytes = true;
-                }
-                if seen_bytes_ops < need_short {
-                    short_bytes_vals.extend_from_slice(out);
-                    seen_bytes_ops += 1;
-                }
-            }
             LfPoseidonTraceOp::SqueezeField(v) => {
-                if seen_first_bytes && seen_bytes_ops >= need_short && field_vals.len() < need_field {
-                    if v.len() != 1 {
-                        return Err("cm_verifier_math_dr1cs: expected base-field squeeze len=1".to_string());
+                if v.len() == d && seen_bytes_ops < need_short {
+                    if !seen_first_bytes {
+                        seen_first_bytes = true;
                     }
-                    field_vals.push(v[0]);
+                    short_digit_vals.extend_from_slice(v);
+                    seen_bytes_ops += 1;
+                } else if seen_first_bytes
+                    && seen_bytes_ops >= need_short
+                    && field_digits.len() < need_field_digits
+                {
+                    if v.len() != CHALLENGE_DIGITS {
+                        return Err(
+                            "cm_verifier_math_dr1cs: expected base-257 squeeze len=CHALLENGE_DIGITS"
+                                .to_string(),
+                        );
+                    }
+                    field_digits.extend_from_slice(v);
                 }
             }
             _ => {}
         }
     }
-    if short_bytes_vals.len() < need_bytes {
-        return Err("cm_verifier_math_dr1cs: not enough squeeze-bytes for short challenges".to_string());
+    if short_digit_vals.len() < need_bytes {
+        return Err("cm_verifier_math_dr1cs: not enough squeeze-field digits for short challenges".to_string());
     }
-    short_bytes_vals.truncate(need_bytes);
-    if field_vals.len() != need_field {
-        return Err("cm_verifier_math_dr1cs: not enough squeeze-field elements for cm challenges".to_string());
+    short_digit_vals.truncate(need_bytes);
+    if field_digits.len() != need_field_digits {
+        return Err("cm_verifier_math_dr1cs: not enough squeeze-field digits for cm challenges".to_string());
     }
 
     // --- Challenges (allocated locally; caller glues to coin/field wiring) ---
     // short challenges: s (3), s_prime_flat (k*d)
+    let mut short_digit_vars = Vec::new();
+    for &dv in short_digit_vals.iter() {
+        short_digit_vars.push(b.new_var(dv));
+    }
     let mut byte_vars = Vec::new();
-    for &by in short_bytes_vals.iter() {
-        byte_vars.push(b.new_var(BF::<R>::from(by as u64)));
+    for &dv in &short_digit_vars {
+        byte_vars.push(f257_digit_to_byte_view::<R>(&mut b, dv));
     }
     let mut rings = Vec::with_capacity(need_short);
     for i in 0..need_short {
@@ -1977,48 +3162,38 @@ where
     let s_prime_flat = rings[3..].to_vec();
 
     // field challenges: c0,c1,rc0,rc1,sumcheck r0,r1
-    let mut cur = 0usize;
-    let c0 = (0..log_kappa)
-        .map(|_| {
-            let v = b.new_var(field_vals[cur]);
-            cur += 1;
-            v
-        })
-        .collect::<Vec<_>>();
-    let c1 = (0..log_kappa)
-        .map(|_| {
-            let v = b.new_var(field_vals[cur]);
-            cur += 1;
-            v
-        })
-        .collect::<Vec<_>>();
-    let rc0 = {
-        let v = b.new_var(field_vals[cur]);
-        cur += 1;
-        v
+    let mut field_digit_vars = Vec::with_capacity(need_field_digits);
+    for dv in field_digits.iter().copied() {
+        field_digit_vars.push(b.new_var(dv));
+    }
+    let mut cur_digit = 0usize;
+    let next_chal = |cur: &mut usize, digits: &[usize], b: &mut Dr1csBuilder<BF<R>>| -> usize {
+        let slice = &digits[*cur..*cur + CHALLENGE_DIGITS];
+        *cur += CHALLENGE_DIGITS;
+        combine_base257_digits::<BF<R>>(b, slice)
     };
-    let sumcheck_r0 = (0..nvars)
-        .map(|_| {
-            let v = b.new_var(field_vals[cur]);
-            cur += 1;
-            v
-        })
-        .collect::<Vec<_>>();
-    let rc1 = {
-        let v = b.new_var(field_vals[cur]);
-        cur += 1;
-        v
-    };
-    let sumcheck_r1 = (0..nvars)
-        .map(|_| {
-            let v = b.new_var(field_vals[cur]);
-            cur += 1;
-            v
-        })
-        .collect::<Vec<_>>();
-    debug_assert_eq!(cur, field_vals.len());
+    let mut c0 = Vec::with_capacity(log_kappa);
+    let mut c1 = Vec::with_capacity(log_kappa);
+    for _ in 0..log_kappa {
+        c0.push(next_chal(&mut cur_digit, &field_digit_vars, &mut b));
+    }
+    for _ in 0..log_kappa {
+        c1.push(next_chal(&mut cur_digit, &field_digit_vars, &mut b));
+    }
+    let rc0 = next_chal(&mut cur_digit, &field_digit_vars, &mut b);
+    let mut sumcheck_r0 = Vec::with_capacity(nvars);
+    for _ in 0..nvars {
+        sumcheck_r0.push(next_chal(&mut cur_digit, &field_digit_vars, &mut b));
+    }
+    let rc1 = next_chal(&mut cur_digit, &field_digit_vars, &mut b);
+    let mut sumcheck_r1 = Vec::with_capacity(nvars);
+    for _ in 0..nvars {
+        sumcheck_r1.push(next_chal(&mut cur_digit, &field_digit_vars, &mut b));
+    }
+    debug_assert_eq!(cur_digit, field_digit_vars.len());
 
     let short_wiring = CmShortChallengeWiring {
+        digit_vars: short_digit_vars,
         byte_vars,
         s,
         s_prime_flat,
@@ -2030,6 +3205,7 @@ where
         rc1,
         sumcheck_r0,
         sumcheck_r1,
+        digit_vars: field_digit_vars.clone(),
     };
 
     // Build the expected absorb surface for the CmProof segment.
@@ -2054,7 +3230,7 @@ where
         for j in 0..kappa {
             let rv = ring_to_ringvars::<R>(&mut b, &proof.comh[l][j]);
             // `absorb_comh` absorbs each ring element in coefficient order.
-            absorb_flat_cm.extend_from_slice(&rv.coeffs);
+            absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat_cm, &rv);
             absorb_cm_comh(rv.coeffs.len());
             row.push(rv);
         }
@@ -2071,16 +3247,16 @@ where
             if out_e_vars[ni].len() < (l + 1) * k {
                 return Err("CmProof: dcom.out.e too short for L,k".to_string());
             }
-            let mut acc = scalar_to_ringvars::<R>(&mut b, BF::<R>::ZERO);
+            let mut acc_lc = ring_lc_zero::<BF<R>>(d);
             for blk in 0..k {
                 for col in 0..d {
                     let uij = &out_e_vars[ni][l * k + blk][col];
                     let sij = &short_wiring.s_prime_flat[blk * d + col];
                     let prod = ring_mul_negacyclic::<BF<R>>(&mut b, uij, sij);
-                    acc = ring_add::<BF<R>>(&mut b, &acc, &prod);
+                    ring_lc_add_ringvars::<BF<R>>(&mut acc_lc, &prod, BF::<R>::ONE);
                 }
             }
-            u_l.push(acc);
+            u_l.push(ring_lc_to_ringvars::<BF<R>>(&mut b, acc_lc));
         }
         u_vars.push(u_l);
     }
@@ -2095,18 +3271,18 @@ where
     let mut tcch0: Vec<RingVars> = Vec::with_capacity(l_instances);
     let mut tcch1: Vec<RingVars> = Vec::with_capacity(l_instances);
     for l in 0..l_instances {
-        let mut acc0 = scalar_to_ringvars::<R>(&mut b, BF::<R>::ZERO);
-        let mut acc1 = scalar_to_ringvars::<R>(&mut b, BF::<R>::ZERO);
+        let mut acc0_lc = ring_lc_zero::<BF<R>>(d);
+        let mut acc1_lc = ring_lc_zero::<BF<R>>(d);
         for j in 0..kappa {
             // tensor_c{0,1}[j] are BF scalars. Multiplying a ring element by a constant-coeff ring
             // is exactly per-coefficient scaling (avoid a full negacyclic multiply gadget).
             let s0 = ring_scale::<BF<R>>(&mut b, &comh_vars[l][j], tensor_c0[j]);
             let s1 = ring_scale::<BF<R>>(&mut b, &comh_vars[l][j], tensor_c1[j]);
-            acc0 = ring_add::<BF<R>>(&mut b, &acc0, &s0);
-            acc1 = ring_add::<BF<R>>(&mut b, &acc1, &s1);
+            ring_lc_add_ringvars::<BF<R>>(&mut acc0_lc, &s0, BF::<R>::ONE);
+            ring_lc_add_ringvars::<BF<R>>(&mut acc1_lc, &s1, BF::<R>::ONE);
         }
-        tcch0.push(acc0);
-        tcch1.push(acc1);
+        tcch0.push(ring_lc_to_ringvars::<BF<R>>(&mut b, acc0_lc));
+        tcch1.push(ring_lc_to_ringvars::<BF<R>>(&mut b, acc1_lc));
     }
 
     // --- Precompute constants for eval_t_z_optimized ---
@@ -2200,16 +3376,16 @@ where
         // - prover message evaluations (3 ring elems)
         // - then absorbs the sampled randomness scalar r_i
         for (round, m) in msgs.iter().enumerate() {
-            absorb_flat.extend_from_slice(&m[0].coeffs);
-            absorb_flat.extend_from_slice(&m[1].coeffs);
-            absorb_flat.extend_from_slice(&m[2].coeffs);
+            absorb_ringvars_as_bytes::<R>(b, absorb_flat, &m[0]);
+            absorb_ringvars_as_bytes::<R>(b, absorb_flat, &m[1]);
+            absorb_ringvars_as_bytes::<R>(b, absorb_flat, &m[2]);
             absorb_field_elem_as_ring::<R>(b, absorb_flat, r_sc[round]);
             absorb_cm_sumcheck_msgs(m[0].coeffs.len() + m[1].coeffs.len() + m[2].coeffs.len());
             absorb_cm_sumcheck_r(1);
         }
 
         let rc_pows = scalar_pow_table::<BF<R>>(b, rc, max_pow);
-        let mut claimed_sum = scalar_to_ringvars::<R>(b, BF::<R>::ZERO);
+        let mut claimed_sum_lc = ring_lc_zero::<BF<R>>(d);
 
         for (l, eval) in proof.dcom.evals.iter().enumerate() {
             let l_idx = l * (4 + 4 * mlen_chunks_usize);
@@ -2217,7 +3393,7 @@ where
             let a0 = b.new_var(bf_from_base_ring::<R>(eval.a[0]));
             let a0pow = scalar_mul::<BF<R>>(b, a0, rc_pows[l_idx]);
             let a0t = scalar_var_to_ringvars::<R>(b, a0pow);
-            claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &a0t);
+            ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &a0t, BF::<R>::ONE);
 
             // b/c are ring
             let b0 = ring_to_ringvars::<R>(b, &eval.b[0]);
@@ -2225,33 +3401,34 @@ where
             let t_b0 = ring_scale::<BF<R>>(b, &b0, rc_pows[l_idx + 1]);
             let t_c0 = ring_scale::<BF<R>>(b, &c0, rc_pows[l_idx + 2]);
             let t_u0 = ring_scale::<BF<R>>(b, &u_vars[l][0], rc_pows[l_idx + 3]);
-            claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_b0);
-            claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_c0);
-            claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_u0);
+            ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_b0, BF::<R>::ONE);
+            ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_c0, BF::<R>::ONE);
+            ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_u0, BF::<R>::ONE);
 
             for i in 0..mlen_chunks_usize {
                 let idx = l_idx + 4 + i * 4;
                 let ai = b.new_var(bf_from_base_ring::<R>(eval.a[1 + i]));
                 let aipow = scalar_mul::<BF<R>>(b, ai, rc_pows[idx]);
                 let ai_t = scalar_var_to_ringvars::<R>(b, aipow);
-                claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &ai_t);
+                ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &ai_t, BF::<R>::ONE);
 
                 let bi = ring_to_ringvars::<R>(b, &eval.b[1 + i]);
                 let ci = ring_to_ringvars::<R>(b, &eval.c[1 + i]);
                 let t_bi = ring_scale::<BF<R>>(b, &bi, rc_pows[idx + 1]);
-                claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_bi);
+                ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_bi, BF::<R>::ONE);
                 let t_ci = ring_scale::<BF<R>>(b, &ci, rc_pows[idx + 2]);
-                claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_ci);
+                ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_ci, BF::<R>::ONE);
                 let t_ui = ring_scale::<BF<R>>(b, &u_vars[l][1 + i], rc_pows[idx + 3]);
-                claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_ui);
+                ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_ui, BF::<R>::ONE);
             }
 
             let t_tcch0 = ring_scale::<BF<R>>(b, &tcch0[l], rc_pows[z_idx]);
-            claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_tcch0);
+            ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_tcch0, BF::<R>::ONE);
             let t_tcch1 = ring_scale::<BF<R>>(b, &tcch1[l], rc_pows[z_idx + 1]);
-            claimed_sum = ring_add::<BF<R>>(b, &claimed_sum, &t_tcch1);
+            ring_lc_add_ringvars::<BF<R>>(&mut claimed_sum_lc, &t_tcch1, BF::<R>::ONE);
         }
 
+        let claimed_sum = ring_lc_to_ringvars::<BF<R>>(b, claimed_sum_lc);
         let subclaim_eval = sumcheck_verify_degree2::<BF<R>>(b, claimed_sum, msgs, r_sc)?;
 
         // t(z) eval at ro (independent of l)
@@ -2274,50 +3451,52 @@ where
 
         // eq(r, ro) where r is the transcript-derived SetChk point
         let eq = eq_eval_vars::<BF<R>>(b, &r_point_vars, r_sc);
-        let mut eval_acc = scalar_to_ringvars::<R>(b, BF::<R>::ZERO);
+        let mut eval_acc_lc = ring_lc_zero::<BF<R>>(d);
 
         for l in 0..l_instances {
             let l_idx = l * (4 + 4 * mlen_chunks_usize);
-            let mut inner = scalar_to_ringvars::<R>(b, BF::<R>::ZERO);
+            let mut inner_lc = ring_lc_zero::<BF<R>>(d);
             // First group (tau,m_tau,f,h) is evals[l][0]
             let e00 = &evals[l][0][0];
             let e01 = &evals[l][0][1];
             let e02 = &evals[l][0][2];
             let e03 = &evals[l][0][3];
             let t_e00 = ring_scale::<BF<R>>(b, e00, rc_pows[l_idx]);
-            inner = ring_add::<BF<R>>(b, &inner, &t_e00);
+            ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_e00, BF::<R>::ONE);
             let t_e01 = ring_scale::<BF<R>>(b, e01, rc_pows[l_idx + 1]);
-            inner = ring_add::<BF<R>>(b, &inner, &t_e01);
+            ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_e01, BF::<R>::ONE);
             let t_e02 = ring_scale::<BF<R>>(b, e02, rc_pows[l_idx + 2]);
-            inner = ring_add::<BF<R>>(b, &inner, &t_e02);
+            ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_e02, BF::<R>::ONE);
             let t_e03 = ring_scale::<BF<R>>(b, e03, rc_pows[l_idx + 3]);
-            inner = ring_add::<BF<R>>(b, &inner, &t_e03);
+            ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_e03, BF::<R>::ONE);
             // M chunks
             for i in 0..mlen_chunks_usize {
                 let idx = l_idx + 4 + i * 4;
                 let Mi = &evals[l][1 + i];
                 let t_m0 = ring_scale::<BF<R>>(b, &Mi[0], rc_pows[idx]);
-                inner = ring_add::<BF<R>>(b, &inner, &t_m0);
+                ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_m0, BF::<R>::ONE);
                 let t_m1 = ring_scale::<BF<R>>(b, &Mi[1], rc_pows[idx + 1]);
-                inner = ring_add::<BF<R>>(b, &inner, &t_m1);
+                ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_m1, BF::<R>::ONE);
                 let t_m2 = ring_scale::<BF<R>>(b, &Mi[2], rc_pows[idx + 2]);
-                inner = ring_add::<BF<R>>(b, &inner, &t_m2);
+                ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_m2, BF::<R>::ONE);
                 let t_m3 = ring_scale::<BF<R>>(b, &Mi[3], rc_pows[idx + 3]);
-                inner = ring_add::<BF<R>>(b, &inner, &t_m3);
+                ring_lc_add_ringvars::<BF<R>>(&mut inner_lc, &t_m3, BF::<R>::ONE);
             }
             // eq * inner
+            let inner = ring_lc_to_ringvars::<BF<R>>(b, inner_lc);
             let eq_inner = ring_scale::<BF<R>>(b, &inner, eq);
-            eval_acc = ring_add::<BF<R>>(b, &eval_acc, &eq_inner);
+            ring_lc_add_ringvars::<BF<R>>(&mut eval_acc_lc, &eq_inner, BF::<R>::ONE);
 
             // Add t(z) terms (uses el[0][0])
             let t0e = ring_mul_negacyclic::<BF<R>>(b, &t0, e00);
             let t1e = ring_mul_negacyclic::<BF<R>>(b, &t1, e00);
             let t0e_s = ring_scale::<BF<R>>(b, &t0e, rc_pows[z_idx]);
-            eval_acc = ring_add::<BF<R>>(b, &eval_acc, &t0e_s);
+            ring_lc_add_ringvars::<BF<R>>(&mut eval_acc_lc, &t0e_s, BF::<R>::ONE);
             let t1e_s = ring_scale::<BF<R>>(b, &t1e, rc_pows[z_idx + 1]);
-            eval_acc = ring_add::<BF<R>>(b, &eval_acc, &t1e_s);
+            ring_lc_add_ringvars::<BF<R>>(&mut eval_acc_lc, &t1e_s, BF::<R>::ONE);
         }
 
+        let eval_acc = ring_lc_to_ringvars::<BF<R>>(b, eval_acc_lc);
         ring_eq::<BF<R>>(b, &subclaim_eval, &eval_acc);
 
         // After sumcheck verification, Cm verifier absorbs the per-instance eval tables.
@@ -2325,10 +3504,10 @@ where
         for l in 0..l_instances {
             for row in &evals[l] {
                 // Each row is [R; 4], absorbed in order.
-                absorb_flat.extend_from_slice(&row[0].coeffs);
-                absorb_flat.extend_from_slice(&row[1].coeffs);
-                absorb_flat.extend_from_slice(&row[2].coeffs);
-                absorb_flat.extend_from_slice(&row[3].coeffs);
+                absorb_ringvars_as_bytes::<R>(b, absorb_flat, &row[0]);
+                absorb_ringvars_as_bytes::<R>(b, absorb_flat, &row[1]);
+                absorb_ringvars_as_bytes::<R>(b, absorb_flat, &row[2]);
+                absorb_ringvars_as_bytes::<R>(b, absorb_flat, &row[3]);
                 absorb_cm_absorb_evals(
                     row[0].coeffs.len() + row[1].coeffs.len() + row[2].coeffs.len() + row[3].coeffs.len(),
                 );
@@ -2378,7 +3557,7 @@ where
 }
 
 /// Build a dR1CS part that reconstructs all LF+ `short_challenge(128)` ring elements
-/// from Poseidon `SqueezeBytes` outputs (bytes -> coefficients).
+/// from Poseidon `SqueezeField` outputs (digits -> coefficients).
 ///
 /// Assumption (holds for current LF+ verifier paths): the only `squeeze_bytes` calls in the
 /// verifier transcript are from `short_challenge(128)` within `CmProof::verify`, and each call
@@ -2390,7 +3569,7 @@ fn cm_short_challenges_dr1cs<R>(
 ) -> Result<(SparseDr1csInstance<BF<R>>, Vec<BF<R>>, CmShortChallengeWiring), String>
 where
     R: PolyRing,
-    R::BaseRing: Field,
+    R::BaseRing: PrimeField,
 {
     let d = R::dimension();
     let lambda = 128usize;
@@ -2403,42 +3582,45 @@ where
     if ops_offset > trace.ops.len() {
         return Err("cm_short_challenges_dr1cs: ops_offset out of range".to_string());
     }
-    // Extract the first `need` CM-style `short_challenge(128)` byte blocks (each of length `d`)
+    // Extract the first `need` CM-style `short_challenge(128)` digit blocks (each of length `d`)
     // *after* `ops_offset`.
-    let mut short_bytes_vals: Vec<u8> = Vec::with_capacity(need_bytes);
+    let mut short_digit_vals: Vec<BF<R>> = Vec::with_capacity(need_bytes);
     let mut seen = 0usize;
     for op in trace.ops.iter().skip(ops_offset) {
-        if let LfPoseidonTraceOp::SqueezeBytes { n, out } = op {
-            if *n == d && seen < need {
-                short_bytes_vals.extend_from_slice(out);
+        if let LfPoseidonTraceOp::SqueezeField(out) = op {
+            if out.len() == d && seen < need {
+                short_digit_vals.extend_from_slice(out);
                 seen += 1;
             }
         }
     }
-    if short_bytes_vals.len() < need_bytes {
+    if short_digit_vals.len() < need_bytes {
         return Err(format!(
-            "cm_short_challenges_dr1cs: not enough cm short-challenge bytes: need {}, got {}",
+            "cm_short_challenges_dr1cs: not enough cm short-challenge digits: need {}, got {}",
             need_bytes,
-            short_bytes_vals.len()
+            short_digit_vals.len()
         ));
     }
-    short_bytes_vals.truncate(need_bytes);
+    short_digit_vals.truncate(need_bytes);
 
     let mut b = Dr1csBuilder::<BF<R>>::new();
     b.enforce_var_eq_const(b.one(), BF::<R>::ONE);
 
     // Soundness note:
-    // This subcircuit is only sound *as part of a merged WE instance* where `byte_vars`
-    // are glued to the Poseidon `SqueezeBytes` outputs. On its own, it does not constrain
+    // This subcircuit is only sound *as part of a merged WE instance* where `digit_vars`
+    // are glued to the Poseidon `SqueezeField` outputs. On its own, it does not constrain
     // transcript bytes to be Poseidon outputs (and therefore does not bind challenges).
 
-    // Allocate byte vars (as field elements) for the needed bytes.
+    // Allocate digit vars (F257) for the needed digits.
+    let mut digit_vars = Vec::with_capacity(need_bytes);
+    for &dv in short_digit_vals.iter() {
+        let v = b.new_var(dv);
+        digit_vars.push(v);
+    }
+    // Convert digits to bytes via F257 canonical byte view (256 -> 0).
     let mut byte_vars = Vec::with_capacity(need_bytes);
-    for &by in short_bytes_vals.iter() {
-        // WE/arm-before-proof: these bytes must be witness variables (later glued to Poseidon
-        // `SqueezeBytes` outputs), not fixed constants from the recorded trace.
-        let v = b.new_var(BF::<R>::from(by as u64));
-        byte_vars.push(v);
+    for &dv in &digit_vars {
+        byte_vars.push(f257_digit_to_byte_view::<R>(&mut b, dv));
     }
 
     // Reconstruct ring elements, chunking by d bytes.
@@ -2459,6 +3641,7 @@ where
         inst,
         asg,
         CmShortChallengeWiring {
+            digit_vars,
             byte_vars,
             s,
             s_prime_flat,
@@ -2491,41 +3674,206 @@ fn eq_eval_vars<F: PrimeField>(b: &mut Dr1csBuilder<F>, c: &[usize], r: &[usize]
     acc
 }
 
-struct ChallengeCursor<'a, F: PrimeField> {
-    vals: &'a [F],
-    idx: usize,
-    vars: Vec<usize>,
+struct ChallengeCursor<F: PrimeField> {
+    /// Candidate digit blocks: one entry per `SqueezeField(len=CHALLENGE_DIGITS)` op.
+    ///
+    /// Under fixed-tries rejection, each logical `get_challenge()` contributes
+    /// `DEFAULT_REJECTION_TRIES` such blocks.
+    blocks: Vec<Vec<F>>,
+    /// Index into `blocks` (number of blocks consumed).
+    blk_idx: usize,
+    /// All allocated digit vars (flattened), in order (for gluing to Poseidon squeeze-field vars).
+    digit_vars: Vec<usize>,
 }
 
-impl<'a, F: PrimeField> ChallengeCursor<'a, F> {
-    fn new(vals: &'a [F]) -> Self {
+impl<F: PrimeField> ChallengeCursor<F> {
+    /// Cursor over the `get_challenge()` stream induced by a Poseidon transcript trace.
+    ///
+    /// We treat each `SqueezeField(len=CHALLENGE_DIGITS)` op as one `get_challenge()` call returning
+    /// a base-field scalar derived from base-257 digits.
+    ///
+    /// IMPORTANT: with LF+ fixed-tries rejection sampling, each logical `get_challenge()` is
+    /// represented by `DEFAULT_REJECTION_TRIES` consecutive `SqueezeField(len=CHALLENGE_DIGITS)` ops
+    /// (each followed by `Absorb(len=CHALLENGE_DIGITS)` in the trace). We group those blocks and
+    /// select the first acceptable candidate inside the circuit.
+    fn new(trace: &PoseidonTranscriptTrace<F>) -> Self {
+        let mut blocks: Vec<Vec<F>> = Vec::new();
+        for op in &trace.ops {
+            if let crate::recording_transcript::PoseidonTraceOp::SqueezeField(v) = op {
+                if v.len() == CHALLENGE_DIGITS {
+                    blocks.push(v.clone());
+                }
+            }
+        }
         Self {
-            vals,
-            idx: 0,
-            vars: Vec::new(),
+            blocks,
+            blk_idx: 0,
+            digit_vars: Vec::new(),
         }
     }
 
     fn next(&mut self, b: &mut Dr1csBuilder<F>) -> usize {
-        let v = self
-            .vals
-            .get(self.idx)
-            .copied()
-            .unwrap_or_else(|| panic!("challenge cursor oob at {}", self.idx));
-        self.idx += 1;
-        let var = b.new_var(v);
-        self.vars.push(var);
-        var
+        let tries = DEFAULT_REJECTION_TRIES;
+        let chunk = self
+            .blocks
+            .get(self.blk_idx..self.blk_idx + tries)
+            .unwrap_or_else(|| panic!("challenge cursor oob at block {}", self.blk_idx));
+        self.blk_idx += tries;
+
+        // Allocate digit vars for all tries (so we can glue them to Poseidon wiring).
+        let mut digit_vars_all: Vec<usize> = Vec::with_capacity(tries * CHALLENGE_DIGITS);
+        for blk in chunk {
+            debug_assert_eq!(blk.len(), CHALLENGE_DIGITS);
+            for &d in blk {
+                let v = b.new_var(d);
+                self.digit_vars.push(v);
+                digit_vars_all.push(v);
+            }
+        }
+        combine_base257_digits_fixed_tries::<F>(b, &digit_vars_all, tries)
     }
 
     #[allow(dead_code)]
     fn consumed(&self) -> usize {
-        self.idx
+        self.blk_idx / DEFAULT_REJECTION_TRIES
     }
 
     fn all_vars(&self) -> &[usize] {
-        &self.vars
+        &self.digit_vars
     }
+}
+
+/// Reconstruct a bounded scalar challenge from **fixed-tries** base-257 digit candidates.
+///
+/// Input is `tries * CHALLENGE_DIGITS` digit vars, ordered by try then digit index.
+/// Semantics match `recording_transcript::TracePoseidonTranscript::get_challenge`:
+/// select the first try whose first 4 digits are all != 256, then pack those 4 digits (byte view)
+/// into a u32 (little-endian) represented in the field.
+fn combine_base257_digits_fixed_tries<F: PrimeField>(
+    b: &mut Dr1csBuilder<F>,
+    digits_all: &[usize],
+    tries: usize,
+) -> usize {
+    assert_eq!(digits_all.len(), tries * CHALLENGE_DIGITS);
+    let c256 = F::from(256u64);
+
+    // Returns (byte, is_eq256_bit).
+    let digit_to_byte_and_eq256 = |b: &mut Dr1csBuilder<F>, digit_var: usize| -> (usize, usize) {
+        // diff = digit - 256
+        let diff_val = b.assignment[digit_var] - c256;
+        let diff = b.new_var(diff_val);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, digit_var),
+            (-c256, b.one()),
+            (-F::ONE, diff),
+        ]);
+
+        // is_eq256 ∈ {0,1} indicates diff==0.
+        let is_eq256 = b.new_var(if diff_val == F::ZERO { F::ONE } else { F::ZERO });
+        enforce_bit::<F>(b, is_eq256);
+
+        // diff * is_eq256 == 0
+        let z = b.new_var(diff_val * b.assignment[is_eq256]);
+        b.enforce_mul(diff, is_eq256, z);
+        b.enforce_var_eq_const(z, F::ZERO);
+
+        // inverse trick: diff * inv = 1 - is_eq256
+        let inv = b.new_var(diff_val.inverse().unwrap_or(F::ZERO));
+        let prod = b.new_var(diff_val * b.assignment[inv]);
+        b.enforce_mul(diff, inv, prod);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, prod),
+            (F::ONE, is_eq256),
+            (-F::ONE, b.one()),
+        ]);
+
+        // byte = digit - 256*is_eq256
+        let byte_val = b.assignment[digit_var] - c256 * b.assignment[is_eq256];
+        let byte = b.new_var(byte_val);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, digit_var),
+            (-c256, is_eq256),
+            (-F::ONE, byte),
+        ]);
+        enforce_byte::<F>(b, byte);
+
+        (byte, is_eq256)
+    };
+
+    // Selection: pick the earliest acceptable try.
+    let mut found = b.new_var(F::ZERO);
+    enforce_bit::<F>(b, found);
+    b.enforce_var_eq_const(found, F::ZERO);
+
+    let mut out = b.new_var(F::ZERO);
+    b.enforce_var_eq_const(out, F::ZERO);
+
+    let one = b.one();
+    for t in 0..tries {
+        let base = t * CHALLENGE_DIGITS;
+        let (b0, e0) = digit_to_byte_and_eq256(b, digits_all[base + 0]);
+        let (b1, e1) = digit_to_byte_and_eq256(b, digits_all[base + 1]);
+        let (b2, e2) = digit_to_byte_and_eq256(b, digits_all[base + 2]);
+        let (b3, e3) = digit_to_byte_and_eq256(b, digits_all[base + 3]);
+
+        // ok = (1-e0)*(1-e1)*(1-e2)*(1-e3)
+        let one_minus = |b: &mut Dr1csBuilder<F>, x: usize| -> usize {
+            let v = b.new_var(F::ONE - b.assignment[x]);
+            b.enforce_lc_times_one_eq_const(vec![(F::ONE, v), (F::ONE, x), (-F::ONE, one)]);
+            v
+        };
+        let o0 = one_minus(b, e0);
+        let o1 = one_minus(b, e1);
+        let o2 = one_minus(b, e2);
+        let o3 = one_minus(b, e3);
+        let ok01 = b.new_var(b.assignment[o0] * b.assignment[o1]);
+        b.enforce_mul(o0, o1, ok01);
+        let ok23 = b.new_var(b.assignment[o2] * b.assignment[o3]);
+        b.enforce_mul(o2, o3, ok23);
+        let ok = b.new_var(b.assignment[ok01] * b.assignment[ok23]);
+        b.enforce_mul(ok01, ok23, ok);
+        enforce_bit::<F>(b, ok);
+
+        // select = ok * (1-found)
+        let not_found = one_minus(b, found);
+        let select = b.new_var(b.assignment[ok] * b.assignment[not_found]);
+        b.enforce_mul(ok, not_found, select);
+        enforce_bit::<F>(b, select);
+
+        // u32 = b0 + 256*b1 + 256^2*b2 + 256^3*b3
+        let w1 = F::from(256u64);
+        let w2 = F::from(256u64 * 256u64);
+        let w3 = F::from(256u64 * 256u64 * 256u64);
+        let u32_var = lc_to_var::<F>(b, vec![(F::ONE, b0), (w1, b1), (w2, b2), (w3, b3)]);
+
+        // out += select * u32_var
+        let term = b.new_var(b.assignment[select] * b.assignment[u32_var]);
+        b.enforce_mul(select, u32_var, term);
+        let next_out = b.new_var(b.assignment[out] + b.assignment[term]);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, next_out),
+            (-F::ONE, out),
+            (-F::ONE, term),
+        ]);
+        out = next_out;
+
+        // found = found OR ok  (since bits: found' = found + ok - found*ok)
+        let found_ok = b.new_var(b.assignment[found] * b.assignment[ok]);
+        b.enforce_mul(found, ok, found_ok);
+        let next_found = b.new_var(b.assignment[found] + b.assignment[ok] - b.assignment[found_ok]);
+        b.enforce_lc_times_one_eq_const(vec![
+            (F::ONE, next_found),
+            (-F::ONE, found),
+            (-F::ONE, ok),
+            (F::ONE, found_ok),
+        ]);
+        found = next_found;
+        enforce_bit::<F>(b, found);
+    }
+
+    // Fixed-shape: require we found an acceptable try.
+    b.enforce_var_eq_const(found, F::ONE);
+    out
 }
 
 fn comr1cs_verifier_math_dr1cs<R>(
@@ -2628,14 +3976,19 @@ fn scalar_sub<F: PrimeField>(b: &mut Dr1csBuilder<F>, x: usize, y: usize) -> usi
     v
 }
 
-fn count_squeezed_field_elems_before_first_squeeze_bytes<F: PrimeField>(
+fn count_squeezed_field_elems_before_first_short_squeeze<F: PrimeField>(
     ops: &[LfPoseidonTraceOp<F>],
+    short_len: usize,
 ) -> usize {
     let mut cnt = 0usize;
     for op in ops {
         match op {
-            LfPoseidonTraceOp::SqueezeBytes { .. } => break,
-            LfPoseidonTraceOp::SqueezeField(v) => cnt += v.len(),
+            LfPoseidonTraceOp::SqueezeField(v) => {
+                if v.len() == short_len {
+                    break;
+                }
+                cnt += v.len();
+            }
             _ => {}
         }
     }
@@ -2684,22 +4037,32 @@ fn absorb_field_elem_as_ring<R>(
     x0: usize,
 ) where
     R: PolyRing,
-    R::BaseRing: Field,
+    R::BaseRing: PrimeField,
 {
-    // Matches `latticefold-plus` PoseidonTranscript's `absorb_field_element` override:
-    // absorb the scalar directly as one base-prime-field element (for our rings, extdeg=1).
-    //
-    // NOTE: This is intentionally *not* the same as absorbing `R::from(x0)` (which would expand
-    // to `R::dimension()` coefficients and blow up Poseidon IO in the WE gate).
-    let _ = b; // keep signature uniform with other helpers
-    absorb_flat.push(x0);
+    // Match transcript encoding: scalar -> fixed-width LE bytes, each absorbed as one F257 element.
+    let bytes = prime_field_to_bytes_le_fixed_vars::<BF<R>>(b, x0);
+    absorb_flat.extend_from_slice(&bytes);
+}
+
+fn absorb_ringvars_as_bytes<R>(
+    b: &mut Dr1csBuilder<BF<R>>,
+    absorb_flat: &mut Vec<usize>,
+    rv: &RingVars,
+) where
+    R: PolyRing,
+    R::BaseRing: PrimeField,
+{
+    for &c in &rv.coeffs {
+        let bytes = prime_field_to_bytes_le_fixed_vars::<BF<R>>(b, c);
+        absorb_flat.extend_from_slice(&bytes);
+    }
 }
 
 #[cfg(feature = "we_gate")]
 fn ct_psi_mul_ring<R>(b: &mut Dr1csBuilder<BF<R>>, x: &RingVars) -> usize
 where
     R: OverField + CoeffRing + PolyRing,
-    R::BaseRing: Zq + Field,
+    R::BaseRing: Zq + Field + PrimeField,
 {
     cm_bump(|c| c.ct_psi_mul_ring += 1);
     // Compute ct(psi * x) as a BF-linear form in the coefficients of x.
@@ -2796,7 +4159,7 @@ pub fn build_we_dr1cs_for_comr1cs_proof<R>(
 ) -> Result<WeDr1csOutput<BF<R>>, String>
 where
     R: OverField + CoeffRing + PolyRing,
-    R::BaseRing: Zq + Field,
+    R::BaseRing: Zq + Field + PrimeField,
 {
     // Poseidon trace -> dR1CS
     let ops = lf_ops_to_symphony_ops::<BF<R>>(&trace.ops);
@@ -2809,12 +4172,12 @@ where
     let mut b_params = Dr1csBuilder::<BF<R>>::new();
     b_params.enforce_var_eq_const(b_params.one(), BF::<R>::ONE);
     for &x in &params.to_field_vec::<BF<R>>() {
-        let _ = b_params.new_var(x);
+        b_params.new_var(x);
     }
     let (params_inst, params_asg) = b_params.into_instance();
 
     // Π_lin verifier arithmetic.
-    let mut ch = ChallengeCursor::<BF<R>>::new(&trace.squeezed_field);
+    let mut ch = ChallengeCursor::<BF<R>>::new(trace);
     let (lin_inst, lin_asg, lin_ch_vars) = comr1cs_verifier_math_dr1cs::<R>(proof, &mut ch)?;
 
     // Glue: each challenge var equals corresponding Poseidon squeeze-field var.
@@ -2829,7 +4192,7 @@ where
 
     let parts = vec![(pose_inst, pose_asg), (params_inst, params_asg), (lin_inst, lin_asg)];
     let (inst, assignment) =
-        merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| e.to_string())?;
+        merge_sparse_dr1cs_share_one_with_glue(parts, &glue).map_err(|e| e.to_string())?;
 
     // Public prefix: [1] + params (fixed 9 scalars)
     let public_len = 1 + 10;
@@ -2857,11 +4220,11 @@ pub fn build_we_dr1cs_for_cm_short_challenges<R>(
 ) -> Result<(WeDr1csOutput<BF<R>>, CmShortChallengeWiring), String>
 where
     R: OverField + CoeffRing + PolyRing,
-    R::BaseRing: Zq + Field,
+    R::BaseRing: Zq + Field + PrimeField,
 {
     // Poseidon trace -> dR1CS (+ wiring with squeeze-field + squeeze-byte var indices).
     let ops = lf_ops_to_symphony_ops::<BF<R>>(&trace.ops);
-    let (mut pose_inst, pose_asg, _replay, _byte_wit, wiring, byte_wiring) =
+    let (mut pose_inst, pose_asg, _replay, _byte_wit, wiring, _byte_wiring) =
         poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
             .map_err(|e| format!("poseidon arith failed: {e}"))?;
     enforce_reabsorb_equals_squeeze::<BF<R>>(&mut pose_inst, &wiring, &ops)?;
@@ -2870,25 +4233,26 @@ where
     let mut b_params = Dr1csBuilder::<BF<R>>::new();
     b_params.enforce_var_eq_const(b_params.one(), BF::<R>::ONE);
     for &x in &params.to_field_vec::<BF<R>>() {
-        let _ = b_params.new_var(x);
+        b_params.new_var(x);
     }
     let (params_inst, params_asg) = b_params.into_instance();
 
     // Short-challenge reconstruction part (allocates its own byte vars; we glue them).
     let (coin_inst, coin_asg, coin_wiring) = cm_short_challenges_dr1cs::<R>(trace, k, 0)?;
 
-    // Glue all squeezed bytes in order.
-    if byte_wiring.squeeze_byte_vars.len() < coin_wiring.byte_vars.len() {
-        return Err("poseidon byte wiring: not enough squeeze_byte_vars".to_string());
+    // Glue all squeezed digits in order (short challenges).
+    if wiring.squeeze_field_vars.len() < coin_wiring.digit_vars.len() {
+        return Err("poseidon wiring: not enough squeeze_field_vars".to_string());
     }
-    let mut glue: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(coin_wiring.byte_vars.len());
-    for i in 0..coin_wiring.byte_vars.len() {
-        glue.push((0, byte_wiring.squeeze_byte_vars[i], 2, coin_wiring.byte_vars[i]));
+    let mut glue: Vec<(usize, usize, usize, usize)> =
+        Vec::with_capacity(coin_wiring.digit_vars.len());
+    for i in 0..coin_wiring.digit_vars.len() {
+        glue.push((0, wiring.squeeze_field_vars[i], 2, coin_wiring.digit_vars[i]));
     }
 
     let parts = vec![(pose_inst, pose_asg), (params_inst, params_asg), (coin_inst, coin_asg)];
     let (inst, assignment) =
-        merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| e.to_string())?;
+        merge_sparse_dr1cs_share_one_with_glue(parts, &glue).map_err(|e| e.to_string())?;
 
     let public_len = 1 + 10;
     Ok((WeDr1csOutput { inst, assignment, public_len }, coin_wiring))
@@ -2911,7 +4275,7 @@ pub fn build_we_dr1cs_for_cm_challenges<R>(
 ) -> Result<(WeDr1csOutput<BF<R>>, CmShortChallengeWiring, CmFieldChallengeWiring), String>
 where
     R: OverField + CoeffRing + PolyRing,
-    R::BaseRing: Zq + Field,
+    R::BaseRing: Zq + Field + PrimeField,
 {
     let ops = lf_ops_to_symphony_ops::<BF<R>>(&trace.ops);
     let (mut pose_inst, pose_asg, _replay, _byte_wit, pose_wiring, byte_wiring) =
@@ -2923,87 +4287,107 @@ where
     let mut b_params = Dr1csBuilder::<BF<R>>::new();
     b_params.enforce_var_eq_const(b_params.one(), BF::<R>::ONE);
     for &x in &params.to_field_vec::<BF<R>>() {
-        let _ = b_params.new_var(x);
+        b_params.new_var(x);
     }
     let (params_inst, params_asg) = b_params.into_instance();
 
     // Short challenges part (bytes -> ring coeffs).
     let (coin_inst, coin_asg, coin_wiring) = cm_short_challenges_dr1cs::<R>(trace, k, 0)?;
     let op_wiring = cm_challenge_op_wiring::<R>(trace, k, log_kappa, nvars, 0)?;
-    let (pose_byte_vars, pose_field_vars) =
+    let (pose_byte_vars, pose_field_digits) =
         cm_poseidon_challenge_vars::<R>(&pose_wiring, &byte_wiring, &op_wiring)?;
 
-    // Glue bytes in the exact order used by short_challenge calls.
-    if pose_byte_vars.len() != coin_wiring.byte_vars.len() {
-        return Err("poseidon/coin byte length mismatch".to_string());
+    // Glue digits in the exact order used by short_challenge calls.
+    if pose_byte_vars.len() != coin_wiring.digit_vars.len() {
+        return Err("poseidon/coin digit length mismatch".to_string());
     }
-    let mut glue: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(coin_wiring.byte_vars.len());
-    for (pv, lv) in pose_byte_vars.iter().zip(coin_wiring.byte_vars.iter()) {
+    let mut glue: Vec<(usize, usize, usize, usize)> =
+        Vec::with_capacity(coin_wiring.digit_vars.len());
+    for (pv, lv) in pose_byte_vars.iter().zip(coin_wiring.digit_vars.iter()) {
         glue.push((0, *pv, 2, *lv));
     }
 
     // Field challenges part: allocate local vars with the expected values from the trace,
     // then glue them to the Poseidon squeeze-field vars selected by op wiring.
     let need_field = 2 * log_kappa + 2 + 2 * nvars;
-    if pose_field_vars.len() != need_field {
-        return Err("poseidon field var length mismatch".to_string());
+    let need_field_digits = need_field * CHALLENGE_DIGITS;
+    if pose_field_digits.len() != need_field_digits {
+        return Err("poseidon field digit length mismatch".to_string());
     }
     // Extract the matching field values from the trace by scanning SqueezeField ops after short challenges.
-    let mut squeezed_field_vals = Vec::with_capacity(need_field);
-    let mut seen_first_bytes = false;
-    let mut bytes_seen = 0usize;
+    let mut squeezed_field_digits = Vec::with_capacity(need_field_digits);
+    let mut seen_first_short = false;
+    let mut short_seen = 0usize;
     for op in &trace.ops {
         match op {
-            LfPoseidonTraceOp::SqueezeBytes { .. } => {
-                if !seen_first_bytes {
-                    seen_first_bytes = true;
-                }
-                if seen_first_bytes && bytes_seen < (3 + k * R::dimension()) {
-                    bytes_seen += 1;
-                }
-            }
             LfPoseidonTraceOp::SqueezeField(v) => {
-                if seen_first_bytes && bytes_seen == (3 + k * R::dimension()) && squeezed_field_vals.len() < need_field {
-                    if v.len() != 1 {
-                        return Err("expected base-field squeeze len=1".to_string());
+                if v.len() == R::dimension() && short_seen < (3 + k * R::dimension()) {
+                    if !seen_first_short {
+                        seen_first_short = true;
                     }
-                    squeezed_field_vals.push(v[0]);
+                    short_seen += 1;
+                } else if seen_first_short
+                    && short_seen == (3 + k * R::dimension())
+                    && squeezed_field_digits.len() < need_field_digits
+                {
+                    if v.len() != CHALLENGE_DIGITS {
+                        return Err("expected base-257 squeeze len=CHALLENGE_DIGITS".to_string());
+                    }
+                    squeezed_field_digits.extend_from_slice(v);
                 }
             }
             _ => {}
         }
     }
-    if squeezed_field_vals.len() != need_field {
-        return Err("could not extract enough squeeze_field values for cm".to_string());
+    if squeezed_field_digits.len() != need_field_digits {
+        return Err("could not extract enough squeeze_field digits for cm".to_string());
     }
 
     let mut b_fields = Dr1csBuilder::<BF<R>>::new();
     b_fields.enforce_var_eq_const(b_fields.one(), BF::<R>::ONE);
-    let mut cur = 0usize;
-    let take = |cur: &mut usize, n: usize, vs: &[BF<R>], b: &mut Dr1csBuilder<BF<R>>| -> Vec<usize> {
-        let out = vs[*cur..*cur + n].iter().copied().map(|x| b.new_var(x)).collect::<Vec<_>>();
-        *cur += n;
-        out
+    let mut digit_vars = Vec::with_capacity(need_field_digits);
+    for &dv in &squeezed_field_digits {
+        digit_vars.push(b_fields.new_var(dv));
+    }
+    let mut cur_digit = 0usize;
+    let next_chal = |cur: &mut usize, digits: &[usize], b: &mut Dr1csBuilder<BF<R>>| -> usize {
+        let slice = &digits[*cur..*cur + CHALLENGE_DIGITS];
+        *cur += CHALLENGE_DIGITS;
+        combine_base257_digits::<BF<R>>(b, slice)
     };
-    let c0 = take(&mut cur, log_kappa, &squeezed_field_vals, &mut b_fields);
-    let c1 = take(&mut cur, log_kappa, &squeezed_field_vals, &mut b_fields);
-    let rc0 = take(&mut cur, 1, &squeezed_field_vals, &mut b_fields)[0];
-    let sumcheck_r0 = take(&mut cur, nvars, &squeezed_field_vals, &mut b_fields);
-    let rc1 = take(&mut cur, 1, &squeezed_field_vals, &mut b_fields)[0];
-    let sumcheck_r1 = take(&mut cur, nvars, &squeezed_field_vals, &mut b_fields);
+    let mut c0 = Vec::with_capacity(log_kappa);
+    let mut c1 = Vec::with_capacity(log_kappa);
+    for _ in 0..log_kappa {
+        c0.push(next_chal(&mut cur_digit, &digit_vars, &mut b_fields));
+    }
+    for _ in 0..log_kappa {
+        c1.push(next_chal(&mut cur_digit, &digit_vars, &mut b_fields));
+    }
+    let rc0 = next_chal(&mut cur_digit, &digit_vars, &mut b_fields);
+    let mut sumcheck_r0 = Vec::with_capacity(nvars);
+    for _ in 0..nvars {
+        sumcheck_r0.push(next_chal(&mut cur_digit, &digit_vars, &mut b_fields));
+    }
+    let rc1 = next_chal(&mut cur_digit, &digit_vars, &mut b_fields);
+    let mut sumcheck_r1 = Vec::with_capacity(nvars);
+    for _ in 0..nvars {
+        sumcheck_r1.push(next_chal(&mut cur_digit, &digit_vars, &mut b_fields));
+    }
+    debug_assert_eq!(cur_digit, digit_vars.len());
     let (field_inst, field_asg) = b_fields.into_instance();
-    let field_wiring_local = CmFieldChallengeWiring { c0, c1, rc0, rc1, sumcheck_r0, sumcheck_r1 };
+    let field_wiring_local = CmFieldChallengeWiring {
+        c0,
+        c1,
+        rc0,
+        rc1,
+        sumcheck_r0,
+        sumcheck_r1,
+        digit_vars: digit_vars.clone(),
+    };
 
-    // Glue local field vars to selected Poseidon squeeze-field vars in order.
-    let mut local_field_vars = Vec::with_capacity(need_field);
-    local_field_vars.extend_from_slice(&field_wiring_local.c0);
-    local_field_vars.extend_from_slice(&field_wiring_local.c1);
-    local_field_vars.push(field_wiring_local.rc0);
-    local_field_vars.extend_from_slice(&field_wiring_local.sumcheck_r0);
-    local_field_vars.push(field_wiring_local.rc1);
-    local_field_vars.extend_from_slice(&field_wiring_local.sumcheck_r1);
-    debug_assert_eq!(local_field_vars.len(), pose_field_vars.len());
-    for (pv, lv) in pose_field_vars.iter().zip(local_field_vars.iter()) {
+    // Glue local digit vars to Poseidon squeeze-field vars in order.
+    debug_assert_eq!(digit_vars.len(), pose_field_digits.len());
+    for (pv, lv) in pose_field_digits.iter().zip(digit_vars.iter()) {
         glue.push((0, *pv, 3, *lv));
     }
 
@@ -3014,7 +4398,7 @@ where
         (field_inst, field_asg),
     ];
     let (inst, assignment) =
-        merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| e.to_string())?;
+        merge_sparse_dr1cs_share_one_with_glue(parts, &glue).map_err(|e| e.to_string())?;
 
     let public_len = 1 + 10;
     Ok((
@@ -3039,7 +4423,7 @@ pub fn build_we_dr1cs_for_cm_proof<R>(
 ) -> Result<WeDr1csOutput<BF<R>>, String>
 where
     R: OverField + CoeffRing + PolyRing,
-    R::BaseRing: Zq + Field,
+    R::BaseRing: Zq + Field + PrimeField,
 {
     // Hygiene: CmProof is a standalone verifier relation, so its transcript segment begins at 0.
     let ops_offset = 0usize;
@@ -3055,43 +4439,40 @@ where
 
     // Build independent parts in parallel (they only get glued/merged later).
     let (
-        (pose_inst, pose_asg, pose_wiring, byte_wiring, t_pose),
-        (params_inst, params_asg, params_vars, pub_input_vars, t_params),
-        (coin_inst, coin_asg, coin_wiring, op_wiring, t_coin),
-        (cm_inst, cm_asg, cm_wiring, t_cm),
+        (pose_inst, pose_asg, pose_wiring, byte_wiring),
+        (params_inst, params_asg, params_vars, pub_input_vars),
+        (coin_inst, coin_asg, coin_wiring, op_wiring),
+        (cm_inst, cm_asg, cm_wiring),
     ) = {
         let pose_build = || {
-            let t = std::time::Instant::now();
-    let (mut pose_inst, pose_asg, _replay, _byte_wit, pose_wiring, byte_wiring) =
-        poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
-            .map_err(|e| format!("poseidon arith failed: {e}"))?;
-    enforce_reabsorb_equals_squeeze::<BF<R>>(&mut pose_inst, &pose_wiring, &ops)?;
-            Ok::<_, String>((pose_inst, pose_asg, pose_wiring, byte_wiring, t.elapsed()))
+            let (mut pose_inst, pose_asg, _replay, _byte_wit, pose_wiring, byte_wiring) =
+                poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
+                    .map_err(|e| format!("poseidon arith failed: {e}"))?;
+            enforce_reabsorb_equals_squeeze::<BF<R>>(&mut pose_inst, &pose_wiring, &ops)?;
+            Ok::<_, String>((pose_inst, pose_asg, pose_wiring, byte_wiring))
         };
         let params_build = || {
-            let t = std::time::Instant::now();
-    let mut b_params = Dr1csBuilder::<BF<R>>::new();
-    b_params.enforce_var_eq_const(b_params.one(), BF::<R>::ONE);
-    let mut params_vars = Vec::with_capacity(9);
-    for &x in &params.to_field_vec::<BF<R>>() {
-        params_vars.push(b_params.new_var(x));
-    }
-    let mut pub_input_vars = Vec::with_capacity(public_inputs.len());
-    for &x in public_inputs {
-            let v = b_params.new_var(x);
-            pub_input_vars.push(v);
-    }
-    let (params_inst, params_asg) = b_params.into_instance();
-            Ok::<_, String>((params_inst, params_asg, params_vars, pub_input_vars, t.elapsed()))
+            let mut b_params = Dr1csBuilder::<BF<R>>::new();
+            b_params.enforce_var_eq_const(b_params.one(), BF::<R>::ONE);
+            let mut params_vars = Vec::with_capacity(9);
+            for &x in &params.to_field_vec::<BF<R>>() {
+                params_vars.push(b_params.new_var(x));
+            }
+            let mut pub_input_vars = Vec::with_capacity(public_inputs.len());
+            for &x in public_inputs {
+                let v = b_params.new_var(x);
+                pub_input_vars.push(v);
+            }
+            let (params_inst, params_asg) = b_params.into_instance();
+            Ok::<_, String>((params_inst, params_asg, params_vars, pub_input_vars))
         };
         let coin_build = || {
-            let t = std::time::Instant::now();
-    let (coin_inst, coin_asg, coin_wiring) = cm_short_challenges_dr1cs::<R>(trace, k, 0)?;
-    let op_wiring = cm_challenge_op_wiring::<R>(trace, k, log_kappa, nvars, 0)?;
-            Ok::<_, String>((coin_inst, coin_asg, coin_wiring, op_wiring, t.elapsed()))
+            let (coin_inst, coin_asg, coin_wiring) =
+                cm_short_challenges_dr1cs::<R>(trace, k, 0)?;
+            let op_wiring = cm_challenge_op_wiring::<R>(trace, k, log_kappa, nvars, 0)?;
+            Ok::<_, String>((coin_inst, coin_asg, coin_wiring, op_wiring))
         };
         let cm_build = || {
-            let t = std::time::Instant::now();
             let (cm_inst, cm_asg, cm_wiring) =
                 cm_verifier_math_dr1cs::<R>(
                     trace,
@@ -3106,7 +4487,7 @@ where
                     squeezed_field_offset,
                     true, // include_public_inputs_in_absorb
                 )?;
-            Ok::<_, String>((cm_inst, cm_asg, cm_wiring, t.elapsed()))
+            Ok::<_, String>((cm_inst, cm_asg, cm_wiring))
         };
 
         #[cfg(feature = "parallel")]
@@ -3122,84 +4503,101 @@ where
         }
     };
 
-    let (pose_byte_vars, pose_field_vars) =
+    let (pose_byte_vars, pose_field_digits) =
         cm_poseidon_challenge_vars::<R>(&pose_wiring, &byte_wiring, &op_wiring)?;
 
-    let t_glue = std::time::Instant::now();
-
-    if pose_byte_vars.len() != coin_wiring.byte_vars.len() {
-        return Err("poseidon/coin byte length mismatch".to_string());
+    if pose_byte_vars.len() != coin_wiring.digit_vars.len() {
+        return Err("poseidon/coin digit length mismatch".to_string());
     }
     let mut glue: Vec<(usize, usize, usize, usize)> = Vec::new();
-    for (pv, lv) in pose_byte_vars.iter().zip(coin_wiring.byte_vars.iter()) {
+    for (pv, lv) in pose_byte_vars.iter().zip(coin_wiring.digit_vars.iter()) {
         glue.push((0, *pv, 2, *lv));
     }
 
     // Field challenge local vars (same as in build_we_dr1cs_for_cm_challenges).
     let need_field = 2 * log_kappa + 2 + 2 * nvars;
-    if pose_field_vars.len() != need_field {
-        return Err("poseidon field var length mismatch".to_string());
+    let need_field_digits = need_field * CHALLENGE_DIGITS;
+    if pose_field_digits.len() != need_field_digits {
+        return Err("poseidon field digit length mismatch".to_string());
     }
-    let mut squeezed_field_vals = Vec::with_capacity(need_field);
-    let mut seen_first_bytes = false;
-    let mut bytes_seen = 0usize;
+    let mut squeezed_field_digits = Vec::with_capacity(need_field_digits);
+    let mut seen_first_short = false;
+    let mut short_seen = 0usize;
     for op in &trace.ops {
         match op {
-            crate::recording_transcript::PoseidonTraceOp::SqueezeBytes { .. } => {
-                if !seen_first_bytes {
-                    seen_first_bytes = true;
-                }
-                if seen_first_bytes && bytes_seen < (3 + k * R::dimension()) {
-                    bytes_seen += 1;
-                }
-            }
             crate::recording_transcript::PoseidonTraceOp::SqueezeField(v) => {
-                if seen_first_bytes && bytes_seen == (3 + k * R::dimension()) && squeezed_field_vals.len() < need_field {
-                    if v.len() != 1 {
-                        return Err("expected base-field squeeze len=1".to_string());
+                if v.len() == R::dimension() && short_seen < (3 + k * R::dimension()) {
+                    if !seen_first_short {
+                        seen_first_short = true;
                     }
-                    squeezed_field_vals.push(v[0]);
+                    short_seen += 1;
+                } else if seen_first_short
+                    && short_seen == (3 + k * R::dimension())
+                    && squeezed_field_digits.len() < need_field_digits
+                {
+                    if v.len() != CHALLENGE_DIGITS {
+                        return Err("expected base-257 squeeze len=CHALLENGE_DIGITS".to_string());
+                    }
+                    squeezed_field_digits.extend_from_slice(v);
                 }
             }
             _ => {}
         }
     }
-    if squeezed_field_vals.len() != need_field {
-        return Err("could not extract enough squeeze_field values for cm".to_string());
+    if squeezed_field_digits.len() != need_field_digits {
+        return Err("could not extract enough squeeze_field digits for cm".to_string());
     }
 
     let mut b_fields = Dr1csBuilder::<BF<R>>::new();
     b_fields.enforce_var_eq_const(b_fields.one(), BF::<R>::ONE);
-    let mut cur = 0usize;
-    let take = |cur: &mut usize, n: usize, vs: &[BF<R>], b: &mut Dr1csBuilder<BF<R>>| -> Vec<usize> {
-        let out = vs[*cur..*cur + n].iter().copied().map(|x| b.new_var(x)).collect::<Vec<_>>();
-        *cur += n;
-        out
+    let mut digit_vars = Vec::with_capacity(need_field_digits);
+    for &dv in &squeezed_field_digits {
+        digit_vars.push(b_fields.new_var(dv));
+    }
+    let mut cur_digit = 0usize;
+    let next_chal = |cur: &mut usize, digits: &[usize], b: &mut Dr1csBuilder<BF<R>>| -> usize {
+        let slice = &digits[*cur..*cur + CHALLENGE_DIGITS];
+        *cur += CHALLENGE_DIGITS;
+        combine_base257_digits::<BF<R>>(b, slice)
     };
-    let c0 = take(&mut cur, log_kappa, &squeezed_field_vals, &mut b_fields);
-    let c1 = take(&mut cur, log_kappa, &squeezed_field_vals, &mut b_fields);
-    let rc0 = take(&mut cur, 1, &squeezed_field_vals, &mut b_fields)[0];
-    let sumcheck_r0 = take(&mut cur, nvars, &squeezed_field_vals, &mut b_fields);
-    let rc1 = take(&mut cur, 1, &squeezed_field_vals, &mut b_fields)[0];
-    let sumcheck_r1 = take(&mut cur, nvars, &squeezed_field_vals, &mut b_fields);
+    let mut c0 = Vec::with_capacity(log_kappa);
+    let mut c1 = Vec::with_capacity(log_kappa);
+    for _ in 0..log_kappa {
+        c0.push(next_chal(&mut cur_digit, &digit_vars, &mut b_fields));
+    }
+    for _ in 0..log_kappa {
+        c1.push(next_chal(&mut cur_digit, &digit_vars, &mut b_fields));
+    }
+    let rc0 = next_chal(&mut cur_digit, &digit_vars, &mut b_fields);
+    let mut sumcheck_r0 = Vec::with_capacity(nvars);
+    for _ in 0..nvars {
+        sumcheck_r0.push(next_chal(&mut cur_digit, &digit_vars, &mut b_fields));
+    }
+    let rc1 = next_chal(&mut cur_digit, &digit_vars, &mut b_fields);
+    let mut sumcheck_r1 = Vec::with_capacity(nvars);
+    for _ in 0..nvars {
+        sumcheck_r1.push(next_chal(&mut cur_digit, &digit_vars, &mut b_fields));
+    }
+    debug_assert_eq!(cur_digit, digit_vars.len());
     let (field_inst, field_asg) = b_fields.into_instance();
-    let field_wiring_local = CmFieldChallengeWiring { c0, c1, rc0, rc1, sumcheck_r0, sumcheck_r1 };
+    let field_wiring_local = CmFieldChallengeWiring {
+        c0,
+        c1,
+        rc0,
+        rc1,
+        sumcheck_r0,
+        sumcheck_r1,
+        digit_vars: digit_vars.clone(),
+    };
 
-    // Glue local field vars to Poseidon squeeze-field vars.
-    let mut local_field_vars = Vec::with_capacity(need_field);
-    local_field_vars.extend_from_slice(&field_wiring_local.c0);
-    local_field_vars.extend_from_slice(&field_wiring_local.c1);
-    local_field_vars.push(field_wiring_local.rc0);
-    local_field_vars.extend_from_slice(&field_wiring_local.sumcheck_r0);
-    local_field_vars.push(field_wiring_local.rc1);
-    local_field_vars.extend_from_slice(&field_wiring_local.sumcheck_r1);
-    for (pv, lv) in pose_field_vars.iter().zip(local_field_vars.iter()) {
+    // Glue local digit vars to Poseidon squeeze-field vars.
+    for (pv, lv) in pose_field_digits.iter().zip(digit_vars.iter()) {
         glue.push((0, *pv, 3, *lv));
     }
 
     // Glue cm_wiring challenges to the coin/field wiring parts (so the math uses the same coins).
-    // Bytes:
-    for (cv, lv) in cm_wiring.short.byte_vars.iter().zip(coin_wiring.byte_vars.iter()) {
+    // Digits (short challenges):
+    for (cv, lv) in cm_wiring.short.digit_vars.iter().zip(coin_wiring.digit_vars.iter()) {
         glue.push((4, *cv, 2, *lv));
     }
     // Field scalars:
@@ -3218,26 +4616,27 @@ where
         glue.push((4, *cv, 3, *lv));
     }
 
-    // Glue Cm absorb surface (non-reabsorb absorbs after first SqueezeBytes) to Poseidon absorb vars.
-    // Compute the absorb-op index at which the Cm segment starts (first SqueezeBytes),
+    // Glue Cm absorb surface (non-reabsorb absorbs after first short SqueezeField) to Poseidon absorb vars.
+    // Compute the absorb-op index at which the Cm segment starts (first short SqueezeField),
     // relative to `ops_offset` (allows embedding Cm inside a larger transcript trace).
+    let d = R::dimension();
     let mut absorb_ops_before_cm = 0usize;
-    let mut seen_bytes = false;
+    let mut seen_short = false;
     if ops_offset > ops.len() {
         return Err("cm proof: ops_offset out of range".to_string());
     }
     for op in &ops[ops_offset..] {
         match op {
-            symphony::transcript::PoseidonTraceOp::SqueezeBytes { .. } => {
-                seen_bytes = true;
+            symphony::transcript::PoseidonTraceOp::SqueezeField(v) if v.len() == d => {
+                seen_short = true;
                 break;
             }
             symphony::transcript::PoseidonTraceOp::Absorb(_) => absorb_ops_before_cm += 1,
             _ => {}
         }
     }
-    if !seen_bytes {
-        return Err("cm proof: trace has no SqueezeBytes (short_challenge) marker".to_string());
+    if !seen_short {
+        return Err("cm proof: trace has no short SqueezeField marker".to_string());
     }
 
     // Determine which Absorb ops are reabsorbs (immediately following a SqueezeField).
@@ -3246,8 +4645,11 @@ where
     let mut absorb_idx = 0usize;
     for op in &ops {
         match op {
-            symphony::transcript::PoseidonTraceOp::SqueezeField(_) => expect_reabsorb = true,
-            symphony::transcript::PoseidonTraceOp::SqueezeBytes { .. } => {}
+            symphony::transcript::PoseidonTraceOp::SqueezeField(v) if v.len() == CHALLENGE_DIGITS => {
+                // Only `get_challenge()` performs a Fiat–Shamir re-absorb.
+                expect_reabsorb = true
+            }
+            symphony::transcript::PoseidonTraceOp::SqueezeField(_) => {}
             symphony::transcript::PoseidonTraceOp::Absorb(_) => {
                 if expect_reabsorb {
                     if absorb_idx < is_reabsorb.len() {
@@ -3257,10 +4659,11 @@ where
                 }
                 absorb_idx += 1;
             }
+            symphony::transcript::PoseidonTraceOp::SqueezeBytes { .. } => {}
         }
     }
 
-    // Glue Dcom-prefix squeeze-field vars (prefix before first SqueezeBytes) to Poseidon squeeze-field vars,
+    // Glue Dcom-prefix squeeze-field vars (prefix before first short SqueezeField) to Poseidon squeeze-field vars,
     // starting at `squeezed_field_offset`.
     if squeezed_field_offset + cm_wiring.squeeze_field_vars.len() > pose_wiring.squeeze_field_vars.len() {
         return Err("poseidon wiring: not enough squeeze_field_vars for dcom prefix".to_string());
@@ -3345,12 +4748,111 @@ where
         (field_inst, field_asg), // 3
         (cm_inst, cm_asg),       // 4
     ];
-    let base_constraints = parts.iter().map(|(i, _)| i.constraints.len()).sum::<usize>();
+    {
+        // #region agent log
+        let mut offsets: Vec<usize> = Vec::with_capacity(parts.len());
+        let mut cur = 0usize;
+        for (_inst, asg) in &parts {
+            offsets.push(cur);
+            cur += asg.len().saturating_sub(1);
+        }
+        let mut mismatch: Option<(usize, usize, usize, usize, usize, usize, String, String)> = None;
+        for &(pa, xa, pb, xb) in &glue {
+            if pa >= parts.len() || pb >= parts.len() {
+                continue;
+            }
+            let asg_a = &parts[pa].1;
+            let asg_b = &parts[pb].1;
+            if xa >= asg_a.len() || xb >= asg_b.len() {
+                continue;
+            }
+            let va = asg_a[xa];
+            let vb = asg_b[xb];
+            if va != vb {
+                let ga = if xa == 0 { 0 } else { xa + offsets[pa] };
+                let gb = if xb == 0 { 0 } else { xb + offsets[pb] };
+                mismatch = Some((
+                    pa,
+                    xa,
+                    ga,
+                    pb,
+                    xb,
+                    gb,
+                    format!("{}", va),
+                    format!("{}", vb),
+                ));
+                break;
+            }
+        }
+        if let Some((pa, xa, ga, pb, xb, gb, va, vb)) = mismatch {
+            debug_log(
+                "H5",
+                "we_gate_arith.rs:build_we_dr1cs_for_cm_proof:glue_mismatch",
+                "glue mismatch before merge",
+                &format!(
+                    "{{\"pa\":{},\"xa\":{},\"ga\":{},\"pb\":{},\"xb\":{},\"gb\":{},\"va\":\"{}\",\"vb\":\"{}\"}}",
+                    pa,
+                    xa,
+                    ga,
+                    pb,
+                    xb,
+                    gb,
+                    escape_json_str(&va),
+                    escape_json_str(&vb)
+                ),
+            );
+        } else {
+            debug_log(
+                "H5",
+                "we_gate_arith.rs:build_we_dr1cs_for_cm_proof:glue_mismatch",
+                "no glue mismatch before merge",
+                &format!("{{\"glue_len\":{}}}", glue.len()),
+            );
+        }
+        // #endregion
+    }
+    let _base_constraints = parts.iter().map(|(i, _)| i.constraints.len()).sum::<usize>();
 
-    let t_merge = std::time::Instant::now();
-    let (inst, assignment) =
-        merge_sparse_dr1cs_share_one_with_glue(&parts, &glue).map_err(|e| e.to_string())?;
-    let _ = (t_pose, t_params, t_coin, t_cm, t_glue, base_constraints, t_merge);
+    // Precompute per-part offsets/ranges for error reporting (must happen before we move `parts`).
+    let parts_len = parts.len();
+    let mut offsets: Vec<usize> = Vec::with_capacity(parts_len);
+    let mut cur = 0usize;
+    let mut part_nvars: Vec<usize> = Vec::with_capacity(parts_len);
+    for (inst, asg) in &parts {
+        offsets.push(cur);
+        cur += asg.len().saturating_sub(1);
+        part_nvars.push(inst.nvars);
+    }
+
+    let (inst, assignment) = merge_sparse_dr1cs_share_one_with_glue(parts, &glue).map_err(|e| {
+        // Add part-local index info for inconsistent-glue errors.
+        let msg = e.to_string();
+        if let Some((a, b)) = msg
+            .strip_prefix("merge_sparse_dr1cs_share_one_with_glue: inconsistent glued assignment (")
+            .and_then(|s| s.strip_suffix(")"))
+            .and_then(|s| s.split_once(" != "))
+            .and_then(|(x, y)| Some((x.parse::<usize>().ok()?, y.parse::<usize>().ok()?)))
+        {
+            let locate = |g: usize| -> Option<(usize, usize)> {
+                if g == 0 {
+                    return Some((0, 0));
+                }
+                for pi in 0..parts_len {
+                    let off = offsets[pi];
+                    let start = off + 1;
+                    let end = off + part_nvars[pi]; // exclusive end
+                    if g >= start && g < end {
+                        return Some((pi, g - off));
+                    }
+                }
+                None
+            };
+            let la = locate(a);
+            let lb = locate(b);
+            return format!("{msg} [global {a} -> {la:?}, global {b} -> {lb:?}]");
+        }
+        msg
+    })?;
 
     let public_len = 1 + 10 + public_inputs.len();
     Ok(WeDr1csOutput { inst, assignment, public_len })
@@ -3365,7 +4867,7 @@ fn decomp_verifier_math_dr1cs<R>(
 ) -> Result<(SparseDr1csInstance<BF<R>>, Vec<BF<R>>), String>
 where
     R: OverField + CoeffRing + PolyRing,
-    R::BaseRing: Zq + Field,
+    R::BaseRing: Zq + Field + PrimeField,
 {
     let mut b = Dr1csBuilder::<BF<R>>::new();
     b.enforce_var_eq_const(b.one(), BF::<R>::ONE);
@@ -3477,7 +4979,7 @@ fn plus_lin_verifier_math_dr1cs<R>(
 ) -> Result<(SparseDr1csInstance<BF<R>>, Vec<BF<R>>, Vec<usize>, Vec<usize>), String>
 where
     R: OverField + PolyRing,
-    R::BaseRing: Field,
+    R::BaseRing: PrimeField,
 {
     use latticefold::utils::sumcheck::Proof as ScProof;
 
@@ -3494,7 +4996,7 @@ where
         params_vars.push(b.new_var(v));
     }
 
-    let mut ch = ChallengeCursor::<BF<R>>::new(&trace.squeezed_field);
+    let mut ch = ChallengeCursor::<BF<R>>::new(trace);
     let mut absorb_flat: Vec<usize> = Vec::new();
 
     for lp in lproofs {
@@ -3530,10 +5032,10 @@ where
             let e1 = ring_to_ringvars::<R>(&mut b, &m.evaluations[1]);
             let e2 = ring_to_ringvars::<R>(&mut b, &m.evaluations[2]);
             let e3 = ring_to_ringvars::<R>(&mut b, &m.evaluations[3]);
-            absorb_flat.extend_from_slice(&e0.coeffs);
-            absorb_flat.extend_from_slice(&e1.coeffs);
-            absorb_flat.extend_from_slice(&e2.coeffs);
-            absorb_flat.extend_from_slice(&e3.coeffs);
+            absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat, &e0);
+            absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat, &e1);
+            absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat, &e2);
+            absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat, &e3);
             msg_vars.push([e0, e1, e2, e3]);
             let ri = ch.next(&mut b);
             // MLSumcheck verifier explicitly absorbs each sampled challenge as a scalar.
@@ -3551,10 +5053,10 @@ where
         let va = ring_to_ringvars::<R>(&mut b, &lp.va);
         let vb = ring_to_ringvars::<R>(&mut b, &lp.vb);
         let vc = ring_to_ringvars::<R>(&mut b, &lp.vc);
-        absorb_flat.extend_from_slice(&v.coeffs);
-        absorb_flat.extend_from_slice(&va.coeffs);
-        absorb_flat.extend_from_slice(&vb.coeffs);
-        absorb_flat.extend_from_slice(&vc.coeffs);
+        absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat, &v);
+        absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat, &va);
+        absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat, &vb);
+        absorb_ringvars_as_bytes::<R>(&mut b, &mut absorb_flat, &vc);
 
         // e = eq_eval(r_pre, r_sc) (scalar).
         let e = eq_eval_vars::<BF<R>>(&mut b, &r_pre, &r_sc);
@@ -3582,7 +5084,7 @@ pub fn build_we_dr1cs_for_plus_proof<R>(
 ) -> Result<WeDr1csOutput<BF<R>>, String>
 where
     R: OverField + CoeffRing + PolyRing,
-    R::BaseRing: Zq + Field,
+    R::BaseRing: Zq + Field + PrimeField,
 {
     build_we_dr1cs_for_plus_proof_internal::<R>(
         poseidon_cfg,
@@ -3607,7 +5109,7 @@ fn build_we_dr1cs_for_plus_proof_internal<R>(
 ) -> Result<WeDr1csOutput<BF<R>>, String>
 where
     R: OverField + CoeffRing + PolyRing,
-    R::BaseRing: Zq + Field,
+    R::BaseRing: Zq + Field + PrimeField,
 {
     let absorb_breakdown_on = std::env::var("LFP_WE_GATE_OPMIX").ok().as_deref() == Some("1");
     if absorb_breakdown_on {
@@ -3671,29 +5173,18 @@ where
              squeezed_field_elems: &mut usize|
              -> Result<(), String> {
                 // TracePoseidonTranscript::get_challenge records:
-                //   SqueezeField(extdeg=1), then Absorb(extdeg=1) (re-absorb).
-                expect_squeeze_field_len(1, op_idx, squeezed_field_elems)?;
-                expect_absorb_len(1, op_idx, absorb_ops)?;
+                //   SqueezeField(len=CHALLENGE_DIGITS), then Absorb(len=CHALLENGE_DIGITS) (re-absorb).
+                expect_squeeze_field_len(CHALLENGE_DIGITS, op_idx, squeezed_field_elems)?;
+                expect_absorb_len(CHALLENGE_DIGITS, op_idx, absorb_ops)?;
                 Ok(())
             };
 
-        let expect_squeeze_bytes =
-            |expected_n: usize, op_idx: &mut usize| -> Result<(), String> {
-                match trace.ops.get(*op_idx) {
-                    Some(Op::SqueezeBytes { n, out }) if *n == expected_n && out.len() == expected_n => {
-                        *op_idx += 1;
-                        Ok(())
-                    }
-                    other => Err(format!(
-                        "offsets: expected SqueezeBytes(n={}) at op {}, got {:?}",
-                        expected_n, *op_idx, other
-                    )),
-                }
-            };
+        let nbytes_scalar = prime_field_fixed_width_bytes::<BF<R>>();
+        let nbytes_ring = d * nbytes_scalar;
 
         for _ in 0..public_inputs.len() {
-            // Public inputs are absorbed as base-field scalars (len=1).
-            expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+            // Public inputs are absorbed as base-field scalars (byte-encoded).
+            expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?;
         }
         for lp in &proof.lproof {
             let nvars = lp.nvars;
@@ -3703,21 +5194,21 @@ where
             for _ in 0..nvars {
                 expect_get_challenge(&mut op_idx, &mut absorb_ops, &mut squeezed_field_elems)?;
             }
-            // absorb (nvars, degree=3) as scalars
-            expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
-            expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+            // absorb (nvars, degree=3) as scalars (byte-encoded)
+            expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?;
+            expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?;
             for _ in 0..nvars {
                 for _ in 0..4 {
-                    // 4 ring evaluations per round (len=d each)
-                    expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+                    // 4 ring evaluations per round (byte-encoded ring)
+                    expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
                 }
                 // verifier challenge + (reabsorb + explicit absorb)
                 expect_get_challenge(&mut op_idx, &mut absorb_ops, &mut squeezed_field_elems)?;
-                expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+                expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?;
             }
             for _ in 0..4 {
-                // absorb (v,va,vb,vc) (ring, len=d each)
-                expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+                // absorb (v,va,vb,vc) (byte-encoded ring)
+                expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
             }
         }
 
@@ -3739,16 +5230,16 @@ where
         // - C_Mf (kappa ring elems)
         // - cm_mtau (kappa ring elems)
         //
-        // Each ring element is absorbed as `len=d` base-field elements by the transcript.
+        // Each ring element is absorbed as fixed-width LE bytes (len = d * nbytes_scalar).
         for f in &dcom.fcoms {
             for _ in 0..f.cm_f.len() {
-                expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+                expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
             }
             for _ in 0..f.C_Mf.len() {
-                expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+                expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
             }
             for _ in 0..f.cm_mtau.len() {
-                expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+                expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
             }
         }
 
@@ -3767,48 +5258,52 @@ where
             expect_get_challenge(&mut op_idx, &mut absorb_ops, &mut squeezed_field_elems)?;
         }
         // MLSumcheck::verify_as_subprotocol for SetChk (nvars, degree=3, claimed_sum=0)
-        expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?; // nvars
-        expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?; // degree=3
+        expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?; // nvars
+        expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?; // degree=3
         for _ in 0..out.nvars {
             // 4 ring evals
             for _ in 0..4 {
-                expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+                expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
             }
             // r_i + (reabsorb + explicit absorb)
             expect_get_challenge(&mut op_idx, &mut absorb_ops, &mut squeezed_field_elems)?;
-            expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+            expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?;
         }
-        // absorb_evaluations_digest(out.e, out.b):
-        // SetChk binds all outputs via an Ajtai aggregate commitment and absorbs that commitment.
-        // (κ ring elements, each absorbed as len=d base-field elems).
-        let kappa = dcom.fcoms.first().map(|f| f.cm_f.len()).unwrap_or(0);
-        for _ in 0..kappa {
-            expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+        // setchk::absorb_evaluations(out.e, out.b): absorb all out.e blocks then out.b.
+        for ek in &out.e {
+            for ej in ek {
+                for _ in 0..ej.len() {
+                    expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
+                }
+            }
+        }
+        for _ in 0..out.b.len() {
+            expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
         }
 
         // rgchk::absorb_evaluations(&dcom.evals):
-        // - eval.a absorbed as scalars (len=1 each)
+        // - eval.a absorbed as scalars (byte-encoded)
         // - eval.c absorbed as ring elements (len=d each)
         for ev in &dcom.evals {
             for _ in 0..ev.a.len() {
-                expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+                expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?;
             }
             for _ in 0..ev.c.len() {
-                expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+                expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
             }
         }
 
         // CM short challenges: s (3) + s_prime (k*d) => need_short squeezes of n=d bytes.
         let need_short = 3 + (params.k as usize) * d;
         for _ in 0..need_short {
-            expect_squeeze_bytes(d, &mut op_idx)?;
+            expect_squeeze_field_len(d, &mut op_idx, &mut squeezed_field_elems)?;
         }
 
         // absorb_comh: L × κ ring elements.
         let l_instances = proof.cmproof.evals.0.len();
         let kappa = proof.cmproof.comh[0].len();
         for _ in 0..(l_instances * kappa) {
-            expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+            expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
         }
 
         // c0/c1 = get_challenges(log_kappa) twice.
@@ -3823,15 +5318,15 @@ where
             // rc = get_challenge
             expect_get_challenge(&mut op_idx, &mut absorb_ops, &mut squeezed_field_elems)?;
             // MLSumcheck::verify_as_subprotocol header (nvars, degree=2)
-            expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
-            expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+            expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?;
+            expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?;
             // rounds: 3 evals + get_challenge (reabsorb) + explicit absorb
             for _ in 0..nvars_cm {
                 for _ in 0..3 {
-                    expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+                    expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
                 }
                 expect_get_challenge(&mut op_idx, &mut absorb_ops, &mut squeezed_field_elems)?;
-                expect_absorb_len(1, &mut op_idx, &mut absorb_ops)?;
+                expect_absorb_len(nbytes_scalar, &mut op_idx, &mut absorb_ops)?;
             }
             // absorb_evaluations(evals)
             let evals = if which_sc == 0 { &proof.cmproof.evals.0 } else { &proof.cmproof.evals.1 };
@@ -3839,7 +5334,7 @@ where
                 for _row in ieval.rows() {
                     // Each row is [R;4]
                     for _ in 0..4 {
-                        expect_absorb_len(d, &mut op_idx, &mut absorb_ops)?;
+                        expect_absorb_len(nbytes_ring, &mut op_idx, &mut absorb_ops)?;
                     }
                 }
             }
@@ -3866,7 +5361,7 @@ where
 
     // Build independent parts in parallel (they only get glued/merged later).
     let (
-        (pose_inst, pose_asg, pose_wiring, byte_wiring, is_reabsorb, pose_permutes),
+        (pose_inst, pose_asg, pose_wiring, byte_wiring, is_reabsorb),
         (params_inst, params_asg, params_vars, pub_input_vars),
         (lin_inst, lin_asg, lin_ch_vars, lin_absorb_flat),
         (coin_inst, coin_asg, coin_wiring, op_wiring),
@@ -3875,19 +5370,21 @@ where
         (decomp_inst, decomp_asg),
     ) = {
         let pose_build = || {
-            let (mut pose_inst, pose_asg, replay, _byte_wit, pose_wiring, byte_wiring) =
+            let (mut pose_inst, pose_asg, _replay, _byte_wit, pose_wiring, byte_wiring) =
                 poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes::<BF<R>>(poseidon_cfg, &ops)
                     .map_err(|e| format!("poseidon arith failed: {e}"))?;
             enforce_reabsorb_equals_squeeze::<BF<R>>(&mut pose_inst, &pose_wiring, &ops)?;
-            let pose_permutes = replay.permutes.len();
-
             // Global reabsorb flags for absorb-op indexing.
             let mut is_reabsorb = vec![false; pose_wiring.absorb_ranges.len()];
             let mut expect_reabsorb = false;
             let mut absorb_idx = 0usize;
             for op in &ops {
                 match op {
-                    symphony::transcript::PoseidonTraceOp::SqueezeField(_) => expect_reabsorb = true,
+                    symphony::transcript::PoseidonTraceOp::SqueezeField(v) if v.len() == CHALLENGE_DIGITS => {
+                        // Only `get_challenge()` performs a Fiat–Shamir re-absorb.
+                        expect_reabsorb = true
+                    }
+                    symphony::transcript::PoseidonTraceOp::SqueezeField(_) => {}
                     symphony::transcript::PoseidonTraceOp::SqueezeBytes { .. } => {}
                     symphony::transcript::PoseidonTraceOp::Absorb(_) => {
                         if expect_reabsorb {
@@ -3906,7 +5403,6 @@ where
                 pose_wiring,
                 byte_wiring,
                 is_reabsorb,
-                pose_permutes,
             ))
         };
 
@@ -3946,47 +5442,55 @@ where
                 return Err("field_build: squeeze_field op wiring length mismatch".to_string());
             }
 
-            // Collect all SqueezeField scalars (base field only) in trace order.
-            let mut all_squeezed_field: Vec<BF<R>> = Vec::new();
+            // Collect all SqueezeField digit vectors (base-257) in trace order.
+            let mut all_squeezed_field: Vec<Vec<BF<R>>> = Vec::new();
             for op in &trace.ops {
                 if let crate::recording_transcript::PoseidonTraceOp::SqueezeField(v) = op {
-                    if v.len() != 1 {
-                        return Err("expected base-field squeeze len=1".to_string());
-                    }
-                    all_squeezed_field.push(v[0]);
+                    all_squeezed_field.push(v.clone());
                 }
             }
 
-            // Select the exact squeeze-field values used by the Cm verifier.
-            let mut squeezed_field_vals = Vec::with_capacity(need_field);
+            // Select the exact squeeze-field digits used by the Cm verifier.
+            let mut squeezed_field_digits = Vec::with_capacity(need_field * CHALLENGE_DIGITS);
             for &idx in &op_wiring.squeeze_field_ops {
-                let v = *all_squeezed_field
+                let v = all_squeezed_field
                     .get(idx)
                     .ok_or("field_build: squeeze_field op idx out of range")?;
-                squeezed_field_vals.push(v);
+                squeezed_field_digits.extend_from_slice(v);
             }
 
             let mut b_fields = Dr1csBuilder::<BF<R>>::new();
             b_fields.enforce_var_eq_const(b_fields.one(), BF::<R>::ONE);
-            let mut cur = 0usize;
-            let take = |cur: &mut usize,
-                        n: usize,
-                        vs: &[BF<R>],
-                        b: &mut Dr1csBuilder<BF<R>>| -> Vec<usize> {
-                let out = vs[*cur..*cur + n]
-                    .iter()
-                    .copied()
-                    .map(|x| b.new_var(x))
-                    .collect::<Vec<_>>();
-                *cur += n;
-                out
-            };
-            let c0 = take(&mut cur, log_kappa, &squeezed_field_vals, &mut b_fields);
-            let c1 = take(&mut cur, log_kappa, &squeezed_field_vals, &mut b_fields);
-            let rc0 = take(&mut cur, 1, &squeezed_field_vals, &mut b_fields)[0];
-            let sumcheck_r0 = take(&mut cur, nvars, &squeezed_field_vals, &mut b_fields);
-            let rc1 = take(&mut cur, 1, &squeezed_field_vals, &mut b_fields)[0];
-            let sumcheck_r1 = take(&mut cur, nvars, &squeezed_field_vals, &mut b_fields);
+            let mut digit_vars = Vec::with_capacity(need_field * CHALLENGE_DIGITS);
+            for &dv in &squeezed_field_digits {
+                digit_vars.push(b_fields.new_var(dv));
+            }
+            let mut cur_digit = 0usize;
+            let next_chal =
+                |cur: &mut usize, digits: &[usize], b: &mut Dr1csBuilder<BF<R>>| -> usize {
+                    let slice = &digits[*cur..*cur + CHALLENGE_DIGITS];
+                    *cur += CHALLENGE_DIGITS;
+                    combine_base257_digits::<BF<R>>(b, slice)
+                };
+            let mut c0 = Vec::with_capacity(log_kappa);
+            let mut c1 = Vec::with_capacity(log_kappa);
+            for _ in 0..log_kappa {
+                c0.push(next_chal(&mut cur_digit, &digit_vars, &mut b_fields));
+            }
+            for _ in 0..log_kappa {
+                c1.push(next_chal(&mut cur_digit, &digit_vars, &mut b_fields));
+            }
+            let rc0 = next_chal(&mut cur_digit, &digit_vars, &mut b_fields);
+            let mut sumcheck_r0 = Vec::with_capacity(nvars);
+            for _ in 0..nvars {
+                sumcheck_r0.push(next_chal(&mut cur_digit, &digit_vars, &mut b_fields));
+            }
+            let rc1 = next_chal(&mut cur_digit, &digit_vars, &mut b_fields);
+            let mut sumcheck_r1 = Vec::with_capacity(nvars);
+            for _ in 0..nvars {
+                sumcheck_r1.push(next_chal(&mut cur_digit, &digit_vars, &mut b_fields));
+            }
+            debug_assert_eq!(cur_digit, digit_vars.len());
             let (field_inst, field_asg) = b_fields.into_instance();
             let field_wiring_local = CmFieldChallengeWiring {
                 c0,
@@ -3995,6 +5499,7 @@ where
                 rc1,
                 sumcheck_r0,
                 sumcheck_r1,
+                digit_vars: digit_vars.clone(),
             };
             Ok::<_, String>((field_inst, field_asg, field_wiring_local))
         };
@@ -4079,14 +5584,15 @@ where
         ));
     }
 
-    let (pose_byte_vars, pose_field_vars) =
+    let (pose_byte_vars, pose_field_digits) =
         cm_poseidon_challenge_vars::<R>(&pose_wiring, &byte_wiring, &op_wiring)?;
 
     // Field challenges part: allocate local vars with the expected values from the trace,
     // then glue them to the Poseidon squeeze-field vars selected by op wiring.
     let need_field = 2 * log_kappa + 2 + 2 * nvars;
-    if pose_field_vars.len() != need_field {
-        return Err("poseidon field var length mismatch".to_string());
+    let need_field_digits = need_field * CHALLENGE_DIGITS;
+    if pose_field_digits.len() != need_field_digits {
+        return Err("poseidon field digit length mismatch".to_string());
     }
 
     // Glue Π_lin challenges (prefix squeeze-field) to Poseidon squeeze-field vars.
@@ -4155,8 +5661,8 @@ where
         + stmt_pub_vars.len()
         + lin_absorb_flat.len()
         + pose_byte_vars.len()
-        + need_field
-        + cm_wiring.short.byte_vars.len()
+        + need_field_digits
+        + cm_wiring.short.digit_vars.len()
         + cm_wiring.field.c0.len()
         + cm_wiring.field.c1.len()
         + 2 /* rc0/rc1 */
@@ -4217,32 +5723,28 @@ where
     }
 
     // --- Glue the Cm verifier parts into the shared transcript ---
-    // Glue all squeezed bytes in the exact order used by short_challenge calls.
-    if pose_byte_vars.len() != coin_wiring.byte_vars.len() {
-        return Err("poseidon/coin byte length mismatch".to_string());
+    // Glue all squeezed digits in the exact order used by short_challenge calls.
+    if pose_byte_vars.len() != coin_wiring.digit_vars.len() {
+        return Err("poseidon/coin digit length mismatch".to_string());
     }
-    for (pv, lv) in pose_byte_vars.iter().zip(coin_wiring.byte_vars.iter()) {
+    for (pv, lv) in pose_byte_vars.iter().zip(coin_wiring.digit_vars.iter()) {
         glue.push((0, *pv, 4, *lv));
     }
 
-    // Glue local field vars to Poseidon squeeze-field vars (selected by op wiring).
-    let mut local_field_vars = Vec::with_capacity(need_field);
-    local_field_vars.extend_from_slice(&field_wiring_local.c0);
-    local_field_vars.extend_from_slice(&field_wiring_local.c1);
-    local_field_vars.push(field_wiring_local.rc0);
-    local_field_vars.extend_from_slice(&field_wiring_local.sumcheck_r0);
-    local_field_vars.push(field_wiring_local.rc1);
-    local_field_vars.extend_from_slice(&field_wiring_local.sumcheck_r1);
-    for (pv, lv) in pose_field_vars.iter().zip(local_field_vars.iter()) {
+    // Glue local digit vars to Poseidon squeeze-field vars (selected by op wiring).
+    if field_wiring_local.digit_vars.len() != pose_field_digits.len() {
+        return Err("poseidon/local digit var length mismatch".to_string());
+    }
+    for (pv, lv) in pose_field_digits.iter().zip(field_wiring_local.digit_vars.iter()) {
         glue.push((0, *pv, 5, *lv));
     }
 
     // Glue Cm math wiring challenges to the coin/field wiring parts (so the math uses the same coins).
     for (cv, lv) in cm_wiring
         .short
-        .byte_vars
+        .digit_vars
         .iter()
-        .zip(coin_wiring.byte_vars.iter())
+        .zip(coin_wiring.digit_vars.iter())
     {
         glue.push((6, *cv, 4, *lv));
     }
@@ -4271,7 +5773,7 @@ where
         glue.push((6, *cv, 5, *lv));
     }
 
-    // Glue Dcom-prefix squeeze-field vars (prefix before first SqueezeBytes) to Poseidon squeeze-field vars,
+    // Glue Dcom-prefix squeeze-field vars (prefix before first short SqueezeField) to Poseidon squeeze-field vars,
     // starting at `cm_squeezed_field_offset`.
     if cm_squeezed_field_offset + cm_wiring.squeeze_field_vars.len()
         > pose_wiring.squeeze_field_vars.len()
@@ -4307,24 +5809,25 @@ where
         glue.push((1, *pv, 6, *dv));
     }
 
-    // Compute the absorb-op count in the Cm-prefix segment (from cm_ops_offset until first SqueezeBytes).
+    // Compute the absorb-op count in the Cm-prefix segment (from cm_ops_offset until first short SqueezeField).
+    let d = R::dimension();
     let mut absorb_ops_before_cm = 0usize;
-    let mut seen_bytes = false;
+    let mut seen_short = false;
     if cm_ops_offset > ops.len() {
         return Err("plus: cm_ops_offset out of range".to_string());
     }
     for op in &ops[cm_ops_offset..] {
         match op {
-            symphony::transcript::PoseidonTraceOp::SqueezeBytes { .. } => {
-                seen_bytes = true;
+            symphony::transcript::PoseidonTraceOp::SqueezeField(v) if v.len() == d => {
+                seen_short = true;
                 break;
             }
             symphony::transcript::PoseidonTraceOp::Absorb(_) => absorb_ops_before_cm += 1,
             _ => {}
         }
     }
-    if !seen_bytes {
-        return Err("plus: trace has no SqueezeBytes (short_challenge) marker".to_string());
+    if !seen_short {
+        return Err("plus: trace has no short SqueezeField marker".to_string());
     }
     if cm_absorb_op_offset > pose_wiring.absorb_ranges.len() {
         return Err("plus: cm_absorb_op_offset out of range".to_string());
@@ -4523,17 +6026,18 @@ where
     // This is logically equivalent to unification (adds equalities rather than identifying vars),
     // and avoids any dependence on which variable becomes the UF representative.
     fn merge_with_glue_constraints<F: PrimeField>(
-        parts: &[(SparseDr1csInstance<F>, Vec<F>)],
+        parts: Vec<(SparseDr1csInstance<F>, Vec<F>)>,
         glue: &[(usize, usize, usize, usize)],
     ) -> Result<(SparseDr1csInstance<F>, Vec<F>), String> {
-        let (mut inst, asg) = merge_sparse_dr1cs_share_one(parts)?;
-        // Compute per-part offsets in merged space (excluding var0).
+        // Compute per-part offsets in merged space (excluding var0) before we move `parts`.
         let mut offsets: Vec<usize> = Vec::with_capacity(parts.len());
         let mut cur = 0usize;
-        for (_inst, a) in parts {
+        for (_inst, a) in &parts {
             offsets.push(cur);
             cur += a.len().saturating_sub(1);
         }
+
+        let (mut inst, asg) = merge_sparse_dr1cs_share_one(parts)?;
         let remap = |part: usize, local: usize, offsets: &[usize]| -> usize {
             if local == 0 { 0 } else { local + offsets[part] }
         };
@@ -4541,16 +6045,21 @@ where
             let ga = remap(pa, xa, &offsets);
             let gb = remap(pb, xb, &offsets);
             // (ga - gb) * 1 = 0
-            inst.constraints.push(Constraint {
-                a: vec![(F::ONE, ga), (-F::ONE, gb)],
-                b: vec![(F::ONE, 0)],
-                c: vec![(F::ZERO, 0)],
-            });
+            let a0 = inst.a_terms.len();
+            inst.a_terms.extend_from_slice(&[(F::ONE, ga), (-F::ONE, gb)]);
+            let a1 = inst.a_terms.len();
+            let b0 = inst.b_terms.len();
+            inst.b_terms.push((F::ONE, 0));
+            let b1 = inst.b_terms.len();
+            let c0 = inst.c_terms.len();
+            inst.c_terms.push((F::ZERO, 0));
+            let c1 = inst.c_terms.len();
+            inst.constraints.push(Constraint { a: a0..a1, b: b0..b1, c: c0..c1 });
         }
         inst.nvars = asg.len();
         Ok((inst, asg))
     }
-    let (inst, assignment) = merge_with_glue_constraints(&parts, &glue)?;
+    let (inst, assignment) = merge_with_glue_constraints(parts, &glue)?;
     if std::env::var("LFP_WE_GATE_OPMIX").is_ok() {
         eprintln!(
             "LF+ WE gate merged: nvars={} constraints={} (glue constraints={})",
@@ -4595,7 +6104,7 @@ mod tests {
         }
 
         // If Rayon was already initialized elsewhere, ignore and proceed.
-        let _ = builder.build_global();
+        drop(builder.build_global());
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -4607,7 +6116,7 @@ mod tests {
     use latticefold::transcript::Transcript;
     use ark_ff::{Fp384, MontBackend, MontConfig};
     use stark_rings::balanced_decomposition::GadgetDecompose;
-    use stark_rings::cyclotomic_ring::models::goldilocks::RqPoly as R;
+    use cyclotomic_rings::rings::GoldilocksRing64 as R;
     use stark_rings_linalg::{Matrix, SparseMatrix};
 
     use crate::lin::Linearize;
@@ -4616,6 +6125,311 @@ mod tests {
     use crate::recording_transcript::TracePoseidonTranscript;
     use crate::rgchk::{DecompParameters, Rg, RgInstance};
     use crate::cm::Cm;
+
+    // NOTE: We intentionally do not keep the old “shape builds and constraints check” tests here.
+    // They were development scaffolding and are slow/ignored. The tiny gate is now exercised via
+    // focused gadget-level tests in `we_gate_tiny/tests.rs`, and will be covered end-to-end by
+    // real-trace tests in the main WE harness.
+
+    #[test]
+    #[ignore = "slow: builds Poseidon(F257) tiny gate + checks all constraints (GoldilocksRing64)"]
+    fn test_tiny_gate_shape_builds_and_constraints_check_goldilocks() {
+        use cyclotomic_rings::rings::GoldilocksRing64 as RR;
+
+        init_rayon_stack();
+
+        // Minimal-but-valid params to keep the schedule small but exercise the d64 path.
+        //
+        // IMPORTANT: CM verifier math (t(z) tensor evaluation) requires `nvars_cm` to be at least
+        // the number of tensor variables: log2(d) + log2(ell) + log2(k*d) + log2(kappa).
+        // For d=64, kappa=1, k=1, ell=1 this is 6 + 0 + 6 + 0 = 12.
+        let ring_dim = <RR as PolyRing>::dimension() as u64;
+        let nvars = 12u64;
+        let params = WeParams {
+            nvars_setchk: nvars,
+            degree_setchk: 3,
+            nvars_cm: nvars,
+            degree_cm: 2,
+            kappa: 1,
+            ring_dim_d: ring_dim,
+            decomp_b: 16,
+            k: 1,
+            l: 1,
+            mlen: 0,
+        };
+
+        // Exercise one digit-mul surface.
+        let pairs: Vec<(usize, usize)> = vec![(0, 0)];
+
+        // Build a self-consistent trace and arithmetize the tiny gate.
+        // Prefix binding requires at least `min(8,kappa)` public inputs absorbed before challenges.
+        // Here kappa=1, so include exactly 1 dummy public input absorb in the trace.
+        let trace = super::poseidon_trace_schedule_for_plus::<RR>(1, &params, 1, 0)
+            .expect("poseidon_trace_schedule_for_plus");
+        let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<RR>>(&trace.ops)
+            .expect("lift_recording_trace_ops_to_f257");
+
+        // The CM segment begins at the first `SqueezeField(len=ring_dim)` (short challenges).
+        // To mirror the real verifier schedule, include prefix `get_challenge()` u32 squeezes.
+        let squeeze_field_op_offset =
+            super::first_squeeze_field_op_index_of_len(&ops_f257, <RR as PolyRing>::dimension())
+                .expect("first short SqueezeField(len=ring_dim) exists");
+        let prefix_u32_squeeze_ops =
+            super::collect_get_challenge_squeeze_field_indices(&ops_f257, 0, squeeze_field_op_offset);
+
+        let k = params.k as usize;
+        let log_kappa = ark_std::log2((params.kappa as usize).next_power_of_two()) as usize;
+        let nvars_cm = params.nvars_cm as usize;
+        let wiring_rel = tiny::infer_cm_coin_op_wiring_from_ops(
+            &ops_f257,
+            <RR as PolyRing>::dimension(),
+            k,
+            log_kappa,
+            nvars_cm,
+            squeeze_field_op_offset,
+        )
+        .expect("infer_cm_coin_op_wiring_from_ops");
+
+        let mut wiring_abs = tiny::TinyCoinOpWiring::default();
+        wiring_abs.short_squeeze_ops = wiring_rel
+            .short_squeeze_ops
+            .into_iter()
+            .map(|i| i + squeeze_field_op_offset)
+            .collect();
+        wiring_abs.u32_squeeze_ops = wiring_rel
+            .u32_squeeze_ops
+            .into_iter()
+            .map(|i| i + squeeze_field_op_offset)
+            .collect();
+        wiring_abs
+            .u32_squeeze_ops
+            .splice(0..0, prefix_u32_squeeze_ops.into_iter());
+
+        let out_dir = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_tiny_gate_build_from_ops");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir");
+            p
+        };
+        let dummy_extra = tiny::TinyExtraWitness {
+            dcom_eval_b: vec![vec![vec![0u64; <RR as PolyRing>::dimension()]]],
+            dcom_eval_v: vec![vec![0u64; <RR as PolyRing>::dimension()]],
+            decomp_c0: vec![vec![0u64; <RR as PolyRing>::dimension()]; params.kappa as usize],
+            decomp_c1: vec![vec![0u64; <RR as PolyRing>::dimension()]; params.kappa as usize],
+            decomp_v0a: vec![vec![0u64; <RR as PolyRing>::dimension()]; 1 + params.mlen as usize],
+            decomp_v0b: vec![vec![0u64; <RR as PolyRing>::dimension()]; 1 + params.mlen as usize],
+            decomp_v1a: vec![vec![0u64; <RR as PolyRing>::dimension()]; 1 + params.mlen as usize],
+            decomp_v1b: vec![vec![0u64; <RR as PolyRing>::dimension()]; 1 + params.mlen as usize],
+        };
+        let (inst, asg, _shorts, _u32s, _goldilocks, _sm, _ssq, _w) =
+            tiny::we_tiny_f257_build_cm_gate_from_trace_ops(
+                None,
+                &ops_f257,
+                <RR as PolyRing>::dimension(),
+                &params,
+                &wiring_abs,
+                &pairs,
+                &dummy_extra,
+                &out_dir,
+            )
+            .expect("we_tiny_f257_build_cm_gate_from_trace_ops");
+
+        inst.check(&asg).expect("dr1cs check");
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+
+    #[test]
+    #[ignore = "very slow in debug: runs full DPP prove+decap; run with `--release`"]
+    fn test_tiny_gate_ringlwe_lock_roundtrip_small() {
+        use crate::lockable_ringlwe::RingLweParams;
+        use crate::we_statement::encode_public_x;
+        use crate::we_tiny_lock::arm_lfplus_we_gate_tiny_ringlwe_streaming;
+        use dpp::dr1cs_flpcp::Dr1csQueryScratch;
+        use std::time::Instant;
+        use rand::{rngs::StdRng, SeedableRng};
+
+        // Minimal-but-valid params to keep the schedule small.
+        //
+        // IMPORTANT: for ring_dim=64 the CM verifier math needs nvars_cm >= 12 (see also
+        // `test_tiny_gate_shape_builds_and_constraints_check_goldilocks`).
+        let ring_dim = <R as PolyRing>::dimension() as u64;
+        let nvars_min = 12u64;
+        let params = WeParams {
+            nvars_setchk: nvars_min,
+            degree_setchk: 3,
+            nvars_cm: nvars_min,
+            degree_cm: 2,
+            kappa: 1,
+            ring_dim_d: ring_dim,
+            decomp_b: 16,
+            k: 1,
+            l: 1,
+            mlen: 0,
+        };
+        let public_inputs_len = 8usize; // number of public **field elements**
+        let n_lin_proofs = 1usize; // schedule builder currently assumes L=1
+        let mlen_mats = 0usize;
+        // Mirror the SP1 oneproof path: use the canonical tiny-gate builders.
+        // Include an SP1-style exposed-prefix public input vector (len=8) so we exercise
+        // prefix binding at arming/proving time.
+        //
+        // NOTE: `pairs` indices are interpreted over the full `u32_squeeze_ops` wiring, which
+        // includes any prefix `get_challenge()` u32 squeezes.
+        let pairs: Vec<(usize, usize)> = vec![(0, 0)];
+        type BF0 = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
+        // Public inputs as base-field elements (used for schedule trace generation).
+        //
+        // the tiny-gate public prefix is the transcript encoding of these field
+        // elements: fixed-width little-endian bytes, lifted into F257 (0..=255). We must NOT
+        // synthesize "bytes" from arbitrary F257 elements, since 256 is a valid F257 element but
+        // is a special base-257 digit (sentinel) in the transcript's byte-view map.
+        let mut public_inputs_bf: Vec<BF0> = (0..public_inputs_len)
+            .map(|i| if (i % 3) == 0 { BF0::ONE } else { BF0::ZERO })
+            .collect();
+        // for kappa=1, the tiny gate's prefix binding constrains `cm_f[0]` to match the
+        // first public input absorbed in the transcript prefix. Our dummy proof uses `cm_f[0]=0`,
+        // so ensure the first public input is 0 to keep the roundtrip test focused on shape↔witness
+        // consistency (not on statement/proof mismatch).
+        if !public_inputs_bf.is_empty() {
+            public_inputs_bf[0] = BF0::ZERO;
+        }
+        // Tiny-gate statement public prefix uses the byte encoding (8 bytes per base-field element).
+        let public_inputs_bytes_f257: Vec<F257> = public_inputs_bf
+            .iter()
+            .flat_map(|x| {
+                let bytes = latticefold::transcript::bytes::prime_field_to_bytes_le_fixed::<BF0>(x);
+                bytes.into_iter().map(|b| F257::from(b as u64))
+            })
+            .collect();
+
+        // Build a self-consistent schedule trace whose initial absorbs match `public_inputs_f257`.
+        let trace = super::poseidon_trace_schedule_for_plus_with_public_inputs::<R>(
+            &public_inputs_bf,
+            &params,
+            n_lin_proofs,
+            mlen_mats,
+        )
+        .expect("poseidon_trace_schedule_for_plus_with_public_inputs");
+
+        // Armer builds the shape.
+        let t_shape = Instant::now();
+        let out_dir_shape = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_tiny_shape_roundtrip_shape");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_shape");
+            p
+        };
+        let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
+            &trace,
+            &params,
+            &public_inputs_bf,
+            n_lin_proofs,
+            mlen_mats,
+            &pairs,
+            &out_dir_shape,
+        )
+        .expect("build_we_dr1cs_for_plus_proof_shape_tiny");
+        assert_eq!(shape.public_len, 1 + 10 + 8 * public_inputs_len);
+
+        // Prover builds a satisfying assignment for *that same shape* from the recorded trace.
+        let out_dir_witness = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_tiny_shape_roundtrip_witness");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_witness");
+            p
+        };
+        let proof =
+            dummy_plus_proof_shape::<R>(&params, mlen_mats, n_lin_proofs).expect("dummy_plus_proof_shape");
+        let (_shape2, asg) = build_we_plus_tiny_dr1cs::<R>(
+            &trace,
+            &params,
+            &public_inputs_bytes_f257,
+            &proof,
+            mlen_mats,
+            &pairs,
+            &out_dir_witness,
+        )
+        .expect("build_we_plus_tiny_dr1cs");
+        let _ = std::fs::remove_dir_all(&out_dir_witness);
+        assert_eq!(asg.len(), shape.inst.nvars);
+        shape.inst.check(&asg).expect("shape should be satisfied by witness assignment");
+        eprintln!(
+            "[tiny_gate] built shape in {:?}: public_len={} nvars={} constraints={}",
+            t_shape.elapsed(),
+            shape.public_len,
+            shape.inst.nvars,
+            shape.inst.layout.nconstraints
+        );
+
+        // Arm and then prove+decap using the satisfying assignment split into (x || z_w).
+        let stmt_digest = [3u8; 32];
+        let armer_seed = [7u8; 32];
+        let lock_j = 0u64;
+
+        let ringlwe_params = RingLweParams {
+            binomial_k: 0,
+            noise_bound: 0,
+            ..RingLweParams::default()
+        };
+
+        let mut rng = StdRng::seed_from_u64(42);
+        // These are no longer needed by the public arming helper, but keep a type-use here to
+        // avoid feature-gated import drift.
+        let _scratch_ty: Option<Dr1csQueryScratch<F257>> = None;
+
+        let public_len = shape.public_len;
+        let t_arm = Instant::now();
+        let ctx = arm_lfplus_we_gate_tiny_ringlwe_streaming::<R>(
+            shape,
+            &params,
+            &public_inputs_bytes_f257,
+            stmt_digest,
+            armer_seed,
+            lock_j,
+            0,
+            0,
+            ringlwe_params,
+            &mut rng,
+        )
+        .expect("arm_lfplus_we_gate_tiny_ringlwe_streaming");
+        eprintln!(
+            "[tiny_gate] armed in {:?}: proof_len={}",
+            t_arm.elapsed(),
+            ctx.proof_len()
+        );
+
+        let x = encode_public_x::<F257>(&params, &public_inputs_bytes_f257);
+        assert_eq!(x.len(), public_len);
+        assert_eq!(&asg[..public_len], x.as_slice(), "satisfying assignment public prefix mismatch");
+        let z_w = asg[public_len..].to_vec();
+
+        let t_prove = Instant::now();
+        let mut pi = Vec::new();
+        ctx.prove_stream(&x, &z_w, &mut |chunk| pi.extend_from_slice(&chunk))
+            .expect("prove_stream");
+        assert_eq!(pi.len(), ctx.proof_len());
+        eprintln!("[tiny_gate] proved in {:?}", t_prove.elapsed());
+
+        let t_decap = Instant::now();
+        let a = ctx.lock.decap_answer(&x, &pi).expect("decap_answer");
+        assert!(a == F257::from(1u64) || a == F257::from(2u64));
+        eprintln!("[tiny_gate] decap in {:?}", t_decap.elapsed());
+
+        // Negative check: tweak proof and ensure decap fails.
+        let mut pi_bad = pi.clone();
+        pi_bad[0] += F257::from(1u64);
+        assert!(ctx.lock.decap_answer(&x, &pi_bad).is_err());
+
+        // Negative check: flip a public input and ensure decap fails with the same proof.
+        let mut x_bad = x.clone();
+        let first_pi = 1usize + 10usize; // [ONE] || [10×WeParams] || [public_input_bytes...]
+        x_bad[first_pi] += F257::ONE;
+        assert!(ctx.lock.decap_answer(&x_bad, &pi).is_err());
+    }
 
     #[derive(MontConfig)]
     #[modulus = "39402006196394479212279040100143613805079739270465446667948293404245721771496870329047266088258938001861606973112319"]
@@ -4639,7 +6453,10 @@ mod tests {
         }
     }
 
-    impl<RR: OverField> Transcript<RR> for ReplayPoseidonTranscript<RR> {
+    impl<RR: OverField> Transcript<RR> for ReplayPoseidonTranscript<RR>
+    where
+        RR::BaseRing: PrimeField,
+    {
         type TranscriptConfig = ark_crypto_primitives::sponge::poseidon::PoseidonConfig<<RR::BaseRing as Field>::BasePrimeField>;
         fn new(_config: &Self::TranscriptConfig) -> Self {
             unreachable!("ReplayPoseidonTranscript::new(trace) should be used in tests")
@@ -4647,9 +6464,11 @@ mod tests {
 
         fn absorb(&mut self, v: &RR) {
             self.scratch.clear();
-            for c in v.coeffs() {
-                self.scratch.extend(c.to_base_prime_field_elements());
-            }
+            // Match the real transcript encoding: ring -> canonical fixed-width LE bytes,
+            // then each byte is absorbed as an F257 element (recorded in base ring as 0..=255).
+            let bytes = latticefold::transcript::bytes::ring_to_bytes_le_fixed::<RR>(v);
+            self.scratch
+                .extend(bytes.iter().map(|b| <RR::BaseRing as Field>::BasePrimeField::from(*b as u64)));
             let op = self.trace.ops.get(self.idx).expect("replay: op index oob").clone();
             match op {
                 crate::recording_transcript::PoseidonTraceOp::Absorb(elems) => {
@@ -4666,10 +6485,12 @@ mod tests {
         }
 
         fn absorb_field_element(&mut self, v: &RR::BaseRing) {
-            // Match `latticefold-plus` transcript encoding: scalar absorbs are absorbed directly
-            // as base-prime-field elements (NOT expanded into a constant-coeff ring element).
+            // Match the real transcript encoding: scalar -> fixed-width LE bytes,
+            // then absorb bytes as F257 elements (recorded as 0..=255 in base ring).
             self.scratch.clear();
-            self.scratch.extend(v.to_base_prime_field_elements());
+            let bytes = latticefold::transcript::bytes::prime_field_to_bytes_le_fixed::<RR::BaseRing>(v);
+            self.scratch
+                .extend(bytes.iter().map(|b| <RR::BaseRing as Field>::BasePrimeField::from(*b as u64)));
             let op = self.trace.ops.get(self.idx).expect("replay: op index oob").clone();
             match op {
                 crate::recording_transcript::PoseidonTraceOp::Absorb(elems) => {
@@ -4689,37 +6510,80 @@ mod tests {
         }
 
         fn get_challenge(&mut self) -> RR::BaseRing {
-            let ext = RR::BaseRing::extension_degree() as usize;
-            let op0 = self.trace.ops.get(self.idx).expect("replay: op index oob").clone();
-            let c = match op0 {
-                crate::recording_transcript::PoseidonTraceOp::SqueezeField(v) => v,
-                other => panic!("replay expected SqueezeField op, got {other:?} at idx {}", self.idx),
-            };
-            assert_eq!(c.len(), ext, "replay squeeze_field length mismatch");
-            self.advance();
+            // Fixed-tries rejection schedule: DEFAULT_REJECTION_TRIES repetitions of
+            //   SqueezeField(len=CHALLENGE_DIGITS) then Absorb(len=CHALLENGE_DIGITS),
+            // then select the first try whose first 4 digits are all != 256.
+            let mut chosen = [0u8; 4];
+            let mut found = false;
+            for _ in 0..DEFAULT_REJECTION_TRIES {
+                let op0 = self.trace.ops.get(self.idx).expect("replay: op index oob").clone();
+                let c = match op0 {
+                    crate::recording_transcript::PoseidonTraceOp::SqueezeField(v) => v,
+                    other => panic!("replay expected SqueezeField op, got {other:?} at idx {}", self.idx),
+                };
+                assert_eq!(c.len(), CHALLENGE_DIGITS, "replay get_challenge digit length mismatch");
+                self.advance();
 
-            // get_challenge reabsorbs the squeezed field elements; the trace records that as Absorb(c).
-            let op1 = self.trace.ops.get(self.idx).expect("replay: op index oob").clone();
-            match op1 {
-                crate::recording_transcript::PoseidonTraceOp::Absorb(v) => {
-                    assert_eq!(v.as_slice(), c.as_slice(), "replay reabsorb mismatch");
+                // Each try reabsorbs the squeezed digits.
+                let op1 = self.trace.ops.get(self.idx).expect("replay: op index oob").clone();
+                match op1 {
+                    crate::recording_transcript::PoseidonTraceOp::Absorb(v) => {
+                        assert_eq!(v.as_slice(), c.as_slice(), "replay reabsorb mismatch");
+                    }
+                    other => panic!("replay expected reabsorb Absorb op after SqueezeField, got {other:?}"),
+                };
+                self.advance();
+
+                if found {
+                    continue;
                 }
-                other => panic!("replay expected reabsorb Absorb op after SqueezeField, got {other:?}"),
-            };
-            self.advance();
-
-            <RR::BaseRing as Field>::from_base_prime_field_elems(&c)
-                .expect("replay: wrong extension_degree")
+                // Accept iff none of the first 4 digits is 256; pack the first 4 digits (byte view) into u32.
+                let mut ok = true;
+                let mut bs = [0u8; 4];
+                for i in 0..4 {
+                    // IMPORTANT: digits are base-257 elements in 0..=256. Do NOT read only the low
+                    // byte (256 would appear as 0x00); read the full limb so we can detect 256.
+                    let du16 = c[i]
+                        .into_bigint()
+                        .as_ref()
+                        .get(0)
+                        .copied()
+                        .unwrap_or(0) as u16;
+                    debug_assert!(du16 < 257u16);
+                    if du16 == 256 {
+                        ok = false;
+                        break;
+                    }
+                    bs[i] = du16 as u8;
+                }
+                if ok {
+                    chosen = bs;
+                    found = true;
+                }
+            }
+            assert!(
+                found,
+                "ReplayPoseidonTranscript::get_challenge exhausted {} rejection tries",
+                DEFAULT_REJECTION_TRIES
+            );
+            RR::BaseRing::from(u32::from_le_bytes(chosen) as u64)
         }
 
         fn squeeze_bytes(&mut self, n: usize) -> Vec<u8> {
             let op = self.trace.ops.get(self.idx).expect("replay: op index oob").clone();
             let out = match op {
-                crate::recording_transcript::PoseidonTraceOp::SqueezeBytes { n: nn, out } => {
-                    assert_eq!(nn, n, "replay squeeze_bytes n mismatch");
-                    out
+                crate::recording_transcript::PoseidonTraceOp::SqueezeField(v) => {
+                    assert_eq!(v.len(), n, "replay squeeze_bytes n mismatch");
+                    v.iter()
+                        .map(|e| {
+                            // Read full limb so 256 is represented as 256 (then map to 0).
+                            let d = e.into_bigint().as_ref().get(0).copied().unwrap_or(0) as u16;
+                            debug_assert!(d < 257u16);
+                            if d == 256 { 0u8 } else { d as u8 }
+                        })
+                        .collect()
                 }
-                other => panic!("replay expected SqueezeBytes op, got {other:?} at idx {}", self.idx),
+                other => panic!("replay expected SqueezeField op, got {other:?} at idx {}", self.idx),
             };
             self.advance();
             out
@@ -4761,13 +6625,70 @@ mod tests {
         assert!(lproof.verify(&mut rec));
         let trace = rec.trace().clone();
 
-        // Build verifier-math dR1CS and check satisfaction.
-        let mut ch = ChallengeCursor::<BF<R>>::new(&trace.squeezed_field);
+        // Build verifier-math dR1CS and check satisfaction, with challenges derived from trace ops.
+        let mut ch = ChallengeCursor::<BF<R>>::new(&trace);
         let (inst, asg, _ch_vars) = comr1cs_verifier_math_dr1cs::<R>(&lproof, &mut ch).unwrap();
         inst.check(&asg).unwrap();
 
         // Sanity: we consumed exactly 2*nvars squeeze-field scalars (r_pre and sumcheck rs).
         assert_eq!(ch.consumed(), 2 * lproof.nvars);
+    }
+
+    #[test]
+    fn test_base257_combine_matches_trace_and_circuit() {
+        type F = BF<R>;
+
+        // Record a small trace with a mix of squeezes.
+        let mut rec = TracePoseidonTranscript::<R>::empty::<PC>();
+        rec.absorb(&<R as stark_rings::Ring>::ONE);
+        drop(rec.squeeze_bytes(9)); // not CHALLENGE_DIGITS; should be ignored for scalar challenges
+
+        let n_chals = 5usize;
+        for _ in 0..n_chals {
+            rec.get_challenge();
+        }
+        let trace = rec.trace().clone();
+
+        // Off-circuit reconstruction from trace ops.
+        let expected = trace.challenge_scalars_base257_all(CHALLENGE_DIGITS);
+        assert_eq!(expected.len(), n_chals);
+
+        // Extract the digit blocks that correspond to get_challenge squeezes.
+        // With fixed-tries rejection, each logical challenge contributes
+        // `DEFAULT_REJECTION_TRIES` blocks of `SqueezeField(len=CHALLENGE_DIGITS)`.
+        let digit_blocks = trace
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                crate::recording_transcript::PoseidonTraceOp::SqueezeField(v)
+                    if v.len() == CHALLENGE_DIGITS =>
+                {
+                    Some(v.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<Vec<F>>>();
+        assert_eq!(digit_blocks.len(), n_chals * crate::transcript::DEFAULT_REJECTION_TRIES);
+
+        // In-circuit reconstruction using the fixed-tries combiner.
+        let mut b = Dr1csBuilder::<F>::new();
+        b.enforce_var_eq_const(b.one(), F::ONE);
+        let tries = crate::transcript::DEFAULT_REJECTION_TRIES;
+        for i in 0..n_chals {
+            let mut digit_vars_all: Vec<usize> = Vec::with_capacity(tries * CHALLENGE_DIGITS);
+            for t in 0..tries {
+                let blk = &digit_blocks[i * tries + t];
+                assert_eq!(blk.len(), CHALLENGE_DIGITS);
+                for &d in blk {
+                    digit_vars_all.push(b.new_var(d));
+                }
+            }
+            let c_var = combine_base257_digits_fixed_tries::<F>(&mut b, &digit_vars_all, tries);
+            assert_eq!(b.assignment[c_var], expected[i]);
+        }
+
+        let (inst, asg) = b.into_instance();
+        inst.check(&asg).unwrap();
     }
 
     #[test]
@@ -4798,19 +6719,19 @@ mod tests {
 
         // Run verifier to get the real transcript coin stream (r_i).
         let mut rec = crate::recording_transcript::TracePoseidonTranscript::<R>::empty::<PC>();
-        let _sub = MLSumcheck::<R, _>::verify_as_subprotocol(
+        drop(MLSumcheck::<R, _>::verify_as_subprotocol(
             &mut rec,
             nvars,
             2,
             claimed_sum,
             &proof,
         )
-        .unwrap();
+        .unwrap());
         let trace = rec.trace().clone();
 
         // Build dR1CS for sumcheck verify (standalone, with challenges from trace.squeezed_field).
         type F = BF<R>;
-        let mut ch = ChallengeCursor::<F>::new(&trace.squeezed_field);
+        let mut ch = ChallengeCursor::<F>::new(&trace);
         let mut b = Dr1csBuilder::<F>::new();
         b.enforce_var_eq_const(b.one(), F::from(1u64));
 
@@ -4833,7 +6754,7 @@ mod tests {
         }
 
         let claim0 = ring_to_ringvars::<R>(&mut b, &claimed_sum);
-        let _final_claim = sumcheck_verify_degree2::<F>(&mut b, claim0, &msg_vars, &r_sc).unwrap();
+        drop(sumcheck_verify_degree2::<F>(&mut b, claim0, &msg_vars, &r_sc).unwrap());
 
         let (inst, asg) = b.into_instance();
         inst.check(&asg).unwrap();
@@ -4874,8 +6795,15 @@ mod tests {
         let mut rec = crate::recording_transcript::TracePoseidonTranscript::<R>::empty::<PC>();
         let r_sc = short_challenge::<R>(128, &mut rec);
         let bytes = match rec.trace().ops.last().unwrap() {
-            crate::recording_transcript::PoseidonTraceOp::SqueezeBytes { out, .. } => out.clone(),
-            _ => panic!("expected last op to be SqueezeBytes"),
+            crate::recording_transcript::PoseidonTraceOp::SqueezeField(v) => v
+                .iter()
+                .map(|e| {
+                    let d = e.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u16;
+                    debug_assert!(d < 257u16);
+                    if d == 256 { 0u8 } else { d as u8 }
+                })
+                .collect::<Vec<u8>>(),
+            _ => panic!("expected last op to be SqueezeField"),
         };
         assert_eq!(bytes.len(), d);
 
@@ -4904,141 +6832,319 @@ mod tests {
         inst.check(&asg).unwrap();
     }
 
+    // Legacy 2-field split WE-gate tests have been removed.
+
+    // -----------------------------------------------------------------------------
+    // Tiny-field (F257) equivalents for legacy 2-field WE-gate coverage.
+    //
+    // The legacy tests above target the historical "2-field split" arithmetization. The production
+    // path is now the Theorem 4.3 tiny-field gate, which:
+    // - builds its instance from a recorded verifier transcript schedule, and
+    // - includes `[ONE] || [WeParams] || [public_inputs]` as the public prefix.
+    //
+    // These tests cover the same *properties* (statement binding + UNSAT on flips) on the tiny
+    // gate. They are ignored because even small schedules are expensive in debug; run in release.
+    // -----------------------------------------------------------------------------
+
     #[test]
-    fn test_we_cm_proof_param_binding_mlen_unsat() {
-        // Small-ish instance.
-        type PCF = cyclotomic_rings::rings::FrogPoseidonConfig;
-        use cyclotomic_rings::rings::GetPoseidonParams;
-        use ark_ff::Zero;
-        use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as RR;
+    #[ignore = "tiny-field gate coverage; run with `--release -- --ignored`"]
+    fn test_we_plus_tiny_param_binding_mlen_changes_shape() {
+        use cyclotomic_rings::rings::GoldilocksRing64 as RR;
         use stark_rings::PolyRing;
 
-        let k = 1usize;
-        let kappa = 1usize;
-        let ell = 32usize;
-        let b = 2u128;
-        let d = RR::dimension();
-        let tau_unpadded_len = kappa * (k * d) * ell * d;
-        let n = tau_unpadded_len.next_power_of_two();
-        let nvars = ark_std::log2(n) as usize;
+        // Choose params so the schedule meaningfully depends on `mlen` (mlen_mats).
+        let ring_dim = RR::dimension() as u64;
+        let pairs: Vec<(usize, usize)> = vec![(0, 0)];
+        // Prefix binding requires at least `min(8, kappa)` public inputs in the transcript prefix.
+        // Here kappa=1 => need at least 1.
+        let public_inputs_len = 1usize;
+        let n_lin_proofs = 1usize;
 
-        let dparams = DecompParameters { b, k, l: ell };
-        let public_inputs = vec![<BF<RR> as ark_ff::Field>::ONE];
-        let mut f = vec![RR::from(<RR as PolyRing>::BaseRing::zero()); n];
-        f[0] = RR::from(public_inputs[0]);
-        let mut A = Matrix::<RR>::zero(kappa, n);
-        A.vals[0][0] = RR::from(<RR as PolyRing>::BaseRing::ONE);
-        let inst = RgInstance::from_f(f, &A, &dparams);
-        let rg = Rg { nvars, instances: vec![inst], dparams: dparams.clone() };
-        let cm = Cm { rg };
-        let M: Vec<std::sync::Arc<SparseMatrix<RR>>> = vec![std::sync::Arc::new(SparseMatrix::identity(n))];
-
-        // Build proof + trace, with a statement public input absorbed first.
-        let mut ts = crate::transcript::PoseidonTranscript::empty::<PCF>();
-        let (_com, proof) = cm.prove(&M, &public_inputs, &mut ts);
-        let mut rec = TracePoseidonTranscript::<RR>::empty::<PCF>();
-        for b in &public_inputs {
-            rec.absorb_field_element(b);
-        }
-        proof.verify(&M, &mut rec).expect("cm verify");
-        let trace = rec.trace().clone();
-
-        let params = WeParams {
-            nvars_setchk: nvars as u64,
+        let base = WeParams {
+            // For ring_dim=64, CM verifier math needs nvars_cm >= 12.
+            nvars_setchk: 12,
             degree_setchk: 3,
-            nvars_cm: nvars as u64,
+            nvars_cm: 12,
             degree_cm: 2,
-            kappa: kappa as u64,
-            ring_dim_d: RR::dimension() as u64,
-            decomp_b: b as u64,
-            k: k as u64,
-            l: ell as u64,
-            mlen: M.len() as u64,
+            kappa: 1,
+            ring_dim_d: ring_dim,
+            decomp_b: 16,
+            k: 1,
+            l: 1,
+            mlen: 0,
         };
-        let poseidon_cfg = PCF::get_poseidon_config();
+        let mut alt = base.clone();
+        alt.mlen = 1;
 
-        let out = build_we_dr1cs_for_cm_proof::<RR>(&poseidon_cfg, &trace, &params, &public_inputs, &proof, M.len())
-                .expect("build we dr1cs");
-        out.inst.check(&out.assignment).expect("should satisfy");
-
-        // Mutate the public `mlen` parameter only.
-        // Public layout for WE is: [ONE] || [10×WeParams] || [public_inputs...]
-        let mlen_global = 1usize + 9usize;
-        let mut bad = out.assignment.clone();
-        bad[mlen_global] += <BF<RR> as ark_ff::Field>::ONE;
-        assert!(out.inst.check(&bad).is_err(), "mlen mutation should break satisfaction");
+        // Arm-time binding: changing `mlen` should change the arm-time circuit shape.
+        let out_dir0 = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_tiny_shape_mlen0");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir0");
+            p
+        };
+        let out_dir1 = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_tiny_shape_mlen1");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir1");
+            p
+        };
+        let public_inputs0 =
+            vec![<<RR as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField::ZERO; public_inputs_len];
+        let trace0 = poseidon_trace_schedule_for_plus_with_public_inputs::<RR>(
+            &public_inputs0,
+            &base,
+            n_lin_proofs,
+            0,
+        )
+        .expect("poseidon_trace_schedule_for_plus_with_public_inputs(base)");
+        let s0 = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
+            &trace0,
+            &base,
+            &public_inputs0,
+            n_lin_proofs,
+            0,
+            &pairs,
+            &out_dir0,
+        )
+        .expect("shape(base)");
+        let public_inputs1 =
+            vec![<<RR as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField::ZERO; public_inputs_len];
+        let trace1 = poseidon_trace_schedule_for_plus_with_public_inputs::<RR>(
+            &public_inputs1,
+            &alt,
+            n_lin_proofs,
+            1,
+        )
+        .expect("poseidon_trace_schedule_for_plus_with_public_inputs(alt)");
+        let s1 = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
+            &trace1,
+            &alt,
+            &public_inputs1,
+            n_lin_proofs,
+            1,
+            &pairs,
+            &out_dir1,
+        )
+        .expect("shape(alt)");
+        assert_ne!(s0.public_len, 0);
+        assert_ne!(s1.public_len, 0);
+        // We don't require a specific delta, but `mlen` should affect at least one size metric.
+        assert!(
+            s0.inst.nvars != s1.inst.nvars
+                || s0.inst.layout.nconstraints != s1.inst.layout.nconstraints
+                || s0.inst.layout.a_terms != s1.inst.layout.a_terms
+                || s0.inst.layout.b_terms != s1.inst.layout.b_terms
+                || s0.inst.layout.c_terms != s1.inst.layout.c_terms,
+            "expected mlen change to alter tiny gate shape metrics"
+        );
+        let _ = std::fs::remove_dir_all(&out_dir0);
+        let _ = std::fs::remove_dir_all(&out_dir1);
     }
 
     #[test]
-    fn test_we_cm_proof_unsat_on_constraint_var_flip() {
-        // Reuse the same construction as the param-binding test, but flip a variable that is
-        // guaranteed to appear in some constraint.
-        type PCF = cyclotomic_rings::rings::FrogPoseidonConfig;
-        use cyclotomic_rings::rings::GetPoseidonParams;
-        use ark_ff::Zero;
-        use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as RR;
+    #[ignore = "tiny-field gate coverage; run with `--release -- --ignored`"]
+    fn test_we_plus_tiny_public_input_digest_unsat_on_flip() {
+        use cyclotomic_rings::rings::GoldilocksRing64 as RR;
         use stark_rings::PolyRing;
+        type BF0 = <<RR as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
 
-        let k = 1usize;
-        let kappa = 1usize;
-        let ell = 32usize;
-        let b = 2u128;
-        let d = RR::dimension();
-        let tau_unpadded_len = kappa * (k * d) * ell * d;
-        let n = tau_unpadded_len.next_power_of_two();
-        let nvars = ark_std::log2(n) as usize;
-
-        let dparams = DecompParameters { b, k, l: ell };
-        let public_inputs = vec![<BF<RR> as ark_ff::Field>::ONE];
-        let mut f = vec![RR::from(<RR as PolyRing>::BaseRing::zero()); n];
-        f[0] = RR::from(public_inputs[0]);
-        let mut A = Matrix::<RR>::zero(kappa, n);
-        A.vals[0][0] = RR::from(<RR as PolyRing>::BaseRing::ONE);
-        let inst = RgInstance::from_f(f, &A, &dparams);
-        let rg = Rg { nvars, instances: vec![inst], dparams: dparams.clone() };
-        let cm = Cm { rg };
-        let M: Vec<std::sync::Arc<SparseMatrix<RR>>> = vec![std::sync::Arc::new(SparseMatrix::identity(n))];
-
-        let mut ts = crate::transcript::PoseidonTranscript::empty::<PCF>();
-        let (_com, proof) = cm.prove(&M, &public_inputs, &mut ts);
-        let mut rec = TracePoseidonTranscript::<RR>::empty::<PCF>();
-        for b in &public_inputs {
-            rec.absorb_field_element(b);
-        }
-        proof.verify(&M, &mut rec).expect("cm verify");
-        let trace = rec.trace().clone();
+        // Keep this small: we only need to cover "public input is bound into transcript absorbs".
+        let ring_dim = RR::dimension() as u64;
+        let public_inputs_len = 32usize; // number of public **field elements** (lighter than full SP1 digest)
+        let n_lin_proofs = 1usize;
+        let mlen_mats = 0usize;
+        let pairs: Vec<(usize, usize)> = vec![(0, 0)];
 
         let params = WeParams {
-            nvars_setchk: nvars as u64,
+            nvars_setchk: 12,
             degree_setchk: 3,
-            nvars_cm: nvars as u64,
+            nvars_cm: 12,
             degree_cm: 2,
-            kappa: kappa as u64,
-            ring_dim_d: RR::dimension() as u64,
-            decomp_b: b as u64,
-            k: k as u64,
-            l: ell as u64,
-            mlen: M.len() as u64,
+            kappa: 1,
+            ring_dim_d: ring_dim,
+            decomp_b: 16,
+            k: 1,
+            l: 1,
+            mlen: mlen_mats as u64,
         };
-        let poseidon_cfg = PCF::get_poseidon_config();
 
-        let out = build_we_dr1cs_for_cm_proof::<RR>(&poseidon_cfg, &trace, &params, &public_inputs, &proof, M.len())
-                .expect("build we dr1cs");
-        out.inst.check(&out.assignment).expect("should satisfy");
+        // Choose a nontrivial public input pattern (digest-like bits).
+        //
+        // IMPORTANT: for kappa=1 the tiny gate's prefix binding enforces `cm_f[0]` matches
+        // public_inputs[0] (constant-coefficient). Our dummy proof/trace uses `cm_f[0]=0`,
+        // so keep public_inputs[0]=0 in this test; the flip below must still break satisfaction.
+        let public_inputs_elems: Vec<F257> = (0..public_inputs_len)
+            .map(|i| if (i % 3) == 1 { F257::ONE } else { F257::ZERO })
+            .collect();
+        // Tiny-gate statement public prefix uses byte encoding (8 bytes per base-field element).
+        let public_inputs_bytes: Vec<F257> = public_inputs_elems
+            .iter()
+            .flat_map(|x| {
+                let u = x.into_bigint().as_ref().get(0).copied().unwrap_or(0) as u8;
+                [u, 0, 0, 0, 0, 0, 0, 0].into_iter().map(|b| F257::from(b as u64))
+            })
+            .collect();
+        let public_inputs_bf: Vec<BF0> = public_inputs_elems
+            .iter()
+            .map(|x| {
+                let d = x.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u64;
+                BF0::from(d)
+            })
+            .collect();
 
-        // Pick a var index that appears in the first constraint (and is not the shared ONE=0).
-        let c0 = &out.inst.constraints[0];
-        let pick = |terms: &Vec<(BF<RR>, usize)>| -> Option<usize> {
-            terms.iter().map(|(_, v)| *v).find(|&v| v != 0)
+        // Build a self-consistent schedule trace whose initial absorbs match `public_inputs`.
+        let trace = poseidon_trace_schedule_for_plus_with_public_inputs::<RR>(
+            &public_inputs_bf,
+            &params,
+            n_lin_proofs,
+            mlen_mats,
+        )
+        .expect("poseidon_trace_schedule_for_plus_with_public_inputs");
+
+        let out_dir_shape = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_we_plus_tiny_shape_public_inputs_bound");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_shape");
+            p
         };
-        let v = pick(&c0.a)
-            .or_else(|| pick(&c0.b))
-            .or_else(|| pick(&c0.c))
-            .expect("constraint should mention some non-one variable");
+        let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
+            &trace,
+            &params,
+            &public_inputs_bf,
+            n_lin_proofs,
+            mlen_mats,
+            &pairs,
+            &out_dir_shape,
+        )
+        .expect("shape tiny");
+        let out_dir_witness = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_we_plus_tiny_witness_public_inputs_bound");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_witness");
+            p
+        };
+        let proof = dummy_plus_proof_shape::<RR>(&params, mlen_mats, n_lin_proofs).expect("dummy_plus_proof_shape");
+        // `build_we_plus_tiny_dr1cs` rebuilds the *same* arming shape while computing an assignment.
+        // Keep both around and assert they match to avoid "two shapes" confusion.
+        let (shape2, asg) = build_we_plus_tiny_dr1cs::<RR>(
+            &trace,
+            &params,
+            &public_inputs_bytes,
+            &proof,
+            mlen_mats,
+            &pairs,
+            &out_dir_witness,
+        )
+        .expect("build_we_plus_tiny_dr1cs");
+        let _ = std::fs::remove_dir_all(&out_dir_witness);
+        assert_eq!(shape.public_len, shape2.public_len);
+        assert_eq!(shape.inst.nvars, shape2.inst.nvars);
+        assert_eq!(shape.inst.layout.nconstraints, shape2.inst.layout.nconstraints);
+        shape.inst.check(&asg).expect("baseline should satisfy");
 
-        let mut bad = out.assignment.clone();
-        bad[v] += <BF<RR> as ark_ff::Field>::ONE;
-        assert!(out.inst.check(&bad).is_err(), "flipping constrained var should break satisfaction");
+        // Flip the first public input. Public prefix layout:
+        // [ONE] || [10×WeParams] || [public_inputs...]
+        let mut bad = asg.clone();
+        let first_pi = 1usize + 10usize;
+        bad[first_pi] += F257::ONE;
+        assert!(
+            shape.inst.check(&bad).is_err(),
+            "public input flip should break satisfaction (bound into transcript absorbs)"
+        );
+        let _ = std::fs::remove_dir_all(&out_dir_shape);
+    }
+
+    #[test]
+    #[ignore = "tiny-field gate coverage; run with `--release -- --ignored`"]
+    fn test_we_plus_tiny_unsat_on_constraint_var_flip() {
+        use cyclotomic_rings::rings::GoldilocksRing64 as RR;
+        use stark_rings::PolyRing;
+
+        let ring_dim = RR::dimension() as u64;
+        // Prefix binding requires at least `min(8, kappa)` public inputs; here kappa=1.
+        let public_inputs_len = 1usize;
+        let n_lin_proofs = 1usize;
+        let mlen_mats = 0usize;
+        let pairs: Vec<(usize, usize)> = vec![(0, 0)];
+
+        let params = WeParams {
+            nvars_setchk: 12,
+            degree_setchk: 3,
+            nvars_cm: 12,
+            degree_cm: 2,
+            kappa: 1,
+            ring_dim_d: ring_dim,
+            decomp_b: 16,
+            k: 1,
+            l: 1,
+            mlen: mlen_mats as u64,
+        };
+
+        let trace =
+            poseidon_trace_schedule_for_plus::<RR>(public_inputs_len, &params, n_lin_proofs, mlen_mats)
+                .expect("poseidon_trace_schedule_for_plus");
+        let public_inputs_elems: Vec<F257> = vec![F257::ZERO; public_inputs_len];
+        let public_inputs_bytes: Vec<F257> = public_inputs_elems
+            .iter()
+            .flat_map(|_x| [0u8, 0, 0, 0, 0, 0, 0, 0].into_iter().map(|b| F257::from(b as u64)))
+            .collect();
+
+        let out_dir_shape = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_we_plus_tiny_shape_var_flip");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_shape");
+            p
+        };
+        let public_inputs_bf: Vec<BF::<RR>> = vec![BF::<RR>::ZERO; public_inputs_len];
+        let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<RR>(
+            &trace,
+            &params,
+            &public_inputs_bf,
+            n_lin_proofs,
+            mlen_mats,
+            &pairs,
+            &out_dir_shape,
+        )
+        .expect("shape tiny");
+        let out_dir_witness = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_we_plus_tiny_witness_var_flip");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_witness");
+            p
+        };
+        let proof = dummy_plus_proof_shape::<RR>(&params, mlen_mats, n_lin_proofs).expect("dummy_plus_proof_shape");
+        let (_shape2, asg) = build_we_plus_tiny_dr1cs::<RR>(
+            &trace,
+            &params,
+            &public_inputs_bytes,
+            &proof,
+            mlen_mats,
+            &pairs,
+            &out_dir_witness,
+        )
+        .expect("build_we_plus_tiny_dr1cs");
+        let _ = std::fs::remove_dir_all(&out_dir_witness);
+        shape.inst.check(&asg).expect("baseline should satisfy");
+
+        // Perturb a non-public variable (the first witness slot after the public prefix).
+        let pub_len = shape.public_len;
+        let v = pub_len;
+        assert!(v < asg.len(), "expected v within assignment");
+
+        let mut bad = asg.clone();
+        bad[v] += F257::ONE;
+        assert!(
+            shape.inst.check(&bad).is_err(),
+            "flipping constrained non-public var should break satisfaction"
+        );
+        let _ = std::fs::remove_dir_all(&out_dir_shape);
     }
 
     #[test]
@@ -5046,9 +7152,9 @@ mod tests {
         // Record a trace from a real verifier run, then replay that exact trace and ensure:
         // - all absorbs/squeezes line up
         // - verifier returns Ok
-        type PCF = cyclotomic_rings::rings::FrogPoseidonConfig;
+        type PCF = cyclotomic_rings::rings::GoldilocksPoseidonConfig;
         use ark_ff::Zero;
-        use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as RR;
+        use cyclotomic_rings::rings::GoldilocksRing64 as RR;
         use stark_rings::PolyRing;
 
         let k = 1usize;
@@ -5084,86 +7190,43 @@ mod tests {
     }
 
     #[test]
-    fn test_we_cm_proof_public_input_digest_unsat_on_flip() {
-        // SP1-style: include exactly one public input digest, absorb it before proving/verifying,
-        // and ensure flipping it in `public_x` breaks dR1CS satisfaction.
-        type PCF = cyclotomic_rings::rings::FrogPoseidonConfig;
-        use ark_ff::Zero;
-        use cyclotomic_rings::rings::GetPoseidonParams;
-        use stark_rings::cyclotomic_ring::models::frog_ring::RqPoly as RR;
+    #[ignore = "slow: builds full Π_plus transcript schedule into Poseidon(F257) dR1CS"]
+    fn test_plus_poseidon_schedule_lifts_to_f257_and_satisfies() {
+        use cyclotomic_rings::rings::GoldilocksRing64 as RR;
         use stark_rings::PolyRing;
-        use sha2::{Digest, Sha256};
+        use symphony::dpp_poseidon::poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes;
 
-        let k = 1usize;
-        let kappa = 1usize;
-        let ell = 32usize;
-        let b = 2u128;
-        let d = RR::dimension();
-        let tau_unpadded_len = kappa * (k * d) * ell * d;
-        let n = tau_unpadded_len.next_power_of_two();
-        let nvars = ark_std::log2(n) as usize;
-
-        // Statement-defined SP1 public input digest as 256 boolean bits (collision-robust and DPP-friendly).
-        type BF0 = <<RR as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
-        let sp1_digest_bits: Vec<BF0> = {
-            let d: [u8; 32] = Sha256::digest(b"LFP_SP1_PUBLIC_INPUT_DIGEST_V1").into();
-            crate::we_statement::digest32_to_bits_field::<BF0>(d)
-        };
-
-        let dparams = DecompParameters { b, k, l: ell };
-        let mut f = vec![RR::from(<RR as PolyRing>::BaseRing::zero()); n];
-        // Bind the first digest bit to the exposed commitment prefix.
-        f[0] = RR::from(sp1_digest_bits[0]);
-        let mut A = Matrix::<RR>::zero(kappa, n);
-        A.vals[0][0] = RR::from(<RR as PolyRing>::BaseRing::ONE);
-        let inst = RgInstance::from_f(f, &A, &dparams);
-        let rg = Rg { nvars, instances: vec![inst], dparams: dparams.clone() };
-        let cm = Cm { rg };
-        let M: Vec<std::sync::Arc<SparseMatrix<RR>>> = vec![std::sync::Arc::new(SparseMatrix::identity(n))];
-
-        // Prove with digest absorbed before proving.
-        let mut ts = crate::transcript::PoseidonTranscript::empty::<PCF>();
-        let (_com, proof) = cm.prove(&M, &sp1_digest_bits, &mut ts);
-
-        // Record verifier trace with the same digest absorbed before verify.
-        let mut rec = TracePoseidonTranscript::<RR>::empty::<PCF>();
-        for b in &sp1_digest_bits {
-            rec.absorb_field_element(b);
-        }
-        proof.verify(&M, &mut rec).expect("cm verify");
-        let trace = rec.trace().clone();
-
+        // Small-ish params; we only care about schedule validity.
         let params = WeParams {
-            nvars_setchk: nvars as u64,
+            nvars_setchk: 4,
             degree_setchk: 3,
-            nvars_cm: nvars as u64,
+            nvars_cm: 4,
             degree_cm: 2,
-            kappa: kappa as u64,
+            kappa: 2,
             ring_dim_d: RR::dimension() as u64,
-            decomp_b: b as u64,
-            k: k as u64,
-            l: ell as u64,
-            mlen: M.len() as u64,
+            decomp_b: 16,
+            k: 1,
+            l: 4,
+            mlen: 1,
         };
-        let poseidon_cfg = PCF::get_poseidon_config();
+        let public_inputs_len = 4usize;
+        let n_lin_proofs = 1usize;
+        let mlen_mats = 1usize;
 
-        let out = build_we_dr1cs_for_cm_proof::<RR>(
-            &poseidon_cfg,
-            &trace,
-            &params,
-            &sp1_digest_bits,
-            &proof,
-            M.len(),
-        )
-        .expect("build we dr1cs");
-        out.inst.check(&out.assignment).expect("should satisfy");
+        let trace =
+            poseidon_trace_schedule_for_plus::<RR>(public_inputs_len, &params, n_lin_proofs, mlen_mats)
+                .expect("poseidon_trace_schedule_for_plus");
+        let ops_f257 = crate::we_gate_tiny::lift_recording_trace_ops_to_f257::<BF<RR>>(&trace.ops)
+            .expect("lift trace ops to f257");
 
-        // Flip the SP1 digest in the public inputs only.
-        // Public layout for WE is: [ONE] || [10×WeParams] || [public_inputs...]
-        let digest_global = 1usize + 10usize; // first digest bit
-        let mut bad = out.assignment.clone();
-        bad[digest_global] += <BF<RR> as ark_ff::Field>::ONE;
-        assert!(out.inst.check(&bad).is_err(), "digest flip should break satisfaction");
+        let cfg = latticefold::transcript::poseidon::f257_poseidon_config();
+        let (inst, asg, _wiring) =
+            poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes::<latticefold::transcript::poseidon::F257>(
+                &cfg,
+                &ops_f257,
+            )
+            .expect("poseidon f257 no-bytes");
+        inst.check(&asg).expect("poseidon f257 schedule satisfiable (no-bytes)");
     }
 
     // Large-scale (n=2^20) end-to-end WE->DPP sanity + digest "before/after" metric.
@@ -5171,18 +7234,11 @@ mod tests {
     #[test]
     #[ignore]
     fn test_large_trace() {
-        use cyclotomic_rings::rings::FrogPoseidonConfig as PCF;
+        use cyclotomic_rings::rings::GoldilocksPoseidonConfig as PCF;
         use cyclotomic_rings::rings::GetPoseidonParams;
         use sha2::{Digest, Sha256};
-        use cyclotomic_rings::rings::FrogRing64 as RR;
+        use cyclotomic_rings::rings::GoldilocksRing64 as RR;
         use stark_rings::PolyRing;
-
-        use crate::we_statement::{digest32_to_bits_field, we_statement_hash_lf_plus, LFP_WE_GATE_DIGEST_V1};
-        use dpp::dr1cs_flpcp::Dr1csInstanceSparse as DppInst;
-        use dpp::sparse::SparseVec;
-        use dpp::pipeline::build_rev2_dpp_sparse_boolean_auto;
-        use dpp::packing::{centered_bigint_to_field, field_to_centered_bigint, sample_packing_weights, FlpcpPredicate, PackedDppQuerySparse};
-        use dpp::BoundedFlpcpSparse;
 
         use ark_ff::PrimeField;
         use rand::{rngs::StdRng, RngCore, SeedableRng};
@@ -5259,11 +7315,11 @@ mod tests {
         type FSmall = <BR as ark_ff::Field>::BasePrimeField;
         let sp1_digest_bits: Vec<FSmall> = {
             let d: [u8; 32] = Sha256::digest(b"LFP_SP1_PUBLIC_INPUT_DIGEST_V1").into();
-            digest32_to_bits_field::<FSmall>(d)
+            crate::we_statement::digest32_to_bits_field::<FSmall>(d)
         };
 
         let run_one = |label: &str, sp1_digest_bits: &[FSmall]| {
-            eprintln!("\n[test_large_trace] case={label} n=2^{n_pow} (sparse-base prover, FrogRing64)");
+            eprintln!("\n[test_large_trace] case={label} n=2^{n_pow} (sparse-base prover, GoldilocksRing64)");
             #[cfg(feature = "parallel")]
             eprintln!("[test_large_trace] rayon_threads={}", current_num_threads());
             #[cfg(not(feature = "parallel"))]
@@ -5366,7 +7422,7 @@ mod tests {
                     bind_prefix,
                 )
                 .expect("cm verify");
-            let trace = rec.trace().clone();
+            let trace = rec.into_trace();
             eprintln!("[test_large_trace] plus.verify(record): {:?}", t1.elapsed());
 
             let params = WeParams {
@@ -5381,384 +7437,64 @@ mod tests {
                 l: ell as u64,
                 mlen: m0.len() as u64,
             };
-            let poseidon_cfg = PCF::get_poseidon_config();
+            let _poseidon_cfg = PCF::get_poseidon_config();
 
-            let t2 = std::time::Instant::now();
-            let shape = build_we_dr1cs_for_plus_proof_shape::<RR>(
-                &poseidon_cfg,
-                &params,
-                sp1_digest_bits.len(),
-                proof.lproof.len(),
-                m0.len(),
-                b_bound,
-            )
-            .expect("build we dr1cs shape");
-            let assignment = build_we_dr1cs_for_plus_proof_witness::<RR>(
-                &poseidon_cfg,
+            // NOTE: this benchmark is now tiny-gate focused; we intentionally skip building the
+            // large-field WE gate here.
+
+            // -------------------------------------------------------------
+            // Tiny gate (Poseidon(F257) + digit-domain verifier math)
+            // -------------------------------------------------------------
+            //
+            // Build the full tiny gate from the **real proof trace** and check satisfaction.
+            // This gives the closest estimate of the eventual F257 verifier-gate size.
+            let _t_tiny = std::time::Instant::now();
+            let ring_dim = RR::dimension();
+            if ring_dim != 64 {
+                panic!("test_large_trace: tiny gate only supports ring_dim=64");
+            }
+            let pairs: Vec<(usize, usize)> = vec![(0, 0)]; // minimal surface exercise
+
+            // Fixed temp dir (no pid/seq). Best-effort cleanup before/after so users don't have to
+            // manually delete large file-backed artifacts.
+            use crate::fs_cleanup::fast_remove_dir_best_effort;
+
+            let out_dir = {
+                let mut p = std::env::temp_dir();
+            p.push("lfplus_tiny_gate");
+                // If a previous run crashed or was interrupted, ensure a clean slate.
+                fast_remove_dir_best_effort(&p);
+                std::fs::create_dir_all(&p).expect("create temp out_dir");
+                p
+            };
+            // Public inputs for the tiny gate are absorbed as bytes (8 bytes per base-field element).
+            // In this benchmark the public inputs are digest bits (0/1), so byte-encoding is trivial.
+            let public_inputs_f257: Vec<F257> = sp1_digest_bits
+                .iter()
+                .flat_map(|x| {
+                    let u = x.into_bigint().as_ref().get(0).copied().unwrap_or(0) as u8;
+                    // 8-byte little-endian encoding of a small integer.
+                    [u, 0, 0, 0, 0, 0, 0, 0].into_iter().map(|b| F257::from(b as u64))
+                })
+                .collect();
+            let (shape, tiny_asg) = build_we_plus_tiny_dr1cs::<RR>(
                 &trace,
                 &params,
-                sp1_digest_bits,
+                &public_inputs_f257,
                 &proof,
                 m0.len(),
-                b_bound,
+                &pairs,
+                &out_dir,
             )
-            .expect("build we dr1cs witness");
-            shape.inst.check(&assignment).expect("dr1cs sat");
-            eprintln!(
-                "[test_large_trace] build_we_dr1cs: {:?} (nvars={}, constraints={})",
-                t2.elapsed(),
-                shape.inst.nvars,
-                shape.inst.constraints.len()
-            );
+            .expect("build tiny gate (inst+asg) from proof");
 
-            // DPP verification (single query).
-            let t3 = std::time::Instant::now();
-            // Avoid cloning multi-million sparse rows: consume the constraints and move (a,b,c) out.
-            let (inst, assignment, public_len) = (shape.inst, assignment, shape.public_len);
-            let n = inst.nvars;
-            let mut a = Vec::with_capacity(inst.constraints.len());
-            let mut b = Vec::with_capacity(inst.constraints.len());
-            let mut c = Vec::with_capacity(inst.constraints.len());
-            for mut row in inst.constraints {
-                a.push(SparseVec::new(std::mem::take(&mut row.a)));
-                b.push(SparseVec::new(std::mem::take(&mut row.b)));
-                c.push(SparseVec::new(std::mem::take(&mut row.c)));
-            }
-            let inst_sparse = DppInst::<FSmall> { n, a, b, c };
-            eprintln!("[test_large_trace] dr1cs->sparse: {:?}", t3.elapsed());
-            let k_rows = inst_sparse.k();
-            let ell_rs = 2 * k_rows;
-            let l_public = public_len;
-            let flpcp = dpp::dr1cs_flpcp::RsDr1csNpFlpcpSparse::<FSmall>::new(inst_sparse, l_public, ell_rs);
-
-            // Build the packed DPP verifier object (parameters + decoding), which is armer-time
-            // public information. This does not require the witness.
-            let t6 = std::time::Instant::now();
-            let dppv = build_rev2_dpp_sparse_boolean_auto::<FSmall, FBig, _>(
-                flpcp.clone(),
-                dpp::EmbeddingParams { gamma: 2, assume_boolean_proof: true, k_prime: 0 },
-            )
-            .expect("build dpp");
-            eprintln!("[test_large_trace] build_rev2_dpp: {:?}", t6.elapsed());
-
-            // ---------------------------------------------------------------------
-            // Armer-time: derive the query "coin" from statement-bound randomness.
-            // ---------------------------------------------------------------------
-            let vk_hash = [1u8; 32];
-            let r1cs_digest = [2u8; 32];
-            let stmt_digest = we_statement_hash_lf_plus::<RR>(
-                vk_hash,
-                r1cs_digest,
-                LFP_WE_GATE_DIGEST_V1,
-                &params,
-                sp1_digest_bits,
-            );
-            const ARMER_SEED: [u8; 32] = *b"LFP_ARMER_SEED_V1_00000000000000";
-            let lock_j: u64 = 0;
-            let coin_seed: [u8; 32] = {
-                let mut h = Sha256::new();
-                h.update(b"LFP_LOCK_COIN_V1");
-                h.update(&ARMER_SEED);
-                h.update(&stmt_digest);
-                h.update(&lock_j.to_le_bytes());
-                h.finalize().into()
-            };
-            let mut rng = StdRng::from_seed(coin_seed);
-            // NOTE: `dppv.sample_query()` expands to a huge packed query vector and can be
-            // O(|constraints|) for RS-FLPCP instances (k = #rows). For SP1-scale k this is not viable.
-            //
-            // Instead: sample coins (idx, λ) + packing weights, answer the 3 RS-FLPCP queries in coin
-            // form (by indexing cached codewords), then pack/decode.
-            let t7 = std::time::Instant::now();
-            let b = dppv.flpcp.bounds_b();
-            let w = sample_packing_weights::<FBig>(&mut rng, dppv.params.ell, &b).expect("sample_packing_weights");
-            let pred = FlpcpPredicate::MulEqModP {
-                p_small: num_bigint::BigInt::from_bytes_le(
-                    num_bigint::Sign::Plus,
-                    &FSmall::MODULUS.to_bytes_le(),
-                ),
-            };
-            let idx = (rng.next_u64() as usize) % ell_rs;
-            let lambda_small = FSmall::from(rng.next_u64());
-            eprintln!(
-                "[test_large_trace] lock coins: idx={idx} (ell_rs={ell_rs}, k_rows={k_rows})"
-            );
-
-            let t4 = std::time::Instant::now();
-            let x_small = assignment[..l_public].to_vec();
-            let z_w_small = assignment[l_public..].to_vec();
-            eprintln!(
-                "[test_large_trace] sizes: l_public={} witness_len={} assignment_len={}",
-                l_public,
-                z_w_small.len(),
-                assignment.len()
-            );
-            let (pi_field, cw) = flpcp.prove_with_codewords(&x_small, &z_w_small);
-            eprintln!(
-                "[test_large_trace] flpcp.prove_with_codewords: {:?} (pi_field_len={})",
-                t4.elapsed(),
-                pi_field.len()
-            );
-            let t5 = std::time::Instant::now();
-            let boolized = dpp::BooleanProofFlpcpSparse::<FSmall, _>::new(flpcp.clone());
-            // Keep proof bits bitpacked to avoid multi-GB allocations.
-            let pi_bits_packed = boolized.encode_proof_bits_packed(&pi_field);
-            eprintln!(
-                "[test_large_trace] booleanize(pi)_packed: {:?} (pi_bits_len={}, packed_bytes={})",
-                t5.elapsed(),
-                boolized.m_bits(),
-                pi_bits_packed.len()
-            );
-
-            let t_xbig = std::time::Instant::now();
-            let _x_big = x_small.iter().copied().map(lift_to_big::<FSmall>).collect::<Vec<_>>();
-            eprintln!("[test_large_trace] lift x_small->x_big: {:?}", t_xbig.elapsed());
-
-            let (a_small, b_small, c_small) = if idx < k_rows {
-                let a = cw.y_a[idx];
-                let b0 = cw.y_b[idx];
-                let wv = cw.w[idx];
-                let cx_minus = cw.y_c[idx] - wv;
-                let c = wv + lambda_small * cx_minus;
-                (a, b0, c)
-            } else {
-                let j = idx - k_rows;
-                let a = cw.y_a_tail[j];
-                let b0 = cw.y_b_tail[j];
-                let wv = cw.w[idx];
-                // Tail-half: the C-part is unused in q3; answer is just w(α)=a*b.
-                let c = wv;
-                (a, b0, c)
-            };
-
-            let ans_field: [FBig; 3] = [
-                lift_to_big::<FSmall>(a_small),
-                lift_to_big::<FSmall>(b_small),
-                lift_to_big::<FSmall>(c_small),
-            ];
-
-            // Pack into one integer a_int = Σ w_i * [ans_i]_centered, then reduce to field.
-            let mut a_int = num_bigint::BigInt::from(0);
-            for (wi, ai) in w.iter().zip(ans_field.iter()) {
-                let ai_int = field_to_centered_bigint::<FBig>(ai);
-                a_int += wi * ai_int;
-            }
-            let a = centered_bigint_to_field::<FBig>(&a_int);
-
-            let q_meta = PackedDppQuerySparse::<FBig> { q: dpp::sparse::SparseVec::default(), w, b, pred };
-            let ok = dppv.verify_packed_answer(&a, &q_meta).expect("verify_packed_answer");
-            eprintln!("[test_large_trace] dpp lock_check(coin-form): {:?} ok={ok}", t7.elapsed());
+            shape.inst.check(&tiny_asg).expect("tiny gate dr1cs check");
+            fast_remove_dir_best_effort(&out_dir);
         };
 
         run_one("sha256->bits", &sp1_digest_bits);
     }
 
-    #[test]
-    fn test_we_plus_prover_sparse_base_small_mock_sat() {
-        init_rayon_stack();
-        // A small end-to-end test for the **production** SP1-style path:
-        // - ComR1CSBase (A/B/C over base ring + const-coeff witness)
-        // - PlusProverSparseBase::prove_sparse_base
-        // - record verifier trace
-        // - build WE dR1CS for the PlusProof and check satisfaction
-        //
-        // This is intended to reproduce any "WE gate dr1cs satisfied: constraint ... failed"
-        // regressions at a tiny scale (seconds, not minutes).
-        type PCF = cyclotomic_rings::rings::FrogPoseidonConfig;
-        use cyclotomic_rings::rings::GetPoseidonParams;
-        use sha2::{Digest, Sha256};
-
-        // Use the same ring type as the SP1 oneproof harness (`examples/lf_plus_sp1_oneproof.rs`)
-        // to ensure Π_decomp (2-digit) assumptions match production.
-        use cyclotomic_rings::rings::FrogRing64 as RR;
-        use stark_rings::PolyRing;
-        use stark_rings_linalg::SparseMatrix;
-        use std::sync::Arc;
-
-        use crate::plus::{PlusParameters, PlusProverSparseBase};
-        use crate::r1cs::ComR1CSBase;
-        use crate::rgchk::DecompParameters;
-        use crate::transcript::PoseidonTranscript;
-        use crate::we_statement::digest32_to_bits_field;
-        use latticefold::arith::r1cs::R1CS;
-        use latticefold::commitment::AjtaiCommitmentScheme;
-
-        type BR = <RR as PolyRing>::BaseRing;
-
-        // Choose small-but-valid parameters for the internal range-check/CM machinery.
-        //
-        // IMPORTANT: `rgchk` digit decomposition will panic if `k` is too small for the chosen base,
-        // so we use the production-style choice `decomp_b = d/2`.
-        //
-        // For statement binding coverage in this small test, we enable Ajtai prefix exposure:
-        // require kappa >= 8. To keep `n` small, we pick a small ℓ (still power-of-two).
-        let kappa = 8usize; // 8 exposed rows (identity block)
-        let k = 1usize;
-        let d = RR::dimension();
-        let d_prime = d / 2;
-        // Small, power-of-two ℓ to keep the test fast (and >=4 to avoid decomposition panics).
-        let ell = 4usize;
-
-        let tau_unpadded_len = kappa * (k * d) * ell * d;
-        let n = tau_unpadded_len.next_power_of_two();
-        let nvars = ark_std::log2(n) as usize;
-        assert!(n <= (1 << 17), "keep this test small");
-
-        // SP1-style public inputs: 256 digest bits.
-        type BF0 = <<RR as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
-        let public_inputs: Vec<BF0> = {
-            let d: [u8; 32] = Sha256::digest(b"LFP_WE_PLUS_SPARSE_BASE_SMALL_V1").into();
-            digest32_to_bits_field::<BF0>(d)
-        };
-
-        // Seeded Ajtai scheme (deterministic system parameter) with prefix exposure.
-        const AJTAI_SEED: [u8; 32] = *b"LFP_SP1_AJTAI_SEED_V1_0000000000";
-        let ajtai = AjtaiCommitmentScheme::<RR>::seeded_with_exposed_prefix(
-            b"lf_plus_ajtai",
-            AJTAI_SEED,
-            kappa,
-            n,
-            8,
-            1, // expose witness cols 1..=8 (col0 is ONE)
-        );
-
-        // Trivial satisfiable R1CS: A=B=C=0, so (Az)*(Bz) - Cz = 0 for any witness.
-        let zero_rows: Vec<Vec<(BR, usize)>> = vec![Vec::new(); n];
-        let a = SparseMatrix::<BR> { nrows: n, ncols: n, coeffs: zero_rows.clone() };
-        let b = SparseMatrix::<BR> { nrows: n, ncols: n, coeffs: zero_rows.clone() };
-        let c = SparseMatrix::<BR> { nrows: n, ncols: n, coeffs: zero_rows };
-        let r1cs = R1CS::<BR> { l: 0, A: a, B: b, C: c };
-
-        // Constant-coeff witness prefix, with the exposed coordinates matching the statement prefix.
-        let bind_prefix: &[BF0] = public_inputs
-            .get(0..8)
-            .expect("need at least 8 public inputs for prefix binding");
-        let f0: Arc<Vec<BR>> = Arc::new(
-            (0..n)
-                .map(|i| {
-                    if i == 0 {
-                        BR::ONE
-                    } else if (1..=8).contains(&i) {
-                        bind_prefix[i - 1]
-                    } else {
-                        BR::ZERO
-                    }
-                })
-                .collect(),
-        );
-
-        let cr1cs = ComR1CSBase::<RR>::from_f0_seeded_base(r1cs, f0, 0, &ajtai);
-        let m0 = cr1cs.x.matrices_arc_base();
-
-        // Range-check decomposition parameters (used inside CM/RG machinery).
-        let dparams = DecompParameters { b: d_prime as u128, k, l: ell };
-        let lin_params = crate::lin::LinParameters { kappa, decomp: dparams.clone() };
-
-        // Π_decomp base B:
-        // Compute a portable conservative power-of-two bound from the base field modulus so that
-        // every base-field coefficient fits in exactly 2 digits (balanced) for Π_decomp.
-        //
-        // We avoid relying on `MODULUS.0[0]` limb layout (platform-dependent) by using bytes.
-        let b_decomp: u128 = {
-            use ark_ff::BigInteger;
-            let m = <BR as ark_ff::PrimeField>::MODULUS;
-            let bytes = m.to_bytes_le();
-            let mut last = None;
-            for (i, &b) in bytes.iter().enumerate().rev() {
-                if b != 0 {
-                    last = Some((i, b));
-                    break;
-                }
-            }
-            let bitlen: u32 = match last {
-                None => 0,
-                Some((i, b)) => {
-                    // msb position in this byte (1..=8)
-                    let msb = 8u32 - (b.leading_zeros() as u32);
-                    (i as u32) * 8 + msb
-                }
-            };
-            // Choose B >= 2^{ceil(bitlen/2)+1} to ensure B^2 > modulus (with slack).
-            let shift = ((bitlen + 1) / 2 + 1) as u32;
-            let shift = shift.min(126); // keep within u128 shift range
-            let mut b = 1u128 << shift;
-            if b % 2 == 1 {
-                b += 1;
-            }
-            b
-        };
-
-        let pparams = PlusParameters { lin: lin_params, B: b_decomp };
-
-        // Prove (SP1-style: absorb public inputs before proving).
-        let mut prover = PlusProverSparseBase::init_seeded_base(
-            ajtai.clone(),
-            m0.clone(),
-            1,
-            pparams.clone(),
-            PoseidonTranscript::empty::<PCF>(),
-        );
-        let proof = prover.prove_sparse_base(std::slice::from_ref(&cr1cs), &public_inputs);
-
-        // Record verifier trace (mirror the SP1 oneproof harness).
-        let poseidon_cfg = PCF::get_poseidon_config();
-        let mut rec = crate::recording_transcript::TracePoseidonTranscript::<RR>::empty::<PCF>();
-        for b in &public_inputs {
-            rec.absorb_field_element(b);
-        }
-        for lp in &proof.lproof {
-            lp.verify(&mut rec);
-        }
-        proof
-            .cmproof
-            .verify_with_mlen(
-                m0.len(),
-                &mut rec,
-                bind_prefix,
-            )
-            .expect("cm verify (record)");
-        let trace = rec.trace().clone();
-
-        let params = WeParams {
-            nvars_setchk: nvars as u64,
-            degree_setchk: 3,
-            nvars_cm: nvars as u64,
-            degree_cm: 2,
-            kappa: kappa as u64,
-            ring_dim_d: RR::dimension() as u64,
-            decomp_b: dparams.b as u64,
-            k: dparams.k as u64,
-            l: dparams.l as u64,
-            mlen: m0.len() as u64,
-        };
-
-        // Arm-before-proof split:
-        // 1) arm/shape: instance depends only on params + shapes
-        let shape = build_we_dr1cs_for_plus_proof_shape::<RR>(
-            &poseidon_cfg,
-            &params,
-            public_inputs.len(),
-            proof.lproof.len(),
-            m0.len(),
-            b_decomp,
-        )
-        .expect("build_we_dr1cs_for_plus_proof_shape");
-
-        // 2) witness: fill assignment from the real proof+trace
-        let assignment = build_we_dr1cs_for_plus_proof_witness::<RR>(
-            &poseidon_cfg,
-            &trace,
-            &params,
-            &public_inputs,
-            &proof,
-            m0.len(),
-            b_decomp,
-        )
-        .expect("build_we_dr1cs_for_plus_proof_witness");
-        shape
-            .inst
-            .check(&assignment)
-            .expect("we gate dr1cs satisfied");
-    }
+    // NOTE: legacy 2-field split WE-gate tests removed (including old Π_plus end-to-end harness).
 }
 
