@@ -1904,6 +1904,69 @@ where
                 let wtab = weights.clone(); // small (<= 2^max_lazy)
                 let inner_ref = inner.as_ref();
 
+                // CM fast path: if the inner is a fused mat-vec part, materialize using the
+                // optimized weighted 4-part evaluator (avoids the slow `eval_part_at_row` path).
+                if let StreamingMleEnum::CmMatVec4Part { shared, which, .. } = inner_ref {
+                    let shared = shared.clone();
+                    let which: usize = *which as usize;
+                    debug_assert!(which < 4);
+
+                    #[cfg(feature = "parallel")]
+                    let dense = {
+                        use rayon::prelude::*;
+                        (0..len)
+                            .into_par_iter()
+                            .map_init(|| None::<HFromIndexCache<R>>, |hfrom_cache, i| {
+                                let base = i << k;
+                                let mut acc4 = [R::ZERO; 4];
+                                for (b, &w) in wtab.iter().enumerate() {
+                                    if w == R::BaseRing::ZERO {
+                                        continue;
+                                    }
+                                    shared.eval4_at_row_weighted_into(
+                                        base | b,
+                                        w,
+                                        &mut acc4,
+                                        hfrom_cache,
+                                    );
+                                }
+                                acc4[which]
+                            })
+                            .collect::<Vec<R>>()
+                    };
+                    #[cfg(not(feature = "parallel"))]
+                    let dense = {
+                        let mut out = vec![R::ZERO; len];
+                        let mut hfrom_cache: Option<HFromIndexCache<R>> = None;
+                        for i in 0..len {
+                            let base = i << k;
+                            let mut acc4 = [R::ZERO; 4];
+                            for (b, &w) in wtab.iter().enumerate() {
+                                if w == R::BaseRing::ZERO {
+                                    continue;
+                                }
+                                shared.eval4_at_row_weighted_into(
+                                    base | b,
+                                    w,
+                                    &mut acc4,
+                                    &mut hfrom_cache,
+                                );
+                            }
+                            out[i] = acc4[which];
+                        }
+                        out
+                    };
+
+                    // Replace self with a dense table for the already-fixed function.
+                    *self = StreamingMleEnum::DenseOwned {
+                        evals: dense,
+                        num_vars: cur_nv,
+                    };
+                    // Now apply this fix to the dense table in-place.
+                    self.fix_variable_in_place_base(r0);
+                    return;
+                }
+
                 #[cfg(feature = "parallel")]
                 let dense = alloc_init_par(len, |i| {
                     let base = i << k;
