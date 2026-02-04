@@ -70,6 +70,25 @@ where
     out
 }
 
+/// Fused `acc += v * s` where `s` is a base scalar (constant coefficient).
+///
+/// Avoids allocating a temporary ring element for `v * s` and avoids an extra pass for `+=`.
+#[inline(always)]
+fn add_scaled_by_base<R: OverField + PolyRing>(acc: &mut R, v: &R, s: R::BaseRing)
+where
+    R::BaseRing: Ring + Copy,
+{
+    if s == R::BaseRing::ZERO {
+        return;
+    }
+    let ac = acc.coeffs_mut();
+    let vc = v.coeffs();
+    debug_assert_eq!(ac.len(), vc.len());
+    for i in 0..ac.len() {
+        ac[i] += vc[i] * s;
+    }
+}
+
 fn try_as_base_scalars<R: PolyRing>(v: &[R]) -> Option<Vec<R::BaseRing>> {
     let mut out = Vec::with_capacity(v.len());
     for x in v {
@@ -1453,23 +1472,23 @@ where
                 let mut lin1 = R::ZERO;
                 for j in l_idx..(l_idx + stride) {
                     let w = rcps[j - 1];
-                    lin0 += v0[j] * w;
-                    lin1 += v1[j] * w;
+                    add_scaled_by_base(&mut lin0, &v0[j], w);
+                    add_scaled_by_base(&mut lin1, &v1[j], w);
                 }
                 let lin2 = lin1 + (lin1 - lin0);
 
-                out0 += scale_by_base_owned(lin0, eq0_0);
-                out1 += scale_by_base_owned(lin1, eq0_1);
-                out2 += scale_by_base_owned(lin2, eq0_2);
+                add_scaled_by_base(&mut out0, &lin0, eq0_0);
+                add_scaled_by_base(&mut out1, &lin1, eq0_1);
+                add_scaled_by_base(&mut out2, &lin2, eq0_2);
 
                 // (tau * t) * w  ==  t * (tau0 * w)  since tau is constant-coeff.
-                out0 += scale_by_base_ref(&t0_0, tau0_0 * w_t0);
-                out1 += scale_by_base_ref(&t0_1, tau0_1 * w_t0);
-                out2 += scale_by_base_ref(&t0_2, tau0_2 * w_t0);
+                add_scaled_by_base(&mut out0, &t0_0, tau0_0 * w_t0);
+                add_scaled_by_base(&mut out1, &t0_1, tau0_1 * w_t0);
+                add_scaled_by_base(&mut out2, &t0_2, tau0_2 * w_t0);
 
-                out0 += scale_by_base_ref(&t1_0, tau0_0 * w_t1);
-                out1 += scale_by_base_ref(&t1_1, tau0_1 * w_t1);
-                out2 += scale_by_base_ref(&t1_2, tau0_2 * w_t1);
+                add_scaled_by_base(&mut out0, &t1_0, tau0_0 * w_t1);
+                add_scaled_by_base(&mut out1, &t1_1, tau0_1 * w_t1);
+                add_scaled_by_base(&mut out2, &t1_2, tau0_2 * w_t1);
             }
 
             [out0, out1, out2]
@@ -1931,22 +1950,22 @@ where
                 let mut lin1 = R::ZERO;
                 for j in l_idx..(l_idx + stride) {
                     let w = rcps[j - 1];
-                    lin0 += v0[j] * w;
-                    lin1 += v1[j] * w;
+                    add_scaled_by_base(&mut lin0, &v0[j], w);
+                    add_scaled_by_base(&mut lin1, &v1[j], w);
                 }
                 let lin2 = lin1 + (lin1 - lin0);
 
-                out0 += scale_by_base_owned(lin0, eq0_0);
-                out1 += scale_by_base_owned(lin1, eq0_1);
-                out2 += scale_by_base_owned(lin2, eq0_2);
+                add_scaled_by_base(&mut out0, &lin0, eq0_0);
+                add_scaled_by_base(&mut out1, &lin1, eq0_1);
+                add_scaled_by_base(&mut out2, &lin2, eq0_2);
 
-                out0 += scale_by_base_ref(&t0_0, tau0_0 * w_t0);
-                out1 += scale_by_base_ref(&t0_1, tau0_1 * w_t0);
-                out2 += scale_by_base_ref(&t0_2, tau0_2 * w_t0);
+                add_scaled_by_base(&mut out0, &t0_0, tau0_0 * w_t0);
+                add_scaled_by_base(&mut out1, &t0_1, tau0_1 * w_t0);
+                add_scaled_by_base(&mut out2, &t0_2, tau0_2 * w_t0);
 
-                out0 += scale_by_base_ref(&t1_0, tau0_0 * w_t1);
-                out1 += scale_by_base_ref(&t1_1, tau0_1 * w_t1);
-                out2 += scale_by_base_ref(&t1_2, tau0_2 * w_t1);
+                add_scaled_by_base(&mut out0, &t1_0, tau0_0 * w_t1);
+                add_scaled_by_base(&mut out1, &t1_1, tau0_1 * w_t1);
+                add_scaled_by_base(&mut out2, &t1_2, tau0_2 * w_t1);
             }
 
             [out0, out1, out2]
