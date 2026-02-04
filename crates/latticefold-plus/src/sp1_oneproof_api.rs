@@ -13,6 +13,7 @@ use ark_ff::{BigInteger, PrimeField};
 use latticefold::commitment::AjtaiCommitmentScheme;
 use latticefold::transcript::poseidon::F257;
 use latticefold::transcript::Transcript;
+use latticefold::transcript::bytes::field_to_bytes_le_fixed;
 use stark_rings::PolyRing;
 use stark_rings_linalg::SparseMatrix;
 
@@ -272,10 +273,15 @@ pub fn run_sp1_oneproof_we_gate_from_files(
     //
     // Therefore, the tiny gate's statement public prefix must be these bytes, not the field
     // elements themselves, and certainly not the centered BabyBear embedding.
-    let coeff_bytes: usize = ((<F as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8;
-    let public_inputs_f257: Vec<F257> = w_u64[1..1 + l_pub]
+    // IMPORTANT: these must be the *exact bytes* absorbed into the recorded transcript:
+    // `PoseidonTranscript::absorb_field_element` encodes field elements using
+    // `field_to_bytes_le_fixed` (fixed width, little-endian).
+    //
+    // Therefore we derive bytes from the **Goldilocks field elements** `public_inputs`,
+    // not from the raw BabyBear u64 witness words.
+    let public_inputs_f257: Vec<F257> = public_inputs
         .iter()
-        .flat_map(|&x| x.to_le_bytes().into_iter().take(coeff_bytes).map(|b| F257::from(b as u64)))
+        .flat_map(|x| field_to_bytes_le_fixed::<BFSmall>(x).into_iter().map(|b| F257::from(b as u64)))
         .collect();
 
     let (shape, assignment) = crate::we_gate_arith::build_we_plus_tiny_dr1cs::<R>(
