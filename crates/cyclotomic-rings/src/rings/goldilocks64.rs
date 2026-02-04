@@ -42,6 +42,9 @@ pub struct GoldilocksRing64(
 // which are the operations we want to avoid in hot loops when one operand is effectively a base scalar.
 static GL64_MUL_STATS_FLAG: AtomicU8 = AtomicU8::new(0); // 0=uninit, 1=disabled, 2=enabled
 static GL64_RING_MUL_CALLS: AtomicU64 = AtomicU64::new(0);
+static GL64_RING_MUL_NTT_CALLS: AtomicU64 = AtomicU64::new(0);
+static GL64_RING_MUL_FAST_CONST_CALLS: AtomicU64 = AtomicU64::new(0);
+static GL64_RING_MUL_FAST_MONO_CALLS: AtomicU64 = AtomicU64::new(0);
 
 #[inline(always)]
 fn gl64_mul_stats_enabled_fast() -> bool {
@@ -63,6 +66,27 @@ fn gl64_ring_mul_stats_inc() {
     }
 }
 
+#[inline(always)]
+fn gl64_ring_mul_stats_inc_ntt() {
+    if gl64_mul_stats_enabled_fast() {
+        GL64_RING_MUL_NTT_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline(always)]
+fn gl64_ring_mul_stats_inc_fast_const() {
+    if gl64_mul_stats_enabled_fast() {
+        GL64_RING_MUL_FAST_CONST_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline(always)]
+fn gl64_ring_mul_stats_inc_fast_mono() {
+    if gl64_mul_stats_enabled_fast() {
+        GL64_RING_MUL_FAST_MONO_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Returns whether GL64 ring×ring mul stats are enabled (`LF_GL64_MUL_STATS=1`).
 #[inline]
 pub fn goldilocks64_ring_mul_stats_enabled() -> bool {
@@ -75,10 +99,43 @@ pub fn goldilocks64_ring_mul_count() -> u64 {
     GL64_RING_MUL_CALLS.load(Ordering::Relaxed)
 }
 
+/// Returns the number of ring×ring muls that took the **NTT** path.
+#[inline]
+pub fn goldilocks64_ring_mul_ntt_count() -> u64 {
+    GL64_RING_MUL_NTT_CALLS.load(Ordering::Relaxed)
+}
+
+/// Returns the number of ring×ring muls that took the **const-coeff scalar** fast path.
+#[inline]
+pub fn goldilocks64_ring_mul_fast_const_count() -> u64 {
+    GL64_RING_MUL_FAST_CONST_CALLS.load(Ordering::Relaxed)
+}
+
+/// Returns the number of ring×ring muls that took the **monomial** fast path.
+#[inline]
+pub fn goldilocks64_ring_mul_fast_mono_count() -> u64 {
+    GL64_RING_MUL_FAST_MONO_CALLS.load(Ordering::Relaxed)
+}
+
 /// Atomically resets and returns the previous ring×ring mul count.
 #[inline]
 pub fn goldilocks64_ring_mul_count_reset() -> u64 {
     GL64_RING_MUL_CALLS.swap(0, Ordering::Relaxed)
+}
+
+#[inline]
+pub fn goldilocks64_ring_mul_ntt_count_reset() -> u64 {
+    GL64_RING_MUL_NTT_CALLS.swap(0, Ordering::Relaxed)
+}
+
+#[inline]
+pub fn goldilocks64_ring_mul_fast_const_count_reset() -> u64 {
+    GL64_RING_MUL_FAST_CONST_CALLS.swap(0, Ordering::Relaxed)
+}
+
+#[inline]
+pub fn goldilocks64_ring_mul_fast_mono_count_reset() -> u64 {
+    GL64_RING_MUL_FAST_MONO_CALLS.swap(0, Ordering::Relaxed)
 }
 
 /// Parameters for \( \mathbb{F}_p[X]/(X^{64}+1) \) over Goldilocks' base prime field.
@@ -184,6 +241,105 @@ impl core::ops::Mul for GoldilocksRing64 {
         gl64_ring_mul_stats_inc();
         const N: usize = 64;
 
+        // ---------------------------------------------------------------------
+        // Fast paths (avoid NTT) for structurally simple operands.
+        // ---------------------------------------------------------------------
+        //
+        // LF+/WE produces many ring elements that are:
+        // - constant-coefficient lifts (via `R::from(base_scalar)`), and/or
+        // - monomials (e.g. `X^j` or `c*X^j`).
+        //
+        // For coefficient-form rings, invoking the generic ring×ring `Mul` here would run an NTT
+        // convolution, which is *much* slower than the O(d) scalar/shift operations below.
+        #[inline(always)]
+        fn is_const_coeff(v: &[Fq; N]) -> Option<Fq> {
+            for &ci in &v[1..] {
+                if ci != <Fq as Field>::ZERO {
+                    return None;
+                }
+            }
+            Some(v[0])
+        }
+
+        #[inline(always)]
+        fn monomial(v: &[Fq; N]) -> Option<(usize, Fq)> {
+            let mut idx: Option<usize> = None;
+            let mut coeff = <Fq as Field>::ZERO;
+            for (i, &ci) in v.iter().enumerate() {
+                if ci != <Fq as Field>::ZERO {
+                    if idx.is_some() {
+                        return None;
+                    }
+                    idx = Some(i);
+                    coeff = ci;
+                }
+            }
+            idx.map(|i| (i, coeff))
+        }
+
+        // Pull coefficient arrays once (Copy).
+        let mut a0 = [<Fq as Field>::ZERO; N];
+        let mut b0 = [<Fq as Field>::ZERO; N];
+        a0.copy_from_slice(self.coeffs());
+        b0.copy_from_slice(rhs.coeffs());
+
+        // Constant-coeff scalar multiply (O(d)).
+        if let Some(c) = is_const_coeff(&b0) {
+            gl64_ring_mul_stats_inc_fast_const();
+            return self * c;
+        }
+        if let Some(c) = is_const_coeff(&a0) {
+            gl64_ring_mul_stats_inc_fast_const();
+            return rhs * c;
+        }
+
+        // Monomial multiply (O(d)): a(X) * (c*X^j) mod (X^64+1).
+        if let Some((j, cj)) = monomial(&b0) {
+            gl64_ring_mul_stats_inc_fast_mono();
+            if cj == <Fq as Field>::ZERO {
+                return GoldilocksRing64::ZERO;
+            }
+            let mut out = [<Fq as Field>::ZERO; N];
+            for i in 0..N {
+                let ai = a0[i];
+                if ai == <Fq as Field>::ZERO {
+                    continue;
+                }
+                let prod = ai * cj;
+                let k = i + j;
+                if k < N {
+                    out[k] += prod;
+                } else {
+                    // X^N = -1 in (X^N+1).
+                    out[k - N] -= prod;
+                }
+            }
+            return GoldilocksRing64::from(out.to_vec());
+        }
+        if let Some((i, ci)) = monomial(&a0) {
+            gl64_ring_mul_stats_inc_fast_mono();
+            if ci == <Fq as Field>::ZERO {
+                return GoldilocksRing64::ZERO;
+            }
+            let mut out = [<Fq as Field>::ZERO; N];
+            for j in 0..N {
+                let bj = b0[j];
+                if bj == <Fq as Field>::ZERO {
+                    continue;
+                }
+                let prod = ci * bj;
+                let k = i + j;
+                if k < N {
+                    out[k] += prod;
+                } else {
+                    out[k - N] -= prod;
+                }
+            }
+            return GoldilocksRing64::from(out.to_vec());
+        }
+
+        gl64_ring_mul_stats_inc_ntt();
+
         #[derive(Clone)]
         struct Precomp {
             bitrev: [usize; N],
@@ -271,10 +427,6 @@ impl core::ops::Mul for GoldilocksRing64 {
 
         let mut a = [<Fq as Field>::ZERO; N];
         let mut b = [<Fq as Field>::ZERO; N];
-        let mut a0 = [<Fq as Field>::ZERO; N];
-        let mut b0 = [<Fq as Field>::ZERO; N];
-        a0.copy_from_slice(self.coeffs());
-        b0.copy_from_slice(rhs.coeffs());
 
         let pc = precomp();
 

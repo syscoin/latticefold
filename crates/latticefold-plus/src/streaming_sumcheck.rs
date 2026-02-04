@@ -3357,10 +3357,15 @@ impl StreamingSumcheck {
     {
         let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
         let gl64_stats = cyclotomic_rings::rings::goldilocks64_ring_mul_stats_enabled();
-        let gl64_start = if gl64_stats {
-            cyclotomic_rings::rings::goldilocks64_ring_mul_count()
+        let (gl64_start, gl64_ntt_start, gl64_const_start, gl64_mono_start) = if gl64_stats {
+            (
+                cyclotomic_rings::rings::goldilocks64_ring_mul_count(),
+                cyclotomic_rings::rings::goldilocks64_ring_mul_ntt_count(),
+                cyclotomic_rings::rings::goldilocks64_ring_mul_fast_const_count(),
+                cyclotomic_rings::rings::goldilocks64_ring_mul_fast_mono_count(),
+            )
         } else {
-            0u64
+            (0u64, 0u64, 0u64, 0u64)
         };
         let t_total = std::time::Instant::now();
 
@@ -3429,9 +3434,15 @@ impl StreamingSumcheck {
         if profile {
             if gl64_stats {
                 let gl64_end = cyclotomic_rings::rings::goldilocks64_ring_mul_count();
+                let gl64_ntt_end = cyclotomic_rings::rings::goldilocks64_ring_mul_ntt_count();
+                let gl64_const_end = cyclotomic_rings::rings::goldilocks64_ring_mul_fast_const_count();
+                let gl64_mono_end = cyclotomic_rings::rings::goldilocks64_ring_mul_fast_mono_count();
                 println!(
-                    "[LF+ streaming_sumcheck] gl64_mul: total_delta={} total_now={}",
+                    "[LF+ streaming_sumcheck] gl64_mul: total_delta={} ntt_delta={} const_delta={} mono_delta={} total_now={}",
                     gl64_end.saturating_sub(gl64_start),
+                    gl64_ntt_end.saturating_sub(gl64_ntt_start),
+                    gl64_const_end.saturating_sub(gl64_const_start),
+                    gl64_mono_end.saturating_sub(gl64_mono_start),
                     gl64_end
                 );
             }
@@ -3464,10 +3475,15 @@ impl StreamingSumcheck {
     {
         let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
         let gl64_stats = cyclotomic_rings::rings::goldilocks64_ring_mul_stats_enabled();
-        let gl64_start = if gl64_stats {
-            cyclotomic_rings::rings::goldilocks64_ring_mul_count()
+        let (gl64_start, gl64_ntt_start, gl64_const_start, gl64_mono_start) = if gl64_stats {
+            (
+                cyclotomic_rings::rings::goldilocks64_ring_mul_count(),
+                cyclotomic_rings::rings::goldilocks64_ring_mul_ntt_count(),
+                cyclotomic_rings::rings::goldilocks64_ring_mul_fast_const_count(),
+                cyclotomic_rings::rings::goldilocks64_ring_mul_fast_mono_count(),
+            )
         } else {
-            0u64
+            (0u64, 0u64, 0u64, 0u64)
         };
         let t_total = std::time::Instant::now();
         let degree: usize = 2;
@@ -3535,9 +3551,15 @@ impl StreamingSumcheck {
         if profile {
             if gl64_stats {
                 let gl64_end = cyclotomic_rings::rings::goldilocks64_ring_mul_count();
+                let gl64_ntt_end = cyclotomic_rings::rings::goldilocks64_ring_mul_ntt_count();
+                let gl64_const_end = cyclotomic_rings::rings::goldilocks64_ring_mul_fast_const_count();
+                let gl64_mono_end = cyclotomic_rings::rings::goldilocks64_ring_mul_fast_mono_count();
                 println!(
-                    "[LF+ streaming_sumcheck] gl64_mul: total_delta={} total_now={}",
+                    "[LF+ streaming_sumcheck] gl64_mul: total_delta={} ntt_delta={} const_delta={} mono_delta={} total_now={}",
                     gl64_end.saturating_sub(gl64_start),
+                    gl64_ntt_end.saturating_sub(gl64_ntt_start),
+                    gl64_const_end.saturating_sub(gl64_const_start),
+                    gl64_mono_end.saturating_sub(gl64_mono_start),
                     gl64_end
                 );
             }
