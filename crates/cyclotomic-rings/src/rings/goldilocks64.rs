@@ -230,8 +230,6 @@ impl core::ops::Mul for GoldilocksRing64 {
             return GoldilocksRing64::from(out.to_vec());
         }
 
-        gl64_ring_mul_stats_inc_ntt();
-
         #[derive(Clone)]
         struct Precomp {
             bitrev: [usize; N],
