@@ -425,19 +425,24 @@ where
                         .map(|j| {
                             let r_tau = inst.tau[j];
                             let r_mtau = inst.m_tau.get(j);
-                            let r_f = match &inst.f {
-                                WitnessVec::Ring(vr) => vr[j],
+                            let (r_f, r_f0_opt) = match &inst.f {
+                                WitnessVec::Ring(vr) => (vr[j], None),
                                 WitnessVec::ConstCoeffBase { values: v0, .. } => {
-                                    R::from(v0.get(j).copied().unwrap_or(R::BaseRing::ZERO))
+                                    let f0 = v0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
+                                    (R::from(f0), Some(f0))
                                 }
                             };
                             let r_h = h[i][j];
-                            // `s[0], s[1], s[2]` are short challenges (constant-coeff lifts).
+                            // `r_tau` is a base scalar lifted into the ring (constant-coeff).
                             // Avoid ring×ring multiplication for coefficient-form rings like `GoldilocksRing64`.
-                            scale_by_base_ref(&R::from(r_tau), s[0].coeffs()[0])
-                                + scale_by_base_ref(&r_mtau, s[1].coeffs()[0])
-                                + scale_by_base_ref(&r_f, s[2].coeffs()[0])
-                                + r_h
+                            let mut acc = scale_by_base_ref(&s[0], r_tau);
+                            acc += s[1] * r_mtau;
+                            if let Some(f0) = r_f0_opt {
+                                acc += scale_by_base_ref(&s[2], f0);
+                            } else {
+                                acc += s[2] * r_f;
+                            }
+                            acc + r_h
                     })
                     .collect::<Vec<R>>()
                 }
@@ -447,17 +452,22 @@ where
                         .map(|j| {
                             let r_tau = inst.tau[j];
                             let r_mtau = inst.m_tau.get(j);
-                            let r_f = match &inst.f {
-                                WitnessVec::Ring(vr) => vr[j],
+                            let (r_f, r_f0_opt) = match &inst.f {
+                                WitnessVec::Ring(vr) => (vr[j], None),
                                 WitnessVec::ConstCoeffBase { values: v0, .. } => {
-                                    R::from(v0.get(j).copied().unwrap_or(R::BaseRing::ZERO))
+                                    let f0 = v0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
+                                    (R::from(f0), Some(f0))
                                 }
                             };
                             let r_h = h[i][j];
-                            scale_by_base_ref(&R::from(r_tau), s[0].coeffs()[0])
-                                + scale_by_base_ref(&r_mtau, s[1].coeffs()[0])
-                                + scale_by_base_ref(&r_f, s[2].coeffs()[0])
-                                + r_h
+                            let mut acc = scale_by_base_ref(&s[0], r_tau);
+                            acc += s[1] * r_mtau;
+                            if let Some(f0) = r_f0_opt {
+                                acc += scale_by_base_ref(&s[2], f0);
+                            } else {
+                                acc += s[2] * r_f;
+                            }
+                            acc + r_h
                         })
                         .collect::<Vec<R>>()
                 }
