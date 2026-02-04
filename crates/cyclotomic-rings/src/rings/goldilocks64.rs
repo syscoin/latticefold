@@ -177,17 +177,14 @@ impl core::ops::Mul for GoldilocksRing64 {
 
         // Constant-coeff scalar multiply (O(d)).
         if let Some(c) = is_const_coeff(&b0) {
-            gl64_ring_mul_stats_inc_fast_const();
             return self * c;
         }
         if let Some(c) = is_const_coeff(&a0) {
-            gl64_ring_mul_stats_inc_fast_const();
             return rhs * c;
         }
 
         // Monomial multiply (O(d)): a(X) * (c*X^j) mod (X^64+1).
         if let Some((j, cj)) = monomial(&b0) {
-            gl64_ring_mul_stats_inc_fast_mono();
             if cj == <Fq as Field>::ZERO {
                 return GoldilocksRing64::ZERO;
             }
@@ -209,7 +206,6 @@ impl core::ops::Mul for GoldilocksRing64 {
             return GoldilocksRing64::from(out.to_vec());
         }
         if let Some((i, ci)) = monomial(&a0) {
-            gl64_ring_mul_stats_inc_fast_mono();
             if ci == <Fq as Field>::ZERO {
                 return GoldilocksRing64::ZERO;
             }
