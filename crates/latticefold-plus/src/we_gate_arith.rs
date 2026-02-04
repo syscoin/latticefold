@@ -6246,7 +6246,7 @@ mod tests {
         use crate::lockable_ringlwe::RingLweParams;
         use crate::we_statement::encode_public_x;
         use crate::we_tiny_lock::arm_lfplus_we_gate_tiny_ringlwe_streaming;
-        use dpp::dr1cs_flpcp::Dr1csQueryScratch;
+        use crate::utils::maybe_print_rss;
         use std::time::Instant;
         use rand::{rngs::StdRng, SeedableRng};
 
@@ -6377,13 +6377,12 @@ mod tests {
         };
 
         let mut rng = StdRng::seed_from_u64(42);
-        // These are no longer needed by the public arming helper, but keep a type-use here to
-        // avoid feature-gated import drift.
-        let _scratch_ty: Option<Dr1csQueryScratch<F257>> = None;
-
         let public_len = shape.public_len;
+        let shape1 = shape.clone();
         let t_arm = Instant::now();
-        let ctx = arm_lfplus_we_gate_tiny_ringlwe_streaming::<R>(
+        // Arm two coin instances so we can reuse a single streamed π0 across multiple coin tails.
+        // This matches `dpp::tests::test_theorem43_f257_reuse_single_pi0_many_coin_tails`.
+        let ctx0 = arm_lfplus_we_gate_tiny_ringlwe_streaming::<R>(
             shape,
             &params,
             &public_inputs_bytes_f257,
@@ -6392,14 +6391,30 @@ mod tests {
             lock_j,
             0,
             0,
-            ringlwe_params,
+            ringlwe_params.clone(),
             &mut rng,
         )
         .expect("arm_lfplus_we_gate_tiny_ringlwe_streaming");
+        let ctx1 = arm_lfplus_we_gate_tiny_ringlwe_streaming::<R>(
+            shape1,
+            &params,
+            &public_inputs_bytes_f257,
+            stmt_digest,
+            armer_seed,
+            lock_j,
+            0,
+            1, // different rep_id => different coins/query => different tail
+            ringlwe_params,
+            &mut rng,
+        )
+        .expect("arm_lfplus_we_gate_tiny_ringlwe_streaming ctx1");
+        // IMPORTANT: with the file-backed FLPCP backend, `ctx` will keep reading constraint rows
+        // from the on-disk shape directory during streaming prove+decap. Do NOT delete it until
+        // after proving finishes.
         eprintln!(
             "[tiny_gate] armed in {:?}: proof_len={}",
             t_arm.elapsed(),
-            ctx.proof_len()
+            ctx0.proof_len()
         );
 
         let x = encode_public_x::<F257>(&params, &public_inputs_bytes_f257);
@@ -6408,27 +6423,76 @@ mod tests {
         let z_w = asg[public_len..].to_vec();
 
         let t_prove = Instant::now();
-        let mut pi = Vec::new();
-        ctx.prove_stream(&x, &z_w, &mut |chunk| pi.extend_from_slice(&chunk))
-            .expect("prove_stream");
-        assert_eq!(pi.len(), ctx.proof_len());
-        eprintln!("[tiny_gate] proved in {:?}", t_prove.elapsed());
+        maybe_print_rss("tiny_gate:before_prove_decap_stream");
+        let mut st0 = ctx0.lock.decap_state(&x).expect("decap_state0");
+        let mut st1 = ctx1.lock.decap_state(&x).expect("decap_state1");
+        let mut st_bad = ctx0.lock.decap_state(&x).expect("decap_state_bad");
+        let mut err: Option<String> = None;
+        let mut pi0: Vec<F257> = Vec::new();
+        let tails = ctx0
+            .stream_pi0_and_collect_tails(
+                &x,
+                &z_w,
+                &[ctx0.lock.coins.clone(), ctx1.lock.coins.clone()],
+                &mut |chunk| {
+                    if err.is_some() {
+                        return;
+                    }
+                    pi0.extend_from_slice(chunk);
+                    if let Err(e) = st0.absorb_chunk(chunk) {
+                        err = Some(e);
+                        return;
+                    }
+                    if let Err(e) = st1.absorb_chunk(chunk) {
+                        err = Some(e);
+                        return;
+                    }
+                    if let Err(e) = st_bad.absorb_chunk(chunk) {
+                        err = Some(e);
+                    }
+                },
+            )
+            .expect("stream_pi0_and_collect_tails");
+        if let Some(e) = err {
+            panic!("stream decap absorb failed: {e}");
+        }
+        assert_eq!(tails.len(), 2);
+        st0.absorb_chunk(&tails[0]).expect("absorb tail0");
+        st1.absorb_chunk(&tails[1]).expect("absorb tail1");
 
-        let t_decap = Instant::now();
-        let a = ctx.lock.decap_answer(&x, &pi).expect("decap_answer");
-        assert!(a == F257::from(1u64) || a == F257::from(2u64));
-        eprintln!("[tiny_gate] decap in {:?}", t_decap.elapsed());
+        let a0 = st0.finish().expect("decap_finish0");
+        let a1 = st1.finish().expect("decap_finish1");
+        assert!(a0 == F257::from(1u64) || a0 == F257::from(2u64));
+        assert!(a1 == F257::from(1u64) || a1 == F257::from(2u64));
 
-        // Negative check: tweak proof and ensure decap fails.
-        let mut pi_bad = pi.clone();
-        pi_bad[0] += F257::from(1u64);
-        assert!(ctx.lock.decap_answer(&x, &pi_bad).is_err());
+        // Cross-check: Theorem-4.3 answer computed from the split proof (π0, tail)
+        // must match the Ring-LWE streaming decapsulation output.
+        let a0_dpp = ctx0
+            .answer_from_pi0_and_tail(&x, &pi0, &tails[0])
+            .expect("ctx0.answer_from_pi0_and_tail");
+        let a1_dpp = ctx1
+            .answer_from_pi0_and_tail(&x, &pi0, &tails[1])
+            .expect("ctx1.answer_from_pi0_and_tail");
+        assert_eq!(a0, a0_dpp, "ringlwe decap != theorem43 answer (coin0)");
+        assert_eq!(a1, a1_dpp, "ringlwe decap != theorem43 answer (coin1)");
 
-        // Negative check: flip a public input and ensure decap fails with the same proof.
+        maybe_print_rss("tiny_gate:after_prove_decap_stream");
+        eprintln!("[tiny_gate] prove+decap(stream) in {:?}", t_prove.elapsed());
+
+        // Negative check: tweak the (small) tail and ensure decapsulation fails.
+        // This avoids a second full streaming proof run.
+        let mut tail_bad = tails[0].clone();
+        tail_bad[0] += F257::ONE; // tweak μ
+        st_bad.absorb_chunk(&tail_bad).expect("absorb tweaked tail");
+        assert!(st_bad.finish().is_err());
+
+        // Negative check: wrong x length must fail immediately.
         let mut x_bad = x.clone();
-        let first_pi = 1usize + 10usize; // [ONE] || [10×WeParams] || [public_input_bytes...]
-        x_bad[first_pi] += F257::ONE;
-        assert!(ctx.lock.decap_answer(&x_bad, &pi).is_err());
+        x_bad.push(F257::ONE);
+        assert!(ctx0.lock.decap_state(&x_bad).is_err());
+
+        // Now it is safe to reclaim disk space used by the shape files.
+        let _ = std::fs::remove_dir_all(&out_dir_shape);
     }
 
     #[derive(MontConfig)]

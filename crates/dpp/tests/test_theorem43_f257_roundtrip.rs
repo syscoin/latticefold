@@ -1,6 +1,6 @@
 use ark_ff::{BigInteger, Field, Fp64, MontBackend, MontConfig, PrimeField};
 
-use dpp::dr1cs_flpcp::{ChunkedMulCodeDr1csNpFlpcpSparse, Dr1csInstanceSparse, MulCode, TensorRsMulCode};
+use dpp::dr1cs_flpcp::{Dr1csInstanceSparse, MulCode, MulCodeDr1csNpFlpcpSparse, TensorRsMulCode};
 use dpp::{SparseVec, Theorem43Dpp};
 
 #[derive(MontConfig)]
@@ -13,115 +13,62 @@ fn f_to_u64<F: PrimeField>(x: &F) -> u64 {
     x.into_bigint().to_bytes_le().get(0).copied().unwrap_or(0) as u64
 }
 
-fn chunked_tiny_dpp() -> Theorem43Dpp<F257, ChunkedMulCodeDr1csNpFlpcpSparse<F257, TensorRsMulCode<F257>>> {
+fn tiny_dpp() -> Theorem43Dpp<F257, MulCodeDr1csNpFlpcpSparse<F257, TensorRsMulCode<F257>>> {
     let n_total = 3usize;
-    let a_row = SparseVec::new(vec![(F257::ONE, 0)]);
-    let b_row = SparseVec::new(vec![(F257::ONE, 1)]);
-    let c_row = SparseVec::new(vec![(F257::ONE, 2)]);
-    let inst = Dr1csInstanceSparse::<F257> {
-        n: n_total,
-        a: vec![a_row],
-        b: vec![b_row],
-        c: vec![c_row],
-    };
     let l_public = 1usize;
     let code = TensorRsMulCode::<F257>::new(2, 1).expect("tensor code");
-    let k_block = code.dim_k();
-    let blocks = {
-        let mut out = Vec::new();
-        let total = inst.k();
-        let mut i = 0usize;
-        while i < total {
-            let end = usize::min(i + k_block, total);
-            let mut a = inst.a[i..end].to_vec();
-            let mut b = inst.b[i..end].to_vec();
-            let mut c = inst.c[i..end].to_vec();
-            while a.len() < k_block {
-                a.push(SparseVec::new(Vec::new()));
-                b.push(SparseVec::new(Vec::new()));
-                c.push(SparseVec::new(Vec::new()));
-            }
-            out.push(Dr1csInstanceSparse { n: inst.n, a, b, c });
-            i = end;
-        }
-        if out.is_empty() {
-            out.push(inst);
-        }
-        out
-    };
-    let flpcp = ChunkedMulCodeDr1csNpFlpcpSparse::<F257, _>::new(blocks, l_public, code)
-        .expect("chunked flpcp");
+    let k = code.dim_k();
+
+    // Tiny dR1CS over F257 with one constraint: z0 * z1 = z2.
+    // Pad with empty constraints up to `k` so it can use the MulCode backend directly.
+    let mut a = vec![SparseVec::new(vec![(F257::ONE, 0)])];
+    let mut b = vec![SparseVec::new(vec![(F257::ONE, 1)])];
+    let mut c = vec![SparseVec::new(vec![(F257::ONE, 2)])];
+    while a.len() < k {
+        a.push(SparseVec::new(Vec::new()));
+        b.push(SparseVec::new(Vec::new()));
+        c.push(SparseVec::new(Vec::new()));
+    }
+    let inst = Dr1csInstanceSparse::<F257> { n: n_total, a, b, c };
+
+    let flpcp = MulCodeDr1csNpFlpcpSparse::<F257, _>::new(inst, l_public, code).expect("mulcode flpcp");
     Theorem43Dpp::<F257, _>::new(flpcp).expect("theorem43 new")
 }
 
-fn collect_streamed_pi(
-    dpp: &Theorem43Dpp<F257, ChunkedMulCodeDr1csNpFlpcpSparse<F257, TensorRsMulCode<F257>>>,
-    x: &[F257],
-    z_w: &[F257],
-    coins: &dpp::Theorem43Coins<F257>,
-) -> Vec<F257> {
-    let mut pi = Vec::new();
-    dpp.prove_for_query_stream(x, z_w, coins, &mut |chunk| {
-        pi.extend_from_slice(&chunk);
-    })
-    .expect("prove_for_query_stream");
-    pi
-}
-
 fn collect_streamed_pi0_and_tail(
-    dpp: &Theorem43Dpp<F257, ChunkedMulCodeDr1csNpFlpcpSparse<F257, TensorRsMulCode<F257>>>,
+    dpp: &Theorem43Dpp<F257, MulCodeDr1csNpFlpcpSparse<F257, TensorRsMulCode<F257>>>,
     x: &[F257],
     z_w: &[F257],
     coins: &dpp::Theorem43Coins<F257>,
     pi0_len: usize,
 ) -> (Vec<F257>, Vec<F257>) {
     let mut pi0 = Vec::with_capacity(pi0_len);
-    let mut tail = Vec::new();
-    let mut seen = 0usize;
-    dpp.prove_for_query_stream(x, z_w, coins, &mut |chunk| {
-        if seen < pi0_len {
-            let need = pi0_len - seen;
-            if chunk.len() <= need {
-                pi0.extend_from_slice(&chunk);
-                seen += chunk.len();
-            } else {
-                pi0.extend_from_slice(&chunk[..need]);
-                tail.extend_from_slice(&chunk[need..]);
-                seen = pi0_len;
-            }
-        } else {
-            tail.extend_from_slice(&chunk);
-        }
-    })
-    .expect("prove_for_query_stream");
+    let tails = dpp
+        .stream_pi0_and_collect_tails(x, z_w, &[coins.clone()], &mut |chunk| {
+            pi0.extend_from_slice(chunk);
+        })
+        .expect("stream_pi0_and_collect_tails");
     assert_eq!(pi0.len(), pi0_len);
-    (pi0, tail)
+    assert_eq!(tails.len(), 1);
+    (pi0, tails[0].clone())
 }
 
 fn collect_streamed_tail_only(
-    dpp: &Theorem43Dpp<F257, ChunkedMulCodeDr1csNpFlpcpSparse<F257, TensorRsMulCode<F257>>>,
+    dpp: &Theorem43Dpp<F257, MulCodeDr1csNpFlpcpSparse<F257, TensorRsMulCode<F257>>>,
     x: &[F257],
     z_w: &[F257],
     coins: &dpp::Theorem43Coins<F257>,
     pi0_len: usize,
 ) -> Vec<F257> {
-    let mut tail = Vec::new();
-    let mut seen = 0usize;
-    dpp.prove_for_query_stream(x, z_w, coins, &mut |chunk| {
-        if seen < pi0_len {
-            let need = pi0_len - seen;
-            if chunk.len() <= need {
-                seen += chunk.len();
-            } else {
-                tail.extend_from_slice(&chunk[need..]);
-                seen = pi0_len;
-            }
-        } else {
-            tail.extend_from_slice(&chunk);
-        }
-    })
-    .expect("prove_for_query_stream");
-    tail
+    let mut _pi0 = Vec::with_capacity(pi0_len);
+    let tails = dpp
+        .stream_pi0_and_collect_tails(x, z_w, &[coins.clone()], &mut |chunk| {
+            _pi0.extend_from_slice(chunk);
+        })
+        .expect("stream_pi0_and_collect_tails");
+    assert_eq!(_pi0.len(), pi0_len);
+    assert_eq!(tails.len(), 1);
+    tails[0].clone()
 }
 
 #[test]
@@ -174,7 +121,7 @@ fn test_tensor_rs_eval_all_matches_row_stream_small() {
 fn test_theorem43_f257_arm_prove_split_roundtrip() {
     // Tiny dR1CS over F257 with one constraint: z0 * z1 = z2.
     // Public: z0. Witness: (z1, z2).
-    let dpp = chunked_tiny_dpp();
+    let dpp = tiny_dpp();
 
     // Satisfying assignment in F257.
     let z0 = F257::from(2u64);
@@ -192,12 +139,13 @@ fn test_theorem43_f257_arm_prove_split_roundtrip() {
     assert_eq!(art.accepting_set, [F257::ONE, F257::from(2u64)]);
     assert_eq!(art.len, x.len() + dpp.proof_len());
 
-    // Prove later using public coins only.
-    let pi = collect_streamed_pi(&dpp, &x, &z_w, &art.coins);
-    assert_eq!(pi.len(), dpp.proof_len());
-
-    // Consistency check: streaming answer computation.
-    let a_full = dpp.answer_for_stream(&art, &x, &pi).expect("answer_for_stream");
+    // Prove later using public coins only (canonical split proof).
+    let pi0_len = dpp.proof_len() - 2 - (257 - 3);
+    let (pi0, tail) = collect_streamed_pi0_and_tail(&dpp, &x, &z_w, &art.coins, pi0_len);
+    let a_full = dpp
+        .answer_from_pi0_and_tail(&art, &x, &pi0, &tail)
+        .expect("answer_from_pi0_and_tail");
+    assert!(dpp.accept_answer(&a_full));
 
     eprintln!(
         "theorem43/f257: proof_len={} (m={} + 2 + (p-3)=254), q_nnz={}, a(u8)={}",
@@ -214,7 +162,7 @@ fn test_theorem43_f257_reuse_single_pi0_many_coin_tails() {
     // - stream/compute π0 = (z_w || all w_eval blocks) once
     // - for each additional (block_id, rep_id) coin instance, stream only the coin-dependent tail
     //   and re-use the same π0 to form a full proof π = (π0 || tail).
-    let dpp = chunked_tiny_dpp();
+    let dpp = tiny_dpp();
 
     // Satisfying assignment in F257.
     let z0 = F257::from(2u64);
@@ -243,16 +191,14 @@ fn test_theorem43_f257_reuse_single_pi0_many_coin_tails() {
     let tail1 = collect_streamed_tail_only(&dpp, &x, &z_w, &art1.coins, pi0_len);
     assert_eq!(tail1.len(), tail_len);
 
-    // Verify both composed proofs are accepted for their respective arming artifacts.
-    let mut pi_for_0 = pi0.clone();
-    pi_for_0.extend_from_slice(&tail0);
-    assert_eq!(pi_for_0.len(), dpp.proof_len());
-    let a0 = dpp.answer_for_stream(&art0, &x, &pi_for_0).expect("answer_for_stream(0)");
+    // Verify both split proofs are accepted for their respective arming artifacts.
+    let a0 = dpp
+        .answer_from_pi0_and_tail(&art0, &x, &pi0, &tail0)
+        .expect("answer_from_pi0_and_tail(0)");
     assert!(dpp.accept_answer(&a0));
 
-    let mut pi_for_1 = pi0;
-    pi_for_1.extend_from_slice(&tail1);
-    assert_eq!(pi_for_1.len(), dpp.proof_len());
-    let a1 = dpp.answer_for_stream(&art1, &x, &pi_for_1).expect("answer_for_stream(1)");
+    let a1 = dpp
+        .answer_from_pi0_and_tail(&art1, &x, &pi0, &tail1)
+        .expect("answer_from_pi0_and_tail(1)");
     assert!(dpp.accept_answer(&a1));
 }

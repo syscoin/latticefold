@@ -25,8 +25,7 @@ use latticefold::transcript::bytes::field_to_bytes_le_fixed;
 use latticefold::transcript::poseidon::{f257_poseidon_config, F257};
 
 use crate::dr1cs_flpcp::{
-    f_to_u16, is_f257_field, ChunkedMulCodeDr1csNpFlpcpSparse, Dr1csNpFlpcpSparseApi,
-    Dr1csQueryScratch, MulCode, QuerySink,
+    f_to_u16, is_f257_field, Dr1csNpFlpcpSparseApi, Dr1csQueryScratch, QuerySink,
 };
 use crate::sparse::SparseVec;
 
@@ -165,6 +164,101 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
         self.flpcp.m() + 2 + self.q_minus_3
     }
 
+    /// Verifier-side evaluation of the Theorem-4.3 check from a split proof `(π0, tail)`.
+    ///
+    /// Canonical layout:
+    /// - `π0 = z_w || w_eval[0] || ... || w_eval[blocks-1]` of length `flpcp.m()`
+    /// - `tail = (μ, ν, u^3..u^{p-1})` of length `p-1`
+    ///
+    /// Returns the field element that should lie in the accepting set (i.e. `1` or `2`)
+    /// for a valid proof, as per the protocol’s reduction.
+    pub fn answer_from_pi0_and_tail(
+        &self,
+        art: &Theorem43LockArtifact<F>,
+        x: &[F],
+        pi0: &[F],
+        tail: &[F],
+    ) -> Result<F, String> {
+        let flpcp = &self.flpcp;
+        if x.len() != flpcp.n() {
+            return Err("bad public input length".to_string());
+        }
+        if art.coins.idx >= flpcp.ell() {
+            return Err("bad idx coin".to_string());
+        }
+        let z_w_len = flpcp.z_w_len();
+        let k_star = flpcp.k_star();
+        let blocks = flpcp.blocks();
+        let m0 = flpcp.m();
+        if pi0.len() != m0 {
+            return Err("bad pi0 length".to_string());
+        }
+        if pi0.len() < z_w_len {
+            return Err("bad pi0 length".to_string());
+        }
+        if tail.len() != art.coeffs.len() {
+            return Err("bad proof tail length".to_string());
+        }
+        if art.coeffs.len() != (self.p as usize) - 1 {
+            return Err("bad Sq coeff length".to_string());
+        }
+        if tail.len() != 2 + self.q_minus_3 {
+            return Err("bad tail length".to_string());
+        }
+
+        let (qs, _pred) = flpcp
+            .queries_for_coins_sparse(art.coins.idx, art.coins.lambda, x)
+            .map_err(|e| format!("outer coins->queries failed: {e}"))?;
+        debug_assert_eq!(qs.len(), 3);
+
+        let z_w = &pi0[..z_w_len];
+        let mut acc0 = QueryStreamAcc::new(&qs[0], x, z_w, z_w_len, k_star, blocks)?;
+        let mut acc1 = QueryStreamAcc::new(&qs[1], x, z_w, z_w_len, k_star, blocks)?;
+        let mut acc2 = QueryStreamAcc::new(&qs[2], x, z_w, z_w_len, k_star, blocks)?;
+
+        // Stream w_eval blocks out of π0.
+        let mut off = z_w_len;
+        for b in 0..blocks {
+            let end = off + k_star;
+            if end > pi0.len() {
+                return Err("bad w_eval slice".to_string());
+            }
+            let w_eval = &pi0[off..end];
+            acc0.add_block(b, w_eval)?;
+            acc1.add_block(b, w_eval)?;
+            acc2.add_block(b, w_eval)?;
+            off = end;
+        }
+        if off != pi0.len() {
+            return Err("bad pi0 layout".to_string());
+        }
+
+        let alpha = acc0.acc;
+        let beta = acc1.acc;
+        let gamma = acc2.acc;
+
+        let coeffs = &art.coeffs;
+        let c1 = coeffs[0];
+        let c2 = coeffs[1];
+        let coeff_alpha = c1 * art.coins.rho;
+        let coeff_beta = c1 * art.coins.sigma;
+        let coeff_gamma = {
+            let two = F::from(2u64);
+            c2 * (two * art.coins.rho * art.coins.sigma)
+        };
+        let coeff_mu = c2 * (art.coins.rho * art.coins.rho);
+        let coeff_nu = c2 * (art.coins.sigma * art.coins.sigma);
+
+        // `tail` layout: [μ, ν, u^3..u^{p-1}]
+        let mut acc = coeff_alpha * alpha + coeff_beta * beta + coeff_gamma * gamma;
+        acc += coeff_mu * tail[0];
+        acc += coeff_nu * tail[1];
+        for (i, c) in coeffs.iter().copied().enumerate().skip(2) {
+            acc += c * tail[i];
+        }
+        Ok(acc + F::ONE)
+    }
+
     /// Arm using a fixed FS transcript for the **full-gate cost shape**, while keeping `q` hidden.
     ///
     /// - Public coins are derived from `(domain_sep, C_stmt, x, block_id, rep_id)`.
@@ -291,49 +385,70 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
     }
 }
 
-impl<F: PrimeField, C: MulCode<F> + Sync> Theorem43Dpp<F, ChunkedMulCodeDr1csNpFlpcpSparse<F, C>> {
-    /// Streaming proof generation for the chunked tensor-RS backend.
+impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
+    /// Stream the coin-independent prefix `π0` once, and return coin-dependent tails for many coins.
     ///
-    /// This emits proof chunks in order: `z_w`, each `w_eval` chunk, then `(μ,ν,u^3..u^{p-1})`.
-    pub fn prove_for_query_stream(
+    /// Proof layout is `π = (π0 || tail)` where:
+    /// - `π0 = z_w || w_eval[0] || ... || w_eval[blocks-1]` depends only on `(x, z_w)`.
+    /// - `tail = (μ, ν, u^3..u^{p-1})` depends on `coins` (via the hidden sparse query and (ρ,σ)).
+    ///
+    /// This is the asymptotically optimal way to decapsulate many coin instances against the
+    /// same witness: stream `π0` once (to all decaps), then absorb each small tail.
+    pub fn stream_pi0_and_collect_tails(
         &self,
         x: &[F],
         z_w: &[F],
-        coins: &Theorem43Coins<F>,
-        on_chunk: &mut dyn FnMut(Vec<F>),
-    ) -> Result<(), String> {
+        coins_list: &[Theorem43Coins<F>],
+        on_pi0_chunk: &mut dyn FnMut(&[F]),
+    ) -> Result<Vec<Vec<F>>, String> {
         let flpcp = &self.flpcp;
         if x.len() != flpcp.n() {
             return Err("bad public input length".to_string());
         }
-        if coins.idx >= flpcp.ell() {
-            return Err("bad idx coin".to_string());
-        }
-        let z_w_len = flpcp.blocks[0].n - flpcp.l;
+        let z_w_len = flpcp.z_w_len();
         if z_w.len() != z_w_len {
             return Err("bad witness length".to_string());
         }
+        for coins in coins_list {
+            if coins.idx >= flpcp.ell() {
+                return Err("bad idx coin".to_string());
+            }
+        }
 
-        let (qs, _pred) = flpcp
-            .queries_for_coins_sparse(coins.idx, coins.lambda, x)
-            .map_err(|e| format!("outer coins->queries failed: {e}"))?;
-        debug_assert_eq!(qs.len(), 3);
+        let k_star = flpcp.k_star();
+        let blocks = flpcp.blocks();
 
-        let k_star = flpcp.code.dim_k_star();
-        let blocks = flpcp.blocks.len();
-        let mut acc0 = QueryStreamAcc::new(&qs[0], x, z_w, z_w_len, k_star, blocks)?;
-        let mut acc1 = QueryStreamAcc::new(&qs[1], x, z_w, z_w_len, k_star, blocks)?;
-        let mut acc2 = QueryStreamAcc::new(&qs[2], x, z_w, z_w_len, k_star, blocks)?;
+        // Precompute per-coin query accumulators.
+        struct AccSet<F: PrimeField> {
+            coins: Theorem43Coins<F>,
+            acc0: QueryStreamAcc<F>,
+            acc1: QueryStreamAcc<F>,
+            acc2: QueryStreamAcc<F>,
+        }
+        let mut accs: Vec<AccSet<F>> = Vec::with_capacity(coins_list.len());
+        for coins in coins_list {
+            let (qs, _pred) = flpcp
+                .queries_for_coins_sparse(coins.idx, coins.lambda, x)
+                .map_err(|e| format!("outer coins->queries failed: {e}"))?;
+            debug_assert_eq!(qs.len(), 3);
+            let acc0 = QueryStreamAcc::new(&qs[0], x, z_w, z_w_len, k_star, blocks)?;
+            let acc1 = QueryStreamAcc::new(&qs[1], x, z_w, z_w_len, k_star, blocks)?;
+            let acc2 = QueryStreamAcc::new(&qs[2], x, z_w, z_w_len, k_star, blocks)?;
+            accs.push(AccSet {
+                coins: coins.clone(),
+                acc0,
+                acc1,
+                acc2,
+            });
+        }
 
-        on_chunk(z_w.to_vec());
+        on_pi0_chunk(z_w);
 
-        // Depends only on code parameters; compute once and reuse.
-        let witness_pos = flpcp.code.witness_positions_star()?;
+        let witness_pos = flpcp.witness_positions_star()?;
         if witness_pos.len() != k_star {
             return Err("witness positions length mismatch".to_string());
         }
 
-        // F257 optimization: avoid repeatedly converting the (huge) witness slice to u16.
         let (x_u16, z_u16) = if is_f257_field::<F>() {
             (
                 Some(x.iter().copied().map(f_to_u16).collect::<Vec<_>>()),
@@ -343,47 +458,67 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Theorem43Dpp<F, ChunkedMulCodeDr1csNpF
             (None, None)
         };
 
-        for (b, inst) in flpcp.blocks.iter().enumerate() {
-            let w_eval = flpcp.compute_block_w_eval(
-                inst,
-                &witness_pos,
-                x,
-                z_w,
-                x_u16.as_deref(),
-                z_u16.as_deref(),
-            )?;
-            acc0.add_block(b, &w_eval)?;
-            acc1.add_block(b, &w_eval)?;
-            acc2.add_block(b, &w_eval)?;
-            on_chunk(w_eval);
+        let mut err: Option<String> = None;
+        flpcp.stream_w_eval_blocks(
+            &witness_pos,
+            x,
+            z_w,
+            x_u16.as_deref(),
+            z_u16.as_deref(),
+            &mut |b, w_eval| {
+                if err.is_some() {
+                    return;
+                }
+                for a in &mut accs {
+                    if let Err(e) = a.acc0.add_block(b, w_eval) {
+                        err = Some(e);
+                        return;
+                    }
+                    if let Err(e) = a.acc1.add_block(b, w_eval) {
+                        err = Some(e);
+                        return;
+                    }
+                    if let Err(e) = a.acc2.add_block(b, w_eval) {
+                        err = Some(e);
+                        return;
+                    }
+                }
+                on_pi0_chunk(w_eval);
+            },
+        )?;
+        if let Some(e) = err {
+            return Err(e);
         }
 
-        let alpha = acc0.acc;
-        let beta = acc1.acc;
-        let gamma = acc2.acc;
+        let mut tails = Vec::with_capacity(accs.len());
+        for a in accs {
+            let alpha = a.acc0.acc;
+            let beta = a.acc1.acc;
+            let gamma = a.acc2.acc;
 
-        let mu = alpha * alpha;
-        let nu = beta * beta;
-        let u = coins.rho * alpha + coins.sigma * beta;
+            let mu = alpha * alpha;
+            let nu = beta * beta;
+            let u = a.coins.rho * alpha + a.coins.sigma * beta;
 
-        let mut tail = Vec::with_capacity(2 + self.q_minus_3);
-        tail.push(mu);
-        tail.push(nu);
-        if self.q_minus_3 > 0 {
-            let mut cur = (u * u) * u; // u^3
-            for _ in 0..self.q_minus_3 {
-                tail.push(cur);
-                cur *= u;
+            let mut tail = Vec::with_capacity(2 + self.q_minus_3);
+            tail.push(mu);
+            tail.push(nu);
+            if self.q_minus_3 > 0 {
+                let mut cur = (u * u) * u; // u^3
+                for _ in 0..self.q_minus_3 {
+                    tail.push(cur);
+                    cur *= u;
+                }
             }
+            let _ = gamma;
+            tails.push(tail);
         }
-        on_chunk(tail);
 
-        let _ = gamma;
-        Ok(())
+        Ok(tails)
     }
 
     pub fn query_scratch(&self) -> Dr1csQueryScratch<F> {
-        Dr1csQueryScratch::new(self.flpcp.blocks[0].n)
+        Dr1csQueryScratch::new(self.flpcp.n_total())
     }
 
     pub fn stream_query_terms_for_pi(
@@ -487,114 +622,6 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Theorem43Dpp<F, ChunkedMulCodeDr1csNpF
 
         Ok(offset)
     }
-
-    pub fn answer_for_stream(
-        &self,
-        art: &Theorem43LockArtifact<F>,
-        x: &[F],
-        pi: &[F],
-    ) -> Result<F, String> {
-        let flpcp = &self.flpcp;
-        if x.len() != flpcp.n() {
-            return Err("bad public input length".to_string());
-        }
-        if x.len() + pi.len() != art.len {
-            return Err("bad (x||pi) length".to_string());
-        }
-        let z_w_len = flpcp.blocks[0].n - flpcp.l;
-        let k_star = flpcp.code.dim_k_star();
-        let m0 = flpcp.m();
-        if pi.len() != self.proof_len() {
-            return Err("bad proof length".to_string());
-        }
-        if pi.len() < m0 + 2 {
-            return Err("bad proof length".to_string());
-        }
-        let (pi0, pi_tail) = pi.split_at(m0);
-        if pi_tail.len() != art.coeffs.len() {
-            return Err("bad proof tail length".to_string());
-        }
-        if pi0.len() < z_w_len {
-            return Err("bad pi0 length".to_string());
-        }
-        let z_w = &pi0[..z_w_len];
-
-        let ell = flpcp.code.len_l();
-        let block_id = art.coins.idx / ell;
-        let local_idx = art.coins.idx % ell;
-        if block_id >= flpcp.blocks.len() {
-            return Err("bad block id".to_string());
-        }
-        let w_eval_start = z_w_len + (block_id * k_star);
-        let w_eval_end = w_eval_start + k_star;
-        if w_eval_end > pi0.len() {
-            return Err("bad w_eval slice".to_string());
-        }
-        let w_eval = &pi0[w_eval_start..w_eval_end];
-
-        let inst = &flpcp.blocks[block_id];
-        let (y_a, y_b, y_c) = (
-            mat_vec_sparse_np_local(&inst.a, x, z_w, flpcp.l),
-            mat_vec_sparse_np_local(&inst.b, x, z_w, flpcp.l),
-            mat_vec_sparse_np_local(&inst.c, x, z_w, flpcp.l),
-        );
-        let mut alpha = F::ZERO;
-        let mut beta = F::ZERO;
-        let mut gamma = F::ZERO;
-        flpcp.code.row_e_stream(local_idx, &mut |i, c| {
-            alpha += c * y_a[i];
-            beta += c * y_b[i];
-        })?;
-        flpcp.code.row_e_star_stream(local_idx, &mut |j, c| {
-            if j < inst.k() {
-                gamma += art.coins.lambda * c * y_c[j];
-            }
-            let coeff = if j < inst.k() {
-                c - (art.coins.lambda * c)
-            } else {
-                c
-            };
-            if !coeff.is_zero() {
-                gamma += coeff * w_eval[j];
-            }
-        })?;
-
-        let coeffs = &art.coeffs;
-        if coeffs.len() != (self.p as usize) - 1 {
-            return Err("bad Sq coeff length".to_string());
-        }
-        let c1 = coeffs[0];
-        let c2 = coeffs[1];
-        let coeff_alpha = c1 * art.coins.rho;
-        let coeff_beta = c1 * art.coins.sigma;
-        let coeff_gamma = {
-            let two = F::from(2u64);
-            c2 * (two * art.coins.rho * art.coins.sigma)
-        };
-        let coeff_mu = c2 * (art.coins.rho * art.coins.rho);
-        let coeff_nu = c2 * (art.coins.sigma * art.coins.sigma);
-
-        let mut acc = coeff_alpha * alpha + coeff_beta * beta + coeff_gamma * gamma;
-        acc += coeff_mu * pi_tail[0];
-        acc += coeff_nu * pi_tail[1];
-        for (i, c) in coeffs.iter().copied().enumerate().skip(2) {
-            acc += c * pi_tail[i];
-        }
-        Ok(acc + F::ONE)
-    }
-}
-
-fn mat_vec_sparse_np_local<F: PrimeField>(m: &[SparseVec<F>], x: &[F], z_w: &[F], l: usize) -> Vec<F> {
-    let mut out = Vec::with_capacity(m.len());
-    for row in m {
-        let mut acc = F::ZERO;
-        for (c, idx) in row.terms.iter().copied() {
-            let v = if idx < l { x[idx] } else { z_w[idx - l] };
-            acc += c * v;
-        }
-        out.push(acc);
-    }
-    out
 }
 
 fn field_modulus_u64<F: PrimeField>() -> Option<u64> {

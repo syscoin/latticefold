@@ -15,6 +15,7 @@ use ark_std::Zero;
 use rand::RngCore;
 use stark_rings::cyclotomic_ring::models::goldilocks::{Fq, RqPoly};
 use stark_rings::PolyRing;
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use dpp::sparse::SparseVec;
@@ -48,14 +49,24 @@ pub struct RingLweLockArtifact<F: PrimeField> {
     pub c_stmt: Vec<F>,
     /// Accepting set in the tiny field (e.g., {1,2}).
     pub accepting_set: [F; 2],
+    /// Public input length (x length) for sanity checks.
+    pub x_len: usize,
+    /// Proof length π (field elements) for sanity checks.
+    pub pi_len: usize,
     /// Total length of (x || π).
     pub len: usize,
     /// Hidden-query public coins.
     pub coins: dpp::theorem43::Theorem43Coins<F>,
     /// RLWE parameters.
     pub params: RingLweParams,
-    /// Public lock vector blocks (packed).
-    pub h_blocks: Vec<RqPoly>,
+    /// Public lock vector blocks (packed), stored sparsely.
+    ///
+    /// Each entry is `(block_index, h_block)` where `block_index` refers to the packing of π
+    /// into blocks of size `RqPoly::dimension()`.
+    ///
+    /// IMPORTANT: `block_index` is with respect to π only (not `(x||π)`), i.e. it indexes
+    /// the packed blocks of `pi[0..pi_len]`.
+    pub h_blocks_sparse: Vec<(usize, RqPoly)>,
     /// Public scalar s.
     pub s: Fq,
     /// Public offset = <q_x, x> + 1, embedded into Fq.
@@ -101,25 +112,6 @@ fn sample_noise_poly(rng: &mut impl RngCore, k: u32) -> RqPoly {
         coeffs.push(fq_from_i16(n));
     }
     RqPoly::from(coeffs)
-}
-
-fn pack_vec_to_ring_blocks<F: PrimeField>(v: &[F]) -> Vec<RqPoly> {
-    let d = RqPoly::dimension();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < v.len() {
-        let mut coeffs = Vec::with_capacity(d);
-        for j in 0..d {
-            if i + j < v.len() {
-                coeffs.push(embed_f_to_fq(&v[i + j]));
-            } else {
-                coeffs.push(Fq::ZERO);
-            }
-        }
-        out.push(RqPoly::from(coeffs));
-        i += d;
-    }
-    out
 }
 
 fn coeff0_mul(a: &RqPoly, b: &RqPoly) -> Fq {
@@ -231,45 +223,23 @@ fn dual_basis_coeff0_cached() -> Result<&'static [RqPoly], String> {
     }
 }
 
-fn pack_query_to_dual_blocks_sparse<F: PrimeField>(
-    sv: &SparseVec<F>,
-    len: usize,
-) -> Result<Vec<RqPoly>, String> {
-    let d = RqPoly::dimension();
-    let dual = dual_basis_coeff0_cached()?;
-    let nblocks = (len + d - 1) / d;
-    let mut coeffs = vec![vec![Fq::ZERO; d]; nblocks];
-
-    for (c, idx) in sv.terms.iter().copied() {
-        if idx >= len {
-            continue;
-        }
-        let block = idx / d;
-        let pos = idx % d;
-        let qi = embed_f_to_fq(&c);
-        let di = dual[pos].coeffs();
-        for k in 0..d {
-            coeffs[block][k] += qi * di[k];
-        }
-    }
-
-    Ok(coeffs.into_iter().map(RqPoly::from).collect())
-}
-
 pub(crate) struct QueryBlockAccumulator {
     pi_len: usize,
     d: usize,
     dual: &'static [RqPoly],
-    coeffs: Vec<Vec<Fq>>,
+    blocks: BTreeMap<usize, Vec<Fq>>,
 }
 
 impl QueryBlockAccumulator {
     pub(crate) fn new(pi_len: usize) -> Result<Self, String> {
         let d = RqPoly::dimension();
         let dual = dual_basis_coeff0_cached()?;
-        let nblocks = (pi_len + d - 1) / d;
-        let coeffs = vec![vec![Fq::ZERO; d]; nblocks];
-        Ok(Self { pi_len, d, dual, coeffs })
+        Ok(Self {
+            pi_len,
+            d,
+            dual,
+            blocks: BTreeMap::new(),
+        })
     }
 
     pub(crate) fn add_term<F: PrimeField>(&mut self, coeff: &F, idx: usize) -> Result<(), String> {
@@ -280,121 +250,144 @@ impl QueryBlockAccumulator {
         let pos = idx % self.d;
         let qi = embed_f_to_fq(coeff);
         let di = self.dual[pos].coeffs();
+        let row = self
+            .blocks
+            .entry(block)
+            .or_insert_with(|| vec![Fq::ZERO; self.d]);
         for k in 0..self.d {
-            self.coeffs[block][k] += qi * di[k];
+            row[k] += qi * di[k];
         }
         Ok(())
     }
 
-    /// Finalize current blocks and clear internal buffers for reuse.
+    /// Finalize current sparse blocks and clear internal buffers for reuse.
     ///
-    /// This is intentionally `&mut self` (not consuming) so callers can reuse the allocated
-    /// buffers across many repetitions `R` when `pi_len` is fixed.
-    pub(crate) fn into_blocks(&mut self) -> Vec<RqPoly> {
-        let out = self
-            .coeffs
-            .iter()
-            .map(|row| RqPoly::from(row.clone()))
-            .collect::<Vec<_>>();
-        for row in &mut self.coeffs {
-            row.fill(Fq::ZERO);
-        }
-        out
+    /// Returns only the blocks that have any nonzero query mass.
+    pub(crate) fn into_sparse_blocks(&mut self) -> Vec<(usize, RqPoly)> {
+        let blocks = std::mem::take(&mut self.blocks);
+        blocks.into_iter().map(|(i, row)| (i, RqPoly::from(row))).collect()
     }
 }
 
 impl<F: PrimeField> RingLweLockArtifact<F> {
-    /// Attempt to decapsulate and recover the tiny-field answer.
-    pub fn decap_answer(&self, x: &[F], pi: &[F]) -> Result<F, String> {
-        if x.len() + pi.len() != self.len {
-            return Err("decap_answer: bad (x||pi) length".to_string());
-        }
-        let pi_blocks = pack_vec_to_ring_blocks(pi);
-        let mut t = Fq::ZERO;
-        for (h_i, pi_i) in self.h_blocks.iter().zip(pi_blocks.iter()) {
-            t += coeff0_mul(h_i, pi_i);
-        }
-        // Add s * offset so that target is s * (q·pi + offset).
-        t += self.s * self.offset;
-
-        // Check against s * accepting_set under small noise, modulo p=257.
-        let t_center = center_lift_fq(&t);
-        let s_mod = fq_mod_257(&self.s);
-        for a in &self.accepting_set {
-            let a_i = f_to_u64(a) as i128;
-            let target = (s_mod * a_i).rem_euclid(SMALL_P);
-            let diff = t_center - target;
-            let rem = centered_mod_257(diff);
-            if rem.abs() <= self.params.noise_bound {
-                return Ok(*a);
-            }
-        }
-        Err("decap_answer: not in accepting set (within noise bound)".to_string())
+    /// Create an incremental streaming decapsulation state.
+    ///
+    /// This is the preferred API for end-to-end streaming: the prover can call
+    /// `state.absorb_chunk(chunk)` as it emits proof chunks, without ever materializing π.
+    pub fn decap_state<'a>(&'a self, x: &[F]) -> Result<RingLweDecapStreamState<'a, F>, String> {
+        RingLweDecapStreamState::new(self, x)
     }
 
-    /// Streaming decapsulation over proof chunks.
-    ///
-    /// This avoids materializing the full `pi` vector in memory.
-    pub fn decap_answer_stream<I>(&self, x: &[F], pi_len: usize, chunks: I) -> Result<F, String>
-    where
-        I: IntoIterator<Item = Vec<F>>,
-    {
-        if x.len() + pi_len != self.len {
-            return Err("decap_answer_stream: bad (x||pi) length".to_string());
+    // Canonical decapsulation is via `decap_state()` + `RingLweDecapStreamState::absorb_chunk()`.
+}
+
+/// Incremental streaming decapsulation state for `RingLweLockArtifact`.
+///
+/// This supports true end-to-end streaming with bounded memory: callers push proof chunks
+/// as they arrive, and `finish()` returns the accepted `a ∈ {1,2}` (or an error).
+pub struct RingLweDecapStreamState<'a, F: PrimeField> {
+    lock: &'a RingLweLockArtifact<F>,
+    d: usize,
+    // sparse block list + cursor
+    sparse: &'a [(usize, RqPoly)],
+    sparse_pos: usize,
+    // streaming position
+    block_idx: usize,
+    filled: usize,
+    coeffs: Vec<Fq>,
+    t: Fq,
+}
+
+impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
+    fn new(lock: &'a RingLweLockArtifact<F>, x: &[F]) -> Result<Self, String> {
+        if x.len() != lock.x_len || x.len() + lock.pi_len != lock.len {
+            return Err("decap_state: bad x length".to_string());
         }
         let d = RqPoly::dimension();
-        let mut t = Fq::ZERO;
-        let mut block_idx = 0usize;
-        let mut filled = 0usize;
-        let mut coeffs: Vec<Fq> = Vec::with_capacity(d);
+        Ok(Self {
+            lock,
+            d,
+            sparse: lock.h_blocks_sparse.as_slice(),
+            sparse_pos: 0,
+            block_idx: 0,
+            filled: 0,
+            coeffs: Vec::with_capacity(d),
+            t: Fq::ZERO,
+        })
+    }
 
-        for chunk in chunks {
-            for v in chunk {
-                coeffs.push(embed_f_to_fq(&v));
-                filled += 1;
-                if coeffs.len() == d {
-                    let pi_block = RqPoly::from(coeffs);
-                    if block_idx >= self.h_blocks.len() {
-                        return Err("decap_answer_stream: too many blocks".to_string());
-                    }
-                    t += coeff0_mul(&self.h_blocks[block_idx], &pi_block);
-                    block_idx += 1;
-                    coeffs = Vec::with_capacity(d);
-                }
-            }
+    #[inline]
+    fn maybe_process_full_block(&mut self) -> Result<(), String> {
+        if self.coeffs.len() != self.d {
+            return Ok(());
         }
-        if filled != pi_len {
-            return Err("decap_answer_stream: bad pi_len".to_string());
+        if self.sparse_pos < self.sparse.len() && self.sparse[self.sparse_pos].0 == self.block_idx {
+            // Only materialize a ring element for blocks that are actually used by the sparse query.
+            let pi_block = RqPoly::from(self.coeffs.clone());
+            let h_i = &self.sparse[self.sparse_pos].1;
+            self.t += coeff0_mul(h_i, &pi_block);
+            self.sparse_pos += 1;
         }
-        if !coeffs.is_empty() {
-            while coeffs.len() < d {
-                coeffs.push(Fq::ZERO);
+        self.block_idx += 1;
+        self.coeffs.clear();
+        Ok(())
+    }
+
+    /// Absorb the next proof chunk (a slice of π field elements).
+    pub fn absorb_chunk(&mut self, chunk: &[F]) -> Result<(), String> {
+        for v in chunk {
+            if self.filled >= self.lock.pi_len {
+                return Err("decap_stream: too many π elements".to_string());
             }
-            if block_idx >= self.h_blocks.len() {
-                return Err("decap_answer_stream: too many blocks".to_string());
-            }
-            let pi_block = RqPoly::from(coeffs);
-            t += coeff0_mul(&self.h_blocks[block_idx], &pi_block);
-            block_idx += 1;
+            self.coeffs.push(embed_f_to_fq(v));
+            self.filled += 1;
+            self.maybe_process_full_block()?;
         }
-        if block_idx != self.h_blocks.len() {
-            return Err("decap_answer_stream: bad block count".to_string());
+        Ok(())
+    }
+
+    /// Finish streaming and return the accepted tiny-field answer.
+    pub fn finish(mut self) -> Result<F, String> {
+        if self.filled != self.lock.pi_len {
+            return Err("decap_stream: bad π length".to_string());
+        }
+        if !self.coeffs.is_empty() {
+            while self.coeffs.len() < self.d {
+                self.coeffs.push(Fq::ZERO);
+            }
+            // process last partial block
+            if self.sparse_pos < self.sparse.len() && self.sparse[self.sparse_pos].0 == self.block_idx {
+                let pi_block = RqPoly::from(self.coeffs.clone());
+                let h_i = &self.sparse[self.sparse_pos].1;
+                self.t += coeff0_mul(h_i, &pi_block);
+                self.sparse_pos += 1;
+            }
+            self.block_idx += 1;
+            self.coeffs.clear();
+        }
+        let nblocks = (self.lock.pi_len + self.d - 1) / self.d;
+        if self.block_idx != nblocks {
+            return Err("decap_stream: internal block count mismatch".to_string());
+        }
+        if self.sparse_pos != self.sparse.len() {
+            return Err("decap_stream: did not consume all sparse blocks".to_string());
         }
 
-        t += self.s * self.offset;
+        // Add s * offset so that target is s * (q·pi + offset).
+        self.t += self.lock.s * self.lock.offset;
 
-        let t_center = center_lift_fq(&t);
-        let s_mod = fq_mod_257(&self.s);
-        for a in &self.accepting_set {
+        let t_center = center_lift_fq(&self.t);
+        let s_mod = fq_mod_257(&self.lock.s);
+        for a in &self.lock.accepting_set {
             let a_i = f_to_u64(a) as i128;
             let target = (s_mod * a_i).rem_euclid(SMALL_P);
             let diff = t_center - target;
             let rem = centered_mod_257(diff);
-            if rem.abs() <= self.params.noise_bound {
+            if rem.abs() <= self.lock.params.noise_bound {
                 return Ok(*a);
             }
         }
-        Err("decap_answer_stream: not in accepting set (within noise bound)".to_string())
+        Err("decap_stream: not in accepting set (within noise bound)".to_string())
     }
 }
 
@@ -405,7 +398,7 @@ pub fn arm_ringlwe_lock<F: PrimeField>(
     offset_f: F,
     x_len: usize,
     pi_len: usize,
-    q_blocks: Vec<RqPoly>,
+    q_blocks: Vec<(usize, RqPoly)>,
     params: RingLweParams,
     rng: &mut impl RngCore,
 ) -> Result<RingLweLockArtifact<F>, String> {
@@ -427,24 +420,26 @@ pub fn arm_ringlwe_lock<F: PrimeField>(
             }
         }
     };
-    let mut h_blocks = Vec::with_capacity(q_blocks.len());
-    for q in &q_blocks {
+    let mut h_blocks_sparse = Vec::with_capacity(q_blocks.len());
+    for (block_idx, q) in &q_blocks {
         let e = sample_noise_poly(rng, params.binomial_k);
         let mut coeffs = q.coeffs().to_vec();
         for c in &mut coeffs {
             *c *= s;
         }
         let q_scaled = RqPoly::from(coeffs);
-        h_blocks.push(q_scaled + e);
+        h_blocks_sparse.push((*block_idx, q_scaled + e));
     }
 
     Ok(RingLweLockArtifact {
         c_stmt,
         accepting_set,
+        x_len,
+        pi_len,
         len: x_len + pi_len,
         coins,
         params,
-        h_blocks,
+        h_blocks_sparse,
         s,
         offset,
     })
