@@ -6198,25 +6198,22 @@ mod tests {
         // NOTE: `pairs` indices are interpreted over the full `u32_squeeze_ops` wiring, which
         // includes any prefix `get_challenge()` u32 squeezes.
         let pairs: Vec<(usize, usize)> = vec![(0, 0)];
-        // Public inputs as field elements (used for schedule trace generation).
-        let public_inputs_elems_f257: Vec<F257> = (0..public_inputs_len)
-            .map(|i| if (i % 3) == 0 { F257::ONE } else { F257::ZERO })
+        type BF0 = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
+        // Public inputs as base-field elements (used for schedule trace generation).
+        //
+        // IMPORTANT: the tiny-gate public prefix is the transcript encoding of these field
+        // elements: fixed-width little-endian bytes, lifted into F257 (0..=255). We must NOT
+        // synthesize "bytes" from arbitrary F257 elements, since 256 is a valid F257 element but
+        // is a special base-257 digit (sentinel) in the transcript's byte-view map.
+        let public_inputs_bf: Vec<BF0> = (0..public_inputs_len)
+            .map(|i| if (i % 3) == 0 { BF0::ONE } else { BF0::ZERO })
             .collect();
         // Tiny-gate statement public prefix uses the byte encoding (8 bytes per base-field element).
-        let public_inputs_bytes_f257: Vec<F257> = public_inputs_elems_f257
+        let public_inputs_bytes_f257: Vec<F257> = public_inputs_bf
             .iter()
             .flat_map(|x| {
-                let u = x.into_bigint().as_ref().get(0).copied().unwrap_or(0) as u8;
-                [u, 0, 0, 0, 0, 0, 0, 0].into_iter().map(|b| F257::from(b as u64))
-            })
-            .collect();
-        type BF0 = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
-        let public_inputs_bf: Vec<BF0> = public_inputs_elems_f257
-            .iter()
-            .map(|x| {
-                // F257 is a small prime field; lift via canonical u64 rep.
-                let u = x.into_bigint().as_ref().get(0).copied().unwrap_or(0);
-                BF0::from(u)
+                let bytes = latticefold::transcript::bytes::prime_field_to_bytes_le_fixed::<BF0>(x);
+                bytes.into_iter().map(|b| F257::from(b as u64))
             })
             .collect();
 
