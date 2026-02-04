@@ -1086,6 +1086,66 @@ impl<R: OverField + PolyRing> StreamingMleEnum<R>
 where
     R::BaseRing: Ring,
 {
+    /// If `x` is a constant-coefficient ring element, return that base scalar.
+    #[inline(always)]
+    fn try_const_coeff0(x: &R) -> Option<R::BaseRing> {
+        let cs = x.coeffs();
+        // Common in LF+: many values are lifted from the base ring.
+        for &ci in cs.iter().skip(1) {
+            if ci != R::BaseRing::ZERO {
+                return None;
+            }
+        }
+        Some(cs[0])
+    }
+
+    /// If `x` is monomial-like (<=1 nonzero coeff), return (shift, coeff).
+    #[inline(always)]
+    fn try_monomial(x: &R) -> Option<(usize, R::BaseRing)> {
+        let cs = x.coeffs();
+        let mut found: Option<(usize, R::BaseRing)> = None;
+        for (i, &ci) in cs.iter().enumerate() {
+            if ci != R::BaseRing::ZERO {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some((i, ci));
+            }
+        }
+        found
+    }
+
+    /// Compute `a(X) * (scale * X^shift) mod (X^d+1)` in O(d) coefficient time.
+    ///
+    /// This avoids ring×ring multiplication (NTT) for coefficient-form rings.
+    #[inline(always)]
+    fn mul_negacyclic_by_monomial_scaled(a: &R, shift: usize, scale: R::BaseRing) -> R {
+        if scale == R::BaseRing::ZERO {
+            return R::ZERO;
+        }
+        let ac = a.coeffs();
+        let d = ac.len();
+        if shift == 0 && scale == R::BaseRing::ONE {
+            return *a;
+        }
+        let mut out = R::ZERO;
+        let outc = out.coeffs_mut();
+        for i in 0..d {
+            let v = ac[i] * scale;
+            if v == R::BaseRing::ZERO {
+                continue;
+            }
+            let j = i + shift;
+            if j < d {
+                outc[j] += v;
+            } else {
+                // X^d = -1
+                outc[j - d] -= v;
+            }
+        }
+        out
+    }
+
     #[inline]
     pub fn num_vars(&self) -> usize {
         match self {
@@ -1418,6 +1478,20 @@ where
                 let q = q / n3;
                 let i2 = q % n2;
                 let i1 = q / n2;
+                // Fast path for LF+ CM:
+                // - `t1` (tensor(c_z)) and `t3` (d_powers) are constant-coeff lifts.
+                // - `t4` (x_powers) is monomial.
+                //
+                // Instead of doing 3 ring×ring multiplies (each would still touch 64 coeffs even with
+                // scalar/monomial fast paths), fuse into a single negacyclic shift+scale loop over `t2`.
+                if let (Some(c1), Some(c3), Some((shift, cm))) = (
+                    Self::try_const_coeff0(&t1[i1]),
+                    Self::try_const_coeff0(&t3[i3]),
+                    Self::try_monomial(&t4[i4]),
+                ) {
+                    let scale = (c1 * c3) * cm;
+                    return Self::mul_negacyclic_by_monomial_scaled(&t2[i2], shift, scale);
+                }
                 t1[i1] * t2[i2] * t3[i3] * t4[i4]
             }
             StreamingMleEnum::LazyFixed {
