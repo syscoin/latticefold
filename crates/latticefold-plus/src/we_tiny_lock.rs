@@ -16,7 +16,7 @@ use dpp::dr1cs_flpcp::{Dr1csNpFlpcpSparseApi, Dr1csQueryScratch, MulCode, QueryS
 use dpp::packing::FlpcpPredicate;
 use dpp::theorem43::{Theorem43Coins, Theorem43Dpp, Theorem43LockArtifact};
 use dpp::SparseVec;
-use symphony::file_backed_dr1cs::FileBackedSparseDr1csInstance;
+use symphony::file_backed_dr1cs::{cfg_read_buf_bytes, FileBackedSparseDr1csInstance};
 
 #[inline]
 fn is_f257_field<F: PrimeField>() -> bool {
@@ -106,7 +106,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> FileBackedChunkedMulCodeDr1csNpFlpcpSp
             Ok(f) => f,
             Err(_) => return Vec::new(),
         };
-        let mut r = BufReader::with_capacity(8 * 1024 * 1024, f);
+        let mut r = BufReader::with_capacity(cfg_read_buf_bytes(), f);
         let mut out = Vec::new();
         loop {
             let row_idx = match read_u64(&mut r) {
@@ -173,7 +173,8 @@ impl<F: PrimeField, C: MulCode<F> + Sync> FileBackedChunkedMulCodeDr1csNpFlpcpSp
         let mut fr = File::open(dir.join("constraints.bin")).map_err(|e| e.to_string())?;
         fr.seek(SeekFrom::Start(row0.saturating_mul(ROW_LENS_SIZE)))
             .map_err(|e| e.to_string())?;
-        let mut rows = BufReader::with_capacity(8 * 1024 * 1024, fr);
+        let cap = cfg_read_buf_bytes();
+        let mut rows = BufReader::with_capacity(cap, fr);
 
         let mut fa_c = File::open(dir.join("a_coeffs.bin")).map_err(|e| e.to_string())?;
         let mut fa_i = File::open(dir.join("a_idx.bin")).map_err(|e| e.to_string())?;
@@ -189,12 +190,12 @@ impl<F: PrimeField, C: MulCode<F> + Sync> FileBackedChunkedMulCodeDr1csNpFlpcpSp
         fc_c.seek(SeekFrom::Start(c0.saturating_mul(2))).map_err(|e| e.to_string())?;
         fc_i.seek(SeekFrom::Start(c0.saturating_mul(4))).map_err(|e| e.to_string())?;
 
-        let mut a_coeffs = BufReader::with_capacity(8 * 1024 * 1024, fa_c);
-        let mut a_idx = BufReader::with_capacity(8 * 1024 * 1024, fa_i);
-        let mut b_coeffs = BufReader::with_capacity(8 * 1024 * 1024, fb_c);
-        let mut b_idx = BufReader::with_capacity(8 * 1024 * 1024, fb_i);
-        let mut c_coeffs = BufReader::with_capacity(8 * 1024 * 1024, fc_c);
-        let mut c_idx = BufReader::with_capacity(8 * 1024 * 1024, fc_i);
+        let mut a_coeffs = BufReader::with_capacity(cap, fa_c);
+        let mut a_idx = BufReader::with_capacity(cap, fa_i);
+        let mut b_coeffs = BufReader::with_capacity(cap, fb_c);
+        let mut b_idx = BufReader::with_capacity(cap, fb_i);
+        let mut c_coeffs = BufReader::with_capacity(cap, fc_c);
+        let mut c_idx = BufReader::with_capacity(cap, fc_i);
 
         // Advance from row0 to row_start.
         //
@@ -271,7 +272,8 @@ impl<F: PrimeField, C: MulCode<F> + Sync> FileBackedChunkedMulCodeDr1csNpFlpcpSp
         let mut fr = File::open(dir.join("constraints.bin")).map_err(|e| e.to_string())?;
         fr.seek(SeekFrom::Start(row0.saturating_mul(ROW_LENS_SIZE)))
             .map_err(|e| e.to_string())?;
-        let mut rows = BufReader::with_capacity(8 * 1024 * 1024, fr);
+        let cap = cfg_read_buf_bytes();
+        let mut rows = BufReader::with_capacity(cap, fr);
 
         let mut fa_c = File::open(dir.join("a_coeffs.bin")).map_err(|e| e.to_string())?;
         let mut fa_i = File::open(dir.join("a_idx.bin")).map_err(|e| e.to_string())?;
@@ -283,10 +285,10 @@ impl<F: PrimeField, C: MulCode<F> + Sync> FileBackedChunkedMulCodeDr1csNpFlpcpSp
         fb_c.seek(SeekFrom::Start(b0.saturating_mul(2))).map_err(|e| e.to_string())?;
         fb_i.seek(SeekFrom::Start(b0.saturating_mul(4))).map_err(|e| e.to_string())?;
 
-        let mut a_coeffs = BufReader::with_capacity(8 * 1024 * 1024, fa_c);
-        let mut a_idx = BufReader::with_capacity(8 * 1024 * 1024, fa_i);
-        let mut b_coeffs = BufReader::with_capacity(8 * 1024 * 1024, fb_c);
-        let mut b_idx = BufReader::with_capacity(8 * 1024 * 1024, fb_i);
+        let mut a_coeffs = BufReader::with_capacity(cap, fa_c);
+        let mut a_idx = BufReader::with_capacity(cap, fa_i);
+        let mut b_coeffs = BufReader::with_capacity(cap, fb_c);
+        let mut b_idx = BufReader::with_capacity(cap, fb_i);
 
         // Advance from row0 to row_start. Sum term counts and seek once per file.
         let mut a_skip: u64 = 0;

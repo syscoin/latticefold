@@ -26,7 +26,7 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use crate::dpp_poseidon::SparseDr1csInstance;
 
 #[inline]
-fn cfg_read_buf_bytes() -> usize {
+pub fn cfg_read_buf_bytes() -> usize {
     let mb: usize = std::env::var("LFP_FILE_BACKED_READ_BUF_MB")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -658,7 +658,7 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             File::create(constraints_path(dir)).map_err(|e| format!("create constraints failed: {e}"))?,
         );
         let f_rows_ckpt = BufWriter::with_capacity(
-            cap.min(8 * 1024 * 1024),
+            cap.min(cfg_read_buf_bytes()),
             File::create(rows_ckpt_path(dir)).map_err(|e| format!("create rows_ckpt failed: {e}"))?,
         );
 
@@ -1958,7 +1958,7 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                     let base_b = b_off[pi];
                     let base_c = c_off[pi];
                     let mut r = BufReader::with_capacity(
-                        8 * 1024 * 1024,
+                        cfg_read_buf_bytes(),
                         File::open(rows_ckpt_path(&inst.layout.dir))
                             .map_err(|e| format!("open rows_ckpt failed: {e}"))?,
                     );
@@ -1980,7 +1980,7 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                 }
                 merged_ckpts.sort_by_key(|x| x.0);
                 let mut ckpt_out = BufWriter::with_capacity(
-                    8 * 1024 * 1024,
+                    cfg_read_buf_bytes(),
                     File::create(rows_ckpt_path(&out_dir)).map_err(|e| format!("create rows_ckpt failed: {e}"))?,
                 );
                 for (row_i, a0, b0, c0) in merged_ckpts {
