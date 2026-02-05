@@ -334,38 +334,55 @@ pub fn run_sp1_oneproof_we_gate_from_files(
 
     let lock_j = 0u64;
     let block_id = 0usize;
-    let rep_id = 0u64;
+    let mut rep_id = 0u64;
     let ringlwe_params = RingLweParams::default();
     // Deterministic RNG seed derived from the statement-binding lock coin seed.
     let mut rng = StdRng::from_seed(lock_coin_seed);
 
     let t_arm = Instant::now();
-    let ctx = crate::we_tiny_lock::arm_lfplus_we_gate_tiny_ringlwe_streaming::<R>(
-        shape.clone(),
-        &we_params,
-        &public_inputs_f257,
-        stmt_digest,
-        ARMER_SEED,
-        lock_j,
-        block_id,
-        rep_id,
-        ringlwe_params,
-        &mut rng,
+    // Canonical RingLWE arming is payload-capable; for oneproof we only need the answer,
+    // so we use an empty payload.
+    let payload: [u8; 0] = [];
+    let lock = loop {
+        match crate::we_tiny_lock::arm_lfplus_ringlwe_lock::<R>(
+            shape.clone(),
+            &we_params,
+            &public_inputs_f257,
+            stmt_digest,
+            ARMER_SEED,
+            lock_j,
+            block_id,
+            rep_id,
+            ringlwe_params.clone(),
+            &payload,
+            &mut rng,
+        ) {
+            Ok(lock) => break lock,
+            Err(e) if e.contains("shifted accepting set contains 0") => {
+                rep_id += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    let prover = crate::we_tiny_lock::we_ringlwe_prover_from_dr1cs::<F257>(
+        shape.inst.clone(),
+        shape.public_len,
     )?;
     eprintln!(
         "[oneproof] armed ringlwe in {:?}: proof_len={}",
         t_arm.elapsed(),
-        ctx.proof_len()
+        prover.proof_len()
     );
 
     let t_prove = Instant::now();
     maybe_print_rss("oneproof:before_prove_decap_stream");
-    let mut st = ctx.lock.decap_state(&x)?;
+    let mut st = lock.decap_state(&x)?;
     let mut err: Option<String> = None;
-    let tails = ctx.stream_pi0_and_collect_tails(
+    let tails = prover.stream_pi0_and_collect_tails(
         &x,
         z_w,
-        std::slice::from_ref(&ctx.lock.coins),
+        std::slice::from_ref(&lock.coins),
         &mut |chunk| {
             if err.is_some() {
                 return;

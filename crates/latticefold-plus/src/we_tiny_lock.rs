@@ -25,7 +25,9 @@ fn is_f257_field<F: PrimeField>() -> bool {
     F::characteristic() == &[257u64]
 }
 
-use crate::lockable_ringlwe::{arm_ringlwe_lock, RingLweLockArtifact, RingLweParams};
+use crate::lockable_ringlwe::{
+    arm_ringlwe_lock, RingLweLockArtifact, RingLweParams,
+};
 use crate::lockable_ringlwe::QueryBlockAccumulator;
 
 pub use crate::we_statement::arm_theorem43_from_statement;
@@ -782,62 +784,15 @@ pub fn public_coins<F: PrimeField>(art: &Theorem43LockArtifact<F>) -> Theorem43C
 
 // NOTE: test-only helpers live in the test module.
 
-/// Arm a Theorem-4.3 tiny-field lock and wrap it in a Ring-LWE backend.
+/// Prover-side streaming context: a thin wrapper around the chunked, file-backed FLPCP backend.
 ///
-/// This produces a compact public lock artifact that does not reveal the hidden query.
-pub(crate) fn arm_theorem43_ringlwe_from_statement<F: PrimeField>(
-    dpp: &Theorem43Dpp<F, impl Dr1csNpFlpcpSparseApi<F> + Sync>,
-    stmt_digest: [u8; 32],
-    x: &[F],
-    armer_seed: [u8; 32],
-    lock_j: u64,
-    block_id: usize,
-    rep_id: u64,
-    params: RingLweParams,
-    rng: &mut impl rand::RngCore,
-    scratch: &mut Dr1csQueryScratch<F>,
-    acc: &mut QueryBlockAccumulator,
-) -> Result<(RingLweLockArtifact<F>, Theorem43LockArtifact<F>), String> {
-    let c_stmt = crate::we_statement::digest32_to_bits_field::<F>(stmt_digest);
-    let armer_secret = crate::we_statement::derive_armer_secret::<F>(armer_seed, stmt_digest, lock_j, 4);
-    let art = dpp.arm(&c_stmt, x, &armer_secret, block_id, rep_id)?;
-    let pi_len = dpp.proof_len();
-    let mut err: Option<String> = None;
-    let offset_f = dpp
-        .stream_query_terms_for_pi(x, &art.coins, &art.coeffs, scratch, &mut |pi_idx, coeff| {
-            if err.is_some() {
-                return;
-            }
-            if let Err(e) = acc.add_term(&coeff, pi_idx) {
-                err = Some(e);
-            }
-        })?;
-    if let Some(e) = err {
-        return Err(e);
-    }
-    let q_blocks = acc.into_sparse_blocks();
-    let lock = arm_ringlwe_lock(
-        c_stmt,
-        art.accepting_set,
-        art.coins.clone(),
-        offset_f,
-        x.len(),
-        pi_len,
-        q_blocks,
-        params,
-        rng,
-    )?;
-    Ok((lock, art))
-}
-
-/// Streaming arming helper that keeps the chunked FLPCP backend available for proof streaming.
-pub struct WeRingLweStreamingContext<F: PrimeField + FftField> {
-    pub lock: RingLweLockArtifact<F>,
-    theorem43_art: Theorem43LockArtifact<F>,
+/// This is intentionally **not** returned from arming: arming publishes a public lock artifact;
+/// proving is a separate role that may happen much later by a different party.
+pub struct WeRingLweProverContext<F: PrimeField + FftField> {
     dpp: Theorem43Dpp<F, FileBackedChunkedMulCodeDr1csNpFlpcpSparse<F, TensorRsMulCode<F>>>,
 }
 
-impl<F: PrimeField + FftField> WeRingLweStreamingContext<F> {
+impl<F: PrimeField + FftField> WeRingLweProverContext<F> {
     pub fn stream_pi0_and_collect_tails(
         &self,
         x: &[F],
@@ -852,19 +807,30 @@ impl<F: PrimeField + FftField> WeRingLweStreamingContext<F> {
     pub fn proof_len(&self) -> usize {
         self.dpp.proof_len()
     }
-
-    /// Compute the DPP answer from an already-streamed `(π0, tail)` split proof.
-    ///
-    /// This is the canonical verification path for Theorem 4.3, and is useful in tests
-    /// to cross-check the Ring-LWE streaming decapsulation output without exposing any
-    /// additional public API surface.
-    pub fn answer_from_pi0_and_tail(&self, x: &[F], pi0: &[F], tail: &[F]) -> Result<F, String> {
-        self.dpp.answer_from_pi0_and_tail(&self.theorem43_art, x, pi0, tail)
-    }
 }
 
-/// Arm a Ring-LWE lock and return a streaming context for chunked proof generation.
-pub(crate) fn arm_we_ringlwe_from_dr1cs_streaming<F: PrimeField + FftField>(
+fn make_theorem43_dpp_from_dr1cs<F: PrimeField + FftField>(
+    dr1cs: FileBackedSparseDr1csInstance<F>,
+    public_len: usize,
+) -> Result<Theorem43Dpp<F, FileBackedChunkedMulCodeDr1csNpFlpcpSparse<F, TensorRsMulCode<F>>>, String> {
+    let code = TensorRsMulCode::<F>::new(48, 3)?;
+    let flpcp = FileBackedChunkedMulCodeDr1csNpFlpcpSparse::<F, _>::new(dr1cs, public_len, code)?;
+    Theorem43Dpp::<F, _>::new(flpcp)
+}
+
+/// Build a prover-side streaming context from a public DR1CS instance.
+pub(crate) fn we_ringlwe_prover_from_dr1cs<F: PrimeField + FftField>(
+    dr1cs: FileBackedSparseDr1csInstance<F>,
+    public_len: usize,
+) -> Result<WeRingLweProverContext<F>, String> {
+    let dpp = make_theorem43_dpp_from_dr1cs::<F>(dr1cs, public_len)?;
+    Ok(WeRingLweProverContext { dpp })
+}
+
+/// Arm (publish) a RingLWE lock artifact from a public DR1CS instance and statement `x`.
+///
+/// Returns only the public lock artifact.
+pub(crate) fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
     dr1cs: FileBackedSparseDr1csInstance<F>,
     public_len: usize,
     stmt_digest: [u8; 32],
@@ -874,34 +840,62 @@ pub(crate) fn arm_we_ringlwe_from_dr1cs_streaming<F: PrimeField + FftField>(
     block_id: usize,
     rep_id: u64,
     params: RingLweParams,
+    payload: &[u8],
     rng: &mut impl rand::RngCore,
-) -> Result<WeRingLweStreamingContext<F>, String> {
+) -> Result<RingLweLockArtifact<F>, String> {
     if x.len() != public_len {
-        return Err("arm_we_ringlwe_from_dr1cs_streaming: x length != public_len".to_string());
+        return Err("arm_we_ringlwe_lock_from_dr1cs: x length != public_len".to_string());
     }
-    let code = TensorRsMulCode::<F>::new(48, 3)?;
-    let flpcp = FileBackedChunkedMulCodeDr1csNpFlpcpSparse::<F, _>::new(dr1cs, public_len, code)?;
-    let dpp = Theorem43Dpp::<F, _>::new(flpcp)?;
+    let dpp = make_theorem43_dpp_from_dr1cs::<F>(dr1cs, public_len)?;
     let mut scratch = dpp.query_scratch();
     let mut acc = QueryBlockAccumulator::new(dpp.proof_len())?;
-    let (lock, theorem43_art) = arm_theorem43_ringlwe_from_statement(
-        &dpp,
-        stmt_digest,
+
+    let c_stmt = crate::we_statement::digest32_to_bits_field::<F>(stmt_digest);
+    let armer_secret = crate::we_statement::derive_armer_secret::<F>(armer_seed, stmt_digest, lock_j, 4);
+    let art = dpp.arm(&c_stmt, x, &armer_secret, block_id, rep_id)?;
+    let pi_len = dpp.proof_len();
+
+    let mut err: Option<String> = None;
+    let offset_f = dpp.stream_query_terms_for_pi(
         x,
-        armer_seed,
-        lock_j,
-        block_id,
-        rep_id,
-        params,
-        rng,
+        &art.coins,
+        &art.coeffs,
         &mut scratch,
-        &mut acc,
+        &mut |pi_idx, coeff| {
+            if err.is_some() {
+                return;
+            }
+            if let Err(e) = acc.add_term(&coeff, pi_idx) {
+                err = Some(e);
+            }
+        },
     )?;
-    Ok(WeRingLweStreamingContext {
-        lock,
-        theorem43_art,
-        dpp,
-    })
+    if let Some(e) = err {
+        return Err(e);
+    }
+    let q_blocks = acc.into_sparse_blocks();
+
+    // Shift accepting set by offset so decap only needs ⟨q_π, π⟩.
+    let shifted = [art.accepting_set[0] - offset_f, art.accepting_set[1] - offset_f];
+    if shifted[0].is_zero() || shifted[1].is_zero() {
+        return Err(
+            "arm_we_ringlwe_lock_from_dr1cs: shifted accepting set contains 0; resample rep_id"
+                .to_string(),
+        );
+    }
+
+    arm_ringlwe_lock(
+        c_stmt,
+        shifted,
+        art.coins.clone(),
+        offset_f,
+        x.len(),
+        pi_len,
+        q_blocks,
+        params,
+        payload,
+        rng,
+    )
 }
 
 /// Arm the **LF+ tiny-field WE gate** (Poseidon(F257) + CM-coin surfaces) as a Theorem-4.3 lock.
@@ -909,14 +903,14 @@ pub(crate) fn arm_we_ringlwe_from_dr1cs_streaming<F: PrimeField + FftField>(
 /// This is the main wiring from:
 /// - `we_gate_arith::build_we_dr1cs_for_plus_proof_shape_tiny` (arm-time instance construction)
 /// into:
-/// - `arm_we_ringlwe_from_dr1cs_streaming` (Theorem-4.3 + Ring-LWE wrapper).
+/// - `arm_we_ringlwe_lock_from_dr1cs` (Theorem-4.3 + Ring-LWE wrapper).
 ///
 /// Notes:
 /// - The statement binding is carried by `stmt_digest` via `c_stmt` inside `arm_theorem43_from_statement`.
 /// - `x` is the canonical public statement encoding:
 ///   `x = [ONE] || [10×WeParams] || [public_inputs...]`.
 #[cfg(feature = "we_gate")]
-pub(crate) fn arm_lfplus_we_gate_tiny_ringlwe_streaming<R>(
+pub(crate) fn arm_lfplus_ringlwe_lock<R>(
     shape: we_gate_arith::WeDr1csShape<F257>,
     params: &WeParams,
     public_inputs: &[F257],
@@ -926,8 +920,9 @@ pub(crate) fn arm_lfplus_we_gate_tiny_ringlwe_streaming<R>(
     block_id: usize,
     rep_id: u64,
     ringlwe_params: RingLweParams,
+    payload: &[u8],
     rng: &mut impl rand::RngCore,
-) -> Result<WeRingLweStreamingContext<F257>, String>
+) -> Result<RingLweLockArtifact<F257>, String>
 where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + ark_ff::Field + ark_ff::PrimeField,
@@ -935,13 +930,13 @@ where
     let x = crate::we_statement::encode_public_x::<F257>(params, public_inputs);
     if x.len() != shape.public_len {
         return Err(format!(
-            "arm_lfplus_we_gate_tiny_ringlwe_streaming: public_len mismatch (shape={} vs x={})",
+            "arm_lfplus_ringlwe_lock: public_len mismatch (shape={} vs x={})",
             shape.public_len,
             x.len()
         ));
     }
 
-    arm_we_ringlwe_from_dr1cs_streaming::<F257>(
+    arm_we_ringlwe_lock_from_dr1cs::<F257>(
         shape.inst,
         shape.public_len,
         stmt_digest,
@@ -951,6 +946,7 @@ where
         block_id,
         rep_id,
         ringlwe_params,
+        payload,
         rng,
     )
 }
