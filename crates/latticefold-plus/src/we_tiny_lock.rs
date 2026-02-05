@@ -401,6 +401,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         } else {
             None
         };
+        let lut = coeff_lut.as_deref();
 
         // Parallelize across blocks, but preserve in-order streaming output.
         //
@@ -428,7 +429,9 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
             let b1 = (b0 + window).min(blocks);
             let out: Vec<Vec<F>> = (b0..b1)
                 .into_par_iter()
-                .map(|b| -> Result<Vec<F>, String> {
+                .map_init(
+                    || (vec![F::ZERO; k], vec![F::ZERO; k]),
+                    |(y_a, y_b), b| -> Result<Vec<F>, String> {
                     // If this block is past the end, it is all-zero (keeps proof length consistent).
                     let row_start = (b as u64).saturating_mul(k as u64);
                     if row_start >= nconstraints {
@@ -437,8 +440,8 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                     let (mut rows, mut a_coeffs, mut a_idx, mut b_coeffs, mut b_idx) =
                         self.open_readers_ab_at_row(row_start)?;
 
-                    let mut y_a = vec![F::ZERO; k];
-                    let mut y_b = vec![F::ZERO; k];
+                    y_a.fill(F::ZERO);
+                    y_b.fill(F::ZERO);
                     for i in 0..k {
                         let row = row_start.saturating_add(i as u64);
                         if row >= nconstraints {
@@ -475,7 +478,6 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                             }
                             (F::from((aval_u % P) as u64), F::from((bval_u % P) as u64))
                         } else {
-                            let lut = coeff_lut.as_deref();
                             let mut aval = F::ZERO;
                             for _ in 0..a_len {
                                 let cu16 = read_u16(&mut a_coeffs)? as usize;
@@ -506,8 +508,8 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                         y_b[i] = bval;
                     }
 
-                    let ea = self.code.eval_e_at_positions(witness_pos, &y_a)?;
-                    let eb = self.code.eval_e_at_positions(witness_pos, &y_b)?;
+                    let ea = self.code.eval_e_at_positions(witness_pos, y_a.as_slice())?;
+                    let eb = self.code.eval_e_at_positions(witness_pos, y_b.as_slice())?;
                     if ea.len() != k_star || eb.len() != k_star {
                         return Err("stream_w_eval_blocks: bad eval length".to_string());
                     }
@@ -523,7 +525,8 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                         }
                     }
                     Ok(w_eval)
-                })
+                },
+                )
                 .collect::<Result<Vec<_>, _>>()?;
 
             for (i, w_eval) in out.iter().enumerate() {
