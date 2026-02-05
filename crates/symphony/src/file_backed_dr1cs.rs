@@ -30,8 +30,7 @@ pub fn cfg_read_buf_bytes() -> usize {
     let mb: usize = std::env::var("LFP_FILE_BACKED_READ_BUF_MB")
         .ok()
         .and_then(|s| s.parse().ok())
-        // Default: large sequential-read buffers on big machines.
-        .unwrap_or(128);
+        .unwrap_or(8);
     mb.saturating_mul(1024 * 1024).max(8 * 1024 * 1024)
 }
 
