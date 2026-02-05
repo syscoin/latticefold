@@ -6955,7 +6955,7 @@ mod tests {
         let mut rep1 = rep0 + 1;
         let lock1 = loop {
             match arm_lfplus_ringlwe_lock::<R>(
-                shape1,
+                shape1.clone(),
                 &params,
                 &public_inputs_bytes_f257,
                 stmt_digest,
