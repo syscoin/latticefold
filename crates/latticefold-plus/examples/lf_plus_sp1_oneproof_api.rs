@@ -52,6 +52,7 @@ fn init_rayon_stack() {}
 
 fn main() {
     init_rayon_stack();
+    let t_total = std::time::Instant::now();
     let r1lf_path = std::env::var("SP1_R1LF").expect("Set SP1_R1LF=/path/to/shrink.r1lf");
     let witness_path =
         std::env::var("SP1_WITNESS").expect("Set SP1_WITNESS=/path/to/shrink_verifier.witness.bundle");
@@ -64,5 +65,6 @@ fn main() {
 
     println!("stmt_digest=0x{}", hex32(out.stmt_digest));
     println!("lock_coin_seed=0x{}", hex32(out.lock_coin_seed));
+    eprintln!("[oneproof] total_elapsed={:?}", t_total.elapsed());
 }
 

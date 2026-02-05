@@ -141,6 +141,33 @@ pub trait MulCode<F: PrimeField> {
         }
     }
 
+    /// Evaluate `E(y)[positions[j]]` into caller-provided storage (no allocation).
+    ///
+    /// Streaming provers should prefer this API and reuse `out` across blocks to
+    /// avoid heap churn.
+    ///
+    /// Default implementation is correct but may allocate internally via
+    /// `eval_e_at_positions` and then copy.
+    fn eval_e_at_positions_into(
+        &self,
+        positions: &[usize],
+        y: &[F],
+        out: &mut [F],
+    ) -> Result<(), String>
+    where
+        Self: Sync,
+    {
+        if out.len() != positions.len() {
+            return Err("eval_e_at_positions_into: out len != positions len".to_string());
+        }
+        let tmp = self.eval_e_at_positions(positions, y)?;
+        if tmp.len() != out.len() {
+            return Err("eval_e_at_positions_into: bad eval length".to_string());
+        }
+        out.copy_from_slice(&tmp);
+        Ok(())
+    }
+
     /// Stream coefficients for E(·)[idx] without allocating a full vector.
     fn row_e_stream(&self, idx: usize, f: &mut dyn FnMut(usize, F)) -> Result<(), String> {
         let row = self.row_e(idx)?;
@@ -182,6 +209,47 @@ pub struct TensorRsMulCode<F: PrimeField> {
     ws_star: Vec<F>,
     lam_k_u16: Vec<u16>,
     lam_star_u16: Vec<u16>,
+}
+
+#[derive(Default)]
+struct TensorRsF257Rank3Scratch {
+    y_u16: Vec<u16>,
+    t0: Vec<u16>,
+    t1: Vec<u16>,
+    out_grid: Vec<u16>,
+}
+
+thread_local! {
+    static TENSOR_RS_F257_R3_SCRATCH: std::cell::RefCell<TensorRsF257Rank3Scratch> =
+        std::cell::RefCell::new(TensorRsF257Rank3Scratch::default());
+}
+
+#[inline]
+fn reduce_mod257_u32(x: u32) -> u16 {
+    // Fast reduction mod 257 using 256 ≡ -1 (mod 257).
+    //
+    // For x < 2^32, write x = b0 + 256 b1 + 256^2 b2 + 256^3 b3, with 0<=bi<=255.
+    // Then x ≡ b0 - b1 + b2 - b3 (mod 257).
+    let b0 = (x & 0xFF) as i32;
+    let b1 = ((x >> 8) & 0xFF) as i32;
+    let b2 = ((x >> 16) & 0xFF) as i32;
+    let b3 = ((x >> 24) & 0xFF) as i32;
+    let mut r = b0 - b1 + b2 - b3;
+    // r is in [-510, 510], so at most two adjustments are needed.
+    if r < 0 {
+        r += 257;
+        if r < 0 {
+            r += 257;
+        }
+    }
+    if r >= 257 {
+        r -= 257;
+        if r >= 257 {
+            r -= 257;
+        }
+    }
+    debug_assert!((0..257).contains(&r));
+    r as u16
 }
 
 impl<F: PrimeField> TensorRsMulCode<F> {
@@ -465,127 +533,12 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
         Self: Sync,
     {
         if Self::is_f257() && self.rank == 3 {
-            // This fast path assumes the canonical Layout A evaluation order, i.e.
-            // `positions == witness_positions_star()`. We keep the API generic for callers,
-            // but we defensively check the invariant in debug builds to avoid silent misuse.
-            #[cfg(debug_assertions)]
-            {
-                if let Ok(expected) = self.witness_positions_star() {
-                    debug_assert_eq!(
-                        positions,
-                        expected.as_slice(),
-                        "TensorRsMulCode::eval_e_at_positions (F257 rank=3) requires positions == witness_positions_star()"
-                    );
-                }
-            }
-
-            let base_k = self.base_k;
-            let side = 2 * base_k - 1;
-            if side > self.base_n {
-                return Err("eval_e_at_positions: side out of range".to_string());
-            }
-            let k = self.dim_k();
-            if y.len() != k {
-                return Err("eval_e_at_positions: bad y length".to_string());
-            }
             let k_star = self.dim_k_star();
             if positions.len() != k_star {
                 return Err("eval_e_at_positions: bad positions length".to_string());
             }
-
-            // Convert once (this is on the prover hot path).
-            let y_u16 = y.iter().copied().map(f_to_u16).collect::<Vec<_>>();
-
-            // Tensor layout conventions:
-            // - Message y is indexed as flat = i0 + i1*base_k + i2*base_k^2 (dim0 least-significant).
-            // - We evaluate E(y) on the side^3 grid of coordinates (c0,c1,c2) with 0<=c*<side.
-            // - Output grid is indexed as g = c0 + c1*side + c2*side^2 (same digit order).
-            let stride_y1 = base_k;
-            let stride_y2 = base_k * base_k;
-            let stride_g1 = side;
-            let stride_g2 = side * side;
-
-            // Pass 1: interpolate along dim0.
-            let mut t0 = vec![0u16; side * base_k * base_k];
-            for i2 in 0..base_k {
-                for i1 in 0..base_k {
-                    let base_y = i1 * stride_y1 + i2 * stride_y2;
-                    let out_base = stride_g1 * (i1 + base_k * i2);
-                    for c0 in 0..side {
-                        let lam0 = &self.lam_k_u16[c0 * base_k..(c0 + 1) * base_k];
-                        let mut acc = 0u16;
-                        for i0 in 0..base_k {
-                            acc = add_mod(acc, mul_mod(lam0[i0], y_u16[base_y + i0]));
-                        }
-                        t0[out_base + c0] = acc;
-                    }
-                }
-            }
-
-            // Pass 2: interpolate along dim1.
-            let mut t1 = vec![0u16; side * side * base_k];
-            for i2 in 0..base_k {
-                for c0 in 0..side {
-                    let out_base = stride_g1 * (c0 + side * i2);
-                    for c1 in 0..side {
-                        let lam1 = &self.lam_k_u16[c1 * base_k..(c1 + 1) * base_k];
-                        let mut acc = 0u16;
-                        for i1 in 0..base_k {
-                            let v = t0[c0 + side * (i1 + base_k * i2)];
-                            acc = add_mod(acc, mul_mod(lam1[i1], v));
-                        }
-                        t1[out_base + c1] = acc;
-                    }
-                }
-            }
-
-            // Pass 3: interpolate along dim2.
-            let mut out_grid = vec![0u16; side * side * side];
-            for c2 in 0..side {
-                let lam2 = &self.lam_k_u16[c2 * base_k..(c2 + 1) * base_k];
-                for c1 in 0..side {
-                    for c0 in 0..side {
-                        let mut acc = 0u16;
-                        for i2 in 0..base_k {
-                            let v = t1[c1 + side * (c0 + side * i2)];
-                            acc = add_mod(acc, mul_mod(lam2[i2], v));
-                        }
-                        out_grid[c0 + c1 * stride_g1 + c2 * stride_g2] = acc;
-                    }
-                }
-            }
-
-            // Emit in the exact order of `witness_positions_star()` (Layout A).
-            // NOTE: callers in this crate always pass `positions = witness_positions_star()`.
-            let mut out = Vec::with_capacity(k_star);
-
-            // Low cube.
-            for i2 in 0..base_k {
-                for i1 in 0..base_k {
-                    for i0 in 0..base_k {
-                        let g = i0 + i1 * stride_g1 + i2 * stride_g2;
-                        out.push(F::from(out_grid[g] as u64));
-                    }
-                }
-            }
-            if out.len() != k {
-                return Err("eval_e_at_positions: low cube length mismatch".to_string());
-            }
-            // Rest of side-cube, skipping low cube points.
-            for c2 in 0..side {
-                for c1 in 0..side {
-                    for c0 in 0..side {
-                        if c0 < base_k && c1 < base_k && c2 < base_k {
-                            continue;
-                        }
-                        let g = c0 + c1 * stride_g1 + c2 * stride_g2;
-                        out.push(F::from(out_grid[g] as u64));
-                    }
-                }
-            }
-            if out.len() != k_star {
-                return Err("eval_e_at_positions: total length mismatch".to_string());
-            }
+            let mut out = vec![F::ZERO; k_star];
+            self.eval_e_at_positions_into(positions, y, &mut out)?;
             return Ok(out);
         }
 
@@ -616,6 +569,164 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
                 out.push(acc);
             }
             Ok(out)
+        }
+    }
+
+    fn eval_e_at_positions_into(
+        &self,
+        positions: &[usize],
+        y: &[F],
+        out: &mut [F],
+    ) -> Result<(), String>
+    where
+        Self: Sync,
+    {
+        if Self::is_f257() && self.rank == 3 {
+            // This fast path assumes the canonical Layout A evaluation order, i.e.
+            // `positions == witness_positions_star()`.
+            #[cfg(debug_assertions)]
+            {
+                if let Ok(expected) = self.witness_positions_star() {
+                    debug_assert_eq!(
+                        positions,
+                        expected.as_slice(),
+                        "TensorRsMulCode::eval_e_at_positions_into (F257 rank=3) requires positions == witness_positions_star()"
+                    );
+                }
+            }
+
+            let base_k = self.base_k;
+            let side = 2 * base_k - 1;
+            if side > self.base_n {
+                return Err("eval_e_at_positions_into: side out of range".to_string());
+            }
+            let k = self.dim_k();
+            if y.len() != k {
+                return Err("eval_e_at_positions_into: bad y length".to_string());
+            }
+            let k_star = self.dim_k_star();
+            if positions.len() != k_star || out.len() != k_star {
+                return Err("eval_e_at_positions_into: bad positions/out length".to_string());
+            }
+
+            // Tensor layout conventions:
+            // - Message y is indexed as flat = i0 + i1*base_k + i2*base_k^2 (dim0 least-significant).
+            // - We evaluate E(y) on the side^3 grid of coordinates (c0,c1,c2) with 0<=c*<side.
+            // - Output grid is indexed as g = c0 + c1*side + c2*side^2 (same digit order).
+            let stride_y1 = base_k;
+            let stride_y2 = base_k * base_k;
+            let stride_g1 = side;
+            let stride_g2 = side * side;
+
+            TENSOR_RS_F257_R3_SCRATCH.with(|cell| {
+                let mut s = cell.borrow_mut();
+
+                if s.y_u16.len() != k {
+                    s.y_u16.resize(k, 0u16);
+                }
+                for (i, yi) in y.iter().copied().enumerate() {
+                    s.y_u16[i] = f_to_u16(yi);
+                }
+
+                let t0_len = side * base_k * base_k;
+                if s.t0.len() != t0_len {
+                    s.t0.resize(t0_len, 0u16);
+                }
+                // Pass 1: interpolate along dim0.
+                for i2 in 0..base_k {
+                    for i1 in 0..base_k {
+                        let base_y = i1 * stride_y1 + i2 * stride_y2;
+                        let out_base = stride_g1 * (i1 + base_k * i2);
+                        for c0 in 0..side {
+                            let lam0 = &self.lam_k_u16[c0 * base_k..(c0 + 1) * base_k];
+                            let mut acc: u32 = 0;
+                            for i0 in 0..base_k {
+                                acc += (lam0[i0] as u32) * (s.y_u16[base_y + i0] as u32);
+                            }
+                            s.t0[out_base + c0] = reduce_mod257_u32(acc);
+                        }
+                    }
+                }
+
+                let t1_len = side * side * base_k;
+                if s.t1.len() != t1_len {
+                    s.t1.resize(t1_len, 0u16);
+                }
+                // Pass 2: interpolate along dim1.
+                for i2 in 0..base_k {
+                    for c0 in 0..side {
+                        let out_base = stride_g1 * (c0 + side * i2);
+                        for c1 in 0..side {
+                            let lam1 = &self.lam_k_u16[c1 * base_k..(c1 + 1) * base_k];
+                            let mut acc: u32 = 0;
+                            for i1 in 0..base_k {
+                                let v = s.t0[c0 + side * (i1 + base_k * i2)];
+                                acc += (lam1[i1] as u32) * (v as u32);
+                            }
+                            s.t1[out_base + c1] = reduce_mod257_u32(acc);
+                        }
+                    }
+                }
+
+                let grid_len = side * side * side;
+                if s.out_grid.len() != grid_len {
+                    s.out_grid.resize(grid_len, 0u16);
+                }
+                // Pass 3: interpolate along dim2.
+                for c2 in 0..side {
+                    let lam2 = &self.lam_k_u16[c2 * base_k..(c2 + 1) * base_k];
+                    for c1 in 0..side {
+                        for c0 in 0..side {
+                            let mut acc: u32 = 0;
+                            for i2 in 0..base_k {
+                                let v = s.t1[c1 + side * (c0 + side * i2)];
+                                acc += (lam2[i2] as u32) * (v as u32);
+                            }
+                            s.out_grid[c0 + c1 * stride_g1 + c2 * stride_g2] = reduce_mod257_u32(acc);
+                        }
+                    }
+                }
+
+                // Emit in the exact order of `witness_positions_star()` (Layout A).
+                let mut w = 0usize;
+                // Low cube.
+                for i2 in 0..base_k {
+                    for i1 in 0..base_k {
+                        for i0 in 0..base_k {
+                            let g = i0 + i1 * stride_g1 + i2 * stride_g2;
+                            out[w] = F::from(s.out_grid[g] as u64);
+                            w += 1;
+                        }
+                    }
+                }
+                if w != k {
+                    return Err("eval_e_at_positions_into: low cube length mismatch".to_string());
+                }
+                // Rest of side-cube, skipping low cube points.
+                for c2 in 0..side {
+                    for c1 in 0..side {
+                        for c0 in 0..side {
+                            if c0 < base_k && c1 < base_k && c2 < base_k {
+                                continue;
+                            }
+                            let g = c0 + c1 * stride_g1 + c2 * stride_g2;
+                            out[w] = F::from(s.out_grid[g] as u64);
+                            w += 1;
+                        }
+                    }
+                }
+                if w != k_star {
+                    return Err("eval_e_at_positions_into: total length mismatch".to_string());
+                }
+                Ok(())
+            })
+        } else {
+            let tmp = <Self as MulCode<F>>::eval_e_at_positions(self, positions, y)?;
+            if tmp.len() != out.len() {
+                return Err("eval_e_at_positions_into: bad eval length".to_string());
+            }
+            out.copy_from_slice(&tmp);
+            Ok(())
         }
     }
 

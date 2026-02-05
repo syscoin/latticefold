@@ -19,9 +19,14 @@ use stark_rings_linalg::SparseMatrix;
 
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::time::Instant;
+
+use rand::{rngs::StdRng, SeedableRng};
 
 use crate::lin::LinearizedVerify;
-use crate::we_statement::{we_statement_hash_lf_plus, LFP_WE_GATE_DIGEST_V1};
+use crate::lockable_ringlwe::RingLweParams;
+use crate::utils::maybe_print_rss;
+use crate::we_statement::{encode_public_x, we_statement_hash_lf_plus, LFP_WE_GATE_DIGEST_V1};
 
 /// Structured output for downstream wiring (no stdout parsing).
 #[derive(Clone, Debug)]
@@ -304,8 +309,87 @@ pub fn run_sp1_oneproof_we_gate_from_files(
             .map_err(|e| format!("we gate armed instance not satisfied: {e}"))?;
     }
 
-    // Extract the WE gate witness tail (excluding public) and convert to u64 (canonical).
+    // -------------------------------------------------------------------------
+    // Ring-LWE streaming decapsulation (Theorem 4.3 canonical path)
+    // -------------------------------------------------------------------------
     let public_len = shape.public_len;
+    let x = encode_public_x::<F257>(&we_params, &public_inputs_f257);
+    if x.len() != public_len {
+        return Err(format!(
+            "oneproof: bad public x length (x_len={} public_len={})",
+            x.len(),
+            public_len
+        ));
+    }
+    if assignment.len() < public_len {
+        return Err("oneproof: assignment shorter than public_len".to_string());
+    }
+    let asg_pub = assignment
+        .get(0..public_len)
+        .ok_or_else(|| "oneproof: assignment shorter than public_len".to_string())?;
+    if asg_pub != x.as_slice() {
+        return Err("oneproof: satisfying assignment public prefix mismatch".to_string());
+    }
+    let z_w = &assignment[public_len..];
+
+    let lock_j = 0u64;
+    let block_id = 0usize;
+    let rep_id = 0u64;
+    let ringlwe_params = RingLweParams::default();
+    // Deterministic RNG seed derived from the statement-binding lock coin seed.
+    let mut rng = StdRng::from_seed(lock_coin_seed);
+
+    let t_arm = Instant::now();
+    let ctx = crate::we_tiny_lock::arm_lfplus_we_gate_tiny_ringlwe_streaming::<R>(
+        shape.clone(),
+        &we_params,
+        &public_inputs_f257,
+        stmt_digest,
+        ARMER_SEED,
+        lock_j,
+        block_id,
+        rep_id,
+        ringlwe_params,
+        &mut rng,
+    )?;
+    eprintln!(
+        "[oneproof] armed ringlwe in {:?}: proof_len={}",
+        t_arm.elapsed(),
+        ctx.proof_len()
+    );
+
+    let t_prove = Instant::now();
+    maybe_print_rss("oneproof:before_prove_decap_stream");
+    let mut st = ctx.lock.decap_state(&x)?;
+    let mut err: Option<String> = None;
+    let tails = ctx.stream_pi0_and_collect_tails(
+        &x,
+        z_w,
+        std::slice::from_ref(&ctx.lock.coins),
+        &mut |chunk| {
+            if err.is_some() {
+                return;
+            }
+            if let Err(e) = st.absorb_chunk(chunk) {
+                err = Some(e);
+            }
+        },
+    )?;
+    if let Some(e) = err {
+        return Err(format!("oneproof: stream decap absorb failed: {e}"));
+    }
+    if tails.len() != 1 {
+        return Err(format!("oneproof: expected 1 tail, got {}", tails.len()));
+    }
+    st.absorb_chunk(&tails[0])?;
+    let a = st.finish()?;
+    maybe_print_rss("oneproof:after_prove_decap_stream");
+    eprintln!("[oneproof] prove+decap(stream) in {:?}", t_prove.elapsed());
+    // F257 is tiny; print the canonical representative.
+    let a_u64 = a.into_bigint().as_ref().get(0).copied().unwrap_or(0);
+    eprintln!("[oneproof] decap_answer={a_u64}");
+
+    // Extract the WE gate witness tail (excluding public) and convert to u64 (canonical).
     let tail = &assignment[public_len..];
     let mut dr1cs_assignment_tail_u64: Vec<u64> = Vec::with_capacity(tail.len());
     for x in tail {

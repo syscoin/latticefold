@@ -6498,6 +6498,241 @@ mod tests {
         crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir_shape);
     }
 
+    #[test]
+    #[ignore = "very slow in debug: production-like tiny-gate params; run with `--release`"]
+    fn test_tiny_gate_ringlwe_lock_roundtrip_large_trace_params() {
+        use crate::lockable_ringlwe::RingLweParams;
+        use crate::we_statement::encode_public_x;
+        use crate::we_tiny_lock::arm_lfplus_we_gate_tiny_ringlwe_streaming;
+        use crate::utils::maybe_print_rss;
+        use rand::{rngs::StdRng, SeedableRng};
+        use std::time::Instant;
+
+        // "Large trace params" defaults (more production-like), but allow overriding down for
+        // scaling studies:
+        //   LFP_TINY_GATE_NVARS=12 LFP_TINY_GATE_K=1 LFP_TINY_GATE_KAPPA=1
+        //
+        // Interpreting your shorthand:
+        // - "npow20" ~ nvars=20 (sumcheck rounds / transcript schedule depth)
+        // - "k8"     ~ k=8      (rgchk/setchk block count)
+        let nvars_min: u64 = std::env::var("LFP_TINY_GATE_NVARS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20)
+            .max(12);
+        let k_rg: u64 = std::env::var("LFP_TINY_GATE_K")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8)
+            .max(1);
+        let kappa: u64 = std::env::var("LFP_TINY_GATE_KAPPA")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8)
+            .max(1);
+        assert!(
+            (kappa as usize).is_power_of_two(),
+            "tiny gate requires kappa power-of-two; set LFP_TINY_GATE_KAPPA=1/2/4/8/..."
+        );
+
+        let ring_dim = <R as PolyRing>::dimension() as u64;
+        let params = WeParams {
+            nvars_setchk: nvars_min,
+            degree_setchk: 3,
+            nvars_cm: nvars_min,
+            degree_cm: 2,
+            kappa,
+            ring_dim_d: ring_dim,
+            decomp_b: 16,
+            k: k_rg,
+            l: 1,
+            mlen: 0,
+        };
+        let public_inputs_len = 8usize; // number of public **field elements**
+        let n_lin_proofs = 1usize; // schedule builder currently assumes L=1
+        let mlen_mats = 0usize;
+        let pairs: Vec<(usize, usize)> = vec![(0, 0)];
+        type BF0 = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
+
+        // Public inputs as base-field elements (used for schedule trace generation).
+        let mut public_inputs_bf: Vec<BF0> = (0..public_inputs_len)
+            .map(|i| if (i % 3) == 0 { BF0::ONE } else { BF0::ZERO })
+            .collect();
+        // Dummy proof uses cm_f[*] = 0, so ensure the exposed prefix absorbed into the transcript
+        // matches that zero prefix (for as many coordinates as we expose).
+        let kappa_exposed = (kappa as usize).min(public_inputs_len);
+        for i in 0..kappa_exposed {
+            public_inputs_bf[i] = BF0::ZERO;
+        }
+
+        let public_inputs_bytes_f257: Vec<F257> = public_inputs_bf
+            .iter()
+            .flat_map(|x| {
+                let bytes = latticefold::transcript::bytes::prime_field_to_bytes_le_fixed::<BF0>(x);
+                bytes.into_iter().map(|b| F257::from(b as u64))
+            })
+            .collect();
+
+        eprintln!(
+            "[tiny_gate_large] params: nvars={} kappa={} k={} ring_dim={}",
+            nvars_min, kappa, k_rg, ring_dim
+        );
+
+        let trace = super::poseidon_trace_schedule_for_plus_with_public_inputs::<R>(
+            &public_inputs_bf,
+            &params,
+            n_lin_proofs,
+            mlen_mats,
+        )
+        .expect("poseidon_trace_schedule_for_plus_with_public_inputs");
+
+        // Armer builds the shape.
+        let t_shape = Instant::now();
+        let out_dir_shape = {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "lfplus_test_tiny_shape_roundtrip_shape_nvars{nvars_min}_kappa{kappa}_k{k_rg}"
+            ));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_shape");
+            p
+        };
+        let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
+            &trace,
+            &params,
+            &public_inputs_bf,
+            n_lin_proofs,
+            mlen_mats,
+            &pairs,
+            &out_dir_shape,
+        )
+        .expect("build_we_dr1cs_for_plus_proof_shape_tiny");
+
+        // Prover builds a satisfying assignment for *that same shape* from the recorded trace.
+        let out_dir_witness = {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "lfplus_test_tiny_shape_roundtrip_witness_nvars{nvars_min}_kappa{kappa}_k{k_rg}"
+            ));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_witness");
+            p
+        };
+        let proof =
+            dummy_plus_proof_shape::<R>(&params, mlen_mats, n_lin_proofs).expect("dummy_plus_proof_shape");
+        let (_shape2, asg) = build_we_plus_tiny_dr1cs::<R>(
+            &trace,
+            &params,
+            &public_inputs_bytes_f257,
+            &proof,
+            mlen_mats,
+            &pairs,
+            &out_dir_witness,
+        )
+        .expect("build_we_plus_tiny_dr1cs");
+        crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir_witness);
+        assert_eq!(asg.len(), shape.inst.nvars);
+        shape.inst.check(&asg).expect("shape should be satisfied by witness assignment");
+        eprintln!(
+            "[tiny_gate_large] built shape in {:?}: public_len={} nvars={} constraints={}",
+            t_shape.elapsed(),
+            shape.public_len,
+            shape.inst.nvars,
+            shape.inst.layout.nconstraints
+        );
+
+        // Arm and then prove+decap using the satisfying assignment split into (x || z_w).
+        let stmt_digest = [3u8; 32];
+        let armer_seed = [7u8; 32];
+        let lock_j = 0u64;
+        let ringlwe_params = RingLweParams {
+            binomial_k: 0,
+            noise_bound: 0,
+            ..RingLweParams::default()
+        };
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let public_len = shape.public_len;
+        let shape1 = shape.clone();
+        let t_arm = Instant::now();
+        let ctx0 = arm_lfplus_we_gate_tiny_ringlwe_streaming::<R>(
+            shape,
+            &params,
+            &public_inputs_bytes_f257,
+            stmt_digest,
+            armer_seed,
+            lock_j,
+            0,
+            0,
+            ringlwe_params.clone(),
+            &mut rng,
+        )
+        .expect("arm_lfplus_we_gate_tiny_ringlwe_streaming");
+        let ctx1 = arm_lfplus_we_gate_tiny_ringlwe_streaming::<R>(
+            shape1,
+            &params,
+            &public_inputs_bytes_f257,
+            stmt_digest,
+            armer_seed,
+            lock_j,
+            0,
+            1,
+            ringlwe_params,
+            &mut rng,
+        )
+        .expect("arm_lfplus_we_gate_tiny_ringlwe_streaming ctx1");
+        eprintln!(
+            "[tiny_gate_large] armed in {:?}: proof_len={}",
+            t_arm.elapsed(),
+            ctx0.proof_len()
+        );
+
+        let x = encode_public_x::<F257>(&params, &public_inputs_bytes_f257);
+        assert_eq!(x.len(), public_len);
+        assert_eq!(&asg[..public_len], x.as_slice(), "satisfying assignment public prefix mismatch");
+        let z_w = asg[public_len..].to_vec();
+
+        let t_prove = Instant::now();
+        maybe_print_rss("tiny_gate_large:before_prove_decap_stream");
+        let mut st0 = ctx0.lock.decap_state(&x).expect("decap_state0");
+        let mut st1 = ctx1.lock.decap_state(&x).expect("decap_state1");
+        let mut err: Option<String> = None;
+        let tails = ctx0
+            .stream_pi0_and_collect_tails(
+                &x,
+                &z_w,
+                &[ctx0.lock.coins.clone(), ctx1.lock.coins.clone()],
+                &mut |chunk| {
+                    if err.is_some() {
+                        return;
+                    }
+                    if let Err(e) = st0.absorb_chunk(chunk) {
+                        err = Some(e);
+                        return;
+                    }
+                    if let Err(e) = st1.absorb_chunk(chunk) {
+                        err = Some(e);
+                    }
+                },
+            )
+            .expect("stream_pi0_and_collect_tails");
+        if let Some(e) = err {
+            panic!("stream decap absorb failed: {e}");
+        }
+        assert_eq!(tails.len(), 2);
+        st0.absorb_chunk(&tails[0]).expect("absorb tail0");
+        st1.absorb_chunk(&tails[1]).expect("absorb tail1");
+        let a0 = st0.finish().expect("decap_finish0");
+        let a1 = st1.finish().expect("decap_finish1");
+        assert!(a0 == F257::from(1u64) || a0 == F257::from(2u64));
+        assert!(a1 == F257::from(1u64) || a1 == F257::from(2u64));
+        maybe_print_rss("tiny_gate_large:after_prove_decap_stream");
+        eprintln!("[tiny_gate_large] prove+decap(stream) in {:?}", t_prove.elapsed());
+
+        // Now it is safe to reclaim disk space used by the shape files.
+        crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir_shape);
+    }
+
     #[derive(MontConfig)]
     #[modulus = "39402006196394479212279040100143613805079739270465446667948293404245721771496870329047266088258938001861606973112319"]
     #[generator = "2"]

@@ -361,7 +361,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         z_u16: Option<&[u16]>,
         on_block: &mut dyn FnMut(usize, &[F]),
     ) -> Result<(), String> {
-        use std::io::{Read as IoRead, Seek, SeekFrom};
+        use std::io::Read as IoRead;
 
         fn read_u32(r: &mut impl IoRead) -> Result<u32, String> {
             let mut buf = [0u8; 4];
@@ -403,6 +403,12 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         };
         let lut = coeff_lut.as_deref();
 
+        let do_prof_w_eval = std::env::var("LF_PROFILE_DPP_W_EVAL").ok().as_deref() == Some("1");
+        let open_ns = std::sync::atomic::AtomicU64::new(0);
+        let eval_ns = std::sync::atomic::AtomicU64::new(0);
+        let mul_ns = std::sync::atomic::AtomicU64::new(0);
+        let blocks_done = std::sync::atomic::AtomicU64::new(0);
+
         // Parallelize across blocks, but preserve in-order streaming output.
         //
         // We process bounded "windows" of blocks in parallel and then emit them sequentially
@@ -424,115 +430,166 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
             window = window.min(max_by_mem);
         }
 
+        // Always process *contiguous* block ranges per rayon task, reusing a single set of open
+        // readers + internal buffers. This significantly reduces `open+seek` overhead for
+        // large instances and avoids nested-parallel overheads in the inner loops.
+        let blocks_per_task: usize = std::env::var("LF_DPP_BLOCKS_PER_TASK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4)
+            .max(1);
+
         let mut b0 = 0usize;
         while b0 < blocks {
             let b1 = (b0 + window).min(blocks);
-            let out: Vec<Vec<F>> = (b0..b1)
+
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
+            let mut s = b0;
+            while s < b1 {
+                let e = (s + blocks_per_task).min(b1);
+                ranges.push((s, e));
+                s = e;
+            }
+
+            let out_chunks: Vec<Vec<F>> = ranges
                 .into_par_iter()
                 .map_init(
-                    || (vec![F::ZERO; k], vec![F::ZERO; k]),
-                    |(y_a, y_b), b| -> Result<Vec<F>, String> {
-                    // If this block is past the end, it is all-zero (keeps proof length consistent).
-                    let row_start = (b as u64).saturating_mul(k as u64);
-                    if row_start >= nconstraints {
-                        return Ok(vec![F::ZERO; k_star]);
-                    }
-                    let (mut rows, mut a_coeffs, mut a_idx, mut b_coeffs, mut b_idx) =
-                        self.open_readers_ab_at_row(row_start)?;
-
-                    y_a.fill(F::ZERO);
-                    y_b.fill(F::ZERO);
-                    for i in 0..k {
-                        let row = row_start.saturating_add(i as u64);
-                        if row >= nconstraints {
-                            break;
+                    || (vec![F::ZERO; k], vec![F::ZERO; k], vec![F::ZERO; k_star], vec![F::ZERO; k_star]),
+                    |(y_a, y_b, ea_buf, eb_buf), (bs, be)| -> Result<Vec<F>, String> {
+                        let n_blocks = be.saturating_sub(bs);
+                        let mut out = vec![F::ZERO; n_blocks.saturating_mul(k_star)];
+                        let row_start0 = (bs as u64).saturating_mul(k as u64);
+                        if row_start0 >= nconstraints {
+                            return Ok(out);
                         }
-                        let a_len = read_u32(&mut rows)? as usize;
-                        let b_len = read_u32(&mut rows)? as usize;
-                        let _c_len = read_u32(&mut rows)? as usize;
-
-                        let (aval, bval) = if f257_fast {
-                            // Work entirely mod 257 in integers.
-                            const P: u64 = 257;
-                            let mut aval_u: u64 = 0;
-                            for _ in 0..a_len {
-                                let cu16 = read_u16(&mut a_coeffs)? as u64;
-                                let idx = read_u32(&mut a_idx)? as usize;
-                                let v = if idx < self.l {
-                                    x_u16[idx] as u64
-                                } else {
-                                    z_u16[idx - self.l] as u64
-                                };
-                                aval_u = aval_u.wrapping_add(cu16.wrapping_mul(v));
-                            }
-                            let mut bval_u: u64 = 0;
-                            for _ in 0..b_len {
-                                let cu16 = read_u16(&mut b_coeffs)? as u64;
-                                let idx = read_u32(&mut b_idx)? as usize;
-                                let v = if idx < self.l {
-                                    x_u16[idx] as u64
-                                } else {
-                                    z_u16[idx - self.l] as u64
-                                };
-                                bval_u = bval_u.wrapping_add(cu16.wrapping_mul(v));
-                            }
-                            (F::from((aval_u % P) as u64), F::from((bval_u % P) as u64))
-                        } else {
-                            let mut aval = F::ZERO;
-                            for _ in 0..a_len {
-                                let cu16 = read_u16(&mut a_coeffs)? as usize;
-                                let idx = read_u32(&mut a_idx)? as usize;
-                                let v = if idx < self.l { x[idx] } else { z_w[idx - self.l] };
-                                let c = if let Some(lut) = lut {
-                                    lut[cu16]
-                                } else {
-                                    F::from(cu16 as u64)
-                                };
-                                aval += c * v;
-                            }
-                            let mut bval = F::ZERO;
-                            for _ in 0..b_len {
-                                let cu16 = read_u16(&mut b_coeffs)? as usize;
-                                let idx = read_u32(&mut b_idx)? as usize;
-                                let v = if idx < self.l { x[idx] } else { z_w[idx - self.l] };
-                                let c = if let Some(lut) = lut {
-                                    lut[cu16]
-                                } else {
-                                    F::from(cu16 as u64)
-                                };
-                                bval += c * v;
-                            }
-                            (aval, bval)
-                        };
-                        y_a[i] = aval;
-                        y_b[i] = bval;
-                    }
-
-                    let ea = self.code.eval_e_at_positions(witness_pos, y_a.as_slice())?;
-                    let eb = self.code.eval_e_at_positions(witness_pos, y_b.as_slice())?;
-                    if ea.len() != k_star || eb.len() != k_star {
-                        return Err("stream_w_eval_blocks: bad eval length".to_string());
-                    }
-                    let mut w_eval = vec![F::ZERO; k_star];
-                    if k_star >= 256 {
-                        w_eval
-                            .par_iter_mut()
-                            .enumerate()
-                            .for_each(|(j, out)| *out = ea[j] * eb[j]);
-                    } else {
-                        for j in 0..k_star {
-                            w_eval[j] = ea[j] * eb[j];
+                        let t_open = std::time::Instant::now();
+                        let (mut rows, mut a_coeffs, mut a_idx, mut b_coeffs, mut b_idx) =
+                            self.open_readers_ab_at_row(row_start0)?;
+                        if do_prof_w_eval {
+                            let dt = t_open.elapsed();
+                            open_ns.fetch_add(
+                                dt.as_nanos().min(u64::MAX as u128) as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                         }
-                    }
-                    Ok(w_eval)
-                },
+
+                        for (bi, b) in (bs..be).enumerate() {
+                            let row_start = (b as u64).saturating_mul(k as u64);
+                            if row_start >= nconstraints {
+                                break;
+                            }
+                            y_a.fill(F::ZERO);
+                            y_b.fill(F::ZERO);
+                            for i in 0..k {
+                                let row = row_start.saturating_add(i as u64);
+                                if row >= nconstraints {
+                                    break;
+                                }
+                                let a_len = read_u32(&mut rows)? as usize;
+                                let b_len = read_u32(&mut rows)? as usize;
+                                let _c_len = read_u32(&mut rows)? as usize;
+
+                                let (aval, bval) = if f257_fast {
+                                    const P: u64 = 257;
+                                    let mut aval_u: u64 = 0;
+                                    for _ in 0..a_len {
+                                        let cu16 = read_u16(&mut a_coeffs)? as u64;
+                                        let idx = read_u32(&mut a_idx)? as usize;
+                                        let v = if idx < self.l { x_u16[idx] as u64 } else { z_u16[idx - self.l] as u64 };
+                                        aval_u = aval_u.wrapping_add(cu16.wrapping_mul(v));
+                                    }
+                                    let mut bval_u: u64 = 0;
+                                    for _ in 0..b_len {
+                                        let cu16 = read_u16(&mut b_coeffs)? as u64;
+                                        let idx = read_u32(&mut b_idx)? as usize;
+                                        let v = if idx < self.l { x_u16[idx] as u64 } else { z_u16[idx - self.l] as u64 };
+                                        bval_u = bval_u.wrapping_add(cu16.wrapping_mul(v));
+                                    }
+                                    (F::from((aval_u % P) as u64), F::from((bval_u % P) as u64))
+                                } else {
+                                    let mut aval = F::ZERO;
+                                    for _ in 0..a_len {
+                                        let cu16 = read_u16(&mut a_coeffs)? as usize;
+                                        let idx = read_u32(&mut a_idx)? as usize;
+                                        let v = if idx < self.l { x[idx] } else { z_w[idx - self.l] };
+                                        let c = if let Some(lut) = lut { lut[cu16] } else { F::from(cu16 as u64) };
+                                        aval += c * v;
+                                    }
+                                    let mut bval = F::ZERO;
+                                    for _ in 0..b_len {
+                                        let cu16 = read_u16(&mut b_coeffs)? as usize;
+                                        let idx = read_u32(&mut b_idx)? as usize;
+                                        let v = if idx < self.l { x[idx] } else { z_w[idx - self.l] };
+                                        let c = if let Some(lut) = lut { lut[cu16] } else { F::from(cu16 as u64) };
+                                        bval += c * v;
+                                    }
+                                    (aval, bval)
+                                };
+                                y_a[i] = aval;
+                                y_b[i] = bval;
+                            }
+
+                            let t_eval = std::time::Instant::now();
+                            self.code
+                                .eval_e_at_positions_into(witness_pos, y_a.as_slice(), ea_buf.as_mut_slice())?;
+                            self.code
+                                .eval_e_at_positions_into(witness_pos, y_b.as_slice(), eb_buf.as_mut_slice())?;
+                            if do_prof_w_eval {
+                                let dt = t_eval.elapsed();
+                                eval_ns.fetch_add(
+                                    dt.as_nanos().min(u64::MAX as u128) as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                            let dst = &mut out[bi * k_star..(bi + 1) * k_star];
+                            let t_mul = std::time::Instant::now();
+                            // keep this multiply *sequential* to avoid nested Rayon overhead.
+                            for j in 0..k_star {
+                                dst[j] = ea_buf[j] * eb_buf[j];
+                            }
+                            if do_prof_w_eval {
+                                let dt = t_mul.elapsed();
+                                mul_ns.fetch_add(
+                                    dt.as_nanos().min(u64::MAX as u128) as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                blocks_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+
+                        Ok(out)
+                    },
                 )
                 .collect::<Result<Vec<_>, _>>()?;
 
-            for (i, w_eval) in out.iter().enumerate() {
-                on_block(b0 + i, w_eval.as_slice());
+            // Emit in-order.
+            let mut b_emit = b0;
+            for chunk in out_chunks.iter() {
+                for blk in 0..(chunk.len() / k_star) {
+                    let s0 = blk * k_star;
+                    let s1 = s0 + k_star;
+                    on_block(b_emit, &chunk[s0..s1]);
+                    b_emit += 1;
+                }
             }
             b0 = b1;
+        }
+
+        if do_prof_w_eval {
+            let b = blocks_done.load(std::sync::atomic::Ordering::Relaxed).max(1);
+            let open = open_ns.load(std::sync::atomic::Ordering::Relaxed);
+            let eval = eval_ns.load(std::sync::atomic::Ordering::Relaxed);
+            let mul = mul_ns.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "[LF_PROFILE] dpp w_eval totals: blocks={} open={:.3}s ({:.3}ms/block) eval={:.3}s ({:.3}ms/block) mul={:.3}s ({:.3}ms/block)",
+                b,
+                (open as f64) * 1e-9,
+                (open as f64) * 1e-6 / (b as f64),
+                (eval as f64) * 1e-9,
+                (eval as f64) * 1e-6 / (b as f64),
+                (mul as f64) * 1e-9,
+                (mul as f64) * 1e-6 / (b as f64),
+            );
         }
 
         Ok(())
