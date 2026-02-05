@@ -198,38 +198,124 @@ impl<F: PrimeField, C: MulCode<F> + Sync> FileBackedChunkedMulCodeDr1csNpFlpcpSp
 
         // Advance from row0 to row_start.
         //
-        // Use seeks for term pools: we only need to advance file cursors, not decode values.
+        // IMPORTANT: avoid per-row seeking (very expensive). We only need to advance file cursors,
+        // so we sum the term counts and do a single seek per file.
+        //
+        // The constraints row-lengths file is fixed-width, so we advance it by decoding u32 triplets.
+        // The term pools are contiguous, so total term-count deltas suffice.
+        let mut a_skip: u64 = 0;
+        let mut b_skip: u64 = 0;
+        let mut c_skip: u64 = 0;
         for _ in row0..row_start {
             let a_len = read_u32(&mut rows)? as u64;
             let b_len = read_u32(&mut rows)? as u64;
             let c_len = read_u32(&mut rows)? as u64;
-            if a_len != 0 {
-                a_coeffs
-                    .seek(SeekFrom::Current((a_len.saturating_mul(2)) as i64))
-                    .map_err(|e| e.to_string())?;
-                a_idx
-                    .seek(SeekFrom::Current((a_len.saturating_mul(4)) as i64))
-                    .map_err(|e| e.to_string())?;
-            }
-            if b_len != 0 {
-                b_coeffs
-                    .seek(SeekFrom::Current((b_len.saturating_mul(2)) as i64))
-                    .map_err(|e| e.to_string())?;
-                b_idx
-                    .seek(SeekFrom::Current((b_len.saturating_mul(4)) as i64))
-                    .map_err(|e| e.to_string())?;
-            }
-            if c_len != 0 {
-                c_coeffs
-                    .seek(SeekFrom::Current((c_len.saturating_mul(2)) as i64))
-                    .map_err(|e| e.to_string())?;
-                c_idx
-                    .seek(SeekFrom::Current((c_len.saturating_mul(4)) as i64))
-                    .map_err(|e| e.to_string())?;
-            }
+            a_skip = a_skip.saturating_add(a_len);
+            b_skip = b_skip.saturating_add(b_len);
+            c_skip = c_skip.saturating_add(c_len);
+        }
+        if a_skip != 0 {
+            a_coeffs
+                .seek(SeekFrom::Current((a_skip.saturating_mul(2)) as i64))
+                .map_err(|e| e.to_string())?;
+            a_idx
+                .seek(SeekFrom::Current((a_skip.saturating_mul(4)) as i64))
+                .map_err(|e| e.to_string())?;
+        }
+        if b_skip != 0 {
+            b_coeffs
+                .seek(SeekFrom::Current((b_skip.saturating_mul(2)) as i64))
+                .map_err(|e| e.to_string())?;
+            b_idx
+                .seek(SeekFrom::Current((b_skip.saturating_mul(4)) as i64))
+                .map_err(|e| e.to_string())?;
+        }
+        if c_skip != 0 {
+            c_coeffs
+                .seek(SeekFrom::Current((c_skip.saturating_mul(2)) as i64))
+                .map_err(|e| e.to_string())?;
+            c_idx
+                .seek(SeekFrom::Current((c_skip.saturating_mul(4)) as i64))
+                .map_err(|e| e.to_string())?;
         }
 
         Ok((rows, a_coeffs, a_idx, b_coeffs, b_idx, c_coeffs, c_idx))
+    }
+
+    fn open_readers_ab_at_row(
+        &self,
+        row_start: u64,
+    ) -> Result<
+        (
+            std::io::BufReader<std::fs::File>,
+            std::io::BufReader<std::fs::File>,
+            std::io::BufReader<std::fs::File>,
+            std::io::BufReader<std::fs::File>,
+            std::io::BufReader<std::fs::File>,
+        ),
+        String,
+    > {
+        use std::fs::File;
+        use std::io::{BufReader, Read as IoRead, Seek, SeekFrom};
+
+        const ROW_LENS_SIZE: u64 = 12;
+        fn read_u32(r: &mut impl IoRead) -> Result<u32, String> {
+            let mut buf = [0u8; 4];
+            r.read_exact(&mut buf).map_err(|e| e.to_string())?;
+            Ok(u32::from_le_bytes(buf))
+        }
+
+        let dir = &self.fb.layout.dir;
+        let (row0, a0, b0, _c0) = Self::ckpt_lookup(self.ckpts.as_slice(), row_start);
+
+        let mut fr = File::open(dir.join("constraints.bin")).map_err(|e| e.to_string())?;
+        fr.seek(SeekFrom::Start(row0.saturating_mul(ROW_LENS_SIZE)))
+            .map_err(|e| e.to_string())?;
+        let mut rows = BufReader::with_capacity(8 * 1024 * 1024, fr);
+
+        let mut fa_c = File::open(dir.join("a_coeffs.bin")).map_err(|e| e.to_string())?;
+        let mut fa_i = File::open(dir.join("a_idx.bin")).map_err(|e| e.to_string())?;
+        let mut fb_c = File::open(dir.join("b_coeffs.bin")).map_err(|e| e.to_string())?;
+        let mut fb_i = File::open(dir.join("b_idx.bin")).map_err(|e| e.to_string())?;
+
+        fa_c.seek(SeekFrom::Start(a0.saturating_mul(2))).map_err(|e| e.to_string())?;
+        fa_i.seek(SeekFrom::Start(a0.saturating_mul(4))).map_err(|e| e.to_string())?;
+        fb_c.seek(SeekFrom::Start(b0.saturating_mul(2))).map_err(|e| e.to_string())?;
+        fb_i.seek(SeekFrom::Start(b0.saturating_mul(4))).map_err(|e| e.to_string())?;
+
+        let mut a_coeffs = BufReader::with_capacity(8 * 1024 * 1024, fa_c);
+        let mut a_idx = BufReader::with_capacity(8 * 1024 * 1024, fa_i);
+        let mut b_coeffs = BufReader::with_capacity(8 * 1024 * 1024, fb_c);
+        let mut b_idx = BufReader::with_capacity(8 * 1024 * 1024, fb_i);
+
+        // Advance from row0 to row_start. Sum term counts and seek once per file.
+        let mut a_skip: u64 = 0;
+        let mut b_skip: u64 = 0;
+        for _ in row0..row_start {
+            let a_len = read_u32(&mut rows)? as u64;
+            let b_len = read_u32(&mut rows)? as u64;
+            let _c_len = read_u32(&mut rows)? as u64;
+            a_skip = a_skip.saturating_add(a_len);
+            b_skip = b_skip.saturating_add(b_len);
+        }
+        if a_skip != 0 {
+            a_coeffs
+                .seek(SeekFrom::Current((a_skip.saturating_mul(2)) as i64))
+                .map_err(|e| e.to_string())?;
+            a_idx
+                .seek(SeekFrom::Current((a_skip.saturating_mul(4)) as i64))
+                .map_err(|e| e.to_string())?;
+        }
+        if b_skip != 0 {
+            b_coeffs
+                .seek(SeekFrom::Current((b_skip.saturating_mul(2)) as i64))
+                .map_err(|e| e.to_string())?;
+            b_idx
+                .seek(SeekFrom::Current((b_skip.saturating_mul(4)) as i64))
+                .map_err(|e| e.to_string())?;
+        }
+
+        Ok((rows, a_coeffs, a_idx, b_coeffs, b_idx))
     }
 }
 
@@ -319,7 +405,21 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         // We process bounded "windows" of blocks in parallel and then emit them sequentially
         // to the callback to preserve proof element order (required by streaming decap).
         let threads = rayon::current_num_threads().max(1);
-        let window = (threads * 4).clamp(32, 512);
+        let mut window = (threads * 4).clamp(8, 512);
+        // Cap the in-flight window to avoid materializing too much `(window × k_star)` output.
+        // This is crucial when k_star is large (e.g. Tensor-RS rank=3).
+        let bytes_per_block = (k_star as u64).saturating_mul(std::mem::size_of::<F>() as u64);
+        let max_window_bytes: u64 = std::env::var("LF_DPP_WINDOW_MAX_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            // Default: allow a few GiB of in-flight w_eval blocks. On realistic params
+            // (k_star ~ 857k, F257 ~ 8 bytes) one block is ~6.8MiB, so 96 blocks is ~650MiB.
+            .unwrap_or(2048)
+            .saturating_mul(1024 * 1024);
+        if bytes_per_block != 0 {
+            let max_by_mem = (max_window_bytes / bytes_per_block).max(1) as usize;
+            window = window.min(max_by_mem);
+        }
 
         let mut b0 = 0usize;
         while b0 < blocks {
@@ -332,9 +432,8 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                     if row_start >= nconstraints {
                         return Ok(vec![F::ZERO; k_star]);
                     }
-
-                    let (mut rows, mut a_coeffs, mut a_idx, mut b_coeffs, mut b_idx, mut c_coeffs, mut c_idx) =
-                        self.open_readers_at_row(row_start)?;
+                    let (mut rows, mut a_coeffs, mut a_idx, mut b_coeffs, mut b_idx) =
+                        self.open_readers_ab_at_row(row_start)?;
 
                     let mut y_a = vec![F::ZERO; k];
                     let mut y_b = vec![F::ZERO; k];
@@ -345,7 +444,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                         }
                         let a_len = read_u32(&mut rows)? as usize;
                         let b_len = read_u32(&mut rows)? as usize;
-                        let c_len = read_u32(&mut rows)? as usize;
+                        let _c_len = read_u32(&mut rows)? as usize;
 
                         let (aval, bval) = if f257_fast {
                             // Work entirely mod 257 in integers.
@@ -401,16 +500,6 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                             }
                             (aval, bval)
                         };
-
-                        // Skip C term pools (not used for w_eval) to keep readers aligned.
-                        if c_len != 0 {
-                            c_coeffs
-                                .seek(SeekFrom::Current(((c_len as u64).saturating_mul(2)) as i64))
-                                .map_err(|e| e.to_string())?;
-                            c_idx
-                                .seek(SeekFrom::Current(((c_len as u64).saturating_mul(4)) as i64))
-                                .map_err(|e| e.to_string())?;
-                        }
                         y_a[i] = aval;
                         y_b[i] = bval;
                     }
