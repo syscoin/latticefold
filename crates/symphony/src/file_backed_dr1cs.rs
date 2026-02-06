@@ -25,6 +25,15 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 
 use crate::dpp_poseidon::SparseDr1csInstance;
 
+#[inline]
+pub fn cfg_read_buf_bytes() -> usize {
+    let mb: usize = std::env::var("LFP_FILE_BACKED_READ_BUF_MB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    mb.saturating_mul(1024 * 1024).max(8 * 1024 * 1024)
+}
+
 #[derive(Clone, Debug)]
 pub struct FileBackedLayout {
     pub dir: PathBuf,
@@ -648,7 +657,7 @@ impl<F: PrimeField + CanonicalSerialize> SparseDr1csFileWriter<F> {
             File::create(constraints_path(dir)).map_err(|e| format!("create constraints failed: {e}"))?,
         );
         let f_rows_ckpt = BufWriter::with_capacity(
-            cap.min(8 * 1024 * 1024),
+            cap.min(cfg_read_buf_bytes()),
             File::create(rows_ckpt_path(dir)).map_err(|e| format!("create rows_ckpt failed: {e}"))?,
         );
 
@@ -1239,7 +1248,7 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
             let p = rows_ckpt_path(&dir);
             match File::open(&p) {
                 Ok(f) => {
-                    let mut r = BufReader::with_capacity(8 * 1024 * 1024, f);
+                    let mut r = BufReader::with_capacity(cfg_read_buf_bytes(), f);
                     let mut out = Vec::new();
                     loop {
                         let row_idx = match read_u64(&mut r) {
@@ -1299,7 +1308,7 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                 let mut fr = File::open(constraints_path(&dir)).map_err(|e| format!("open constraints failed: {e}"))?;
             fr.seek(std::io::SeekFrom::Start(row0.saturating_mul(ROW_LENS_SIZE as u64)))
                     .map_err(|e| format!("seek constraints failed: {e}"))?;
-                let mut rows = BufReader::with_capacity(8 * 1024 * 1024, fr);
+                let mut rows = BufReader::with_capacity(cfg_read_buf_bytes(), fr);
 
             // Open term pools and seek to the checkpoint offsets.
             //
@@ -1336,12 +1345,13 @@ impl<F: PrimeField + CanonicalDeserialize + CanonicalSerialize> FileBackedSparse
                 .seek(std::io::SeekFrom::Start(c0.saturating_mul(4)))
                 .map_err(|e| format!("seek c_idx failed: {e}"))?;
 
-            let mut a_coeffs = BufReader::with_capacity(8 * 1024 * 1024, fa_c);
-            let mut a_idx = BufReader::with_capacity(8 * 1024 * 1024, fa_i);
-            let mut b_coeffs = BufReader::with_capacity(8 * 1024 * 1024, fb_c);
-            let mut b_idx = BufReader::with_capacity(8 * 1024 * 1024, fb_i);
-            let mut c_coeffs = BufReader::with_capacity(8 * 1024 * 1024, fc_c);
-            let mut c_idx = BufReader::with_capacity(8 * 1024 * 1024, fc_i);
+            let cap = cfg_read_buf_bytes();
+            let mut a_coeffs = BufReader::with_capacity(cap, fa_c);
+            let mut a_idx = BufReader::with_capacity(cap, fa_i);
+            let mut b_coeffs = BufReader::with_capacity(cap, fb_c);
+            let mut b_idx = BufReader::with_capacity(cap, fb_i);
+            let mut c_coeffs = BufReader::with_capacity(cap, fc_c);
+            let mut c_idx = BufReader::with_capacity(cap, fc_i);
 
             // Advance from row0 to c_start (skip evaluation) to compute starting offsets,
             // while also consuming the corresponding term bytes so the term readers stay aligned.
@@ -1947,7 +1957,7 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                     let base_b = b_off[pi];
                     let base_c = c_off[pi];
                     let mut r = BufReader::with_capacity(
-                        8 * 1024 * 1024,
+                        cfg_read_buf_bytes(),
                         File::open(rows_ckpt_path(&inst.layout.dir))
                             .map_err(|e| format!("open rows_ckpt failed: {e}"))?,
                     );
@@ -1969,7 +1979,7 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
                 }
                 merged_ckpts.sort_by_key(|x| x.0);
                 let mut ckpt_out = BufWriter::with_capacity(
-                    8 * 1024 * 1024,
+                    cfg_read_buf_bytes(),
                     File::create(rows_ckpt_path(&out_dir)).map_err(|e| format!("create rows_ckpt failed: {e}"))?,
                 );
                 for (row_i, a0, b0, c0) in merged_ckpts {

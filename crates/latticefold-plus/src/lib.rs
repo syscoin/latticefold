@@ -15,6 +15,7 @@ pub mod tensor_eval;
 pub mod transcript;
 pub mod utils;
 pub mod fs_cleanup;
+pub mod shamir_gf256;
 
 // SP1 lift vacuity/soundness regression tests (WE-gate only).
 #[cfg(all(test, feature = "we_gate"))]

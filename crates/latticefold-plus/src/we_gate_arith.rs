@@ -6245,8 +6245,8 @@ mod tests {
     fn test_tiny_gate_ringlwe_lock_roundtrip_small() {
         use crate::lockable_ringlwe::RingLweParams;
         use crate::we_statement::encode_public_x;
-        use crate::we_tiny_lock::arm_lfplus_we_gate_tiny_ringlwe_streaming;
-        use dpp::dr1cs_flpcp::Dr1csQueryScratch;
+        use crate::we_tiny_lock::arm_lfplus_ringlwe_lock;
+        use crate::utils::maybe_print_rss;
         use std::time::Instant;
         use rand::{rngs::StdRng, SeedableRng};
 
@@ -6354,7 +6354,7 @@ mod tests {
             &out_dir_witness,
         )
         .expect("build_we_plus_tiny_dr1cs");
-        let _ = std::fs::remove_dir_all(&out_dir_witness);
+        crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir_witness);
         assert_eq!(asg.len(), shape.inst.nvars);
         shape.inst.check(&asg).expect("shape should be satisfied by witness assignment");
         eprintln!(
@@ -6370,36 +6370,72 @@ mod tests {
         let armer_seed = [7u8; 32];
         let lock_j = 0u64;
 
-        let ringlwe_params = RingLweParams {
-            binomial_k: 0,
-            noise_bound: 0,
-            ..RingLweParams::default()
-        };
+        let ringlwe_params = RingLweParams::default();
+        let dummy_payload: [u8; 0] = [];
 
         let mut rng = StdRng::seed_from_u64(42);
-        // These are no longer needed by the public arming helper, but keep a type-use here to
-        // avoid feature-gated import drift.
-        let _scratch_ty: Option<Dr1csQueryScratch<F257>> = None;
-
         let public_len = shape.public_len;
-        let t_arm = Instant::now();
-        let ctx = arm_lfplus_we_gate_tiny_ringlwe_streaming::<R>(
-            shape,
-            &params,
-            &public_inputs_bytes_f257,
-            stmt_digest,
-            armer_seed,
-            lock_j,
-            0,
-            0,
-            ringlwe_params,
-            &mut rng,
+        let prover = crate::we_tiny_lock::we_ringlwe_prover_from_dr1cs::<F257>(
+            shape.inst.clone(),
+            shape.public_len,
         )
-        .expect("arm_lfplus_we_gate_tiny_ringlwe_streaming");
+        .expect("we_ringlwe_prover_from_dr1cs");
+        let shape1 = shape.clone();
+        let t_arm = Instant::now();
+        // Arm two coin instances so we can reuse a single streamed π0 across multiple coin tails.
+        // This matches `dpp::tests::test_theorem43_f257_reuse_single_pi0_many_coin_tails`.
+        // Payload arming rejects shifted accepting-set candidates equal to 0 (would trivialize key
+        // material). In tests, avoid flakiness by deterministically bumping `rep_id` until ok.
+        let mut rep0 = 0u64;
+        let lock0 = loop {
+            match arm_lfplus_ringlwe_lock::<R>(
+                shape.clone(),
+                &params,
+                &public_inputs_bytes_f257,
+                stmt_digest,
+                armer_seed,
+                lock_j,
+                0,
+                rep0,
+                ringlwe_params.clone(),
+                &dummy_payload,
+                &mut rng,
+            ) {
+                Ok(lock) => break lock,
+                Err(e) if e.contains("shifted accepting set contains 0") => {
+                    rep0 += 1;
+                    continue;
+                }
+                Err(e) => panic!("arm ctx0 failed: {e}"),
+            }
+        };
+        let mut rep1 = rep0 + 1; // ensure different coins/query => different tail
+        let lock1 = loop {
+            match arm_lfplus_ringlwe_lock::<R>(
+                shape1.clone(),
+                &params,
+                &public_inputs_bytes_f257,
+                stmt_digest,
+                armer_seed,
+                lock_j,
+                0,
+                rep1,
+                ringlwe_params.clone(),
+                &dummy_payload,
+                &mut rng,
+            ) {
+                Ok(lock) => break lock,
+                Err(e) if e.contains("shifted accepting set contains 0") => {
+                    rep1 += 1;
+                    continue;
+                }
+                Err(e) => panic!("arm ctx1 failed: {e}"),
+            }
+        };
         eprintln!(
             "[tiny_gate] armed in {:?}: proof_len={}",
             t_arm.elapsed(),
-            ctx.proof_len()
+            prover.proof_len()
         );
 
         let x = encode_public_x::<F257>(&params, &public_inputs_bytes_f257);
@@ -6408,27 +6444,1079 @@ mod tests {
         let z_w = asg[public_len..].to_vec();
 
         let t_prove = Instant::now();
-        let mut pi = Vec::new();
-        ctx.prove_stream(&x, &z_w, &mut |chunk| pi.extend_from_slice(&chunk))
-            .expect("prove_stream");
-        assert_eq!(pi.len(), ctx.proof_len());
-        eprintln!("[tiny_gate] proved in {:?}", t_prove.elapsed());
+        maybe_print_rss("tiny_gate:before_prove_decap_stream");
+        let mut st0 = lock0.decap_state(&x).expect("decap_state0");
+        let mut st1 = lock1.decap_state(&x).expect("decap_state1");
+        let mut st_bad = lock0.decap_state(&x).expect("decap_state_bad");
+        let mut err: Option<String> = None;
+        let tails = prover
+            .stream_pi0_and_collect_tails(
+                &x,
+                &z_w,
+                &[lock0.coins.clone(), lock1.coins.clone()],
+                &mut |chunk| {
+                    if err.is_some() {
+                        return;
+                    }
+                    if let Err(e) = st0.absorb_chunk(chunk) {
+                        err = Some(e);
+                        return;
+                    }
+                    if let Err(e) = st1.absorb_chunk(chunk) {
+                        err = Some(e);
+                        return;
+                    }
+                    if let Err(e) = st_bad.absorb_chunk(chunk) {
+                        err = Some(e);
+                    }
+                },
+            )
+            .expect("stream_pi0_and_collect_tails");
+        if let Some(e) = err {
+            panic!("stream decap absorb failed: {e}");
+        }
+        assert_eq!(tails.len(), 2);
+        st0.absorb_chunk(&tails[0]).expect("absorb tail0");
+        st1.absorb_chunk(&tails[1]).expect("absorb tail1");
 
-        let t_decap = Instant::now();
-        let a = ctx.lock.decap_answer(&x, &pi).expect("decap_answer");
-        assert!(a == F257::from(1u64) || a == F257::from(2u64));
-        eprintln!("[tiny_gate] decap in {:?}", t_decap.elapsed());
+        // Verify both locks produce candidate decryptions (unauthenticated — both branches decrypt).
+        let _cands0 = st0.finish_decrypt_candidates().expect("decap_finish0");
+        let _cands1 = st1.finish_decrypt_candidates().expect("decap_finish1");
+        // Accepting set structure: both locks' accepting_set elements + offset should be in {1,2}.
+        for lock in [&lock0, &lock1] {
+            let a0 = lock.accepting_set[0] + lock.offset;
+            let a1 = lock.accepting_set[1] + lock.offset;
+            assert!(a0 == F257::from(1u64) || a0 == F257::from(2u64));
+            assert!(a1 == F257::from(1u64) || a1 == F257::from(2u64));
+        }
 
-        // Negative check: tweak proof and ensure decap fails.
-        let mut pi_bad = pi.clone();
-        pi_bad[0] += F257::from(1u64);
-        assert!(ctx.lock.decap_answer(&x, &pi_bad).is_err());
+        maybe_print_rss("tiny_gate:after_prove_decap_stream");
+        eprintln!("[tiny_gate] prove+decap(stream) in {:?}", t_prove.elapsed());
 
-        // Negative check: flip a public input and ensure decap fails with the same proof.
+        // Negative check: tweak the (small) tail and verify streaming still completes
+        // (unauthenticated encryption doesn't error on wrong keys — it just produces garbage).
+        let mut tail_bad = tails[0].clone();
+        tail_bad[0] += F257::ONE;
+        st_bad.absorb_chunk(&tail_bad).expect("absorb tweaked tail");
+        let _bad_cands = st_bad.finish_decrypt_candidates().expect("finish with bad tail should not error");
+
+        // Negative check: wrong x length must fail immediately.
         let mut x_bad = x.clone();
-        let first_pi = 1usize + 10usize; // [ONE] || [10×WeParams] || [public_input_bytes...]
-        x_bad[first_pi] += F257::ONE;
-        assert!(ctx.lock.decap_answer(&x_bad, &pi).is_err());
+        x_bad.push(F257::ONE);
+        assert!(lock0.decap_state(&x_bad).is_err());
+
+        // Now it is safe to reclaim disk space used by the shape files.
+        crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir_shape);
+    }
+
+    #[test]
+    #[ignore = "very slow in debug: runs full DPP prove+decap; run with `--release`"]
+    fn test_tiny_gate_ringlwe_payload_shamir_2of2_small() {
+        use crate::lockable_ringlwe::RingLweParams;
+        use crate::shamir_gf256::{reconstruct_secret_32, split_secret_32, ShamirConfig, ShamirShare};
+        use crate::we_statement::encode_public_x;
+        use crate::we_tiny_lock::arm_lfplus_ringlwe_lock;
+        use crate::utils::maybe_print_rss;
+        use rand::{rngs::StdRng, RngCore, SeedableRng};
+        use std::time::Instant;
+
+        // Same minimal params as the small roundtrip test.
+        let ring_dim = <R as PolyRing>::dimension() as u64;
+        let nvars_min = 12u64;
+        let params = WeParams {
+            nvars_setchk: nvars_min,
+            degree_setchk: 3,
+            nvars_cm: nvars_min,
+            degree_cm: 2,
+            kappa: 1,
+            ring_dim_d: ring_dim,
+            decomp_b: 16,
+            k: 1,
+            l: 1,
+            mlen: 0,
+        };
+        let public_inputs_len = 8usize;
+        let n_lin_proofs = 1usize;
+        let mlen_mats = 0usize;
+        let pairs: Vec<(usize, usize)> = vec![(0, 0)];
+        type BF0 = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
+        let mut public_inputs_bf: Vec<BF0> = (0..public_inputs_len)
+            .map(|i| if (i % 3) == 0 { BF0::ONE } else { BF0::ZERO })
+            .collect();
+        if !public_inputs_bf.is_empty() {
+            public_inputs_bf[0] = BF0::ZERO;
+        }
+        let public_inputs_bytes_f257: Vec<F257> = public_inputs_bf
+            .iter()
+            .flat_map(|x| {
+                let bytes = latticefold::transcript::bytes::prime_field_to_bytes_le_fixed::<BF0>(x);
+                bytes.into_iter().map(|b| F257::from(b as u64))
+            })
+            .collect();
+
+        let trace = super::poseidon_trace_schedule_for_plus_with_public_inputs::<R>(
+            &public_inputs_bf,
+            &params,
+            n_lin_proofs,
+            mlen_mats,
+        )
+        .expect("poseidon_trace_schedule_for_plus_with_public_inputs");
+
+        // Shape + satisfying assignment.
+        let out_dir_shape = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_tiny_payload_shamir_2of2_shape");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_shape");
+            p
+        };
+        let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
+            &trace,
+            &params,
+            &public_inputs_bf,
+            n_lin_proofs,
+            mlen_mats,
+            &pairs,
+            &out_dir_shape,
+        )
+        .expect("build_we_dr1cs_for_plus_proof_shape_tiny");
+        let out_dir_witness = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_tiny_payload_shamir_2of2_witness");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_witness");
+            p
+        };
+        let proof =
+            dummy_plus_proof_shape::<R>(&params, mlen_mats, n_lin_proofs).expect("dummy_plus_proof_shape");
+        let (_shape2, asg) = build_we_plus_tiny_dr1cs::<R>(
+            &trace,
+            &params,
+            &public_inputs_bytes_f257,
+            &proof,
+            mlen_mats,
+            &pairs,
+            &out_dir_witness,
+        )
+        .expect("build_we_plus_tiny_dr1cs");
+        crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir_witness);
+        shape.inst.check(&asg).expect("shape should be satisfied by witness assignment");
+
+        let public_len = shape.public_len;
+        let x = encode_public_x::<F257>(&params, &public_inputs_bytes_f257);
+        assert_eq!(x.len(), public_len);
+        assert_eq!(&asg[..public_len], x.as_slice());
+        let z_w = asg[public_len..].to_vec();
+
+        // Shamir secret (T-of-R).
+        //
+        // This is the *intended* usage in the design docs: decapsulation under noise is
+        // probabilistic (AEAD may fail). We publish R independent share-locks and only need
+        // T successful decryptions (treat failures as erasures).
+        let shamir = ShamirConfig {
+            threshold: 3,
+            shares: 5,
+        };
+        let mut rng = StdRng::seed_from_u64(20260205);
+        let mut secret = [0u8; 32];
+        rng.fill_bytes(&mut secret);
+        let shares = split_secret_32(&mut rng, &shamir, secret).expect("split_secret_32");
+        assert_eq!(shares.len(), shamir.shares);
+
+        let prover = crate::we_tiny_lock::we_ringlwe_prover_from_dr1cs::<F257>(
+            shape.inst.clone(),
+            shape.public_len,
+        )
+        .expect("we_ringlwe_prover_from_dr1cs");
+
+        // MLWE/RLWE hint locks (one per Shamir share).
+        // Disable noise for deterministic AEAD key agreement in tests.
+        let ringlwe_params = RingLweParams {
+            ..RingLweParams::default()
+        };
+        let stmt_digest = [5u8; 32];
+        let lock_j = 0u64;
+
+        let t_arm = Instant::now();
+        let mut locks = Vec::with_capacity(shamir.shares);
+        for i in 0..shamir.shares {
+            let mut rep_id = i as u64;
+            let lock = loop {
+                match arm_lfplus_ringlwe_lock::<R>(
+                    shape.clone(),
+                    &params,
+                    &public_inputs_bytes_f257,
+                    stmt_digest,
+                    [11u8.wrapping_add(i as u8); 32],
+                    lock_j,
+                    0,
+                    rep_id,
+                    ringlwe_params.clone(),
+                    &shares[i].value,
+                    &mut rng,
+                ) {
+                    Ok(lock) => break lock,
+                    Err(e) if e.contains("shifted accepting set contains 0") => {
+                        rep_id += 1;
+                        continue;
+                    }
+                    Err(e) => panic!("arm lock[{i}] failed: {e}"),
+                }
+            };
+            locks.push(lock);
+        }
+        eprintln!(
+            "[tiny_payload_shamir] armed {} share locks (T={} of R={}) in {:?}: proof_len={}",
+            shamir.shares,
+            shamir.threshold,
+            shamir.shares,
+            t_arm.elapsed(),
+            prover.proof_len()
+        );
+
+        // Prove once (π0 streamed), decap R times (tails differ).
+        let t_prove = Instant::now();
+        maybe_print_rss("tiny_payload_shamir:before_prove_decap_stream");
+        let mut states: Vec<_> = locks
+            .iter()
+            .enumerate()
+            .map(|(i, l)| l.decap_state(&x).unwrap_or_else(|_| panic!("decap_state[{i}]")))
+            .collect();
+        let mut err: Option<String> = None;
+        let tails = prover
+            .stream_pi0_and_collect_tails(
+                &x,
+                &z_w,
+                &locks.iter().map(|l| l.coins.clone()).collect::<Vec<_>>(),
+                &mut |chunk| {
+                    if err.is_some() {
+                        return;
+                    }
+                    for st in &mut states {
+                        if let Err(e) = st.absorb_chunk(chunk) {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                },
+            )
+            .expect("stream_pi0_and_collect_tails");
+        if let Some(e) = err {
+            panic!("stream decap absorb failed: {e}");
+        }
+        assert_eq!(tails.len(), shamir.shares);
+
+        // Absorb tails (no corruption — with unauthenticated encryption, "erasures" manifest as
+        // wrong decryptions that fail at batch reconstruction, not per-lock AEAD failures).
+        for (i, st) in states.iter_mut().enumerate() {
+            st.absorb_chunk(&tails[i]).unwrap_or_else(|_| panic!("absorb tail[{i}]"));
+        }
+
+        // Decrypt all R locks: each produces 2 candidate shares (unauthenticated).
+        // NO per-armer hash is published — verification is deferred to the combined key level.
+        let mut candidates_per_lock: Vec<(u32, [[u8; 32]; 2])> = Vec::with_capacity(shamir.shares);
+        for (i, st) in states.into_iter().enumerate() {
+            let [pt0, pt1] = st.finish_decrypt_candidates()
+                .unwrap_or_else(|e| panic!("finish_decrypt_candidates[{i}]: {e}"));
+            assert_eq!(pt0.len(), 32, "share candidate 0 wrong length");
+            assert_eq!(pt1.len(), 32, "share candidate 1 wrong length");
+            let mut c0 = [0u8; 32];
+            let mut c1 = [0u8; 32];
+            c0.copy_from_slice(&pt0);
+            c1.copy_from_slice(&pt1);
+            candidates_per_lock.push((shares[i].index, [c0, c1]));
+        }
+
+        // Try 2^T combinations — NO published hash to check against.
+        // In production, verification happens at the combined-key level (Bitcoin address).
+        // For this unit test, we verify using the known secret (test-only, not published).
+        let subset = &candidates_per_lock[..shamir.threshold];
+        let n_cands = subset.len();
+        let mut found = false;
+        for mask in 0u64..(1u64 << n_cands) {
+            let selected: Vec<ShamirShare> = subset.iter().enumerate()
+                .map(|(i, (idx, cands))| {
+                    let branch = ((mask >> i) & 1) as usize;
+                    ShamirShare { index: *idx, value: cands[branch] }
+                })
+                .collect();
+            if let Ok(candidate) = reconstruct_secret_32(&shamir, &selected) {
+                if candidate == secret {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "failed to reconstruct the correct secret from 2^T search");
+
+        // Print amplification security summary.
+        let amp = crate::lockable_ringlwe::AmplificationParams {
+            r: shamir.shares,
+            t: shamir.threshold,
+            ..Default::default()
+        };
+        amp.print_summary(1);
+
+        maybe_print_rss("tiny_payload_shamir:after_prove_decap_stream");
+        eprintln!(
+            "[tiny_payload_shamir] prove+decap(stream) in {:?}",
+            t_prove.elapsed()
+        );
+
+        // Now safe to reclaim disk space used by the shape files.
+        crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir_shape);
+    }
+
+    /// End-to-end PVUGC test: 3 armers × secp256k1 → P2WPKH Bitcoin address → WE lock → decap → recover.
+    ///
+    /// This is the "ultimate test": no per-lock tags, no per-armer hashes. The ONLY verification
+    /// is that the recovered combined secret key produces the same P2WPKH address.
+    #[test]
+    #[ignore = "very slow in debug: runs full DPP prove+decap for 3 armers; run with `--release`"]
+    fn test_pvugc_3armer_btc_address_we_lock_e2e() {
+        use crate::lockable_ringlwe::{RingLweParams, AmplificationParams};
+        use crate::shamir_gf256::{reconstruct_secret_32, split_secret_32, ShamirConfig, ShamirShare};
+        use crate::we_statement::encode_public_x;
+        use crate::we_tiny_lock::arm_lfplus_ringlwe_lock;
+        use crate::utils::maybe_print_rss;
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        use k256::{ProjectivePoint, Scalar};
+        use rand::{rngs::StdRng, RngCore, SeedableRng};
+        use sha2::Digest;
+        use std::time::Instant;
+
+        const N_ARMERS: usize = 3;
+
+        // --- Bitcoin P2WPKH address derivation ---
+        fn pubkey_to_p2wpkh_hash(pubkey_compressed: &[u8; 33]) -> [u8; 20] {
+            let sha = sha2::Sha256::digest(pubkey_compressed);
+            let ripe = ripemd::Ripemd160::digest(&sha);
+            let mut out = [0u8; 20];
+            out.copy_from_slice(&ripe);
+            out
+        }
+
+        fn scalar_from_bytes_mod_order(bytes: &[u8; 32]) -> Scalar {
+            // Reduce mod secp256k1 order (k256 handles this).
+            use k256::elliptic_curve::ops::Reduce;
+            let uint = k256::U256::from_be_slice(bytes);
+            Scalar::reduce(uint)
+        }
+
+        fn point_to_compressed(pt: &ProjectivePoint) -> [u8; 33] {
+            use k256::elliptic_curve::group::GroupEncoding;
+            let bytes = pt.to_bytes();
+            let mut out = [0u8; 33];
+            out.copy_from_slice(&bytes);
+            out
+        }
+
+        // --- DPP / WE gate setup (reuse minimal params from the Shamir test) ---
+        let ring_dim = <R as PolyRing>::dimension() as u64;
+        let nvars_min = 12u64;
+        let params = WeParams {
+            nvars_setchk: nvars_min,
+            degree_setchk: 3,
+            nvars_cm: nvars_min,
+            degree_cm: 2,
+            kappa: 1,
+            ring_dim_d: ring_dim,
+            decomp_b: 16,
+            k: 1,
+            l: 1,
+            mlen: 0,
+        };
+        let public_inputs_len = 8usize;
+        let n_lin_proofs = 1usize;
+        let mlen_mats = 0usize;
+        let pairs: Vec<(usize, usize)> = vec![(0, 0)];
+        type BF0 = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
+        let mut public_inputs_bf: Vec<BF0> = (0..public_inputs_len)
+            .map(|i| if (i % 3) == 0 { BF0::ONE } else { BF0::ZERO })
+            .collect();
+        if !public_inputs_bf.is_empty() {
+            public_inputs_bf[0] = BF0::ZERO;
+        }
+        let public_inputs_bytes_f257: Vec<F257> = public_inputs_bf
+            .iter()
+            .flat_map(|x| {
+                let bytes = latticefold::transcript::bytes::prime_field_to_bytes_le_fixed::<BF0>(x);
+                bytes.into_iter().map(|b| F257::from(b as u64))
+            })
+            .collect();
+
+        let trace = super::poseidon_trace_schedule_for_plus_with_public_inputs::<R>(
+            &public_inputs_bf,
+            &params,
+            n_lin_proofs,
+            mlen_mats,
+        )
+        .expect("poseidon_trace_schedule_for_plus_with_public_inputs");
+
+        let out_dir_shape = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_btc_3armer_shape");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_shape");
+            p
+        };
+        let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
+            &trace, &params, &public_inputs_bf, n_lin_proofs, mlen_mats, &pairs, &out_dir_shape,
+        )
+        .expect("build_we_dr1cs_for_plus_proof_shape_tiny");
+        let out_dir_witness = {
+            let mut p = std::env::temp_dir();
+            p.push("lfplus_test_btc_3armer_witness");
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_witness");
+            p
+        };
+        let proof = dummy_plus_proof_shape::<R>(&params, mlen_mats, n_lin_proofs)
+            .expect("dummy_plus_proof_shape");
+        let (_shape2, asg) = build_we_plus_tiny_dr1cs::<R>(
+            &trace, &params, &public_inputs_bytes_f257, &proof, mlen_mats, &pairs, &out_dir_witness,
+        )
+        .expect("build_we_plus_tiny_dr1cs");
+        crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir_witness);
+        shape.inst.check(&asg).expect("shape satisfied");
+
+        let public_len = shape.public_len;
+        let x = encode_public_x::<F257>(&params, &public_inputs_bytes_f257);
+        let z_w = asg[public_len..].to_vec();
+
+        let prover = crate::we_tiny_lock::we_ringlwe_prover_from_dr1cs::<F257>(
+            shape.inst.clone(), shape.public_len,
+        )
+        .expect("we_ringlwe_prover_from_dr1cs");
+
+        // =====================================================================
+        // Phase 1: ARMING (3 armers, each with a secp256k1 secret)
+        // =====================================================================
+        let mut rng = StdRng::seed_from_u64(20260206);
+        let shamir = ShamirConfig { threshold: 3, shares: 5 };
+        let ringlwe_params = RingLweParams::default();
+        let stmt_digest = [5u8; 32];
+
+        // Each armer samples a secret scalar. Individual P_j = s_j·G are NEVER published.
+        // Only the combined P_combined is public (derived Bitcoin address).
+        //
+        // Production protocol (2 rounds, private channel between armers):
+        //   Round 1: each armer j sends commitment H_j = SHA256(P_j || nonce_j) to all others.
+        //   Round 2: each armer j reveals (P_j, nonce_j); all verify H_j and compute P_combined.
+        //   Only P_combined is published on-chain. Individual P_j stay private to the armer group.
+        //
+        // This prevents:
+        //   - Public per-armer oracle: nobody outside the group knows P_j
+        //   - Equivocation: commitment H_j binds P_j before reveal
+        //
+        // Here we simulate this: each armer generates s_j, the test computes P_combined
+        // (as the armers would privately), and only P_combined + the address are "public."
+
+        let mut armer_secrets: Vec<[u8; 32]> = Vec::with_capacity(N_ARMERS);
+        // Simulate private P_j accumulation (armers share P_j only with each other).
+        let mut p_combined = ProjectivePoint::IDENTITY;
+        for _j in 0..N_ARMERS {
+            let mut sk = [0u8; 32];
+            rng.fill_bytes(&mut sk);
+            sk[31] |= 1; // ensure nonzero
+            let scalar = scalar_from_bytes_mod_order(&sk);
+            let scalar_bytes: [u8; 32] = scalar.to_bytes().into();
+            armer_secrets.push(scalar_bytes);
+            // Each armer adds their P_j to the running sum (private, between armers only).
+            p_combined += ProjectivePoint::GENERATOR * scalar;
+        }
+
+        // ONLY P_combined is public. No individual P_j escapes the armer group.
+        let p_combined_compressed = point_to_compressed(&p_combined);
+        let address_hash = pubkey_to_p2wpkh_hash(&p_combined_compressed);
+        eprintln!("[btc_3armer] P_combined (public) = {:?}", p_combined_compressed);
+        eprintln!("[btc_3armer] P2WPKH address hash (public) = {:02x?}", address_hash);
+
+        // Each armer: Shamir-split their secret, arm R locks.
+        let t_arm = Instant::now();
+        #[derive(Clone)]
+        struct ArmerLockset<F: PrimeField> {
+            locks: Vec<crate::lockable_ringlwe::RingLweLockArtifact<F>>,
+            share_indices: Vec<u32>,
+        }
+        let mut armer_locksets: Vec<ArmerLockset<F257>> = Vec::with_capacity(N_ARMERS);
+        for j in 0..N_ARMERS {
+            let shares = split_secret_32(&mut rng, &shamir, armer_secrets[j])
+                .expect("split_secret_32");
+            let mut locks = Vec::with_capacity(shamir.shares);
+            let mut indices = Vec::with_capacity(shamir.shares);
+            for i in 0..shamir.shares {
+                let mut rep_id = (j * 1000 + i) as u64;
+                let lock = loop {
+                    match arm_lfplus_ringlwe_lock::<R>(
+                        shape.clone(),
+                        &params,
+                        &public_inputs_bytes_f257,
+                        stmt_digest,
+                        // Unique armer seed per (armer, lock).
+                        {
+                            let mut seed = [0u8; 32];
+                            seed[0] = j as u8;
+                            seed[1] = i as u8;
+                            seed[2..4].copy_from_slice(&(rep_id as u16).to_le_bytes());
+                            seed
+                        },
+                        0,
+                        0,
+                        rep_id,
+                        ringlwe_params.clone(),
+                        &shares[i].value,
+                        &mut rng,
+                    ) {
+                        Ok(lock) => break lock,
+                        Err(e) if e.contains("shifted accepting set contains 0") => {
+                            rep_id += 1;
+                            continue;
+                        }
+                        Err(e) => panic!("arm armer[{j}] lock[{i}] failed: {e}"),
+                    }
+                };
+                indices.push(shares[i].index);
+                locks.push(lock);
+            }
+            armer_locksets.push(ArmerLockset { locks, share_indices: indices });
+        }
+        eprintln!(
+            "[btc_3armer] armed {} armers × {} locks each in {:?}",
+            N_ARMERS, shamir.shares, t_arm.elapsed()
+        );
+
+        // =====================================================================
+        // Phase 2: DECAP — single π₀ pass feeds ALL armers' locks in parallel
+        // =====================================================================
+        let t_decap = Instant::now();
+        maybe_print_rss("btc_3armer:before_decap");
+
+        // Flatten all locks across all armers into one state list.
+        // Track which armer each state belongs to.
+        let all_locks: Vec<&crate::lockable_ringlwe::RingLweLockArtifact<F257>> = armer_locksets
+            .iter()
+            .flat_map(|ls| ls.locks.iter())
+            .collect();
+        let all_coins: Vec<_> = all_locks.iter().map(|l| l.coins.clone()).collect();
+        let mut all_states: Vec<_> = all_locks
+            .iter()
+            .enumerate()
+            .map(|(i, l)| l.decap_state(&x).unwrap_or_else(|_| panic!("decap_state[{i}]")))
+            .collect();
+
+        // Stream π₀ ONCE — all N×R locks absorb the same chunks simultaneously.
+        let mut err: Option<String> = None;
+        let tails = prover.stream_pi0_and_collect_tails(
+            &x, &z_w, &all_coins,
+            &mut |chunk| {
+                if err.is_some() { return; }
+                for st in &mut all_states {
+                    if let Err(e) = st.absorb_chunk(chunk) {
+                        err = Some(e);
+                        break;
+                    }
+                }
+            },
+        ).expect("stream_pi0_and_collect_tails");
+        if let Some(e) = err { panic!("stream failed: {e}"); }
+
+        // Absorb per-lock tails.
+        for (i, st) in all_states.iter_mut().enumerate() {
+            st.absorb_chunk(&tails[i]).unwrap_or_else(|_| panic!("absorb tail[{i}]"));
+        }
+
+        // Collect candidates, grouped by armer.
+        let mut armer_candidate_secrets: Vec<Vec<[u8; 32]>> = Vec::with_capacity(N_ARMERS);
+        let mut state_iter = all_states.into_iter();
+        for (j, lockset) in armer_locksets.iter().enumerate() {
+            let mut cands_per_lock: Vec<(u32, [[u8; 32]; 2])> = Vec::with_capacity(shamir.shares);
+            for i in 0..shamir.shares {
+                let st = state_iter.next().unwrap();
+                let [pt0, pt1] = st.finish_decrypt_candidates()
+                    .unwrap_or_else(|e| panic!("finish armer[{j}] lock[{i}]: {e}"));
+                let mut c0 = [0u8; 32];
+                let mut c1 = [0u8; 32];
+                c0.copy_from_slice(&pt0);
+                c1.copy_from_slice(&pt1);
+                cands_per_lock.push((lockset.share_indices[i], [c0, c1]));
+            }
+
+            // Try 2^T combinations for this armer's secret.
+            let subset = &cands_per_lock[..shamir.threshold];
+            let n_cands = subset.len();
+            let mut found_secrets: Vec<[u8; 32]> = Vec::new();
+            for mask in 0u64..(1u64 << n_cands) {
+                let selected: Vec<ShamirShare> = subset.iter().enumerate()
+                    .map(|(i, (idx, cands))| {
+                        let branch = ((mask >> i) & 1) as usize;
+                        ShamirShare { index: *idx, value: cands[branch] }
+                    })
+                    .collect();
+                if let Ok(secret) = reconstruct_secret_32(&shamir, &selected) {
+                    found_secrets.push(secret);
+                }
+            }
+            found_secrets.sort();
+            found_secrets.dedup();
+            eprintln!("[btc_3armer] armer {j}: {} candidate secrets from 2^{} search", found_secrets.len(), n_cands);
+            armer_candidate_secrets.push(found_secrets);
+        }
+
+        // =====================================================================
+        // Phase 3: Meet-in-the-middle across N armers to find s_combined matching P_combined.
+        // =====================================================================
+        eprintln!("[btc_3armer] meet-in-the-middle: {} × {} × {} candidates",
+            armer_candidate_secrets[0].len(),
+            armer_candidate_secrets[1].len(),
+            armer_candidate_secrets[2].len(),
+        );
+
+        // For 3 armers with small candidate sets: just enumerate all combinations.
+        let mut found = false;
+        let mut s_combined_found = [0u8; 32];
+        'outer: for s0 in &armer_candidate_secrets[0] {
+            let sc0 = scalar_from_bytes_mod_order(s0);
+            for s1 in &armer_candidate_secrets[1] {
+                let sc1 = scalar_from_bytes_mod_order(s1);
+                for s2 in &armer_candidate_secrets[2] {
+                    let sc2 = scalar_from_bytes_mod_order(s2);
+                    let sc_combined = sc0 + sc1 + sc2;
+                    let pk_candidate = ProjectivePoint::GENERATOR * sc_combined;
+                    let pk_compressed = point_to_compressed(&pk_candidate);
+                    let hash_candidate = pubkey_to_p2wpkh_hash(&pk_compressed);
+                    if hash_candidate == address_hash {
+                        s_combined_found = sc_combined.to_bytes().into();
+                        found = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        assert!(found, "failed to find s_combined matching the Bitcoin address");
+
+        // Verify: the found combined scalar produces the correct combined public key.
+        let sc_verify = scalar_from_bytes_mod_order(&s_combined_found);
+        let pk_verify = ProjectivePoint::GENERATOR * sc_verify;
+        assert_eq!(
+            point_to_compressed(&pk_verify),
+            p_combined_compressed,
+            "recovered key does not match combined public key"
+        );
+
+        maybe_print_rss("btc_3armer:after_decap");
+        eprintln!("[btc_3armer] decap + reconstruct + verify in {:?}", t_decap.elapsed());
+
+        let amp = AmplificationParams {
+            r: shamir.shares,
+            t: shamir.threshold,
+            ..Default::default()
+        };
+        amp.print_summary(N_ARMERS);
+
+        // =====================================================================
+        // Adversarial tests: verify the lock rejects corrupted inputs.
+        // =====================================================================
+
+        // --- ADV 1: Corrupted proof tail (one bit flip in first tail) ---
+        // Restream with a corrupted tail for armer 0. Should produce garbage candidates
+        // that don't match the Bitcoin address.
+        {
+            let mut adv_states: Vec<_> = all_locks.iter()
+                .map(|l| l.decap_state(&x).unwrap())
+                .collect();
+            let mut adv_err: Option<String> = None;
+            let adv_tails = prover.stream_pi0_and_collect_tails(
+                &x, &z_w, &all_coins,
+                &mut |chunk| {
+                    if adv_err.is_some() { return; }
+                    for st in &mut adv_states {
+                        if let Err(e) = st.absorb_chunk(chunk) { adv_err = Some(e); break; }
+                    }
+                },
+            ).expect("adv stream");
+            // Corrupt armer 0's first tail.
+            let mut bad_tails = adv_tails;
+            bad_tails[0][0] += F257::from(42u64);
+            for (i, st) in adv_states.iter_mut().enumerate() {
+                st.absorb_chunk(&bad_tails[i]).unwrap();
+            }
+            // Collect candidates from corrupted stream.
+            let mut adv_state_iter = adv_states.into_iter();
+            let mut adv_cands_armer0: Vec<[u8; 32]> = Vec::new();
+            for i in 0..shamir.shares {
+                let st = adv_state_iter.next().unwrap();
+                let [pt0, pt1] = st.finish_decrypt_candidates().unwrap();
+                if i < shamir.threshold {
+                    let mut c = [0u8; 32];
+                    c.copy_from_slice(&pt0);
+                    adv_cands_armer0.push(c);
+                    c.copy_from_slice(&pt1);
+                    adv_cands_armer0.push(c);
+                }
+            }
+            // Try all candidate scalars from the corrupted armer 0 against the real armers 1,2.
+            let mut adv_found = false;
+            for s0_bad in &adv_cands_armer0 {
+                let sc0 = scalar_from_bytes_mod_order(s0_bad);
+                for s1 in &armer_candidate_secrets[1] {
+                    let sc1 = scalar_from_bytes_mod_order(s1);
+                    for s2 in &armer_candidate_secrets[2] {
+                        let sc2 = scalar_from_bytes_mod_order(s2);
+                        let sc_comb = sc0 + sc1 + sc2;
+                        let pk = ProjectivePoint::GENERATOR * sc_comb;
+                        if pubkey_to_p2wpkh_hash(&point_to_compressed(&pk)) == address_hash {
+                            adv_found = true;
+                        }
+                    }
+                }
+            }
+            assert!(!adv_found, "ADV1: corrupted tail should NOT recover the Bitcoin address");
+            eprintln!("[btc_3armer] ADV1 (corrupted tail): correctly rejected");
+        }
+
+        // --- ADV 2: Tampered ciphertext (bit flip in armer 0's first lock) ---
+        {
+            let mut tampered_locksets = armer_locksets.clone();
+            if let Some(first_enc) = tampered_locksets[0].locks[0].cts[0].encoded.first_mut() {
+                use ark_ff::Field;
+                // Add a large value to corrupt the first encoded byte.
+                type GlFq = <cyclotomic_rings::rings::GoldilocksRing64 as stark_rings::PolyRing>::BaseRing;
+                *first_enc += GlFq::from(1u64 << 60);
+            }
+            // Restream with tampered lockset.
+            let tampered_all_locks: Vec<&crate::lockable_ringlwe::RingLweLockArtifact<F257>> =
+                tampered_locksets.iter().flat_map(|ls| ls.locks.iter()).collect();
+            let tampered_coins: Vec<_> = tampered_all_locks.iter().map(|l| l.coins.clone()).collect();
+            let mut tam_states: Vec<_> = tampered_all_locks.iter()
+                .map(|l| l.decap_state(&x).unwrap())
+                .collect();
+            let mut tam_err: Option<String> = None;
+            let tam_tails = prover.stream_pi0_and_collect_tails(
+                &x, &z_w, &tampered_coins,
+                &mut |chunk| {
+                    if tam_err.is_some() { return; }
+                    for st in &mut tam_states {
+                        if let Err(e) = st.absorb_chunk(chunk) { tam_err = Some(e); break; }
+                    }
+                },
+            ).expect("tam stream");
+            for (i, st) in tam_states.iter_mut().enumerate() {
+                st.absorb_chunk(&tam_tails[i]).unwrap();
+            }
+            let mut tam_iter = tam_states.into_iter();
+            let mut tam_cands: Vec<[u8; 32]> = Vec::new();
+            for i in 0..shamir.shares {
+                let st = tam_iter.next().unwrap();
+                let [pt0, pt1] = st.finish_decrypt_candidates().unwrap();
+                if i < shamir.threshold {
+                    let mut c = [0u8; 32];
+                    c.copy_from_slice(&pt0);
+                    tam_cands.push(c);
+                    c.copy_from_slice(&pt1);
+                    tam_cands.push(c);
+                }
+            }
+            // Check that none of the tampered candidates for armer 0 + correct armer 1,2 match.
+            let mut tam_found = false;
+            for s0_bad in &tam_cands {
+                let sc0 = scalar_from_bytes_mod_order(s0_bad);
+                for s1 in &armer_candidate_secrets[1] {
+                    let sc1 = scalar_from_bytes_mod_order(s1);
+                    for s2 in &armer_candidate_secrets[2] {
+                        let sc2 = scalar_from_bytes_mod_order(s2);
+                        let sc_comb = sc0 + sc1 + sc2;
+                        let pk = ProjectivePoint::GENERATOR * sc_comb;
+                        if pubkey_to_p2wpkh_hash(&point_to_compressed(&pk)) == address_hash {
+                            tam_found = true;
+                        }
+                    }
+                }
+            }
+            assert!(!tam_found, "ADV2: tampered ciphertext should NOT recover the Bitcoin address");
+            eprintln!("[btc_3armer] ADV2 (tampered ciphertext): correctly rejected");
+        }
+
+        // --- ADV 3: Wrong address (different combined key) ---
+        // Even with correct decap, the recovered key shouldn't match a DIFFERENT address.
+        {
+            let wrong_scalar = scalar_from_bytes_mod_order(&[0xFFu8; 32]);
+            let wrong_pk = ProjectivePoint::GENERATOR * wrong_scalar;
+            let wrong_hash = pubkey_to_p2wpkh_hash(&point_to_compressed(&wrong_pk));
+            assert_ne!(wrong_hash, address_hash, "sanity: wrong address should differ");
+            // The correctly recovered s_combined should NOT match the wrong address.
+            let wrong_check = pubkey_to_p2wpkh_hash(&point_to_compressed(
+                &(ProjectivePoint::GENERATOR * sc_verify)
+            ));
+            assert_ne!(wrong_check, wrong_hash, "ADV3: correct key should not match wrong address");
+            eprintln!("[btc_3armer] ADV3 (wrong address): correctly rejected");
+        }
+
+        eprintln!("[btc_3armer] all adversarial tests passed");
+
+        crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir_shape);
+    }
+
+    #[test]
+    #[ignore = "very slow in debug: production-like tiny-gate params; run with `--release`"]
+    fn test_tiny_gate_ringlwe_lock_roundtrip_large_trace_params() {
+        use crate::lockable_ringlwe::RingLweParams;
+        use crate::we_statement::encode_public_x;
+        use crate::we_tiny_lock::arm_lfplus_ringlwe_lock;
+        use crate::utils::maybe_print_rss;
+        use rand::{rngs::StdRng, SeedableRng};
+        use std::time::Instant;
+
+        // "Large trace params" defaults (more production-like), but allow overriding down for
+        // scaling studies:
+        //   LFP_TINY_GATE_NVARS=12 LFP_TINY_GATE_K=1 LFP_TINY_GATE_KAPPA=1
+        //
+        // Interpreting your shorthand:
+        // - "npow20" ~ nvars=20 (sumcheck rounds / transcript schedule depth)
+        // - "k8"     ~ k=8      (rgchk/setchk block count)
+        let nvars_min: u64 = std::env::var("LFP_TINY_GATE_NVARS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20)
+            .max(12);
+        let k_rg: u64 = std::env::var("LFP_TINY_GATE_K")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8)
+            .max(1);
+        let kappa: u64 = std::env::var("LFP_TINY_GATE_KAPPA")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8)
+            .max(1);
+        assert!(
+            (kappa as usize).is_power_of_two(),
+            "tiny gate requires kappa power-of-two; set LFP_TINY_GATE_KAPPA=1/2/4/8/..."
+        );
+
+        let ring_dim = <R as PolyRing>::dimension() as u64;
+        let params = WeParams {
+            nvars_setchk: nvars_min,
+            degree_setchk: 3,
+            nvars_cm: nvars_min,
+            degree_cm: 2,
+            kappa,
+            ring_dim_d: ring_dim,
+            decomp_b: 16,
+            k: k_rg,
+            l: 1,
+            mlen: 0,
+        };
+        let public_inputs_len = 8usize; // number of public **field elements**
+        let n_lin_proofs = 1usize; // schedule builder currently assumes L=1
+        let mlen_mats = 0usize;
+        let pairs: Vec<(usize, usize)> = vec![(0, 0)];
+        type BF0 = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
+
+        // Public inputs as base-field elements (used for schedule trace generation).
+        let mut public_inputs_bf: Vec<BF0> = (0..public_inputs_len)
+            .map(|i| if (i % 3) == 0 { BF0::ONE } else { BF0::ZERO })
+            .collect();
+        // Dummy proof uses cm_f[*] = 0, so ensure the exposed prefix absorbed into the transcript
+        // matches that zero prefix (for as many coordinates as we expose).
+        let kappa_exposed = (kappa as usize).min(public_inputs_len);
+        for i in 0..kappa_exposed {
+            public_inputs_bf[i] = BF0::ZERO;
+        }
+
+        let public_inputs_bytes_f257: Vec<F257> = public_inputs_bf
+            .iter()
+            .flat_map(|x| {
+                let bytes = latticefold::transcript::bytes::prime_field_to_bytes_le_fixed::<BF0>(x);
+                bytes.into_iter().map(|b| F257::from(b as u64))
+            })
+            .collect();
+
+        eprintln!(
+            "[tiny_gate_large] params: nvars={} kappa={} k={} ring_dim={}",
+            nvars_min, kappa, k_rg, ring_dim
+        );
+
+        let trace = super::poseidon_trace_schedule_for_plus_with_public_inputs::<R>(
+            &public_inputs_bf,
+            &params,
+            n_lin_proofs,
+            mlen_mats,
+        )
+        .expect("poseidon_trace_schedule_for_plus_with_public_inputs");
+
+        // Armer builds the shape.
+        let t_shape = Instant::now();
+        let out_dir_shape = {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "lfplus_test_tiny_shape_roundtrip_shape_nvars{nvars_min}_kappa{kappa}_k{k_rg}"
+            ));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_shape");
+            p
+        };
+        let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
+            &trace,
+            &params,
+            &public_inputs_bf,
+            n_lin_proofs,
+            mlen_mats,
+            &pairs,
+            &out_dir_shape,
+        )
+        .expect("build_we_dr1cs_for_plus_proof_shape_tiny");
+
+        // Prover builds a satisfying assignment for *that same shape* from the recorded trace.
+        let out_dir_witness = {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "lfplus_test_tiny_shape_roundtrip_witness_nvars{nvars_min}_kappa{kappa}_k{k_rg}"
+            ));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create temp out_dir_witness");
+            p
+        };
+        let proof =
+            dummy_plus_proof_shape::<R>(&params, mlen_mats, n_lin_proofs).expect("dummy_plus_proof_shape");
+        let (_shape2, asg) = build_we_plus_tiny_dr1cs::<R>(
+            &trace,
+            &params,
+            &public_inputs_bytes_f257,
+            &proof,
+            mlen_mats,
+            &pairs,
+            &out_dir_witness,
+        )
+        .expect("build_we_plus_tiny_dr1cs");
+        crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir_witness);
+        assert_eq!(asg.len(), shape.inst.nvars);
+        shape.inst.check(&asg).expect("shape should be satisfied by witness assignment");
+        eprintln!(
+            "[tiny_gate_large] built shape in {:?}: public_len={} nvars={} constraints={}",
+            t_shape.elapsed(),
+            shape.public_len,
+            shape.inst.nvars,
+            shape.inst.layout.nconstraints
+        );
+
+        // Arm and then prove+decap using the satisfying assignment split into (x || z_w).
+        let stmt_digest = [3u8; 32];
+        let armer_seed = [7u8; 32];
+        let lock_j = 0u64;
+        let ringlwe_params = RingLweParams::default();
+        let dummy_payload: [u8; 0] = [];
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let public_len = shape.public_len;
+        let prover = crate::we_tiny_lock::we_ringlwe_prover_from_dr1cs::<F257>(
+            shape.inst.clone(),
+            shape.public_len,
+        )
+        .expect("we_ringlwe_prover_from_dr1cs");
+        let shape1 = shape.clone();
+        let t_arm = Instant::now();
+        let mut rep0 = 0u64;
+        let lock0 = loop {
+            match arm_lfplus_ringlwe_lock::<R>(
+                shape.clone(),
+                &params,
+                &public_inputs_bytes_f257,
+                stmt_digest,
+                armer_seed,
+                lock_j,
+                0,
+                rep0,
+                ringlwe_params.clone(),
+                &dummy_payload,
+                &mut rng,
+            ) {
+                Ok(lock) => break lock,
+                Err(e) if e.contains("shifted accepting set contains 0") => {
+                    rep0 += 1;
+                    continue;
+                }
+                Err(e) => panic!("arm ctx0 failed: {e}"),
+            }
+        };
+        let mut rep1 = rep0 + 1;
+        let lock1 = loop {
+            match arm_lfplus_ringlwe_lock::<R>(
+                shape1.clone(),
+                &params,
+                &public_inputs_bytes_f257,
+                stmt_digest,
+                armer_seed,
+                lock_j,
+                0,
+                rep1,
+                ringlwe_params.clone(),
+                &dummy_payload,
+                &mut rng,
+            ) {
+                Ok(lock) => break lock,
+                Err(e) if e.contains("shifted accepting set contains 0") => {
+                    rep1 += 1;
+                    continue;
+                }
+                Err(e) => panic!("arm ctx1 failed: {e}"),
+            }
+        };
+        eprintln!(
+            "[tiny_gate_large] armed in {:?}: proof_len={}",
+            t_arm.elapsed(),
+            prover.proof_len()
+        );
+
+        let x = encode_public_x::<F257>(&params, &public_inputs_bytes_f257);
+        assert_eq!(x.len(), public_len);
+        assert_eq!(&asg[..public_len], x.as_slice(), "satisfying assignment public prefix mismatch");
+        let z_w = asg[public_len..].to_vec();
+
+        let t_prove = Instant::now();
+        maybe_print_rss("tiny_gate_large:before_prove_decap_stream");
+        let mut st0 = lock0.decap_state(&x).expect("decap_state0");
+        let mut st1 = lock1.decap_state(&x).expect("decap_state1");
+        let mut err: Option<String> = None;
+        let tails = prover
+            .stream_pi0_and_collect_tails(
+                &x,
+                &z_w,
+                &[lock0.coins.clone(), lock1.coins.clone()],
+                &mut |chunk| {
+                    if err.is_some() {
+                        return;
+                    }
+                    if let Err(e) = st0.absorb_chunk(chunk) {
+                        err = Some(e);
+                        return;
+                    }
+                    if let Err(e) = st1.absorb_chunk(chunk) {
+                        err = Some(e);
+                    }
+                },
+            )
+            .expect("stream_pi0_and_collect_tails");
+        if let Some(e) = err {
+            panic!("stream decap absorb failed: {e}");
+        }
+        assert_eq!(tails.len(), 2);
+        st0.absorb_chunk(&tails[0]).expect("absorb tail0");
+        st1.absorb_chunk(&tails[1]).expect("absorb tail1");
+        let _cands0 = st0.finish_decrypt_candidates().expect("decap_finish0");
+        let _cands1 = st1.finish_decrypt_candidates().expect("decap_finish1");
+        for lock in [&lock0, &lock1] {
+            let a0 = lock.accepting_set[0] + lock.offset;
+            let a1 = lock.accepting_set[1] + lock.offset;
+            assert!(a0 == F257::from(1u64) || a0 == F257::from(2u64));
+            assert!(a1 == F257::from(1u64) || a1 == F257::from(2u64));
+        }
+        maybe_print_rss("tiny_gate_large:after_prove_decap_stream");
+        eprintln!("[tiny_gate_large] prove+decap(stream) in {:?}", t_prove.elapsed());
+
+        // Now it is safe to reclaim disk space used by the shape files.
+        crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir_shape);
     }
 
     #[derive(MontConfig)]

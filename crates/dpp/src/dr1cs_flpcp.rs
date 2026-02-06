@@ -11,6 +11,7 @@ use rand::RngCore;
 
 use rayon::prelude::*;
 use rayon::join;
+use std::collections::HashMap;
 
 use crate::packing::{BoundedFlpcp, BoundedFlpcpSparse, FlpcpPredicate};
 use crate::rs::{barycentric_weights_consecutive, extrapolate_consecutive_next_block, lagrange_coeffs_at};
@@ -23,6 +24,10 @@ use crate::sparse::SparseVec;
 pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
     /// Number of public variables in `z`.
     fn n(&self) -> usize;
+    /// Total number of variables in `z = (x || z_w)`.
+    fn n_total(&self) -> usize;
+    /// Private witness length `|z_w|`.
+    fn z_w_len(&self) -> usize;
     /// Proof length `m` for π = (z_w || w).
     fn m(&self) -> usize;
     /// Codeword length ℓ (verifier coin index range).
@@ -31,6 +36,34 @@ pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
     fn blocks(&self) -> usize;
     /// Codeword length per block ℓ_local (equals `ell()` when `blocks()==1`).
     fn ell_local(&self) -> usize;
+    /// Square-code witness block length `k*` (length of each `w_eval`).
+    fn k_star(&self) -> usize;
+    /// Witness positions for `w_eval` (Layout A).
+    fn witness_positions_star(&self) -> Result<Vec<usize>, String>;
+
+    /// Stream `w_eval` blocks in order without materializing the full proof.
+    ///
+    /// Implementations must call `on_block(block_id, w_eval)` for each block_id in `0..blocks()`,
+    /// where `w_eval.len() == k_star()`.
+    fn stream_w_eval_blocks(
+        &self,
+        witness_pos: &[usize],
+        x: &[F],
+        z_w: &[F],
+        x_u16: Option<&[u16]>,
+        z_u16: Option<&[u16]>,
+        on_block: &mut dyn FnMut(usize, &[F]),
+    ) -> Result<(), String>;
+
+    /// Stream verifier queries for fixed coins without allocating full query vectors.
+    fn stream_queries_for_coins_sparse(
+        &self,
+        idx: usize,
+        lambda: F,
+        x: &[F],
+        scratch: &mut Dr1csQueryScratch<F>,
+        sink: &mut dyn QuerySink<F>,
+    ) -> Result<(), String>;
     /// Prover: given public `x` and private witness `z_w`, output π = (z_w || w).
     fn prove(&self, x: &[F], z_w: &[F]) -> Vec<F>;
     /// Deterministic sparse queries for fixed verifier coins.
@@ -108,6 +141,33 @@ pub trait MulCode<F: PrimeField> {
         }
     }
 
+    /// Evaluate `E(y)[positions[j]]` into caller-provided storage (no allocation).
+    ///
+    /// Streaming provers should prefer this API and reuse `out` across blocks to
+    /// avoid heap churn.
+    ///
+    /// Default implementation is correct but may allocate internally via
+    /// `eval_e_at_positions` and then copy.
+    fn eval_e_at_positions_into(
+        &self,
+        positions: &[usize],
+        y: &[F],
+        out: &mut [F],
+    ) -> Result<(), String>
+    where
+        Self: Sync,
+    {
+        if out.len() != positions.len() {
+            return Err("eval_e_at_positions_into: out len != positions len".to_string());
+        }
+        let tmp = self.eval_e_at_positions(positions, y)?;
+        if tmp.len() != out.len() {
+            return Err("eval_e_at_positions_into: bad eval length".to_string());
+        }
+        out.copy_from_slice(&tmp);
+        Ok(())
+    }
+
     /// Stream coefficients for E(·)[idx] without allocating a full vector.
     fn row_e_stream(&self, idx: usize, f: &mut dyn FnMut(usize, F)) -> Result<(), String> {
         let row = self.row_e(idx)?;
@@ -149,6 +209,47 @@ pub struct TensorRsMulCode<F: PrimeField> {
     ws_star: Vec<F>,
     lam_k_u16: Vec<u16>,
     lam_star_u16: Vec<u16>,
+}
+
+#[derive(Default)]
+struct TensorRsF257Rank3Scratch {
+    y_u16: Vec<u16>,
+    t0: Vec<u16>,
+    t1: Vec<u16>,
+    out_grid: Vec<u16>,
+}
+
+thread_local! {
+    static TENSOR_RS_F257_R3_SCRATCH: std::cell::RefCell<TensorRsF257Rank3Scratch> =
+        std::cell::RefCell::new(TensorRsF257Rank3Scratch::default());
+}
+
+#[inline]
+fn reduce_mod257_u32(x: u32) -> u16 {
+    // Fast reduction mod 257 using 256 ≡ -1 (mod 257).
+    //
+    // For x < 2^32, write x = b0 + 256 b1 + 256^2 b2 + 256^3 b3, with 0<=bi<=255.
+    // Then x ≡ b0 - b1 + b2 - b3 (mod 257).
+    let b0 = (x & 0xFF) as i32;
+    let b1 = ((x >> 8) & 0xFF) as i32;
+    let b2 = ((x >> 16) & 0xFF) as i32;
+    let b3 = ((x >> 24) & 0xFF) as i32;
+    let mut r = b0 - b1 + b2 - b3;
+    // r is in [-510, 510], so at most two adjustments are needed.
+    if r < 0 {
+        r += 257;
+        if r < 0 {
+            r += 257;
+        }
+    }
+    if r >= 257 {
+        r -= 257;
+        if r >= 257 {
+            r -= 257;
+        }
+    }
+    debug_assert!((0..257).contains(&r));
+    r as u16
 }
 
 impl<F: PrimeField> TensorRsMulCode<F> {
@@ -432,127 +533,12 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
         Self: Sync,
     {
         if Self::is_f257() && self.rank == 3 {
-            // This fast path assumes the canonical Layout A evaluation order, i.e.
-            // `positions == witness_positions_star()`. We keep the API generic for callers,
-            // but we defensively check the invariant in debug builds to avoid silent misuse.
-            #[cfg(debug_assertions)]
-            {
-                if let Ok(expected) = self.witness_positions_star() {
-                    debug_assert_eq!(
-                        positions,
-                        expected.as_slice(),
-                        "TensorRsMulCode::eval_e_at_positions (F257 rank=3) requires positions == witness_positions_star()"
-                    );
-                }
-            }
-
-            let base_k = self.base_k;
-            let side = 2 * base_k - 1;
-            if side > self.base_n {
-                return Err("eval_e_at_positions: side out of range".to_string());
-            }
-            let k = self.dim_k();
-            if y.len() != k {
-                return Err("eval_e_at_positions: bad y length".to_string());
-            }
             let k_star = self.dim_k_star();
             if positions.len() != k_star {
                 return Err("eval_e_at_positions: bad positions length".to_string());
             }
-
-            // Convert once (this is on the prover hot path).
-            let y_u16 = y.iter().copied().map(f_to_u16).collect::<Vec<_>>();
-
-            // Tensor layout conventions:
-            // - Message y is indexed as flat = i0 + i1*base_k + i2*base_k^2 (dim0 least-significant).
-            // - We evaluate E(y) on the side^3 grid of coordinates (c0,c1,c2) with 0<=c*<side.
-            // - Output grid is indexed as g = c0 + c1*side + c2*side^2 (same digit order).
-            let stride_y1 = base_k;
-            let stride_y2 = base_k * base_k;
-            let stride_g1 = side;
-            let stride_g2 = side * side;
-
-            // Pass 1: interpolate along dim0.
-            let mut t0 = vec![0u16; side * base_k * base_k];
-            for i2 in 0..base_k {
-                for i1 in 0..base_k {
-                    let base_y = i1 * stride_y1 + i2 * stride_y2;
-                    let out_base = stride_g1 * (i1 + base_k * i2);
-                    for c0 in 0..side {
-                        let lam0 = &self.lam_k_u16[c0 * base_k..(c0 + 1) * base_k];
-                        let mut acc = 0u16;
-                        for i0 in 0..base_k {
-                            acc = add_mod(acc, mul_mod(lam0[i0], y_u16[base_y + i0]));
-                        }
-                        t0[out_base + c0] = acc;
-                    }
-                }
-            }
-
-            // Pass 2: interpolate along dim1.
-            let mut t1 = vec![0u16; side * side * base_k];
-            for i2 in 0..base_k {
-                for c0 in 0..side {
-                    let out_base = stride_g1 * (c0 + side * i2);
-                    for c1 in 0..side {
-                        let lam1 = &self.lam_k_u16[c1 * base_k..(c1 + 1) * base_k];
-                        let mut acc = 0u16;
-                        for i1 in 0..base_k {
-                            let v = t0[c0 + side * (i1 + base_k * i2)];
-                            acc = add_mod(acc, mul_mod(lam1[i1], v));
-                        }
-                        t1[out_base + c1] = acc;
-                    }
-                }
-            }
-
-            // Pass 3: interpolate along dim2.
-            let mut out_grid = vec![0u16; side * side * side];
-            for c2 in 0..side {
-                let lam2 = &self.lam_k_u16[c2 * base_k..(c2 + 1) * base_k];
-                for c1 in 0..side {
-                    for c0 in 0..side {
-                        let mut acc = 0u16;
-                        for i2 in 0..base_k {
-                            let v = t1[c1 + side * (c0 + side * i2)];
-                            acc = add_mod(acc, mul_mod(lam2[i2], v));
-                        }
-                        out_grid[c0 + c1 * stride_g1 + c2 * stride_g2] = acc;
-                    }
-                }
-            }
-
-            // Emit in the exact order of `witness_positions_star()` (Layout A).
-            // NOTE: callers in this crate always pass `positions = witness_positions_star()`.
-            let mut out = Vec::with_capacity(k_star);
-
-            // Low cube.
-            for i2 in 0..base_k {
-                for i1 in 0..base_k {
-                    for i0 in 0..base_k {
-                        let g = i0 + i1 * stride_g1 + i2 * stride_g2;
-                        out.push(F::from(out_grid[g] as u64));
-                    }
-                }
-            }
-            if out.len() != k {
-                return Err("eval_e_at_positions: low cube length mismatch".to_string());
-            }
-            // Rest of side-cube, skipping low cube points.
-            for c2 in 0..side {
-                for c1 in 0..side {
-                    for c0 in 0..side {
-                        if c0 < base_k && c1 < base_k && c2 < base_k {
-                            continue;
-                        }
-                        let g = c0 + c1 * stride_g1 + c2 * stride_g2;
-                        out.push(F::from(out_grid[g] as u64));
-                    }
-                }
-            }
-            if out.len() != k_star {
-                return Err("eval_e_at_positions: total length mismatch".to_string());
-            }
+            let mut out = vec![F::ZERO; k_star];
+            self.eval_e_at_positions_into(positions, y, &mut out)?;
             return Ok(out);
         }
 
@@ -583,6 +569,162 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
                 out.push(acc);
             }
             Ok(out)
+        }
+    }
+
+    fn eval_e_at_positions_into(
+        &self,
+        positions: &[usize],
+        y: &[F],
+        out: &mut [F],
+    ) -> Result<(), String>
+    where
+        Self: Sync,
+    {
+        if Self::is_f257() && self.rank == 3 {
+            // This fast path assumes the canonical Layout A evaluation order, i.e.
+            // `positions == witness_positions_star()`.
+            if let Ok(expected) = self.witness_positions_star() {
+                if positions != expected.as_slice() {
+                    return Err(
+                        "eval_e_at_positions_into: F257 rank=3 fast path requires positions == witness_positions_star()"
+                            .to_string(),
+                    );
+                }
+            }
+
+            let base_k = self.base_k;
+            let side = 2 * base_k - 1;
+            if side > self.base_n {
+                return Err("eval_e_at_positions_into: side out of range".to_string());
+            }
+            let k = self.dim_k();
+            if y.len() != k {
+                return Err("eval_e_at_positions_into: bad y length".to_string());
+            }
+            let k_star = self.dim_k_star();
+            if positions.len() != k_star || out.len() != k_star {
+                return Err("eval_e_at_positions_into: bad positions/out length".to_string());
+            }
+
+            // Tensor layout conventions:
+            // - Message y is indexed as flat = i0 + i1*base_k + i2*base_k^2 (dim0 least-significant).
+            // - We evaluate E(y) on the side^3 grid of coordinates (c0,c1,c2) with 0<=c*<side.
+            // - Output grid is indexed as g = c0 + c1*side + c2*side^2 (same digit order).
+            let stride_y1 = base_k;
+            let stride_y2 = base_k * base_k;
+            let stride_g1 = side;
+            let stride_g2 = side * side;
+
+            TENSOR_RS_F257_R3_SCRATCH.with(|cell| {
+                let mut s = cell.borrow_mut();
+
+                if s.y_u16.len() != k {
+                    s.y_u16.resize(k, 0u16);
+                }
+                for (i, yi) in y.iter().copied().enumerate() {
+                    s.y_u16[i] = f_to_u16(yi);
+                }
+
+                let t0_len = side * base_k * base_k;
+                if s.t0.len() != t0_len {
+                    s.t0.resize(t0_len, 0u16);
+                }
+                // Pass 1: interpolate along dim0.
+                for i2 in 0..base_k {
+                    for i1 in 0..base_k {
+                        let base_y = i1 * stride_y1 + i2 * stride_y2;
+                        let out_base = stride_g1 * (i1 + base_k * i2);
+                        for c0 in 0..side {
+                            let lam0 = &self.lam_k_u16[c0 * base_k..(c0 + 1) * base_k];
+                            let mut acc: u32 = 0;
+                            for i0 in 0..base_k {
+                                acc += (lam0[i0] as u32) * (s.y_u16[base_y + i0] as u32);
+                            }
+                            s.t0[out_base + c0] = reduce_mod257_u32(acc);
+                        }
+                    }
+                }
+
+                let t1_len = side * side * base_k;
+                if s.t1.len() != t1_len {
+                    s.t1.resize(t1_len, 0u16);
+                }
+                // Pass 2: interpolate along dim1.
+                for i2 in 0..base_k {
+                    for c0 in 0..side {
+                        let out_base = stride_g1 * (c0 + side * i2);
+                        for c1 in 0..side {
+                            let lam1 = &self.lam_k_u16[c1 * base_k..(c1 + 1) * base_k];
+                            let mut acc: u32 = 0;
+                            for i1 in 0..base_k {
+                                let v = s.t0[c0 + side * (i1 + base_k * i2)];
+                                acc += (lam1[i1] as u32) * (v as u32);
+                            }
+                            s.t1[out_base + c1] = reduce_mod257_u32(acc);
+                        }
+                    }
+                }
+
+                let grid_len = side * side * side;
+                if s.out_grid.len() != grid_len {
+                    s.out_grid.resize(grid_len, 0u16);
+                }
+                // Pass 3: interpolate along dim2.
+                for c2 in 0..side {
+                    let lam2 = &self.lam_k_u16[c2 * base_k..(c2 + 1) * base_k];
+                    for c1 in 0..side {
+                        for c0 in 0..side {
+                            let mut acc: u32 = 0;
+                            for i2 in 0..base_k {
+                                let v = s.t1[c1 + side * (c0 + side * i2)];
+                                acc += (lam2[i2] as u32) * (v as u32);
+                            }
+                            s.out_grid[c0 + c1 * stride_g1 + c2 * stride_g2] = reduce_mod257_u32(acc);
+                        }
+                    }
+                }
+
+                // Emit in the exact order of `witness_positions_star()` (Layout A).
+                let mut w = 0usize;
+                // Low cube.
+                for i2 in 0..base_k {
+                    for i1 in 0..base_k {
+                        for i0 in 0..base_k {
+                            let g = i0 + i1 * stride_g1 + i2 * stride_g2;
+                            out[w] = F::from(s.out_grid[g] as u64);
+                            w += 1;
+                        }
+                    }
+                }
+                if w != k {
+                    return Err("eval_e_at_positions_into: low cube length mismatch".to_string());
+                }
+                // Rest of side-cube, skipping low cube points.
+                for c2 in 0..side {
+                    for c1 in 0..side {
+                        for c0 in 0..side {
+                            if c0 < base_k && c1 < base_k && c2 < base_k {
+                                continue;
+                            }
+                            let g = c0 + c1 * stride_g1 + c2 * stride_g2;
+                            out[w] = F::from(s.out_grid[g] as u64);
+                            w += 1;
+                        }
+                    }
+                }
+                if w != k_star {
+                    return Err("eval_e_at_positions_into: total length mismatch".to_string());
+                }
+                Ok(())
+            })
+        } else {
+            let tmp = <Self as MulCode<F>>::eval_e_at_positions(self, positions, y)?;
+            if tmp.len() != out.len() {
+                return Err("eval_e_at_positions_into: bad eval length".to_string());
+            }
+            out.copy_from_slice(&tmp);
+            Ok(())
         }
     }
 
@@ -653,304 +795,6 @@ pub struct MulCodeDr1csNpFlpcpSparse<F: PrimeField, C: MulCode<F>> {
     /// Number of public variables in `z` (prefix length).
     pub l: usize,
     pub code: C,
-}
-
-/// Chunked multiplication-code FLPCP backend.
-///
-/// - Splits dR1CS constraints into fixed-size blocks of `k = code.dim_k()`.
-/// - Proof layout: `π0 = (z_w || w_eval^(0) || ... || w_eval^(B-1))`.
-/// - Verifier coins `idx` encode the block selector: `block_id = idx / ell`.
-#[derive(Clone, Debug)]
-pub struct ChunkedMulCodeDr1csNpFlpcpSparse<F: PrimeField, C: MulCode<F>> {
-    pub blocks: Vec<Dr1csInstanceSparse<F>>,
-    pub l: usize,
-    pub code: C,
-}
-
-impl<F: PrimeField, C: MulCode<F> + Sync> ChunkedMulCodeDr1csNpFlpcpSparse<F, C> {
-    pub fn new(blocks: Vec<Dr1csInstanceSparse<F>>, l: usize, code: C) -> Result<Self, String> {
-        if blocks.is_empty() {
-            return Err("no blocks".to_string());
-        }
-        let k = code.dim_k();
-        for (i, inst) in blocks.iter().enumerate() {
-            if inst.k() != k {
-                return Err(format!("block {i}: k mismatch"));
-            }
-            if l > inst.n {
-                return Err(format!("block {i}: bad public length"));
-            }
-        }
-        Ok(Self { blocks, l, code })
-    }
-
-    fn ell(&self) -> usize {
-        self.code.len_l()
-    }
-
-    fn k_star(&self) -> usize {
-        self.code.dim_k_star()
-    }
-
-    pub(crate) fn compute_block_w_eval(
-        &self,
-        inst: &Dr1csInstanceSparse<F>,
-        witness_pos: &[usize],
-        x: &[F],
-        z_w: &[F],
-        x_u16: Option<&[u16]>,
-        z_u16: Option<&[u16]>,
-    ) -> Result<Vec<F>, String> {
-        let k = inst.k();
-        let k_star = self.k_star();
-        if witness_pos.len() != k_star {
-            return Err("witness positions length mismatch".to_string());
-        }
-
-        let (y_a, y_b) = join(
-            || mat_vec_sparse_np(&inst.a, x, z_w, self.l, x_u16, z_u16),
-            || mat_vec_sparse_np(&inst.b, x, z_w, self.l, x_u16, z_u16),
-        );
-        if y_a.len() != k || y_b.len() != k {
-            return Err("bad mat-vec size".to_string());
-        }
-
-        // Canonical path: evaluate E(y_a), E(y_b) at the precomputed witness positions once,
-        // then multiply componentwise.
-        let ea = self.code.eval_e_at_positions(witness_pos, &y_a)?;
-        let eb = self.code.eval_e_at_positions(witness_pos, &y_b)?;
-        if ea.len() != k_star || eb.len() != k_star {
-            return Err("bad eval_e_at_positions length".to_string());
-        }
-
-        let mut w_eval = vec![F::ZERO; k_star];
-        if k_star >= 256 {
-            w_eval
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(j, out)| *out = ea[j] * eb[j]);
-        } else {
-            for j in 0..k_star {
-                w_eval[j] = ea[j] * eb[j];
-            }
-        }
-        Ok(w_eval)
-    }
-
-    fn decode_block_idx(&self, idx: usize) -> Result<(usize, usize), String> {
-        let ell = self.ell();
-        if ell == 0 {
-            return Err("ell=0".to_string());
-        }
-        let block_id = idx / ell;
-        let local_idx = idx % ell;
-        if block_id >= self.blocks.len() {
-            return Err("bad block id".to_string());
-        }
-        Ok((block_id, local_idx))
-    }
-
-    /// Streaming-friendly proof generation.
-    ///
-    /// This emits each `w_eval` chunk to `on_chunk` as it is computed, while still returning
-    /// the full `π0 = (z_w || w^(0) || ... || w^(B-1))` for compatibility.
-    pub fn prove_stream(
-        &self,
-        x: &[F],
-        z_w: &[F],
-        on_chunk: &mut dyn FnMut(usize, &[F]),
-    ) -> Result<Vec<F>, String> {
-        let z_w_len = self.blocks[0].n - self.l;
-        if x.len() != self.l {
-            return Err("bad public input length".to_string());
-        }
-        if z_w.len() != z_w_len {
-            return Err("bad witness length".to_string());
-        }
-        let mut pi = Vec::with_capacity(self.m());
-        pi.extend_from_slice(z_w);
-
-        // This depends only on code parameters, so compute once and reuse across blocks.
-        let witness_pos = self.code.witness_positions_star()?;
-        if witness_pos.len() != self.k_star() {
-            return Err("witness positions length mismatch".to_string());
-        }
-
-        // F257 optimization: converting `z_w` to u16 is expensive; do it once for all blocks.
-        let (x_u16, z_u16) = if is_f257_field::<F>() {
-            (
-                Some(x.iter().copied().map(f_to_u16).collect::<Vec<_>>()),
-                Some(z_w.iter().copied().map(f_to_u16).collect::<Vec<_>>()),
-            )
-        } else {
-            (None, None)
-        };
-
-        for (b, inst) in self.blocks.iter().enumerate() {
-            let w_eval = self.compute_block_w_eval(
-                inst,
-                &witness_pos,
-                x,
-                z_w,
-                x_u16.as_deref(),
-                z_u16.as_deref(),
-            )?;
-            on_chunk(b, &w_eval);
-            pi.extend_from_slice(&w_eval);
-        }
-        Ok(pi)
-    }
-
-    pub(crate) fn stream_queries_for_coins_sparse(
-        &self,
-        idx: usize,
-        lambda: F,
-        x: &[F],
-        scratch: &mut Dr1csQueryScratch<F>,
-        sink: &mut dyn QuerySink<F>,
-    ) -> Result<(), String> {
-        if x.len() != self.l {
-            return Err("bad input".to_string());
-        }
-        let (block_id, local_idx) = self.decode_block_idx(idx)?;
-        let inst = &self.blocks[block_id];
-        let k = inst.k();
-        let k_star = self.k_star();
-        let z_w_len = inst.n - self.l;
-        let base = self.l + z_w_len;
-        let block_offset = base + (block_id * k_star);
-
-        scratch.clear();
-        let q_a_z = &mut scratch.q_a_z;
-        let q_b_z = &mut scratch.q_b_z;
-        let q_cx2_z = &mut scratch.q_cx2_z;
-
-        self.code.row_e_stream(local_idx, &mut |i, c| {
-            add_scaled_sparse_row_into_acc(q_a_z, &inst.a[i], c);
-            add_scaled_sparse_row_into_acc(q_b_z, &inst.b[i], c);
-        })?;
-
-        self.code.row_e_star_stream(local_idx, &mut |j, c| {
-            if j < k {
-                add_scaled_sparse_row_into_acc(q_cx2_z, &inst.c[j], c);
-            }
-            let coeff = if j < k { c - (lambda * c) } else { c };
-            if !coeff.is_zero() {
-                sink.on_q3(coeff, block_offset + j);
-            }
-        })?;
-
-        for (idx, c) in q_a_z.take_terms().into_iter() {
-            let (is_pub, j) = map_z_index_to_v(self.l, idx);
-            let v_idx = if is_pub { j } else { self.l + j };
-            sink.on_q1(c, v_idx);
-        }
-        for (idx, c) in q_b_z.take_terms().into_iter() {
-            let (is_pub, j) = map_z_index_to_v(self.l, idx);
-            let v_idx = if is_pub { j } else { self.l + j };
-            sink.on_q2(c, v_idx);
-        }
-        for (idx, c) in q_cx2_z.take_terms().into_iter() {
-            let cc = lambda * c;
-            if cc.is_zero() {
-                continue;
-            }
-            let (is_pub, j) = map_z_index_to_v(self.l, idx);
-            let v_idx = if is_pub { j } else { self.l + j };
-            sink.on_q3(cc, v_idx);
-        }
-
-        Ok(())
-    }
-}
-
-impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
-    for ChunkedMulCodeDr1csNpFlpcpSparse<F, C>
-{
-    fn n(&self) -> usize {
-        self.l
-    }
-
-    fn m(&self) -> usize {
-        let z_w_len = self.blocks[0].n - self.l;
-        z_w_len + (self.k_star() * self.blocks.len())
-    }
-
-    fn ell(&self) -> usize {
-        self.ell() * self.blocks.len()
-    }
-
-    fn blocks(&self) -> usize {
-        self.blocks.len()
-    }
-
-    fn ell_local(&self) -> usize {
-        self.ell()
-    }
-
-    fn prove(&self, x: &[F], z_w: &[F]) -> Vec<F> {
-        let z_w_len = self.blocks[0].n - self.l;
-        assert_eq!(x.len(), self.l);
-        assert_eq!(z_w.len(), z_w_len);
-
-        let mut pi = Vec::with_capacity(self.m());
-        pi.extend_from_slice(z_w);
-
-        // This depends only on code parameters, so compute once and reuse across blocks.
-        let witness_pos = self
-            .code
-            .witness_positions_star()
-            .expect("witness positions");
-        assert_eq!(witness_pos.len(), self.k_star());
-
-        for inst in self.blocks.iter() {
-            let w_eval = self
-                .compute_block_w_eval(inst, &witness_pos, x, z_w, None, None)
-                .expect("block w_eval failed");
-            pi.extend_from_slice(&w_eval);
-        }
-        pi
-    }
-
-    fn queries_for_coins_sparse(
-        &self,
-        idx: usize,
-        lambda: F,
-        x: &[F],
-    ) -> Result<(Vec<SparseVec<F>>, FlpcpPredicate<F>), String> {
-        struct VecSink<F: PrimeField> {
-            q1: Vec<(F, usize)>,
-            q2: Vec<(F, usize)>,
-            q3: Vec<(F, usize)>,
-        }
-        impl<F: PrimeField> QuerySink<F> for VecSink<F> {
-            fn on_q1(&mut self, coeff: F, idx: usize) {
-                self.q1.push((coeff, idx));
-            }
-            fn on_q2(&mut self, coeff: F, idx: usize) {
-                self.q2.push((coeff, idx));
-            }
-            fn on_q3(&mut self, coeff: F, idx: usize) {
-                self.q3.push((coeff, idx));
-            }
-        }
-        let mut sink = VecSink {
-            q1: Vec::new(),
-            q2: Vec::new(),
-            q3: Vec::new(),
-        };
-        let mut scratch = Dr1csQueryScratch::<F>::new(self.blocks[0].n);
-        self.stream_queries_for_coins_sparse(idx, lambda, x, &mut scratch, &mut sink)?;
-
-        Ok((
-            vec![
-                SparseVec::new(sink.q1),
-                SparseVec::new(sink.q2),
-                SparseVec::new(sink.q3),
-            ],
-            FlpcpPredicate::MulEq,
-        ))
-    }
 }
 
 impl<F: PrimeField, C: MulCode<F> + Sync> MulCodeDr1csNpFlpcpSparse<F, C> {
@@ -1129,6 +973,14 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         self.l
     }
 
+    fn n_total(&self) -> usize {
+        self.inst.n
+    }
+
+    fn z_w_len(&self) -> usize {
+        self.inst.n - self.l
+    }
+
     fn m(&self) -> usize {
         (self.inst.n - self.l) + self.code.dim_k_star()
     }
@@ -1145,6 +997,67 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         self.code.len_l()
     }
 
+    fn k_star(&self) -> usize {
+        self.code.dim_k_star()
+    }
+
+    fn witness_positions_star(&self) -> Result<Vec<usize>, String> {
+        self.code.witness_positions_star()
+    }
+
+    fn stream_w_eval_blocks(
+        &self,
+        witness_pos: &[usize],
+        x: &[F],
+        z_w: &[F],
+        x_u16: Option<&[u16]>,
+        z_u16: Option<&[u16]>,
+        on_block: &mut dyn FnMut(usize, &[F]),
+    ) -> Result<(), String> {
+        // Single-block backend: compute one `w_eval` and stream it as block 0.
+        let k = self.inst.k();
+        let k_star = self.code.dim_k_star();
+        if witness_pos.len() != k_star {
+            return Err("stream_w_eval_blocks: witness positions length mismatch".to_string());
+        }
+        let (y_a, y_b) = join(
+            || mat_vec_sparse_np(&self.inst.a, x, z_w, self.l, x_u16, z_u16),
+            || mat_vec_sparse_np(&self.inst.b, x, z_w, self.l, x_u16, z_u16),
+        );
+        if y_a.len() != k || y_b.len() != k {
+            return Err("stream_w_eval_blocks: bad mat-vec size".to_string());
+        }
+        let ea = self.code.eval_e_at_positions(witness_pos, &y_a)?;
+        let eb = self.code.eval_e_at_positions(witness_pos, &y_b)?;
+        if ea.len() != k_star || eb.len() != k_star {
+            return Err("stream_w_eval_blocks: bad eval length".to_string());
+        }
+        let mut w_eval = vec![F::ZERO; k_star];
+        if k_star >= 256 {
+            w_eval
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(j, out)| *out = ea[j] * eb[j]);
+        } else {
+            for j in 0..k_star {
+                w_eval[j] = ea[j] * eb[j];
+            }
+        }
+        on_block(0, &w_eval);
+        Ok(())
+    }
+
+    fn stream_queries_for_coins_sparse(
+        &self,
+        idx: usize,
+        lambda: F,
+        x: &[F],
+        scratch: &mut Dr1csQueryScratch<F>,
+        sink: &mut dyn QuerySink<F>,
+    ) -> Result<(), String> {
+        MulCodeDr1csNpFlpcpSparse::stream_queries_for_coins_sparse(self, idx, lambda, x, scratch, sink)
+    }
+
     fn prove(&self, x: &[F], z_w: &[F]) -> Vec<F> {
         MulCodeDr1csNpFlpcpSparse::prove_checked(self, x, z_w)
             .expect("mulcode prove failed")
@@ -1156,7 +1069,37 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         lambda: F,
         x: &[F],
     ) -> Result<(Vec<SparseVec<F>>, FlpcpPredicate<F>), String> {
-        self.queries_for_coins_sparse(idx, lambda, x)
+        struct VecSink<F: PrimeField> {
+            q1: Vec<(F, usize)>,
+            q2: Vec<(F, usize)>,
+            q3: Vec<(F, usize)>,
+        }
+        impl<F: PrimeField> QuerySink<F> for VecSink<F> {
+            fn on_q1(&mut self, coeff: F, idx: usize) {
+                self.q1.push((coeff, idx));
+            }
+            fn on_q2(&mut self, coeff: F, idx: usize) {
+                self.q2.push((coeff, idx));
+            }
+            fn on_q3(&mut self, coeff: F, idx: usize) {
+                self.q3.push((coeff, idx));
+            }
+        }
+        let mut sink = VecSink {
+            q1: Vec::new(),
+            q2: Vec::new(),
+            q3: Vec::new(),
+        };
+        let mut scratch = Dr1csQueryScratch::<F>::new(self.inst.n);
+        MulCodeDr1csNpFlpcpSparse::stream_queries_for_coins_sparse(self, idx, lambda, x, &mut scratch, &mut sink)?;
+        Ok((
+            vec![
+                SparseVec::new(sink.q1),
+                SparseVec::new(sink.q2),
+                SparseVec::new(sink.q3),
+            ],
+            FlpcpPredicate::MulEq,
+        ))
     }
 }
 
@@ -1691,6 +1634,14 @@ impl<F: PrimeField + FftField> Dr1csNpFlpcpSparseApi<F> for RsDr1csNpFlpcpSparse
         self.l
     }
 
+    fn n_total(&self) -> usize {
+        self.inst.n
+    }
+
+    fn z_w_len(&self) -> usize {
+        self.inst.n - self.l
+    }
+
     fn m(&self) -> usize {
         (self.inst.n - self.l) + 2 * self.inst.k()
     }
@@ -1705,6 +1656,58 @@ impl<F: PrimeField + FftField> Dr1csNpFlpcpSparseApi<F> for RsDr1csNpFlpcpSparse
 
     fn ell_local(&self) -> usize {
         self.ell
+    }
+
+    fn k_star(&self) -> usize {
+        // RS-NP backend stores `w` of length 2k (not a multiplication-code k*).
+        2 * self.inst.k()
+    }
+
+    fn witness_positions_star(&self) -> Result<Vec<usize>, String> {
+        // Identity layout (best-effort; this backend is not used by Theorem-4.3 chunked prover).
+        Ok((0..self.k_star()).collect())
+    }
+
+    fn stream_w_eval_blocks(
+        &self,
+        _witness_pos: &[usize],
+        x: &[F],
+        z_w: &[F],
+        _x_u16: Option<&[u16]>,
+        _z_u16: Option<&[u16]>,
+        on_block: &mut dyn FnMut(usize, &[F]),
+    ) -> Result<(), String> {
+        let pi = RsDr1csNpFlpcpSparse::prove(self, x, z_w);
+        if pi.len() < z_w.len() {
+            return Err("rs stream_w_eval_blocks: bad proof length".to_string());
+        }
+        let w = &pi[z_w.len()..];
+        on_block(0, w);
+        Ok(())
+    }
+
+    fn stream_queries_for_coins_sparse(
+        &self,
+        idx: usize,
+        lambda: F,
+        x: &[F],
+        _scratch: &mut Dr1csQueryScratch<F>,
+        sink: &mut dyn QuerySink<F>,
+    ) -> Result<(), String> {
+        let (qs, _pred) = RsDr1csNpFlpcpSparse::queries_for_coins_sparse(self, idx, lambda, x)?;
+        if qs.len() != 3 {
+            return Err("rs stream_queries_for_coins_sparse: expected 3 queries".to_string());
+        }
+        for (c, i) in qs[0].terms.iter().copied() {
+            sink.on_q1(c, i);
+        }
+        for (c, i) in qs[1].terms.iter().copied() {
+            sink.on_q2(c, i);
+        }
+        for (c, i) in qs[2].terms.iter().copied() {
+            sink.on_q3(c, i);
+        }
+        Ok(())
     }
 
     fn prove(&self, x: &[F], z_w: &[F]) -> Vec<F> {
@@ -1906,22 +1909,47 @@ fn map_z_index_to_v(l: usize, idx: usize) -> (bool, usize) {
     }
 }
 
-struct SparseAccumulator<F: PrimeField> {
-    vals: Vec<F>,
-    touched: Vec<usize>,
+enum SparseAccumulator<F: PrimeField> {
+    Dense {
+        vals: Vec<F>,
+        touched: Vec<usize>,
+    },
+    Map {
+        map: HashMap<usize, F>,
+    },
 }
 
 impl<F: PrimeField> SparseAccumulator<F> {
     fn new(len: usize) -> Self {
-        Self {
-            vals: vec![F::ZERO; len],
-            touched: Vec::new(),
+        // For huge variable domains, a dense accumulator is a RAM bomb.
+        //
+        // We switch to a hash-map-backed accumulator once the dense `vals` vector would become
+        // too large. This is on the arming/query side (not prover hot loops), so the asymptotic
+        // and constant-factor hit is acceptable compared to OOM.
+        //
+        // Empirically, a threshold around 1e6 keeps dense mode fast for small instances while
+        // avoiding multi-GB allocations for large WE shapes.
+        const DENSE_MAX_LEN: usize = 1_000_000;
+        if len <= DENSE_MAX_LEN {
+            Self::Dense {
+                vals: vec![F::ZERO; len],
+                touched: Vec::new(),
+            }
+        } else {
+            Self::Map { map: HashMap::new() }
         }
     }
 
     fn clear(&mut self) {
-        for idx in self.touched.drain(..) {
-            self.vals[idx] = F::ZERO;
+        match self {
+            SparseAccumulator::Dense { vals, touched } => {
+                for idx in touched.drain(..) {
+                    vals[idx] = F::ZERO;
+                }
+            }
+            SparseAccumulator::Map { map } => {
+                map.clear();
+            }
         }
     }
 
@@ -1929,22 +1957,39 @@ impl<F: PrimeField> SparseAccumulator<F> {
         if coeff.is_zero() {
             return;
         }
-        if self.vals[idx].is_zero() {
-            self.touched.push(idx);
+        match self {
+            SparseAccumulator::Dense { vals, touched } => {
+                if vals[idx].is_zero() {
+                    touched.push(idx);
+                }
+                vals[idx] += coeff;
+            }
+            SparseAccumulator::Map { map } => {
+                let e = map.entry(idx).or_insert(F::ZERO);
+                *e += coeff;
+                // Keep map small-ish if cancellation happens.
+                if e.is_zero() {
+                    map.remove(&idx);
+                }
+            }
         }
-        self.vals[idx] += coeff;
     }
 
     fn take_terms(&mut self) -> Vec<(usize, F)> {
-        let mut out = Vec::with_capacity(self.touched.len());
-        for idx in self.touched.drain(..) {
-            let c = self.vals[idx];
-            if !c.is_zero() {
-                out.push((idx, c));
+        match self {
+            SparseAccumulator::Dense { vals, touched } => {
+                let mut out = Vec::with_capacity(touched.len());
+                for idx in touched.drain(..) {
+                    let c = vals[idx];
+                    if !c.is_zero() {
+                        out.push((idx, c));
+                    }
+                    vals[idx] = F::ZERO;
+                }
+                out
             }
-            self.vals[idx] = F::ZERO;
+            SparseAccumulator::Map { map } => map.drain().collect(),
         }
-        out
     }
 }
 
@@ -1967,6 +2012,44 @@ impl<F: PrimeField> Dr1csQueryScratch<F> {
         self.q_a_z.clear();
         self.q_b_z.clear();
         self.q_cx2_z.clear();
+    }
+
+    /// Clear all internal accumulators.
+    ///
+    /// This is public so out-of-crate FLPCP backends can implement streaming query generation
+    /// without needing access to private fields.
+    pub fn clear_all(&mut self) {
+        self.clear();
+    }
+
+    #[inline]
+    pub fn add_q1_term_on_z(&mut self, idx: usize, coeff: F) {
+        self.q_a_z.add_term(idx, coeff);
+    }
+
+    #[inline]
+    pub fn add_q2_term_on_z(&mut self, idx: usize, coeff: F) {
+        self.q_b_z.add_term(idx, coeff);
+    }
+
+    #[inline]
+    pub fn add_q3_cx2_term_on_z(&mut self, idx: usize, coeff: F) {
+        self.q_cx2_z.add_term(idx, coeff);
+    }
+
+    #[inline]
+    pub fn take_q1_terms_on_z(&mut self) -> Vec<(usize, F)> {
+        self.q_a_z.take_terms()
+    }
+
+    #[inline]
+    pub fn take_q2_terms_on_z(&mut self) -> Vec<(usize, F)> {
+        self.q_b_z.take_terms()
+    }
+
+    #[inline]
+    pub fn take_q3_cx2_terms_on_z(&mut self) -> Vec<(usize, F)> {
+        self.q_cx2_z.take_terms()
     }
 }
 
