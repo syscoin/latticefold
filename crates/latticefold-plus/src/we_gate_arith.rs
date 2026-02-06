@@ -6370,12 +6370,7 @@ mod tests {
         let armer_seed = [7u8; 32];
         let lock_j = 0u64;
 
-        // Canonical MLWE/RLWE hint arming; use tiny noise for deterministic-ish tests.
-        let ringlwe_params = RingLweParams {
-            binomial_k: 1,
-            recon_bits: 8,
-            ..RingLweParams::default()
-        };
+        let ringlwe_params = RingLweParams::default();
         let dummy_payload: [u8; 0] = [];
 
         let mut rng = StdRng::seed_from_u64(42);
@@ -6637,8 +6632,6 @@ mod tests {
         // MLWE/RLWE hint locks (one per Shamir share).
         // Disable noise for deterministic AEAD key agreement in tests.
         let ringlwe_params = RingLweParams {
-            binomial_k: 1,
-            recon_bits: 8,
             ..RingLweParams::default()
         };
         let stmt_digest = [5u8; 32];
@@ -6654,7 +6647,6 @@ mod tests {
                     &params,
                     &public_inputs_bytes_f257,
                     stmt_digest,
-                    // Different armer seeds per share-lock (models per-lock independent arming).
                     [11u8.wrapping_add(i as u8); 32],
                     lock_j,
                     0,
@@ -6905,29 +6897,40 @@ mod tests {
         let ringlwe_params = RingLweParams::default();
         let stmt_digest = [5u8; 32];
 
-        // Each armer samples a secret scalar and computes their public point.
+        // Each armer samples a secret scalar. Individual P_j = s_j·G are NEVER published.
+        // Only the combined P_combined is public (derived Bitcoin address).
+        //
+        // Production protocol (2 rounds, private channel between armers):
+        //   Round 1: each armer j sends commitment H_j = SHA256(P_j || nonce_j) to all others.
+        //   Round 2: each armer j reveals (P_j, nonce_j); all verify H_j and compute P_combined.
+        //   Only P_combined is published on-chain. Individual P_j stay private to the armer group.
+        //
+        // This prevents:
+        //   - Public per-armer oracle: nobody outside the group knows P_j
+        //   - Equivocation: commitment H_j binds P_j before reveal
+        //
+        // Here we simulate this: each armer generates s_j, the test computes P_combined
+        // (as the armers would privately), and only P_combined + the address are "public."
+
         let mut armer_secrets: Vec<[u8; 32]> = Vec::with_capacity(N_ARMERS);
-        let mut armer_pubkeys: Vec<ProjectivePoint> = Vec::with_capacity(N_ARMERS);
-        for j in 0..N_ARMERS {
+        // Simulate private P_j accumulation (armers share P_j only with each other).
+        let mut p_combined = ProjectivePoint::IDENTITY;
+        for _j in 0..N_ARMERS {
             let mut sk = [0u8; 32];
             rng.fill_bytes(&mut sk);
-            // Ensure nonzero scalar.
-            sk[31] |= 1;
+            sk[31] |= 1; // ensure nonzero
             let scalar = scalar_from_bytes_mod_order(&sk);
-            let pk = ProjectivePoint::GENERATOR * scalar;
-            // Store the REDUCED scalar bytes (mod order) as the secret.
             let scalar_bytes: [u8; 32] = scalar.to_bytes().into();
             armer_secrets.push(scalar_bytes);
-            armer_pubkeys.push(pk);
-            eprintln!("[btc_3armer] armer {j}: pubkey = {:?}", point_to_compressed(&pk));
+            // Each armer adds their P_j to the running sum (private, between armers only).
+            p_combined += ProjectivePoint::GENERATOR * scalar;
         }
 
-        // Combined public key: P_combined = P_0 + P_1 + P_2
-        let p_combined: ProjectivePoint = armer_pubkeys.iter().copied().sum();
+        // ONLY P_combined is public. No individual P_j escapes the armer group.
         let p_combined_compressed = point_to_compressed(&p_combined);
         let address_hash = pubkey_to_p2wpkh_hash(&p_combined_compressed);
-        eprintln!("[btc_3armer] P_combined = {:?}", p_combined_compressed);
-        eprintln!("[btc_3armer] P2WPKH address hash = {:02x?}", address_hash);
+        eprintln!("[btc_3armer] P_combined (public) = {:?}", p_combined_compressed);
+        eprintln!("[btc_3armer] P2WPKH address hash (public) = {:02x?}", address_hash);
 
         // Each armer: Shamir-split their secret, arm R locks.
         let t_arm = Instant::now();
@@ -7261,11 +7264,7 @@ mod tests {
         let stmt_digest = [3u8; 32];
         let armer_seed = [7u8; 32];
         let lock_j = 0u64;
-        let ringlwe_params = RingLweParams {
-            binomial_k: 1,
-            recon_bits: 8,
-            ..RingLweParams::default()
-        };
+        let ringlwe_params = RingLweParams::default();
         let dummy_payload: [u8; 0] = [];
 
         let mut rng = StdRng::seed_from_u64(42);

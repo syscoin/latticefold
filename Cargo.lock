@@ -870,6 +870,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rand",
+ "rand_chacha",
  "rand_distr",
  "rayon",
  "ripemd",

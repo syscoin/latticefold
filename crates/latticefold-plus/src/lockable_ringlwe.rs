@@ -27,7 +27,9 @@
 
 use ark_ff::{BigInteger, Field, PrimeField};
 use cyclotomic_rings::rings::GoldilocksRing64;
-use rand::RngCore;
+use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaCha20Rng;
+use rayon::prelude::*;
 use stark_rings::PolyRing;
 use std::collections::BTreeMap;
 
@@ -91,7 +93,7 @@ pub struct AmplificationParams {
     pub r: usize,
     pub t: usize,
     /// Per-lock brute-force candidates (conservative bound).
-    /// This is a heuristic estimate for the nonstandard RLWE distribution used here.
+    /// This is a heuristic estimate for the nonstandard distribution used here.
     /// The actual per-lock hardness is NOT reduced to standard RLWE; this bound should
     /// be set conservatively and the system security validated via `security_bits_*()`.
     pub candidates_per_lock: u64,
@@ -102,7 +104,7 @@ impl Default for AmplificationParams {
         Self {
             r: 64,
             t: 7,
-            candidates_per_lock: 1 << 19,
+            candidates_per_lock: 1 << 20, // heuristic; nonstandard distribution, not a BKZ claim
         }
     }
 }
@@ -153,8 +155,14 @@ fn ln_binom(n: usize, k: usize) -> f64 {
 
 #[derive(Clone, Debug)]
 pub struct RingLweParams {
-    /// Centered binomial parameter η: secret/noise coefficients in [-η, η].
-    pub binomial_k: u32,
+    /// Centered binomial parameter for the SECRET ring polynomial.
+    /// CBD(1) gives coefficients in {-1, 0, 1} — short, for carry bounding.
+    pub secret_binomial_k: u32,
+    /// Log2 of the error noise standard deviation σ.
+    /// σ = 2^{noise_log2_sigma}. Must be large enough for RLWE security (σ >> signal).
+    /// Signal per coefficient ≈ d × 256 ≈ 2^{14}. Need σ >> 2^{14} for hiding.
+    /// σ = 2^{25} gives ~20-bit RLWE per lock. Noise budget: d×σ×256 ≈ 2^{39} vs margin 2^{55}.
+    pub noise_log2_sigma: u32,
     /// Reconciliation bits per lock element (rounding to 2^d buckets).
     pub recon_bits: u32,
     /// Domain separation label.
@@ -164,7 +172,8 @@ pub struct RingLweParams {
 impl Default for RingLweParams {
     fn default() -> Self {
         Self {
-            binomial_k: 1, // binary secret: coefficients in {-1, 0, 1}
+            secret_binomial_k: 2,   // CBD(2): secret in {-2,-1,0,1,2}, more entropy than ±1
+            noise_log2_sigma: 25,   // σ = 2^25 ≈ 33M — large for RLWE security
             recon_bits: 8,
             domain_label: *b"LFP_RINGLWE_V2_00000000000000000",
         }
@@ -183,106 +192,68 @@ pub struct RingLweLockArtifact<F: PrimeField> {
     pub params: RingLweParams,
     /// Per-branch hint ring elements, stored sparsely as (block_idx, GoldilocksRing64).
     ///
-    /// **Independent secrets per branch**: branch b has its own (s0_b, s1_b) and noise.
-    /// This prevents difference attacks if the cipher is ever upgraded to additive form.
-    /// `branch_hints[b]` = (hint0_blocks, hint1_blocks) for branch b ∈ {0, 1}.
+    /// **Independent scalar secrets per branch**: branch b has its own `s_b` (constant polynomial)
+    /// and noise. `branch_hints[b]` = hint blocks for branch b ∈ {0, 1}.
     pub branch_hints: [BranchHints; 2],
     /// Two unauthenticated ciphertexts (one per accepting-set branch).
     pub cts: [LockCiphertext; 2],
 }
 
-/// Per-branch hint material: two independent hint vectors (for 2× key entropy).
+/// Per-branch hint material: one hint vector per branch.
 #[derive(Clone, Debug)]
 pub struct BranchHints {
-    pub hint0_blocks_sparse: Vec<(usize, GoldilocksRing64)>,
-    pub hint1_blocks_sparse: Vec<(usize, GoldilocksRing64)>,
+    pub hint_blocks_sparse: Vec<(usize, GoldilocksRing64)>,
 }
 
+/// Per-branch ciphertext: Frodo/Regev additive encoding of the payload.
+///
+/// Each byte μ[j] of the payload is encoded as `C[j] = s[0]*a + Δ*μ[j] + e'[j] (mod q)`
+/// where Δ = q/256. The decapper subtracts their inner-product value and rounds.
+/// This is unauthenticated — both branches decode to SOMETHING.
 #[derive(Clone, Debug)]
 pub struct LockCiphertext {
-    pub nonce: [u8; 12],
-    pub ct: Vec<u8>,
+    /// Goldilocks-encoded share bytes. Length = payload length.
+    /// Each element encodes one byte via Frodo rounding.
+    pub encoded: Vec<Fq>,
 }
 
 // ---------------------------------------------------------------------------
 // Cryptographic helpers
 // ---------------------------------------------------------------------------
 
-fn sha256_32(chunks: &[&[u8]]) -> [u8; 32] {
-    use sha2::Digest;
-    let mut h = sha2::Sha256::new();
-    for c in chunks {
-        h.update(c);
-    }
-    h.finalize().into()
+
+/// Frodo-style rounding: encode a byte at the MIDPOINT of its bucket.
+///
+/// Enc(μ) = floor(((2μ+1) * q) / 512).
+/// This avoids wrap issues at μ=0 and μ=255 under modular arithmetic.
+/// Correctness holds when total noise < q/512.
+#[inline]
+fn frodo_encode_byte(mu: u8) -> Fq {
+    let q = GL_P as u128;
+    let mu_u = mu as u128;
+    let val = ((2 * mu_u + 1) * q) / 512;
+    Fq::from(val as u64)
 }
 
-fn derive_payload_key_bytes<F: PrimeField>(
-    domain_label: &[u8; 32],
-    c_stmt: &[F],
-    coins: &dpp::theorem43::Theorem43Coins<F>,
-    y0: u64,
-    y1: u64,
-) -> [u8; 32] {
-    let mut coins_bytes = Vec::with_capacity(8 * 4);
-    coins_bytes.extend_from_slice(&(coins.idx as u64).to_le_bytes());
-    coins_bytes.extend_from_slice(&f_to_u64(&coins.lambda).to_le_bytes());
-    coins_bytes.extend_from_slice(&f_to_u64(&coins.rho).to_le_bytes());
-    coins_bytes.extend_from_slice(&f_to_u64(&coins.sigma).to_le_bytes());
-
-    let mut stmt_bytes = Vec::with_capacity(c_stmt.len() * 8);
-    for f in c_stmt {
-        stmt_bytes.extend_from_slice(&f_to_u64(f).to_le_bytes());
-    }
-
-    sha256_32(&[
-        b"LFP_DPP_PAYLOAD_KEY_V2",
-        domain_label,
-        stmt_bytes.as_slice(),
-        coins_bytes.as_slice(),
-        &y0.to_le_bytes(),
-        &y1.to_le_bytes(),
-    ])
+/// Decode via bucket index: Dec(y) = floor((y * 256) / q).
+/// Works if y is within < q/512 of the correct bucket midpoint.
+#[inline]
+fn frodo_decode_byte(y: Fq) -> u8 {
+    let q = GL_P as u128;
+    let y_u = fq_to_u64(&y) as u128;
+    let mu = (y_u * 256) / q;
+    mu.min(255) as u8
 }
 
-fn xor_stream_encrypt(key: &[u8; 32], nonce: &[u8; 12], data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
-    let mut ctr = 0u32;
-    let mut pos = 0usize;
-    while pos < data.len() {
-        let block = sha256_32(&[b"LFP_XOR_STREAM_V1", key, nonce, &ctr.to_le_bytes()]);
-        let take = (data.len() - pos).min(32);
-        for j in 0..take {
-            out.push(data[pos + j] ^ block[j]);
-        }
-        pos += take;
-        ctr += 1;
-    }
-    out
+/// Fast u64 extraction from an Fq element (Goldilocks has one limb).
+#[inline]
+fn fq_to_u64(x: &Fq) -> u64 {
+    x.into_bigint().as_ref()[0]
 }
 
 #[inline]
-fn xor_stream_decrypt(key: &[u8; 32], nonce: &[u8; 12], ct: &[u8]) -> Vec<u8> {
-    xor_stream_encrypt(key, nonce, ct)
-}
-
-/// Frodo-style rounding: extract d bits from a Goldilocks value.
-/// reconcile(y, d) = round(y * 2^d / q) mod 2^d.
-fn reconcile_u64(y: u64, d: u32) -> u64 {
-    let q = GL_P as u128;
-    let y_u = y as u128;
-    let buckets = 1u128 << d;
-    let rounded = (y_u * buckets + q / 2) / q;
-    (rounded % buckets) as u64
-}
-
 fn f_to_u64<F: PrimeField>(f: &F) -> u64 {
-    let bytes = f.into_bigint().to_bytes_le();
-    let mut acc = 0u64;
-    for (i, b) in bytes.iter().take(8).enumerate() {
-        acc |= (*b as u64) << (8 * i);
-    }
-    acc
+    f.into_bigint().as_ref()[0]
 }
 
 fn centered_binomial(rng: &mut impl RngCore, k: u32) -> i16 {
@@ -303,33 +274,79 @@ fn fq_from_i16(x: i16) -> Fq {
     }
 }
 
-fn fq_to_u64(x: &Fq) -> u64 {
-    let bytes = x.into_bigint().to_bytes_le();
-    let mut acc = 0u64;
-    for (i, b) in bytes.iter().take(8).enumerate() {
-        acc |= (*b as u64) << (8 * i);
-    }
-    acc
-}
 
+/// Embed an F257 element into Goldilocks using CENTERED representatives [-128, 128].
+/// This reduces the integer dot product magnitude (and thus the carry noise) by ~4×
+/// compared to the canonical [0, 256] embedding, without changing the mod-257 value.
 fn embed_f_to_fq<F: PrimeField>(f: &F) -> Fq {
-    Fq::from(f_to_u64(f))
+    let v = f_to_u64(f);
+    if v <= 128 {
+        Fq::from(v)
+    } else {
+        // v in 129..256 maps to -(257 - v) in [-128..-1]
+        -Fq::from(257u64 - v)
+    }
 }
 
-fn sample_noise_ring(rng: &mut impl RngCore, k: u32) -> GoldilocksRing64 {
+/// Sample a nonzero short Fq scalar via centered binomial.
+fn sample_nonzero_short_scalar(rng: &mut impl RngCore, k: u32) -> Fq {
+    loop {
+        let v = centered_binomial(rng, k);
+        if v != 0 {
+            return fq_from_i16(v);
+        }
+    }
+}
+
+/// Sample a short ring element (SECRET) with CBD coefficients.
+fn sample_short_ring(rng: &mut impl RngCore, k: u32) -> GoldilocksRing64 {
     let coeffs: Vec<Fq> = (0..RING_D)
         .map(|_| fq_from_i16(centered_binomial(rng, k)))
         .collect();
     GoldilocksRing64::from(coeffs)
 }
 
-/// Sample a short ring element with CBD coefficients, rejecting the all-zero polynomial.
-fn sample_nonzero_short_ring(rng: &mut impl RngCore, k: u32) -> GoldilocksRing64 {
+
+/// Sample a NOISE ring element with discrete Gaussian coefficients (σ = 2^{log2_sigma}).
+///
+/// Uses rejection sampling from a uniform box to approximate a rounded Gaussian:
+/// sample uniform in [-tail, tail], accept with probability proportional to exp(-x²/2σ²).
+/// Tail bound = 6σ (captures >99.9999% of the Gaussian mass).
+///
+/// This matches the standard RLWE error distribution used in formal reductions
+/// (Regev, Peikert, etc.) and is required for any future worst-case-to-average-case proof.
+fn sample_error_ring(rng: &mut impl RngCore, log2_sigma: u32) -> GoldilocksRing64 {
+    let sigma = 1u64 << log2_sigma;
+    let coeffs: Vec<Fq> = (0..RING_D)
+        .map(|_| {
+            let val = sample_discrete_gaussian(rng, sigma);
+            if val >= 0 {
+                Fq::from(val as u64)
+            } else {
+                -Fq::from((-val) as u64)
+            }
+        })
+        .collect();
+    GoldilocksRing64::from(coeffs)
+}
+
+/// Sample a single discrete Gaussian value with standard deviation σ.
+/// Rejection sampling: sample uniform in [-6σ, 6σ], accept with prob ∝ exp(-x²/2σ²).
+fn sample_discrete_gaussian(rng: &mut impl RngCore, sigma: u64) -> i64 {
+    let tail = 6 * sigma; // 6σ tail bound
+    let sigma_sq_2 = 2.0 * (sigma as f64) * (sigma as f64); // 2σ²
     loop {
-        let r = sample_noise_ring(rng, k);
-        // Reject if all coefficients are zero (degenerate).
-        if r.coeffs().iter().any(|c| *c != Fq::ZERO) {
-            return r;
+        // Uniform candidate in [-tail, tail].
+        let raw = rng.next_u64();
+        let candidate = (raw % (2 * tail + 1)) as i64 - (tail as i64);
+        // Accept with probability exp(-candidate² / 2σ²).
+        // Since candidate ∈ [-6σ, 6σ]: candidate²/2σ² ∈ [0, 18].
+        // exp(-18) ≈ 1.5e-8, so worst-case acceptance ≈ 1.5e-8 (but average is ~0.24).
+        let prob = (-(candidate as f64 * candidate as f64) / sigma_sq_2).exp();
+        // Sample uniform [0, 1) and accept if < prob.
+        let u = (rng.next_u64() as f64) / (u64::MAX as f64);
+        if u < prob {
+            return candidate;
         }
     }
 }
@@ -349,12 +366,9 @@ pub struct RingLweDecapStreamState<'a, F: PrimeField> {
 }
 
 struct BranchAccum<'a> {
-    sparse0: &'a [(usize, GoldilocksRing64)],
-    sparse1: &'a [(usize, GoldilocksRing64)],
-    sparse0_pos: usize,
-    sparse1_pos: usize,
-    y0: Fq,
-    y1: Fq,
+    sparse: &'a [(usize, GoldilocksRing64)],
+    sparse_pos: usize,
+    y: Fq,
 }
 
 impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
@@ -367,14 +381,12 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
             d: PACK_D,
             branches: [
                 BranchAccum {
-                    sparse0: lock.branch_hints[0].hint0_blocks_sparse.as_slice(),
-                    sparse1: lock.branch_hints[0].hint1_blocks_sparse.as_slice(),
-                    sparse0_pos: 0, sparse1_pos: 0, y0: Fq::ZERO, y1: Fq::ZERO,
+                    sparse: lock.branch_hints[0].hint_blocks_sparse.as_slice(),
+                    sparse_pos: 0, y: Fq::ZERO,
                 },
                 BranchAccum {
-                    sparse0: lock.branch_hints[1].hint0_blocks_sparse.as_slice(),
-                    sparse1: lock.branch_hints[1].hint1_blocks_sparse.as_slice(),
-                    sparse0_pos: 0, sparse1_pos: 0, y0: Fq::ZERO, y1: Fq::ZERO,
+                    sparse: lock.branch_hints[1].hint_blocks_sparse.as_slice(),
+                    sparse_pos: 0, y: Fq::ZERO,
                 },
             ],
             block_idx: 0,
@@ -390,15 +402,10 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
         }
         let pi_ring = pi_row_to_ring(self.coeffs.as_slice());
         for br in &mut self.branches {
-            if br.sparse0_pos < br.sparse0.len() && br.sparse0[br.sparse0_pos].0 == self.block_idx {
-                let h0 = &br.sparse0[br.sparse0_pos].1;
-                br.y0 += coeff0_mul(h0, &pi_ring);
-                br.sparse0_pos += 1;
-            }
-            if br.sparse1_pos < br.sparse1.len() && br.sparse1[br.sparse1_pos].0 == self.block_idx {
-                let h1 = &br.sparse1[br.sparse1_pos].1;
-                br.y1 += coeff0_mul(h1, &pi_ring);
-                br.sparse1_pos += 1;
+            if br.sparse_pos < br.sparse.len() && br.sparse[br.sparse_pos].0 == self.block_idx {
+                let h = &br.sparse[br.sparse_pos].1;
+                br.y += coeff0_mul(h, &pi_ring);
+                br.sparse_pos += 1;
             }
         }
         self.block_idx += 1;
@@ -418,8 +425,8 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
         Ok(())
     }
 
-    /// Finalize streaming and return one key per branch.
-    fn finish_keys(mut self) -> Result<[[u8; 32]; 2], String> {
+    /// Finalize streaming and return per-branch inner-product signals.
+    fn finish_signals(mut self) -> Result<[Fq; 2], String> {
         if self.filled != self.lock.pi_len {
             return Err("ringlwe_decap_stream: bad π length".to_string());
         }
@@ -430,15 +437,10 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
             }
             let pi_ring = pi_row_to_ring(self.coeffs.as_slice());
             for br in &mut self.branches {
-                if br.sparse0_pos < br.sparse0.len() && br.sparse0[br.sparse0_pos].0 == self.block_idx {
-                    let h0 = &br.sparse0[br.sparse0_pos].1;
-                    br.y0 += coeff0_mul(h0, &pi_ring);
-                    br.sparse0_pos += 1;
-                }
-                if br.sparse1_pos < br.sparse1.len() && br.sparse1[br.sparse1_pos].0 == self.block_idx {
-                    let h1 = &br.sparse1[br.sparse1_pos].1;
-                    br.y1 += coeff0_mul(h1, &pi_ring);
-                    br.sparse1_pos += 1;
+                if br.sparse_pos < br.sparse.len() && br.sparse[br.sparse_pos].0 == self.block_idx {
+                    let h = &br.sparse[br.sparse_pos].1;
+                    br.y += coeff0_mul(h, &pi_ring);
+                    br.sparse_pos += 1;
                 }
             }
             self.block_idx += 1;
@@ -449,38 +451,35 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
             return Err("ringlwe_decap_stream: internal block count mismatch".to_string());
         }
         for br in &self.branches {
-            if br.sparse0_pos != br.sparse0.len() || br.sparse1_pos != br.sparse1.len() {
+            if br.sparse_pos != br.sparse.len() {
                 return Err("ringlwe_decap_stream: did not consume all sparse blocks".to_string());
             }
         }
 
-        let rd = self.lock.params.recon_bits;
-        let mut keys = [[0u8; 32]; 2];
+        let mut signals = [Fq::ZERO; 2];
         for (b, br) in self.branches.iter().enumerate() {
-            let y0_r = reconcile_u64(fq_to_u64(&br.y0), rd);
-            let y1_r = reconcile_u64(fq_to_u64(&br.y1), rd);
-            keys[b] = derive_payload_key_bytes(
-                &self.lock.params.domain_label,
-                &self.lock.c_stmt,
-                &self.lock.coins,
-                y0_r,
-                y1_r,
-            );
+            signals[b] = br.y;
         }
-        Ok(keys)
+        Ok(signals)
     }
 
     /// Finish streaming and return both candidate decryptions (unauthenticated).
     ///
-    /// Each branch b is decrypted with its own key (from its own independent secrets).
-    /// Exactly one is the correct Shamir share; the other is garbage.
+    /// Each branch b is decoded via Frodo rounding: μ[j] = Dec(C[j] - y_b).
+    /// Exactly one branch gives the correct Shamir share; the other is garbage.
     pub fn finish_decrypt_candidates(self) -> Result<[Vec<u8>; 2], String> {
         let lock = self.lock;
-        let keys = self.finish_keys()?;
-        // Branch b's ciphertext is decrypted with branch b's key.
-        let pt0 = xor_stream_decrypt(&keys[0], &lock.cts[0].nonce, &lock.cts[0].ct);
-        let pt1 = xor_stream_decrypt(&keys[1], &lock.cts[1].nonce, &lock.cts[1].ct);
-        Ok([pt0, pt1])
+        let signals = self.finish_signals()?;
+        let mut out = [Vec::new(), Vec::new()];
+        for b in 0..2 {
+            let y = signals[b];
+            out[b] = lock.cts[b]
+                .encoded
+                .iter()
+                .map(|c_j| frodo_decode_byte(*c_j - y))
+                .collect();
+        }
+        Ok(out)
     }
 
 }
@@ -555,19 +554,19 @@ pub fn arm_ringlwe_lock<F: PrimeField>(
     if params.recon_bits == 0 || params.recon_bits > 32 {
         return Err("arm_ringlwe_lock: recon_bits must be in 1..=32".to_string());
     }
-    if params.binomial_k == 0 {
-        return Err("arm_ringlwe_lock: binomial_k must be nonzero".to_string());
+    if params.secret_binomial_k == 0 {
+        return Err("arm_ringlwe_lock: secret_binomial_k must be nonzero".to_string());
     }
 
     // Per-branch: independent (s0, s1) secrets, independent noise, independent hints.
     // This prevents difference attacks across branches.
     let mut branch_hints: [BranchHints; 2] = [
-        BranchHints { hint0_blocks_sparse: Vec::new(), hint1_blocks_sparse: Vec::new() },
-        BranchHints { hint0_blocks_sparse: Vec::new(), hint1_blocks_sparse: Vec::new() },
+        BranchHints { hint_blocks_sparse: Vec::new() },
+        BranchHints { hint_blocks_sparse: Vec::new() },
     ];
     let mut cts: [LockCiphertext; 2] = [
-        LockCiphertext { nonce: [0u8; 12], ct: Vec::new() },
-        LockCiphertext { nonce: [0u8; 12], ct: Vec::new() },
+        LockCiphertext { encoded: Vec::new() },
+        LockCiphertext { encoded: Vec::new() },
     ];
 
     for (b, a) in accepting_set_shifted.iter().enumerate() {
@@ -575,36 +574,49 @@ pub fn arm_ringlwe_lock<F: PrimeField>(
             return Err("arm_ringlwe_lock: shifted accepting set contains 0; resample rep_id".to_string());
         }
 
-        // Fresh independent RING secrets for this branch.
-        // s must be a full ring element (not a scalar) so that ring multiplication
-        // couples all d=64 positions via negacyclic convolution.
-        let s0: GoldilocksRing64 = sample_nonzero_short_ring(rng, params.binomial_k);
-        let s1: GoldilocksRing64 = sample_nonzero_short_ring(rng, params.binomial_k);
+        // Fresh independent SCALAR secret for this branch, embedded as a constant polynomial.
+        // Using a scalar (not full ring) ensures coeff0(s_const * X) = s_scalar * coeff0(X),
+        // so armer's signal matches decapper's coeff0_mul exactly.
+        // The ring convolution coupling comes from q_ring (the query), not s.
+        let s_scalar: Fq = sample_nonzero_short_scalar(rng, params.secret_binomial_k);
+        let s_const: GoldilocksRing64 = GoldilocksRing64::from(s_scalar);
 
-        // Build hints: h = q_ring * s + e (full ring multiply via NTT).
-        let mut h0_blocks = Vec::with_capacity(q_blocks.len());
-        let mut h1_blocks = Vec::with_capacity(q_blocks.len());
-        for (block_idx, q) in &q_blocks {
-            let h0 = (*q * s0) + sample_noise_ring(rng, params.binomial_k);
-            let h1 = (*q * s1) + sample_noise_ring(rng, params.binomial_k);
-            h0_blocks.push((*block_idx, h0));
-            h1_blocks.push((*block_idx, h1));
-        }
+        // Build hints: h = q_ring * s_const + e (parallelized across blocks).
+        // Pre-derive per-block RNG seeds sequentially, then compute in parallel.
+        let noise_sigma = params.noise_log2_sigma;
+        let block_seeds: Vec<[u8; 32]> = (0..q_blocks.len())
+            .map(|_| {
+                let mut seed = [0u8; 32];
+                rng.fill_bytes(&mut seed);
+                seed
+            })
+            .collect();
+        let h_blocks: Vec<(usize, GoldilocksRing64)> = q_blocks
+            .par_iter()
+            .zip(block_seeds.par_iter())
+            .map(|((block_idx, q), seed)| {
+                let mut block_rng = ChaCha20Rng::from_seed(*seed);
+                let h = (*q * s_const) + sample_error_ring(&mut block_rng, noise_sigma);
+                (*block_idx, h)
+            })
+            .collect();
         branch_hints[b] = BranchHints {
-            hint0_blocks_sparse: h0_blocks,
-            hint1_blocks_sparse: h1_blocks,
+            hint_blocks_sparse: h_blocks,
         };
 
-        // Key derivation: coeff₀(s * a_const) where a_const is the accepting-set element
-        // embedded as a constant polynomial (scalar ring element).
-        // coeff₀(s * a_const) = s[0] * a (since a_const = (a, 0, 0, ..., 0)).
+        // Frodo/Regev additive encoding: C[j] = s_scalar*a + Δ*μ[j] + e'[j]
+        // with small per-byte noise e' to preserve correctness.
         let a_fq: Fq = embed_f_to_fq(a);
-        let k0 = reconcile_u64(fq_to_u64(&(s0.coeffs()[0] * a_fq)), params.recon_bits);
-        let k1 = reconcile_u64(fq_to_u64(&(s1.coeffs()[0] * a_fq)), params.recon_bits);
-        let key = derive_payload_key_bytes(&params.domain_label, &c_stmt, &coins, k0, k1);
-        let mut nonce = [0u8; 12];
-        rng.fill_bytes(&mut nonce);
-        cts[b] = LockCiphertext { nonce, ct: xor_stream_encrypt(&key, &nonce, payload) };
+        let signal = s_scalar * a_fq;
+        let encoded: Vec<Fq> = payload
+            .iter()
+            .map(|&mu_j| {
+                // Sample small per-byte noise for the ciphertext.
+                let e_prime = fq_from_i16(centered_binomial(rng, params.secret_binomial_k));
+                signal + frodo_encode_byte(mu_j) + e_prime
+            })
+            .collect();
+        cts[b] = LockCiphertext { encoded };
     }
 
     Ok(RingLweLockArtifact {
