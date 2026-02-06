@@ -584,13 +584,11 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
         if Self::is_f257() && self.rank == 3 {
             // This fast path assumes the canonical Layout A evaluation order, i.e.
             // `positions == witness_positions_star()`.
-            #[cfg(debug_assertions)]
-            {
-                if let Ok(expected) = self.witness_positions_star() {
-                    debug_assert_eq!(
-                        positions,
-                        expected.as_slice(),
-                        "TensorRsMulCode::eval_e_at_positions_into (F257 rank=3) requires positions == witness_positions_star()"
+            if let Ok(expected) = self.witness_positions_star() {
+                if positions != expected.as_slice() {
+                    return Err(
+                        "eval_e_at_positions_into: F257 rank=3 fast path requires positions == witness_positions_star()"
+                            .to_string(),
                     );
                 }
             }
