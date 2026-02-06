@@ -2743,13 +2743,9 @@ pub(crate) fn goldilocks_add_mod_p_digits_ir(
     let sum = (a_u as u128) + (c_u as u128);
     let q_u8: u8 = if sum >= (p_u64 as u128) { 1 } else { 0 };
     let r_u: u64 = if q_u8 == 1 { (sum - (p_u64 as u128)) as u64 } else { sum as u64 };
-    let q = if q_u8 == 1 {
-        b.one()
-    } else {
-        let z = b.new_var(F257::ZERO);
-        b.ir.enforce_var_eq_const(z, F257::ZERO);
-        z
-    };
+    // IMPORTANT (shape): allocate `q` as a boolean var (not a host-side constant) so we don't
+    // make variable counts witness-dependent.
+    let q = alloc_bool_ir(b, q_u8 == 1);
     let r_d = alloc_u64_as_bal16_digits_witness_ir(b, r_u);
     enforce_add_mod_p_relation_bal16_ir(b, a, c, &r_d, q, q_u8, p_d_const);
     r_d
@@ -2770,13 +2766,9 @@ pub(crate) fn goldilocks_sub_mod_p_digits_ir(
     } else {
         (1u8, (a_u as u128 + (p_u64 as u128) - (c_u as u128)) as u64)
     };
-    let q = if q_u8 == 1 {
-        b.one()
-    } else {
-        let z = b.new_var(F257::ZERO);
-        b.ir.enforce_var_eq_const(z, F257::ZERO);
-        z
-    };
+    // IMPORTANT (shape): allocate `q` as a boolean var (not a host-side constant) so we don't
+    // make variable counts witness-dependent.
+    let q = alloc_bool_ir(b, q_u8 == 1);
     let r_d = alloc_u64_as_bal16_digits_witness_ir(b, r_u);
     enforce_sub_mod_p_relation_bal16_ir(b, a, c, &r_d, q, q_u8, p_d_const);
     r_d
@@ -2856,8 +2848,9 @@ fn enforce_add_mod_p_relation_bal4_ir(
         lc.push((F257::ONE, a[k]));
         lc.push((F257::ONE, c[k]));
         lc.push((-F257::ONE, r[k]));
-        if pk != 0 && q_u8 == 1 {
-            // q is boolean constant (0 or 1), so just include it when q==1.
+        if pk != 0 {
+            // IMPORTANT (shape): always include the `q * pk` term so the constraint structure is
+            // witness-independent. `q_u8` is only used to compute carry witnesses.
             lc.push((-i32_to_f257(pk), q));
         }
         lc.push((-F257::from(4u64), carry_next_var));
@@ -2915,7 +2908,9 @@ fn enforce_sub_mod_p_relation_bal4_ir(
         lc.push((F257::ONE, a[k]));
         lc.push((-F257::ONE, c[k]));
         lc.push((-F257::ONE, r[k]));
-        if pk != 0 && q_u8 == 1 {
+        if pk != 0 {
+            // IMPORTANT (shape): always include the `q * pk` term so the constraint structure is
+            // witness-independent. `q_u8` is only used to compute carry witnesses.
             lc.push((i32_to_f257(pk), q));
         }
         lc.push((-F257::from(4u64), carry_next_var));
@@ -2934,13 +2929,9 @@ pub(crate) fn goldilocks_add_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[V
     let sum = (a_u as u128) + (c_u as u128);
     let q_u8: u8 = if sum >= (p_u64 as u128) { 1 } else { 0 };
     let r_u: u64 = if q_u8 == 1 { (sum - (p_u64 as u128)) as u64 } else { sum as u64 };
-    let q = if q_u8 == 1 {
-        b.one()
-    } else {
-        let z = b.new_var(F257::ZERO);
-        b.ir.enforce_var_eq_const(z, F257::ZERO);
-        z
-    };
+    // IMPORTANT (shape): allocate `q` as a boolean var (not a host-side constant) so we don't
+    // make variable counts witness-dependent.
+    let q = alloc_bool_ir(b, q_u8 == 1);
     // IMPORTANT (soundness): `r4[k]` are the "digit variables" of the base-4 carry chain.
     // Without explicit membership checks `r4[k] ∈ {-2,-1,0,1}`, the carry-chain equation admits
     // alternative integer solutions (e.g. shifting `r4[k]` by ±4 and compensating carry), and
@@ -2959,13 +2950,9 @@ pub(crate) fn goldilocks_sub_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[V
     } else {
         (1u8, (a_u as u128 + (p_u64 as u128) - (c_u as u128)) as u64)
     };
-    let q = if q_u8 == 1 {
-        b.one()
-    } else {
-        let z = b.new_var(F257::ZERO);
-        b.ir.enforce_var_eq_const(z, F257::ZERO);
-        z
-    };
+    // IMPORTANT (shape): allocate `q` as a boolean var (not a host-side constant) so we don't
+    // make variable counts witness-dependent.
+    let q = alloc_bool_ir(b, q_u8 == 1);
     let r4 = alloc_u64_as_bal4_digits_checked_ir(b, r_u);
     enforce_sub_mod_p_relation_bal4_ir(b, a4, c4, &r4, q, q_u8);
     r4
