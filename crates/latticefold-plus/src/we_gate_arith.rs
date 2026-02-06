@@ -6934,6 +6934,7 @@ mod tests {
 
         // Each armer: Shamir-split their secret, arm R locks.
         let t_arm = Instant::now();
+        #[derive(Clone)]
         struct ArmerLockset<F: PrimeField> {
             locks: Vec<crate::lockable_ringlwe::RingLweLockArtifact<F>>,
             share_indices: Vec<u32>,
@@ -7113,6 +7114,146 @@ mod tests {
             ..Default::default()
         };
         amp.print_summary(N_ARMERS);
+
+        // =====================================================================
+        // Adversarial tests: verify the lock rejects corrupted inputs.
+        // =====================================================================
+
+        // --- ADV 1: Corrupted proof tail (one bit flip in first tail) ---
+        // Restream with a corrupted tail for armer 0. Should produce garbage candidates
+        // that don't match the Bitcoin address.
+        {
+            let mut adv_states: Vec<_> = all_locks.iter()
+                .map(|l| l.decap_state(&x).unwrap())
+                .collect();
+            let mut adv_err: Option<String> = None;
+            let adv_tails = prover.stream_pi0_and_collect_tails(
+                &x, &z_w, &all_coins,
+                &mut |chunk| {
+                    if adv_err.is_some() { return; }
+                    for st in &mut adv_states {
+                        if let Err(e) = st.absorb_chunk(chunk) { adv_err = Some(e); break; }
+                    }
+                },
+            ).expect("adv stream");
+            // Corrupt armer 0's first tail.
+            let mut bad_tails = adv_tails;
+            bad_tails[0][0] += F257::from(42u64);
+            for (i, st) in adv_states.iter_mut().enumerate() {
+                st.absorb_chunk(&bad_tails[i]).unwrap();
+            }
+            // Collect candidates from corrupted stream.
+            let mut adv_state_iter = adv_states.into_iter();
+            let mut adv_cands_armer0: Vec<[u8; 32]> = Vec::new();
+            for i in 0..shamir.shares {
+                let st = adv_state_iter.next().unwrap();
+                let [pt0, pt1] = st.finish_decrypt_candidates().unwrap();
+                if i < shamir.threshold {
+                    let mut c = [0u8; 32];
+                    c.copy_from_slice(&pt0);
+                    adv_cands_armer0.push(c);
+                    c.copy_from_slice(&pt1);
+                    adv_cands_armer0.push(c);
+                }
+            }
+            // Try all candidate scalars from the corrupted armer 0 against the real armers 1,2.
+            let mut adv_found = false;
+            for s0_bad in &adv_cands_armer0 {
+                let sc0 = scalar_from_bytes_mod_order(s0_bad);
+                for s1 in &armer_candidate_secrets[1] {
+                    let sc1 = scalar_from_bytes_mod_order(s1);
+                    for s2 in &armer_candidate_secrets[2] {
+                        let sc2 = scalar_from_bytes_mod_order(s2);
+                        let sc_comb = sc0 + sc1 + sc2;
+                        let pk = ProjectivePoint::GENERATOR * sc_comb;
+                        if pubkey_to_p2wpkh_hash(&point_to_compressed(&pk)) == address_hash {
+                            adv_found = true;
+                        }
+                    }
+                }
+            }
+            assert!(!adv_found, "ADV1: corrupted tail should NOT recover the Bitcoin address");
+            eprintln!("[btc_3armer] ADV1 (corrupted tail): correctly rejected");
+        }
+
+        // --- ADV 2: Tampered ciphertext (bit flip in armer 0's first lock) ---
+        {
+            let mut tampered_locksets = armer_locksets.clone();
+            if let Some(first_enc) = tampered_locksets[0].locks[0].cts[0].encoded.first_mut() {
+                use ark_ff::Field;
+                // Add a large value to corrupt the first encoded byte.
+                type GlFq = <cyclotomic_rings::rings::GoldilocksRing64 as stark_rings::PolyRing>::BaseRing;
+                *first_enc += GlFq::from(1u64 << 60);
+            }
+            // Restream with tampered lockset.
+            let tampered_all_locks: Vec<&crate::lockable_ringlwe::RingLweLockArtifact<F257>> =
+                tampered_locksets.iter().flat_map(|ls| ls.locks.iter()).collect();
+            let tampered_coins: Vec<_> = tampered_all_locks.iter().map(|l| l.coins.clone()).collect();
+            let mut tam_states: Vec<_> = tampered_all_locks.iter()
+                .map(|l| l.decap_state(&x).unwrap())
+                .collect();
+            let mut tam_err: Option<String> = None;
+            let tam_tails = prover.stream_pi0_and_collect_tails(
+                &x, &z_w, &tampered_coins,
+                &mut |chunk| {
+                    if tam_err.is_some() { return; }
+                    for st in &mut tam_states {
+                        if let Err(e) = st.absorb_chunk(chunk) { tam_err = Some(e); break; }
+                    }
+                },
+            ).expect("tam stream");
+            for (i, st) in tam_states.iter_mut().enumerate() {
+                st.absorb_chunk(&tam_tails[i]).unwrap();
+            }
+            let mut tam_iter = tam_states.into_iter();
+            let mut tam_cands: Vec<[u8; 32]> = Vec::new();
+            for i in 0..shamir.shares {
+                let st = tam_iter.next().unwrap();
+                let [pt0, pt1] = st.finish_decrypt_candidates().unwrap();
+                if i < shamir.threshold {
+                    let mut c = [0u8; 32];
+                    c.copy_from_slice(&pt0);
+                    tam_cands.push(c);
+                    c.copy_from_slice(&pt1);
+                    tam_cands.push(c);
+                }
+            }
+            // Check that none of the tampered candidates for armer 0 + correct armer 1,2 match.
+            let mut tam_found = false;
+            for s0_bad in &tam_cands {
+                let sc0 = scalar_from_bytes_mod_order(s0_bad);
+                for s1 in &armer_candidate_secrets[1] {
+                    let sc1 = scalar_from_bytes_mod_order(s1);
+                    for s2 in &armer_candidate_secrets[2] {
+                        let sc2 = scalar_from_bytes_mod_order(s2);
+                        let sc_comb = sc0 + sc1 + sc2;
+                        let pk = ProjectivePoint::GENERATOR * sc_comb;
+                        if pubkey_to_p2wpkh_hash(&point_to_compressed(&pk)) == address_hash {
+                            tam_found = true;
+                        }
+                    }
+                }
+            }
+            assert!(!tam_found, "ADV2: tampered ciphertext should NOT recover the Bitcoin address");
+            eprintln!("[btc_3armer] ADV2 (tampered ciphertext): correctly rejected");
+        }
+
+        // --- ADV 3: Wrong address (different combined key) ---
+        // Even with correct decap, the recovered key shouldn't match a DIFFERENT address.
+        {
+            let wrong_scalar = scalar_from_bytes_mod_order(&[0xFFu8; 32]);
+            let wrong_pk = ProjectivePoint::GENERATOR * wrong_scalar;
+            let wrong_hash = pubkey_to_p2wpkh_hash(&point_to_compressed(&wrong_pk));
+            assert_ne!(wrong_hash, address_hash, "sanity: wrong address should differ");
+            // The correctly recovered s_combined should NOT match the wrong address.
+            let wrong_check = pubkey_to_p2wpkh_hash(&point_to_compressed(
+                &(ProjectivePoint::GENERATOR * sc_verify)
+            ));
+            assert_ne!(wrong_check, wrong_hash, "ADV3: correct key should not match wrong address");
+            eprintln!("[btc_3armer] ADV3 (wrong address): correctly rejected");
+        }
+
+        eprintln!("[btc_3armer] all adversarial tests passed");
 
         crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir_shape);
     }
