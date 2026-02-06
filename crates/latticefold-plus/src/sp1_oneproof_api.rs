@@ -252,16 +252,22 @@ pub fn run_sp1_oneproof_we_gate_from_files(
     // -------------------------------------------------------------------------
     // Tiny-field (F257) WE gate (Theorem 4.3 path)
     // -------------------------------------------------------------------------
-    // File-backed instance artifacts (canonical tiny gate path).
+    // Shape cache directory.
     //
-    // Use a fixed temp dir with best-effort cleanup so callers don't have to manage paths.
-    // If you need to inspect artifacts, set `LFP_KEEP_TINY_GATE_OUT_DIR=1`.
+    // The shape (constraint matrices) is compiled once and cached on disk.
+    // Subsequent calls load the cached shape and only compute the per-proof assignment
+    // (lightweight count-only pass, no disk writes).
     let out_dir = {
-        let mut p = std::env::temp_dir();
-        p.push("lfplus_sp1_oneproof_tiny_gate");
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).map_err(|e| format!("create temp out_dir failed: {e}"))?;
-        p
+        let base = std::env::var("LFP_SHAPE_CACHE_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                let mut p = std::env::temp_dir();
+                p.push("lfplus_sp1_oneproof_tiny_gate");
+                p
+            });
+        std::fs::create_dir_all(&base).map_err(|e| format!("create shape cache dir failed: {e}"))?;
+        base
     };
 
     let pairs: Vec<(usize, usize)> = vec![(0, 0)];
@@ -284,7 +290,7 @@ pub fn run_sp1_oneproof_we_gate_from_files(
         .flat_map(|x| field_to_bytes_le_fixed::<BFSmall>(x).into_iter().map(|b| F257::from(b as u64)))
         .collect();
 
-    let (shape, assignment) = crate::we_gate_arith::build_we_plus_tiny_dr1cs::<R>(
+    let (shape, assignment) = crate::we_gate_arith::build_or_load_we_plus_tiny_dr1cs::<R>(
         &trace,
         &we_params,
         &public_inputs_f257,
@@ -293,7 +299,7 @@ pub fn run_sp1_oneproof_we_gate_from_files(
         &pairs,
         &out_dir,
     )
-    .map_err(|e| format!("build_we_plus_tiny_dr1cs: {e}"))?;
+    .map_err(|e| format!("build_or_load_we_plus_tiny_dr1cs: {e}"))?;
 
     // Optional sanity: the witness must satisfy the armed instance.
     // This can be expensive for large gates; enable only when debugging.
@@ -321,9 +327,8 @@ pub fn run_sp1_oneproof_we_gate_from_files(
     // Debug-only: keep deterministic footprints if you need to compare runs.
     let _ = hex32(&stmt_digest);
 
-    if std::env::var("LFP_KEEP_TINY_GATE_OUT_DIR").ok().as_deref() != Some("1") {
-        let _ = std::fs::remove_dir_all(&out_dir);
-    }
+    // Shape cache is intentionally kept on disk for reuse across invocations.
+    // To force a rebuild, delete the cache directory manually or set LFP_SHAPE_CACHE_DIR.
 
     Ok(Sp1OneProofWeGateOutput {
         stmt_digest,

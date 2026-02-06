@@ -46,3 +46,19 @@ pub fn we_tiny_f257_build_cm_gate_from_trace_ops(
     builder::build(cfg, ops, ring_dim, params, wiring, pairs, extra_witness, out_dir)
 }
 
+/// Assignment-only builder: runs the count-only pass (Pass 0) and returns the merged
+/// assignment + Poseidon wiring **without writing any constraint files to disk**.
+///
+/// Use this on cache-hit when the shape is already on disk.
+pub fn we_tiny_f257_build_assignment_only(
+    cfg: Option<&PoseidonConfig<F257>>,
+    ops: &[PoseidonTraceOp<F257>],
+    ring_dim: usize,
+    params: &WeParams,
+    wiring: &TinyCoinOpWiring,
+    pairs: &[(usize, usize)],
+    extra_witness: &TinyExtraWitness,
+) -> Result<(Vec<F257>, PoseidonDr1csWiring), String> {
+    builder::build_assignment_only(cfg, ops, ring_dim, params, wiring, pairs, extra_witness)
+}
+

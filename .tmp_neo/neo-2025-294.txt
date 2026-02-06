@@ -1,0 +1,3844 @@
+Neo: Lattice-based folding scheme for CCS over
+small fields and pay-per-bit commitments
+Wilson Nguyen
+
+Srinath Setty
+
+Stanford University
+
+Microsoft Research
+
+Abstract. This paper introduces Neo, a new lattice-based folding scheme
+for CCS, an NP-complete relation that generalizes R1CS, Plonkish, and
+AIR. Neo’s folding scheme can be viewed as adapting the folding scheme
+in HyperNova (CRYPTO’24), which assumes elliptic-curve based linearly
+homomorphic commitments, to the lattice setting. Unlike HyperNova, Neo
+can use “small” prime fields (e.g., over the Goldilocks prime). Additionally,
+Neo provides plausible post-quantum security.
+Prior to Neo, folding schemes in the lattice setting, notably LatticeFold (ePrint 2024/257), worked with constraint systems defined over a
+cyclotomic polynomial ring. This structure allows packing a fixed batch of
+constraint systems over a small prime field into a single constraint system
+over a polynomial ring. However, it introduces significant overheads, both
+for committing to witnesses (e.g., the commitment scheme cannot take
+advantage of bit-width of values), and within the folding protocol itself
+(e.g., the sum-check protocol is run over cyclotomic polynomial rings).
+Additionally, the required ring structure places restrictions on the choice
+of primes (e.g., LatticeFold is not compatible with the Goldilocks field).
+Neo addresses these problems, by drawing inspiration from both HyperNova and LatticeFold. A key contribution is a folding-friendly instantiation of Ajtai’s commitments, with “pay-per-bit” commitment costs
+i.e., the commitment costs scale with the bit-width of the scalars (e.g.,
+committing to a vector of bits is 32× cheaper than committing to a vector
+of 32-bit values). This scheme commits to vectors over a small prime field.
+It does so by transforming the provided vector into a matrix and committing to that matrix. We prove that this commitment scheme provides the
+desired linear homomorphism for building a folding scheme. Additionally,
+like HyperNova, Neo runs a single invocation of the sum-check protocol,
+where in HyperNova it is over the scalar field of an elliptic curve and in
+Neo it is over an extension of a small prime field.
+
+Table of Contents
+1
+
+Introduction . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+1.1 Open problems and recent progress on those problems . . . . . . . . . . . . . . .
+1.2 Our work in a nutshell: Neo . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+1.3 A technical overview of Neo . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+1.4 Lattice-based folding scheme for lookups and read-write memory . . . . . .
+1.5 Constructing an IVC/PCD scheme, with proof compression . . . . . . . . . .
+Preliminaries . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+2.1 Notation . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+2.2 Reductions of knowledge . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+2.3 Rings and Modules . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+Neo’s folding-friendly lattice-based commitments . . . . . . . . . . . . . . . . . . . . . . . .
+3.1 Requirements . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+3.2 Neo’s solution, part-1: A matrix commitment scheme . . . . . . . . . . . . . . . .
+3.3 Neo’s solution, part-2: linear homomorphism for folding multilinear
+evaluation claims . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+3.4 Challenge sets . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+Neo’s folding scheme for CCS . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+4.1 Relations . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+4.2 Constructing a folding scheme via reductions of knowledge . . . . . . . . . . .
+4.3 Reduction parameters . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+4.4 CCS Reduction – ΠCCS . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+4.5 Random linear combination reduction – ΠRLC . . . . . . . . . . . . . . . . . . . . . . .
+4.6 Decomposition reduction – ΠDEC . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+Security analysis of reductions . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+5.1 New properties . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+Concrete parameters . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+6.1 Almost Goldilocks: (264 − 232 + 1) − 32 . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+6.2 Goldilocks: 264 − 232 + 1 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+6.3 Mersenne 61: 261 − 1 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+
+3
+5
+7
+8
+10
+11
+12
+12
+13
+15
+16
+16
+18
+
+References . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+
+34
+38
+38
+39
+39
+41
+41
+42
+44
+44
+46
+46
+49
+52
+54
+57
+
+2
+
+3
+
+4
+
+5
+6
+
+A Additional Background . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+A.1 Polynomials and multilinear extensions . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+B Deferred theorems and proofs . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+B.1 Proof of Theorem 2 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+B.2 Proof of Lemma 3 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+B.3 Proof of Theorem 3 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+B.4 Proof of Lemma 4 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+B.5 Proof of Lemma 5 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+B.6 Proof of Theorem 4 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+B.7 Proof of Lemma 6 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+B.8 Proof of Lemma 7 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+B.9 Proof of Lemma 8 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+B.10 Proof of Theorem 5 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+B.11 Finding choices of cyclotomic and fields . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+B.12 Lattice Estimator Script . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+
+21
+22
+23
+24
+24
+25
+25
+27
+28
+29
+30
+32
+32
+33
+33
+
+1
+
+Introduction
+
+A folding scheme [44] is a cryptographic primitive that reduces the task of
+checking that two instance-witness pairs are in some NP relation to the task of
+checking that a single instance-witness pair is in the same relation. As an example,
+for a circuit C and two public inputs (i.e., instances) x1 and x2 , a folding scheme
+reduces the task of checking that there exists witnesses w1 and w2 such that
+C(w1 , x1 ) = 1 and C(w2 , x2 ) = 1 to the task of checking that there exists a single
+witness w for a specific public input x such that C(w, x) = 1. Furthermore, the
+verifier’s work in a folding scheme is limited to roughly taking the weighted sum
+of the commitments to underlying witnesses. By using a folding scheme in a
+recursive manner, one can continually fold many instance-witness pairs into a
+single instance-witness pair, providing powerful primitives such as incrementally
+verifiable computation (IVC) [62] and proof-carrying data (PCD) [13].
+Benefits of folding schemes. Folding schemes provide a more efficient approach
+to construct SNARKs [37, 49] that can scale to large computations.
+A modern approach to construct SNARKs is to combine a polynomial
+interactive oracle proof (PIOP) [19, 25, 57] with a polynomial commitment
+scheme (PCS) [36], and then apply the Fiat-Shamir transformation [33]. In
+particular, the PIOP reduces the task of checking the validity of an instancewitness pair in some relation (e.g., R1CS) to a collection of tasks where each task
+is to check if a (committed) polynomial evaluates to a certain value at a certain
+point in their domain (i.e., a set of polynomial evaluation instance-witness pairs).
+In turn, the polynomial evaluation argument provided by the PCS is used by the
+prover to prove those polynomial evaluation instances. However, this approach
+only provides a “monolithic” SNARK, meaning that a prover must prove a
+fixed-sized computation at once. To scale to larger computations, one typically
+breaks the computation into smaller pieces and then uses SNARK recursion (a
+la IVC or PCD) to produce a succinct argument in a scalable manner [12].
+Folding schemes provide a more direct and a more efficient approach. In
+particular, folding schemes allow recursion to operate at the “statement” level
+(i.e., prior to producing a PIOP or a PCS evaluation argument). This has two
+concrete benefits. First, the overheads from recursion are far lower than traditional
+SNARK recursion. For example, even with one of the earliest folding schemes,
+Nova [44], it only takes 10,000 R1CS gates to fold a proof. Whereas, traditional
+SNARK recursion takes millions of gates [24, 26]. Second, the prover incurs far
+less work from not having to produce a PIOP or a PCS evaluation argument.
+For instance, the prover in monolithic SNARKs such as Marlin [25] perform at
+least 20× higher work over simply committing to a witness. In contrast, with
+state-of-the-art folding schemes [17, 29, 42, 43], the prover’s work is dominated by
+the cost to commit to a witness. This results in at least an order of magnitude
+speedup over monolithic SNARKs, and up to two orders of magnitude speedup
+when the witness contains values from a small subset of the entire field.1
+1
+
+If the witness contains “small” field elements (e.g., they are from a small subset of the
+entire finite field say {0, 1, . . . , 232 − 1}), the state-of-the-art folding schemes perform
+
+3
+
+State-of-the-art folding schemes. Nova [44] formally introduced folding schemes.
+It also provides a folding scheme for R1CS, where the prover’s work is dominated
+by two multi-scalar multiplications (MSMs) of size proportional to the circuit
+size, and the recursive verifier circuit is dominated by two group scalar multiplications and hashing a constant number of field elements.2 Folding schemes
+further developed in HyperNova [42], Protostar [17], ProtoGalaxy [29], and NeutronNova [43]. These works provide folding schemes for more expressive relations
+such as CCS [59], a generalization of R1CS, Plonkish, and AIR, including lookup
+checks. With recent works, the prover’s work is dominated by a single MSM that
+commits to a purported witness, and the verifier circuit size is dominated by 3
+group scalar multiplications and hashing a constant number of field elements.
+These state-of-the-art folding schemes [2, 17, 28, 29, 40–44, 52, 65] rely on
+cryptographic groups. Specifically, they leverage linearly homomorphic commitments for vectors over a finite field. In practice, these commitments are instantiated with Pedersen commitments over regular cycles of elliptic curves (e.g.,
+Pallas/Vesta) or with KZG commitments over half pairing cycles of elliptic
+curves (e.g., BN254/Grumpkin).
+The area of folding schemes has witnessed significant progress in just the last
+year. There is a lot of recent work to extend folding schemes with additional
+constructs such as a read-only and a read-write memory [8, 21, 30, 34], and some
+works prove non-uniform constraint systems (e.g., Plonkish) in a space-efficient
+manner [53] while others focus on providing an efficient on-chain verifier [64]. Due
+to their efficiency, some projects have adopted folding schemes as a foundation
+for proving virtual machine executions [3, 4]. In a similar vein, a recent work [43]
+provides a systematic framework to build efficient folding schemes for complex
+relations in a composable manner, which can then be used to prove virtual
+machine executions more efficiently.
+
+up to 200× less work than a monolithic SNARK prover such as Marlin [25] because
+Marlin ends up committing to “random” field elements as part of its PIOP and PCS
+evaluation argument, which are at least an order of magnitude more expensive than
+committing to a witness with “small” field elements. Proof systems such as Spartan
+and variants [57, 59] incur lower overheads than Marlin, but they must still produce
+a PIOP and PCS evaluation argument.
+2
+Prior to Nova [44], Halo [16] provides a recursive SNARK for achieving IVC/PCD
+where the verifier circuit does not verify a full SNARK proof. However, this approach
+still requires producing a PIOP and a PCS evaluation argument. Furthermore, Halo’s
+verifier circuit is significantly larger than Nova’s. Folding schemes not only aim
+to minimize work in a recursive verifier circuit, but also aim to avoid producing a
+SNARK in the first place. Following Halo and in concurrent with Nova, Bunz et al. [18]
+achieve IVC/PCD while only requiring NARKs in which the verifier provides a splitaccumulation scheme. Folding schemes offer a cleaner abstraction and a more efficient
+instantiation. They also lead to IVC/PCD without even arguments of knowledge.
+Nova [44] provides additional context on works that inspired folding schemes.
+
+4
+
+1.1
+
+Open problems and recent progress on those problems
+
+Despite the above progress, there are two downsides associated with the aforementioned state-of-the-art folding schemes.
+1. They rely on cryptographic groups based on elliptic curves. As a result,
+constraint systems that they work with are defined over the scalar field of
+an elliptic curve. For security (e.g., to ensure the hardness of DLOG), this
+field is a prime field where the modulus is approximately 256 bits. Even
+if the original computation is naturally represented with “small” numbers,
+the computation must be lifted to work with 256-bit fields. This incurs
+an “embedding” overhead. For example, computations on a real machine
+are naturally expressed with 32-bit or 64-bit field, but when using the
+aforementioned folding schemes, they must be expressed with 256-bit fields.
+2. Due to their reliance on the hardness of the discrete logarithm problem, they
+are not post-quantum secure.
+In the rest of this paper, when we say “small” prime fields, we refer to
+prime fields where the prime modulus q fits within a machine register. Examples
+of such prime modulus include M61 (q = 261 − 1) and the Goldilocks prime
+(q = 264 − 232 + 1). Prime fields with such a modulus provide fast arithmetic;
+they also allow the use of vector instructions (SIMD) to perform multiple field
+operations at once.
+Research question. Can we construct a folding scheme that provides better efficiency than the aforementioned state-of-the-art folding schemes while addressing
+the two problems noted above?
+Recent progress and their downsides. Boneh and Chen [14] make significant
+progress toward addressing the above research question. They construct LatticeFold [14], a new folding scheme for CCS [59], where security holds under a
+structured lattice assumption. More recently, Lova [31] provides a Nova-like folding scheme using an unstructured lattice assumption. In another work, Arc [20]
+provides a folding scheme for general constraint systems including CCS while only
+relying on hash functions. However, compared to existing group-based folding
+schemes, all these works incur significant overheads.
+Lova [31] constructs a folding scheme for the subset sum problem defined
+over the integers. In particular, it does not provide a folding scheme for CCS or
+even R1CS. So, if one were to use Lova for real world problems of interest, one
+must transform their CCS or R1CS instance-witness pairs to instance-witness
+pairs in the subset sum relation over the integers. This likely incurs significant
+overheads. Even ignoring these overheads, based on Lova’s reported performance
+for the subset sum relation, Lova (for subset sum) is already multiple orders of
+magnitude slower than Nova (for R1CS). For a subset sum instance length of
+219 , Lova reports a prover time of ≈3,000 seconds [31, Table 2]. On a machine
+with the same number of vCPUs and lower speed, Nova reports 500 ms for an
+R1CS instance of size 219 . Given this, Lova appears to be at least 6, 000× slower
+5
+
+than Nova. Representing R1CS with subset sum likely blows up the size of the
+corresponding subset sum instance substantially. If we include the overhead from
+R1CS to subset sum transformation (which could be at least 10× and likely far
+higher), Lova is more than four orders of magnitude slower than Nova.
+Arc [20] incurs high folding overheads.3 To fold two instances, Arc requires
+λ/ log(1/ρ) Merkle tree openings in the recursive verifier circuit, where λ is the
+security parameter and ρ is the Reed-Solomon code rate used. For λ = 128 and
+the widely used rate of ρ = 1/2 (which leads to the fastest encoding time for
+Reed-Solomon codes), Arc requires 128 Merkle tree openings. This translates to
+about 800, 000 constraints in R1CS when using a SNARK-friendly hash function
+such as Poseidon [35]. Note that this is a lower bound on the verifier circuit size
+as the verifier must perform other tasks besides verifying Merkle proofs. As a
+comparison point, Nova [1, 44] only needs ≈10,000 R1CS constraints in total for
+the entire verifier circuit.
+LatticeFold [14] is arguably more “practical” than Lova (for the prover) and
+Arc (for the verifier circuit). However, LatticeFold has many significant downsides,
+especially when compared to existing state-of-the-art group-based folding schemes.
+For instance, LatticeFold is not a replacement for existing group-based schemes
+(e.g., HyperNova [42]) unless one is willing to accept a significant prover slow
+down. We now provide details of these downsides.
+1. LatticeFold works with CCS defined over cyclotomic polynomial rings rather
+than over (small) prime fields. LatticeFold partially mitigates this issue with
+an approach to “pack” a batch of independent constraints defined over a
+“small” prime field into a single constraint over a cyclotomic polynomial
+ring [14, Remark 4.1]. However, this imposes a requirement that one must
+have a “data parallel” (or SIMD) constraint system. Additionally, “packing”
+introduces a significant performance problem: The prover’s cost to commit
+to a vector of values is the same regardless of the bit-width of the values. For
+example, for a given vector length, it costs the same to commit to a vector
+of 64-bit values or a vector of 1-bit values.4
+2. For security and to support packing of constraint systems over a small prime
+field (see [14, §3.3]), LatticeFold requires a particular type of cyclotomic
+polynomial ring that is not “fully splitting”. This requires rephrasing LatticeFold’s relations and modifying the overall protocol to accommodate the
+3
+
+In an earlier work, Bunz et al. [22] provide a different hash-based folding scheme.
+However, the verifier circuit overheads of this construction is worse than those
+of Arc [20, Table 1]. Additionally, that construction only provides a “bounded
+depth” IVC (i.e., there exist concrete attacks if the depth of recursion exceeds a
+pre-determined bound).
+4
+This is because CCS witness values are packed and embedded in the NTT form
+of cyclotomic ring elements. Additionally, LatticeFold’s commitment scheme must
+decompose the corresponding ring elements in their coefficient form to ensure norm
+bounds. This entire process unfortunately prevents LatticeFold’s commitment scheme
+from leveraging the bit-width of the original witness elements to provide a pay-per-bit
+commitment costs. We provide more details of this issue in Section 3.
+
+6
+
+smaller field, since the protocol descriptions assume a large prime field that
+causes the cyclotomic ring to fully split. Additionally, using small prime fields
+adds a τ (extension field degree) multiplicative factor loss to the efficiency
+of LatticeFold’s protocols, due to the need to run a further τ instances in
+parallel. In LatticeFold’s sample parameterization (see [14, §5]), despite the
+field being 64-bits in size, the extension field degree is required to be τ = 4.
+This leads to a 4× overhead in LatticeFold’s protocols (due to the required
+repetition) and requires the use of a much larger (extension) field F q4 (if the
+NTT representation is used).
+3. As part of its folding scheme, LatticeFold runs the sum-check protocol over
+cyclotomic polynomial rings. Cyclotomic polynomial ring operations are
+10–100× more expensive than (extension) field operations and even 256-bit
+fields, making the overall protocol significantly more expensive than desired.5
+4. LatticeFold’s use of cyclotomic polynomial rings imposes many requirements
+on the ring structure. This in turn limits the choice of the underlying “small”
+prime field. We find that LatticeFold’s requirements do not allow one to use
+popular small field modulus such as Golidlocks’ prime or M61.6
+Beyond these, there is a less fundamental issue. LatticeFold runs two sequential
+invocations of the sum-check protocol, making the verifier perform twice the work.
+LatticeFold addresses this problem with an optimization that rearranges the
+protocol steps, allowing the batching of the two sum-check invocations [14, §4.3].
+However, this protocol does not fit within LatticeFold’s modular framework, so
+the security proofs provided in the paper do not cover this stand-alone protocol.
+
+1.2
+
+Our work in a nutshell: Neo
+
+We address the aforementioned problems with our work, which we refer to as
+Neo. Our work draws inspiration from prior works including HyperNova [42]
+and LatticeFold [14], but introduces several new techniques. Before we introduce
+Neo’s underlying techniques, we provide a brief overview.
+Neo provides a folding scheme for CCS [59], an NP-complete relation that
+generalizes widely used arithmetizations such as R1CS, Plonkish, and AIR. Unlike
+HyperNova (where constraints are defined over the scalar field of an elliptic curve
+group) and LatticeFold (where the constraints are defined over a cyclotomic
+polynomial ring), the constraints that Neo folds are defined natively over a small
+5
+
+Recent benchmarks report that a polynomial ring multiplication costs ≈213 ns [51].
+Whereas, a field multiplication with M61 costs a fraction of a ns.
+6
+As described, LatticeFold [14] works with cyclotomic polynomial rings where the
+modulus polynomial is of the form X d + 1 and d is a power of 2. If the polynomial ring
+is instantiated with a popular small field such as a prime field over the Goldilocks’
+prime (q = 264 − 232 + 1, which is a 64 bit prime), the polynomial ring splits
+completely. This ruins the security of LatticeFold as this complete split makes the
+ring Rq isomorphic to Fqd , so LatticeFold instantiated with this prime gives at most
+64 bits bits of security. See Section 6 and [14, §3.3] for more details.
+
+7
+
+prime field. Specifically, our construction supports the use of popular fields such
+as M61 and the Goldilocks field. These fields feature extremely efficient field
+arithmetic implementations. Additionally, unlike LatticeFold, Neo does not have
+to pack multiple constraints over a prime field into a single constraint over a
+ring. So, Neo’s folding scheme, like HyperNova, runs a single invocation of the
+sum-check protocol. In Neo, the sum-check protocol is run over an extension of a
+small prime field.7
+Beyond this, Neo provides a new folding-friendly lattice-based commitment
+scheme. Unlike the commitment scheme in LatticeFold, our scheme provides a
+key performance property: the commitment costs scale linearly with the bit width
+of the values in the vectors committed. For example, for n > 1, it is 64× cheaper
+to commit to a length-n vector of bits than it is to commit to a length-n vector
+of 64-bit values. This commitment scheme may be of independent interest.
+Overall, Neo provides a folding scheme similar to HyperNova with the two
+added benefits: (1) Neo supports “small” prime fields (e.g., M61) and a lightweight commitment scheme, opening door for a faster prover; and (2) Neo is
+plausibly post-quantum secure.
+
+1.3
+
+A technical overview of Neo
+
+We now provide an overview of various components in Neo.
+(1) Folding-friendly lattice-based commitments with pay-per-bit commitment costs.
+A key contribution of our work is a new folding-friendly lattice-based commitment
+(Ajtai with a new embedding for elements). As discussed above, it works with
+vectors over a “small” prime field and provides a pay-per-bit commitment cost.
+A starting point for Neo’s commitment scheme is Ajtai commitments [5], which
+commits to a vector of cyclotomic polynomial ring elements, and the security
+holds under a structured lattice assumption: Module SIS. In particular, to commit
+to a vector of small field elements, we provide a more efficient mapping from a
+vector of elements from a small field Fq to a vector of cyclotomic polynomial ring
+elements, where the cyclotomic polynomial is defined over Fq . The vector of ring
+elements is then committed with Ajtai’s commitment scheme.
+Our mapping provides two key properties. First, it provides the aforementioned
+pay-per-bit commitment costs.8 Discrete-log based commitment schemes such as
+Pedersen [54] and KZG [15, 36, 64], which can be used with HyperNova [42], also
+provide the property that it is cheaper to commit to a vector of bits than it is
+to commit to a vector of arbitrary field elements. But, as noted earlier, they do
+7
+8
+
+When using a 64-bit field, a degree-2 extension is sufficient for 128 bits of security.
+As noted earlier, pay-per-bit commitment cost property is not achieved by LatticeFold’s commitment scheme because it uses a different map that must preserve more
+complex properties including the satisfiability of packed CCS constraints. Additionally, in our context, we are not restricted to the power-of-2 cyclotomic polynomial
+rings. This allows a wider choice of q.
+
+8
+
+not provide post-quantum security.9 In other words, Neo’s commitment scheme
+allows porting a performance property that is currently available within the
+discrete-log setting to the lattice setting while providing post-quantum security.
+Second, we show that our commitment scheme provides the required linear
+homomorphism property. In particular, we treat a vector underneath a commitment as a multilinear polynomial represented in evaluation form over the Boolean
+hypercube. For example, a vector of size n uniquely determines a multilinear
+polynomial in ℓ = log n variables. The commitment scheme then provides a folding scheme for evaluation claims. Informally, suppose that we have a collection of
+β ≥ 2 commitments and claimed multilinear evaluations at an evaluation point
+over their entire domain: {(Ci , r, yi )}i∈[β] . Suppose we have the corresponding
+witnesses: {wi }i∈[β] . That is, witnesses are satisfying if and only if for i ∈ [β], Ci
+is a commitment to wi and that w
+fi (r) = yi . Neo’s commitment scheme provides
+a reduction of knowledge (RoK) that outputs a new instance (C, r, y) and a
+witness w such that the new instance-witness pair is satisfying if and only if
+all the original instances are satisfying. With discrete-log-based commitments,
+it is quite easy to construct such a RoK. Whereas, in the lattice setting, many
+challenges arise. We provide details of these challenges and how we address them
+in Section 3. In a nutshell, the RoK must tame the norm growth when taking a
+random linear combination of commitments, which we address by adapting prior
+decomposition techniques along with a use of “small norm” challenges.
+(2) A folding scheme for CCS. With the lattice-based commitment scheme in
+hand, devising a folding scheme for CCS is relatively straightforward. Our starting
+point here is the folding scheme in HyperNova [42],10 which assumes a discretelog-based linearly homomorphic commitments. Roughly speaking, we replace the
+commitment scheme in HyperNova with the aforementioned commitment scheme
+that provides the required linear homomorphism with respect to multilinear
+polynomial evaluation claims.
+There are however some challenges. As mentioned above, our commitment
+scheme relies on decomposition techniques to tame norm growth of committed
+vectors. This decomposition process requires the prover to establish that the
+prover indeed decomposed its vectors correctly. We phrase these checks as a
+sum-check claim that is then proven with the sum-check protocol. At a high level,
+this idea is similar to how LatticeFold proves norm checks of decomposed vectors.
+9
+
+Hash-based commitments such as FRI [11] and the commitment schemes used in
+Arc [20] do not provide a pay-per-bit cost. Some recent hash-based commitments,
+such as Binius [27], provide a pay-per-bit commitment costs, but as they are hash
+based, they incur much higher recursion overheads than group-based folding schemes.
+Binius also requires the use of binary fields and the constraint systems are defined
+over binary fields. Such constraint systems are not widely used in practice.
+10
+An alternative is Protostar [17] or NeutronNova [43], both of which provide folding
+scheme verifier with a constant size whereas with HyperNova it is logarithmic-sized.
+Unfortunately, they require a truly linearly homomorphic commitment scheme, not
+just a scheme that can fold multilinear evaluation claims associated with committed
+vectors. Our commitment scheme cannot be used with those folding schemes.
+
+9
+
+However, due to a different mapping that we use to map CCS witness vectors to
+cyclotomic polynomial ring elements, we are able to avoid running the sum-check
+protocol over cyclotomic polynomial rings. In fact, we simply batch the norm
+check claim with the sum-check claim arising from CCS, and run the sum-check
+protocol over an extension of a small prime field. Section 4 provides details.
+Note that this norm-check claim introduces additional work for the prover
+in the sum-check protocol as well as in the commitment scheme, relative to
+HyperNova. However, one can tame this with the following. Neo’s folding scheme,
+like HyperNova’s, can be naturally extended to a multi-folding scheme [42] i.e.,
+it can fold multiple CCS instances at once. In particular, the additional work
+related to decomposition is performed only for the “running” instance-witness
+to which multiple CCS instance-witness pairs are folded. So, by folding multiple
+CCS instance-witness pairs at once, we can amortize the costs of decomposition.
+(3) Security analysis. Proving the security of our commitment scheme as well as
+of the folding scheme for CCS is non-trivial. We structure our folding scheme
+for CCS with three reductions: (1) a reduction that allows decomposing an
+evaluation claim about a committed vector with a particular norm B into a batch
+of k instances with a lower norm b < B 1/k (for some chosen value of k); (2) a
+reduction that folds a batch of k + 1 instances with norm b into a single instance
+with norm at most B; and (3) a reduction that transforms a claim about a CCS
+instance-witness pair into a claim about linearized form of CCS instance-witness
+pair (this reduction is inherited from HyperNova). The first one is a RoK with
+standard completeness and knowledge soundness properties. Unfortunately, the
+second and the third reductions are not. To formally capture their properties, we
+introduce relaxed notions of knowledge soundness. Additionally, we prove that
+by sequentially composing these reductions with relaxed knowledge soundness
+guarantees, we get a RoK with standard knowledge soundness. These proof
+techniques may be of independent interest. Ultimately, we obtain Neo’s folding
+scheme for CCS. Section 5 provides details.
+(4) Concrete parameter choices. To instantiate Neo’s folding scheme, we must
+choose a prime q as well as a suitable cyclotomic polynomial ring. The sum-check
+protocol will be run on an extension of a field Fq . For efficiency, it is imperative to
+choose a value of q that minimizes operations over these structures. We provide
+multiple different options for q including the very efficient Mersenne-61 i.e.,
+q = 261 − 1, the widely used Goldilocks field q = 264 − 232 + 1, and a third field
+that we refer to as “almost” Goldilocks field (AGL). The AGL field allows the
+use a power-of-2 cyclotomic polynomial ring. Section 6 provides details.
+1.4
+
+Lattice-based folding scheme for lookups and read-write memory
+
+Neo extends easily to support folding lookup checks. Specifically, Shout [58] is
+a recent sum-check-based lookup argument. It can be viewed as a RoK from
+the lookup relation to the multilinear polynomial evaluation relation. Similar
+to how Neo transforms HyperNova [42] to a lattice-based folding scheme for
+10
+
+CCS, by leveraging our instantiation of Ajtai’s commitments, we can use Shout’s
+RoK to fold lookup relations alongside CCS, as both our folding scheme and
+Shout’s RoK use the sum-check protocol [46]. The same approach works with
+Twist [58] to support a lattice-based folding scheme for read-write memory.
+For high performance, Shout and Twist rely on commitment schemes that can
+commit to sparse vectors efficiently. Prior to this work, the choice of commitment
+schemes includes group-based commitment schemes such as Pedersen [54] and
+HyperKZG [64], or hash-based commitment schemes over binary fields such
+as Binius [27]. Fortunately, Neo’s commitment scheme provides the required
+performance property in the lattice setting.
+Beyond this, supporting lookups alongside CCS opens up the possibility
+improving Neo further. In particular, within Neo’s folding scheme, the prover
+establishes that every value in a committed vector are within a certain range. For
+a range of [−b, b], our current approach, which is adapted from LatticeFold [14]
+to the prime field setting, is somewhat naive: the range check is performed by
+representing it with a degree-2b sum-check instance. To minimize work in the
+sum-check protocol, b must be chosen to be small (e.g., b = 2). Instead of the
+naive approach, by using our adaptation of Shout, the degree of the multivariate
+polynomial in the sum-check can be made independent of b. We leave it to future
+work to incorporate these ideas into our folding scheme.
+1.5
+
+Constructing an IVC/PCD scheme, with proof compression
+
+By applying prior compilers from folding schemes to IVC [42,44] and PCD [65] to
+Neo’s folding scheme, we immediately obtain a lattice-based IVC/PCD scheme.
+Note that operations in the folding scheme verifier (e.g., extension field operations)
+can be natively represented in the finite field over which the constraint system
+is defined. Also, constructing an IVC/PCD scheme using Neo’s folding schemes
+does not require any cycles of elliptic curves [41, 52].
+With prior compilers, the IVC proof is a pair of instance-witness pairs, one
+in the CCS relation and another in a linearized version of the CCS relation
+(Section 4.1 provides details of the specific relations used in Neo). If IVC proof
+size is a concern, as in prior work [44], Neo’s prover can instead provide a SNARK
+proof which proves the knowledge of a valid IVC proof. The SNARK proof can be
+exponentially smaller than the size of the underlying IVC proof. In particular, we
+can apply Neo’s folding scheme to fold the two instance-witness pairs in an IVC
+proof into a single instance-witness pair in the linearized variant of CCS. We can
+then apply (Super)Spartan [57, 59] to reduce the task of proving the knowledge
+of a valid witness to a linearized CCS relation to a set of multilinear polynomial
+evaluation claims. Unfortunately, our lattice-based commitment scheme does
+not provide an efficient procedure to prove polynomial evaluations directly.
+Fortunately, we can use Spartan with a FRI-based polynomial commitment
+scheme [11] to prove the multilinear polynomial evaluations. Note that this
+preserves plausible post-quantum security. It also does not require any nonnative arithmetic or “wrong” field emulation, since we natively support SNARK
+friendly fields like Goldilocks. In particular, the size of the circuit proven with
+11
+
+Spartan+FRI will be O(n), where n is the size of the CCS witness polynomial.
+Note that the Spartan-based proof is an evaluation argument for our lattice-based
+commitment scheme, but a more direct approach would be preferable.
+
+2
+
+Preliminaries
+
+In this section, we fix our notation and recall reductions of knowledge and the
+sum-check protocol. In Appendix A, we formally present multilinear polynomials
+and relevant properties. We adapt some preliminaries from a prior work [43].
+2.1
+
+Notation
+
+We let λ to denote the security parameter. We let negl(λ) to denote a negligible
+function in λ. Throughout the paper, the depicted asymptotics depend on λ, but
+we elide this for brevity. We let PPT denote probabilistic polynomial time and
+let EPT denote expected probabilistic polynomial time. We let [n] denote the set
+{1, . . . , n}. We let {ui }i∈[n] denote the set {u1 , . . . , un }.
+We let F denote a prime field of order q, and K ⊇ F be the smallest degree
+extension field of F such that 1/ |K| = negl(λ). Let F n denote vectors of length
+n over elements in F . For a scalar s ∈ F , we define the scalar matrix s := s · Id ,
+where Id is the d × d identity matrix.
+We write F d [X1 , . . . , Xn ] to denote multivariate polynomials over field F in the
+variables (X1 , . . . , Xn ) with degree bound ≤ d for each variable. We omit the superscript if there is no degree bound. We let eq(x, y) ∈ F 1 [X1 , . . . , Xℓ , Y1 , . . . , Yℓ ]
+denote the polynomial that outputs 1 if x = y and 0 otherwise for x, y ∈ {0, 1}ℓ .
+We define ZSℓ as the set of all multivariate polynomials F ∈ F [X1 , . . . , Xℓ ] such
+that for all x ∈ {0, 1}ℓ , F (x) = 0 (i.e. vanish over the Boolean hypercube).
+For vector v ∈ F n we let ve ∈ F 1 [X
+P1 , . . . , Xlog n ] denote the multilinear polynomial extension of v (i.e., ve(i) = j eq(i, j) · vj ). For matrix M ∈ F d×n we let
+f ∈ F 1 [X1 , . . . , Xlog(dn) ] denote the multilinear polynomial extension of M (i.e.,
+M
+P
+ve(i, j) = u,v eq((i, j), (u, v)) · Mu,v ). In other words, the multilinear extension of
+a matrix M is the multilinear extension of the vector m := M (1) ||M (2) || . . . ||M (d)
+which is the concatenation of the rows of M . For a vector r ∈ K log n (for n a
+Nlog n
+power of two), we denote the tensor as rb =
+i=1 (ri , 1 − ri ). Notably, for a
+vector f ∈ F n , we have fe(r) = ⟨ f, rb ⟩. M ⊺ is the transpose of the matrix M .
+Norm For an element a ∈ F , we define ∥a∥∞ as follows: Let a′ ∈ [0, q − 1]
+denote the integer representation of a mod q. If a′ ≤ (q − 1)/2, then ∥a∥∞ = a′ .
+Otherwise, if a′ > (q − 1)/2, then ∥a∥∞ = a′ − q. This maps each F element into
+the interval [−(q − 1)/2, (q − 1)/2] ⊆ Z. For a matrix Z ∈ F d×m , we define the
+ℓ∞ -norm ∥Z∥∞ to be the max infinity norm of its elements.
+The sum-check protocol [46] The sum-check protocol is a classic interactive
+proof protocol between two PPT algorithms (P, V) that checks that the sum
+12
+
+of evaluations of a ℓ-variate polynomial Q ∈ F ≤d [X1 , . . . , Xℓ ] on the Boolean
+hypercube results in some value T. The output of the sum-check protocol is a
+?
+claim that v = Q(r) for some random point r ∈ F ℓ and claimed evaluations v,
+which the verifier V can query Q to check. The protocol is public-coin, has a
+completeness error of 0, and has a soundness error of ≤ ℓd/ |F |. More generally,
+the field can be chosen to be an extension field K. In this case, the soundness
+error is ≤ ℓd/ |K|. A self-contained description of the sum-check protocol can be
+found in this note [61].
+2.2
+
+Reductions of knowledge
+
+We now recall the reductions of knowledge framework, introduced by Kothapalli
+and Parno [39]. Reductions of knowledge are a generalization of arguments of
+knowledge, in which a verifier interactively reduces checking a prover’s knowledge
+of a witness in a relation R1 to checking the prover’s knowledge of a witness
+in another (simpler) relation R2 . In particular, both parties take as input a
+claimed instance u1 to be checked, and the prover additionally takes as input a
+corresponding witness w1 such that (u1 , w1 ) ∈ R1 . After interaction, the prover
+and verifier together output a new instance u2 to be checked in place of the
+original instance, and the prover additionally outputs a corresponding witness
+w2 such that (u2 , w2 ) ∈ R2 .
+Definition 1 (Reduction of knowledge [38, 39]). A reduction from R1
+to R2 is defined by PPT algorithms (G, K, P, V) called the generator, encoder
+(deterministic), prover, and verifier respectively with the following interface.
+– G(1λ , sz) → pp: Takes as input a security parameter 1λ and size parameters
+sz. Outputs public parameters pp.
+– K(pp, s) → (pk, vk): Takes as input public parameters pp and a structure s.
+Outputs a prover key pk and a verifier key vk.
+– P(pk, u1 , w1 ) → (u2 , w2 ): Takes as input a proving key pk and an instancewitness pair (u1 , w1 ). Interactively reduces the task of checking (pp, s, u1 , w1 ) ∈
+R1 to the task of checking (pp, s, u2 , w2 ) ∈ R2 .
+– V(vk, u1 ) → u2 : Takes as input a verifier key vk and an instance u1 in
+R1 . Interactively reduces the task of checking the instance u1 to the task of
+checking a new instance u2 in R2 .
+Let ⟨P, V⟩ denote the interaction between P and V. We treat ⟨P, V⟩ as a
+function that takes as input ((pk, vk), u1 , w1 ) and runs the interaction on the
+prover’s input (pk, u1 , w1 ) and the verifier’s input (vk, u1 ). At the end of the
+interaction, ⟨P, V⟩ outputs the verifier’s instance u2 and the prover’s witness
+w2 . A reduction of knowledge is a reduction, (G, K, P, V), that satisfies the
+following properties:
+(i) Completeness: For any EPT adversary A, given pp ← G(1λ , sz), (s, u1 , w1 )
+← A(pp) such that (pp, s, u1 , w1 ) ∈ R1 , we have that the prover’s output
+instance is equal to the verifier’s output instance u2 , and that
+(pp, s, ⟨P, V⟩((pk, vk), u1 , w1 )) ∈ R2 .
+13
+
+(ii) Knowledge soundness: For any EPT adversary (A, P ∗ ), there exists an
+EPT extractor E such that if the success probability of the adversary
+
+
+pp ← G(1λ , sz)
+ϵ(A, P ∗ ) := Pr  (pp, s, ⟨P ∗ , V⟩((pk, vk), u1 , st)) ∈ R2 (s, u1 , st) ← A(pp) 
+(pk, vk) ← K(pp, s)
+≥ 1/poly(λ), then we have that
+
+
+pp ← G(1λ , sz)
+
+(s, u1 , st) ← A(pp) 
+∗
+
+Pr 
+(pp, s, u1 , w1 ) ∈ R1 (pk, vk) ← K(pp, s)  ≥ ϵ(A, P ) − negl(λ).
+w1 ← E(pp, s, u1 , st)
+(iii) Public Coin: All of the verifier’s messages are uniformly random strings of
+some prescribed length. Furthermore, the verifier’s messages contain all of
+the random coins (randomness) used by the verifier.11
+Typically, we are interested in reducing several relations at once. We can
+interpret several relations as a single relation using the following product operator.
+Definition 2 (Relation product). For relations R1 and R2 over public parameter, structure, instance, and witness pairs we define the relation product as
+follows.
+
+R1 × R2 = (pp, s, (u1 , u2 ), (w1 , w2 )) (pp, s, u1 , w1 ) ∈ R1 , (pp, s, u2 , w2 ) ∈ R2 .
+We let Rn denote R × . . . × R for n times.
+A motivating property of reductions of knowledge is that they are composable,
+allowing us to build complex reductions by stitching together simpler ones. In
+particular, given reductions of knowledge Π1 : R1 → R2 and Π2 : R2 → R3 we
+have that Π2 ◦ Π1 (i.e., running Π1 first and then running Π2 on the outputs) is
+a reduction of knowledge from R1 to R3 . We define the formal semantics of the
+sequential composition operator ◦.
+Lemma 1 (Sequential composition [38, 39]). For reductions of knowledge
+Π1 = (G, K, P1 , V1 ) : R1 → R2 and Π2 = (G, K, P2 , V2 ) : R2 → R3 , we have that
+Π2 ◦ Π1 = (G, K, P, V) : R1 → R3 is a reduction of knowledge where K(pp, s)
+computes (pk, vk) and where
+P(pk, u1 , w1 ) = P2 (pk, P1 (pk, u1 , w1 ))
+V(vk, u1 ) = V2 (vk, V1 (vk, u1 , w1 ))
+In this work, we are primarily interested in building folding schemes, a
+particular type of reduction of knowledge that reduces the task of checking
+instances in some relation R2 into a running instance in a relation R1 .
+Definition 3 (Folding scheme). A folding scheme for R1 and R2 is a reduction
+of knowledge of type R1 × R2 → R1 .
+11
+
+If a reduction of knowledge is public-coin, then it trivially satisfies the property
+of public reducibility described in [39] as the execution of the verifier V can be
+emulated using the randomness from the transcript.
+
+14
+
+2.3
+
+Rings and Modules
+
+Definition 4 (Modules). Modules are a generalization of vector spaces for
+which the field of scalars is replaced by a ring R. Suppose R is a commutative
+ring with identity 1 and G is an abelian (commutative) group. The group G is
+an R-module if there is an operation · : R × G → G such that for all r, s ∈ R
+and x, y ∈ G, r · (x + y) = r · x + r · y, (r + s) · x = r · x + s · x, (rs) · x =
+r · (s · x), 1 · x = x. Suppose G1 and G2 are R-modules. Similarly, an R-module
+homomorphism is a map L : G1 → G2 that is a generalization of a linear map of
+vector spaces. L is an R-module homomorphism if for all x, y ∈ G1 and r ∈ R,
+f (x + y) = f (x) + f (y), f (r · x) = r · f (x).
+Definition 5 (Cyclotomic ring). Let η ∈ N be a prime power, and Φη is the
+η-th cyclotomic polynomial with degree d.12 We define the cyclotomic ring that
+we operate over as the quotient ring Rq := F [X]/(Φη ), whose elements can be
+viewed as polynomials over F with degree less than d.
+Definition 6 (Coefficient maps). We denote the coefficient vector of an
+element a ∈ Rq as a′ = cf(a) ∈ F d and a = cf -1 (a′ ) ∈ Rq to be the inverse map which takes a vector of d coefficients and outputs the corresponding ring element. Given a vector z ∈ Rqm , we denote cf(z) to be the matrix
+
+
+Z = cf(z1 ) cf(z2 ) · · · cf(zm ) ∈ F d×m and cf -1 (Z) to be the inverse map
+which takes a matrix in F d×m and outputs the corresponding vector of ring
+elements.
+Norm. For an element a ∈ Rq , we define ∥a∥∞ to be the ℓ∞ -norm of the vector
+cf(a). Similarly, for a vector z ∈ Rqm , we define ∥z∥∞ to be the ℓ∞ -norm of the
+matrix cf(Z).
+Definition 7 (Rotation matrices). We define a shift matrix F ∈ F d×d and
+rotation matrix, rot(a) ∈ F d×d for an element a ∈ Rq [50, pg. 11]:
+
+
+
+F := 
+
+
+0
+Id−1
+
+- c0
+- c1
+..
+.
+
+
+
+
+
+
+ , rot(a) := cf(a) F · cf(a) · · · Fd−1 · cf(a)
+
+
+- cd−1
+where the coefficients of the cyclotomic polynomial are Φη = xd + cd−1 xd−1 +
+cd−2 xd−2 + · · · + c0 . For all a ∈ Rq , we have cf(X · a) = F · cf(a). Hence, for all
+a, b ∈ Rq , rot(a) · cf(b) = cf(ab).
+Remark 1 (Visualizing rotation matrices). The shift matrix F effectively rotates
+a vector and shifts by the coefficents of the cyclotomic polynomial scaled by the
+12
+
+If d is a power of two, then Φη = X d +1 for η = 2d. If η = 34 , then Φη = X 54 +X 27 +1.
+
+15
+
+last entry of the vector. Below, we have an example for a rotation matrix for an
+element a ∈ Rq where Φη = X d + 1.
+
+
+
+
+
+
+0
+-c0
+a0 -ad−1 . . . -a1
+ a0 
+ -c1 
+ a1
+a0 . . . -a2 
+
+
+
+
+
+
+F · cf(a) =  .  + ad−1  .  , rot(a) :=  .
+.. . . .. 
+ .. 
+ .. 
+ ..
+. . 
+.
+ad−2
+-cd−1
+ad−1 ad−2 . . . a0
+Definition 8 (Module short integer solution [45, 47, 55]). Define the ring
+R := Z[X]/(Φη ). The MSIS∞,κ,q
+m,B problem is defined as follows: Given a matrix
+$
+
+M ← Rqκ×m sampled uniformly at random, find a non-zero vector z ∈ R such
+that M z = 0 mod q and ∥z∥∞ ≤ B.
+Definition 9 (Ajtai commitment scheme [5]). Assume the MSIS∞,κ,q
+m,2B
+problem is hard. Let message length m ∈ N. The Ajtai commitment scheme
+com := (Setup, Commit) consists of the following algorithms:
+$
+
+– Setup(κ, m) → pp: Sample a random matrix M ← Rqκ×m . Output pp ← M .
+– Commit(pp, z) → c: Given public parameters pp and vector z ∈ Rqm such that
+∥z∥∞ ≤ B, output M z.
+Theorem 1 (Low norm invertibility [48, Theorem 1.1]). Let
+p z ∈ N such
+that z | η, q ≡ 1 (mod z), and ordη (q) = η/z. Define binv := 1/ τ (z) · q 1/ϕ(z)
+where τ (z) := z if z is odd, otherwise τ (z) = z/2. For an arbitrary a ∈ Rq , if
+0 < ∥cf(a)∥∞ < binv , then a is invertible in Rq .
+Definition 10 (Strong sampling sets [23]). Define CR ⊆ Rq to be any set of
+ring elements such that for any distinct elements a, b ∈ CR , ∥cf(a − b)∥∞ < binv
+(Theorem 1).
+
+3
+
+Neo’s folding-friendly lattice-based commitments
+
+This section describes Neo’s lattice-based commitment scheme that can be used
+to construct folding schemes. We begin with requirements on this commitment
+scheme and highlight challenges that must be addressed.
+3.1
+
+Requirements
+
+To construct our lattice-based folding scheme for CCS, we need a lattice-based
+commitment scheme for a vector of field elements z ∈ F m (e.g., a witness vector
+for CCS). We require this commitment scheme to satisfy several properties.
+(1) Linear homomorphism for folding multilinear evaluation claims. Given a
+collection of commitments (ci )i∈[k] and the corresponding claimed evaluations
+(ri , yi )i∈[k] , we want to be able to reduce the task of proving that the commitments indeed open to corresponding vectors, (zi )i∈[k] , such that their multilinear
+16
+
+extension polynomials evaluate to the claimed evaluations to the task of proving
+that a single commitment C opens to a vector, z, whose multilinear extension
+polynomial evaluates to some value y.13
+Challenges. For discrete-log based commitments (e.g., Pedersen [54], HyperKZG [64]), this simply amounts to taking a random linear combination of
+the commitments to get a single commitment c, and proving that a vector z
+underneath c evaluates to some y at r, where y is the weighted sum of {yi }i∈[k]
+(the weights used for combining evaluations is the same as the weights used for
+combining commitments). However, for lattice-based commitments such as Ajtai
+(Definition 9), the binding of the commitment scheme depends on the norm of the
+vector z. Thus, there are two main challenges when taking linear combinations.
+First, the norm of the vector z may be larger than allowed for the binding of the
+commitment scheme, and the extraction procedure of the folding scheme (for
+knowledge soundness) may not preserve the original norm. Second, how can we
+even commit to arbitrary vectors z ∈ F m , when the norm of z may be large?
+(2) Pay-per-bit costs. We require that the cost to commit to a vector of values
+scales with the bit width of the values in the vector. This is not necessary for
+constructing a folding scheme for CCS, but it is a highly desirable property in
+practice as often times the witness values are in a small subset of the field.
+Challenges. With discrete-log based commitments, the cost of committing
+to a vector z scales with the bit-width of its elements. When moving to Ajtai
+commitments, this is non-trivial to achieve. For example, prior works such as
+LatticeFold [14] do not provide such a cost profile. We now provide details.
+LatticeFold does not provide pay-per-bit commitment costs because of the way
+it embeds a vector z ∈ F m into the cyclotomic ring z ′ ∈ Rqm prior to committing
+with Ajtai’s commitment scheme. In particular, for certain choices of cyclotomic
+rings, the ring Rq ≃ (F qτ )t (for which t · τ = d and d is the degree of Φη ) is
+isomorphic to multiple copies of an extension field F qτ . This is often referred to as
+the NTT representation of an Rq element. When committing to a vector z ∈ F m
+(e.g., the CCS witness), LatticeFold first embeds the vector z into the extension
+field F qτ . Together with t − 1 other vectors, LatticeFold applies the so-called NTT
+transformation to obtain a ring vector z ′ ∈ Rqm whose NTT representation equals
+to those t vectors. The important point here is that the NTT transformation
+does not preserve the norm of the input vectors. If z ∈ F m has a low norm, then
+that does not mean z ′ ∈ Rqm has a low norm. Hence, the final step to commit
+using Ajtai’s commitment scheme is to decompose z ′ ∈ Rqm into a longer vector
+z ′′ ∈ Rqm·ℓ whose ring elements have low enough norm or into multiple vectors
+(zi′ )i∈[k] , which further increases the cost to commit. Thus, regardless of the
+bit-width of the original vectors, the cost to commit is the same (i.e., LatticeFold
+does not achieve pay-per-bit commitment costs).
+13
+
+We treat a vector z ∈ F n , where n is a power of 2, as evaluations of a multilinear
+polynomial over the Boolean hypercube {0, 1}log n . Since a log n-variate multilinear
+polynomial is uniquely determined by its evaluations over {0, 1}log n , committing to
+z commits to the unique multilinear extension polynomial ve.
+
+17
+
+(3) Support for small fields and for folding linear transforms. To fold CCS
+instance-witness pairs, we need to fold evaluations of not only the multilinear
+gz for some CCS
+extensions of CCS witness vector z, but also evaluations of M
+constraint matrix M .
+Challenges. In prior work [14], this is achieved by taking random linear
+combinations of the witness commitments and evaluations, where the witnesses
+are embedded in the NTT representation of ring elements. However, as noted [14,
+Section 3.3], when supporting “small” fields (i.e., fields whose order is not 2λ ),
+this strategy leads to a τ multiplicative factor blow-up in the cost of the protocols,
+where τ is the degree of the extension field in the NTT representation. For example,
+in LatticeFold’s example parameterization [14, Sec. 5] for 64-bit fields, one would
+need to set τ = 4. This is due to security requirements and a mapping between
+coefficient and NTT representation that loses a τ factor of packing. Furthermore,
+this transformation between coefficient and NTT representation incurs another
+factor of 2, because evaluations over both NTT representation and coefficient
+representation need to be accounted for. In LatticeFold’s folding protocol, the
+prover and the verifier must execute the sum-check protocol over cyclotomic
+polynomial rings (instead of fields). When using the NTT representation (F qτ )t for
+ring elements, this sum-check can be performed as operations over F qτ . Despite
+the field being 64-bits in size, they must work over a larger extension field
+F q4 ≈ 2256 . As we describe later, Neo’s folding scheme does not have to operate
+over such a large extension field, since we avoid this security issue entirely. In
+our parameterization Section 6, the sum-check protocol can draw challenges over
+F q2 instead when q is about 64 bits.
+3.2
+
+Neo’s solution, part-1: A matrix commitment scheme
+
+Research question. Can we construct a simple and efficient lattice-based commitment scheme that can satisfy all of our requirements and that works natively
+over small prime fields (e.g., M61)?
+Our starting point is Ajtai’s commitment scheme (Definition 9). This scheme
+commits to a vector of low-norm ring elements z ∈ Rqm (i.e., the coefficients
+of ring elements have low-norm) by multiplying the vector with a matrix M
+sampled in the setup algorithm. Looking ahead, we can view the vector z of ring
+elements as a matrix of its coefficients.
+The first question that we need to resolve is the following: given a vector
+z ∈ F m , how can we embed z into a low-norm vector z ′ ∈ Rqm such that z ′ can
+be committed directly with Ajtai’s commitment scheme while preserving the
+required homomorphism properties?
+We map each element zi ∈ F to a single ring element zi′ ∈ Rq by embedding
+Pd
+Pd
+the b-bit words of zi := j=1 bj−1 zi,j into the coefficients zi′ := j=1 zi,j · X j−1 .
+This embedding guarantees that zi′ has low-norm. More formally, we define several
+decomposition mappings that we employ: (1) Decompb maps z ∈ F m into a matrix
+Z ∈ F d×m with low-norm; and (2) Given a matrix Z ∈ F d×m , splitb splits Z into
+multiple matrices with low-norm.
+18
+
+Definition 11 (Decomposition and splitting). Let b, m ∈ N. We define
+Decompb : F m → F ∗×m as the map which takes a vector z and performs the b-ary
+decomposition into a matrix Z := Decompb (z) ∈ F ∗×m . For example, if z ∈ F m
+such that ∥z∥∞ < bd , then we have
+
+
+Z (1)
+d
+
+
+X
+Z (2)
+
+
+<b
+Decompb (z) := 
+bi−1 · Z (i) and Z (i)
+ such that z =
+
+
+∞
+···
+i=1
+Z (d)
+where Z (i) is the i-th row of Z.
+We define splitb : F d×m → (F d×m )∗ to be the b-ary decomposition map, which performs the b-ary decomposition of a matrix Z ∈ F d×m into matrices Z1 , Z2 , . . . , Z∗ .
+For example, if Z ∈ F d×m such that and ∥Z∥∞ < bk , then we have
+splitb (Z) := (Z1 , Z2 , . . . Zk )
+
+such that
+
+Z=
+
+k
+X
+
+bi−1 · Zi and ∥Zi ∥∞ < b
+
+i=1
+
+We then apply Ajtai’s commitment scheme to commit to low-norm matrices
+Z ∈ F d×m (Theorem 2). In particular, each column of a low-norm matrix gets
+mapped as the coefficients of a single ring element. Each ring element corresponds
+1-to-1 with the decomposition of a single witness element. We refer to the resulting
+vector as z ′ ← cf -1 (Z). To compute the commitment to Z, we compute the Ajtai
+commitment M z ′ . Since Z is low-norm, Ajtai’s commitment scheme provides the
+desired binding property.
+Bit-width scaling multiplication. We now discuss how the cost of Ajtai’s commitment scheme, with our particular embedding of witnesses into ring elements,
+scales linearly with the bit-width of the witness z. Recall that Ajtai’s commitment
+scheme is merely a ring matrix multiplication M z ′ .
+We show how the cost of a ring multiplication for which a, b ∈ Rq where b
+only has binary coefficients scales with the number of non-zero coefficients of b.
+As a result, this shows that the cost of the matrix multiplication M z ′ scales with
+the bit-width of z ′ . By the definition of rotation matrices (Definition 7),
+ 
+
+ b1
+d
+ b2  X
+ 
+cf(a · b) = rot(a) · cf(b) =  a1 a2 . . . ad   .  =
+bi · ai
+ ..  i=1
+bd
+where ai denotes the i-th column of rot(a). Since coefficients (bi )i are bits, this
+amounts to just adding the columns which correspond to the bi = 1. For a choice of
+cyclotomic ring (Definition 5) (with a cyclotomic polynomial containing a constant
+number of coefficients), computing these columns ai requires just a rotation of
+the prior column and adding a constant number of field elements (Remark 1).
+19
+
+Homomorphism. When Ajtai’s commitment scheme is viewed as a commitment
+scheme for vectors z ∈ Rqm , there is a natural understanding of taking linear
+combinations, namely the Ajtai commitment scheme is an Rq -module homomorphism L : Rqm → Rqκ (i.e. c1 + r · c2 = L(z1 + r · z2 ) for r ∈ Rq ). But, what is the
+analogue for matrices? We now provide details.
+Definition 12 (Ring of rotation matrices). Let Rq be a cyclotomic ring. We
+define S := { rot(a) | a ∈ Rq } ⊆ F d×d to be the ring of all rotation matrices
+for elements in Rq . For our purposes, S can be thought of as a commutative
+subring of matrices F d×d , which contains all scalar matrices (exactly the rotation
+matrices for the constant ring elements).
+It turns out that the ring Rq is isomorphic to the ring of rotation matrices
+S ⊆ F d×d (Theorem 7). Hence, instead of an Rq -module homomorphism, the
+commitment scheme can be viewed as a S-module homomorphism L : F d×m →
+F d×κ , where the matrices Z ∈ F d×d and commitments in F d×κ (i.e., the coefficient
+matrix of the ring elements) are left multiplied by elements r ∈ S ⊆ F d×d . We
+formalize this view with the following definition.
+Definition 13 (Matrix commitment scheme). Let F be a field. A matrix
+commitment scheme com := (Setup, Commit) consists of two algorithms.
+– Setup(1λ , d, m) → pp: Takes as input a security parameter 1λ and matrix
+dimensions d, m ∈ N, outputs public parameters pp.
+– Commit(pp, Z) → c: Takes as input public parameters pp and a matrix
+Z ∈ F d×m , outputs a commitment c ∈ C.
+These algorithms can satisfy the following properties.
+S-homomorphic: Let space S ⊂ F d×d be a commutative sub-ring of d×d matrices. For all m ∈ N and public parameters pp output by Setup(1λ , d, m), we have
+that for all matrices Z1 , Z2 ∈ F d×m and ρ1 , ρ2 ∈ S that
+ρ1 · Commit(pp, Z1 ) + ρ2 · Commit(pp, Z2 ) = Commit(pp, ρ1 · Z1 + ρ2 · Z2 )
+More formally, the commitment algorithm Commit(pp, · ) : F d×m → C is an
+S-module homomorphism.
+(d, m, B)-Binding: For all expected polynomial time adversaries A, we have
+
+
+Commit(pp, Z1 ) = Commit(pp, Z2 )
+λ
+pp ← Setup(1 , d, m)
+
+
+Pr  ∧ Z1 ̸= Z2
+
+d×m
+Z1 , Z2 ∈ F
+← A(pp)
+∧ ∥Z1 ∥∞ , ∥Z2 ∥∞ < B
+≤ ϵbind (com, d, m, B) ≤ negl(λ). We refer to the pair of messages (Z1 , Z2 ) which
+satisfies the conditions in the probability as an (d, m, B)-binding collision.
+Theorem 2. Let Rq be a cyclotomic ring (Definition 5) and S be the ring
+of all rotation matrices (Definition 7). If the MSIS∞,κ,q
+m,2B problem is hard then
+Ajtai’s commitment scheme (Definition 9) is a matrix commitment scheme
+(Definition 13) that is S-homomorphic and (d, m, B)-binding.
+Proof. For brevity, we defer the proof to Appendix B.1.
+20
+
+3.3
+
+Neo’s solution, part-2: linear homomorphism for folding
+multilinear evaluation claims
+
+Based on the description thus far, we have a commitment scheme that commits
+to CCS witnesses z := x || w ∈ F m as low-norm matrices Z := X || W ∈ F d×m .
+As discussed earlier, we want to be able to fold evaluations of the multilinear
+gz for some matrix M (e.g., the CCS constraint matrices).
+extensions M
+Our starting point is the following lemma, which observes that linear combinations of commitments respect right multiplication of their openings. Looking
+ahead, we carefully choose the matrix V to be M ⊺ rb which will allow us to fold
+the desired multilinear evaluations at a point r. In particular, consider a vector
+Z ← Decompb (z) ∈ F d×m (Definition 11). For a matrix M ∈ F n×m and r ∈ K log n
+(b
+r ∈ K n ), observe that
+ZM ⊺ rb = [Z (1) M ⊺ rb, Z (2) M ⊺ rb, . . . , Z (d) M ⊺ rb]
+^
+^
+^
+= [M
+Z (1) (r), M
+Z (2) (r), . . . , M
+Z (d) (r)]
+gz(r), it suffices
+where Z (i) is the i-th row of Z. To obtain the evaluation M
+Pd
+Pd
+i−1 (i)
+⊺
+i−1 (i)
+Z M rb = ( i=1 b Z )M ⊺ rb = zM ⊺ rb =
+to compute the sum
+i=1 b
+gz(r). Another way to view ZM ⊺ rb is as a partial evaluation y ∈ F d such that
+M
+⊺ (X , . . . , X , r).
+^
+ye(X1 , . . . , Xd ) = ZM
+1
+d
+Lemma 2 (Linear combination lemma). Let S ⊆ F d×d be any commutative
+sub-ring of d × d matrices and m, n, k ∈ N. Let L : F d×m → C be a S-module
+homomorphism. Consider arbitrary ρ1 , . . . , ρk ∈ S, Z1 , . . . , Zk ∈ F d×m , and
+V ∈ K m×n . For all i ∈ [k], define
+ci := L(Zi ) ∈ C
+
+and
+
+vi := Zi V ∈ K d×n
+
+Define
+c :=
+
+X
+
+ρi ci ∈ C
+
+Z :=
+
+i∈[k]
+
+X
+
+ρi Zi ∈ F d×m
+
+i∈[k]
+
+v :=
+
+X
+
+ρi vi ∈ K d×n
+
+i∈[k]
+
+Then, c = L(Z) and v = ZV .
+Proof. First, we will prove that c = L(Z). Since L is a S-module homomorphism,
+the following holds
+P
+
+X
+X
+c=
+ρi ci =
+ρi L(Zi ) = L
+i∈[k] ρi Zi = L(Z).
+i∈[k]
+
+i∈[k]
+
+Now, we will prove that v = ZV , as follows
+P
+
+X
+X
+v=
+ρ i vi =
+ρi Z i V =
+i∈[k] ρi Zi V = ZV
+i∈[k]
+
+i∈[k]
+
+This concludes our proof.
+21
+
+The following corollary can be immediately obtained from Lemma 2 by defining
+V := Mj⊺ rb for each j ∈ [t] and choosing Lx as the trivial S-homomorphism,
+which projects the first min columns of Z.
+Corollary 1. Let S ⊆ F d×d be any commutative sub-ring of d × d matrices and m, n, k ∈ N. Let L : F d×m → C and Lx : F d×m → F d×min be Smodule homomorphisms. Consider arbitrary ρ1 , . . . , ρk ∈ S, Z1 , . . . , Zk ∈ F d×m ,
+M1 , . . . , Mt ∈ F n×m , r ∈ K log n . Define
+∀ i ∈ [k], ci := L(Zi ) ∈ C, Xi := Lx (Zi ) ∈ F d×min
+∀ i ∈ [k], j ∈ [t], y(i,j) := Zi Mj⊺ rb ∈ K d
+Define
+Z :=
+
+c :=
+P
+
+P
+
+i∈[k] ρi ci ∈ C
+
+i∈[k] ρi Zi ∈ F
+
+d×m
+
+X :=
+
+P
+
+yj :=
+
+P
+
+i∈[k] ρi Xi ∈ C
+i∈[k] ρi · y(i,j) ∈ K
+
+d
+
+Then, c = L(Z), X = Lx (Z), and for all j ∈ [t], yj = ZMj⊺ rb.
+3.4
+
+Challenge sets
+
+As hinted earlier, when taking random linear combinations of lattice-based
+commitments, there are two concerns: (1) the random combination of the openings
+might be larger than the norm-bound required for binding; and (2) for extraction
+(i.e., knowledge soundness of the folding scheme), we need the differences between
+challenges to be invertible. We formalize these requirements by lifting strong
+sampling sets over cyclotomic rings Rq (Definition 10) to our setting.
+Definition 14 (Strong sampling set). Let S ⊆ F d×d be any commutative
+sub-ring of d × d matrices. A strong sampling set for S is a subset C ⊆ S such
+that for any two distinct elements ρ, ρ′ ∈ C, (ρ − ρ′ ) is invertible in the ring S.
+Furthermore, we define the
+expansion factor of C := max
+d
+
+v∈F
+ρ∈C
+
+∥ρv∥∞
+∥v∥∞
+
+Lattice instantiation. Consider a strong sampling set CR over the cyclotomic
+ring Rq (Definition 10). By definition, for any distinct elements a, b ∈ CR ,
+∥cf(a − b)∥∞ < binv . Thus, by Theorem 1, a − b is invertible in Rq . Since Rq
+and S (Definition 12) are isomorphic, we can define a strong sampling set
+C := { rot(c) | c ∈ CR } to be the correspond set of rotation matrices. Consider arbitrary distinct elements rot(a) , rot(b) ∈ C. By Theorem 7, we have
+(rot(a) − rot(b))−1 = rot (a − b)−1 .
+Theorem 3 (Expansion factors). Let CR be a strong sampling set over the
+cyclotomic ring Rq (Definition 10), and C := { rot(c) | c ∈ CR } be the corresponding set of rotation matrices. We denote the Euler totient function as ϕ. We
+22
+
+must have that the expansion factor (Definition 14) of C is
+max
+d
+
+v∈F
+ρ∈C
+
+∥ρv∥∞
+≤ 2 · ϕ(η) · max
+∥ρ′ ∥∞
+ρ′ ∈CR
+∥v∥∞
+
+Proof. For brevity, we defer the proof to Appendix B.3.
+Looking ahead, our security analysis will require a different notion of binding
+called relaxed binding. Here, we lift the notion from prior works to the matrix
+setting, where C will be a challenge set with which we take linear combinations
+of commitments.
+Definition 15 ((d, m, B, C)-relaxed binding [9, 10, 14]). Let com := (Setup,
+Commit) be an arbitrary matrix commitment scheme (Definition 13) that is Shomomorphic. Let C be any subset of S. The commitment scheme com satisfies
+(d, m, B, C)-relaxed binding if for all expected polynomial time adversaries A,
+we have
+
+
+∆1 · c = Commit(pp, Z1 )
+pp ← Setup(1λ , m)
+ ∧ ∆2 · c = Commit(pp, Z2 )
+
+
+
+
+
+c ∈ C,
+Pr 
+
+ ∧ ∥Z1 ∥∞ , ∥Z2 ∥∞ < B,
+ ∆1 , ∆2 ∈ (C − C),  ← A(pp) 
+Z1 , Z2 ∈ F d×m
+∧ ∆1 Z2 ̸= ∆2 Z1
+≤ ϵrelax (com, d, m, B, C) ≤ negl(λ). We refer to a tuple of elements (c, ∆1 , ∆2 , Z1 ,
+Z2 ) which satisfies the conditions in the probability as an (d, m, B, C)-relaxed
+binding collision.
+It turns out that regular binding implies relaxed binding. Here, we lift the
+corresponding lemmas from prior work to our setting.
+Lemma 3 (Binding implies relaxed binding [9,10,14]). Let com := (Setup,
+Commit) be an arbitrary matrix commitment scheme (Definition 13) that is
+S-homomorphic and C ⊆ S be a strong-sampling set with expansion factor
+T (Definition 14). If com is (d, m, 2T B)-binding (Definition 13), then com is
+(d, m, B, C)-relaxed binding (Definition 15).
+Proof. For brevity, we defer the proof to Appendix B.2.
+
+4
+
+Neo’s folding scheme for CCS
+
+This section describes Neo’s folding scheme for CCS. At a high level, we leverage
+the commitment scheme we provided in Section 3 in conjunction with HyperNova’s
+folding scheme for CCS [42]. To make this sketch work, we first lift the CCS
+relation [59] to the matrix setting, and provide three reductions. These reductions
+can also be viewed as adapting the ideas in LatticeFold [14] to the prime field
+setting in a way that natively supports “small” primes. The security analysis of
+some of our reductions will require new security definitions and a new composition
+theorem for reductions, which we provide in Section 5. By composing the three
+reductions, we obtain a lattice-based folding scheme for CCS.
+23
+
+4.1
+
+Relations
+
+The CCS structure contains the CCS constraint matrices {Mj }j∈[t] and a constraint polynomial f .
+Definition 16 (Structure). Let m, n, u, t ∈ N. We define a structure as a
+collection of elements
+n
+o
+s :=
+Mj ∈ F n×m j∈[t] , f ∈ F <u [X1 , . . . , Xt ] ,
+which consists of matrices and a degree-u polynomial.
+Below, we provide an analogue of the CCS relation updated to match our low
+norm requirement (which is enforced by decomposition) and a matrix commitment
+scheme (more generally, any S-module homomorphism).
+Definition 17 (Matrix constraint system relation). Let L : F d×m → C be
+a S-module homomorphism. Let s be a structured as defined in Definition 17. We
+define the Matrix constraint system relation as follows:
+
+MCS(b, L) :=
+
+
+
+
+
+
+
+
+
+
+For z := x || w and
+s; (c ∈ C, x ∈ F min ); w ∈ F m−min
+
+
+
+
+
+
+
+
+
+
+
+:
+
+
+
+
+
+
+
+
+
+
+Z := Decompb (z),
+
+c=L Z
+
+
+
+
+
+
+
+
+g
+g
+f M1 z, . . . , Mt z ∈ ZSn 
+
+HyperNova’s folding scheme [42] can be viewed as providing a reduction
+from CCS to linearized CCS, a variant of CCS that they define. In a nutshell,
+linearized CCS amounts to the multilinear evaluations of (M1 z, . . . , Mt z). Here,
+we define the analogue of linearized CCS in our setting, where we get the partial
+evaluation instead. Ultimately, we fold these partial evaluations using random
+linear combinations as hinted in our linear combination lemma (Corollary 1).
+Definition 18 (Matrix evaluation relation). Let L : F d×m → C be a
+S-module homomorphism. Let Lx : F d×m → F d×min be the trivial S-module
+homomorphism which projects the first min columns. Let s be a structure as
+defined in Definition 17.
+ 
+
+
+
+c ∈ C,
+c = L(Z) ∧ X = Lx (Z) 
+
+
+
+
+
+  X ∈ F d×min , 
+
+
+ 
+
+d×m 
+∥Z∥
+<
+b
+∞
+ME(b, L) := s; 
+;
+Z
+∈
+F
+:
+
+
+
+
+  r ∈ K log n , 
+
+
+
+
+
+∀ j ∈ [t], yj = ZMj⊺ rb
+
+
+d
+{yj ∈ K }j∈[t]
+
+
+⊺
+^
+The condition yj = ZMj⊺ rb is equivalently expressed as yej = ZM
+j X[1, log d] , r .
+4.2
+
+Constructing a folding scheme via reductions of knowledge
+
+In this section, we provide an overview of three reductions. By sequentially
+composing the three, we obtain a lattice-based folding scheme for CCS.
+24
+
+(1) CCS reduction ΠCCS . This reduction takes as input ME(b, L)k ×MCS(b, L),
+which contains k b-norm partial evaluation claims and one CCS claim, and
+reduces to k + 1 b-norm partial evaluation claims ME(b, L)k+1 . This reduction
+can be viewed as the lattice analogue of the CCS to linearized CCS reduction in
+HyperNova [42], which reduces CCS claims to evaluation claims by invoking the
+sum-check protocol [46].
+(2) Random linear combination reduction ΠRLC . This reduction takes as
+input k + 1 b-norm partial evaluation claims ME(b, L)k+1 , and reduces to a single
+(B = bk )-norm partial evaluation claim ME(B, L). This reduction simply takes
+linear combinations of the input commitments and claims using challenges from
+a strong sampling set (Definition 14).
+(3) Decomposition reduction ΠDEC . This reduction takes as input a single
+B-norm partial evaluation claim ME(B, L) and reduces to k b-norm partial evaluation claims ME(b, L)k . Informally, the prover effectively sends k commitments
+which represent the decomposition of the original B partial evaluation claim.
+This reduction does not use any randomness from the verifier, and is required to
+keep the norm of the commitments lower than the binding requirement for the
+commitment scheme.
+In terms of security, the composition ΠRLC ◦ ΠCCS is a reduction of knowledge from ME(b, L)k × MCS(b, L) to ME(B, L), and ΠDEC alone is a reduction of knowledge from ME(B, L) to ME(b, L)k . All together, the composition
+Π := ΠDEC ◦ ΠRLC ◦ ΠCCS is a reduction of knowledge from ME(b, L)k × MCS(b, L)
+to ME(b, L)k . This allows for the continual folding of MCS(b, L) claims. Thus, we
+obtain a folding scheme for CCS.
+4.3
+
+Reduction parameters
+
+Here, we define global parameters for all the three reductions.
+– Let S ⊆ F d×d be a commutative subring of d × d matrices (Definition 12)
+and m, n, b, k, B = bk < q/2 ∈ N.
+– Let C ⊆ S be a strong sampling set (Definition 14) with expansion factor T
+such that (k + 1)T (b − 1) < B and 1/ |C| = negl(λ).
+– Let com := (Setup, Commit) be an commitment scheme (Definition 13),
+which is S-homomorphic and (d, m, 2B, C)-relaxed binding (Definition 15).
+For pp ← Setup(1λ , d, m), define L := Commit(pp, · ) : F d×m → C, which is
+a S-module homomorphism by definition.
+– Let Lx : F d×m → F d×min be the trivial S-module homomorphism that
+projects the first min columns.
+– Let s denote a structure as defined in Definition 17.
+4.4
+
+CCS Reduction – ΠCCS
+
+For notational simplicity, we describe the protocol as a reduction from MCS(b, L)×
+ME(b, L)k−1 to ME(b, L)k instead of MCS(b, L) × ME(b, L)k to ME(b, L)k+1 . This
+only affects indexing.
+25
+
+Overview. In this reduction, we first construct a multivariate polynomial Q(X1 ,
+. . . , Xlog(dn) ) such that we can encode the CCS constraints (encoded as the
+polynomial F), norm constraints (encoded as polynomials NCi for i ∈ [k]), and
+evaluation claims Zi Mj⊺ rb (encoded as polynomials Evali,j for i ∈ [k], j ∈ [t]) to
+a claimed sum of a polynomial Q(X1 , . . . , Xlog(dn) ) over the Boolean hypercube
+{0, 1}log(dn) . Then, we rely on the classic sum-check protocol [46] to reduce this
+?
+
+sum claim to a single evaluation claim for v = Q((α′ , r′ )), which can be derived
+by the partial evaluations of each sub-component polynomial on r′ . This leaves k
+new partial evaluation claims over r′ .14
+Without loss of generality, assume that m = n and n, d · n are both powers of
+two and that M1 = In is the identity matrix. By choosing M1 = In , we simplify
+our notation as folding M1 z evaluations is equivalent to folding z evaluations.
+CCS reduction ΠCCS
+Parameters: Refer to Section 4.3.
+
+Input: s; (c1 ∈ C, x1 ∈ F min ); w1 ∈ F m−min ,
+
+k
+s; ci ∈ C, Xi ∈ F d×min , r ∈ K log n , {y(i,j) ∈ K d }j∈[t] ; Zi ∈ F d×m
+
+i=2
+
+∈ MCS(b, L) × ME(b, L)k−1
+
+′
+∈ K d }j∈[t] ; Zi ∈ F d×m i∈[k]
+Output: s; ci ∈ C, Xi ∈ F d×min , r′ ∈ K log n , {y(i,j)
+∈ ME(b, L)k
+Setup G(1λ , sz) → pp: Output pp ← Setup(1λ , sz), which defines L := Commit
+(pp, · ) : F d×m → C.
+
+Encoder K(pp, s) → (pk, vk): Output (pp, s), ⊥ .
+Reduction ⟨P, V⟩((pk, vk), u1 , w1 ) → (u2 ; w2 ):
+$
+
+$
+
+$
+
+1. V: Send challenges α ← K log d , β ← K log(dn) , γ ← K to P.
+2. V ↔ P: Define z1 := x1 || w1 , X1 := Decompb (x1 ), Z1 := Decompb (z1 ), for all
+i ∈ [k], j ∈ [t], M(i,j) := Zi Mj⊺ , and
+
+
+
+^
+]
+F X[1, log n] := f M
+1 z1 , . . . , M
+t z1
+
+
+
+Q
+f
+NCi X[1, log(dn)] := b−1
+j=−b−1 Zi (X) − j
+
+
+f(i,j) (X)
+Eval(i,j) X[1, log(dn)] := eq X, (α, r) · M
+
+14
+
+∀ i ∈ [k]
+∀ i ∈ [2, k], ∀ j ∈ [t]
+
+Note that the polynomial Q to which the sum-check protocol is applied includes
+Evali,j because we rely on the sum-check protocol to rerandomize all evaluation
+claims, including those arising from F, to be over the same random point r′ . This is
+important to be able to take a random linear combination of all evaluation claims.
+HyperNova [42] and LatticeFold [14] also perform a similar rerandomization.
+
+26
+
+
+
+P
+Q X[1, log(dn)] := eq(X, β) F(X[log(d)+1, log(dn)] ) + i∈[k] γ i NCi (X)
++ γk
+
+Pt,k
+
+j=1,i=2 γ
+
+i+(j−1)k−1
+
+· Eval(i,j) (X)
+
+Define claimed sum of Q over {0, 1}log(dn) as
+P
+i+(j−1)k−1
+· ye(i,j) (α)
+T := γ k t,k
+j=1,i=2 γ
+?
+
+Perform SumCheck (T; Q) which reduces to evaluation claim v = Q(α′ , r′ ) for
+(α′ , r′ ) ∈ F log d × F log n .
+′
+′
+3. P: For all i ∈ [k] and j ∈ [t], send y(i,j)
+:= Zi Mj⊺ rb′ ∈ K d (i.e. ye(i,j)
+=
+
+′
+f
+M(i,j) X[1, log d] , r ).
+
+
+?
+4. V: Check the evaluation claim v = Q α′ , r′ as follows,
+∀j ∈ [t], mj :=
+F := f (m1 , . . . , mt ),
+
+P
+
+ℓ∈[d] b
+
+ℓ−1
+
+∀i ∈ [k], Ni :=
+
+′
+· y(1,j),ℓ
+
+Qb−1
+
+j=−b−1
+
+
+′
+ye(i,1)
+(α′ ) − j ,
+
+′
+∀ i ∈ [2, k], ∀ j ∈ [t], E(i,j) := eq((α′ , r′ ), (α, r)) · ye(i,j)
+(α′ )
+
+
+ 
+P
+P
+?
+i+(j−1)k−1
+v = eq (α′ , r′ ), β · F + i∈[k] γ i · Ni + γ k t,k
+· E(i,j)
+j=1,i=2 γ
+
+′
+5. Output s; ci , Xi , r′ , {y(i,j)
+}j∈[t] ; Zi i∈[k]
+
+Lemma 4. The CCS reduction ΠCCS is a complete and public coin reduction
+from MCS(b, L) × ME(b, L)k−1 to ME(b, L)k .
+Proof. For brevity, we defer the proof to Appendix B.4.
+Security of ΠCCS . We defer the formal security analysis of the reduction ΠCCS
+to Section 5, because the reduction by itself is not a reduction of knowledge
+(Definition 1). This is because ΠCCS is not directly knowledge sound (against
+arbitrary adversaries). Instead, in Section 5, we introduce new security properties
+which ΠCCS satisfies. In particular, ΠCCS is knowledge sound against restricted
+adversaries (A, P ∗ ) which can only output the same output witnesses w2 with
+all but negligible probability. A trivial property of ΠCCS is that it always outputs
+the same commitments from the instance regardless of what the potentially
+malicious prover P ∗ does. This property will help with our composition with
+ΠRLC . Ultimately, we prove that the composition ΠRLC ◦ ΠCCS is a ROK.
+4.5
+
+Random linear combination reduction – ΠRLC
+
+Overview. This reduction takes a random linear combination of the inputs using
+challenges from a strong sampling set C (Definition 14).
+
+27
+
+Random linear combination reduction ΠRLC
+Parameters: Refer to Section 4.3.
+
+Input: s; ci ∈ C, Xi ∈ F d×min , r ∈ K log n , {y(i,j) ∈ K d }j∈[t] ; Zi ∈ F d×m i∈[k+1] ∈
+ME(b, L)k+1
+
+Output: s; c ∈ C, X ∈ F d×min , r ∈ K log n , {yj ∈ K d }j∈[t] ; Z ∈ F d×m ∈ ME(B, L)
+Setup G(1λ , sz) → pp: Output pp ← Setup(1λ , sz), which defines L := Commit(pp,
+· ) : F d×m → C.
+
+Encoder K(pp, s) → (pk, vk): Output (pp, s), ⊥ .
+Reduction ⟨P, V⟩((pk, vk), u1 , w1 ) → (u2 ; w2 ):
+$
+
+1. V: Sample ρ1 , . . . , ρk+1 ← C and compute:
+X
+X
+c←
+ρi ci ,
+X←
+ρi Xi ,
+i∈[k+1]
+
+and
+
+yj ←
+
+i∈[k+1]
+
+X
+
+ρi · y(i,j)
+
+i∈[k+1]
+
+Send ρ1 , . . . , ρk+1 to P.
+P
+2. P: Compute Z ← i∈[k+1] ρi Zi .
+
+3. Output s; c, X, r, {yj }j∈[t] ; Z .
+
+Lemma 5. The random linear combination protocol ΠRLC is a complete and
+public coin reduction from ME(b, L)k+1 to ME(B, L).
+Proof. For brevity, we defer the proof to Appendix B.5.
+Security of ΠRLC . As with ΠCCS , the reduction ΠRLC is not knowledge-sound
+against arbitrary adversaries (A, P ∗ ). However, it satisfies a relaxed notion
+of knowledge-soundness for which the extractor is able to extract witnesses
+(Zi )i∈[k+1] such that (s, ci , Xi , . . . ; Zi )i∈[k+1] belongs to ME(q/2, L)k+1 (which
+has a trivial norm bound) instead of ME(b, L)k+1 , which is the original input
+relation. Furthermore, this extractor can only output the same witnesses (Zi )i
+with all but negligible probability, or else we could use the extractor to construct
+a (d, m, 2B, C)-relaxed binding (Definition 15) adversary which succeeds with nonnegligible probability. These properties are formalized in Section 5. In particular,
+using this extractor, we will be able to construct a restricted adversary for ΠCCS .
+4.6
+
+Decomposition reduction – ΠDEC
+
+Overview. Our final reduction aims to reduce the norm of claims from B = bk to
+b, which will allow us to continually fold CCS claims without increasing the norm
+of the openings (Zi )i to the commitments. Otherwise, the norm would eventually
+exceed the norm-bound requirement of the commitment scheme.
+28
+
+This reduction works by having the prover do a bit-decomposition of the
+witness Z into k lower norm witnesses (Zi )i . Then, the prover sends over new
+commitments and partial evaluation claims for this new witnesses. The verifier
+checks these new commitments and evaluations with respect to the original input
+commitment and evaluation.
+Decomposition reduction ΠDEC
+Parameters: Refer to Section 4.3.
+
+Input: s; c ∈ C, X ∈ F d×min , r ∈ K log n , {yj ∈ K d }j∈[t] ; Z ∈ F d×m ∈ ME(B, L)
+
+Output: s; ci ∈ C, Xi ∈ F d×min , r ∈ K log n , {y(i,j) ∈ K d }j∈[t] ; Zi ∈ F d×m i∈[k] ∈
+ME(b, L)k
+Setup G(1λ , sz) → pp: Output pp ← Setup(1λ , sz), which defines L := Commit(pp,
+· ) : F d×m → C.
+
+Encoder K(pp, s) → (pk, vk): Output (pp, s), ⊥ .
+Reduction ⟨P, V⟩((pk, vk), u1 , w1 ) → (u2 ; w2 ):
+
+1. P: Compute ci , {y(i,j) }j∈[t] ; Zi i∈[k] as follows,
+(Z1 , . . . , Zk ) ← splitb (Z),
+
+Send ci , {y(i,j) }j∈[t] i∈[k] to V.
+
+y(i,j) ← Zi Mj⊺ rb ∈ K d
+
+ci ← L(Zi ),
+
+2. V: Compute (X1 , . . . , Xk ) ← splitb (X). Check for all j ∈ [t],
+?
+
+c=
+
+Pk
+
+i=1 b
+
+i−1
+
+?
+
+· ci
+
+and yj =
+
+3. Output s; ci , Xi , r, {y(i,j) }j∈[t] ; Zi i∈[k]
+
+Pk
+
+i=1 b
+
+i−1
+
+· y(i,j)
+
+Unlike ΠCCS and ΠRLC , the reduction ΠDEC is directly a reduction of knowledge.
+Theorem 4. The reduction ΠDEC is a reduction of knowledge (Definition 1)
+from ME(B, L) to ME(b, L)k .
+Proof. For brevity, we defer the proof to Appendix B.6.
+
+5
+
+Security analysis of reductions
+
+This section provides a formal security analysis of the ΠCCS and ΠRLC reductions.
+In particular, we design new security properties that a reduction can satisfy, and
+prove that ΠCCS and ΠRLC satisfy these properties. Finally, we show that the
+composition ΠRLC ◦ ΠCCS is a reduction of knowledge by using a new general
+composition theorem for reductions (Theorem 5).
+29
+
+5.1
+
+New properties
+
+We begin with an informal description of each of our new properties, and then
+provide their formal definitions (Definition 19)
+– ϕ-restricted. Regardless of the adversary, the evaluation of ϕ on the output
+instance u2 remains the same (with all but negligible probability). For example,
+in ΠCCS , the reduction always preserves the instance commitments (ci )i .
+– ϕ-relaxed knowledge soundness. Nearly identical to knowledge soundness, but
+with two major differences: (1) the extractor only succeeds in extracting
+witnesses that satisfy a relaxed relation (a superset of the original relation);
+and (2) if the adversary is restricted in its choice of input instances by ϕ,
+then the extractor can only output a single witness with all but negligible
+probability. For example, in ΠRLC , the extractor will only be able to extract
+witnesses with potentially large norm; furthermore, if the commitments in
+the instance remain the same across executions, then the extractor can only
+output at most one satisfying witness; otherwise, the extractor could break
+the relaxed binding of the commitment scheme.
+– restricted knowledge soundness. Nearly identical to knowledge soundness,
+except that the extraction only succeeds against restricted adversaries. In
+particular, the potentially malicious prover P ∗ is restricted to outputing the
+exact same witness w2 with all but negligible probability. For example, in
+ΠCCS , the prover P ∗ would be restricted to only one possible set of openings
+(Zi )i for the output commitments.
+Theorem 5 (Composition Theorem). Let ϕ be an arbitrary function. Consider relations R1 and R2 ⊆ R′2 and R3 . Given a reduction (Definition 1)
+Π1 := (G, K, P1 , V1 ) from R1 to R2 (R′2 ) such that Π1 is (1) complete and
+public-coin, (2) ϕ-restricted, (3) and has restricted knowledge soundness and a
+reduction Π2 := (G, K, P2 , V2 ) from R2 (R′2 ) to R3 such that Π2 is (1) complete
+and public-coin (2) and has ϕ-relaxed knowledge soundness then the composition
+Π := Π2 ◦ Π1 is knowledge sound.
+Proof. For brevity, we defer the proof to Appendix B.10.
+Corollary 2. The composition Π := ΠRLC ◦ ΠCCS is a reduction of knowledge
+(Definition 1) from ME(b, L)k × MCS(b, L) to ME(B, L).
+Proof. Follows directly from ΠCCS ’s completeness and public-coin (Lemma 4),
+ΠRLC ’s completeness and public-coin (Lemma 5), the new composition theorem (Theorem 5), ΠCCS ’s ϕ-restricted (Lemma 6), ΠCCS ’s restricted knowledge
+soundness (Lemma 7), and ΠRLC ’s ϕ-relaxed knowledge soundness (Lemma 8).
+Corollary 3. The composition Π := ΠDEC ◦ ΠRLC ◦ ΠCCS is a reduction of
+knowledge (Definition 1) from ME(b, L)k × MCS(b, L) to ME(b, L)k .
+Proof. Follows directly from Corollary 2, ΠDEC is a reduction of knowledge
+(Theorem 4), and the sequential composition of reductions (Lemma 1).
+30
+
+Definition 19. Consider relations R1 and R2 over public parameters, structure,
+instance, and witness tuples. Further, consider relations R′1 and R′2 such that
+R1 ⊆ R′1 and R2 ⊆ R′2 . We will refer to these relations as the relaxed versions
+of R1 and R2 , because they are supersets. Let ϕ be an arbitrary function. A
+reduction (G, K, P, V) (Definition 1) from R1 (R′1 ) to R2 (R′2 ) can satisfy the
+following properties,
+(i) ϕ-restricted: For any expected polynomial-time adversary (A, P ∗ ),
+
+
+pp ← Gen(1λ )
+ u2 , u′2 ̸= ⊥ (s, u1 , st1 ) ← A(pp)
+
+
+
+
+=1
+⇓
+(pk, vk) ← K(pp, s)
+Pr 
+
+ ϕ(u2 ) = ϕ(u′2 ) (u2 , w2 ) ← ⟨P ∗ , V⟩((pk, vk), u1 , st) 
+(u′2 , w2′ ) ← ⟨P ∗ , V⟩((pk, vk), u1 , st)
+(ii) ϕ-relaxed knowledge soundness: For any expected polynomial-time adversary (A, P ∗ ), there exists an expected polynomial-time extractor E such that
+if the success probability of the adversary ϵ(A, P ∗ ) ≥ 1/poly(λ), then
+
+
+pp ← G(1λ , sz)
+
+
+′ (s, u1 , st) ← A(pp) 
+∗
+Pr 
+(pp, s, u1 , w1 ) ∈ R1 (pk, vk) ← K(pp, s)  ≥ ϵ(A, P ) − negl(λ).
+w1 ← E(pp, s, u1 , st)
+and if A := (B, B ′ ) such that
+
+u1 , u′1 ̸= ⊥
+
+pp ← G(1λ , sz)
+(s, st∗ ) ← B(pp)
+
+
+
+
+
+
+
+⇓
+Pr 
+ = 1,
+ ϕ(u ) = ϕ(u′ ) (u1 , st) ← B ′ (st∗ ) 
+1
+1
+(u′1 , st′ ) ← B ′ (st∗ )
+then
+
+
+pp ← G(1λ , sz)
+(s, st∗ ) ← B(pp)
+
+
+
+
+
+
+
+ w , w′ ̸= ⊥
+
+′
+∗
+(u1 , st) ← B (st )
+ 1 1
+
+Pr 
+ ≤ negl(λ)
+′
+ ∧ w1 ̸= w1 w1 ← E(pp, s, u1 , st) 
+
+
+
+(u′1 , st′ ) ← B ′ (st∗ ) 
+w1′ ← E(pp, s, u′1 , st′ )
+(iii) Restricted Knowledge Soundness: For any expected polynomial-time
+adversary (A, P ∗ ), there exists an expected polynomial-time extractor E such
+that if the relaxed success probability of the adversary
+
+
+pp ← G(1λ , sz)
+ϵ′ (A, P ∗ ) := Pr  (pp, s, ⟨P ∗ , V⟩((pk, vk), u1 , st)) ∈ R′2 (s, u1 , st) ← A(pp) 
+(pk, vk) ← K(pp, s)
+31
+
+≥ 1/poly(λ), and
+
+
+
+pp ← Gen(1λ )
+
+ w2 , w2′ ̸= ⊥ (s, u1 , st) ← A(pp)
+
+
+ ≤ negl(λ)
+
+∧
+(pk, vk) ← K(pp, s)
+Pr 
+
+ w2 ̸= w2′ (u2 , w2 ) ← ⟨P ∗ , V⟩((pk, vk), u1 , st) 
+(u′2 , w2′ ) ← ⟨P ∗ , V⟩((pk, vk), u1 , st)
+
+then we have that
+
+
+
+pp ← G(1λ , sz)
+
+(s, u1 , st) ← A(pp) 
+′
+∗
+
+Pr 
+(pp, s, u1 , w1 ) ∈ R1 (pk, vk) ← K(pp, s)  ≥ ϵ (A, P ) − negl(λ).
+w1 ← E(pp, s, u1 , st)
+
+Lemma 6. Let ϕ be the function which projects commitments (ci )i∈[k] from the
+instance. The reduction ΠCCS is ϕ-restricted.
+Proof. For brevity, we defer the proof to Appendix B.7.
+Lemma 7. The reduction ΠCCS is a restricted knowledge sound reduction from
+MCS(b, L) × ME(b, L)k−1 to ME(b, L)k (ME(q/2, L)k ).
+Proof. For brevity, we defer the proof to Appendix B.8.
+Lemma 8. Let ϕ be the function which projects commitments (ci )i∈[k+1] from
+the instance. The reduction ΠRLC is a ϕ-relaxed knowledge sound reduction from
+ME(b, L)k+1 (ME(q/2, L)k+1 ) to ME(B, L).
+Proof. For brevity, we defer the proof to Appendix B.9.
+
+6
+
+Concrete parameters
+
+This section provides three efficient parameterizations over ≤ 64-bit fields. Additionally, Appendix B.11 and Appendix B.12. provide the corresponding sage
+scripts that we used to determine valid parameterizations. In Section 4.3, we require the commitment scheme to be (d, m, 2B, C)-relaxed binding (Definition 15).
+Thus, by Lemma 3, we need the commitment scheme to be (d, m, 4T B)-binding
+(Definition 15). Finally, Ajtai’s commitment scheme is (d, m, 4T B)-binding if
+MSIS∞,κ,q
+m,8T B is hard. We estimate the hardness of Module-SIS using the lattice
+estimator library provided by [7] using our script (Appendix B.12).
+6.1
+
+Almost Goldilocks: (264 − 232 + 1) − 32
+
+We provide a new field, which we refer to as Almost Goldilocks. This field’s order
+is q = (264 − 232 + 1) − 32, which is close to the order of the Goldilocks field
+264 − 232 + 1. Because of this, the field admits an efficient implementation with a
+small change to the Solinas prime reduction algorithm (which is typically used
+for the Goldilocks field).
+32
+
+Parameterization. η = 128, Φη = X 64 + 1, d = 64, Rq := F q [X]/(Φη ), κ = 13,
+m = 226 , b = 2, k = 11, B = 211 . Define CR to be the set polynomials in Rq whose
+coefficients belong to [−1, 0, 1, 2], and C = {rot(a) | a ∈ CR }. By Theorem 3,
+T = 128. By Theorem 1, binv ≈ 4. K = F q2 .
+Security |C| = 2128 , |K| ≈ 2128 , MSIS∞,κ,q
+m,8T B ≈ 127 bits of security.
+6.2
+
+Goldilocks: 264 − 232 + 1
+
+This is a popular choice of field for SNARKs as the field admits an efficient
+implementation: field operations can be implemented with essentially only bitshifts and the field has high 2-adicity (232 | (p−1)), which is useful for compressing
+Neo’s IVC proofs with SNARKs.
+Parameterization. η = 81, Φη = X 54 + X 27 + 1, d = 54, Rq := F q [X]/(Φη ),
+κ = 16, m = 224 , b = 2, k = 12, B = 212 . Define CR to be the set polynomials in
+Rq whose coefficients belong to [−2, −1, 0, 1, 2], and C = {rot(a) | a ∈ CR }. By
+Theorem 3, T = 216. By Theorem 1, binv ≈ 2.5 · 109 . K = F q2 .
+Security |C| ≈ 2125 , |K| ≈ 2128 , MSIS∞,κ,q
+m,8T B ≈ 128 bits of security.
+Remark 2 (Incompatibility with Latticefold [14]). In LatticeFold [14], the constructions and analysis are limited to power-of-two cyclotomic polynomials, namely
+of the form X d + 1 with d being a power-of-two. Since the Goldilocks field has
+high 2-acidity, the cyclotomic polynomial completely factors into linear terms.
+This means that the ring Rq is isomorphic to F qd (the NTT representation). The
+security of LatticeFold’s construction depends on the size of the field in the NTT
+representation [14, Sec 3.3], which here is only 64 bits.
+6.3
+
+Mersenne 61: 261 − 1
+
+This field admits an incredibly efficient implementation as it is only one off from a
+power-of-two. Specifically, modular arithmetic over this field can be implemented
+with simple bit-shifts with an algorithm more efficient than Goldilocks.
+Parameterization η = 81, Φη = X 54 + X 27 + 1, d = 54, Rq := F q [X]/(Φη ),
+κ = 16, m = 222 , b = 2, k = 12, B = 212 . Define CR to be the set polynomials in
+Rq whose coefficients belong to [−2, −1, 0, 1, 2], and C = {rot(a) | a ∈ CR }. By
+Theorem 3, T = 216. By Theorem 1, binv ≈ 383. K = F q2 .
+Security |C| ≈ 2125 , |K| ≈ 2122 , MSIS∞,κ,q
+m,8T B ≈ 129 bits of security.
+Remark 3 (Incompatibility with Latticefold [14]). As stated earlier, LatticeFold’s
+constructions and analysis are limited to power-of-two cyclotomic polynomials,
+namely of the form X d +1 for d being a power-of-two. For Mersenne 61, there is no
+choice of power-of-two cyclotomic polynomials, which satisfies the requirements
+of Theorem 1. Hence, it cannot be determined whether a choice of parameters
+with Φη = X d + 1 leads to a secure construction.
+33
+
+References
+
+[1] Nova: Recursive SNARKs without trusted setup. https://github.com/
+Microsoft/Nova
+[2] Ova: A slightly better Nova. https://hackmd.io/V4838nnlRKal9ZiTHiGYzw
+[3] Folding (Jolt Book). https://jolt.a16zcrypto.com/future/folding.html (2024)
+[4] The Nexus zkVM. https://github.com/nexus-xyz/nexus-zkvm (2024)
+[5] Ajtai, M.: Generating hard instances of lattice problems (extended abstract).
+In: 28th Annual ACM Symposium on Theory of Computing. pp. 99–108.
+ACM Press, Philadephia, PA, USA (May 22–24, 1996). https://doi.org/10.
+1145/237814.237838
+[6] Albrecht, M.R., Lai, R.W.F.: Subtractive sets over cyclotomic rings - limits
+of Schnorr-like arguments over lattices. In: Malkin, T., Peikert, C. (eds.)
+Advances in Cryptology – CRYPTO 2021, Part II. Lecture Notes in Computer
+Science, vol. 12826, pp. 519–548. Springer, Cham, Switzerland, Virtual Event
+(Aug 16–20, 2021). https://doi.org/10.1007/978-3-030-84245-1 18
+[7] Albrecht, M.R., Player, R., Scott, S.: On the concrete hardness of learning
+with errors. Journal of Mathematical Cryptology 9(3), 169–203 (2015)
+[8] Arun, A., Setty, S.: Nebula: Efficient read-write memory and switchboard
+circuits for folding schemes. Cryptology ePrint Archive (2024)
+[9] Attema, T., Cramer, R., Kohl, L.: A compressed Σ-protocol theory for
+lattices. In: Malkin, T., Peikert, C. (eds.) Advances in Cryptology –
+CRYPTO 2021, Part II. Lecture Notes in Computer Science, vol. 12826, pp.
+549–579. Springer, Cham, Switzerland, Virtual Event (Aug 16–20, 2021).
+https://doi.org/10.1007/978-3-030-84245-1 19
+[10] Attema, T., Lyubashevsky, V., Seiler, G.: Practical product proofs for
+lattice commitments. In: Micciancio, D., Ristenpart, T. (eds.) Advances in
+Cryptology – CRYPTO 2020, Part II. Lecture Notes in Computer Science,
+vol. 12171, pp. 470–499. Springer, Cham, Switzerland, Santa Barbara, CA,
+USA (Aug 17–21, 2020). https://doi.org/10.1007/978-3-030-56880-1 17
+[11] Ben-Sasson, E., Bentov, I., Horesh, Y., Riabzev, M.: Scalable zero knowledge
+with no trusted setup. In: CRYPTO (2019)
+[12] Ben-Sasson, E., Chiesa, A., Tromer, E., Virza, M.: Scalable zero knowledge
+via cycles of elliptic curves. In: CRYPTO (2014)
+[13] Bitansky, N., Canetti, R., Chiesa, A., Tromer, E.: Recursive composition
+and bootstrapping for SNARKs and proof-carrying data. In: STOC (2013)
+[14] Boneh, D., Chen, B.: LatticeFold: A lattice-based folding scheme and its
+applications to succinct proof systems. Cryptology ePrint Archive, Paper
+2024/257 (2024)
+[15] Bootle, J., Chiesa, A., Hu, Y., Orrú, M.: Gemini: Elastic snarks for diverse
+environments. In: Annual International Conference on the Theory and
+Applications of Cryptographic Techniques. pp. 427–457 (2022)
+[16] Bowe, S., Grigg, J., Hopwood, D.: Halo: Recursive proof composition without
+a trusted setup. Cryptology ePrint Archive, Report 2019/1021 (2019)
+
+[17] Bünz, B., Chen, B.: Protostar: Generic efficient accumulation/folding for
+special sound protocols. Cryptology ePrint Archive, Paper 2023/620 (2023)
+[18] Bünz, B., Chiesa, A., Lin, W., Mishra, P., Spooner, N.: Proof-carrying data
+without succinct arguments. In: CRYPTO (2021)
+[19] Bünz, B., Fisch, B., Szepieniec, A.: Transparent SNARKs from DARK
+compilers. In: EUROCRYPT (2020)
+[20] Bunz, B., Mishra, P., Nguyen, W., Wang, W.: Arc: Accumulation for reed–
+solomon codes. Cryptology ePrint Archive, Paper 2024/1731 (2024)
+[21] Bünz, B., Chen, J.: Proofs for deep thought: Accumulation for large memories
+and deterministic computations. Cryptology ePrint Archive, Paper 2024/325
+(2024)
+[22] Bünz, B., Mishra, P., Nguyen, W., Wang, W.: Accumulation without homomorphism. Cryptology ePrint Archive, Paper 2024/474 (2024)
+[23] Chen, S., Cheon, J.H., Kim, D., Park, D.: Verifiable computing for approximate computation. Cryptology ePrint Archive, Report 2019/762 (2019),
+https://eprint.iacr.org/2019/762
+[24] Chen, W., Chiesa, A., Dauterman, E., Ward, N.P.: Reducing participation
+costs via incremental verification for ledger systems. Cryptology ePrint
+Archive, Report 2020/1522 (2020)
+[25] Chiesa, A., Hu, Y., Maller, M., Mishra, P., Vesely, N., Ward, N.: Marlin: Preprocessing zkSNARKs with universal and updatable SRS. In: EUROCRYPT
+(2020)
+[26] Chiesa, A., Ojha, D., Spooner, N.: Fractal: Post-quantum and transparent
+recursive proofs from holography. In: EUROCRYPT (2020)
+[27] Diamond, B.E., Posen, J.: Succinct arguments over towers of binary fields.
+Cryptology ePrint Archive, Paper 2023/1784 (2023)
+[28] Dimitriou, N., Garreta, A., Manzur, I., Vlasov, I.: Mova: Nova folding without
+committing to error terms. Cryptology ePrint Archive, Paper 2024/1220
+(2024)
+[29] Eagen, L., Gabizon, A.: Protogalaxy: Efficient protostar-style folding of
+multiple instances. Cryptology ePrint Archive, Paper 2023/1106 (2023)
+[30] Eagen, L., Gabizon, A., Sefranek, M., Towa, P., Williamson, Z.J.: Stackproofs:
+Private proofs of stack and contract execution using protogalaxy. Cryptology
+ePrint Archive, Paper 2024/1281 (2024)
+[31] Fenzi, G., Knabenhans, C., Nguyen, N.K., Pham, D.T.: Lova: Lattice-based
+folding scheme from unstructured lattices. Cryptology ePrint Archive, Paper
+2024/1964 (2024)
+[32] Fenzi, G., Moghaddas, H., Nguyen, N.K.: Lattice-based polynomial commitments: Towards asymptotic and concrete efficiency. Journal of Cryptology
+37(3), 31 (Jul 2024). https://doi.org/10.1007/s00145-024-09511-8
+[33] Fiat, A., Shamir, A.: How to prove yourself: Practical solutions to identification and signature problems. In: CRYPTO. pp. 186–194 (1986)
+[34] Garreta, A., Manzur, I.: FLI: Folding lookup instances. Cryptology ePrint
+Archive, Paper 2024/1531 (2024), https://eprint.iacr.org/2024/1531
+[35] Grassi, L., Khovratovich, D., Rechberger, C., Roy, A., Schofnegger, M.:
+Poseidon: A new hash function for zero-knowledge proof systems. Cryptology
+ePrint Archive, Paper 2019/458 (2019)
+35
+
+[36] Kate, A., Zaverucha, G.M., Goldberg, I.: Constant-size commitments to
+polynomials and their applications. In: ASIACRYPT. pp. 177–194 (2010)
+[37] Kilian, J.: A note on efficient zero-knowledge proofs and arguments (extended
+abstract). In: STOC (1992)
+[38] Kothapalli, A.: A Theory of Composition for Proofs of Knowledge. Ph.D.
+thesis, Carnegie Mellon University (2024)
+[39] Kothapalli, A., Parno, B.: Algebraic reductions of knowledge. In: CRYPTO
+(2023)
+[40] Kothapalli, A., Setty, S.: SuperNova: Proving universal machine executions
+without universal circuits. Cryptology ePrint Archive (2022)
+[41] Kothapalli, A., Setty, S.: Cyclefold: Folding-scheme-based recursive arguments over a cycle of elliptic curves. Cryptology ePrint Archive, Paper
+2023/1192 (2023), https://eprint.iacr.org/2023/1192, https://eprint.iacr.
+org/2023/1192
+[42] Kothapalli, A., Setty, S.: HyperNova: Recursive arguments for customizable
+constraint systems. In: CRYPTO (2024)
+[43] Kothapalli, A., Setty, S.: NeutronNova: Folding everything that reduces to
+zero-check. Cryptology ePrint Archive (2024)
+[44] Kothapalli, A., Setty, S., Tzialla, I.: Nova: Recursive Zero-Knowledge Arguments from Folding Schemes. In: CRYPTO (2022)
+[45] Langlois, A., Stehlé, D.: Worst-case to average-case reductions for module
+lattices. Designs, Codes and Cryptography 75(3), 565–599 (2015). https:
+//doi.org/10.1007/s10623-014-9938-4
+[46] Lund, C., Fortnow, L., Karloff, H., Nisan, N.: Algebraic methods for interactive proof systems. In: FOCS (Oct 1990)
+[47] Lyubashevsky, V., Micciancio, D.: Generalized compact Knapsacks are
+collision resistant. In: Bugliesi, M., Preneel, B., Sassone, V., Wegener, I.
+(eds.) ICALP 2006: 33rd International Colloquium on Automata, Languages
+and Programming, Part II. Lecture Notes in Computer Science, vol. 4052,
+pp. 144–155. Springer Berlin Heidelberg, Germany, Venice, Italy (Jul 10–14,
+2006). https://doi.org/10.1007/11787006 13
+[48] Lyubashevsky, V., Seiler, G.: Short, invertible elements in partially splitting
+cyclotomic rings and applications to lattice-based zero-knowledge proofs.
+In: Nielsen, J.B., Rijmen, V. (eds.) Advances in Cryptology – EUROCRYPT 2018, Part I. Lecture Notes in Computer Science, vol. 10820, pp.
+204–224. Springer, Cham, Switzerland, Tel Aviv, Israel (Apr 29 – May 3,
+2018). https://doi.org/10.1007/978-3-319-78381-9 8
+[49] Micali, S.: CS proofs. In: FOCS (1994)
+[50] Micciancio, D., Regev, O.: Lattice-based cryptography. In: Post-quantum
+cryptography, pp. 147–191. Springer (2009)
+[51] Nethermind
+Research:
+Lattice-based
+operations
+performance
+report.
+https://nethermind.notion.site/
+Latticefold-and-lattice-based-operations-performance-report-153360fc38d080ac930cdeeffed69559
+(2025)
+[52] Nguyen, W., Boneh, D., Setty, S.: Revisiting the Nova proof system on a
+cycle of curves. Cryptology ePrint Archive, Paper 2023/969 (2023)
+36
+
+[53] Nguyen, W., Datta, T., Chen, B., Tyagi, N., Boneh, D.: Mangrove: A scalable
+framework for folding-based SNARKs. In: CRYPTO (2024)
+[54] Pedersen, T.P.: Non-interactive and information-theoretic secure verifiable
+secret sharing. In: CRYPTO (1991)
+[55] Peikert, C., Rosen, A.: Efficient collision-resistant hashing from worst-case
+assumptions on cyclic lattices. In: Halevi, S., Rabin, T. (eds.) TCC 2006: 3rd
+Theory of Cryptography Conference. Lecture Notes in Computer Science,
+vol. 3876, pp. 145–166. Springer Berlin Heidelberg, Germany, New York,
+NY, USA (Mar 4–7, 2006). https://doi.org/10.1007/11681878 8
+[56] Schwartz, J.T.: Fast probabilistic algorithms for verification of polynomial
+identities. J. ACM 27(4) (1980)
+[57] Setty, S.: Spartan: Efficient and general-purpose zkSNARKs without trusted
+setup. In: CRYPTO (2020)
+[58] Setty, S., Thaler, J.: Twist and Shout: Faster memory checking arguments
+via one-hot addressing and increments. Cryptology ePrint Archive, Paper
+2025/105 (2025)
+[59] Setty, S., Thaler, J., Wahby, R.: Customizable constraint systems for succinct
+arguments. Cryptology ePrint Archive (2023)
+[60] Thaler, J.: Time-optimal interactive proofs for circuit evaluation. In:
+CRYPTO (2013)
+[61] Thaler, J.: The sum-check protocol. https://people.cs.georgetown.edu/
+jthaler/sumcheck.pdf (Sep 2017)
+[62] Valiant, P.: Incrementally verifiable computation or proofs of knowledge
+imply time/space efficiency. In: TCC. pp. 552–576 (2008)
+[63] Vu, V., Setty, S., Blumberg, A.J., Walfish, M.: A hybrid architecture for
+verifiable computation. In: S&P (2013)
+[64] Zhao, J., Setty, S., Cui, W.: MicroNova: Folding-based arguments with
+efficient (on-chain) verification. Cryptology ePrint Archive, Paper 2024/2099
+(2024), https://eprint.iacr.org/2024/2099
+[65] Zhou, Z., Zhang, Z., Dong, J.: Proof-carrying data from multi-folding schemes.
+Cryptology ePrint Archive, Paper 2023/1282 (2023)
+
+37
+
+Supplementary Material
+A
+
+Additional Background
+
+A.1
+
+Polynomials and multilinear extensions
+
+We adapt this some of this subsection from prior work [57]. We recall several
+definitions and results regarding multivariate polynomials.
+Definition 20 (Multilinear polynomial). A multivariate polynomial is called
+a multilinear polynomial if the degree of the polynomial in each variable is at
+most one.
+Definition 21 (Multilinear polynomial extension). Given a vector v ∈ F n a
+multilinear polynomial extension of v is an (log n)-variate multilinear polynomial,
+denoted ve, such that ve(x) = vx for all x ∈ {0, 1}log n . Specifically, ve can be
+computed as follows.
+X
+ve(x) =
+vy · eq(x, y)
+y∈{0,1}ℓ
+
+Qℓ
+where eq(x, y) = i=1 (xi · yi + (1 − xi ) · (1 − yi )), outputs 1 if x = y and 0
+otherwise for x, y ∈ {0, 1}log n .
+For any r ∈ F ℓ , ve(r) can be computed in O(2ℓ ) operations in F [60, 63].
+Lemma 9 (Schwartz-Zippel [56]). let g : F ℓ → F be an ℓ-variate polynomial
+of total degree at most d. Then, on any finite set S ⊆ F ,
+Pr [g(x) = 0] ≤ d/|S|.
+
+x←S ℓ
+
+Lemma 10. Let Q ∈ F [X1 , . . . , Xℓ ] be an arbitrary multivariate polynomial.
+Define multivariate polynomial Q′ (X, Z) := eq(X, Z) · Q(X).
+X
+0=
+Q′ (x, Z) if and only if Q(X) ∈ ZSℓ
+x∈{0,1}log ℓ
+
+Definition 22 (Special sets [32]). Let C be a set and ℓ ∈ N. Consider two
+vectors x, y ∈ C ℓ . We define the relation ≡i for i ∈ [ℓ] as follows:
+x ≡i y ⇐⇒ xi ̸= yi ∧ xj = yj for all j ∈ [ℓ] \ {i}.
+A special set SS(C, ℓ) is as follows:
+
+
+∀ i ∈ [ℓ],
+SS(C, ℓ) = (c, c1 , . . . , cℓ ) ∈ (C ℓ )ℓ+1 :
+,
+c ≡i c i
+38
+
+Theorem 6 (Coordinate-wise extraction [32, Lemma 7.1]). Let C be a
+finite set, ℓ ∈ N, and C := C ℓ be a challenge space. Let A : C → {0, 1}∗ be
+an arbitrary (probabilistic) expected polynomial-time algorithm (adversary), and
+V : C × {0, 1}∗ → {0, 1} be an arbitrary (probabilistic) polynomial-time function
+(verification). Define the success probability of adversary A as
+ϵV (A) := Pr[V (c, A(c)) = 1]
+$
+
+c←C
+
+Then, there exists an expected polynomial-time oracle algorithm EA (extractor)
+that makes at most ℓ + 1 queries to A in expectation and with probability at least
+ℓ
+ϵV (A) − |C|
+outputs ℓ + 1 pairs (c, w), (c1 , w1 ), . . . (cℓ , wℓ ) such that
+– V (c, w) = 1,
+– for all i ∈ [ℓ], V (ci , wi ) = 1,
+– and (c, c1 , . . . , cℓ ) ∈ SS(C, ℓ).
+
+B
+
+Deferred theorems and proofs
+
+Theorem 7. The rings Rq (Definition 5) and S (Definition 7) are isomorphic.
+That is, the rotation matrix mapping rot : Rq → S is an isomorphism.
+Proof. We first show that rot is a homomorphism:
+
+
+rot(a) + rot(b) = cf(a) + cf(b) F · cf(a) + F · cf(b) · · · Fd−1 · cf(a) + Fd−1 · cf(b)
+
+
+= cf(a + b) F · cf(a + b) · · · Fd−1 · cf(a + b)
+= rot(a + b)
+
+
+rot(a) · rot(b) = rot(a) · cf(b) F · cf(b) · · · Fd−1 · cf(b)
+
+
+= rot(a) · cf(b) rot(a) · F · cf(b) · · · rot(a) · Fd−1 · cf(b)
+
+
+= rot(a) · cf(b) rot(a) · cf(X · b) · · · rot(a) · cf X d−1 · b
+
+
+= cf(ab) cf(X · ab) · · · cf X d−1 · ab
+
+
+= cf(ab) F · cf(ab) · · · Fd−1 · cf(ab)
+= rot(ab)
+
+rot(1) = cf(1)
+
+cf(X)
+
+···
+
+cf X d−1
+
+
+
+= Id
+We can observe that rot is trivially a bijection because the first column contains
+the polynomial coefficients; hence rot is additionally a ring isomorphism.
+B.1
+
+Proof of Theorem 2
+
+Proof. We make a small notational modification to Ajtai’s commitment scheme
+to adapt it to our matrix setting. In particular, the commitment scheme is
+functionally exactly identical.
+39
+
+Ajtai’s commitment scheme. Let m ∈ N denote the message length. Ajtai’s
+commitment scheme com := (Setup, Commit) consists of the following algorithms:
+$
+
+– Setup(κ, m) → pp: Sample a random matrix M ← Rqκ×m . Output pp ← M .
+– Commit(pp, Z ∈ F d×m ) → c: Parse M ← pp. Assign z := cf -1 (Z) ∈ Rqm .
+Output c ← cf(M z).
+We will first show that the commitment scheme is homomorphic. We
+can trivially observe that the groups F d×m and F d×κ are S-modules by left
+multiplication, and Rqm and Rqκ are isomorphic (as groups) to F d×m and F d×κ ,
+respectively. That is, the coefficient map cf( · ) is a trivial group isomorphism.
+Consider two arbitrary matrices A, B ∈ F d×m and rot(s) ∈ S. We must have
+
+
+Commit(pp, A) + Commit(pp, B) = cf M cf -1 (A) + cf M cf -1 (B)
+(1)
+
+-1
+-1
+= cf M cf (A) + M cf (B)
+(2)
+
+-1
+-1
+= cf M (cf (A) + cf (B))
+
+= cf M cf -1 (A + B)
+(3)
+= Commit(pp, A + B)
+
+(4)
+
+
+rot(s) · Commit(pp, A) = rot(s) · cf M cf -1 (A)
+
+= cf s · M cf -1 (A)
+
+= cf M · s · cf -1 (A)
+
+(5)
+(6)
+
+
+= cf M · cf -1 (rot(s) · A)
+
+(7)
+
+= Commit(pp, rot(s) · A)
+
+(8)
+
+where (1), (4), and (5), (8) are by the definition of Ajtai’s commitment scheme,
+(2) and (3) are by the homomorphism of the cf( · ) map, and (6) and (7) come
+from the fact that rot(a) · cf(b) = cf(ab) for any a, b ∈ Rq .
+Now, we will show that the commitment scheme is (d, m, B)-binding. For this, it
+suffices to show that a (d, m, B)-binding collision produces an MSIS∞,κ,q
+m,2B solution
+with respect to the uniformly sampled M in the pubic parameters pp. Consider an
+arbitrary (d, m, B)-binding collision Z1 , Z2 ∈ F d×m . We will show cf -1 (Z1 − Z2 )
+is an MSIS∞,κ,q
+m,2B solution. By the definition of collision, we must have
+Commit(pp, Z1 ) = Commit(pp, Z2 )
+Commit(pp, Z1 − Z2 ) = 0 ∈ F d×κ
+
+cf M cf -1 (Z1 − Z2 ) = 0 ∈ F d×κ
+M cf
+
+-1
+
+(Z1 − Z2 ) = 0 ∈ Rqκ
+
+(9)
+(10)
+(11)
+
+where (9) is by homomorphism, (10) is by the definition of Ajtai’s commitment scheme, and (11) is by applying the map cf -1 ( · ) to both sides. Since
+∥Z1 ∥∞ , ∥Z2 ∥∞ < B (from the definition of an (d, m, B)-binding collision), we
+must have ∥Z1 − Z2 ∥∞ < 2B, and therefore cf -1 (Z1 − Z2 ) ∞ = ∥Z1 − Z2 ∥∞ <
+2B.
+40
+
+B.2
+
+Proof of Lemma 3
+
+Proof. It suffices to show that an arbitrary (d, m, B, C)-relaxed binding collision
+(c, ∆1 , ∆2 , Z1 , Z2 ) can be used to construct a (d, m, 2T B)-binding collision. Specifically, we will show the pair (∆1 Z2 , ∆2 Z1 ) is an (d, m, 2T B)-binding collision.
+We must have
+∆1 Z2 ̸= ∆2 Z1
+
+(12)
+
+∆1 · c = Commit(pp, Z1 )
+
+(13)
+
+∆2 · ∆1 · c = ∆2 · Commit(pp, Z1 )
+∆1 · Commit(pp, Z2 ) = ∆2 · Commit(pp, Z1 )
+
+(14)
+
+Commit(pp, ∆1 Z2 ) = Commit(pp, ∆2 Z1 )
+
+(15)
+
+∥∆1 Z2 ∥∞ , ∥∆2 Z1 ∥∞ ≤ 2T B
+
+(16)
+
+where (12) and (13) follow from the definition of relaxed binding collision, (14)
+is by commutativity and substitution, and (15) follows from C ⊆ S and homomorphism. Since expansion factor of C is T and ∆1 , ∆2 ∈ (C − C), we
+must have that that ∥∆1 Z2 ∥∞ ≤ 2T ∥Z2 ∥∞ and ∥∆2 Z1 ∥∞ ≤ 2T ∥Z1 ∥∞ . Since
+∥Z1 ∥∞ , ∥Z2 ∥∞ < B by definition, we have (16) holds. From (12), (15), and (16),
+we have the pair (∆1 Z2 , ∆2 Z1 ) is an (d, m, 2T B)-binding collision.
+B.3
+
+Proof of Theorem 3
+
+Proof. By [6, Proposition 2], we have that
+∥uv∥∞
+max
+≤ 2 · ϕ(η)
+u,v∈Rq ∥u∥∞ · ∥v∥∞
+
+(17)
+
+For all u, v ∈ Rq , we must have that
+∥uv∥∞
+≤ 2 · ϕ(η) · ∥u∥∞
+∥v∥∞
+∥rot(u) · cf(v)∥∞
+≤ 2 · ϕ(η) · ∥u∥∞
+∥cf(v)∥∞
+
+(18)
+(19)
+
+where (18) follows from (17), and (19) follows from rot(u) · cf(v) = cf(uv) and
+the definition of norm ∥ · ∥∞ for ring elements. Therefore, we must have for all
+u ∈ Rq , v ∈ F d that
+∥rot(u) · v∥∞
+≤ 2 · ϕ(η) · ∥u∥∞
+∥v∥∞
+
+(20)
+
+Since CR ⊆ Rq , we must also have the prior bound holds for all u ∈ CR , v ∈ F d .
+Since C := { rot(u) | u ∈ CR }, we must have for all ρ := rot(u) ∈ C, v ∈ F d ,
+∥ρ · v∥∞
+≤ 2 · ϕ(η) · ∥u∥∞ ≤ 2 · ϕ(η) · max
+∥ρ′ ∥∞
+ρ′ ∈CR
+∥v∥∞
+which is exactly what we wanted to show.
+41
+
+(21)
+
+B.4
+
+Proof of Lemma 4
+
+We first provide a lemma that will be helpful for both the security and completeness of the reduction.
+Lemma 11. Consider an arbitrary structure s, a vector z1 ∈ F m , matrices
+k
+Zi ∈ F d×m i=2 , a point r ∈ K log n , and vectors ({y(i,j) ∈ K d }j∈[t] )ki=2 . Define
+Z1 := Decompb (z1 ). For all i ∈ [k], j ∈ [t], define M(i,j) := Zi Mj⊺ . Define δ :=
+log d and ζ := log(dn). Define polynomials F(X[1,n] ) and NCi (X[1,ζ] ) for i ∈ [k]
+as in ΠCCS . Define indeterminates X := X[1,ζ] , A := A[1,δ] , and B := B[1,ζ] .
+Additionally, define polynomials
+
+fi,j (X) ∀ i ∈ [k + 1, 2k], ∀ j ∈ [t]
+Evali,j (X, A) := eq X, A, r · M
+
+P
+Q(X, A, B, C) := eq(X, B) F(X[δ+1, ζ] ) + i∈[k] C i · NCi (X)
++ Ck
+
+Pt,k
+
+j=1,i=2 C
+
+i+(j−1)k−1
+
+· Eval(i,j) (X)
+
+Pt,k
+k
+i+(j−1)k−1
+Further,
+· ye(i,j) (A). We must have
+j=1,i=2 C
+P define quantity T := C
+T ̸= x∈{0,1}ζ Q(x, A, B, C) if and only if
+1. F(X[δ+1,ζ] ) ̸∈ ZSn (identically, F(X[1,n] ) ̸∈ ZSn ),
+2. OR there exists an i ∈ [k] for which ∥Zi ∥∞ ≥ b,
+fi,j (A, r) (identically,
+3. OR there exists an i ∈ [2, k] for which ye(i,j) (A) ̸= M
+y(i,j) = Zi Mj⊺ rb)
+Proof.
+Since the powers of indeterminate C are linearly independent, T ̸=
+P
+x∈{0,1}ζ Q(x, A, B, C) if and only if
+0 ̸=
+
+X
+
+eq(x, B) · F(x[δ+1,ζ] ),
+
+(22)
+
+x∈{0,1}ζ
+
+OR ∃ i ∈ [k],
+
+0 ̸=
+
+X
+
+eq(x, B) · NCi (x),
+
+(23)
+
+x∈{0,1}ζ
+
+OR ∃ i ∈ [2, k], j ∈ [t]
+
+ye(i,j) (A) ̸=
+
+X
+
+Evali,j (x, A)
+
+(24)
+
+x∈{0,1}ζ
+
+By Lemma 10, we must have (22) if and only if F(X) ̸∈ ZSdn (Item 1). Since, for
+all i ∈ [k], ∥Zi ∥∞ ≥ b if and only if NCi (X) ̸∈ ZSζ , by Lemma 10, we have that
+(23) if and only if there exists an i ∈ [k] for which ∥Zi ∥∞ ≥ b (Item 2). Observe
+for all i, j that
+X
+X
+
+fi,j (x)
+Evali,j (x, A) =
+eq x, A, r · M
+x∈{0,1}ζ
+
+x∈{0,1}ζ
+
+=
+
+X
+
+
+fi,j (x)
+eq x, A, r · M
+
+x∈{0,1}ζ
+
+42
+
+fi,j (A, r)
+=M
+
+(25)
+
+where (25) follows from the definition of a multilinear extension. Thus, by (25),
+fi,j (A, r)
+we have (24) if and only if there exists an i ∈ [2, k] for which yei,j (A) ̸= M
+(Item 3).
+P
+In conclusion, we have shown T ̸= x∈{0,1}ζ Q(x, A, B, C) if and only if (22),
+(23), or (24), which holds if and only if (Item 1), (Item 2), or (Item 3). This
+concludes our proof.
+Now, we provide the proof of Lemma 4.
+Proof.
+Completeness: We will first argue that the sum-check verifier does not reject if
+the original tuples belong to the input relations. Consider the contrapositive of
+Lemma 11,
+1. F(X[δ+1,ζ] ) ∈ ZSn (identically, F(X[1,n] ) ∈ ZSn ),
+2. for all i ∈ [k], ∥Zi ∥∞ < b, and
+fi,j (A, r) (identically, y(i,j) = Zi M ⊺ rb)
+3. for all i ∈ [2, k], ye(i,j) (A) ̸= M
+j
+P
+if and only if T =
+Q(x,
+A,
+B,
+C).
+We
+will
+show
+each
+condition
+is
+ζ
+x∈{0,1}
+k−1
+guaranteed by the input tuples belonging to MCS(b, L) × ME(b, L)
+.
+By the definition of MCS(b, L) (Definition 17), (s; (c1 , x1 ); w1 ) ∈ MCS(b, L)
+guarantees that F(X[δ+1,ζ] ) ∈ ZSn and ∥Z1 ∥∞ < b. By the definition of ME(b, L)
+(Definition 18),
+k
+s; ci , Xi , r, {y(i,j) }j∈[t] ; Zi i=2 ∈ ME(b, L)k−1
+⊺
+guarantees that for all i ∈ [2, k], we have both ∥Zi ∥∞ < b and yP
+b.
+(i,j) = Zi Mj r
+Thus, in total, we have by the contrapositive of Lemma 11 that T = x∈{0,1}ζ Q(x,
+Pt,k
+A, B, C), where T := C k j=1,i=2 C i+(j−1)k−1 · ye(i,j) (A). Thus, since the sum
+holds for indeterminate variables A, B, C, they must hold for the verifier challenges α, β, γ. Therefore, the verifier will not reject during the honest execution
+of the sum-check protocol, since the Q does sum to T.
+
+Now, we will argue that the verifier’s evaluation check passes. Consider an
+′
+arbitrary j ∈ [t]. By construction (Item 3), ye(1,j)
+= Z1 Mj⊺ rb′ , where Z1 =
+′
+Decompb (z1 ). By the definition of Decompb , for all ℓ ∈ [d], we have y(1,j),ℓ
+=
+(ℓ)
+
+(ℓ)
+
+Z1 Mj⊺ rb′ , where Z1
+
+mj =
+
+is the ℓ-th row of Z1 . Therefore, we have
+ℓ∈[d] b
+
+ℓ−1 ′
+y(1,j),ℓ =
+
+(ℓ)
+
+Z1 Mj rb′
+
+
+P
+P
+ℓ−1 ′
+ℓ−1 (ℓ)
+b
+y
+=
+b
+Z
+Mj⊺ rb′
+1
+ℓ∈[d]
+ℓ∈[d]
+(1,j),ℓ
+P
+′
+ℓ−1 ′
+g
+y(1,j),ℓ = z · Mj⊺ rb′ = M
+j z(r )
+ℓ∈[d] b
+P
+
+43
+
+P
+
+ℓ∈[d] b
+
+ℓ−1
+
+Therefore, the value F = F(r′ ) = f (m1 , . . . , mt ), since we considered an arbitrary
+′
+j ∈ [t]. Since we required M1 = In , we must have for all i ∈ [k], ye(i,1)
+(α′ ) =
+⊺
+′ ′
+′
+′
+^
+f ′ ′
+Z
+i M (α , r ) = Zi (α , r ). Therefore, the value Ni = NC(α , γ ) for all i ∈ [k].
+1
+
+By construction (Item 3), we can trivially observe that E(i,j) = Eval(i,j) (α′ , r′ ).
+All together, the verifier’s check in Item 4 must pass by construction, since the
+values F , Ni for all i ∈ [k], and E(i,j) for all i ∈ [k], j ∈ [t], exactly match their
+corresponding evaluations in the definition of Q(α′ , r′ ).
+Now, we will argue the output tuple does belong to ME(b, L)k . The condition
+that for all i ∈ [2, k], ci = L(Zi ) and Xi = Lx (Zi ) is trivially guaranteed by the
+input tuples belonging to ME(b, L)k−1 (Definition 18). By the construction of
+X1 ← Decompb (x1 ) and the first tuple belonging to MCS (Definition 17), we have
+c1 = L(Z1 ) and X1 = Lx (Z1 ). Finally, by construction in step Item 3, we exactly
+′
+have that y(i,j)
+= Zi Mj⊺ rb′ for all i ∈ [k] and j ∈ [t]. All together, we have that
+all of the conditions are satisfied for the output tuples to belong to ME(b, L)k .
+Public coin. The sum-check protocol itself is a public-coin protocol. The remaining
+randomness from the verifier are the challenges α ∈ K log d , β ∈ K log(dn) , γ ∈ K,
+which are sampled uniformly at random.
+B.5
+
+Proof of Lemma 5
+
+Completeness: Since (s; ci , Xi , r, {y(i,j) }j∈[t] ; Zi )i∈[k+1] ∈ ME(b, L)k+1 , by
+Corollary 1, we must have c = L(Z) and ∀j ∈ [t], yj = ZMj⊺ rb. Furthermore, we
+must have
+∥Z∥∞ =
+
+Pk+1
+
+i=1 ρi · Zi
+
+≤
+∞
+
+Pk+1
+
+i=1 ∥ρi · Zi ∥∞ ≤
+
+Pk+1
+
+i=1 T ·∥Zi ∥∞ ≤ (k+1)T (b−1) < B,
+
+where the second inequality is from the expansion factor of C being T , the third
+inequality is from the definition of ME(b, L)k+1 , which enforces a norm bound of
+b, and the last inequality is by assumption (Section
+4.3). Hence, we must have
+
+that the output tuple s; c, X, r, {yj }j∈[t] ; Z ∈ ME(B, L).
+Public coin. The only randomness from the verifier is the challenges ρ1 , . . . , ρk+1 ,
+which are sampled uniformly at random from C.
+B.6
+
+Proof of Theorem 4
+
+Completeness: First, we show that the verifier’s checks pass. By the definition of
+ME(B, L), we must have that ∥Z∥∞ < B. Thus, by definition of splitb , we must
+Pk
+have Z = i=1 bi−1 · Zi . Therefore, we must have
+Z=
+
+Pk
+
+i−1
+
+Z=
+
+Pk
+
+i−1
+
+i=1 b
+i=1 b
+
+L(Z) = L(
+
+Pk
+
+· Zi
+
+i−1
+
+i=1 b
+
+44
+
+· Zi
+
+· Zi ),
+
+(26)
+
+c=
+
+Pk
+
+i−1
+
+c=
+
+Pk
+
+i−1
+
+i=1 b
+i=1 b
+
+· L(Zi ),
+
+(27)
+
+· ci ,
+
+(28)
+
+Since Zi ∈ F d×m , (26) follows from b ∈ F d×d being a scalar matrix. Since all
+scalar matrices are contained in S, (27) follows directly from L being a S-module
+homomorphism. (28) follows by construction, in step 1, ci ← L(Zi ). Starting
+from equation (26), we must have for all j ∈ [t],
+Z=
+
+Pk
+
+i=1 b
+
+i−1
+
+· Zi
+
+Pk i−1
+Z · Mj⊺ rb = ( i=1 b
+· Zi ) · Mj⊺ rb
+
+Pk  i−1
+yj = i=1 b
+· Zi Mj⊺ rb
+yj =
+
+Pk
+
+i=1 b
+
+i−1
+
+· y(i,j)
+
+(29)
+(30)
+
+(29) follows from the definition of ME(B, L) and distribution. (30) follows by
+construction, in step 1, y(i,j) ← Zi Mj⊺ rb. Thus, by (28) and (30), we have the
+verifier’s checks must pass.
+Next, we show that the output tuple, (s; {ci , Xi , r, {y(i,j) }j∈[t] }i∈[k] ; {Zi }i∈[k] ),
+belongs to ME(b, L)k . By the definition of splitb , we must have that ∥Zi ∥∞ < b
+for all i ∈ [k]. Since Lx is the trivial S-module homomorphism which projects the
+first min columns, we must have that, by construction in step 2, that Xi = Lx (Zi )
+for all i ∈ [k]. Thus, in total, we must have, along with the construction of
+ci , {y(i,j) }j∈[t] i∈[k] in step 1, that the output tuple belongs to ME(b, L)k .
+Knowledge soundness: Consider an arbitrary expected-polynomial time adversary
+(A, P ∗ ) for ΠDEC with success probability, ϵ(A, P ∗ ) ≥ 1/poly(λ). We construct
+an extractor E for ΠDEC as follows,
+
+
+E pp, s, u1 := c, X, r, {yj }j∈[t] , st :
+1. Execute encoder (pk, vk) ← K(pp, s).
+2. Simulate (u2 , w2 ) ← ⟨P ∗ (pk, u1 , st), V(vk, u1 )⟩.
+3. If u2 = ⊥, output ⊥.
+4. Parse (Z1 , . . . , Zk ) ← w2 .
+P
+i−1
+5. Output w1 := ki=1 b
+Zi .
+
+Extractor runtime: The extractor runs in expected polynomial time, since it
+simulates only one execution between the adversary P ∗ and verifier V, which
+both run in expected polynomial time.
+Extractor success probability: Assume that the simulated adversary (A, P ∗ )
+succeeds in convincing the verifier V and the parties jointly output (s, u2 , w2 ) ∈
+ME(b, L)k ; note that this occurs with probability ϵ(A, P ∗ ). Define (ci , Xi , r,
+45
+
+{y(i,j) }j∈[t] )i∈[k] := u2 and Z1 , . . . , Zk := w2 . By the definition of ME(b, L)k , we
+have for all i ∈ [k] and j ∈ [t],
+ci := L(Zi ),
+
+Xi := Lx (Zi ),
+
+∥Zi ∥∞ < b
+
+and
+
+y(i,j) := Zi Mj⊺ rb
+(31)
+
+Since the adversary succeeds in convincing the verifier, we must have that for all
+j ∈ [t],
+Pk i−1
+Pk i−1
+c = i=1 b
+· ci
+and
+yj = i=1 b
+· y(i,j)
+(32)
+By construction in step 2 (i.e. definition of splitb ), we also must have X =
+Pk i−1
+Pk i−1
+Pk i−1
+· Xi . By defining Z := i=1 b Zi , observe that X = i=1 b
+· Xi ,
+i=1 b
+(31), and (32) satisfy the remaining conditions stated in Corollary 1. Since S
+contains all scalar matrices, by Corollary 1, we must have c = L(Z), X = Lx (Z),
+and for all j ∈ [t], yj = ZMj⊺ rb. Since in (31), we have for all i ∈ [k], ∥Zi ∥∞ < b,
+we must also have ∥Z∥∞ < B = bk . These are exactly the conditions for (s; u1 :=
+{c, X, r, {yj }j∈[t] }; w1 := Z) to belong to ME(B, L). Therefore, since the
+adversary succeeds with probability ϵ(A, P ∗ ), we must have by construction, that
+E outputs a satisfying witness such that (s, u1 , w1 ) ∈ ME(B, L) with probability
+ϵ(A, P ∗ ).
+Public coin: The verifier uses no randomness in this protocol. Thus, the protocol
+is trivially public coin.
+B.7
+
+Proof of Lemma 6
+
+Proof. By construction, the verifier trivially outputs the same commitments
+(ci )i∈[k] from the original instance u1 to u2 . Hence, for repeated executions with
+respect to the same original instance u1 , the commitments in the output instances
+u2 must be the same.
+B.8
+
+Proof of Lemma 7
+
+Proof. Consider an arbitrary expected polynomial-time adversary (A, P ∗ ), such
+that the relaxed success probability of the adversary ϵ′ (A, P ∗ ) ≥ 1/poly(λ) and
+
+
+pp ← Gen(1λ )
+ w2 , w2′ ̸= ⊥ (s, u1 , st) ← A(pp)
+
+
+
+ ≤ negl(λ)
+∧
+(pk,
+vk)
+←
+K(pp,
+s)
+Pr 
+(33)
+
+
+ w2 ̸= w2′ (u2 , w2 ) ← ⟨P ∗ , V⟩((pk, vk), u1 , st) 
+(u′2 , w2′ ) ← ⟨P ∗ , V⟩((pk, vk), u1 , st)
+then we will show that there exists an expected polynomial-time extractor E
+such that
+
+
+pp ← G(1λ , sz)
+
+(s, u1 , st) ← A(pp) 
+′
+∗
+
+Pr 
+(pp, s, u1 , w1 ) ∈ R1 (pk, vk) ← K(pp, s)  ≥ ϵ (A, P ) − negl(λ).
+w1 ← E(pp, s, u1 , st)
+46
+
+Namely, the following extractor E,
+E(pp, s, u1 , st) → w1 :
+1. (pk, vk) ← K(pp, s).
+2. Assign result := ⊥.
+3. While result = ⊥:
+– Simulate result ← ⟨P1∗ , V1 ⟩((pk, vk), u1 , st∗ )
+– If result ̸= ⊥
+• Parse (u2 , w2 ) ← result.
+• If (pp, s, u2 , w2 ) ̸∈ R′2 , then set result = ⊥.
+4. Simulate result′ ← ⟨P1∗ , V1 ⟩((pk, vk), u1 , st∗ )
+5. If result′ ̸= ⊥:
+– Parse (u′2 , w2′ ) ← result′ .
+– If (pp, s, u′2 , w2′ ) ̸∈ R′2 , then set result′ = ⊥.
+6. If result′ = ⊥, then output ⊥.
+7. Parse (u2 , w2 ) ← result and (u′2 , w2′ ) ← result′ .
+8. If w2 ̸= w2′ , then output ⊥.
+9. Parse (Z1 , . . . , Zk ) ← w2 .
+P
+(i)
+10. Assign z1 ← di=1 bi−1 · Z1 .
+11. Output w1 := (z1 , Z2 , . . . , Zk ).
+
+Extractor runtime. We will show that the extractor E makes at most 1 +
+1/ϵ′ (A, P ∗ ) calls to P ∗ in expectation. Since ϵ′ (A, P ∗ ) ≥ 1/poly(λ), we have
+that the extractor makes at most a polynomial number of calls to P ∗ in expectation. Hence, since K and V1 run in poly(λ) time, we have that overall the
+extractor runs in expected polynomial-time.
+By construction, the while loop (Item 3) terminates when the adversary
+(A, P ∗ ) succeeds. Since the relaxed success probability is ϵ′ (A, P ∗ ), the while loop
+executes 1/ϵ′ (A, P ∗ ) times in expectation. This implies the while loop performs
+1/ϵ′ (A, P ∗ ) calls to P ∗ in expectation. Finally, Item 4 performs one call to P ∗ .
+Extractor success probability. First, we will show
+
+pp ← G(1λ , sz)
+′
+result
+=
+̸
+⊥
+
+(s, u1 , st) ← A(pp) 
+ ≥ ϵ′ (A, P ∗ ) − negl(λ).
+∧
+Pr 
+
+
+(pk,
+vk)
+←
+K(pp,
+s)
+w2 = w2′
+w1 ← E(pp, s, u1 , st)
+
+
+(34)
+
+Item 5 exactly checks that the simulated adversary in Item 4 succeeds. Thus, the
+event that result′ ̸= ⊥ occurs with probability ϵ′ (A, P ∗ ). Assume that the event
+result′ ̸= ⊥ occurs. By (33), w2 ̸= w2′ with at most negl(λ) probability. Thus, all
+together, we have (34) holds.
+Assume that the event result′ ̸= ⊥ ∧ w2 = w2′ occurs, which implies the extractor
+outputs a witness w1 := (z1 , Z2 , . . . , Zk ) ̸= ⊥ (as the extractor passes the checks
+in Item 6 and Item 8). We will show that (pp, s, u1 , w1 ) ̸∈ R1 with probabilty at
+47
+
+most negl(λ). Hence,
+
+
+
+pp ← G(1λ , sz)
+
+(s, u1 , st) ← A(pp) 
+
+Pr 
+(pp, s, u1 , w1 ) ∈ R1 (pk, vk) ← K(pp, s) 
+w1 ← E(pp, s, u1 , st)
+
+≥ ϵ′ (A, P ∗ ) − negl(λ) − negl(λ) = ϵ′ (A, P ∗ ) − negl(λ).
+Since result′ ̸= ⊥, by construction (Item 5), we must have (pp, s, u′2 , w2′ ) ∈ R′2
+and during the simulation ⟨P1∗ , V1 ⟩((pk, vk), u1 , st∗ ) in Item 4, the verifier V1 did
+not abort. Namely, that the sum-check verifier in protocol (Item 2) did not abort
+and the evaluation checks Item 4 were satisfied. By definition of R′2 = ME(q/2, L)k ,
+we must know that for all i ∈ [k], Xi := Lx (Zi ) and ci := L(Zi ). This also
+implies, by construction (Item 2 and Item 10), that X1 := Decompb (x1 ) and
+c1 = L(Decompb (z1 )).
+Assume that (pp, s, u1 , w1 ) ̸∈ R1 . Recall that R1 := MCS(b, L) × ME(b, L)k−1 .
+Since the commitments agree with the witnesses, we must have that (pp, s, u1 , w1 ) ̸∈
+R1 implies that either (using notation from Lemma 11)
+1. F(X[δ+1,ζ] ) ̸∈ ZSn (identically, F(X[1,n] ) ̸∈ ZSn ),
+2. OR there exists an i ∈ [k] for which ∥Zi ∥∞ ≥ b,
+fi,j (A, r) (identically,
+3. OR there exists an i ∈ [2, k] for which ye(i,j) (A) ̸= M
+y(i,j) = Zi Mj⊺ rb)
+P
+By Lemma 11, we must have T ̸= x∈{0,1}ζ Q(x, A, B, C). By the construction
+of the verifier’s checks in Item 4 and definition of (pp, s, u′2 , w2′ ) ∈ R′2 , we must
+have that the sum-check evaluation check v = Q(α′ , r′ ) is true. Note, that the
+randomness used in the second simulation of the protocol (Item 4) is fresh and
+independent of the first simulation of the protocol (Item 3). Additionally, note
+that the witness from the first execution, w2 , agrees with the witness from the
+second execution, w2′ := (z1 , Z2 , . . . , Zk ) . Thus, in order for the sum-check verifier
+to have passed, either the adversary P ∗
+P
+– violated the soundness of the sum-check protocol since T ̸= x∈{0,1}ζ Q(x, A,
+B, C)
+– OR the non-zero polynomial
+P
+T − x∈{0,1}ζ Q(x, A, B, C)
+Pt,k
+for T := C k j=1,i=2 C i+(j−1)k−1 · ye(i,j) (A) evaluated to zero on random
+point (α ∈ K log d , β ∈ K log(dn) , γ ∈ K).
+By the soundness error of the sum-check protocol, the first event occurs with probability at most ϵSC := max(u + 1, 2b + 1, 2) · log(dn)/|K|. By the Schwartz–Zippel
+lemma, the second event occurs with probability at most ϵSZ := max(log dn, (t +
+1)k − 1)/|K|. Thus, all together, (pp, s, u1 , w1 ) ̸∈ R1 with probability at most
+negl(λ) := ϵSC + ϵSZ .
+48
+
+B.9
+
+Proof of Lemma 8
+
+Proof. Consider an arbitrary expected-polynomial time adversary (A, P ∗ ) for
+ΠRLC with success probability, ϵ(A, P ∗ ) ≥ 1/poly(λ). First, we can construct an
+adversary and verification function for Theorem 6,
+A(pp,s,u1 ,st) (c) :
+1. Execute encoder (pk, vk) ← K(pp, s).
+2. Simulate (u2 , w2 ) ← ⟨P ∗ (pk, u1 , st), V(vk, u1 )⟩ with verifier randomness c.
+3. Output w2
+V(pp,s,u1 ,st) (c, w2 ) → {0, 1} :
+1. Execute encoder (pk, vk) ← K(pp, s).
+2. Simulate (u2 , ) ← ⟨P ∗ (pk, u1 , st), V(vk, u1 )⟩ with verifier randomness c.
+3. Output accept if and only if (u2 , w2 ) ∈ ME(B, L).
+
+Let E(pp,s,u1 ,st) be the corresponding extractor from Theorem 6. We define
+E(pp, s, u1 , st) as the trivial algorithm that executes E(pp,s,u1 ,st) by simulating
+calls to A(pp,s,u1 ,st) . We construct an extractor for adversary (A, P ∗ ) as follows:
+E(pp, s, u1 , st) :
+1. result ← E(pp, s, u1 , st).
+2. If u1 = ⊥ or result = ⊥, output ⊥.
+′
+) ← result.
+3. Parse (c, w1′ ), (c1 , w1′ ), . . . (ck+1 , wk+1
+
+4. Parse ρ1 , . . . , ρk+1 ← c.
+5. For i ∈ [k + 1],
+(i)
+(i)
+(a) Parse ρ1 , . . . , ρk+1 ← ci .
+′
+(b) Parse Z ← w1 and Zi ← wi′ .
+(i) −1
+(c) Assign Zi ← ρi − ρi
+· (Z − Z (i) ).
+6. Parse (ci , Xi , r, {y(i,j) }j∈[t] )i∈[k+1] ← u1 .
+
+7. Output w1 := (Zi )i∈[k+1] if and only if s; ci , Xi , r, {y(i,j) }j∈[t] ; Zi i∈[k+1] ∈
+ME(q/2, L)k+1
+
+Extractor runtime. By Theorem 6, we are guaranteed E(pp,s,u1 ,st) makes in
+expectation at most k + 2 calls to A(pp,s,u1 ,st) . Hence, our overall extractor E runs
+in expected polynomial time.
+Extractor success probability. By Theorem 6, we are guaranteed that E(pp, s, u1 , st)
+′
+outputs k + 2 pairs (c, w1′ ), (c1 , w1′ ), . . . (ck+1 , wk+1
+) such that
+– V (c, w1′ ) = 1,
+– for all i ∈ [k + 1], V (ci , wi′ ) = 1, and
+– (c, c1 , . . . , ck+1 ) ∈ SS(C, k + 1)
+with probability ϵV(pp,s,u1 ,st)(A(pp,s,u1 ,st) ) − k+1
+|C| . Since A(pp,s,u1 ,st) and V(pp,s,u1 ,st)
+simulate the interaction between P ∗ and V and checks if the output pair (u2 , w1′ )
+∗
+belongs to ME(B, L), we must have ϵV(pp,s,u1 ,st)(A(pp,s,u1 ,st) ) − k+1
+|C| = ϵ(A, P ) −
+49
+
+(k + 1)/|C|. Assume that this event occurs. Since V (c, w1′ ) = 1, by construction
+of ΠRLC , we have
+
+
+Pk+1
+c = i=1 ρi ci ,
+Pk+1
+
+
+X = i=1 ρi Xi ,
+
+
+s;
+ ∈ ME(B, L)
+;
+Z
+(35)
+r,
+ n
+
+o
+
+
+Pk+1
+yj = i=1 ρi y(i,j)
+j∈[t]
+
+Furthermore, since V (ci , wi′ ) = 1, we have for all i ∈ [k + 1],
+
+
+Pk+1 (i)
+c(i) = i=1 ρi ci ,
+Pk+1 (i)
+
+
+
+
+X (i) = i=1 ρi Xi ,
+(i) 
+s;
+;
+Z
+ n
+ ∈ ME(B, L)
+r,
+o
+
+
+P
+(i)
+k+1 (i)
+yj = i=1 ρi y(i,j)
+
+(36)
+
+j∈[t]
+
+Since (c, c1 , . . . , ck+1 ) ∈ SS(C, k + 1), we must have for all i ∈ [k + 1] that
+(i)
+
+(i)
+
+(ρ1 , . . . , ρk+1 ) ≡i (ρ1 , . . . , ρk+1 )
+
+(37)
+
+which means the challenges differ only on index i. Thus, we have for all i ∈ [k + 1],
+
+Pk+1 (i)
+(i)
+,
+i=1 ρi ci −
+i=1 ρi ci = L(Z) − L Z
+
+Pk+1
+Pk+1 (i)
+(i)
+i=1 ρi Xi −
+i=1 ρi Xi = Lx (Z) − Lx Z
+Pk+1
+
+(i) 
+
+ρi − ρi
+
+(i) 
+
+ρi − ρi
+
+(38)
+
+
+· ci = L(Z) − L Z (i) ,
+
+· Xi = Lx (Z) − Lx Z (i)
+
+
+
+
+(i) −1
+ρi − ρi
+· Z − Z (i) ,
+
+
+(i) −1
+Xi = Lx ρi − ρi
+· Z − Z (i)
+ci = L
+
+(39)
+
+
+
+ci = L(Zi ),
+
+(40)
+
+Xi = Lx (Zi )
+
+where equation (38) follows from the definition of ME(B, L) and both (35) and
+(36). Equation (39) follows from the equivalence (37). Equation (40) follows
+from L, Lx being S-homomorphisms and C ⊆ S being a strong sampling set
+(i)
+(i)
+(Definition 14) which because ρi ̸= ρi (guaranteed by (37)) means ρi − ρi is
+invertible. Similarly, we must have for all i ∈ [k + 1] and j ∈ [t],
+Pk+1
+
+(i)
+⊺
+b − Z (i) Mj⊺ rb
+(41)
+i=1 ρi y(i,j) = ZMj r
+
+(i) 
+⊺
+ρi − ρi · y(i,j) = Z − Z (i) Mj rb
+(42)
+ ⊺
+(i) −1
+⊺
+(i)
+y(i,j) = ρi − ρi
+· Z − Z Mj rb = Zi Mj rb (43)
+
+i=1 ρi y(i,j) −
+
+Pk+1
+
+50
+
+where equation (41) follows from the definition of ME(B, L) and both (35) and
+(36), equations (42) follows from the equivalence (37), and (43) follows from
+(i)
+C ⊆ S being a strong sampling set (Definition 14) which because ρi ̸= ρi
+(i)
+(guaranteed by (37)) means ρi − ρi is invertible. Therefore, by (40) and (43),
+we must have with probability ϵ(A, P ∗ ) − (k + 1)/|C|,
+ the extractor outputs
+Z1 , . . . , Zk+1 such that s; ci , Xi , r, {y(i,j) }j∈[t] ; Zi i∈[k+1] ∈ ME(q/2, L)k+1 ,
+which has the trivial norm bound of q/2.
+Now, assume that A := (B, B ′ ) such that
+
+
+pp ← G(1λ , sz)
+′
+ u1 , u1 ̸= ⊥ (s, st∗ ) ← B(pp) 
+
+
+⇓
+Pr 
+=1
+′
+∗ 
+
+′
+(u
+,
+st)
+←
+B
+(st
+)
+1
+ϕ(u1 ) = ϕ(u1 )
+(u′1 , st′ ) ← B ′ (st∗ )
+We will show that
+
+
+pp ← G(1λ , sz)
+(s, st∗ ) ← B(pp)
+
+
+
+
+
+
+
+ w , w′ ̸= ⊥
+
+′
+∗
+(u1 , st) ← B (st )
+ 1 1
+
+Pr 
+ ≤ ϵbind (d, m, 2B, C)
+ ∧ w1 ̸= w1′ w1 ← E(pp, s, u1 , st) 
+
+
+
+(u′1 , st′ ) ← B ′ (st∗ ) 
+w1′ ← E(pp, s, u′1 , st′ )
+Assume that the event w1 , w1′ ̸= ⊥ ∧ w1 ̸= w1′ occurs. Since w1 , w1′ ̸= ⊥, we
+have that u1 , u′1 ̸= ⊥, since the extractor would have failed otherwise. Thus, we
+must have that:
+1. ϕ(u1 ) = ϕ(u′1 ), which guarantees the instances share identical commitments
+(ci )i∈[j] .
+2. Define (fi )i∈[k+1] = w1 and (fi′ )i∈[k+1] = w1′ . Then, w1 ̸= w1′ implies that
+there exist an i ∈ [k + 1] such that fi ̸= fi′ .
+During the execution of E(pp, s, u1 , st), the call to algorithm E(pp, s, u1 , st) pro(i)
+duces ρi , ρi , Z, Z (i) and E(pp, s′ , u′1 , st′ ), the call to algorithm E(pp, s′ , u′1 , st′ )
+(i)′
+produces ρ′i , ρi , Z ′ , Z (i)′ such that
+(i) −1
+(i)′ −1
+fi ̸= fi′ ⇐⇒ ρi − ρi
+· (Z − Z (i) ) ̸= ρ′i − ρi
+· (Z ′ − Z (i)′ )
+(44)
+∥Z∥∞ , Z (i)
+
+∞
+
+, ∥Z ′ ∥∞ , Z (i)′
+
+∞
+
+<B
+
+(45)
+
+where (44) follows from Item 2 and (45) follows from Theorem 6, which guarantees
+the verification function V(pp,s,u1 ,st) accepts (by construction, this verification
+function checks if the output tuples belong to ME(B, L), which checks the output
+witnesses have norm bound B). By Item 1 and (40), we must have
+
+
+
+
+(i) −1
+(i)′ −1
+ci = L ρi − ρi
+· Z − Z (i) = L ρ′i − ρi
+· Z ′ − Z (i)′
+51
+
+Thus, since L is a S-homomorphism, we have
+(i) 
+
+ρi − ρi
+
+· ci = L Z − Z (i)
+
+
+
+∧
+
+(i)′ 
+
+ρ′i − ρi
+
+· ci = L Z ′ − Z (i)′
+
+
+
+(46)
+
+(i)
+
+All together, by (44), (45), and (46), we have that (ci , ∆1 = ρi − ρi , ∆2 =
+(i)′
+ρ′i − ρi , Z1 = Z − Z (i) , Z2 = Z ′ − Z (i)′ ) is a 2B-relaxed binding collision. Thus,
+the probability of the original event must be less than or equal to ϵbind (d, m, 2B, C).
+Otherwise, we could construct a corresponding relaxed-binding adversary which
+executes the extractor E twice to retrieve the corresponding elements for the
+2B-relaxed binding collision with probability greater than ϵbind (d, m, 2B, C).
+B.10
+
+Proof of Theorem 5
+
+Proof. Consider an arbitrary expected polynomial-time adversary (A, P ∗ ) for the
+composition Π := Π2 ◦Π1 with success probability ϵ(A, P ∗ ) ≥ 1/poly(λ). Without
+loss of generality, the adversary P ∗ can be split into two adversaries (P1∗ , P2∗ )
+such that given pp ← G(1λ ), (s, u1 , st1 ) ← A(pp), and (pk, vk) ← K(pp, s),
+– ⟨P1∗ , V1 ⟩((pk, vk), u1 , st1 ) → (u2 , st2 )
+– ⟨P2∗ , V2 ⟩((pk, vk), u2 , st2 ) → (u3 , w3 )
+Furthermore, we assume that A outputs st1 which contains (s, pp); otherwise, we
+could trivially construct an adversary A′ with an identical distribution of prior
+outputs that does so. First, we construct an adversary A2 := (B2 , B2′ ) for Π2 :
+B2 (pp) → (s, st∗ ) :
+1. (s, u1 , st1 ) ← A(pp).
+2. Output (s, st1 ).
+B2′ (st∗ ) → (u2 , st2 ) :
+1. Parse st∗ to obtain (s, pp).
+2. (pk, vk) ← K(pp, s).
+3. Simulate (u2 , st2 ) ← ⟨P1∗ , V1 ⟩((pk, vk), u1 , st∗ ).
+4. Output (u2 , st2 ).
+A2 (pp) → (s, u2 , st2 ) :
+1. (s, st∗ ) ← B2 (pp).
+2. (u2 , st2 ) ← B2′ (st∗ ).
+3. Output (s, u2 , st2 ).
+
+Observe that, by construction, the success probability ϵ(A2 , P2∗ ) of adversary
+(A2 , P2∗ ) for Π2 is equal to the success probabilty ϵ(A, P ∗ ) of adversary (A, P ∗ )
+for Π. Since Π1 is ϕ-restricted, we must have
+
+
+pp ← G(1λ , sz)
+′
+ u2 , u2 ̸= ⊥ (s, st∗ ) ← B2 (pp) 
+
+
+⇓
+Pr 
+(47)
+ = 1,
+ ϕ(u ) = ϕ(u′ ) (u2 , st2 ) ← B2′ (st∗ ) 
+2
+2
+(u′2 , st′2 ) ← B2′ (st∗ )
+52
+
+Thus, we have by (47) and the ϕ-relaxed knowledge soundness of Π2 that there
+exists an expected polynomial-time extractor E2 such that
+
+
+pp ← G(1λ , sz)
+
+
+′ (s, u2 , st2 ) ← A2 (pp) 
+≥ ϵ(A, P ∗ ) − negl(λ) (48)
+(pp,
+s,
+u
+,
+w
+)
+∈
+R
+Pr 
+2
+2
+2
+
+(pk, vk) ← K(pp, s) 
+w2 ← E2 (pp, s, u2 , st2 )
+and
+
+
+pp ← G(1λ , sz)
+(s, st∗ ) ← B2 (pp)
+
+
+
+
+
+
+
+
+ w , w′ ̸= ⊥
+′
+∗
+(u2 , st) ← B2 (st )
+
+ 2 2
+Pr 
+ ≤ negl(λ)
+ ∧ w2 ̸= w2′ w2 ← E2 (pp, s, u2 , st) 
+
+
+
+(u′2 , st′ ) ← B2′ (st∗ ) 
+w2′ ← E2 (pp, s, u′2 , st′ )
+
+(49)
+
+Next, we will construct an adversary P1∗∗ for Π1 :
+P1∗∗ (pk, u1 , st1 ) → w2 :
+1. Parse st1 to obtain (s, pp).
+2. (pk, vk) ← K(pp, s).
+3. Simulate (u2 , st2 ) ← ⟨P1∗ , V1 ⟩((pk, vk), u1 , st1 ).
+4. w2 ← E2 (pp, s, u2 , st2 ).
+5. Output w2 .
+
+Observe that, by construction, the relaxed success probability ϵ′ (A, P1∗∗ ) of
+adversary (A, P1∗∗ ) for Π1 is equal to ϵ(A, P ∗ ) − negl(λ) ≥ 1/poly(λ) which is the
+success probability of the relaxed extractor E2 from equation (48). Furthermore,
+by equation (49) and construction of (B2 , B2′ ), we must have that
+
+
+pp ← Gen(1λ )
+ w2 , w2′ ̸= ⊥ (s, u1 , st1 ) ← A(pp)
+
+
+
+
+ ≤ negl(λ)
+∧
+(pk, vk) ← K(pp, s)
+Pr 
+(50)
+
+ w2 ̸= w2′ (u2 , w2 ) ← ⟨P1∗∗ , V⟩((pk, vk), u1 , st1 ) 
+(u′2 , w2′ ) ← ⟨P1∗∗ , V⟩((pk, vk), u1 , st1 )
+Thus, we have by (50) and the restricted knowledge soundness of Π1 that there
+exists an expected polynomial-time extractor E1 such that
+
+
+pp ← G(1λ , sz)
+
+(s, u1 , st1 ) ← A(pp) 
+∗
+
+Pr 
+(pp, s, u1 , w1 ) ∈ R1 (pk, vk) ← K(pp, s)  ≥ ϵ(A, P ) − negl(λ) (51)
+w1 ← E1 (pp, s, u1 , st1 )
+In conclusion, we have constructed an extractor E := E1 with respect to adversary
+(A, P ∗ ) such that
+
+
+pp ← G(1λ , sz)
+
+(s, u1 , st1 ) ← A(pp) 
+∗
+
+Pr 
+(pp, s, u1 , w1 ) ∈ R1 (pk, vk) ← K(pp, s)  ≥ ϵ(A, P ) − negl(λ).
+w1 ← E(pp, s, u1 , st1 )
+53
+
+Thus, Π := Π2 ◦ Π1 is knowledge sound.
+B.11
+
+Finding choices of cyclotomic and fields
+
+# [LS18, eprint 2017-523] pg 6
+# m is the cyclotomic polynomial index
+def tau(m):
+return m if (m % 2) != 0 else m / 2
+# [LS18, eprint 2017-523] Thm 1.1, pg 4
+# m is the cyclotomic polynomial index
+# p is the prime
+# z is any divisor of m
+# This tests for the condition for thm 1.1 to hold
+def thm1_1_cond(m, p, z):
+cond1 = (p % z) == 1
+cond2 = Mod(p,m).multiplicative_order() == m/z
+return cond1 and cond2
+# [LS18, eprint 2017-523] Thm 1.1, pg 4
+# p is the prime
+# z is any divisor of m
+# lInf bound for elements to be invertible
+# given that m,p,z satisfy thm 1.1 cond
+def thm1_1_inv_bound(p, z):
+return (1/s1(z)*p^(1/euler_phi(z))).n()
+def thm1_1_num_factors(z):
+return euler_phi(z)
+# Output divisors of m
+def divisors(m):
+zs = list()
+for i in range(1,m+1):
+if m % i == 0:
+zs.append(i)
+return zs
+# [LS18, eprint 2017-523] pg 6, pg 9
+# We only consider prime power cyclotomics
+# m is the cyclotomic polynomial index
+def s1(m):
+return sqrt(tau(m))
+# checks if cyclotomic index m is power of two
+def is_pow2(m):
+return sum(m.digits(2)) == 1
+# [MR09] lattice-based cryptography
+
+54
+
+# makes sure characteristic does not lead
+# to trivial bound
+def non_trivial(q, n, d, delta):
+return (q/2).n() >= (2^(2 * sqrt( n*d * log(q,2) * log(delta, 2)))).n()
+# [AL21] eprint Prop 2. 2021/202
+# for all u,v in R, |u*v| / |v| <= gamma*|u|
+# outputs T = gamma * |u|
+# assumes we are only testing prime powers
+def expansion_factor(m, norm):
+if is_pow2(m):
+return euler_phi(m) * norm
+else:
+return 2 * euler_phi(m) * norm
+# p is prime
+# max_idx is max cyclotomic index
+# outputs list of (m, z)
+def candidates(p, min_idx=10, max_idx=200):
+# prime powers
+possible_indices = [i for i in range(min_idx, max_idx) if len(factor(i)) == 1]
+c = list()
+for m in possible_indices:
+zs = divisors(m)
+for z in zs:
+if thm1_1_cond(m, p, z):
+c.append((Integer(m), Integer(z)))
+return c
+def pre_filter(q, cyclotomic_index, z, n, m, chals):
+chals_norm = max({abs(c) for c in chals})
+chals_max_diff = chals[-1] - chals[0]
+delta = 1.0045 # root hermite factor, chosen from [ESSLL19] eprint 2018/773
+phi = cyclotomic_polynomial(cyclotomic_index) # index cyclotomic polynomial
+d = phi.degree() # degree of cyclotomic
+
+# return non_trivial(q, n, d, delta) and chals_max_diff < thm1_1_inv_bound(q, z) and log(len(chals
+# We remove non_trivial(...) because we use the lattice estimator for hardness
+return chals_max_diff < thm1_1_inv_bound(q, z) and log(len(chals)^d,2).n() >= 120
+def info(q, cyclotomic_index, z, n, m, chals):
+chals_norm = max({abs(c) for c in chals})
+chals_max_diff = chals[-1] - chals[0]
+delta = 1.0045 # root hermite factor, chosen from [ESSLL19] eprint 2018/773
+phi = cyclotomic_polynomial(cyclotomic_index) # index cyclotomic polynomial
+d = phi.degree() # degree of cyclotomic
+T = expansion_factor(cyclotomic_index, chals_norm)
+# Bounds for MSIS to be hard
+# [MR09] lattice-based cryptography pg 6
+
+55
+
+# [CMNW24] pg 38 eprint 2024/281
+MSIS_B_l2_bound = min(q, 2^(2 * sqrt( n*d * log(q,2) * log(delta, 2))))
+MSIS_B_linf_bound = MSIS_B_l2_bound / sqrt(m*d)
+# We need MSIS infinity bound 8TB to be hard
+B = MSIS_B_linf_bound / (8*T)
+print("####")
+print("Cyclotomic idx:", cyclotomic_index)
+print("Cyclotomic Poly:", phi)
+print("z:", z)
+#print("Prime is non-trivial?", non_trivial(q, n, d, delta))
+print("Csmall norm is small enough?", chals_max_diff < thm1_1_inv_bound(q, z))
+print("Csmall large enough?", log(len(chals)^d,2).n() >= 120)
+print("Degree of Cyclotomic:", d)
+# print("log(B):", log(B, 2).n())
+print("Expansion Factor T:", T)
+print("Invertible Norm bound:", thm1_1_inv_bound(q, z))
+print("log(|C_Small|):", log(len(chals)^d,2).n())
+print("Factors of Cyclotomic:", thm1_1_num_factors(z))
+print()
+
+def possible_settings(q, n, m, chals):
+for (cyclotomic_index, z) in candidates(q):
+if pre_filter(q, cyclotomic_index, z, n, m, chals):
+info(q, cyclotomic_index, z, n, m, chals)
+else:
+delta = 1.0045
+d = cyclotomic_polynomial(cyclotomic_index).degree()
+print("[Does not satisfy security requirements] index: {}, degree: {}, z: {}, non_trivial:
+# Primes:
+GL = 2^64 - 2^32 + 1
+AGL = GL - 32
+print("###############################")
+print("AGL ###############################")
+print("###############################")
+# MSIS settings
+n = 13 # rows, kappa in latticefold
+m = 2^26 # cols
+# Small Challenge set
+chals = [-1, 0, 1, 2]
+possible_settings(AGL, n, m, chals)
+print("###############################")
+print("M61 ###############################")
+print("###############################")
+# MSIS settings
+n = 16 # rows, kappa in latticefold
+m = 2^22 # cols
+# Small Challenge set
+
+56
+
+chals = [-2, -1, 0, 1, 2]
+possible_settings(2^61-1, n, m, chals)
+print("###############################")
+print("GL ###############################")
+print("###############################")
+# MSIS settings
+n = 16 # rows, kappa in latticefold
+m = 2^24 # cols
+# Small Challenge set
+chals = [-2, -1, 0, 1, 2]
+possible_settings(GL, n, m, chals)
+print("###############################")
+
+B.12
+
+Lattice Estimator Script
+
+from estimator import *
+Logging.set_level(Logging.LEVEL0)
+M61 = 2^61 -1
+GL = 2^64 - 2^32 +1
+AGL = GL - 32
+n = 13
+d = 64
+T = 128
+k = 11
+b = 2
+B = b^k
+m = 2^26
+q = AGL
+n_sis = n*d
+m_sis = m*d
+B_l2 = sqrt(m*d)*(8*T*B)
+params = SIS.Parameters(n=n_sis, q=q, m=m_sis,length_bound=B_l2, norm=2)
+_ = SIS.estimate(params)
+print((k+1)*T*(b-1) < B)
+n = 16
+d = 54
+T = 216
+k = 12
+b = 2
+B = b^k
+m = 2^22
+q = M61
+n_sis = n*d
+
+57
+
+m_sis = m*d
+B_l2 = sqrt(m*d)*(8*T*B)
+params = SIS.Parameters(n=n_sis, q=q, m=m_sis,length_bound=B_l2, norm=2)
+_ = SIS.estimate(params)
+print((k+1)*T*(b-1) < B)
+n = 16
+d = 54
+T = 216
+k = 12
+b = 2
+B = b^k
+m = 2^24
+q = GL
+n_sis = n*d
+m_sis = m*d
+B_l2 = sqrt(m*d)*(8*T*B)
+params = SIS.Parameters(n=n_sis, q=q, m=m_sis,length_bound=B_l2, norm=2)
+_ = SIS.estimate(params)
+print((k+1)*T*(b-1) < B)
+
+58
+
+

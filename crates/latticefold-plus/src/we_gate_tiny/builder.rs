@@ -624,7 +624,12 @@ fn tiny_gate_poseidon_shard_permutes(cfg: &PoseidonConfig<F257>, ops: &[Poseidon
     }
 }
 
-fn build_count_plan(
+/// Shared inner logic for the count-only pass.
+///
+/// Returns `(plan, merged_assignment, pose_wiring)`.
+/// The merged assignment follows the same layout as `build_direct_to_merged_unix`:
+/// `[ONE] ++ pose_asg[1..] ++ base_asg[1..] ++ extra_asg[1..] ...`
+fn build_count_plan_inner(
     cfg: &PoseidonConfig<F257>,
     ops: &[PoseidonTraceOp<F257>],
     ring_dim: usize,
@@ -632,7 +637,7 @@ fn build_count_plan(
     wiring: &TinyCoinOpWiring,
     pairs: &[(usize, usize)],
     extra_witness: &TinyExtraWitness,
-) -> Result<TinyGatePlan, String> {
+) -> Result<(TinyGatePlan, Vec<F257>, PoseidonDr1csWiring), String> {
     let t_all = Instant::now();
     // Poseidon (count-only sharded, no disk writes).
     let t = Instant::now();
@@ -944,7 +949,85 @@ fn build_count_plan(
         total_c_terms,
     };
 
+    // Collect part assignments from GlueCtx *before* dropping them (they borrow pose_asg).
+    let base_asg = std::mem::take(&mut glue.gb.assignment);
+    let extra_asgs: Vec<Vec<F257>> = extra_glues
+        .iter_mut()
+        .map(|g| std::mem::take(&mut g.gb.assignment))
+        .collect();
+    // Drop the GlueCtx borrows so we can move pose_asg.
+    drop(glue);
+    drop(extra_glues);
+
+    // Reconstruct merged assignment by moving tails (same layout as build_direct_to_merged_unix).
+    let mut merged_asg: Vec<F257> = Vec::with_capacity(1usize.saturating_add(cur));
+    merged_asg.push(F257::ONE);
+    {
+        let mut pose_asg = pose_asg;
+        if pose_asg.len() > 1 {
+            let mut tail = pose_asg.split_off(1);
+            merged_asg.append(&mut tail);
+        }
+    }
+    {
+        let mut base_asg = base_asg;
+        if base_asg.len() > 1 {
+            let mut tail = base_asg.split_off(1);
+            merged_asg.append(&mut tail);
+        }
+    }
+    for mut asg in extra_asgs {
+        if asg.len() > 1 {
+            let mut tail = asg.split_off(1);
+            merged_asg.append(&mut tail);
+        }
+    }
+
+    Ok((plan, merged_asg, pose_wiring))
+}
+
+/// Count-only plan for the tiny gate (exact sizes + eq_pairs + var offsets).
+///
+/// This is a thin wrapper around `build_count_plan_inner` that discards the merged assignment
+/// and wiring, returning only the plan.  Used by `build_direct_to_merged_unix` for Pass0 sizing.
+fn build_count_plan(
+    cfg: &PoseidonConfig<F257>,
+    ops: &[PoseidonTraceOp<F257>],
+    ring_dim: usize,
+    params: &WeParams,
+    wiring: &TinyCoinOpWiring,
+    pairs: &[(usize, usize)],
+    extra_witness: &TinyExtraWitness,
+) -> Result<TinyGatePlan, String> {
+    let (plan, _merged_asg, _pose_wiring) =
+        build_count_plan_inner(cfg, ops, ring_dim, params, wiring, pairs, extra_witness)?;
     Ok(plan)
+}
+
+/// Assignment-only builder: runs the count-only pass and returns the merged assignment
+/// and Poseidon wiring without writing any constraint files to disk.
+///
+/// This is the fast path for cache-hit scenarios where the shape is already on disk.
+pub(super) fn build_assignment_only(
+    cfg: Option<&PoseidonConfig<F257>>,
+    ops: &[PoseidonTraceOp<F257>],
+    ring_dim: usize,
+    params: &WeParams,
+    wiring: &TinyCoinOpWiring,
+    pairs: &[(usize, usize)],
+    extra_witness: &TinyExtraWitness,
+) -> Result<(Vec<F257>, PoseidonDr1csWiring), String> {
+    let default_cfg;
+    let poseidon_cfg = match cfg {
+        Some(c) => c,
+        None => {
+            default_cfg = f257_poseidon_config();
+            &default_cfg
+        }
+    };
+    let (_plan, merged_asg, pose_wiring) =
+        build_count_plan_inner(poseidon_cfg, ops, ring_dim, params, wiring, pairs, extra_witness)?;
+    Ok((merged_asg, pose_wiring))
 }
 
 #[cfg(unix)]
