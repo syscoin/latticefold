@@ -18,13 +18,6 @@ use dpp::theorem43::{Theorem43Coins, Theorem43Dpp, Theorem43LockArtifact};
 use dpp::SparseVec;
 use symphony::file_backed_dr1cs::{cfg_read_buf_bytes, FileBackedSparseDr1csInstance};
 
-#[inline]
-fn is_f257_field<F: PrimeField>() -> bool {
-    // `PrimeField::characteristic()` returns little-endian u64 limbs.
-    // F257's characteristic is exactly 257.
-    F::characteristic() == &[257u64]
-}
-
 use crate::lockable_ringlwe::{arm_ringlwe_lock, QueryBlockAccumulator, RingLweLockArtifact, RingLweParams};
 
 pub use crate::we_statement::arm_theorem43_from_statement;
@@ -387,20 +380,11 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         let k_star = self.k_star();
         let blocks = self.blocks();
         let nconstraints = self.nconstraints();
-        let f257_fast = x_u16.is_some() && z_u16.is_some() && is_f257_field::<F>();
-        let (x_u16, z_u16) = if f257_fast {
-            (x_u16.unwrap(), z_u16.unwrap())
-        } else {
-            (&[][..], &[][..])
-        };
-
-        // Coefficient lookup table for F257: avoid repeated `F::from(u16)`.
-        let coeff_lut: Option<Vec<F>> = if is_f257_field::<F>() {
-            Some((0u16..=256u16).map(|c| F::from(c as u64)).collect())
-        } else {
-            None
-        };
-        let lut = coeff_lut.as_deref();
+        let f257_fast = x_u16.is_some() && z_u16.is_some();
+        if !f257_fast {
+            return Err("stream_w_eval_blocks: only F257 fast path is supported".to_string());
+        }
+        let (x_u16, z_u16) = (x_u16.unwrap(), z_u16.unwrap());
 
         let do_prof_w_eval = std::env::var("LF_PROFILE_DPP_W_EVAL").ok().as_deref() == Some("1");
         let open_ns = std::sync::atomic::AtomicU64::new(0);
@@ -488,7 +472,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                                 let b_len = read_u32(&mut rows)? as usize;
                                 let _c_len = read_u32(&mut rows)? as usize;
 
-                                let (aval, bval) = if f257_fast {
+                                let (aval, bval) = {
                                     const P: u64 = 257;
                                     let mut aval_u: u64 = 0;
                                     for _ in 0..a_len {
@@ -505,24 +489,6 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                                         bval_u = bval_u.wrapping_add(cu16.wrapping_mul(v));
                                     }
                                     (F::from((aval_u % P) as u64), F::from((bval_u % P) as u64))
-                                } else {
-                                    let mut aval = F::ZERO;
-                                    for _ in 0..a_len {
-                                        let cu16 = read_u16(&mut a_coeffs)? as usize;
-                                        let idx = read_u32(&mut a_idx)? as usize;
-                                        let v = if idx < self.l { x[idx] } else { z_w[idx - self.l] };
-                                        let c = if let Some(lut) = lut { lut[cu16] } else { F::from(cu16 as u64) };
-                                        aval += c * v;
-                                    }
-                                    let mut bval = F::ZERO;
-                                    for _ in 0..b_len {
-                                        let cu16 = read_u16(&mut b_coeffs)? as usize;
-                                        let idx = read_u32(&mut b_idx)? as usize;
-                                        let v = if idx < self.l { x[idx] } else { z_w[idx - self.l] };
-                                        let c = if let Some(lut) = lut { lut[cu16] } else { F::from(cu16 as u64) };
-                                        bval += c * v;
-                                    }
-                                    (aval, bval)
                                 };
                                 y_a[i] = aval;
                                 y_b[i] = bval;
@@ -653,11 +619,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
             self.open_readers_at_row(row_start)?;
 
         // Coefficient lookup table (tiny format): avoid repeated `F::from(u16)` in hot loops.
-        let coeff_lut: Option<Vec<F>> = if is_f257_field::<F>() {
-            Some((0u16..=256u16).map(|c| F::from(c as u64)).collect())
-        } else {
-            None
-        };
+        let coeff_lut: Vec<F> = (0u16..=256u16).map(|c| F::from(c as u64)).collect();
 
         for i in 0..k {
             let row = row_start.saturating_add(i as u64);
@@ -673,11 +635,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                 let cu16 = read_u16(&mut a_coeffs)?;
                 let vidx = read_u32(&mut a_idx)? as usize;
                 if !cab.is_zero() {
-                    let c = if let Some(lut) = coeff_lut.as_deref() {
-                        lut[cu16 as usize]
-                    } else {
-                        F::from(cu16 as u64)
-                    };
+                    let c = coeff_lut[cu16 as usize];
                     scratch.add_q1_term_on_z(vidx, c * cab);
                 }
             }
@@ -685,11 +643,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                 let cu16 = read_u16(&mut b_coeffs)?;
                 let vidx = read_u32(&mut b_idx)? as usize;
                 if !cab.is_zero() {
-                    let c = if let Some(lut) = coeff_lut.as_deref() {
-                        lut[cu16 as usize]
-                    } else {
-                        F::from(cu16 as u64)
-                    };
+                    let c = coeff_lut[cu16 as usize];
                     scratch.add_q2_term_on_z(vidx, c * cab);
                 }
             }
@@ -698,11 +652,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                 let cu16 = read_u16(&mut c_coeffs)?;
                 let vidx = read_u32(&mut c_idx)? as usize;
                 if !cc.is_zero() {
-                    let c = if let Some(lut) = coeff_lut.as_deref() {
-                        lut[cu16 as usize]
-                    } else {
-                        F::from(cu16 as u64)
-                    };
+                    let c = coeff_lut[cu16 as usize];
                     scratch.add_q3_cx2_term_on_z(vidx, c * cc);
                 }
             }
