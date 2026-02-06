@@ -25,10 +25,7 @@ fn is_f257_field<F: PrimeField>() -> bool {
     F::characteristic() == &[257u64]
 }
 
-use crate::lockable_ringlwe::{
-    arm_ringlwe_lock, RingLweLockArtifact, RingLweParams,
-};
-use crate::lockable_ringlwe::QueryBlockAccumulator;
+use crate::lockable_ringlwe::{arm_ringlwe_lock, QueryBlockAccumulator, RingLweLockArtifact, RingLweParams};
 
 pub use crate::we_statement::arm_theorem43_from_statement;
 
@@ -848,7 +845,7 @@ pub(crate) fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
     }
     let dpp = make_theorem43_dpp_from_dr1cs::<F>(dr1cs, public_len)?;
     let mut scratch = dpp.query_scratch();
-    let mut acc = QueryBlockAccumulator::new(dpp.proof_len())?;
+    let mut acc = QueryBlockAccumulator::<F>::new(dpp.proof_len())?;
 
     let c_stmt = crate::we_statement::digest32_to_bits_field::<F>(stmt_digest);
     let armer_secret = crate::we_statement::derive_armer_secret::<F>(armer_seed, stmt_digest, lock_j, 4);

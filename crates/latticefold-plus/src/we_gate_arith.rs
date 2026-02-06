@@ -6370,11 +6370,9 @@ mod tests {
         let armer_seed = [7u8; 32];
         let lock_j = 0u64;
 
-        // Canonical (payload-carrying) RingLWE lock requires a secret mask `s`,
-        // and until reconciliation is implemented we also force `noise_bound=0`.
+        // Canonical MLWE/RLWE hint arming; use σ=0 for deterministic tests.
         let ringlwe_params = RingLweParams {
-            binomial_k: 16,
-            noise_bound: 0,
+            noise_sigma: 0.0,
             ..RingLweParams::default()
         };
         let dummy_payload: [u8; 0] = [];
@@ -6493,12 +6491,19 @@ mod tests {
         maybe_print_rss("tiny_gate:after_prove_decap_stream");
         eprintln!("[tiny_gate] prove+decap(stream) in {:?}", t_prove.elapsed());
 
-        // Negative check: tweak the (small) tail and ensure decapsulation fails.
-        // This avoids a second full streaming proof run.
+        // Negative check: tweak the (small) tail and ensure the answer is wrong.
+        // With unauthenticated encryption, a corrupted tail produces a wrong key → garbage
+        // decryption, but no error. The answer-only `finish()` returns a value that should
+        // NOT be in the valid accepting set {1, 2}.
         let mut tail_bad = tails[0].clone();
         tail_bad[0] += F257::ONE; // tweak μ
         st_bad.absorb_chunk(&tail_bad).expect("absorb tweaked tail");
-        assert!(st_bad.finish().is_err());
+        let bad_answer = st_bad.finish().expect("finish with bad tail should not error");
+        assert!(
+            bad_answer != F257::from(1u64) && bad_answer != F257::from(2u64),
+            "corrupted tail should NOT produce a valid accepting-set answer (got {:?})",
+            bad_answer,
+        );
 
         // Negative check: wrong x length must fail immediately.
         let mut x_bad = x.clone();
@@ -6629,11 +6634,10 @@ mod tests {
         )
         .expect("we_ringlwe_prover_from_dr1cs");
 
-        // RingLWE payload locks (one per Shamir share).
-        // Disable noise for deterministic AEAD key agreement (until reconciliation is implemented).
+        // MLWE/RLWE hint locks (one per Shamir share).
+        // Disable noise for deterministic AEAD key agreement in tests.
         let ringlwe_params = RingLweParams {
-            binomial_k: 16,
-            noise_bound: 0,
+            noise_sigma: 0.0,
             ..RingLweParams::default()
         };
         let stmt_digest = [5u8; 32];
@@ -6709,52 +6713,54 @@ mod tests {
         }
         assert_eq!(tails.len(), shamir.shares);
 
-        // Simulate probabilistic incompleteness (e.g. excessive noise) by corrupting a couple tails,
-        // which should cause AEAD failure for those locks (treated as erasures).
-        let mut tails_mut = tails;
-        if shamir.shares >= 2 {
-            tails_mut[0][0] += F257::ONE;
-            tails_mut[1][0] += F257::ONE;
-        }
+        // Absorb tails (no corruption — with unauthenticated encryption, "erasures" manifest as
+        // wrong decryptions that fail at batch reconstruction, not per-lock AEAD failures).
         for (i, st) in states.iter_mut().enumerate() {
-            st.absorb_chunk(&tails_mut[i]).unwrap_or_else(|_| panic!("absorb tail[{i}]"));
+            st.absorb_chunk(&tails[i]).unwrap_or_else(|_| panic!("absorb tail[{i}]"));
         }
 
-        // Attempt to decrypt all R shares; treat failures as erasures.
-        let mut recovered_all: Vec<ShamirShare> = Vec::with_capacity(shamir.shares);
+        // Decrypt all R locks: each produces 2 candidate shares (unauthenticated).
+        let secret_hash: [u8; 32] = {
+            use sha2::Digest;
+            sha2::Sha256::digest(&secret).into()
+        };
+        let mut candidates_per_lock: Vec<(u32, [[u8; 32]; 2])> = Vec::with_capacity(shamir.shares);
         for (i, st) in states.into_iter().enumerate() {
-            if let Ok((idx, pt)) = st.finish_decrypt() {
-                // Sanity-check the corresponding tiny-field answers (a ∈ {1,2}).
-                let a = locks[i].accepting_set[idx] + locks[i].offset;
-                assert!(a == F257::from(1u64) || a == F257::from(2u64));
-                if pt.len() != 32 {
-                    panic!("share[{i}] decrypted but wrong length {}", pt.len());
-                }
-                let mut rec = [0u8; 32];
-                rec.copy_from_slice(&pt);
-                recovered_all.push(ShamirShare {
-                    index: shares[i].index,
-                    value: rec,
-                });
-            }
+            let [pt0, pt1] = st.finish_decrypt_candidates()
+                .unwrap_or_else(|e| panic!("finish_decrypt_candidates[{i}]: {e}"));
+            assert_eq!(pt0.len(), 32, "share candidate 0 wrong length");
+            assert_eq!(pt1.len(), 32, "share candidate 1 wrong length");
+            let mut c0 = [0u8; 32];
+            let mut c1 = [0u8; 32];
+            c0.copy_from_slice(&pt0);
+            c1.copy_from_slice(&pt1);
+            candidates_per_lock.push((shares[i].index, [c0, c1]));
         }
-        assert!(
-            recovered_all.len() < shamir.shares,
-            "expected at least one AEAD failure after corrupting tails (got {} of {})",
-            recovered_all.len(),
-            shamir.shares
-        );
-        assert!(
-            recovered_all.len() >= shamir.threshold,
-            "expected >=T successful decryptions (got {} < {})",
-            recovered_all.len(),
-            shamir.threshold
-        );
 
-        // Reconstruct from any T recovered shares.
-        let got = reconstruct_secret_32(&shamir, &recovered_all[..shamir.threshold])
-            .expect("reconstruct_secret_32");
+        // Use any T=threshold locks for reconstruction.
+        // Each lock has 2 candidates → 2^T combinations, checked against secret_hash.
+        let subset = &candidates_per_lock[..shamir.threshold];
+        let got = crate::lockable_ringlwe::reconstruct_from_candidates(
+            subset,
+            secret_hash,
+            |selected| {
+                let shamir_shares: Vec<ShamirShare> = selected
+                    .iter()
+                    .map(|c| ShamirShare { index: c.index, value: c.value })
+                    .collect();
+                reconstruct_secret_32(&shamir, &shamir_shares).ok()
+            },
+        )
+        .expect("reconstruct_from_candidates should find the correct secret");
         assert_eq!(got, secret, "reconstructed secret mismatch");
+
+        // Print amplification security summary.
+        let amp = crate::lockable_ringlwe::AmplificationParams {
+            r: shamir.shares,
+            t: shamir.threshold,
+            ..Default::default()
+        };
+        amp.print_summary(1);
 
         maybe_print_rss("tiny_payload_shamir:after_prove_decap_stream");
         eprintln!(
@@ -6914,8 +6920,7 @@ mod tests {
         let armer_seed = [7u8; 32];
         let lock_j = 0u64;
         let ringlwe_params = RingLweParams {
-            binomial_k: 16,
-            noise_bound: 0,
+            noise_sigma: 0.0,
             ..RingLweParams::default()
         };
         let dummy_payload: [u8; 0] = [];

@@ -335,6 +335,7 @@ pub fn run_sp1_oneproof_we_gate_from_files(
     let lock_j = 0u64;
     let block_id = 0usize;
     let mut rep_id = 0u64;
+    // Deterministic by default; production should set σ>0 and enable reconciliation/rounding.
     let ringlwe_params = RingLweParams::default();
     // Deterministic RNG seed derived from the statement-binding lock coin seed.
     let mut rng = StdRng::from_seed(lock_coin_seed);
