@@ -153,7 +153,7 @@ where
 
     let (
         inst_pose,
-        asg_pose,
+        asg_pose_shape,
         _shorts,
         _u32s,
         _goldilocks,
@@ -203,7 +203,7 @@ where
     // - Poseidon absorb byte vars inside the tiny-gate instance
     let mut extra_eqs: Vec<(usize, usize)> = Vec::new();
     let mut parts: Vec<(FileBackedSparseDr1csInstance<F257>, Vec<F257>)> =
-        vec![(params_inst, params_asg), (inst_pose, asg_pose)];
+        vec![(params_inst, params_asg), (inst_pose, asg_pose_shape)];
 
     if public_inputs_elems > 0 {
         // IMPORTANT: The transcript trace includes **Fiat–Shamir re-absorbs** for each
@@ -8429,11 +8429,19 @@ mod tests {
             // manually delete large file-backed artifacts.
             use crate::fs_cleanup::fast_remove_dir_best_effort;
 
+            // If set, keep `/tmp/lfplus_tiny_gate` between runs to enable cache hits (skips Pass1).
+            // This is useful when iterating on unrelated code and you want stable runtime.
+            let keep_tiny_cache = std::env::var("LFP_KEEP_TINY_GATE_CACHE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+
             let out_dir = {
                 let mut p = std::env::temp_dir();
-            p.push("lfplus_tiny_gate");
-                // If a previous run crashed or was interrupted, ensure a clean slate.
-                fast_remove_dir_best_effort(&p);
+                p.push("lfplus_tiny_gate");
+                // If a previous run crashed or was interrupted, ensure a clean slate (unless caching).
+                if !keep_tiny_cache {
+                    fast_remove_dir_best_effort(&p);
+                }
                 std::fs::create_dir_all(&p).expect("create temp out_dir");
                 p
             };
@@ -8459,7 +8467,9 @@ mod tests {
             .expect("build_or_load tiny gate (inst+asg) from proof");
 
             shape.inst.check(&tiny_asg).expect("tiny gate dr1cs check");
-            fast_remove_dir_best_effort(&out_dir);
+            if !keep_tiny_cache {
+                fast_remove_dir_best_effort(&out_dir);
+            }
         };
 
         run_one("sha256->bits", &sp1_digest_bits);
