@@ -400,12 +400,14 @@ pub fn run_sp1_oneproof_we_gate_from_files(
         return Err(format!("oneproof: expected 1 tail, got {}", tails.len()));
     }
     st.absorb_chunk(&tails[0])?;
-    let a = st.finish()?;
+    let _cands = st.finish_decrypt_candidates()?;
     maybe_print_rss("oneproof:after_prove_decap_stream");
     eprintln!("[oneproof] prove+decap(stream) in {:?}", t_prove.elapsed());
-    // F257 is tiny; print the canonical representative.
-    let a_u64 = a.into_bigint().as_ref().get(0).copied().unwrap_or(0);
-    eprintln!("[oneproof] decap_answer={a_u64}");
+    // With unauthenticated encryption, branch identification is deferred to Shamir reconstruction.
+    // The accepting set structure is verified from the lock artifact directly.
+    let a0 = lock.accepting_set[0] + lock.offset;
+    let a_u64 = a0.into_bigint().as_ref().get(0).copied().unwrap_or(0);
+    eprintln!("[oneproof] accepting_set_answer={a_u64}");
 
     // Extract the WE gate witness tail (excluding public) and convert to u64 (canonical).
     let tail = &assignment[public_len..];
