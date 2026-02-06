@@ -1,0 +1,3116 @@
+LatticeFold+: Faster, Simpler, Shorter Lattice-Based Folding
+for Succinct Proof Systems
+Dan Boneh and Binyi Chen
+Stanford University
+August 9, 2025
+
+Abstract
+Folding is a technique for building efficient succinct proof systems. Many existing
+folding protocols rely on the discrete-log based Pedersen commitment scheme, and are
+therefore not post-quantum secure and require a large (256-bit) field. Recently, Boneh
+and Chen constructed LatticeFold, a folding protocol using lattice-based commitments
+which is plausibly post-quantum secure and can operate with small (64-bit) fields. For
+knowledge soundness, LatticeFold requires the prover to provide a range proof on all the
+input witnesses using bit-decomposition, and this slows down the prover. In this work
+we present LatticeFold+, a very different lattice-based folding protocol that improves
+on LatticeFold in every respect: the prover is significantly faster, the verification circuit
+is simpler, and the folding proofs are shorter. To do so we develop two novel lattice
+techniques. First, we develop a new purely algebraic range proof which is much more
+efficient than the one in LatticeFold, and may be of independent interest. We further
+shrink the proof using double commitments (commitments of commitments). Second,
+we show how to fold statements about double commitments using a new sumcheckbased transformation.
+
+1
+
+Contents
+1 Introduction
+1.1 Additional related work . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+
+3
+7
+
+2 Preliminaries
+2.1 Cyclotomic rings . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+2.2 Multilinear extensions and sumchecks over rings . . . . . . . . . . . . . . .
+2.3 Module-based Ajtai commitments . . . . . . . . . . . . . . . . . . . . . . . .
+2.4 Reduction of Knowledge . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+
+8
+8
+11
+13
+13
+
+3 Generalized Committed Linear Relations
+
+14
+
+4 A Toolbox of Reduction of Knowledge
+4.1 Linear commitments and double commitments . . . . . . . . . . . . . . . .
+4.2 Monomial set check . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+4.3 Range check . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+4.4 Commitment transformation . . . . . . . . . . . . . . . . . . . . . . . . . .
+
+15
+16
+17
+21
+25
+
+5 Folding Generalized Committed Linear Relations
+5.1 Folding . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+5.2 Decomposition . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+5.3 Efficiency estimate . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+
+36
+37
+40
+41
+
+6 Conclusion and future work
+
+43
+
+A Reducing R1CS to the general linear relation
+
+51
+
+B Supporting Small Moduli
+
+52
+
+2
+
+1
+
+Introduction
+
+In recent years succinct non-interactive arguments of knowledge (SNARKs) have found
+many real-world applications: scaling and bridging blockchains [Whi18; Xie+22], authenticating media [NT16; DB22; KHSS22], machine learning [CWSK24; YCBC24], verifiable
+delay functions [BBBF18], and many others. To avoid the high memory requirements of
+some SNARK proof systems, provers in practice break the task of constructing a proof
+into small steps and prove each step separately. This approach is called incrementally verifiable computation (IVC) [Val08] or proof carrying data (PCD) [CT10]. It also provides
+additional opportunities for parallelizing the prover [Ngu+24].
+The original IVC/PCD schemes were built using SNARK recursion [Val08; BCTV14],
+where the SNARK verifier is embedded in every computation step being proved. A more
+efficient approach, called accumulation or folding, was introduced in Halo [BGH19] and
+further developed in [BCMS20; Bün+21; BDFG21] and Nova [KST22]. Many elegant
+ideas have since further optimized and extended the folding paradigm [KS24b; BC23;
+EG23; BMNW24; Moh23; NBS23; FKNP24; KS24a; AS24].
+Folding is best explained using the language of reductions of knowledge [KP23] (see
+Section 2.4 for details). Let R1 and R2 be two instance-witness relations. A reduction
+of knowledge from R1 to R2 is a protocol Π between a prover and verifier. The verifier
+takes as input an instance x1 for R1 , interacts with the prover, and outputs an instance x2
+for R2 at the end of the protocol. The key requirement is that if the prover can present
+a witness w2 for x2 , then it is possible to extract from the prover a witnesses w1 for x1 .
+Hence, knowledge of a valid witness for x2 proves knowledge of a valid witness for x1 .
+A folding scheme is a reduction of knowledge from some product relation Racc × Rcomp
+to Racc . That is, the folding scheme can fold a pair of instances (xacc , xcomp ) into a single
+new instance x′acc of Racc . By repeatedly folding in this way, the prover can accumulate
+many steps of a computation expressed by Rcomp into a single instance of the accumulation
+relation Racc . Eventually, the prover proves knowledge of a witness for the final Racc
+instance, and this proves knowledge of a valid witness for every step of the computation.
+Alternatively, folding can take place along a d-ary tree, with d-to-1 foldings, as in [Ngu+24;
+RZ22]. The benefit of folding schemes is that now the statement being proved at every
+step only needs to ensure that folding was performed correctly at the previous step, which
+is far simpler than a full SNARK verifier. Folding is also much faster for the prover
+because folding two witnesses into one is primarily a random linear combination of the two
+witnesses.
+Folding schemes typically extend the input relation to include a short commitment to
+the witness. The commitment scheme is linearly homomorphic, so that the verifier can compute the folded instance as a a random linear combination of these input commitments1 .
+Often one uses Pedersen as the homomorphic commitment scheme. This poses three dif1
+
+The ARC folding scheme [BMNW24] is one example that does not use a linearly homomorphic commitment.
+
+3
+
+ficulties: first, the resulting schemes are unsound in a post-quantum setting; second, the
+Pedersen hash requires the prover to do a compute-intensive multiscalar multiplication over
+a large (256-bit) field; and third, the domain and range of the Pedersen hash are different
+groups, requiring arithmetic over two distinct fields to verify a folding proof. This can be
+expensive because arithmetic circuits natively support only one field.
+Lattice-based folding. Boneh and Chen [BC24] recently proposed a lattice-based folding scheme, called LatticeFold, where the Pedersen commitment is replaced with an Ajtai
+commitment over modules. This resolves all three difficulties mentioned in the previous
+paragraph2 . However, using Ajtai commitments in folding introduces significant challenges.
+The difficulty is that Ajtai commitments are binding only when the input vector is low
+norm. This is incompatible with the random linear combination approach used in folding.
+Repeatedly taking a random linear combination of witnesses quickly increases the norm
+of the accumulated witness to the point where Ajtai commitments are no longer binding.
+This breaks soundness of the resulting folding scheme.
+To address this issue, folding in LatticeFold is done in two primary steps. First, a norm
+reduction step decomposes each of the two input witnesses into d lower norm witnesses.
+Second, the resulting 2d instances are folded into a single low norm instance. This ensures
+that after repeated folding, the norm of the accumulated witness remains small. However,
+this by itself is insufficient. One must also exhibit an extractor that extracts from the prover
+low norm witnesses for the two input instances. LatticeFold ensures that the extracted
+witnesses are low norm by using a novel sumcheck-based range proof. Forcing the prover
+to output this range proof for the two input witnesses is sufficient to ensure that the
+extracted witnesses are valid and low norm. However, the range proof in LatticeFold uses
+bit decomposition and is therefore expensive to construct because it requires the prover to
+commit to many decomposed witnesses.
+Experiments by Nethermind [Net24] show that this additional complexity in folding
+using Ajtai commitments results in a LatticeFold prover that runs in approximately the
+same time as the Pedersen-based HyperNova folding prover [KS24b]. While LatticeFold
+has the benefit of post-quantum security, one would further expect that Ajtai-based folding
+would be faster than Pedersen-based folding.
+Our results. In this work we design a new lattice-based folding scheme called LatticeFold+ that greatly improves the performance of LatticeFold using a number of new latticering techniques.
+As in HyperNova, LatticeFold+ represents the computation relation Rcomp as either a
+rank-1 constraint system (R1CS), using quadratic constraints, or a customizable constraint
+system (CCS) [STW23] using higher degree constraints. The first step in LatticeFold+ is
+2
+
+Experiments by Nethermind [Net24] show that the Ajtai hash is about thirty times faster than a
+Pedersen hash for committing to ≈ 219 field elements.
+
+4
+
+a sumcheck-based linearization process that is a reduction of knowledge from an R1CS or
+CCS relation Rcomp to a general linear relation we call Rlin,B , as explained in Section 3.
+This step is similar to HyperNova’s linearization step, but adapted to operate over rings
+as was done in LatticeFold [BC24]. This linearization step shows that it suffices to design
+a folding scheme that folds L > 2 instances of the linear relation Rlin,B into two instances.
+An instance of Rlin,B is a triple (cm, r, v) where cm is an Ajtai commitment to a witness
+vector f ∈ Rqn , where the ℓ∞ norm of f satisfies ∥f ∥∞ < B (as defined in the next section).
+The elements r and v will be explained in Section 3. Here the witness f is an n-vector of
+elements in the ring Rq := Zq [X]/⟨X d + 1⟩ for some prime q and degree d > 1.
+The core of LatticeFold+ takes as input L > 2 instances of Rlin,B and folds them into
+two instances of Rlin,B . It does so in two steps. In the first step, it folds the given L
+instances of Rlin,B into one instance of Rlin,B 2 , namely an instance with a norm bound B 2
+on the witness. The new range proof in this step is purely algebraic — it does not require
+commitments to bit-decomposed vectors. The increase in norm from B to B 2 has to be
+corrected, and LatticeFold+ does this in the second step. It uses witness decomposition to
+reduce a linear instance with norm bound B 2 to two linear instances with norm bound B
+by splitting every scalar in the witness into its high and low order bits. This second step is
+approximately the same as decomposition in LatticeFold. The key new insights are in the
+first folding step, which we discuss next.
+A new range proof. To ensure that an extractor is able to extract L low norm witnesses
+from a folding prover, the prover must provide a range proof that all the input witnesses
+are low norm. We develop a new range proof, presented in Section 4.3, that avoids bit
+decomposition and is far more efficient than the range proof in LatticeFold. This range
+proof method may be of independent interest. The key idea is as follows. Say we want
+to prove that a committed vector f = (f1 , . . . , fn ) ∈ Znq satisfies fi ∈ (−d/2, d/2) for all
+i ∈ [n]. The prover will commit to a vector of ring elements m = (m1 , . . . , mn ) ∈ Rqn
+where each mi ∈ Rq is the monomial mi := X fi . We denote this commitment by com (m)
+and note that computing the Ajtai commitment to m is fast because it is a vector of
+monomials (see Remark 4.3). Next we show in Lemma 2.2 that if mi is a monomial and
+mi and fi satisfy a simple algebraic relation then fi ∈ (−d/2, d/2). Hence, our range
+proof needs to (i) prove that com (m) is a commitment to a vector of monomials, which
+we do in Section 4.2, and (ii) prove that m and f satisfy a certain algebraic relation, which
+we do in Section 4.3. Both steps are presented as reductions of knowledge that reduce
+these checks to checking a simple evaluation relation. The resulting range proof requires
+no commitments to bit-decomposed vectors, and is significantly faster than the LatticeFold
+range proof.
+Double commitments. When applying this range proof to a vector of ring elements
+f ∈ Rqn , we could repeat the range proof above d times: once for the vector of all constant
+
+5
+
+terms in f , once for the vector of all linear terms in f , and so on. This would require the
+prover to commit to d vectors m0 , . . . , md−1 ∈ Rqn which would result in a large transcript
+of d commitments c := (com (m0 ) , . . . , com (md−1 )) ∈ Rqκ×d that must be sent to the
+verifier. Instead, we introduce in Section 4.1 the concept of a double commitment, where
+the prover sends to the verifier a commitment to the vector of commitments c. This vector
+c is not low norm, so we must first decompose it to reduce its norm and then commit to
+the decomposition using an Ajtai commitment. We use dcom (M) to denote this double
+commitment to the matrix M := [m0 , . . . , md−1 ] ∈ Rqn×d . Note that dcom (M) ∈ Rqκ is
+short as required. These double commitments are crucial for making our folding proofs
+shorter and simpler to verify compared to LatticeFold. In Section 4.3 we present a range
+proof that uses double commitments to prove that a vector f ∈ Rqn has low ℓ∞ norm.
+Commitment transformation. Double commitments are not linearly homomorphic,
+and as a result statements that use double commitments are hard to fold using random
+linear combinations. In Section 4.4 we develop a technique that transforms such statements
+to ones involving only linear commitments to smaller witnesses. We use sumchecks to ensure consistency between the double commitment of a witness M and a linear commitment
+to a transformed version of M. Again, this technique may be of independent interest.
+Supporting small field arithmetic. Following Neo’s approach [NS25], LatticeFold+
+naturally supports small prime moduli, which we reinterpret using the tensor-of-rings
+d/e
+framework in Appendix B. The folding challenge set is of size q e if Rq ∼
+= Fqe , and the
+sumchecks are running over an extension field Fqt . We can achieve the desired security by
+setting e and t appropriately. For example, if q is a 64-bit prime, to achieve 128-bit security,
+all the sumchecks will be over the extension field Fq2 . If d ≫ 2, a sumcheck over Fq2 for a
+size-n statement is more efficient than computing a module-based Ajtai commitment to a
+vector of size n over Rq . Hence, the prover cost for sumcheck is insignificant. We refer to
+the “Challenge sets” paragraph in Section 4 and Appendix B for a detailed discussion.
+Evaluation. LatticeFold+ improves over LatticeFold in every respect: the folding prover
+is faster, the folding verifier is simpler, and the folding proof is shorter. We give a detailed evaluation analysis in Section 5.3. Here we present a brief summary when folding L
+witnesses each of dimension n and norm less than B:
+• Prover complexity: In LatticeFold, the prover’s complexity is dominated by a degree4 sumcheck over Rq of size n and the computation of L log2 (B) commitments to bitdecomposed vectors. LatticeFold+ eliminates all these commitments and is consequently
+Ω(log(B))-times faster. Concretely, going by Nethermind’s LatticeFold benchmark [Net24],
+we estimate that the LatticeFold+ prover is five times faster than the LatticeFold prover.
+• Verifier circuit complexity: The verifier circuit size is dominated by hashing needed for
+
+6
+
+the Fiat-Shamir transform. In LatticeFold, all the L log2 (B) decomposed commitments
+must be hashed. LatticeFold+ eliminates all these commitments thereby shrinking the
+size of the verification circuit.
+• Proof size: The LatticeFold proof size is Oλ (κd log B + d log n) bits. In LatticeFold+ the
+proof size is only Oλ (κd + log n) bits. Since a folding circuit needs to compute a FiatShamir hash of its input, this shorter proof leads to a simpler circuit when compared to
+LatticeFold. We also emphasize that, in folding-based IVC schemes, folding proofs serve
+as recursive witnesses and are not part of the final output proof.
+Finally, since the prover running time in LatticeFold is comparable to HyperNova [Net24],
+we expect the prover time in LatticeFold+ to be significantly faster than HyperNova. Hence,
+LatticeFold+ provides both a fast prover and plausible post-quantum security.
+
+1.1
+
+Additional related work
+
+Several post-quantum monolithic SNARKs (i.e., not using folding) are built from hashbased Merkle commitments: Stark [BBHR18b], Ligero [AHIV17], Aurora [Ben+19], Brakedown [Gol+23], BaseFold [ZCF24], Blaze [Bre+24], and Fractal [COS20]. Their proof
+sizes scale sublinearly with the witness size. In practice they require a significant amount
+of memory when proving a large statement. Several elegant post-quantum lattice-based
+proof systems also offer sublinear proof size [Bau+18; BLNS20; ACK21; Alb+22; BCS23],
+however the resulting proofs are larger than the hash-based schemes. One exception is
+LaBRADOR [BS23] that produces relatively short proofs, but has a linear time verifier. We
+note that LaBRADOR also uses commitments to commitments to shrink the proof size. A
+polynomial commitment scheme derived from LaBRADOR, called Greyhound [NS24], has a
+square root time verifier. Other lattice-based proof systems, such as [ENS20; LNP22], perform well for small statements, but their proof size is linear in the size of the witness. Cini
+et al. [CMNW24] recently presented a lattice-based polynomial commitment scheme (PCS)
+from Bulletproof/FRI-like techniques [BBHR18a; Bün+18]. Their approach achieves better control over witness norm/slack blowup than previous works. However, their scheme
+incurs norm blowup/slack at each step, limiting it to supporting only a logarithmic number
+of folding steps.
+Following LatticeFold [BC24], which uses module-based Ajtai commitments and the ℓ∞ norm, Fenzi et al. proposed Lova [FKNP24] which operates similarly, but using integerbased Ajtai commitments and the ℓ2 -norm. Lova [FKNP24] relies on the integer-based
+SIS assumption, but has worse concrete efficiency. Very recently, Klooß et al. [KLNO24]
+suggest another approach to ℓ2 -norm range proofs that can apply to LatticeFold. Compared to LatticeFold+, their approach requires the use of subtractive sets which are only of
+polynomial size. To boost soundness, they rely on parallel repetition of folding challenges,
+which impacts efficiency.
+Concurrent to LatticeFold+, Neo [NS25] addresses an orthogonal problem and suggests
+
+7
+
+a new approach for embedding small field elements into the cyclotomic polynomial ring
+used in LatticeFold. This technique is naturally compatible with LatticeFold+.
+
+2
+
+Preliminaries
+
+Notation. λ ∈ N is the security parameter. For l, r ∈ Z, l < r, we denote by (l, r) the
+set {l + 1, l + 2, . . . , r − 1} and [l, r) the set {l, l + 1, . . . , r − 1}, and we define [n] := [0, n).
+For a set S, we denote by P (S) the power set of S that consists of all the subsets of S.
+If S supports element subtraction, we denote by S − S the set of differences between any
+two distinct elements in S. A function f (λ) is poly(λ) if there exists a c ∈ N such that
+f (λ) = O(λc ). If f (λ) = o(λ−c ) for all c ∈ N, we say f (λ) is in negl(λ) and is negligible.
+A probability that is 1 − negl(λ) is overwhelming.
+By default, a vector is a column vector and a ring is always commutative. For a vector
+f of length n, we use fi or f [i] (0 ≤ i < n) to denote its ith element. For two vectors f , g
+of the same length we let ⟨f , g⟩ denote their inner product.
+Let R̄ be an arbitrary ring. Given column vectors u1 , . . . , uk ∈ R̄n , we use [u1 , . . . , uk ] ∈
+n×k
+R̄
+to denote horizontal concatenation and (u1 , . . . , uk ) ∈ R̄nk to denote vertical concatenation. Concatenations of row vectors are similarly defined. For a matrix M ∈ R̄n×m ,
+{Mi,∗ ∈ R̄m }i∈[n] and {M∗,j ∈ R̄n }j∈[m] denote the rows and columns of M, respectively.
+We denote by flat(M) := (M0,∗ , . . . , Mn−1,∗ ) ∈ R̄nm the vertical concatenation of its rows.
+R̄[X1 , . . . , Xk ] denotes the set of k-variate polynomials over R̄, and we use R̄≤d [X1 , . . . , Xk ]
+to denote the set of polynomials with the degree of each variable at most d.
+An indexed relation is a set of triples (i, x, w) where the index i is fixed at the setup
+phase, x is the online instance and w is the witness. In what follows, we omit the index i
+when it is clear in the context.
+
+2.1
+
+Cyclotomic rings
+
+Let d ∈ N be a power of two. We denote by R := Z[X]/⟨X d + 1⟩ the power-of-two
+cyclotomic ring of dimension d. Let q > 2 be a prime and denote by Rq := R/qR =
+Zq [X]/⟨X d + 1⟩ where we represent Zq := {−⌊q/2⌋, . . . , ⌊q/2⌋}. If q ≡ 1 + 2e (mod 4e) for
+some e | d, it is well-known that Rq ∼
+= Feqd/e via the Number Theoretic Transform (NTT).
+P
+For f = i∈[d] fi X i ∈ Rq , we use cf(f ) := (f0 , . . . , fd−1 ) ∈ Zdq to denote the coefficient
+vector of f , and ct(f ) := f0 is the constant term of f . For a vector f ∈ Rqn , we denote
+by cf(f ) := (cf(f0 )⊤ , . . . , cf(fn−1 )⊤ ) ∈ Zn×d
+the concatenation of the transposed coefficient
+q
+vectors, and ct(f ) = (ct(f0 ), . . . , ct(fn−1 )) ∈ Znq is the first column of cf(f ).
+Monomial sets.
+
+Define the Zq [X]-monomial set
+M′ := {0, 1, X, X 2 , X 3 , . . . } ⊆ Zq [X] .
+
+8
+
+(1)
+
+We will need the following lemma.
+Lemma 2.1. Let q > 2 be a prime. For every a ∈ Zq [X] we have that a(X 2 ) = a(X)2 if
+and only if a ∈ M′ .
+Proof. When a ∈ M′ then indeed a(X 2P
+) = a(X)2 . Conversely, we prove that a(X 2 ) =
+2
+′
+a(X) implies that a ∈ M . Let a(X) = ni=1 ai X di for some dn > dn−1 > . . . > d1 ≥ 0. If
+n = 1 and a(X 2 ) = a(X)2 then a1 X 2d1 = a21 X 2d1 , which implies that a21 = a1 . Therefore
+a1 ∈ {0, 1} and either way a ∈ M′ , as required. Next, suppose towards a contradiction that
+a(X 2 ) = a(X)2 , but n > 1 and all a1 , . . . , an ∈ Zq are non-zero. The highest degree term
+in a(X)2 has degree 2dn . The second highest degree term in a(X)2 has degree is dn + dn−1
+and its coefficient is 2an an−1 . Since 2dn > dn + dn−1 > 2dn−1 , the polynomial a(X 2 ) has
+no term of degree dn + dn−1 . Therefore, because a(X 2 ) = a(X)2 , we can conclude that
+2an an−1 = 0. But since q > 2 this implies that one of an or an−1 must be zero, which
+contradicts the assumption that a1 , . . . , an ∈ Zq are non-zero.
+Define another monomial set
+n
+o
+M := 0, 1, X, . . . , X d−1 ⊆ M′ .
+
+(2)
+
+In what follows, we abuse the
+ notation a bit and sometimes also write M ⊆ Rq to denote
+the natural embedding of 0, 1, X, . . . , X d−1 ⊆ Zq [X] to the ring Rq , and a statement
+that “a is in M” is well-defined for a ∈ Rq .
+Remark 2.1. Lemma 2.1 does not hold if Zq [X] is replaced by Rq .
+Zq [X]/⟨X 4 + 1⟩ with q ≡ 1 (mod 4), define
+
+For example, in
+
+a(X) := X 3 /2 + (i/2)X 2 + (i/2)X + (1/2) ∈ Rq
+where i ∈ Zq satisfies i2 = −1. Then a(X) satisfies a(X)2 = a(X 2 ), but a is not in M.
+For a ∈ (−d, d) ⊆ Zq , we denote by sgn(a) ∈ {−1, 0, 1} the sign of a and sgn(0) := 0.
+Define exp(a) ∈ Rq as exp(a) := sgn(a)X a . Note that exp(a) is in M. E.g., if a < 0, then
+exp(a) = −X a = −(−X a+d ) = X a+d ∈ M. Similarly, we define set EXP(a) ⊆ M to be
+(
+{exp(a)}
+if a ̸= 0
+EXP(a) :=
+(3)
+d/2
+{0, 1, X } if a = 0
+For a matrix M ∈ (−d, d)m×n , exp(M) ∈ Mm×n denotes the matrix that replaces each
+entry Mi,j with exp(Mi,j ), and EXP(M) : [m] × [n] → P (M) denotes the product of sets
+that replaces each entry Mi,j with EXP(Mi,j ).
+We will need the following lemma.
+
+9
+
+P
+Lemma 2.2. Let d′ := d/2 and ψ := i∈[1,d′ ) i · (X −i + X i ) ∈ Rq . For every a ∈ Zq , if
+a ∈ (−d′ , d′ ), then for all b ∈ EXP(a) ⊆ M, we have ct(b · ψ) = a. Conversely, if there
+exists b ∈ M such that ct(b · ψ) = a, then a ∈ (−d′ , d′ ) and b ∈ EXP(a).
+Proof. If a ∈ (−d′ , d′ ), then either a = 0 and ct(b · ψ) = 0 for all b ∈ EXP(0), or a ̸= 0, and
+the only element b := exp(a) in EXP(a) satisfies that
+
+
+X
+i · (X −i + X i ) = a .
+ct(b · ψ) = ct sgn(a)X a ·
+i∈[1,d′ )
+
+Conversely, suppose ct(b∗ · ψ) = a for some b∗ ∈ M, we show that a ∈ (−d′ , d′ ). If
+b∗ = 0, then a = 0 ∈ (−d′ , d′ ). Otherwise, b∗ ·ψ rotates and flips the signs of the coefficients
+of ψ, and the constant term ct(b∗ · ψ) stays in (−d′ , d′ ). Therefore, a ∈ (−d′ , d′ ) as required.
+Finally, given that b∗ ∈ M and ct(b∗ ·ψ) = a for a ∈ (−d′ , d′ ), by inspection, b∗ is in EXP(a)
+and the claim holds.
+Remark 2.2 (Lookup arguments). While we use Lemma 2.2 for a range proof, namely
+proving membership in the set (−d′ , d′ ) ⊂ Zq , the lemma can be generalized by replacing
+(−d′ , d′ ) with any table of values T ⊆ Zq of size at most d, where 0 ∈ T . Simply change
+the definition of ψ to encode the values in T . Then our range proof gives a table lookup
+argument for T . Specifically, given a table T = (Ti )i∈[d] where T0 = 0, one can set
+X
+X
+ψT :=
+(−Ti ) · X i +
+Ti+d′ X −i .
+i∈[1,d′ ]
+
+i∈[1,d′ )
+
+P
+Norms. Given f = i∈[d] fi X i ∈ R, the ℓ∞ -norm of f is defined as ∥f ∥∞ := maxd−1
+i=0 (|fi |).
+n×m
+For a matrix F ∈ R
+with entries {Fi,j }i∈[n],j∈[m] , its ℓ∞ -norm is defined as ∥F∥∞ :=
+maxi∈[n],j∈[m] {∥Fi,j ∥∞ }. We similarly define the ℓ∞ -norms for Rq -elements by lifting elements in Rq to R via the natural embedding.
+For an element a ∈ R, we define its operator norm as
+∥a · y∥∞
+.
+y∈R ∥y∥∞
+
+∥a∥op := sup
+
+(4)
+
+For a finite set S ⊆ R, the operator norm ∥S∥op is defined as ∥S∥op := maxa∈S ∥a∥op .
+Similarly, we can define operator norms for sets over Rq by lifting the elements to R.
+When we write a · b for a ∈ Rq and b ∈ R, we meant the product over R between b and the
+embedding of a to R. We will use the following useful facts.
+Lemma 2.3. For every a ∈ M and b ∈ R, we have ∥a · b∥∞ ≤ ∥b∥∞ .
+Proof. If a ∈ M, then either a = 0 and the claim holds; or a · b rotates the coefficients of
+b and flips the sign of some coefficients of b. Hence the ℓ∞ -norm won’t change.
+10
+
+Lemma 2.4 (Corollary 1.2 of [LS18]). Let d, e ∈ N be power-of-twos and e | d, and let
+1/e
+q ≡ 1 + 2e (mod 4e) be a prime. Every non-zero y ∈ Rq with ∥y∥∞ < q√e is invertible.
+Strong sampling sets. A strong sampling set S ⊆ Rq satisfies that the difference
+of any two distinct elements in S is invertible. E.g., if q is a prime, then Zq ⊆ Rq is a
+strong sampling set as the difference of any two distinct elements in Zq is invertible in
+Rq . By Lemma 2.4, the set of Rq -elements with small coefficients is strongly samplable,
+because the differences of small coefficients are still small and thus invertible. Moreover,
+such a set has small operator norm:
+Lemma 2.5 (Prop. 2 of [AL21]). For all u ∈ R, ∥u∥op ≤ d · ∥u∥∞ .
+Gadget matrix decomposition. Let b > 1 and b̂ = bk for some k ∈ N. Denote by
+gb,k = (1, b, . . . , bk−1 ) ∈ Zk . Given a matrix M ∈ Rn×m where ∥M∥∞ < b̂, we can
+deterministically decompose3 M into a matrix M′ ∈ Rn×mk such that ∥M′ ∥∞ < b and
+M = M′ Gb,k , where Gb,k ∈ Zmk×m is the gadget matrix Gb,k := Im ⊗ gb,k . We denote by
+n×m → Rn×mk the deterministic function that maps M to G−1 (M) = M′ , that is,
+G−1
+b,k
+b,k : R
+−1 when m, b, k are all clear in the context.
+(M)G
+=
+M.
+We
+simply
+write
+G
+and
+G
+G−1
+b,k
+b,k
+
+2.2
+
+Multilinear extensions and sumchecks over rings
+
+P
+For a binary vector a ∈ {0, 1}k , denote by [a]k := i∈[k] ai 2i ∈ [2k ]; for integer b ∈ [2k ],
+denote by ⟨b⟩k ∈ {0, 1}k the binary representation of b. We write ⟨b⟩ in short when there
+is no ambiguity in context. We review the notion of multilinear extensions over rings.
+Definition 2.1 (Multilinear Extensions over Rings). Let R̄ be a ring with zero 0 and
+identity 1. The multilinear extension fe ∈ R̄≤1 [X1 , . . . , Xk ] of a function f : {0, 1}k → R̄ is
+X
+f (b) · eq(b, x)
+fe(x) :=
+b∈{0,1}k
+
+where eq(b, x) :=
+
+Q
+
+
+
+
+
+i∈[k] (1 − bi )(1 − xi ) + bi xi .
+
+N
+k
+For r ∈ R̄k we define tensor(r) := i∈[k] (1 − ri , ri ) ∈ R̄2 as the tensor product of r. More
+generally, we can define tensor product
+Let M be an R̄-module.
+N over “R̄-vector spaces”.
+k
+For m ∈ Mk , we define tensor(m) := i∈[k] (1 − mi , mi ) ∈ M2 . E.g., if M = R̄ × R̄ and
+m = (r(0) , r(1) ) ∈ Mk where r(0) , r(1) ∈ R̄k , then tensor(m) = (tensor(r(0) ), tensor(r(1) )) can
+be understood as a pair of tensor products of r(0) , r(1) ∈ R̄k , respectively.
+3
+For every entry x ∈ (−b̂, b̂), we first compute the base-b decomposition (x0 , . . . , xk−1 ) of |x|, if x < 0,
+we further flip the sign of xi for all i ∈ [k].
+
+11
+
+Remark 2.3. For a function f : {0, 1}k → R̄ we define its table as
+
+k
+f := f (⟨0⟩k ), f (⟨1⟩k ), . . . , f (⟨2k − 1⟩k ) ∈ R̄2 .
+Observe that the evaluation of fe at the point r ∈ R̄k is exactly fe(r) = ⟨f , tensor(r)⟩. More
+generally, for a point m ∈ (R̄ℓ )k where ℓ ∈ N, we define fe(m) := ⟨f , tensor(m)⟩ ∈ R̄ℓ .
+E.g., if ℓ = 2, fe(m) denotes the evaluations of f at a pair of points m = (r(0) , r(1) ) where
+r(0) , r(1) ∈ R̄k .
+Lemma 2.6 (Generalized Schwartz-Zippel [BCPS18]). For a nonzero polynomial f ∈
+dk
+r k [f (r) = 0] ≤
+R̄≤d [X1 , . . . , Xk ] and a strong sampling set C, we have Prr←
+C
+|C| .
+As noted by [CCKP19], we can do sumcheck over rings.
+Lemma 2.7 (Generalized Sum-Check [CCKP19]). For a polynomial f ∈ R̄≤ℓ [X1 , . . . , Xk ]
+with individual degree at most ℓ, a strong sampling set C ⊆ R̄, and a value s ∈ R̄, there is
+a public-coin interactive protocol that reduces the checking of
+?
+
+s=
+
+X
+
+f (b)
+
+b∈{0,1}k
+?
+r
+to the checking of an evaluation claim fe(r) = v for some r ←
+C k and v ∈ R̄. The protocol
+4
+k
+is perfectly complete, has prover time Õ(2 ℓ), verifier time and proof size O(kℓ), and
+kℓ
+soundness error |C|
+.
+
+Remark 2.4 (Boosting soundness). The soundness error kℓ/|C| can be decreased to (kℓ/|C|)r
+with r > 1 parallel repetitions. E.g., for r = 2, set MC := C × C, we can understand the
+2-way parallel execution as a sumcheck with challenge set MC .
+Remark 2.5 (Batching multiple claims). As noted in [BCS21, Sect. 2.1] and in Hyperplonk [CBBZ23], when checking s > 1 sumcheck claims over the same domain, we can
+batch them into a single sumcheck over a larger domain, with no additional randomness
+needed outside the sumcheck itself. For example, we can view d sumcheck claims over Zq
+as a single sumcheck claim over Rq = Zq [X]/⟨X d + 1⟩. We can also view s > 1 sumcheck
+claims over Rq as a single sumcheck claim over Rq [Y ]/⟨Y s + 1⟩.
+Remark 2.6 (Compressing multiple claims to one). Using randomness, we can compress
+multiple sumcheck claims into one. Given k sumcheck claims (over a field F) w.r.t. polynomials
+g1 , . . . , gk respectively, we can reduce the claims to a single sumcheck claim w.r.t.
+Pk
+r
+i−1 , where r ←
+F is a random challenge. This introduces an additive soundness
+i=1 gi · r
+error of k/|F|. When |F| is small, to boost soundness, we can lift the polynomials to a
+larger extension field F′ of F and use a random challenge r ∈ F′ instead.
+4
+
+f needs to be a sum of product of multilinear polynomials to achieve prover time Õ(2k ℓ).
+
+12
+
+2.3
+
+Module-based Ajtai commitments
+
+We recall the Module Short Integer Solution (MSIS) assumption.
+Definition 2.2 (Module SIS with ℓ∞ -Norms [LS15; PR06; LM06; ACK21]). Let q = q(λ),
+κ = κ(λ), m = m(λ) and βSIS = βSIS (λ). The module SIS assumption MSIS∞
+q,κ,m,βSIS holds
+if for all expected polynomial-time adversary A,
+
+
+r
+A←
+Rqκ×m
+Pr (Ax = 0 mod q) ∧ 0 < ∥x∥∞ < βSIS
+= negl(λ) .
+x ∈ Rm ← A(A)
+Looking ahead, to argue knowledge soundness of the folding schemes, we need the
+commitments to satisfy a relaxed binding property defined below.
+Definition 2.3 (Relaxed Binding Commitment [ALS20; ACK21; Ajt96; PR06; LM06]).
+Fix q = q(λ),κ = κ(λ), m = m(λ), bound b ∈ N and a set S ⊆ Rq∗ with invertible elements.
+r
+We say that a randomly sampled linear function A ←
+Rqκ×m is (b, S)-relaxed binding if for
+all expected polynomial-time adversary A,
+
+
+0 < ∥z1 ∥∞ , ∥z2 ∥∞ < b ∧ s1 , s2 ∈ S∧
+r
+κ×m
+A ← Rq
+−1
+ = negl(λ) .
+Az1 s−1
+Pr 
+1 = Az2 s2 ∧
+(z
+,
+z
+∈
+Rqm , s1 , s2 ) ← A(A)
+1
+2
+−1
+−1
+z1 s1 ̸= z2 s2
+It is clear that if the (b, S)-relaxed binding property doesn’t hold, then we can find
+x := s2 z1 − s1 z2 ̸= 0 ∈ Rm such that Ax = 0 mod q. Here s2 z1 − s1 z2 is computed over
+R by first lifting s1 , s2 , z1 , z2 to R. Moreover, ∥x∥∞ < B := 2b∥S∥op , thus we can reduce
+the (b, S)-relaxed binding property to the MSIS assumption MSIS∞
+q,κ,m,B .
+
+2.4
+
+Reduction of Knowledge
+
+We review the notion of reduction of knowledge (RoK) from [KP23]. Informally, it converts
+the checking of a statement in relation R1 to that of a reduced statement in R2 . Note that
+it also captures the notion of folding schemes.
+Definition 2.4 (Reduction of Knowledge [KP23]). Let R1 , R2 be indexed relations. A
+reduction of knowledge Π from relation R1 to R2 consists of the following PPT algorithms:
+• G(1λ ) → i: on input security parameter λ output index i.
+• P(i, x1 , w1 ) → (x2 , w2 ): take index i, a statement (x1 , w1 ) ∈ R1 , interacts with the
+verifier, and output a statement (x2 , w2 ) such that (i, x2 , w2 ) ∈ R2 .
+• V(i, x1 ) → x2 : take index i, an instance x1 for R1 , interacts with the prover, and
+output an instance x2 for relation R2 . V outputs ⊥ if rejects early.
+
+13
+
+For brevity, we denote by ⟨P(w1 ), V⟩ [i, x1 ] → (x2 , w2 ) the interaction between P and V with
+common input (i, x1 ), and assume without loss of generality that (i) the reduced instances
+output by the prover and verifier are the same, (ii) ⊥ ∈
+/ L(R2 ) by default.
+A reduction of knowledge with the above syntax satisfy the properties below.
+Definition 2.5 (Perfect Completeness). For every PPT adversary A,
+
+
+i ← G(1λ )
+(i, x1 , w1 ) ∈
+/ R1 ∨
+ = 1.
+(x1 , w1 ) ← A(i)
+Pr 
+(i, x2 , w2 ) ∈ R2
+(x2 , w2 ) ← ⟨P(w1 ), V⟩ [i, x1 ]
+Definition 2.6 (Knowledge Soundness). There exists a knowledge-error function κ(·) and
+an expected polynomial time extractor Ext such that for all expected polynomial time adversaries (A, P∗ ) that can output (i, x2 , w2 ) ∈ R2 with non-negligible probability after the
+interaction with V, we have that given i ← G(1λ ), (x1 , st) ← A(i),
+h
+i
+∗
+Pr [(i, ⟨P∗ (st), V⟩ [i, x1 ]) ∈ R2 ] − Pr (i, x1 , ExtP (i, x1 , st)) ∈ R1 ≤ κ(λ) .
+Definition 2.7 (Public reducibility.). There is a deterministic polynomial time algorithm
+f such that for all PPT adversary A and expected polynomial time adversary P∗ :
+
+
+i ← G(1λ )
+ = 1.
+(x1 , st) ← A(i)
+Pr  f (i, x1 , tr) = x2
+∗
+(tr, x2 , w2 ) ← ⟨P (st), V⟩ [i, x1 ]
+Here tr denotes the transcript of the interaction ⟨P∗ (st), V⟩ [i, x1 ].
+We recall the knowledge composition theorem from [KP23].
+Theorem 2.1 (Sequential Composition, Thm. 5 [KP23]). Let R1 , R2 , R3 be indexed
+relations. Let Π1 (and Π2 ) be reduction of knowledge from R1 to R2 (and from R2 to R3 ),
+respectively. Then Π2 ◦ Π1 is a reduction of knowledge from R1 to R3 .
+
+3
+
+Generalized Committed Linear Relations
+
+Our goal is to build a folding scheme for R1CS relations — relations expressed as a
+set of quadratic constraints — and more generally, for customizable constraint systems
+(CCS) [STW23] that are expressed as a set of constraints of higher degree. LatticeFold [BC24, Sec. 4] gives a reduction of knowledge from CCS over rings to a linear relation over rings. This reduction of knowledge is inspired by a technique used over fields
+in HyperNova [KS24b].
+Here we define a general linear relation over rings that is the target of this reduction of
+knowledge. The relation uses a commitment scheme com (·) : Rqn → Rqκ for vectors f ∈ Rqn
+where ∥f ∥∞ < B, for some norm bound B. Usually, this is simply the Ajtai commitment
+scheme from Section 2.3. The commitment to f is denoted by cm = com (f ).
+14
+
+Definition 3.1. Let q > 2 be a prime, n, κ, nlin ∈ N, and let com (·) : Rqn → Rqκ be
+a commitment scheme. A generalized committed linear relation parameterized by
+B ∈ N, denoted Rlin,B , is a set of triples (i, x, w) where
+
+i = com (·) , (M(i) ∈ Rqn×n )i∈[nlin ] ,
+
+n
+x = (cmf , r ∈ Mlog
+, v ∈ Mnq lin ),
+C
+
+w = f ∈ Rqn .
+
+Here MC := C × C where C is a strong sampling set5 , and Mq := Rq × Rq . A triple (i, x, w)
+is in the relation Rlin,B if
+
+
+(∥f ∥∞ < B) ∧ (cmf = com (f )) ∧ ∀i ∈ [nlin ] : ⟨M(i) · f , tensor(r)⟩ = vi .
+(5)
+In words, an instance (cm, r, v) is in the language of the relation Rlin,B if cm is a
+commitment to a low-norm vector f ∈ Rqn , and for all i ∈ [nlin ], the multilinear extension
+n
+.
+of the vector M(i) f ∈ Rqn evaluates to the pair vi ∈ Mq at the pair of points r ∈ Mlog
+C
+In Section A we present a reduction of knowledge from R1CS to Rlin,B where nlin = 4.
+This protocol shows that a folding scheme for Rlin,B is sufficient for folding R1CS relations.
+At the heart of the protocol is a sumcheck to reduce the quadratic R1CS relation to four
+multilinear evaluation of degree 1, which is an instance of Rlin,B . When the R1CS relation is
+defined by matrices A, B, C ∈ Rqn×m , the derived matrices M(1) , M(2) , M(3) , M(4) ∈ Rqn×n
+in Rlin,B are
+M(1) := In ,
+
+,
+M(2) := A · G⊤
+B,ℓ̂
+
+,
+M(3) := B · G⊤
+B,ℓ̂
+
+M(4) := C · G⊤
+B,ℓ̂
+
+ℓ̂×m = Zn×m is the gadget matrix from Section 2.1. A
+where ℓ̂ := ⌈logB (q)⌉ and GB,ℓ̂ ∈ Zm
+q
+q
+similar reduction of knowledge applies to CCS with higher degree constraints.
+
+4
+
+A Toolbox of Reduction of Knowledge
+
+In this section, we introduce several reduction of knowledge protocols, which serve as
+the building blocks of our folding scheme for general linear relations. In Section 4.1, we
+introduce double commitments, which commits matrices in Rqn×m to short vectors in Rqκ .
+Section 4.2 introduces Πmon , an RoK that checks if every entry of a committed matrix
+belongs to the monomial set from (2). In Section 4.3, we leverage Πmon to construct a
+range-check protocol Πrgchk for committed Rq -vectors. In Section 4.4, using Πrgchk , we
+present an RoK Πcm which transforms a committed relation associated with a double
+commitment, into a simpler relation associated with regular Ajtai commitments.
+Recall that the power-of-two d ∈ N is the dimension of the ring Rq , and d′ := d/2.
+Define ℓ := ⌈logd′ (q)⌉. We will work over two types of challenge sets.
+5
+
+Or more generally, a product of strong sampling sets.
+
+15
+
+Challenge sets. A folding challenge set S̄ ⊆ Rq is a strong sampling set with small
+operator norm. It is used to fold multiple witness vectors into a single low-norm vector.
+A sumcheck challenge set C is used to sample challenges for sumcheck protocols. For
+simplicity, we assume that |S̄| = |C| ≥ 2λ . In particular, when q is a 128-bit prime, we
+set C := Zq . More generally, for a smaller modulus q, we set C as a Zq -vector space that
+is large enough. E.g., if q is 64-bit, we can set C := Fq2 , which is a Zq -vector space of
+dimension 2. To prove a sumcheck claim over Rq (or Zq ), we run a sumcheck protocol
+over the challenge space C, which can be understood as two parallel sumcheck executions
+over the challenge space Zq . For notation convenience, in what follows, we assume q is
+large enough and C = Zq , but all protocols easily generalize to smaller moduli as specified
+in Appendix B. Finally, we define the Rq -module Mq := Rq × Rq and set MC := C × C.
+They are useful when we want to enforce even smaller sumcheck soundness error.
+
+4.1
+
+Linear commitments and double commitments
+
+General linear commitments. For a ∈ Rqn and M ∈ Rqn×m , we denote by com (a) ∈ Rqκ
+and com (M) ∈ Rqκ×m the “general linear commitments” to a and M respectively. In our
+paper, com (a) is computed as Aa given the SIS matrix A ∈ Rqκ×n . Similarly, we set
+com (M) := A × M.
+Fix b ∈ N and set S ⊆ Rq∗ , we say that a ∈ Rqn is a (b, S)-valid opening of cma , if
+′
+cma = com (a) and a = as for some a′ ∈ Rqn , s ∈ S such that ∥a′ ∥∞ < b. We simply
+say that a is a valid opening if (b, S) is clear in context. Similarly, M ∈ Rqn×m is a valid
+opening of CM ∈ Rqκ×m if for all i ∈ [m], the i-th column of M is a valid opening of the
+i-th column of CM . We define the commitment opening relation (for Rq -vectors)
+
+Ropen := (x = cmf ∈ Rqκ , w = f ∈ Rqn ) : f is valid opening of cmf .
+(6)
+A general linear commitment is (b, S)-binding if it is infeasible to find two different (b, S)valid openings a, a′ to the same commitment cm. In our work, binding is implied by
+the (b, S = S̄ − S̄)-relaxed binding property (Definition 2.3). We simply say that the
+commitment is binding if (b, S) is clear in context.
+Double commitments. For a vector m ∈ Rqn , the double commitment of m is defined
+as dcom (m) := com (m) ∈ Rqκ . For a matrix M ∈ Rqn×m where m > 1, we compute
+the linear commitment com (M) ∈ Rqκ×m , and decompose com (M) to a low norm vector
+τ ∈ (−d′ , d′ )n ⊆ Znq , and finally set com (τ ) ∈ Rqκ as the double commitment to M, which
+is more compact. Specifically, assume that κmdℓ ≤ n, we denote by
+dcom (M) := com (split(com (M))) ∈ Rqκ
+
+(7)
+
+the double commitment to M, which is much shorter than com (M). Here the decomposition map split : Rqκ×m → (−d′ , d′ )n is an injective function computed as follows:
+16
+
+Construction 4.1. On input com (M), compute split(com (M)) ∈ (−d′ , d′ )n as follows:
+κ×mℓ —the gadget decomposition of com (M) ∈
+1. compute M′ := G−1
+d′ ,ℓ (com (M)) ∈ Rq
+Rqκ×m , and flatten it to M′′ := flat(M′ ) ∈ Rqκmℓ where ∥M′′ ∥∞ < d′
+′ := flat(cf(M′′ )) ∈ (−d′ , d′ )κmℓd is set as the flattening of the coefficient matrix of
+2. τM
+′ ∥
+′
+M′′ , it is clear that ∥τM
+∞ <d
+′ with zeros to obtain τ
+′ ′ n
+3. pad τM
+M ∈ (−d , d ) , and output split(com (M)) := τM .
+
+split is injective given the injectivity of gadget decomposition and flattening. Moreover,
+by the property of gadget matrices, there is a function pow : (−d′ , d′ )n → Rqκ×m such that
+pow(split(D)) = D for all D ∈ Rqκ×m . (However, pow is not injective.) Intuitively, pow
+computes the power-sums of input sub-vectors and embeds the results to the coefficients
+of κ × m polynomial ring elements.
+We say that (τ ∈ (−d′ , d′ )n , M ∈ Rqn×m ) is a valid opening of C ∈ Rqκ if
+1. M is a valid opening of pow(τ ) = com (M), and
+2. τ is a valid opening of C when treating C as a linear commitment.
+Remark 4.1. τ is not necessarily split(com (M)) because pow is not injective.
+Define the double commitment opening relation
+
+
+x = CM ∈ Rqκ
+
+
+Rdopen,m := (x, w) : w = (τ ∈ (−d′ , d′ )n , M ∈ Rqn×m )
+.
+
+
+where (τ, M) is valid opening of CM
+
+(8)
+
+Lemma 4.1. If com (·) is binding, then dcom (·) is also binding, that is, it’s infeasible to
+find C, (τ, M), (τ ′ , M′ ) where M ̸= M′ and (τ, M), (τ ′ , M′ ) are both valid openings of C.
+Proof. We can find a collision for com (·) given such openings: if com (M) = com (M′ ),
+then we find a collision M ̸= M′ ; if τ ̸= τ ′ , we find a collision (τ, τ ′ ) given that com (τ ) =
+com (τ ′ ) = C. Otherwise, suppose τ = τ ′ and com (M) ̸= com (M′ ). Since (τ, M), (τ ′ , M′ )
+are both valid openings, we reach a contradiction that com (M) = pow(τ ) = pow(τ ′ ) =
+com (M′ ).
+
+4.2
+
+Monomial set check
+
+In this section, we present a protocol for checking that every element of a committed matrix
+M is in the monomial set M ⊆ Rq from (2). This will be useful later in our range proofs.
+We present the protocol as a reduction of knowledge from an input relation Rm,in to an
+output relation Rm,out .
+
+17
+
+The input relation Rm,in holds when the double commitment CM is a commitment to
+a witness matrix M of monomials:
+
+
+x = CM ∈ Rqκ , w = M ∈ Rqn×m s.t.
+
+
+.
+(9)
+Rm,in := (x, w) : Mi,j ∈ M for all (i, j) ∈ [n] × [m]
+
+
+(CM , (split(com (M)), M)) ∈ Rdopen,m
+The output relation Rm,out is defined as
+
+
+x = (CM ∈ Rqκ , r ∈ C log n , e ∈ Rqm ) , w = M ∈ Rqn×m s.t.
+Rm,out := (x, w) :
+. (10)
+M⊤ tensor(r) = e ∧ (CM , (split(com (M)), M)) ∈ Rdopen,m
+The output relation holds for an instance x = (CM , r, e) and a witness matrix w = M, if
+M is an opening of CM and satisfies M⊤ tensor(r) = e.
+Before the construction, we introduce some notation and a useful corollary.
+Notation. P
+For every i ∈ [n], we write ⟨i⟩ ∈ {0, 1}log n in short for ⟨i⟩log n . For a ring
+element a = i∈[d] ai X i ∈ Rq , and a value β ∈ Fqu (where u ≥ 1), we denote by eva (β) :=
+P
+i
+i∈[d] ai β ∈ Fq u the evaluation of a = a(X) at point β ∈ Fq u .
+Corollary 4.1. Let q > 2 be a prime and Fqu an extension field of Zq with u ≥ 1. For all
+a ∈ M ⊆ Rq and β ∈ Fqu , we have eva (β)2 = eva (β 2 ) (where the arithmetic is over Fqu ).
+And for every a ∈ Rq not in M,
+
+
+2
+2
+Pr
+ev
+(β)
+=
+ev
+(β
+)
+< 2d/|Fqu | .
+a
+a
+r
+β ←Fqu
+Proof. The completeness is trivial. We focus on proving soundness. For a ∈
+/ M, consider the natural embedding a(X) of a in Zq [X] as a polynomial of degree less than d.
+By Lemma 2.1, a(X)2 ̸= a(X 2 ) where a(X)2 and a(X 2 ) both have degree less than 2d.
+Moreover, since Zq is a subfield of Fqu , we can lift a(X)2 and a(X 2 ) from Zq [X] to Fqu [X].
+Then by Lemma 2.6, the claim holds.
+Corollary 4.1 suggests a natural way to do monomial set check, by testing evMi,j (β)2 =
+evMi,j (β 2 ) for every entry (i, j). However, this is too expensive for the verifier, thus we
+use sumcheck to improve verifier complexity. We formally describe the construction below.
+Construction 4.2. On input x = CM ∈ Rqκ and w = M ∈ Mn×m ⊆ Rqn×m where (x, w) ∈
+Rm,in , the protocol Πmon proceeds as follows.
+r
+r
+1. V → P : Send challenges c ←
+C log n and β ←
+C.
+
+18
+
+2. P ↔ V : Combine the following sumcheck claims to one according to Remark 2.6 and
+run a degree-3 sumcheck protocol for it. For all j ∈ [m], denote by
+m(j) := (evM0,j (β), . . . , evMn−1,j (β)) ,
+
+′
+
+m (j) := (evM0,j (β 2 ), . . . , evMn−1,j (β 2 )) ,
+
+the j-th sumcheck claim is:
+
+
+X
+g
+]
+(j) (⟨i⟩)2 − m′
+(j) (⟨i⟩) = 0 .
+eq(c, ⟨i⟩) · m
+
+(11)
+
+i∈[n]
+r
+r
+Let r ←
+C log n be the sumcheck challenge, α ←
+C be the random combiner and v ∈ C
+be the claimed evaluation. The sumcheck reduces to the claim:
+
+
+
+
+X
+?
+′ (j)
+g
+]
+(j) (r)2 − m
+eq(c, r) · 
+αj · m
+(r)  = v .
+
+j∈[m]
+
+3. P → V : Send
+
+n
+o
+g
+ej = M
+∗,j (r) ∈ Rq
+
+j∈[m]
+
+4. V : Check that:
+
+eq(c, r) · 
+
+X
+
+
+
+?
+αj · evej (β)2 − evej (β 2 )  = v ,
+
+(12)
+
+j∈[m]
+
+Abort and return ⊥ if the checks fail.
+5. Return the reduced statement (x = (CM , r, e), w = M) ∈ Rm,out .
+Remark 4.2 (Batching). Πmon can be extended to check multiple committed matrices. That
+is, we convert all sumcheck statements into one via random linear combination and run a
+sumcheck protocol for the randomly-combined polynomial (c.f. Remark 2.6).
+Remark 4.3 (Efficiency). The protocol Πmon is highly efficient for reasons below.
+1. The degree-3 sumcheck operates over C. E.g., if q ≥ 2λ , C = Zq has much more efficient arithmetic than Rq . For a smaller modulus q, we can still use parallel repetitions
+or extension fields of Zq to boost soundness without increasing much cost.
+2. The multilinear evaluations {ej }j∈[m] can be computed in only O(n) Zq -multiplications
+plus O(nm) Zq -additions. We first compute the vector tensor(r) using O(n) Zq ]
+multiplications. Then for
+P each j ∈i [m], M∗,j (r) = ⟨M∗,j , tensor(r)⟩ is computed as
+follows: initialize v := i∈[d] vi X ∈ Rq as zero. For every i ∈ [n], do nothing if
+Mi,j = 0; otherwise, denote by Mi,j = X mi,j ∈ M ⊆ Rq where mi,j ∈ [d], and
+]
+update vmi,j ← vmi,j + tensor(r)i . The resulting v is exactly M
+∗,j (r) and it takes only
+O(n) Zq -additions.
+19
+
+3. Looking ahead, in an end-to-end folding scheme, the prover also needs to compute
+the commitment CM = dcom (M), whose main cost is computing com (M). Recall
+that the entries of M are in the monomial set M ⊆ Rq . Thus, for each column
+M∗,j (j ∈ [m]), com (M∗,j ) = AM∗,j is the sum of A’s columns (after rotation and
+sign flipping). This requires only nκ Rq -additions, much more efficient than Rq multiplications. Overall, committing com (M) takes ≈ nκm Rq -additions, or equivalently, nκdm (parallelizable) Zq -additions. For m ≈ d = 64, and q ≈ 2128 , the concrete cost is comparable to computing an Ajtai commitment for an arbitrary a ∈ Rqn ,
+which takes nκ Rq -multiplications, or equivalently, Ω(nκd log d) Zq -multiplications.
+Lemma 4.2. The protocol Πmon is a reduction of knowledge from Rm,in to Rm,out .
+Proof. Public reducibility is trivial. The claim follows from the lemmas below.
+Lemma 4.3. Πmon is perfectly complete.
+Proof. For every input statement in Rm,in , the verifier checks pass and the prover’s output
+is in Rm,out : Since M’s entries are in the monomial set M, by Corollary 4.1, the sumcheck
+claim in (11) holds. Thus, the sumcheck verifier accepts, and the evaluation claim holds.
+Since the prover sends correct evaluations {ej }, the check in (12) holds and the output
+statement is in Rm,out .
+Lemma 4.4. If dcom (·) is binding with binding error ϵbind , then Πmon is knowledge sound
+with knowledge error ϵmon,m := (2d + m + 4 log n)/|C| + ϵbind .
+Proof. The extractor Ext simulates the execution with the malicious prover (A, P∗ ) and
+returns P∗ ’s output if P∗ passes the verification. Otherwise, Ext returns ⊥. It is clear that
+Ext has polynomial time complexity.
+Let w = M denote Ext’s output. Let B0 be the event that w is not valid for Rm,in
+but valid for Rm,out . That is, there exists an entry (i, j) where Mi,j ∈
+/ M. Consider the
+following bad events:
+• Event B1 : B0 occurs and evMi,j (β)2 = evMi,j (β 2 ). (Note that for a fixed M, by
+Corollary 4.1, this happens with probability at most 2d/|C|.)
+• Event B2 : B0 occurs and evMi,j (β)2 ̸= evMi,j (β 2 ) but the batched sumcheck claim
+(at Step 2) holds. (Note that for a fixed M, by Lemma 2.6, this happens with
+probability at most m/|C| + log n/|C|.)
+• Event B3 : B0 occurs, the sumcheck claim (at Step 2) does not hold, but the evaluations e of M are correct. (Note that for a fixed M, by sumcheck soundness, this
+happens with probability at most 3 log n/|C|.)
+Suppose for contradiction that Pr[B0 ] ≥ Pr[B1 ∨ B2 ∨ B3 ] > 2d/|C| + m/|C| + 4 log n/|C| +
+ϵbind . Then there is an adversary that breaks the binding property of com (·) with probability more than ϵbind , contradiction. Thus the claim holds.
+20
+
+4.3
+
+Range check
+
+In this section, we show how to check that the Zq -coefficients of a committed Rq -vector f
+are within a fixed range (−B, B), where B = (d′ )k for some k ∈ N. Recall that d′ := d/2.
+Warm-up. As a warm-up, we first set the range to (−d′ , d′ ) and range-check a vector
+τ ∈ Znq . Our goal is to reduce the relation
+
+
+R′rg := (x, w) :
+
+
+
+x = (cmτ , cmmτ ∈ Rqκ ) , w = (τ, mτ ∈ Rqn ) s.t. 
+.
+τ ∈ (−d′ , d′ )n ∧ (cmmτ , mτ ) ∈ Rm,in
+
+(mτ ∈ EXP(τ )) ∧ (cmτ , τ ) ∈ Ropen
+
+
+
+
+
+′
+R := (x, w) :
+
+
+
+
+
+x = (cmτ , cmmτ ∈ Rqκ , r ∈ C log n , (a, b ∈ Rq )) , 
+
+
+w = (τ, mτ ∈ Rqn ) s.t.
+.
+
+[τ, mτ ]⊤ tensor(r) = (a, b)
+
+
+(cmτ , τ ) ∈ Ropen ∧ (cmmτ , mτ ) ∈ Ropen
+
+to
+
+In words, R′rg checks that τ, mτ are openings to cmτ , cmmτ , and mτ is in EXP(τ ) ⊆ Mn
+(where EXP(·) is defined in (3)), and τ is in the range (−d′ , d′ )n . R′ checks that for instance
+(cmτ , cmmτ , r, a, b), the witnesses τ, mτ are openings to cmτ , cmmτ and the matrix-vector
+product [τ, mτ ]⊤ tensor(r) = (a, b) holds. Here, cmmτ serves as a helper commitment for
+the range-check. One may understand it as a proof element in the reduction of knowledge.
+However, we put it directly into the instance to simplify the protocols and their analysis.
+Construction 4.3. On input x = (cmτ , cmmτ ∈ Rqκ ), w = (τ ∈ (−d′ , d′ )n , mτ ∈ EXP(τ ) ⊆
+Mn ) where6 (x, w) ∈ R′rg , the protocol proceeds as follows:
+1. Run monomial set check Πmon for mτ , which outputs a statement
+(x = (cmmτ , r ∈ C log n , b ∈ Rq ), w = mτ ) ∈ Rm,out
+where b = ⟨mτ , tensor(r)⟩ ∈ Rq .
+2. P → V : Send a := ⟨τ, tensor(r)⟩ ∈ C.
+P
+?
+3. V : Let ψ := i∈[1,d′ ) i · (X −i + X i ) ∈ Rq . Check ct(ψ · b) = a, abort and return ⊥ if
+the check fails.
+4. Return the reduced statement (x = (cmτ , cmmτ , r, (a, b)), w = (τ, mτ )) ∈ R′ .
+Lemma 4.5. If com (·) is binding with binding error ϵbind , then the above protocol is a
+reduction of knowledge from R′rg to R′ with knowledge error ϵ′rg := ϵmon,1 + ϵbind + log n/|C|.
+6
+
+In practice, a standard implementation will set mτ := exp(τ ).
+
+21
+
+Proof. Completeness is straightforward, we prove knowledge soundness below.
+The extractor simulates execution with the adversary (A, P∗ ) and return P∗ ’s output.
+Conditioned on the verifier accepts, let w = (τ, mτ ) be the extractor’s output. Suppose w is
+not valid for R′rg , then either (i) mτ is an invalid opening or mτ ∈
+/ Mn , which happens with
+probability at most ϵmon,1 ; or (ii) mτ is a valid opening within Mn , but τ ∈
+/ (−d′ , d′ )n or
+n
+mτ ∈
+/ EXP(τ ). By Lemma 2.2, we have ct(ψ · mτ − τ ) ̸= 0 . Note that verifier accepts and
+w is valid for R′ , so ct(ψ · b) = a where a = ⟨τ, tensor(r)⟩, ct(ψ · b) = ⟨ct(ψ · mτ ), tensor(r)⟩.
+By the binding property and Lemma 2.6 (over C), this happens with probability at most
+ϵbind + log n/|C|. In sum, with probability at most ϵ′rg , the adversary succeeds while the
+extractor’s output is invalid for R′rg . Thus the claim holds.
+Next, we are ready to prove that a committed ring vector f ∈ Rqn lies within a specific range. Naively, we can commit to the coefficient vectors cf(f ) ∈ Zn×d
+and run the
+q
+above protocol in parallel d times. However, this incurs high communication costs, as the
+input includes d commitments of total size Rqκ×d , which affects verifier circuit complexity
+for the Fiat-Shamir transform. To address this, we optimize communication via double
+commitments.
+Notation.
+
+Given f ∈ Rqn where ∥f ∥∞ < B = (d′ )k , denote by
+n×dk
+Df = [Df ,0 , . . . , Df ,k−1 ] = G−1
+d′ ,k (cf(f )) ∈ Zq
+
+(13)
+
+the decomposition matrix of cf(f ) so that ∥Df ∥∞ < d′ . Here Df ,i ∈ Zn×d
+for all i ∈ [k].
+q
+n×dk
+Let Mf ∈ EXP(Df ) ⊆ M
+. Consider the double commitment dcom (Mf ) = com (τD )
+where τD := split(com (Mf )) ∈ (−d′ , d′ )n is the decomposed version of com (Mf ). Let
+mτ ∈ EXP(τD ) ⊆ Mn . We consider a range-check relation
+
+
+x = (cmf , CMf , cmmτ ∈ Rqκ ),
+
+
+
+
+
+
+n×(2+dk)
+
+
+n
+
+
+w = [τD , mτ , f , Mf ] ∈ Zq × Rq
+s.t.
+
+
+Rrg,B := (x, w) : cf(f ) ∈ (−B, B)n×d ∧ (CM , Mf ) ∈ Rm,in
+(14)
+f
+
+
+
+
+
+
+
+(Mf ∈ EXP(Df )) ∧ ((CMf , cmmτ ), (τD , mτ )) ∈ R′rg 
+
+
+
+
+(CMf , (τD , Mf )) ∈ Rdopen,dk
+The reduction of knowledge is from Rrg,B to the output relation
+ 
+
+x = cmf , CMf , cmmτ ∈ Rqκ , r ∈ C log n , e ∈ Rq3+dk , 
+
+
+
+
+
+n × Rn×(2+dk) s.t.
+
+
+
+
+w
+=
+[τ
+,
+m
+,
+f
+,
+M
+]
+∈
+Z
+q
+τ
+D
+f
+
+
+q
+Rdcom := (x, w) : [τ , m , f , M ]⊤ tensor(r) = e
+τ
+D
+f
+
+
+
+
+
+
+
+
+(cm
+,
+f
+)
+∈
+R
+open ∧ (cmmτ , mτ ) ∈ Ropen
+f
+
+
+
+
+(CMf , (τD , Mf )) ∈ Rdopen,dk
+
+(15)
+
+In words, given instance the commitment cmf , the helper commitments CMf , cmmτ , the
+witness f , and the helper witness vectors τD , mτ and matrix Mf , the relation Rrg,B checks
+22
+
+1. f is an opening to cmf ;
+2. mτ and (τD , Mf ) are openings to cmmτ and CMf respectively;
+3. Mf is in EXP(Df ) ⊆ Mn×dk and mτ is in EXP(τD ) ⊆ Mn (EXP(·) is defined in (3));
+4. τD is a Zq -vector in (−d′ , d′ )n ;
+5. the coefficients of f lie within (−B, B).
+Rrg,B is equivalent to a simpler relation that only checks (i) and (v) for instance cmf and
+witness f , but we put all helper information into the statement to simplify the protocol
+and their analysis.
+Similarly, the output relation Rdcom checks that, for instance (cmf , CMf , cmmτ , r, e),
+the witnesses f , mτ are openings to cmf , cmmτ and (τD , Mf ) is an opening to CMf , and
+the matrix-vector product [τD , mτ , f , Mf ]⊤ tensor(r) = e holds.
+The protocol.
+
+Intuitively, the protocol Πrgchk does the following:
+
+1. check that Mf ∈ EXP(Df ) and mτ ∈ EXP(τD ) are well-formed via the monomial set
+tests;
+2. verify that
+P each entry of cf(f ), τD matches the constant term of the corresponding
+entry in i∈[k] d′i · (ψ · Mf ,i ) and ψ · mτ ; by Lemma 2.2, this implies that cf(f ), τD
+are within the ranges.
+Construction 4.4. On input x = (cmf , CMf , cmmτ ) ∈ Rqκ×3 , w = [τD , mτ , f , Mf ] ∈ Znq ×
+n×(2+dk)
+
+Rq
+
+where (x, w) ∈ Rrg,B , the protocol Πrgchk proceeds as follows:
+
+1. Run a batched protocol Πmon (Construction 4.2) w.r.t. Mf = [Mf ,0 ∈ Rqn×d , . . . , Mf ,k−1 ] ∈
+EXP(Df ) ⊆ Mn×dk and mτ ∈ EXP(τD ) ⊆ Mn . The output statements are
+(x = (cmmτ , r, b ∈ Rq ), w = mτ ) ∈ Rm,out
+(x = (CMf , r, e ∈ Rqdk ), w = Mf ) ∈ Rm,out
+where b = ⟨mτ , tensor(r)⟩. For every i ∈ [k], denote by
+ui := (Mf ,i )⊤ tensor(r) = e[di, d(i + 1)) ∈ Rqd .
+2. P → V : Send v := cf(f )⊤ tensor(r) ∈ C d and a := ⟨τD , tensor(r)⟩ ∈ C
+3. V : Let ψ :=
+
+P
+
+i∈[1,d′ ) i · (X
+
+?
+−i + X i ) ∈ R . Check that ct(ψ · b) =
+a and
+q
+
+
+
+?
+ct ψ · (u0 + d′ u1 + · · · + d′k−1 uk−1 ) = v
+Abort and return ⊥ if the checks fail.
+23
+
+(16)
+
+4. Denote by v̂ :=
+
+P
+
+i∈[d] vi X
+
+i ∈ R . Return the reduced statement
+q
+
+(xo = (cmf , CMf , cmmτ , r, (a, b, v̂, u0 , . . . , uk−1 )), wo = [τD , mτ , f , Mf ]) ∈ Rdcom .
+Remark 4.4. Πrgchk can be extended to support multiple input instances by batching the
+executions of Πmon as described in Remark 4.2.
+Theorem 4.2. Πrgchk is a reduction of knowledge from Rrg,B to Rdcom .
+Proof. Public reducibility is trivial. The claim follows from the lemmas below.
+Lemma 4.6. Πrgchk is perfectly complete.
+Proof. For every input statement in Rrg,B , we show that the verifier checks pass and the
+prover’s output is in Rdcom .
+First, the prover’s output is in Rdcom : {ui }i∈[k] , a, b sent by the honest prover are
+exactly theP
+claimed values in Rdcom . And the sent v satisfies that v = cf(f )⊤ tensor(r).
+Thus, v̂ := i∈[d] vi X i = ⟨f , tensor(r)⟩ as required given that tensor(r) is in C n = Znq .
+Next, we show that the verifier accepts: First, mτ is in EXP(τD ) ⊆ Mn and the
+matrix Mf is in EXP(Df ) ⊆ Mn×dk . By completeness of Πmon , the monomial set checks
+pass. Also note that τD ∈ (−d′ , d′ )n , by Lemma 2.2, we have ct(ψ · mτ ) = τD . Since
+tensor(r) ∈ C n = Znq , we have ct(ψ · b) = a. By definition of the decomposed matrix Df ,
+with a similar argument, Eq. (16) holds and thus the verifier accepts.
+Lemma 4.7. If com (·) is binding with binding error ϵbind , then Πrgchk is knowledge sound
+with knowledge error ϵrg := ϵmon,dk+1 + ϵbind + log n/|C|.
+Proof. The extractor Ext simulates the execution with adversary (A, P∗ ) and returns P∗ ’s
+output witness if the verifier accepts. Otherwise Ext returns ⊥. It is clear that Ext has
+polynomial time complexity.
+Let x, xo denote the instances for the input and output relations. Conditioned on the
+verifier accepts, let w = (f , Mf , τD , mτ ) be the extractor’s output. Suppose (x, w) is not in
+Rrg,B but (xo , w) is in Rdcom . Consider two cases.
+Case 1: Mf ∈ Rqn×dk or mτ ∈ Rqn are invalid openings, or some of their entries are outside
+the monomial set. By knowledge soundness of Πmon , this happens with probability at most
+ϵmon,dk+1 .
+Case 2: Mf is in Mn×dk and mτ is in Mn and they are valid openings, but
+cf(f ) ∈
+/ (−B, B)n×d ∨ τD ∈
+/ (−d′ , d′ )n ∨ Mf ∈
+/ EXP(Df ) ∨ mτ ∈
+/ EXP(τ ) .
+For all i ∈ [k], let Mf ,i ∈ Mn×d be the (di + 1)-th to (di + d)-th columns of Mf . By
+Lemma 2.2, we have ct(ψ · mτ − τD ) ̸= 0n or
+
+
+ct ψ · (Mf ,0 + d′ Mf ,1 + · + d′k−1 Mf ,k−1 )) ̸= cf(f ) .
+24
+
+Note that (xo , w) is in Rdcom and the verification passed, so ct(ψ · b) = a and (16) holds,
+where a = ⟨τD , tensor(r)⟩ and ct(ψ · b) = ⟨ct(ψ · mτ ), tensor(r)⟩. By the binding property
+of com (·) and Lemma 2.6, this happens with probability at most ϵbind + log n/|C|. In sum,
+the knowledge error is ϵrg = ϵmon,dk+1 + ϵbind + log n/|C|.
+
+4.4
+
+Commitment transformation
+
+Double commitments are not linearly homomorphic, thus statements involving double commitments are hard to fold using random linear combinations. This section introduces a
+technique that simplifies such statements by reducing them to statements involving only
+linear commitments to smaller witnesses. The core idea is to use sumchecks to ensure
+consistency between the double commitment of a large witness matrix Mf and a linear
+commitment to a folded version of Mf .
+Specifically, let B := (d′ )k where k ∈ N. Fix b ∈ N and folding challenge set S̄ ⊂ Rq
+such that com (·) is (b, S := S̄ − S̄)-binding and b ≥ 2 S̄ op (d′ + 1 + B + dk). The protocol
+Πcm reduces relation Rrg,B from (14) to
+(
+)
+
+n
+, vo ∈ Mq , w = g ∈ Rqn s.t.
+x = cmg ∈ Rqκ , ro ∈ Mlog
+C
+Rcom := (x, w) :
+(17)
+⟨g, tensor(ro )⟩ = vo ∧ ∥g∥∞ < b/2 ∧ (cmg , g) ∈ Ropen
+where MC := C × C and Mq := Rq × Rq . We can understand Rcom as a special case of
+the general linear relation Rlin,b/2 , where the only linear check is the evaluation statement
+⟨g, tensor(ro )⟩ = vo .
+Why a double commitment and its transformation? One may attempt to avoid
+commitment transformation by flattening the matrix Mf to a vector fM ∈ Rqn·dk and
+directly commit to fM via a linear commitment. However, this approach is infeasible for
+folding schemes, because after each folding step, one needs to range-check more and more
+integer elements in the witness. For example, in the first folding step, we need to rangecheck a witness vector of n elements in Rq . After the folding, the output witness now
+consists of ndk Rq -elements, which requires a range-proof again in a later folding step.
+This introduces a blowup of dk in the witness size after each folding step.
+The protocol Πcm . The protocol Πcm , which we describe next, is the central protocol
+that we use in the next section to construct our folding scheme. It uses the range check
+protocol Πrgchk from the previous section as a subroutine.
+At a high level, the protocol takes as input a double commitment CMf to the matrix
+Mf (plus some auxiliary information), and the goal is to reduce the checking of the double
+commitment to that of a linear commitment cmg , where the opening g ≈ Mf s′ is a random
+linear combination of Mf ’s columns and some auxiliary vectors. (Here s′ is the folding
+challenge.) Towards this, the verifier sends s′ and the prover replies with cmg . Further,
+25
+
+the verifier needs to check that cmg and CMf are consistent, that is, there exists a witness
+com (Mf ), which are the dk linear commitments to the dk columns of Mf , such that
+1. cmg is the correct random linear combination of com (Mf )’s columns (and some
+auxiliary vector commitments) with respect to s′ ;
+2. the decomposed vector τD = split(com (Mf )) is a valid opening of CMf , when viewing
+CMf as a linear commitment.
+The protocol Πcm proves the above two relations efficiently via sumchecks.
+For simplicity, assume that n = κd2 kℓ and κ, k, ℓ, d are powers of two (in Remark 4.8
+we explain how to support smaller n). Recall that split : Rqκ×dk → (−d′ , d′ )n is the injective
+map defined in Section 4.1 that decomposes a matrix in Rqκ×dk to a low-norm vector in
+(−d, d′ )n ; and pow : (−d′ , d′ )n → Rqκ×dk is the map such that pow(split(D)) = D for all
+D ∈ Rqκ×dk .
+Construction 4.5. The protocol takes as input an instance-witness pair (x, w) ∈ Rrg,B where
+x = (cmf , CMf = com (τD ) , cmmτ ) ∈ Rqκ×3 , w = [τD , mτ , f , Mf ] ∈ Znq × (Rqn )2 × Rqn×dk
+and mτ , Mf satisfy7 mτ ∈ EXP(τD ) ⊆ Mn and Mf ∈ EXP(Df ) ⊆ Mn×dk . Here Df is a
+decomposition of f as defined as in (13). The protocol Πcm proceeds as follows:
+1. P ↔ V : Run Πrgchk to reduce the input statement in Rrg,B to that in Rdcom from
+(15). Let r ∈ C log n and e ∈ Rq3+dk be the challenge and evaluations.
+r
+r
+2. V → P : Send folding challenges s ←
+S̄ 3 and s′ ←
+S̄ dk .
+
+3. P → V : Send com (h) := com (Mf ) s′ = com (Mf s′ ) ∈ Rqκ .
+r
+4. V → P : Send challenges (c(0) , c(1) ) ←
+C log κ × C log κ .
+
+5. P ↔ V : Run two sumcheck protocols in parallel, where each of them checks the same
+sumcheck claims below in a batch via random linear combination (c.f. Remark 2.6)8 :
+• Set u := ⟨e[3, 3 + dk), s′ ⟩ ∈ Rq ; the relation to be checked is
+?
+
+[τD , mτ , f , h]⊤ · tensor(r) = (e[0, 2], u).
+
+(18)
+
+This left hand side represents four sums each over n elements. Each sum can
+be compared to the corresponding value on the right hand side using a degree-2
+sumcheck claim that uses the multilinear extensions of τD , mτ , f , h and tensor(r).
+In total, (18) represents four sumcheck claims.
+7
+8
+
+In practice, a standard implementation will set mτ := exp(τ ) and Mf := exp(Df ).
+The two parallel sumcheck executions use independent verifier challenges.
+
+26
+
+• For every z ∈ [2], define a vector t(z) ∈ Rqn
+t(z) = tensor(c(z) ) ⊗ s′ ⊗ (1, d′ , . . . , d′ℓ−1 ) ⊗ (1, X, . . . , X d−1 ) .
+
+(19)
+
+(z) denote t(z) ’s multilinear extension which can be evaluated9 by the verLet tg
+ifier in time O(log κ + dk + ℓ). Check the two degree-2 sumcheck claims:10
+
+X
+
+?
+(z)
+g
+(z)
+τf
+D (⟨i⟩) · t (⟨i⟩) = ⟨tensor(c ), com (h)⟩ ∈ Rq
+
+for z = 0, 1.
+
+(20)
+
+i∈[n]
+
+If τD ∈ (−d′ , d′ )n , this is equivalent to checking that (See Remark 4.5)
+?
+
+⟨tensor(c(z) ), pow(τD )s′ ⟩ = ⟨tensor(c(z) ), com (h)⟩ .
+
+(21)
+
+In total, (20) represents two sumcheck claims.
+The verifier can verify all six sumcheck claims from (18) and (20) as a batch using
+the sumcheck batching technique from Remark 2.5 and Remark 2.6. In Remark 4.6
+we explain that these six sumchecks can be treated as 6d sumcheck claims over Zq
+that can all be compressed into a single sumcheck over Zq (or an extension field of
+Zq ) via random linear combination (c.f. Remark 2.6).
+P and V run two parallel sumcheck protocols for this single batch claim. The need for
+r
+two parallel sumchecks in explained in Remark 4.9. Let ro ←
+(C × C)log n denote the
+g
+(0) , t
+(1) at
+corresponding sumcheck challenges. Then, since V can evaluate eq(r, ·), tg
+both C log n points in ro by itself, the two sumcheck executions reduce to the evaluation
+claims
+?
+[τD , mτ , f , h]⊤ · tensor(ro ) = eo
+(22)
+for some eo ∈ (Rq × Rq )4 , where τD , mτ , f , h ∈ Rqn are the committed witnesses.
+These are eight evaluation claims: a claim for each of τD , mτ , f , h for each of the two
+points in ro . The next two steps aggregate these eight claims into two claims.
+6. V : Compute cmg ∈ Rqκ and vo ∈ Rq2 where
+(cmg , vo ) := s0 · (CMf , eo,0 ) + s1 · (cmmτ , eo,1 ) + s2 · (cmf , eo,2 ) + (com (h) , eo,3 ) ∈ Rqκ+2
+Here we treat eo as a matrix in Rq2×4 so that eo,i ∈ Rq2 is its i’th column, for i ∈ [4].
+7. P : Compute g := s0 · τD + s1 · mτ + s2 · f + h ∈ Rqn .
+9 (z)
+
+(z) (r) = ⟨t(z) , tensor(r)⟩ can be efficiently evaluated due to
+t is a tensor product defined in (19), so tg
+the mixed-product property of tensors.
+10
+⟨tensor(c(z) ), com (h)⟩ is directly computed by the verifier in time O(κ).
+
+27
+
+8. Output the reduced statement (x = (cmg , ro , vo ), w = g) ∈ Rcom .
+Remark 4.5. To see why Eq. (20) and Eq. (21) are equivalent, it suffices to check ⟨τD , t(z) ⟩ =
+2
+⟨tensor(c(z) ), pow(τD )s′ ⟩. We can understand τD ∈ (−d′ , d′ )κd kℓ as a four-dimensional
+array T ∈ (−d′ , d′ )κ×dk×d×ℓ such that Ti,j,o,p = τD [i · (d2 kℓ) + j · (dℓ) + o · ℓ + p]. Then we
+have
+⟨τD , t(z) ⟩ = ⟨τD , tensor(c(z) ) ⊗ s′ ⊗ (1, d′ , . . . , d′ℓ−1 ) ⊗ (1, X, . . . , X d−1 )⟩
+X
+=
+Ti,j,o,p · tensor(c(z) )i · s′j · d′o · X p
+i∈[κ],j∈[dk],o∈[d],p∈[ℓ]
+
+
+= ⟨tensor(c(z) ),
+
+X
+
+j∈[dk]
+
+= ⟨tensor(c(z) ),
+
+
+X
+
+X
+
+T∗,j,o,p · d′o · X p  · s′j ⟩
+
+o∈[d],p∈[ℓ]
+
+pow(τD )∗,j · s′j ⟩ = ⟨tensor(c(z) ), pow(τD )s′ ⟩ .
+
+j∈[dk]
+
+Remark 4.6 (Efficient Instantiations of Sumchecks). Step 5 verifies six sumcheck claims over
+Rq in a batch. Observe that each sumcheck claim over Rq can be understood as d sumcheck
+claims over Zq : In (18), the elements of tensor(r) are in Zq ; similarly, in (20), the elements
+of τD are in Zq . Thus there are only scalar multiplications rather than Rq -multiplications
+in the degree-2 sumchecks. Hence the sumcheck claim over Rq can be understood as d
+coefficient-wise sumcheck claims over Zq .
+In sum, the six sumcheck claims over Rq can then be understood as 6d sumcheck claims
+over Zq . We can compress the 6d sumcheck claims over Zq to a single sumcheck claim over
+Zq (or its field extension) via random linear combination (c.f. Remark 2.6). Thus Πcm only
+needs to run two parallel sumcheck protocols over Zq (or an extension field of Zq ).
+Remark 4.7 (Optimizing communication). The communication is dominated by e′ :=
+e[3, 3 + dk) ∈ Rqdk , which consists of dk “full” Rq -elements. This affects the folding verifier circuit size as the Fiat-Shamir transform is the bottleneck. (E.g., a 2-to-1 hash over
+Rq takes more than 100 R1CS constraints over Rq .) Fortunately, we can use the same
+compression trick for com (Mf ) to compress e′ .
+Let n′ = nk/κ and assume that n′ = n for simplicity. (The technique easily generalizes
+′
+for all n′ ≤ n.) Decompose e′ into τe ∈ (−d′ , d′ )n using an injective map similar to split(·).
+We reuse the notation split and pow and note that pow(τe ) = e′ . To check that Mf is
+in Mn×dk in the subprotocol Πmon (Construction 4.2), the prover sends the commitment
+com (τe ) (rather than e′ ) and the claimed values (ve , ve′ ) := (e′ [β], e′ [β 2 ]) ∈ C dk (used in the
+check (12)). The rest of the protocol is the same as Πcm except for the following changes:
+′
+
+• The prover proves that the committed τe is in range (−d′ , d′ )n . This can be achieved
+by sending com (exp(τe )) and running Construction 4.3, which is really efficient.
+
+28
+
+• In Step 5, the prover sends the claimed value of u and batches a sumcheck claim that
+proves ⟨pow(τe ), s′ ⟩ = u. (Recall that e′ = pow(τe ).)
+• In Step 5, the prover further proves that pow(τe )[β] = ve and pow(τe )[β 2 ] = ve′ (via
+sumchecks). The idea is almost identical to that explained in Eq. (19), Eq. (20),
+except that the term (1, . . . , X d−1 ) in Eq. (19) is replaced with (1, β, . . . , β d−1 ) and
+(1, β 2 , . . . , (β 2 )d−1 ) respectively.
+• In Step 5, the prover proves the constant term check in Eq. (16) via sumchecks.
+r
+Specifically, let v ∈ C d be the claimed values in Eq. (16). The verifier sends c′ ←
+C log d and the prover sends v ′ = ⟨u0 + · · · + d′k−1 uk−1 , tensor(c′ )⟩ ∈ Rq . Denote by
+z := (1, d′ , . . . , d′k−1 ) ⊗ tensor(c′ ) ∈ C dk . It suffices to check that (i) ct(ψ · v ′ ) =
+⟨v, tensor(c′ )⟩, and (ii)
+⟨pow(τe ), z⟩ = v ′ .
+(23)
+The inner product (23) can be represented as a degree-2 sumcheck using the same
+trick in Eq. (19), Eq. (20).
+• At Step 2, V samples two more challenges r1 , r2 ∈ S̄, and at Step 6 and 7, V and
+P fold (com (τe ) , com (exp(τe )) and (τe , exp(τe )) into cmg and g respectively, using
+scalars r1 , r2 .
+This optimization removes e′ that has dk Rq -elements, at the cost of adding two commitments com (τe ) , com (exp(τe )) ∈ Rqκ , one Rq -element b and C-element a in the execution of
+Construction 4.3, ve , ve′ which has 2dk C-elements, and v ′ ∈ Rq , c′ ∈ C log d . In practice,
+d ≫ κ > k, so this gives us a ≈ dk/(2κ)-factor saving on communication.
+Remark 4.8 (Supporting n < κd2 kℓ). Construction 4.5 requires the witness length n to be
+large enough, i.e., n ≥ κd2 kℓ. In this remark, we explain how to support smaller11 n. To
+illustrate the idea, consider an example where d = (d∗ )2 and n = κdkℓd∗ ≪ κd2 kℓ. We
+need to make two changes to the protocol Πcm .
+First, we need to slightly change how we compute τD = split(com (Mf )). In Step 2 of
+into
+Construction 4.1, instead of flattening the entire coefficient matrix cf(M′′f ) ∈ Zκdkℓ×d
+q
+a Zq -vector, we convert the matrix to an Rq -vector: Split C := cf(M′′f ) into d∗ parts, i.e.,
+C = [C0 , C1 , . . . , Cd∗ −1 ]
+∗
+
+∗
+
+where for every i ∈ [d∗ ], Ci ∈ Zκdkℓ×d
+by τi := flat(Ci ) ∈ Zqn=κdkℓd .
+q
+P and we denote
+i
+n
+Finally, we set split(com (Mf )) := τD = i∈[d∗ ] τi X ∈ Rq .
+Recall that CMf = com (τD ) is the double commitment in Πcm . Now, the committed
+√
+vector τD is no longer in (−d′ , d′ )n but an Rq -vector whose elements have degree d∗ = d
+and norm d′ , and we need to range-check the committed vector τD ∈ Rqn . A naive approach
+11
+
+Specifically, we only need n to be slightly larger than κdkℓ.
+
+29
+
+∗
+
+is to send the linear commitment to a matrix Mτ ∈ Mn×d and run monomial set checks,
+which is still inefficient if d∗ is relatively large.
+∗
+Fortunately, the commitment com (Mτ ) ∈ Rqκ×d is much shorter than com (Mf ) ∈
+Rqκ×dk and n is now sufficiently long compared to κd∗ ℓd. That is, d∗ ≪ dk and n =
+κdkℓd∗ ≥ κd∗ ℓd. This enables the prover to compute τ ′ := split(com (Mτ )) ∈ (−d′ , d)n
+(following Construction 4.1 with no modification) and send the commitment com (τ ′ ), and
+then range-check τ ′ by running Construction 4.3. Additionally, the protocol checks the
+′′
+′′
+∗
+r
+consistency between com (τ ′ ), com (h′ ) := com (Mτ ) s (where s ←
+S̄ d ) and com (Mτ )
+via a sumcheck claim as in Eq. (20). The sumcheck claim can be batched in Step 5.
+As a trade-off, we replace the two commitments CMf = com (τD ) , cmmτ = com (exp(τD ))
+with four commitments com (τD ) , com (τ ′ = split(com (Mτ ))), com (exp(τ ′ )) and com (h′ )
+(that folds com (Mτ )).
+Security analysis of Construction 4.5. Note that cmg is a random linear combination
+of the commitments [CMf = com (τD ) , cmmτ , cmf ] and com (Mf ). However, the prover
+never sends com (Mf ), which is too large. Instead, the prover adaptively sends a folded
+commitment com (h) = com (Mf ) s′ after learning the challenge s′ . At a first glance, it is
+unclear how to enforce the prover to fix the witness Mf before learning the challenge. A key
+observation is that CMf was sent initially, which is claimed to be the double commitment
+to Mf . By running a sumcheck to enforce the consistency between the instances com (h),
+CMf and the witness com (Mf ), we can recover the binding of Mf . Next, we formally prove
+the security of the scheme.
+Theorem 4.3. Let k ∈ N and B := (d′ )k . Fix b ∈ N and S̄ ⊆ Rq such that com (·) is
+(b, S = S̄ − S̄)-binding (defined in Section 4.1) and b ≥ 2 S̄ op (d′ + 1 + B + dk). Then
+Πcm is a reduction of knowledge from Rrg,B to Rcom .
+Proof. Public reducibility is trivial. The theorem follows from the lemmas below.
+Lemma 4.8. If b ≥ B ′ = 2 S̄ op · (d′ + 1 + B + dk), then Πcm is perfectly complete.
+Proof. For every input instance x = (cmf = com (f ) , CMf = com (τD ) , cmmτ = com (mτ ))
+and witness w = [τD , mτ , f , Mf ] such that (x, w) ∈ Rrg,B , we prove that the honest execution of Πcm succeeds and the output statement is in Rcom .
+We first show that the verifier accepts and the evaluation claim in Rcom (Eq. (17))
+holds. By completeness of Πrgchk , Step 1 executes correctly and the output statement
+is in Rdcom from (15). This implies that the first 4 sumcheck claims at Step 5 hold.
+Moreover, since (CMf , (τD , Mf )) ∈ Rdopen,dk (defined in (8)), we have com (τD ) = CMf
+and pow(τD ) = com (Mf ), thus
+pow(τD )s′ = com (Mf ) s′ = com (h)
+
+30
+
+and the last two sumcheck claims (at Step 5) hold. Therefore, the batched sumcheck
+executes correctly and the evaluation claims in (22) holds, which implies that the evaluation
+claim in Rcom also holds.
+Next, we show that the norm constraint in Rcom holds (Eq. (17)), which also implies
+that g is a valid opening of cmg . Note that ∥τD ∥∞ < d′ , the entries of mτ , Mf are in
+the monomial set from (2), and ∥f ∥∞ < B. By definition of operator norms from (4) and
+Lemma 2.3, we have that
+∥g∥∞ < d′ S̄ op + S̄ op + B S̄ op + dk S̄ op = B ′ /2 ≤ b/2 .
+Thus, the output statement is in Rcom , which completes the proof.
+Before proving knowledge soundness, we review an adapted version of the coordinatewise special soundnesss lemma from [FMN24]. Fix µ ∈ N and let S̄ be a finite set. For two
+vectors a, b ∈ S̄ µ , we say that a ≡i b for i ∈ [µ] if ai ̸= bi and aj = bj for all j ∈ [µ] \ {i}.
+Lemma 4.9 ([FMN24], Lemma 7.1). Fix µ ∈ N and let S̄ be a finite set. Define U := S̄ µ
+and let Ψ : U × T → {0, 1} be any predicate. Let A be a probabilistic algorithm A : U → T
+and let
+
+
+ϵΨ (A) := Pr
+Ψ(u, A(u)) = 1 .
+r
+u←U
+r
+There is an oracle algorithm E such that E A (u0 , y0 ), on input u0 ←
+U , y0 ← A(u0 ), with
+probability at least
+ϵΨ (A) − µ/|S̄|
+(24)
+
+outputs µ+1 pairs (u0 , y0 ), (u1 , y1 ← A(u1 )), ..., (uµ , yµ ← A(uµ )) such that Ψ(ui , yi ) = 1
+for all i ∈ [µ + 1] and ui+1 ≡i u0 for all i ∈ [µ]. E calls A for 1 + µ times in expectation,
+and 1 + µ(|S̄| − 1) < µ|S̄| times in the worst case.
+Next, we are ready to prove knowledge soundness.
+Lemma 4.10. Fix k ∈ N and B = (d′ )k . Let S̄, C be challenge sets where |S̄| = |C| ≥ 2λ .
+Define
+ϵsum := (2 log(n)/|C|)2 .
+and µ = 3 + dk. Fix any b ∈ N such that com (·) is (b, S = S̄ − S̄)-binding with binding
+error ϵbind , the protocol Πcm has knowledge error
+ϵcm,k =
+
+µ + dk
+µ(log2 (κ) + (2 log n)2 )
++ 3ϵbind + ϵ′rg + ϵrg + 2ϵsum +
+|C|
+|S̄|
+
+where ϵ′rg , ϵrg are defined in Lemma 4.5 and Lemma 4.7.
+
+31
+
+Proof. Let A∗ := (A, P∗ ) be any malicious prover with winning probability ϵA∗ . Without
+loss of generality, we assume that A∗ is deterministic. We derive an adversary A′ below
+that will be fed to the extractor in Lemma 4.9. Note that A′ only calls A∗ as an oracle.
+Recall that MC := C × C.
+n
+Let µ := 3 + dk and U := S̄ µ . The adversary A′ , with a hardcoded ro ∈ Mlog
+, on input
+C
+u = (s ∈ S̄ 3 , s′ ∈ S̄ dk ), simulates execution with A∗ by using u as the folding challenge
+and ro as the challenge of the last sumcheck, and internally sampling other randomness
+of the verifier. If A∗ fails or A∗ ’s output is not a valid witness for Rcom , A′ returns ⊥;
+otherwise A′ outputs y := (tr, wo ), where wo is A∗ ’s output witness and tr is the execution
+transcript, which includes the input and output instances, the verifier randomness, and the
+prover messages.
+Define the predicate Ψ : U × {0, 1}∗ → {0, 1} such that Ψ(u, y = (tr, wo )) = 1 if and
+only if the following two conditions both hold:
+1. The execution transcript tr is accepted and uses u as the folding challenges.
+2. (xo , wo ) ∈ Rcom where xo is the output instance in the transcript.
+Next, we describe the extractor Ext for Πcm , which calls the extractor E in Lemma 4.9
+as a subroutine:
+∗
+
+Extractor ExtA :
+n
+r
+to be used by A′ . Each call of A′ will reuse the same ro but
+1. Sample ro ←
+Mlog
+C
+freshly sample other randomness for simulating execution with A∗ .
+r
+2. Sample u(0) ←
+U and y0 ← A′ (u(0) ).
+′
+
+3. Call E A (u(0) , y0 ). If the execution fails, abort and return ⊥; otherwise, parse the
+output
+(u(0) , y0 ),
+
+(u(1) , y1 ← A(u1 )),
+
+(i)
+
+...,
+
+(u(µ) , yµ ← A′ (u(µ) )) ,
+
+(i)
+
+where yi = (tri = (xo , ∗), wo ) for all i ∈ [µ + 1] and u(i+1) ≡i u(0) for all i ∈ [µ].
+4. For every i ∈ [µ], compute12
+(i+1)
+
+wi :=
+
+wo
+
+(0)
+
+− wo
+
+(i+1)
+(0)
+ui
+− ui
+
+∈ Rqn .
+
+(25)
+
+5. Output w := [τˆD , m̂τ , f̂ , M̂f ] := [w0 , . . . , wµ−1 ] ∈ Rqn×µ .
+By Lemma 4.9, it is clear that Ext runs in expected polynomial time. Next, we focus on
+analyzing the success probability of Ext.
+12
+
+(i+1)
+
+wi is well-defined as ui
+
+(0)
+
+− ui
+
+∈ S̄ − S̄ is invertible.
+
+32
+
+Success probability.
+
+Define ϵΨ (A′ ) := Pru←
+[Ψ(u, A′ (u)) = 1], which is
+r
+r
+U,ro ←Mlog n
+C
+
+equal to ϵA∗ . By Lemma 4.9, with non-negligible13 probability ϵA∗ − µ/|S̄|, the extractor Ext does not abort. Conditioned on this, denote by x = (cmf , CMf , cmmτ ) the input
+instance in the execution, it suffices to upper-bound the probability that the extracted
+witness w = [τˆD , m̂τ , f̂ , M̂f ] is invalid, i.e., (x, w) ∈
+/ Rrg,B .
+We first review some properties of the extracted witness. Recall that com (·) and mul(i)
+(i)
+tilinear evaluations are linear functions; com (·) is (b, S = S̄ − S̄)-binding and (xo , wo ) ∈
+Rcom for all i ∈ [µ + 1]. Thus, if Ext succeeds, w = [τˆD , m̂τ , f̂ , M̂f ] has the following
+properties:
+1. τˆD , m̂τ , f̂ are (b, S)-valid openings of CMf = com (τˆD ) , cmmτ , cmf (Eq. (6)).
+ 
+2. M̂f is a valid opening of com M̂f . (However, (τˆD , M̂f ) may not be a valid opening
+ 
+of the double commitment CMf if com M̂f ̸= pow(τˆD ).)
+
+3. For every i ∈ [µ+1], parse u(i) = (s(i) , s′(i) ∈ S̄ dk ) and denote by com h(i) (included
+in tri ) the h-commitment sent by the prover at Step 3. By linearity of com (·) and
+the verifier computation at Step 6, we have that
+
+
+ 
+com h(i) = com M̂f s′(i) .
+(26)
+
+We note that M̂f s′(i) , however, may not be a (b, S)-valid opening of com h(i) , because we do not have sufficient norm guarantee for M̂f s′(i) .
+(0)
+
+(0)
+
+4. [τˆD , m̂τ , f̂ ]⊤ tensor(ro ) = eo [0, 3) where eo (in the first transcript tr0 ) is the claimed
+evaluation in Eq. (22).
+(0)
+
+5. ⟨M̂f s′(0) , tensor(ro )⟩ = eo [3].
+Next, we analyze the probability of bad events below.
+Define BAD1 as the event that Ext does not abort, but τˆD (in the extracted witness w)
+is not in (−d′ , d′ )n .
+Claim 1. Pr[BAD1 ] ≤ ϵ1 := ϵbind + ϵ′rg + ϵsum where ϵ′rg is defined in Lemma 4.5.
+Proof. If BAD1 occurs, by Property (1) and Property (4), we have (x̄ = CMf , w̄ = τˆD ) ∈
+(0)
+Ropen and ⟨τˆD , tensor(ro )⟩ = eo [0].
+Conditioned on Ext does not abort, consider a mental experiment where we re-run
+∗
+ExtA with fresh randomness. If the re-execution does not abort, let τˆD ∗ denote part of
+the extracted witness that is a claimed opening to CMf ; otherwise τˆD ∗ := ⊥. Consider the
+13
+
+ϵA∗ is non-negligible and µ/|S̄| is negligible.
+
+33
+
+first transcript generated by the re-execution. Let r, r∗o , e[0], eo [0] be the random variables
+corresponding to the random challenges and evaluations at Step 1 and Eq. (22). Note that
+∗
+r, r∗o are uniformly random, because the first transcript is for the first call to A∗ , and ExtA
+cannot do rejection sampling to bias the distribution.
+Let E ∗ be the event that at least one event below occurs in the mental experiment:
+• Event B1 : (τˆD ∗ ̸= ⊥) ∧ (τˆD ∗ ̸= τˆD );
+• Event B2 : (τˆD ∗ = τˆD ) and (τˆD ∈
+/ (−d′ , d′ )n ∧ ⟨τˆD , tensor(r)⟩ = e[0]);
+• Event B3 : (τˆD ∗ = τˆD ) and (⟨τˆD , tensor(r)⟩ ̸= e[0] ∧ ⟨τˆD , tensor(r∗o )⟩ = eo [0]).
+By the binding property of com (·), Lemma 4.5, and Lemma 2.7, we have that
+Pr [E ∗ ] ≤ Pr [B1 ] + Pr [B2 ] + Pr [B3 ] ≤ ϵbind + ϵ′rg + ϵsum .
+
+(27)
+
+Note that if BAD1 occurs in the mental experiment, then E ∗ must also occur. Moreover,
+BAD1 occurs with the same probability in the real execution and the mental experiment.
+Thus, Pr[BAD1 ] ≤ Pr[E ∗ ] and the claim holds.
+Define BAD2 as the event that (i) Ext does not abort and BAD1 does not occur, but
+(ii) (τˆD , M̂f ) (in the extracted witness w) is not a valid opening of the double commitment
+CMf , i.e., (CMf , (τˆD , M̂f )) ∈
+/ Rdopen,dk (Eq. (8)).
+2
+
+2
+
+log n) )
+Claim 2. If |C| = |S̄|, then Pr[BAD2 ] ≤ ϵ2 := ϵbind + µ(log (κ)+(2
+.
+|C|
+
+Proof. If BAD2 occurs, then the following conditions all hold for the extracted witness
+w = [τˆD , m̂τ , f̂ , M̂f ]:
+ 
+• (CMf , τˆD ) ∈ Ropen (Property (1)) and M̂f is a valid opening of com M̂f (Property (2));
+• The sumcheck evaluation claims for τˆD in the µ + 1 transcripts are correct;
+ 
+• (CMf , (τˆD , M̂f )) ∈
+/ Rdopen,dk , which implies that pow(τˆD ) ̸= com M̂f .
+∗
+
+Conditioned on Ext does not abort, consider a mental experiment where we re-run ExtA
+∗
+with fresh randomness. If it does not abort, let w∗ = (τˆD ∗ , ∗, ∗, M̂f ) denote the extracted
+output, otherwise w∗ := ⊥. Let E ∗ be the event that at least one event below occurs in
+the mental experiment:
+• Event B1 : (w∗ ̸= ⊥) ∧ (τˆD ∗ ̸= τˆD );
+ ∗
+• Event B2 : (τˆD ∗ = τˆD ) and pow(τˆD ) ̸= com M̂f .
+34
+
+Note that if BAD2 occurs in the mental experiment, then E ∗ also occurs. Moreover, BAD2
+occurs with the same probability in the real execution and the mental experiment. Thus,
+Pr[BAD2 ] ≤ Pr[E ∗ ] ≤ Pr[B1 ] + Pr[B2 ]. Suppose for contradiction that Pr[B1 ] > ϵbind , then
+we can find an adversary14 that breaks the binding property of com (·) with probability
+Pr[B1 ] > ϵbind , contradiction. Thus Pr[B1 ] ≤ ϵbind and it suffices to analyze Pr[B2 ].
+For every i ∈ [µ + 1], denote by u′i = (∗, s′(i) ∈ S̄ dk ) the folding challenge in the
+i-th transcript output by Ext in the mental experiment. Observe
+B2 im that
+ event
+∗
+∗)
+∗)
+∗
+′(i
+′(i
+plies that there exists i ∈ [µ + 1] where pow(τˆD )s
+̸= com M̂f s
+; moreover,
+ ∗ ∗
+
+
+∗
+∗
+com M̂f s′(i ) = com h(i ) by Property (3), where com h(i ) is in the transcript tri∗ .
+∗
+∗ 
+Thus, pow(τˆD )s′(i ) ̸= com h(i ) , but recall that the evaluation claim for τˆD holds.
+By Lemma 4.9, Ext calls the adversary for at most µ|S̄| times. For each fixed call,
+conditioned on that pow(τˆD )s′ ̸= com (h) (where s′ is the folding challenge and com (h)
+is the h-commitment sent by the prover in this call), by Lemma 2.6 and Lemma 2.7, the
+sumcheck evaluation claim holds w.r.t. τf
+ˆD with probability at most (log κ/|C|)2 + ϵsum . By
+union bound over the µ|S̄| calls, we have that
+ µ(log2 (κ) + (2 log n)2 )
+.
+Pr[B2 ] ≤ µ|S̄| · (log κ/|C|)2 + ϵsum ≤
+|C|
+We note that this is where we rely on running two independent sumchecks to ensure a small
+soundness error despite the large union bound. We will come back to this in Remark 4.9.
+In sum, Pr[BAD2 ] ≤ Pr[E ∗ ] ≤ Pr[B1 ] + Pr[B2 ] ≤ ϵ2 as claimed.
+Define BAD3 as the event that (i) Ext does not abort and (τˆD , M̂f ) in the extracted
+witness w is a valid opening of CMf ; but (ii) (x, w) ∈
+/ Rrg,B , where x is the input instance.
+Claim 3. Pr[BAD3 ] ≤ ϵ3 := ϵbind + ϵrg + (dk)/|S̄| + ϵsum .
+Proof. If BAD3 occurs, by Property (4), (5), we have that
+[τˆD , m̂τ , f̂ , M̂f s′(0) ]⊤ tensor(ro ) = e(0)
+o .
+And by Property (1) and the premise of BAD3 , τˆD , m̂τ , f̂ are valid openings of CMf =
+com (τˆD ) , cmmτ , cmf ; and (CMf , (τˆD , M̂f )) ∈ Rdopen,dk .
+Conditioned on Ext does not abort, define w′ = [τˆD , m̂τ , f̂ ] and consider a mental
+∗
+experiment where we re-run ExtA with fresh randomness. If it does not abort, let w∗
+denote the extracted output, otherwise w∗ := ⊥. Consider the first transcript generated by
+the re-execution. Let r, r∗o and e, eo , u be the random variables corresponding to the verifier
+′
+randomness and claimed evaluations at Step 1, Eq. (18) and Eq. (22). Let s∗ ∈ S̄ dk be the
+∗
+
+∗
+
+The collision attacker keeps re-running ExtA until Ext does not abort, and then re-executes ExtA one
+more time with fresh randomness.
+14
+
+35
+
+′
+
+folding challenge. Note that r, r∗o , s∗ are uniformly random, because the first transcript
+∗
+corresponds to the first call to A∗ , and thus ExtA cannot bias the distribution. Let E ∗ be
+the event that at least one event below occurs in the mental experiment:
+• B1 : (w∗ ̸= ⊥ ∧ w∗ ̸= w);
+• B2 : (w∗ = w) and (x, w) ∈
+/ Rrg,B and w⊤ tensor(r) = e;
+′
+
+• B3 : (w∗ = w) and w⊤ tensor(r) ̸= e and [w′ , M̂f s∗ ]⊤ tensor(r) = (e[0, 2], u);
+′
+
+′
+
+• B4 : (w∗ = w) and [w′ , M̂f s∗ ]⊤ tensor(r) ̸= (e[0, 2], u) and [w′ , M̂f s∗ ]⊤ tensor(r∗o ) = eo .
+By the binding property of com (·) and dcom (·) (Lemma 4.1), knowledge soundness of
+Πrgchk (Lemma 4.7), Lemma 2.6, and Lemma 2.7, we have that
+Pr [E ∗ ] ≤ Pr [B1 ] + Pr [B2 ] + Pr [B3 ] + Pr [B4 ]
+≤ ϵbind + ϵrg + dk/|S̄| + ϵsum .
+Note that if BAD3 occurs in the mental experiment, then E ∗ must also occur. Moreover,
+BAD3 occurs with the same probability in the real execution and the mental experiment.
+Thus Pr[BAD3 ] ≤ Pr[E ∗ ] and the claim holds.
+Conditioned on that Ext does not abort and BAD1 , BAD2 , BAD3 do not occur, the
+extracted witness w is valid for the input x, i.e., (x, w) ∈ Rrg,B . Thus, Πcm is knowledge
+sound with knowledge error ϵcm,k := (3 + dk)/|S̄| + ϵ1 + ϵ2 + ϵ3 . This completes the proof
+of Lemma 4.10.
+Remark 4.9. We need to run two parallel sumchecks at Step 5 because Claim 2 relies on a
+union bound over up to µ|S̄| adversary calls and the bound is meaningless if we only run
+one sumcheck. It is unclear whether this is merely a proof artifact or if a concrete attack
+exists. We leave it as an interesting future work.
+
+5
+
+Folding Generalized Committed Linear Relations
+
+In this section, we present a folding scheme for generalized committed linear relations
+(Definition 3.1). Fix norm bound B = (d′ )k where k ∈ N. Let L be the number of input
+instances and S̄ the folding challenge set. Let com (·) be a general linear commitment
+defined in Section 4.1. For simplicity, we assume that com (·) is (2B 2 , S̄ − S̄)-binding and15
+S̄ op L(d′ + 1 + B + dk) ≤ B 2 .
+
+(28)
+
+For an indexed relation R and m ∈ N, we use R(m) to denote the set of tuples
+(i, (xi , wi )i∈[m] ) such that (i, xi , wi ) ∈ R for all i ∈ [m]. Define online relation Rcomp :=
+15
+
+Our scheme naturally extends to more flexible choices of B and L.
+
+36
+
+(L−2)
+(2)
+Rlin,B and accumulated relation Racc := Rlin,B . Our goal is to build a reduction of
+knowledge from Rcomp × Racc to Racc . Our construction consists of two phases.
+(L)
+
+1. In Section 5.1, we reduce Rcomp × Racc = Rlin,B to Rlin,B 2 by leveraging and adapting
+the commitment-transformation protocol Πcm from Section 4.4.
+2. To avoid norm blowup and enable unbounded folding, Section 5.2 reduces Rlin,B 2 to
+(2)
+
+Racc = Rlin,B by adapting a decomposition technique from [BC24].
+Remark 5.1. One could also use the “decompose-then-fold” strategy from [BC24], which
+(L)
+(2L)
+decompose Rlin,B to R √ and then reduce back to Rlin,B via folding. This strategy allows
+lin, B
+a larger parameter B if needed, as the witness norm bound never exceeds B. However, it
+leads to a less efficient prover for computing 2L decomposed commitments.
+We state our main result below.
+Theorem 5.1. Fix S̄, L, B = (d′ )k such that |S̄| ≥ 2λ , (28) holds and assume that com (·) is
+(2B 2 , S̄ − S̄)-binding (Section 4.1). There exists a reduction of knowledge from Rcomp ×Racc
+(L−2)
+(2)
+to Racc , where Rcomp := Rlin,B and Racc := Rlin,B .
+Proof. The claim follows from Theorem 5.2, Lemma 5.1 and the sequential composition
+theorem (Theorem 2.1).
+
+5.1
+
+Folding
+(L)
+
+In this section, we show how to reduce Rlin,B to Rlin,B 2 . Let us first recall the definition of
+Rlin,B from Section 3. Given a triple (i, x, w) defined by
+i = (com (·) , (M(i) ∈ Rqn×n )i∈[nlin ] ) ,
+
+n
+x = (cmf ∈ Rqκ , r ∈ Mlog
+, v ∈ Mnq lin ) ,
+C
+
+w = f ∈ Rqn ,
+
+where MC := C × C and Mq := Rq × Rq , (i, x, w) is in the relation Rlin,B if
+
+
+(∥f ∥∞ < B) ∧ (cmf , f ) ∈ Ropen ∧ ⟨M(i) · f , tensor(r)⟩ = vi ∀i ∈ [nlin ]
+where the commitment opening relation Ropen is defined in (6). Notably, a statement
+(L)
+in Rlin,B consists of L different statements in Rlin,B with distinct challenge vectors ri .
+So we need a reduction that unifies the challenges ri into a single challenge ro in the
+output statement. Next, we first illustrate how to reduce from Rlin,B to Rlin,B 2 /L ; then via
+(L)
+
+batching, we extend the idea and show the reduction from Rlin,B to Rlin,B 2 .
+
+37
+
+Warm-up. We first show how to reduce a single statement in Rlin,B to Rlin,B 2 /L . While
+this basic scheme is primarily for illustration, we later extend it to reduce L > 1 statements
+(L)
+in Rlin,B to a single statement in Rlin,B 2 . Notably, the reduction from Rlin,B to Rlin,B 2
+unifies the challenges ri in the input statements to a single challenge ro in the output.
+Our scheme, Πlin,B , is a simple adaptation to Πcm in Construction 4.5. The key difference is that each linear check in Rlin,B is represented as a sumcheck claim, and a (batched)
+sumcheck protocol is used to reduce the claim to a fresh linear check in the output statement. More formally, for each ℓ ∈ [nlin ], let ⟨M(ℓ) f , tensor(r)⟩ = vℓ be the ℓ-th input linear
+check, we can rewrite it as a sumcheck claim
+X
+?
+m(⟨i⟩)eq(r, ⟨i⟩) = vℓ
+(29)
+i∈[n]
+
+P
+(ℓ)
+(ℓ)
+where m(⟨i⟩) is defined as m(⟨i⟩) := j∈[n] Mi,j fj = Mi,∗ f .
+By running a sumcheck protocol, we can reduce the claim in (29) to an evaluation claim
+e
+m(ro ) = vo,ℓ . By Remark 2.3, this is equivalent to
+X
+?
+(ℓ)
+e
+m(ro ) =
+(Mi,∗ f ) · tensor(ro )i = ⟨M(ℓ) f , tensor(ro )⟩ = vo,ℓ .
+i∈[n]
+?
+
+?
+
+In sum, we reduce ⟨M(ℓ) f , tensor(r)⟩ = vℓ to ⟨M(ℓ) f , tensor(ro )⟩ = vo,ℓ .
+The adapted protocol. We consider a protocol Π′cm that adapts Πcm (c.f. Construction 4.5). In Step 5, we have nlin more equations akin to (18), where the ℓ-th equation is
+of the form
+h
+i⊤
+?
+M(ℓ) [τD , mτ , f , h] · tensor(r) = e(ℓ) .
+Note that the prover provides the e(ℓ) -values prior to learning the folding challenges s, s′ .
+Then we transform these equations using the technique above, which lead to equations
+similar to (22), i.e., of the form
+h
+i⊤
+?
+M(ℓ) [τD , mτ , f , h] · tensor(ro ) = e(ℓ)
+o .
+(ℓ)
+
+Steps 6-8 of Π′cm are similar to those in Πcm , except that we also fold the eo values. The
+output relation of Π′cm is exactly Rlin,B 2 /L by definition of Rcom (17).
+We describe the protocol Πlin,B below:
+Construction 5.1. On input the index i = ((M(i) ∈ Rqn×n )i∈[nlin ] , com (·)) and
+n
+x = (cmf ∈ Rqκ , r ∈ Mlog
+, v ∈ Mnq lin ) ,
+C
+
+w = f ∈ Rqn
+
+where (i, x, w) ∈ Rlin,B , define the decomposed matrix Df for f as in (13). Set Mf ∈
+EXP(Df ), τD = split(com (Mf )) ∈ (−d′ , d′ )n where split is defined in Section 4.1, and
+mτ ∈ EXP(τD ). The protocol Πlin,B proceeds as follows:
+38
+
+1. P → V : Send commitments
+CMf = dcom (Mf ) = com (τD ) ∈ Rqκ ,
+
+cmmτ = com (mτ ) ∈ Rqκ .
+
+2. P ↔ V : Run protocol Π′cm , checking that ⟨M(i) f , tensor(r)⟩ = vi ∀i ∈ [nlin ], and
+
+x′ = (cmf , CMf , cmmτ ), w′ = (τD , mτ , f , Mf ) ∈ Rrg,B
+where Rrg,B is defined in (14).
+
+3. Return the reduced statement i, xo = (cmg , ro , vo ), wo = g ∈ Rqn ∈ Rlin,B 2 /L .
+By Eq. (28), Theorem 4.3, and the previous argument for reducing linear checks, Πlin,B
+is a reduction of knowledge from Rlin,B to Rlin,B 2 /L . The knowledge error ϵlin,k is identical
+to ϵcm,k (in Theorem 4.3).16
+Folding multiple inputs. Next, we extend Πlin,B to reduce multiple statements in the
+(L)
+committed linear relation to a single statement. Our goal is to reduce from Rlin,B to
+Rlin,B 2 . The construction is a simple adaptation of Construction 5.1 via batching. We can
+understand it as running L parallel instances of Πlin,B , but with two modifications: First,
+all of the concurrent sumchecks are compressed to one using random linear combination
+(c.f. Remark 2.6). Second, the output witness is a (randomly) folded sum of the L input
+(and intermediate) witnesses. This is equivalent to summing up the output witnesses from
+the L individual executions of Πlin,B .
+Construction 5.2. On input the index i = ((M(i) ∈ Rqn×n )i∈[nlin ] , com (·)) and
+o
+n
+
+n
+(i)
+nlin
+,
+v
+∈
+M
+)
+, w = fi ∈ Rqn i∈[L]
+x = xi = (cmfi ∈ Rqκ , ri ∈ Mlog
+q
+C
+i∈[L]
+
+(L)
+
+where (i, x, w) ∈ Rlin,B , the protocol Πmlin,L,B proceeds as follows:
+1. P ↔ V : Check (i, xi , fi ) ∈ Rlin,B ∀i ∈ [L] by running L executions of Πlin,B in parallel
+and compressing the sumcheck claims to a single one using random linear combination
+(c.f. Remark 2.6).
+(i)
+
+2. Denote by {(cmgi , ro , vo , gi ) ∈ Rlin,B 2 /L }i∈[L] the reduced statements of the L
+(batched) executions of Πlin,B . Return the reduced statement
+
+
+
+
+X
+X
+X
+x = 
+cmgi , ro ,
+vo(i)  , w =
+gi  ∈ Rlin,B 2 .
+i∈[L]
+
+i∈[L]
+
+16
+
+i∈[L]
+
+The difference between Πlin,B and Πcm is that we have more sumcheck claims to verify at Step 5, which
+can be compressed to one using the technique from Remark 2.6.
+
+39
+
+Theorem 5.2. If com (·) is (2B 2 , S = S̄ − S̄)-binding and Eq. (28) holds, then Πmlin,L,B
+(L)
+is a reduction of knowledge from Rlin,B to Rlin,B 2 with knowledge error ϵmlin,B,L ≤ L · ϵlin,k .
+Proof. Public reducibility and completeness follows from that of Πlin,B . The proof of knowledge soundness is almost identical to that of Theorem 4.3, except that the number of folding
+challenges is multiplied by L.
+
+5.2
+
+Decomposition
+(2)
+
+In this section, we show how to reduce Rlin,B 2 to Rlin,B . The scheme is a simple adaptation
+to the decomposition protocol from [BC24].
+Construction 5.3. On input the index i = ((M(i) ∈ Rqn×n )i∈[nlin ] , com (·)) and
+n
+x = (cmf ∈ Rqκ , r ∈ Mlog
+, v ∈ Mnq lin ) ,
+C
+
+w = (f ∈ Rqn )
+
+such that (i, x, w) ∈ Rlin,B 2 , the protocol Πdecomp,B proceeds as follows:
+1. P → V : Decompose f to F = [F(0) , F(1) ] ∈ Rqn×2 according to Footnote 3, such that
+∥F∥∞ < B and f = F × [1, B]⊤ . Denote the commitment C = com (F) ∈ Rqκ×2 and
+values v(0) , v(1) ∈ Mnq lin such that for all i ∈ [2],
+(i, xi = (C∗,i , r, v(i) ), wi = F(i) ) ∈ Rlin,B .
+Send C and (v(i) )i∈[2] .
+?
+
+?
+
+2. V : Check C × [1, B]⊤ = cmf and v(0) + Bv(1) = v. Return ⊥ if fail.
+3. Return the reduced statement xo = (C∗,i , r, v(i) )i∈[2] and wo = F.
+Remark 5.2. In applications like IVC/PCDs, L is typically kept small (e.g., < 10) to
+minimize the folding verifier circuit size, thus the norm b̄ of the output witness in Construction 5.2 is much smaller than B 2 . In this case, to improve efficiency, we can delay the
+decomposition step√until more folding steps are completed, or replace the norm bound B
+in Πdecomp,B with b̄ < B.
+(2)
+
+Lemma 5.1. Πdecomp,B is RoK from Rlin,B 2 to Rlin,B with no knowledge error.
+Proof. The proof is a simple adaptation to that in Lemma 3.3 of [BC24]. Public reducibility and completeness are trivial. Next, we prove knowledge soundness. Given malicious prover’s output xo = (C∗,i , r, v(i) )i∈[2] and wo = F, the extractor simply outputs
+(2)
+
+f := F×[1, B]⊤ . If the verifier checks at Step 2 pass and (xo , wo ) ∈ Rlin,B , then ∥f ∥∞ < B 2 ,
+and other checks in Rlin,B 2 are satisfied w.r.t. x = (cmf , r, v). Thus, (i, x, f ) ∈ Rlin,B 2 and
+the claim holds.
+40
+
+5.3
+
+Efficiency estimate
+
+Next, we analyze the complexity of the reduction of knowledge from Rcomp × Racc to Racc .
+The scheme we consider is the version that applies the technique from Remark 4.6 and
+Remark 4.7.
+Theorem 5.3. Fix S̄, L, B = (d′ )k such that |S̄| ≥ 2λ and (28) holds. Assume that
+com (·) : Rqn → Rqκ is (2B 2 , S̄ − S̄)-binding and d ≫ max(κ, log n). Let nlin be the number of
+linear checks in Rlin,B . The RoK from Rcomp ×Racc to Racc , combined with the optimization
+in Remark 4.6 and Remark 4.7, has the following complexity:
+Prover time: Dominated by Lnκ Rq -multiplications and O(Lnκdk) Rq -additions.
+Verifier time (excluding hashing): Dominated by O(Ldk) Rq -multiplications.
+Online instance size: (L − 2) · [(κ + 2nlin ) · log |Rq | + 2 log n log |C|] bits.
+Accumulated instance size: 2 · [(κ + 2nlin ) · log |Rq | + 2 log n log |C|] bits.
+Folding proof size: Dominated by L(5κ + 6) + 10 Rq -elements, L(dk + 5) S̄-elements,
+and L(2dk + d + 1) C-elements.
+Remark 5.3 (Further optimizing proof sizes). We can further shorten the proof size by
+replacing the 5L commitments with 5 commitments. The idea is to have a single batch
+of helper commitments (e.g., dcom (Mf ) , com (mτ ) , com (h), etc.) for all of the L inputs,
+rather than having separate helper commitments for each input.
+Remark 5.4. An S̄-element is much smaller than an Rq -element. E.g., if we choose d = 64
+and each coordinate of S̄ to be in {−1, 0, 1, 2}, it takes less than 2d bits to represent an
+element in S̄, compared to d log q bits for an Rq -element.
+Proof of Theorem 5.3. We first analyze prover complexity. Since the sumchecks are all
+instantiated over fields (See Remark 4.6), even with more parallel repetitions (or running
+over extension fields) for small q, they remain much cheaper than computing commitments
+over Rq . Also, it is much more efficient to compute the commitments to τD ∈ (−d′ , d′ )n and
+mτ = exp(τD ) (at Step 1) than standard Ajtai commitments: com (τD ) only requires scalar
+multiplications rather than Rq -multiplications; and because mτ ∈ Mn , by Remark 4.3,
+com (mτ ) takes only O(nκ) Rq -additions.
+Therefore, for each online input i ∈ [L − 2], the dominant cost is for computing com (fi )
+(which takes nκ Rq -multiplications), plus the task of computing com (Mfi ) where Mfi ∈
+Mn×dk . By Remark 4.3, the latter takes O(nκdk) Rq -additions. Additionally, the prover
+needs to compute two decomposed commitments in Πdecomp, . Thus the prover complexity
+is as claimed.
+Next, we analyze verifier complexity. With the optimization from Remark 4.7, there are
+two main expensive steps: (i) the sumcheck verifier at Step 5 of Construction 4.5, which
+takes O(dk) Rq -operations for each input i ∈ [L]; (ii) the folding operation at Step 6,
+which takes O(κ) Rq -operation for each input i ∈ [L]. Since d ≫ κ in practice, the verifier
+complexity is as claimed.
+41
+
+The instance sizes are correct by inspection. Next, we analyze the folding proof size.
+Since the sumchecks are instantiated over fields and only have log n ≪ d rounds, their
+communication complexities are much smaller compared to commitments and Rq -elements.
+For each input i ∈ [L], besides the 2 commitments, 2 Rq -elements, and 2dk C-elements
+introduced from the optimization in Remark 4.7, the proof size is dominated by the 2
+commitments CMf , cmmτ sent at Step 1 of Construction 5.1, the dk + 5 folding challenges
+(s, s′ ) in S̄ sent at Step 2, the com (h)-commitment sent at Step 3, and the 4 Rq -elements
+e[0..2], u in Construction 4.5. Additionally, the verifier sends a vector (v, a) ∈ C d+1 at
+Step 2 of Construction 4.4. In total, they are (5κ + 6) Rq -elements, dk + 5 S̄-elements,
+and 2dk + d + 1 C-elements, all multiplied by L. Finally, we need to separately add the
+eo -values (consisting of 8 + 2 Rq -elements) at Step 5 of Construction 4.5. Thus the claim
+holds.
+Comparison with LatticeFold. LatticeFold+ is a significant improvement over LatticeFold [BC24], both asymptotically and concretely.
+In LatticeFold, the prover’s complexity is dominated by an n-sized degree-4 sumcheck
+over Rq and the computation of L log2 (B) decomposed commitments. This requires at least
+O(Lnκ log2 (B) Rq -multiplication, which is Ω(log2 (B))-times worse than LatticeFold+.
+The verifier circuit size of LatticeFold+, dominated by the Fiat-Shamir transform, is
+also much better. In LatticeFold, it takes more than L log2 (B) decomposed commitments
+and Ω(log2 (n)) Rq -elements (for sumcheck executions) into its transcript. This is at least
+Ω(log2 (B))-times worse than LatticeFold+.
+Concrete prover complexity. By Theorem 5.3, Remark 4.3, Remark 4.6, for typical
+parameters (e.g., 128-bit or 64-bit q), we expect prover time to be comparable to the
+cost of only committing to input witnesses. Given the high efficiency of module-based
+Ajtai commitments (e.g., see Footnote 2), we anticipate promising performance and leave
+concrete implementation for future work.
+Concrete verifier circuit size for Fiat-Shamir. As noted in Remark 4.7, proof size is
+crucial to minimize recursive verifier circuit complexity in applications like IVC/PCD. We
+provide a candidate set of parameters to show how small the Fiat-Shamir verifier circuit
+can be. While not highly optimized, this choice serves as a baseline, and we expect further
+efficiency gains with better parameter tuning.
+L
+3
+
+q
+128-bit
+
+d
+64
+
+n
+221
+
+S̄
+{−1, 0, 1, 2}d
+
+B
+210
+
+k
+2
+
+κ
+9
+
+# of hashes for Fiat-Shamir
+≲ 100
+
+The parameters are chosen for 128-bit conjectured hardness against the best-known attacks
+on Module-SIS [APS15; Esg+19; ADPS16; BDGL16]. The prime q is selected so that Rq
+
+42
+
+splits into 16 factors, and by Lemma 2.4, S̄ is indeed a strong sampling set. We set n = 221
+to allow proving a R1CS statements over17 Fq4 of size 16 · 221 = 225 .
+The folding proof size is under 200KB without the optimization from Remark 5.3 and
+≲ 100KB with the optimization. This corresponds to ≲ 100 hashes (over Rq ) in the FiatShamir transform circuit, which dominates the circuit cost of our recursive folding verifier.
+While LaBRADOR achieves even smaller proof sizes for the Fiat-Shamir transform, its
+linear-time verifier prevents its use in recursive SNARKs. We also emphasize that, in
+folding-based IVC schemes, folding proofs serve as recursive witnesses and are not part of
+the final output proof.
+
+6
+
+Conclusion and future work
+
+We presented LatticeFold+, a lattice-based folding technique that leverages a new purely
+algebraic ring-based range check along with a commitment transformation protocol that
+converts a statement about double commitments into a linear statement that can be folded.
+The result is a lattice-based folding system that is faster than LatticeFold, produces shorter
+proofs, and has a simpler verification circuit.
+This work raises two interesting directions for future work. First, throughout the paper
+we used the ℓ∞ norm rather than ℓ2 to simplify the analysis of our sub-protocols. However,
+the ℓ∞ norm leads to slightly worse parameters in the definition of Module-SIS compared
+to ℓ2 . It would be interesting to develop an ℓ2 variant of all of our protocols. Second,
+we defined all of our protocols over Zq modules for a prime q. In practice, there may be
+interest in implementing these protocols modulo a power of two. It would be interesting
+to generalize all these results to operate over a non-prime modulus.
+Acknowledgments. We sincerely thank the anonymous CRYPTO reviewers for their
+helpful comments. We also thank Wilson Nguyen for noting the equivalence between the
+tensor-of-rings framework and Neo’s approach for supporting small moduli. This work
+was funded by NSF, DARPA, the Simons Foundation, and UBRI. Opinions, findings, and
+conclusions or recommendations expressed in this material are those of the authors and do
+not necessarily reflect the views of DARPA.
+
+References
+[ACK21]
+
+17
+
+Thomas Attema, Ronald Cramer, and Lisa Kohl. “A Compressed Σ-Protocol
+Theory for Lattices”. In: CRYPTO 2021, Part II. Ed. by Tal Malkin and
+Chris Peikert. Vol. 12826. LNCS. Virtual Event: Springer, Cham, Aug. 2021,
+pp. 549–579. doi: 10.1007/978-3-030-84245-1_19.
+
+By Remark 4.1 of [BC24], we can pack 16 R1CS field constraints to an Rq -constraint.
+
+43
+
+[ADPS16]
+
+Erdem Alkim, Léo Ducas, Thomas Pöppelmann, and Peter Schwabe. “Postquantum Key Exchange - A New Hope”. In: USENIX Security 2016. Ed. by
+Thorsten Holz and Stefan Savage. USENIX Association, Aug. 2016, pp. 327–
+343.
+
+[AHIV17]
+
+Scott Ames, Carmit Hazay, Yuval Ishai, and Muthuramakrishnan Venkitasubramaniam. “Ligero: Lightweight Sublinear Arguments Without a Trusted
+Setup”. In: ACM CCS 2017. Ed. by Bhavani M. Thuraisingham, David
+Evans, Tal Malkin, and Dongyan Xu. ACM Press, 2017, pp. 2087–2104. doi:
+10.1145/3133956.3134104.
+
+[Ajt96]
+
+Miklós Ajtai. “Generating Hard Instances of Lattice Problems (Extended
+Abstract)”. In: 28th ACM STOC. ACM Press, May 1996, pp. 99–108. doi:
+10.1145/237814.237838.
+
+[AL21]
+
+Martin R. Albrecht and Russell W. F. Lai. “Subtractive Sets over Cyclotomic
+Rings - Limits of Schnorr-Like Arguments over Lattices”. In: CRYPTO 2021,
+Part II. Ed. by Tal Malkin and Chris Peikert. Vol. 12826. LNCS. Virtual
+Event: Springer, Cham, Aug. 2021, pp. 519–548. doi: 10.1007/978-3-03084245-1_18.
+
+[Alb+22]
+
+Martin R. Albrecht, Valerio Cini, Russell W. F. Lai, Giulio Malavolta, and
+Sri Aravinda Krishnan Thyagarajan. “Lattice-Based SNARKs: Publicly Verifiable, Preprocessing, and Recursively Composable - (Extended Abstract)”.
+In: CRYPTO 2022, Part II. Ed. by Yevgeniy Dodis and Thomas Shrimpton.
+Vol. 13508. LNCS. Springer, Cham, Aug. 2022, pp. 102–132. doi: 10.1007/
+978-3-031-15979-4_4.
+
+[ALS20]
+
+Thomas Attema, Vadim Lyubashevsky, and Gregor Seiler. “Practical Product Proofs for Lattice Commitments”. In: CRYPTO 2020, Part II. Ed. by
+Daniele Micciancio and Thomas Ristenpart. Vol. 12171. LNCS. Springer,
+Cham, Aug. 2020, pp. 470–499. doi: 10.1007/978-3-030-56880-1_17.
+
+[APS15]
+
+Martin R Albrecht, Rachel Player, and Sam Scott. “On the concrete hardness
+of learning with errors”. In: Journal of Mathematical Cryptology 9.3 (2015),
+pp. 169–203.
+
+[AS24]
+
+Arasu Arun and Srinath Setty. Nebula: Efficient read-write memory and
+switchboard circuits for folding schemes. Cryptology ePrint Archive, Paper
+2024/1605. 2024. url: https://eprint.iacr.org/2024/1605.
+
+[Bau+18]
+
+Carsten Baum, Jonathan Bootle, Andrea Cerulli, Rafaël del Pino, Jens Groth,
+and Vadim Lyubashevsky. “Sub-linear Lattice-Based Zero-Knowledge Arguments for Arithmetic Circuits”. In: CRYPTO 2018, Part II. Ed. by Hovav
+Shacham and Alexandra Boldyreva. Vol. 10992. LNCS. Springer, Cham, Aug.
+2018, pp. 669–699. doi: 10.1007/978-3-319-96881-0_23.
+44
+
+[BBBF18]
+
+Dan Boneh, Joseph Bonneau, Benedikt Bünz, and Ben Fisch. “Verifiable
+Delay Functions”. In: CRYPTO 2018, Part I. Ed. by Hovav Shacham and
+Alexandra Boldyreva. Vol. 10991. LNCS. Springer, Cham, Aug. 2018, pp. 757–
+788. doi: 10.1007/978-3-319-96884-1_25.
+
+[BBHR18a]
+
+Eli Ben-Sasson, Iddo Bentov, Yinon Horesh, and Michael Riabzev. “Fast
+Reed-Solomon Interactive Oracle Proofs of Proximity”. In: ICALP 2018. Ed.
+by Ioannis Chatzigiannakis, Christos Kaklamanis, Dániel Marx, and Donald
+Sannella. Vol. 107. LIPIcs. Schloss Dagstuhl, July 2018, 14:1–14:17. doi: 10.
+4230/LIPIcs.ICALP.2018.14.
+
+[BBHR18b]
+
+Eli Ben-Sasson, Iddo Bentov, Yinon Horesh, and Michael Riabzev. Scalable,
+transparent, and post-quantum secure computational integrity. Cryptology
+ePrint Archive, Report 2018/046. 2018. url: https://eprint.iacr.org/
+2018/046.
+
+[BC23]
+
+Benedikt Bünz and Binyi Chen. “Protostar: Generic Efficient Accumulation/Folding for Special-Sound Protocols”. In: ASIACRYPT 2023, Part II.
+Ed. by Jian Guo and Ron Steinfeld. Vol. 14439. LNCS. Springer, Singapore,
+Dec. 2023, pp. 77–110. doi: 10.1007/978-981-99-8724-5_3.
+
+[BC24]
+
+Dan Boneh and Binyi Chen. LatticeFold: A Lattice-based Folding Scheme
+and its Applications to Succinct Proof Systems. Cryptology ePrint Archive,
+Report 2024/257. 2024. url: https://eprint.iacr.org/2024/257.
+
+[BCMS20]
+
+Benedikt Bünz, Alessandro Chiesa, Pratyush Mishra, and Nicholas Spooner.
+“Recursive Proof Composition from Accumulation Schemes”. In: TCC 2020,
+Part II. Ed. by Rafael Pass and Krzysztof Pietrzak. Vol. 12551. LNCS.
+Springer, Cham, Nov. 2020, pp. 1–18. doi: 10.1007/978-3-030-64378-2_1.
+
+[BCPS18]
+
+Anurag Bishnoi, Pete L Clark, Aditya Potukuchi, and John R Schmitt. “On
+zeros of a polynomial in a finite grid”. In: Combinatorics, Probability and
+Computing 27.3 (2018), pp. 310–333.
+
+[BCS21]
+
+Jonathan Bootle, Alessandro Chiesa, and Katerina Sotiraki. “Sumcheck Arguments and Their Applications”. In: CRYPTO 2021, Part I. Ed. by Tal
+Malkin and Chris Peikert. Vol. 12825. LNCS. Virtual Event: Springer, Cham,
+Aug. 2021, pp. 742–773. doi: 10.1007/978-3-030-84242-0_26.
+
+[BCS23]
+
+Jonathan Bootle, Alessandro Chiesa, and Katerina Sotiraki. “Lattice-Based
+Succinct Arguments for NP with Polylogarithmic-Time Verification”. In:
+CRYPTO 2023, Part II. Ed. by Helena Handschuh and Anna Lysyanskaya.
+Vol. 14082. LNCS. Springer, Cham, Aug. 2023, pp. 227–251. doi: 10.1007/
+978-3-031-38545-2_8.
+
+45
+
+[BCTV14]
+
+Eli Ben-Sasson, Alessandro Chiesa, Eran Tromer, and Madars Virza. “Scalable Zero Knowledge via Cycles of Elliptic Curves”. In: CRYPTO 2014,
+Part II. Ed. by Juan A. Garay and Rosario Gennaro. Vol. 8617. LNCS.
+Springer, Berlin, Heidelberg, Aug. 2014, pp. 276–294. doi: 10.1007/978-3662-44381-1_16.
+
+[BDFG21]
+
+Dan Boneh, Justin Drake, Ben Fisch, and Ariel Gabizon. “Halo Infinite:
+Proof-Carrying Data from Additive Polynomial Commitments”. In: CRYPTO 2021,
+Part I. Ed. by Tal Malkin and Chris Peikert. Vol. 12825. LNCS. Virtual
+Event: Springer, Cham, Aug. 2021, pp. 649–680. doi: 10.1007/978-3-03084242-0_23.
+
+[BDGL16]
+
+Anja Becker, Léo Ducas, Nicolas Gama, and Thijs Laarhoven. “New directions in nearest neighbor searching with applications to lattice sieving”. In:
+27th SODA. Ed. by Robert Krauthgamer. ACM-SIAM, Jan. 2016, pp. 10–24.
+doi: 10.1137/1.9781611974331.ch2.
+
+[Ben+19]
+
+Eli Ben-Sasson, Alessandro Chiesa, Michael Riabzev, Nicholas Spooner, Madars
+Virza, and Nicholas P. Ward. “Aurora: Transparent Succinct Arguments for
+R1CS”. In: EUROCRYPT 2019, Part I. Ed. by Yuval Ishai and Vincent
+Rijmen. Vol. 11476. LNCS. Springer, Cham, May 2019, pp. 103–128. doi:
+10.1007/978-3-030-17653-2_4.
+
+[BGH19]
+
+Sean Bowe, Jack Grigg, and Daira Hopwood. Halo: Recursive Proof Composition without a Trusted Setup. Cryptology ePrint Archive, Report 2019/1021.
+2019. url: https://eprint.iacr.org/2019/1021.
+
+[BLNS20]
+
+Jonathan Bootle, Vadim Lyubashevsky, Ngoc Khanh Nguyen, and Gregor
+Seiler. “A Non-PCP Approach to Succinct Quantum-Safe Zero-Knowledge”.
+In: CRYPTO 2020, Part II. Ed. by Daniele Micciancio and Thomas Ristenpart. Vol. 12171. LNCS. Springer, Cham, Aug. 2020, pp. 441–469. doi:
+10.1007/978-3-030-56880-1_16.
+
+[BMNW24]
+
+Benedikt Bünz, Pratyush Mishra, Wilson Nguyen, and William Wang. Arc:
+Accumulation for Reed–Solomon Codes. Cryptology ePrint Archive, Paper
+2024/1731. 2024. url: https://eprint.iacr.org/2024/1731.
+
+[Bre+24]
+
+Martijn Brehm, Binyi Chen, Ben Fisch, Nicolas Resch, Ron D. Rothblum,
+and Hadas Zeilberger. Blaze: Fast SNARKs from Interleaved RAA Codes.
+Cryptology ePrint Archive, Paper 2024/1609. 2024. url: https://eprint.
+iacr.org/2024/1609.
+
+[BS23]
+
+Ward Beullens and Gregor Seiler. “LaBRADOR: Compact Proofs for R1CS
+from Module-SIS”. In: CRYPTO 2023, Part V. Ed. by Helena Handschuh and
+Anna Lysyanskaya. Vol. 14085. LNCS. Springer, Cham, Aug. 2023, pp. 518–
+548. doi: 10.1007/978-3-031-38554-4_17.
+46
+
+[Bün+18]
+
+Benedikt Bünz, Jonathan Bootle, Dan Boneh, Andrew Poelstra, Pieter Wuille,
+and Greg Maxwell. “Bulletproofs: Short Proofs for Confidential Transactions
+and More”. In: 2018 IEEE Symposium on Security and Privacy. IEEE Computer Society Press, May 2018, pp. 315–334. doi: 10.1109/SP.2018.00020.
+
+[Bün+21]
+
+Benedikt Bünz, Alessandro Chiesa, William Lin, Pratyush Mishra, and Nicholas
+Spooner. “Proof-Carrying Data Without Succinct Arguments”. In: CRYPTO 2021,
+Part I. Ed. by Tal Malkin and Chris Peikert. Vol. 12825. LNCS. Virtual
+Event: Springer, Cham, Aug. 2021, pp. 681–710. doi: 10.1007/978-3-03084242-0_24.
+
+[CBBZ23]
+
+Binyi Chen, Benedikt Bünz, Dan Boneh, and Zhenfei Zhang. “HyperPlonk:
+Plonk with Linear-Time Prover and High-Degree Custom Gates”. In: EUROCRYPT 2023, Part II. Ed. by Carmit Hazay and Martijn Stam. Vol. 14005.
+LNCS. Springer, Cham, Apr. 2023, pp. 499–530. doi: 10.1007/978-3-03130617-4_17.
+
+[CCKP19]
+
+Shuo Chen, Jung Hee Cheon, Dongwoo Kim, and Daejun Park. Verifiable
+Computing for Approximate Computation. Cryptology ePrint Archive, Report 2019/762. 2019. url: https://eprint.iacr.org/2019/762.
+
+[CMNW24]
+
+Valerio Cini, Giulio Malavolta, Ngoc Khanh Nguyen, and Hoeteck Wee.
+“Polynomial Commitments from Lattices: Post-quantum Security, Fast Verification and Transparent Setup”. In: CRYPTO 2024, Part X. Ed. by Leonid
+Reyzin and Douglas Stebila. Vol. 14929. LNCS. Springer, Cham, Aug. 2024,
+pp. 207–242. doi: 10.1007/978-3-031-68403-6_7.
+
+[COS20]
+
+Alessandro Chiesa, Dev Ojha, and Nicholas Spooner. “Fractal: Post-quantum
+and Transparent Recursive Proofs from Holography”. In: EUROCRYPT 2020,
+Part I. Ed. by Anne Canteaut and Yuval Ishai. Vol. 12105. LNCS. Springer,
+Cham, May 2020, pp. 769–793. doi: 10.1007/978-3-030-45721-1_27.
+
+[CT10]
+
+Alessandro Chiesa and Eran Tromer. “Proof-Carrying Data and Hearsay Arguments from Signature Cards”. In: ICS 2010. Ed. by Andrew Chi-Chih Yao.
+Tsinghua University Press, Jan. 2010, pp. 310–331.
+
+[CWSK24]
+
+Bing-Jyue Chen, Suppakit Waiwitlikhit, Ion Stoica, and Daniel Kang. “ZKML:
+An Optimizing System for ML Inference in Zero-Knowledge Proofs”. In: Proceedings of the Nineteenth European Conference on Computer Systems, EuroSys 2024, Athens, Greece, April 22-25, 2024. ACM, 2024, pp. 560–574. doi:
+10.1145/3627703.3650088. url: https://doi.org/10.1145/3627703.
+3650088.
+
+[DB22]
+
+Trisha Datta and Dan Boneh. Using ZK Proofs to Fight Disinformation. link.
+2022.
+
+47
+
+[DP24]
+
+Benjamin E. Diamond and Jim Posen. Polylogarithmic Proofs for Multilinears
+over Binary Towers. Cryptology ePrint Archive, Report 2024/504. 2024. url:
+https://eprint.iacr.org/2024/504.
+
+[EG23]
+
+Liam Eagen and Ariel Gabizon. ProtoGalaxy: Efficient ProtoStar-style folding of multiple instances. Cryptology ePrint Archive, Report 2023/1106.
+2023. url: https://eprint.iacr.org/2023/1106.
+
+[ENS20]
+
+Muhammed F. Esgin, Ngoc Khanh Nguyen, and Gregor Seiler. “Practical Exact Proofs from Lattices: New Techniques to Exploit Fully-Splitting Rings”.
+In: ASIACRYPT 2020, Part II. Ed. by Shiho Moriai and Huaxiong Wang.
+Vol. 12492. LNCS. Springer, Cham, Dec. 2020, pp. 259–288. doi: 10.1007/
+978-3-030-64834-3_9.
+
+[Esg+19]
+
+Muhammed F. Esgin, Ron Steinfeld, Amin Sakzad, Joseph K. Liu, and
+Dongxi Liu. “Short Lattice-Based One-out-of-Many Proofs and Applications
+to Ring Signatures”. In: ACNS 19International Conference on Applied Cryptography and Network Security. Ed. by Robert H. Deng, Valérie GauthierUmaña, Martı́n Ochoa, and Moti Yung. Vol. 11464. LNCS. Springer, Cham,
+June 2019, pp. 67–88. doi: 10.1007/978-3-030-21568-2_4.
+
+[FKNP24]
+
+Giacomo Fenzi, Christian Knabenhans, Ngoc Khanh Nguyen, and Duc Tu
+Pham. “Lova: Lattice-Based Folding Scheme from Unstructured Lattices”.
+In: ASIACRYPT 2024, Part IV. Ed. by Kai-Min Chung and Yu Sasaki.
+Vol. 15487. LNCS. Springer, Singapore, Dec. 2024, pp. 303–326. doi: 10 .
+1007/978-981-96-0894-2_10.
+
+[FMN24]
+
+Giacomo Fenzi, Hossein Moghaddas, and Ngoc Khanh Nguyen. “LatticeBased Polynomial Commitments: Towards Asymptotic and Concrete Efficiency”. In: Journal of Cryptology 37.3 (July 2024), p. 31. doi: 10.1007/
+s00145-024-09511-8.
+
+[Gol+23]
+
+Alexander Golovnev, Jonathan Lee, Srinath T. V. Setty, Justin Thaler, and
+Riad S. Wahby. “Brakedown: Linear-Time and Field-Agnostic SNARKs for
+R1CS”. In: CRYPTO 2023, Part II. Ed. by Helena Handschuh and Anna
+Lysyanskaya. Vol. 14082. LNCS. Springer, Cham, Aug. 2023, pp. 193–226.
+doi: 10.1007/978-3-031-38545-2_7.
+
+[KHSS22]
+
+Daniel Kang, Tatsunori Hashimoto, Ion Stoica, and Yi Sun. ZK-IMG: Attested Images via Zero-Knowledge Proofs to Fight Disinformation. 2022. eprint:
+2211.04775.
+
+[KLNO24]
+
+Michael Klooß, Russell W. F. Lai, Ngoc Khanh Nguyen, and Michal Osadnik.
+“RoK, Paper, SISsors Toolkit for Lattice-Based Succinct Arguments - (Extended Abstract)”. In: ASIACRYPT 2024, Part V. Ed. by Kai-Min Chung
+and Yu Sasaki. Vol. 15488. LNCS. Springer, Singapore, Dec. 2024, pp. 203–
+235. doi: 10.1007/978-981-96-0935-2_7.
+48
+
+[KP23]
+
+Abhiram Kothapalli and Bryan Parno. “Algebraic Reductions of Knowledge”.
+In: CRYPTO 2023, Part IV. Ed. by Helena Handschuh and Anna Lysyanskaya. Vol. 14084. LNCS. Springer, Cham, Aug. 2023, pp. 669–701. doi:
+10.1007/978-3-031-38551-3_21.
+
+[KS24a]
+
+Abhiram Kothapalli and Srinath Setty. NeutronNova: Folding everything that
+reduces to zero-check. Cryptology ePrint Archive, Paper 2024/1606. 2024.
+url: https://eprint.iacr.org/2024/1606.
+
+[KS24b]
+
+Abhiram Kothapalli and Srinath T. V. Setty. “HyperNova: Recursive Arguments for Customizable Constraint Systems”. In: CRYPTO 2024, Part X.
+Ed. by Leonid Reyzin and Douglas Stebila. Vol. 14929. LNCS. Springer,
+Cham, Aug. 2024, pp. 345–379. doi: 10.1007/978-3-031-68403-6_11.
+
+[KST22]
+
+Abhiram Kothapalli, Srinath Setty, and Ioanna Tzialla. “Nova: Recursive
+Zero-Knowledge Arguments from Folding Schemes”. In: CRYPTO 2022, Part IV.
+Ed. by Yevgeniy Dodis and Thomas Shrimpton. Vol. 13510. LNCS. Springer,
+Cham, Aug. 2022, pp. 359–388. doi: 10.1007/978-3-031-15985-5_13.
+
+[LM06]
+
+Vadim Lyubashevsky and Daniele Micciancio. “Generalized Compact Knapsacks Are Collision Resistant”. In: ICALP 2006, Part II. Ed. by Michele
+Bugliesi, Bart Preneel, Vladimiro Sassone, and Ingo Wegener. Vol. 4052.
+LNCS. Springer, Berlin, Heidelberg, July 2006, pp. 144–155. doi: 10.1007/
+11787006_13.
+
+[LNP22]
+
+Vadim Lyubashevsky, Ngoc Khanh Nguyen, and Maxime Plançon. “LatticeBased Zero-Knowledge Proofs and Applications: Shorter, Simpler, and More
+General”. In: CRYPTO 2022, Part II. Ed. by Yevgeniy Dodis and Thomas
+Shrimpton. Vol. 13508. LNCS. Springer, Cham, Aug. 2022, pp. 71–101. doi:
+10.1007/978-3-031-15979-4_3.
+
+[LS15]
+
+Adeline Langlois and Damien Stehlé. “Worst-case to average-case reductions
+for module lattices”. In: DCC 75.3 (2015), pp. 565–599. doi: 10 . 1007 /
+s10623-014-9938-4.
+
+[LS18]
+
+Vadim Lyubashevsky and Gregor Seiler. “Short, Invertible Elements in Partially Splitting Cyclotomic Rings and Applications to Lattice-Based ZeroKnowledge Proofs”. In: EUROCRYPT 2018, Part I. Ed. by Jesper Buus
+Nielsen and Vincent Rijmen. Vol. 10820. LNCS. Springer, Cham, 2018, pp. 204–
+224. doi: 10.1007/978-3-319-78381-9_8.
+
+[Moh23]
+
+Nicolas Mohnblatt. Sangria: a folding scheme for PLONK. link. 2023.
+
+[NBS23]
+
+Wilson D. Nguyen, Dan Boneh, and Srinath T. V. Setty. “Revisiting the
+Nova Proof System on a Cycle of Curves”. In: 5th Conference on Advances
+in Financial Technologies, AFT 2023. Vol. 282. LIPIcs. 2023, 18:1–18:22.
+
+49
+
+doi: 10.4230/LIPICS.AFT.2023.18. url: https://doi.org/10.4230/
+LIPIcs.AFT.2023.18.
+[Net24]
+
+Nethermind. Latticefold and lattice-based operations performance report. 2024.
+
+[Ngu+24]
+
+Wilson D. Nguyen, Trisha Datta, Binyi Chen, Nirvan Tyagi, and Dan Boneh.
+“Mangrove: A Scalable Framework for Folding-Based SNARKs”. In: CRYPTO 2024,
+Part X. Ed. by Leonid Reyzin and Douglas Stebila. Vol. 14929. LNCS.
+Springer, Cham, Aug. 2024, pp. 308–344. doi: 10.1007/978-3-031-684036_10.
+
+[NS24]
+
+Ngoc Khanh Nguyen and Gregor Seiler. “Greyhound: Fast Polynomial Commitments from Lattices”. In: CRYPTO 2024, Part X. Ed. by Leonid Reyzin
+and Douglas Stebila. Vol. 14929. LNCS. Springer, Cham, Aug. 2024, pp. 243–
+275. doi: 10.1007/978-3-031-68403-6_8.
+
+[NS25]
+
+Wilson Nguyen and Srinath Setty. Neo: Lattice-based folding scheme for CCS
+over small fields and pay-per-bit commitments. Cryptology ePrint Archive,
+Report 2025/294. 2025. url: https://eprint.iacr.org/2025/294.
+
+[NT16]
+
+Assa Naveh and Eran Tromer. “PhotoProof: Cryptographic Image Authentication for Any Set of Permissible Transformations”. In: 2016 IEEE Symposium on Security and Privacy. IEEE Computer Society Press, May 2016,
+pp. 255–271. doi: 10.1109/SP.2016.23.
+
+[PR06]
+
+Chris Peikert and Alon Rosen. “Efficient Collision-Resistant Hashing from
+Worst-Case Assumptions on Cyclic Lattices”. In: TCC 2006. Ed. by Shai
+Halevi and Tal Rabin. Vol. 3876. LNCS. Springer, Berlin, Heidelberg, Mar.
+2006, pp. 145–166. doi: 10.1007/11681878_8.
+
+[RZ22]
+
+Carla Ràfols and Alexandros Zacharakis. Folding Schemes with Selective Verification. Cryptology ePrint Archive, Report 2022/1576. 2022. url: https:
+//eprint.iacr.org/2022/1576.
+
+[STW23]
+
+Srinath Setty, Justin Thaler, and Riad Wahby. Customizable constraint systems for succinct arguments. Cryptology ePrint Archive, Report 2023/552.
+2023. url: https://eprint.iacr.org/2023/552.
+
+[Val08]
+
+Paul Valiant. “Incrementally Verifiable Computation or Proofs of Knowledge
+Imply Time/Space Efficiency”. In: TCC 2008. Ed. by Ran Canetti. Vol. 4948.
+LNCS. Springer, Berlin, Heidelberg, Mar. 2008, pp. 1–18. doi: 10.1007/9783-540-78524-8_1.
+
+[Whi18]
+
+Barry Whitehat. Roll up token. link. 2018.
+
+50
+
+[Xie+22]
+
+Tiancheng Xie, Jiaheng Zhang, Zerui Cheng, Fan Zhang, Yupeng Zhang,
+Yongzheng Jia, Dan Boneh, and Dawn Song. “zkBridge: Trustless Cross-chain
+Bridges Made Practical”. In: ACM CCS 2022. Ed. by Heng Yin, Angelos
+Stavrou, Cas Cremers, and Elaine Shi. ACM Press, Nov. 2022, pp. 3003–
+3017. doi: 10.1145/3548606.3560652.
+
+[YCBC24]
+
+Chhavi Yadav, Amrita Roy Chowdhury, Dan Boneh, and Kamalika Chaudhuri. “FairProof : Confidential and Certifiable Fairness for Neural Networks”.
+In: ICML 2024. OpenReview.net, 2024. url: https://openreview.net/
+forum?id=EKye56rLuv.
+
+[ZCF24]
+
+Hadas Zeilberger, Binyi Chen, and Ben Fisch. “BaseFold: Efficient FieldAgnostic Polynomial Commitment Schemes from Foldable Codes”. In: CRYPTO 2024,
+Part X. Ed. by Leonid Reyzin and Douglas Stebila. Vol. 14929. LNCS.
+Springer, Cham, Aug. 2024, pp. 138–169. doi: 10.1007/978-3-031-684036_5.
+
+A
+
+Reducing R1CS to the general linear relation
+
+In this section we describe a reduction of knowledge from a committed R1CS relation to
+the general linear relation from Section 3. First, let us define the committed R1CS relation.
+Definition A.1 (Committed R1CS). A committed R1CS relation is an indexed relation
+parameterized by B ∈ N:
+
+
+i = (A, B, C ∈ Rqn×m ),
+
+
+
+
+
+
+
+
+
+κ
+ℓ
+n
+in
+x = cm ∈ Rq , x ∈ Rq , w = f ∈ Rq where
+RcR1CS,B := (i, x, w) :
+
+cm = com (f ) , ∥f ∥∞ < B, and for z = G⊤
+· f ∈ Rqm : 
+
+
+
+
+B,ℓ̂
+
+
+(Az) ◦ (Bz) = (Cz), z[0 . . . ℓin ] = (1, x)
+(30)
+n×m
+m
+ℓ̂×m
+is the gadget matrix from Section 2.1.
+= Zq
+where ℓ̂ := ⌈logB (q)⌉ and GB,ℓ̂ ∈ Zq
+In this definition we assumed that the dimension of the R1CS matrices is n × m and
+that n = m × ℓ̂, where ℓ̂ is the expansion factor of the gadget matrix GB,ℓ̂ . One can just
+as easily describe a reduction of knowledge when the R1CS matrices are n′ × m, for an
+unconstrained n′ , however this complicates the tensor notation from Remark 2.3 since it
+requires tensors on varying number of variables. To keep things simple we assume n = m×ℓ̂.
+We first introduce a simplified linear relation,
+
+
+
+
+i = (com (·) , (M(i) ∈ Rqn×n )i∈[nlin ] ),
+
+
+
+
+
+log n , v ∈ Rnlin ),
+n s.t. 
+x
+=
+(cm
+,
+r
+∈
+C
+w
+=
+f
+∈
+R
+f
+q
+q
+′
+:=
+(i, x, w) :
+(31)
+Rlin,B
+
+
+(∥f ∥∞ < B) ∧ (cmf = com (f )) ∧ 
+
+
+
+
+
+
+∀i ∈ [nlin ] : ⟨M(i) · f , tensor(r)⟩ = vi
+51
+
+which is almost identical to Rlin,B except that we replace Mq := Rq × Rq , MC := C × C
+(from Rlin,B ) with Rq , C respectively.
+The protocol to reduce RcR1CS,B to R′lin,B is shown in Figure 1. Its completeness,
+knowledge soundness, and public reducibility are analyzed in [BC24, Sec. 4]. Let xo :=
+cm, ro , (v, vA , vB , vC ) denote the reduced instance in R′lin,B . To complete the reduction,
+we expand xo to an instance x′o in Rlin,B defined as follows:
+
+x′o := cm, r′o := (ro , ro ) ∈ MC , ((v, v), (vA , vA ), (vB , vB ), (vC , vC )) ∈ M4q .
+Remark A.1. In Figure 1, the evaluation v = fe(ro ) is never used. A reader may wonder why
+we need it in the reduced instance. This is because the accumulated instance in our folding
+scheme (Section 5.1) requires an evaluation check, which is the result of the sumcheck in
+Construction 5.2. So we add this evaluation value to align with the accumulated instance.
+
+B
+
+Supporting Small Moduli
+
+In this section, we show how to support small prime moduli in LatticeFold+. Our approach
+is equivalent to the one used in [NS25], but we reinterpret it using the tensor-of-rings
+framework inspired by [DP24].
+Let q be a prime modulus. Let K = Fqt be a sufficiently large extension field. Define
+the tensor ring E := K ⊗Fq Rq , which is a Fq -vector space of dimension t × d. We can view
+E as a Fq -matrix of dimension t × d, where each row can be viewed as an Rq -element and
+each column can be viewed as a K-element. Importantly, there are two ways to interpret a
+“multiplication” between an Rq -element a(X) and a K-element b(Y ):
+Column interpretation: View a(X) as its coefficient vector (a1 , . . . , ad ) ∈ Zdq , the multiplication a(X)·b(Y ) ∈ E is interpreted as the matrix [a1 ·b(Y ) | a2 ·b(Y ) | · · · | ad ·b(Y )],
+where we view ai ∈ Zq (1 ≤ i ≤ d) as a constant element in K = Fqt and “·” denotes
+K-multiplication.
+Row interpretation: View b(Y ) as its coefficient vector (b1 , . . . , bt ) ∈ Ztq , the multiplication a(X) · b(Y ) ∈ E is interpreted as the matrix
+
+
+a(X) · b1
+a(X) · b2 
+
+
+
+
+..
+
+
+.
+a(X) · bt
+where we view bi ∈ Zq (1 ≤ i ≤ t) as a constant element in Rq and “·” denotes
+Rq -multiplication.
+Given the tensor ring E, the inner product between an Rq -vector and a K-vector is now
+well-defined. Let us see how to run sumchecks over K and do folding over Rq in LatticeFold+.
+52
+
+Parameters: A sumcheck challenge set C (Section 4)
+Input: i = (A, B, C ∈ Rqn×m ) and x := (cm, x) ∈ Rqκ × Rqℓin and w := f ∈ Rqn
+
+Output: xo := cm, r ∈ C log n , (v, vA , vB , vC ) ∈ Rq4 and wo := f
+The protocol ⟨P(x; w); V(x)⟩:
+1. V → P: V sends P a random vector r ← C log n .
+2. P ↔ V: Define the polynomial g ∈ Rq≤2 [X1 , . . . , Xlog n ] as
+g(x) := eq(r, x) · [gA (x) · gB (x) − gC (x)]
+where for every M ∈ {A, B, C} set M′ := M · G⊤
+∈ Rqn×n and define
+B,ℓ̂
+gM (x) :=
+
+X
+
+f′ )(x, b) · fe(b).
+(M
+
+b∈{0,1}log n
+
+P
+P and V run a sum-check protocol for the claim b∈{0,1}log n g(b) = 0.
+Let ro ← C log n be the sum-check challenge vector. The protocol reduces to a
+?
+random evaluation check g(ro ) = s for some s ∈ Rq .
+3. P → V: P sends V values (v, vA , vB , vC ) ∈ Rq4 . When P is honest these values are
+v := e
+f (ro ) = ⟨f , tensor(ro )⟩ ∈ Rq , and for every M ∈ {A, B, C}
+X
+f′ (ro , b) · e
+vM :=
+M
+f (b) ∈ Rq
+b∈{0,1}log n
+
+. Applying Remark 2.3 to the columns of M′ shows that
+where M′ := M · G⊤
+B,ℓ̂
+⊤
+vM = (M′ )⊤ · tensor(ro ) · f = (M′ · f )⊤ · tensor(ro ) = ⟨M′ · f , tensor(ro )⟩.
+?
+
+4. V computes e := eq(r, ro ) and checks that e · (vA vB − vC ) = s .
+5. The derived R′lin,B triple (io , xo , wo ) is defined by
+
+V outputs io := (In , A′ , B′ , C′ ) and xo := cm, ro , (v, vA , vB , vC ) ,
+P outputs wo := f
+Figure 1: The protocol to reduce RcR1CS,B to R′lin,B .
+
+53
+
+Sumchecks. In the variant of LatticeFold+, all the sumchecks are over K:
+g
+(j) (⟨i⟩) are interpreted as K-elements.
+• Eq. (11) is over K where both eq(c, ⟨i⟩) and m
+• Eq. (18) represents a sequence of inner product claims between Rq -vectors and Kvectors. By the column interpretation, they can be understood as a list of inner
+product claims between Zq -vectors and K-vectors, which in turn can be interpreted
+as sumchecks over K. By random linear combination, we can reduce them to a single
+sumcheck over K.
+• Similarly, the left hand side of Eq. (20) can be understood as d sumcheck claims over
+K, which can be reduced to a single sumcheck over K by random linear combination.
+Note that t(z) ∈ En (z ∈ [2]) is now interpreted as a E-vector.
+Folding. After running the sumcheck protocol, the above claims reduce to random evaluation statements, which can be interpreted as inner product claims between (committed)
+Rq -vectors and a shared K-vectors. By the row interpretation, each such claim can be
+viewed as t inner product claims between a committed Rq -vector and a Zq -vector, where
+the i-th Zq -vector (i ∈ [t]) is identical across all committed Rq -vectors. We can therefore
+fold the committed Rq -vectors into a single vector using folding challenges over S̄ ⊆ Rq ,
+reducing the claims to t separate inner product claims between the folded Rq -vector and a
+Zq -vector. Applying the column interpretation again, these t claims can be viewed as a single inner product claim between a folded Rq -vector and a K-vector, which is an evaluation
+statement we need.
+
+54
+
+

@@ -115,11 +115,6 @@ harness = false
 name = "ring64_mul"
 harness = false
 
-[[bench]]
-name = "we_dpp"
-harness = false
-required-features = ["we_gate"]
-
 [[example]]
 name = "lf_plus_sp1_oneproof"
 path = "examples/lf_plus_sp1_oneproof_api.rs"
