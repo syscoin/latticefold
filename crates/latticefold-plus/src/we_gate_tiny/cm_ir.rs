@@ -2731,6 +2731,19 @@ fn enforce_sub_mod_p_relation_bal16_ir(
 }
 
 /// Digit-domain Goldilocks addition (mod p) in IR form.
+///
+/// ## Important: congruence only (not canonical)
+///
+/// This gadget enforces the modular relation \(r \equiv a + c \pmod p\) via a carry chain for
+/// `a + c = q*p + r` with a **shape-stable boolean witness** `q ∈ {0,1}`.
+///
+/// It intentionally does **not** enforce that the output `r` is the canonical representative
+/// in `[0, p)`; i.e. the remainder representation is not unique (e.g. `r=p, q=0` can satisfy the
+/// relation when `a+c=p`).
+///
+/// Invariant: any value that must be statement-/transcript-bound must cross a canonical byte
+/// boundary (canonicality shards on absorbed 8-byte ranges, or
+/// `cm_math::goldilocks_digits_to_bytes_canonical`), which enforces `< p` and round-trips back.
 pub(crate) fn goldilocks_add_mod_p_digits_ir(
     b: &mut IrBuilder<'_>,
     a: &[VarRef; 17],
@@ -2753,6 +2766,12 @@ pub(crate) fn goldilocks_add_mod_p_digits_ir(
 }
 
 /// Digit-domain Goldilocks subtraction (mod p) in IR form.
+///
+/// ## Important: congruence only (not canonical)
+///
+/// Like `goldilocks_add_mod_p_digits_ir`, this enforces the modular relation but does **not**
+/// enforce that the output is reduced to `[0, p)`. Canonicalization is performed at byte/IO
+/// boundaries (see the invariant documented on the add gadget).
 pub(crate) fn goldilocks_sub_mod_p_digits_ir(
     b: &mut IrBuilder<'_>,
     a: &[VarRef; 17],
@@ -2924,6 +2943,7 @@ fn enforce_sub_mod_p_relation_bal4_ir(
 
 #[inline]
 pub(crate) fn goldilocks_add_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[VarRef; 33], c4: &[VarRef; 33], p_u64: u64) -> [VarRef; 33] {
+    // See `goldilocks_add_mod_p_digits_ir` for the congruence-vs-canonicality contract.
     let a_u = digits4_to_u64_witness_ir(b, a4);
     let c_u = digits4_to_u64_witness_ir(b, c4);
     let sum = (a_u as u128) + (c_u as u128);
@@ -2942,6 +2962,7 @@ pub(crate) fn goldilocks_add_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[V
 
 #[inline]
 pub(crate) fn goldilocks_sub_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[VarRef; 33], c4: &[VarRef; 33], p_u64: u64) -> [VarRef; 33] {
+    // See `goldilocks_add_mod_p_digits_ir` for the congruence-vs-canonicality contract.
     let a_u = digits4_to_u64_witness_ir(b, a4);
     let c_u = digits4_to_u64_witness_ir(b, c4);
     let (q_u8, r_u) = if a_u >= c_u {
@@ -3278,6 +3299,163 @@ mod soundness_regression_tests {
         assert!(
             inst.check(&asg).is_err(),
             "canonical bytes boundary must reject unreduced remainder r=p"
+        );
+    }
+
+    /// Same local non-canonicality phenomenon for subtraction:
+    /// the raw relation `a + q*p = c + r` admits `q=1, r=p` for `a=c=0`.
+    #[test]
+    fn test_sub_mod_p_relation_allows_unreduced_remainder_without_boundary() {
+        let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+        let p_d_const = goldilocks::goldilocks_p_bal16_digits_le_const();
+
+        let a_u64 = 0u64;
+        let c_u64 = 0u64;
+
+        let base_asg = [F257::ONE];
+        let mut ib = IrBuilder::new(&base_asg);
+        let a = alloc_u64_as_bal16_digits_witness_ir(&mut ib, a_u64);
+        let c = alloc_u64_as_bal16_digits_witness_ir(&mut ib, c_u64);
+        let q = alloc_bool_ir(&mut ib, true);
+        let r = alloc_u64_as_bal16_digits_witness_ir(&mut ib, p);
+        enforce_sub_mod_p_relation_bal16_ir(&mut ib, &a, &c, &r, q, 1u8, &p_d_const);
+
+        let mut gb = Dr1csBuilder::<F257>::new();
+        gb.enforce_var_eq_const(gb.one(), F257::ONE);
+        let _lowered = lower_ir_into_builder(&mut gb, ib.ir);
+        let (inst, asg) = gb.into_instance();
+        inst.check(&asg)
+            .expect("unreduced remainder should satisfy raw sub mod-p relation (no boundary check)");
+    }
+
+    #[test]
+    fn test_sub_mod_p_relation_unreduced_remainder_rejected_by_canonical_bytes_boundary() {
+        let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+        let p_d_const = goldilocks::goldilocks_p_bal16_digits_le_const();
+
+        let a_u64 = 0u64;
+        let c_u64 = 0u64;
+
+        let base_asg = [F257::ONE];
+        let mut ib = IrBuilder::new(&base_asg);
+        let a = alloc_u64_as_bal16_digits_witness_ir(&mut ib, a_u64);
+        let c = alloc_u64_as_bal16_digits_witness_ir(&mut ib, c_u64);
+        let q = alloc_bool_ir(&mut ib, true);
+        let r = alloc_u64_as_bal16_digits_witness_ir(&mut ib, p);
+        enforce_sub_mod_p_relation_bal16_ir(&mut ib, &a, &c, &r, q, 1u8, &p_d_const);
+
+        let mut gb = Dr1csBuilder::<F257>::new();
+        gb.enforce_var_eq_const(gb.one(), F257::ONE);
+        let lowered = lower_ir_into_builder(&mut gb, ib.ir);
+
+        let r_digits: goldilocks::GoldilocksScalar = core::array::from_fn(|i| lowered.map_var(r[i]));
+        let _bytes = cm_math::goldilocks_digits_to_bytes_canonical(&mut gb, &r_digits);
+
+        let (inst, asg) = gb.into_instance();
+        assert!(
+            inst.check(&asg).is_err(),
+            "canonical bytes boundary must reject unreduced remainder r=p (sub)"
+        );
+    }
+
+    /// Repeat the add-mod-p non-canonicality tests in the bal4 domain (used by NTT pipelines).
+    #[test]
+    fn test_add_mod_p_relation_bal4_allows_unreduced_remainder_without_boundary() {
+        let p = gl_ntt64::GOLDILOCKS_P_U64;
+        let a_u64 = p - 1;
+        let c_u64 = 1u64;
+
+        let base_asg = [F257::ONE];
+        let mut ib = IrBuilder::new(&base_asg);
+        let a4 = alloc_u64_as_bal4_digits_checked_ir(&mut ib, a_u64);
+        let c4 = alloc_u64_as_bal4_digits_checked_ir(&mut ib, c_u64);
+        let q = alloc_bool_ir(&mut ib, false);
+        let r4 = alloc_u64_as_bal4_digits_checked_ir(&mut ib, p);
+        enforce_add_mod_p_relation_bal4_ir(&mut ib, &a4, &c4, &r4, q, 0u8);
+
+        let mut gb = Dr1csBuilder::<F257>::new();
+        gb.enforce_var_eq_const(gb.one(), F257::ONE);
+        let _lowered = lower_ir_into_builder(&mut gb, ib.ir);
+        let (inst, asg) = gb.into_instance();
+        inst.check(&asg)
+            .expect("unreduced remainder should satisfy raw add mod-p relation in bal4 (no boundary check)");
+    }
+
+    #[test]
+    fn test_add_mod_p_relation_bal4_unreduced_remainder_rejected_by_canonical_bytes_boundary() {
+        let p = gl_ntt64::GOLDILOCKS_P_U64;
+        let a_u64 = p - 1;
+        let c_u64 = 1u64;
+
+        let base_asg = [F257::ONE];
+        let mut ib = IrBuilder::new(&base_asg);
+        let a4 = alloc_u64_as_bal4_digits_checked_ir(&mut ib, a_u64);
+        let c4 = alloc_u64_as_bal4_digits_checked_ir(&mut ib, c_u64);
+        let q = alloc_bool_ir(&mut ib, false);
+        let r4 = alloc_u64_as_bal4_digits_checked_ir(&mut ib, p);
+        enforce_add_mod_p_relation_bal4_ir(&mut ib, &a4, &c4, &r4, q, 0u8);
+        let r16 = bal4_to_bal16_digits_ir(&mut ib, &r4);
+
+        let mut gb = Dr1csBuilder::<F257>::new();
+        gb.enforce_var_eq_const(gb.one(), F257::ONE);
+        let lowered = lower_ir_into_builder(&mut gb, ib.ir);
+        let r_digits: goldilocks::GoldilocksScalar = core::array::from_fn(|i| lowered.map_var(r16[i]));
+        let _bytes = cm_math::goldilocks_digits_to_bytes_canonical(&mut gb, &r_digits);
+
+        let (inst, asg) = gb.into_instance();
+        assert!(
+            inst.check(&asg).is_err(),
+            "canonical bytes boundary must reject unreduced remainder r=p (add bal4)"
+        );
+    }
+
+    #[test]
+    fn test_sub_mod_p_relation_bal4_allows_unreduced_remainder_without_boundary() {
+        let p = gl_ntt64::GOLDILOCKS_P_U64;
+        let a_u64 = 0u64;
+        let c_u64 = 0u64;
+
+        let base_asg = [F257::ONE];
+        let mut ib = IrBuilder::new(&base_asg);
+        let a4 = alloc_u64_as_bal4_digits_checked_ir(&mut ib, a_u64);
+        let c4 = alloc_u64_as_bal4_digits_checked_ir(&mut ib, c_u64);
+        let q = alloc_bool_ir(&mut ib, true);
+        let r4 = alloc_u64_as_bal4_digits_checked_ir(&mut ib, p);
+        enforce_sub_mod_p_relation_bal4_ir(&mut ib, &a4, &c4, &r4, q, 1u8);
+
+        let mut gb = Dr1csBuilder::<F257>::new();
+        gb.enforce_var_eq_const(gb.one(), F257::ONE);
+        let _lowered = lower_ir_into_builder(&mut gb, ib.ir);
+        let (inst, asg) = gb.into_instance();
+        inst.check(&asg)
+            .expect("unreduced remainder should satisfy raw sub mod-p relation in bal4 (no boundary check)");
+    }
+
+    #[test]
+    fn test_sub_mod_p_relation_bal4_unreduced_remainder_rejected_by_canonical_bytes_boundary() {
+        let p = gl_ntt64::GOLDILOCKS_P_U64;
+        let a_u64 = 0u64;
+        let c_u64 = 0u64;
+
+        let base_asg = [F257::ONE];
+        let mut ib = IrBuilder::new(&base_asg);
+        let a4 = alloc_u64_as_bal4_digits_checked_ir(&mut ib, a_u64);
+        let c4 = alloc_u64_as_bal4_digits_checked_ir(&mut ib, c_u64);
+        let q = alloc_bool_ir(&mut ib, true);
+        let r4 = alloc_u64_as_bal4_digits_checked_ir(&mut ib, p);
+        enforce_sub_mod_p_relation_bal4_ir(&mut ib, &a4, &c4, &r4, q, 1u8);
+        let r16 = bal4_to_bal16_digits_ir(&mut ib, &r4);
+
+        let mut gb = Dr1csBuilder::<F257>::new();
+        gb.enforce_var_eq_const(gb.one(), F257::ONE);
+        let lowered = lower_ir_into_builder(&mut gb, ib.ir);
+        let r_digits: goldilocks::GoldilocksScalar = core::array::from_fn(|i| lowered.map_var(r16[i]));
+        let _bytes = cm_math::goldilocks_digits_to_bytes_canonical(&mut gb, &r_digits);
+
+        let (inst, asg) = gb.into_instance();
+        assert!(
+            inst.check(&asg).is_err(),
+            "canonical bytes boundary must reject unreduced remainder r=p (sub bal4)"
         );
     }
 
