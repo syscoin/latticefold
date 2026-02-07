@@ -12,6 +12,7 @@ use rand::RngCore;
 use rayon::prelude::*;
 use rayon::join;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use crate::packing::{BoundedFlpcp, BoundedFlpcpSparse, FlpcpPredicate};
 use crate::rs::{barycentric_weights_consecutive, extrapolate_consecutive_next_block, lagrange_coeffs_at};
@@ -1814,6 +1815,21 @@ fn mat_vec_sparse_np<F: PrimeField>(
 ) -> Vec<F> {
     debug_assert_eq!(x.len(), l);
     debug_assert_eq!(l + z_w.len(), m.first().map(|_| l + z_w.len()).unwrap_or(l + z_w.len()));
+    // Parallelization threshold for sparse row-wise mat-vec.
+    //
+    // This is on a prover hot-path (Theorem 4.3 / lock streaming), so we default to a lower
+    // threshold than the generic R1CS helpers.
+    //
+    // Override with `DPP_MATVEC_PAR_THRESHOLD=<n>`.
+    let par_threshold: usize = {
+        static THRESH: OnceLock<usize> = OnceLock::new();
+        *THRESH.get_or_init(|| {
+            std::env::var("DPP_MATVEC_PAR_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(64)
+        })
+    };
     if is_f257_field::<F>() {
         let (x_u16, z_u16) = match (x_u16, z_u16) {
             (Some(xu), Some(zu)) => {
@@ -1827,7 +1843,7 @@ fn mat_vec_sparse_np<F: PrimeField>(
                 let zu = z_w.iter().copied().map(f_to_u16).collect::<Vec<_>>();
                 // SAFETY: we only use these within this call, so keep them owned.
                 // To avoid code duplication below, handle this case separately.
-                if m.len() >= 256 {
+                if m.len() >= par_threshold {
                     return m
                         .par_iter()
                         .map(|row| {
@@ -1855,7 +1871,7 @@ fn mat_vec_sparse_np<F: PrimeField>(
                     .collect();
             }
         };
-        if m.len() >= 256 {
+        if m.len() >= par_threshold {
             m.par_iter()
                 .map(|row| {
                     let mut acc = 0u16;
@@ -1880,7 +1896,7 @@ fn mat_vec_sparse_np<F: PrimeField>(
                 })
                 .collect()
         }
-    } else if m.len() >= 256 {
+    } else if m.len() >= par_threshold {
         m.par_iter()
             .map(|row| {
                 row.terms.iter().fold(F::ZERO, |acc, (c, idx)| {
