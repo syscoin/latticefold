@@ -9,7 +9,7 @@
 
 use cyclotomic_rings::rings::{GetPoseidonParams, GoldilocksPoseidonConfig as PC};
 use cyclotomic_rings::rings::GoldilocksRing64 as R;
-use ark_ff::{BigInteger, PrimeField};
+use ark_ff::PrimeField;
 use latticefold::commitment::AjtaiCommitmentScheme;
 use latticefold::transcript::poseidon::F257;
 use latticefold::transcript::Transcript;
@@ -33,13 +33,12 @@ use crate::we_statement::{encode_public_x, we_statement_hash_lf_plus, LFP_WE_GAT
 pub struct Sp1OneProofWeGateOutput {
     pub stmt_digest: [u8; 32],
     pub lock_coin_seed: [u8; 32],
-    /// Best-effort dR1CS **assignment tail** for downstream lock scaffolding.
+    /// The decapsulated 32-byte key derived from the proof.
     ///
-    /// Concretely: `assignment[public_len..]` (i.e., the non-public variables) converted to `u64`
-    /// via canonical reduction in the small field.
-    ///
-    /// This is **not** the final Architecture bounded-integer witness representation.
-    pub dr1cs_assignment_tail_u64: Vec<u64>,
+    /// This is a research harness convenience: the underlying RingLWE lock has two branches, so
+    /// we embed a short self-authenticating tag into the lock payload and pick the unique branch
+    /// whose payload validates.
+    pub decapped_key: [u8; 32],
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -347,10 +346,43 @@ pub fn run_sp1_oneproof_we_gate_from_files(
     let mut rng = StdRng::from_seed(lock_coin_seed);
 
     let t_arm = Instant::now();
-    // Canonical RingLWE arming is payload-capable; for oneproof we only need the answer,
-    // so we use an empty payload.
-    let payload: [u8; 0] = [];
+    // Payload (research harness):
+    // We want this API to return a single decapped key (not 2 unauthenticated candidates).
+    //
+    // So we arm the lock with a payload containing:
+    //   payload = tag16 || key32
+    // where tag16 = H("LFP_ONEPROOF_TAG_V1" || key32 || stmt_digest)[0..16].
+    //
+    // After streaming decap, we try both candidates and pick the unique one whose tag validates.
+    // This avoids depending on external branch-identification plumbing (e.g. Shamir) in PVUGC.
+    // IMPORTANT: `rep_id` may be incremented on retry. `payload` (and therefore the returned
+    // decapped key) must be derived *inside* the retry loop so it stays consistent with the
+    // lock parameters that were actually armed.
     let lock = loop {
+        let key32: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(b"LFP_ONEPROOF_KEY_V1");
+            h.update(&lock_coin_seed);
+            h.update(&stmt_digest);
+            h.update(&lock_j.to_le_bytes());
+            h.update(&block_id.to_le_bytes());
+            h.update(&rep_id.to_le_bytes());
+            h.finalize().into()
+        };
+        let tag16: [u8; 16] = {
+            let mut h = Sha256::new();
+            h.update(b"LFP_ONEPROOF_TAG_V1");
+            h.update(&key32);
+            h.update(&stmt_digest);
+            let full: [u8; 32] = h.finalize().into();
+            full[0..16].try_into().expect("slice->array")
+        };
+        let payload: [u8; 48] = {
+            let mut p = [0u8; 48];
+            p[0..16].copy_from_slice(&tag16);
+            p[16..48].copy_from_slice(&key32);
+            p
+        };
         match crate::we_tiny_lock::arm_lfplus_ringlwe_lock::<R>(
             shape.clone(),
             &we_params,
@@ -406,7 +438,7 @@ pub fn run_sp1_oneproof_we_gate_from_files(
         return Err(format!("oneproof: expected 1 tail, got {}", tails.len()));
     }
     st.absorb_chunk(&tails[0])?;
-    let _cands = st.finish_decrypt_candidates()?;
+    let cands = st.finish_decrypt_candidates()?;
     maybe_print_rss("oneproof:after_prove_decap_stream");
     eprintln!("[oneproof] prove+decap(stream) in {:?}", t_prove.elapsed());
     // With unauthenticated encryption, branch identification is deferred to Shamir reconstruction.
@@ -415,18 +447,28 @@ pub fn run_sp1_oneproof_we_gate_from_files(
     let a_u64 = a0.into_bigint().as_ref().get(0).copied().unwrap_or(0);
     eprintln!("[oneproof] accepting_set_answer={a_u64}");
 
-    // Extract the WE gate witness tail (excluding public) and convert to u64 (canonical).
-    let tail = &assignment[public_len..];
-    let mut dr1cs_assignment_tail_u64: Vec<u64> = Vec::with_capacity(tail.len());
-    for x in tail {
-        let bi = x.into_bigint();
-        let le = bi.to_bytes_le();
-        let mut buf = [0u8; 8];
-        for (i, b) in le.iter().take(8).enumerate() {
-            buf[i] = *b;
+    // Select the unique candidate whose tag validates.
+    let mut picked: Option<[u8; 32]> = None;
+    for cand in &cands {
+        if cand.len() != 48 {
+            continue;
         }
-        dr1cs_assignment_tail_u64.push(u64::from_le_bytes(buf));
+        let tag = &cand[0..16];
+        let key = &cand[16..48];
+        let mut h = Sha256::new();
+        h.update(b"LFP_ONEPROOF_TAG_V1");
+        h.update(key);
+        h.update(&stmt_digest);
+        let full: [u8; 32] = h.finalize().into();
+        if tag == &full[0..16] {
+            let arr: [u8; 32] = key.try_into().expect("len checked");
+            if picked.is_some() {
+                return Err("oneproof: multiple decap candidates validated tag (unexpected)".to_string());
+            }
+            picked = Some(arr);
+        }
     }
+    let decapped_key = picked.ok_or_else(|| "oneproof: no decap candidate validated tag".to_string())?;
 
     // Debug-only: keep deterministic footprints if you need to compare runs.
     let _ = hex32(&stmt_digest);
@@ -437,7 +479,7 @@ pub fn run_sp1_oneproof_we_gate_from_files(
     Ok(Sp1OneProofWeGateOutput {
         stmt_digest,
         lock_coin_seed,
-        dr1cs_assignment_tail_u64,
+        decapped_key,
     })
 }
 
