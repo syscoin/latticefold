@@ -1488,10 +1488,15 @@ mod tests {
         .expect("poseidon_trace_schedule_for_plus_with_public_inputs");
 
         // Shape + satisfying assignment (canonical cache-aware path).
+        let keep_tiny_cache = std::env::var("LFP_KEEP_TINY_GATE_CACHE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let out_dir = {
             let mut p = std::env::temp_dir();
             p.push("lfplus_test_tiny_payload_shamir_2of2");
-            let _ = std::fs::remove_dir_all(&p);
+            if !keep_tiny_cache {
+                let _ = std::fs::remove_dir_all(&p);
+            }
             std::fs::create_dir_all(&p).expect("create temp out_dir");
             p
         };
@@ -1522,7 +1527,9 @@ mod tests {
         // T successful decryptions (treat failures as erasures).
         let shamir = ShamirConfig {
             threshold: 3,
-            shares: 5,
+            // Keep this > `DPP_PI0_COINS_PAR_THRESHOLD` default (8) so we exercise the
+            // parallel per-coin accumulation in `stream_pi0_and_collect_tails`.
+            shares: 9,
         };
         let mut rng = StdRng::seed_from_u64(20260205);
         let mut secret = [0u8; 32];
@@ -1670,8 +1677,10 @@ mod tests {
             t_prove.elapsed()
         );
 
-        // Now safe to reclaim disk space used by the shape files.
-        crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir);
+        // Now safe to reclaim disk space used by the shape files (unless caching).
+        if !keep_tiny_cache {
+            crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir);
+        }
     }
 
     /// End-to-end PVUGC test: 3 armers × secp256k1 → P2WPKH Bitcoin address → WE lock → decap → recover.
