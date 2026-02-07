@@ -1054,7 +1054,7 @@ mod tests {
     use super::*;
     use latticefold::arith::r1cs::R1CS;
     use latticefold::transcript::Transcript;
-    use ark_ff::{Fp384, MontBackend, MontConfig};
+    use ark_ff::{BigInteger, Fp384, MontBackend, MontConfig};
     use cyclotomic_rings::rings::GoldilocksRing64 as R;
     use stark_rings_linalg::SparseMatrix;
 
@@ -1686,7 +1686,6 @@ mod tests {
         use crate::we_statement::encode_public_x;
         use crate::we_tiny_lock::arm_lfplus_ringlwe_lock;
         use crate::utils::maybe_print_rss;
-        use k256::elliptic_curve::sec1::ToEncodedPoint;
         use k256::{ProjectivePoint, Scalar};
         use rand::{rngs::StdRng, RngCore, SeedableRng};
         use sha2::Digest;
@@ -2075,7 +2074,6 @@ mod tests {
         {
             let mut tampered_locksets = armer_locksets.clone();
             if let Some(first_enc) = tampered_locksets[0].locks[0].cts[0].encoded.first_mut() {
-                use ark_ff::Field;
                 // Add a large value to corrupt the first encoded byte.
                 type GlFq = <cyclotomic_rings::rings::GoldilocksRing64 as stark_rings::PolyRing>::BaseRing;
                 *first_enc += GlFq::from(1u64 << 60);
@@ -2872,7 +2870,7 @@ mod tests {
         use stark_rings::PolyRing;
 
         use ark_ff::PrimeField;
-        use rand::{rngs::StdRng, RngCore, SeedableRng};
+        use rand::{RngCore, SeedableRng};
         #[cfg(feature = "parallel")]
         use rayon::current_num_threads;
 
