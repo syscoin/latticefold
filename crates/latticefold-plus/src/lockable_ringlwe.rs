@@ -59,15 +59,6 @@ fn query_row_to_ring(row: &[Fq]) -> GoldilocksRing64 {
     GoldilocksRing64::from(coeffs)
 }
 
-/// Pack a proof chunk into a ring element (coefficients are the embedded F257 values).
-fn pi_row_to_ring(row: &[Fq]) -> GoldilocksRing64 {
-    let mut coeffs = vec![Fq::ZERO; RING_D];
-    for i in 0..RING_D.min(row.len()) {
-        coeffs[i] = row[i];
-    }
-    GoldilocksRing64::from(coeffs)
-}
-
 /// Scale a ring element by a scalar (coefficientwise). O(d), no NTT.
 /// This is much faster than full ring multiply when one operand is a constant polynomial.
 #[inline]
@@ -76,17 +67,19 @@ fn ring_scale(r: &GoldilocksRing64, s: Fq) -> GoldilocksRing64 {
     GoldilocksRing64::from(coeffs)
 }
 
-/// Extract coefficient 0 of the negacyclic ring product a * b in O(d).
+/// Extract coefficient 0 of a * b when b is provided in coefficient form.
 ///
-/// For R = Z_q[x]/(x^d+1): coeff0(a·b) = a[0]*b[0] - Σ_{i=1}^{d-1} a[i]*b[d-i].
-/// This avoids the full NTT ring multiply (which computes all d coefficients).
-fn coeff0_mul(a: &GoldilocksRing64, b: &GoldilocksRing64) -> Fq {
+/// This avoids allocating a temporary `GoldilocksRing64` for each proof block.
+#[inline]
+fn coeff0_mul_row(a: &GoldilocksRing64, row: &[Fq]) -> Fq {
     let ac = a.coeffs();
-    let bc = b.coeffs();
     let d = ac.len();
-    let mut acc = ac[0] * bc[0];
+    let mut acc = if row.is_empty() { Fq::ZERO } else { ac[0] * row[0] };
     for i in 1..d {
-        acc -= ac[i] * bc[d - i];
+        let idx = d - i;
+        if idx < row.len() {
+            acc -= ac[i] * row[idx];
+        }
     }
     acc
 }
@@ -388,11 +381,10 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
         if self.coeffs.len() != self.d {
             return Ok(());
         }
-        let pi_ring = pi_row_to_ring(self.coeffs.as_slice());
         for br in &mut self.branches {
             if br.sparse_pos < br.sparse.len() && br.sparse[br.sparse_pos].0 == self.block_idx {
                 let h = &br.sparse[br.sparse_pos].1;
-                br.y += coeff0_mul(h, &pi_ring);
+                br.y += coeff0_mul_row(h, self.coeffs.as_slice());
                 br.sparse_pos += 1;
             }
         }
@@ -420,14 +412,10 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
         }
         // Flush remaining partial block.
         if !self.coeffs.is_empty() {
-            while self.coeffs.len() < self.d {
-                self.coeffs.push(Fq::ZERO);
-            }
-            let pi_ring = pi_row_to_ring(self.coeffs.as_slice());
             for br in &mut self.branches {
                 if br.sparse_pos < br.sparse.len() && br.sparse[br.sparse_pos].0 == self.block_idx {
                     let h = &br.sparse[br.sparse_pos].1;
-                    br.y += coeff0_mul(h, &pi_ring);
+                    br.y += coeff0_mul_row(h, self.coeffs.as_slice());
                     br.sparse_pos += 1;
                 }
             }
