@@ -337,7 +337,7 @@ pub struct WeDr1csShape<F: PrimeField> {
 }
 
 #[cfg(feature = "we_gate")]
-fn poseidon_trace_schedule_for_plus<R>(
+pub(crate) fn poseidon_trace_schedule_for_plus<R>(
     public_inputs_len: usize,
     params: &WeParams,
     n_lin_proofs: usize,
@@ -357,7 +357,7 @@ where
 /// the transcript prefix). The returned trace is self-consistent: all squeeze outputs match the
 /// sponge state induced by the chosen absorbs.
 #[cfg(feature = "we_gate")]
-fn poseidon_trace_schedule_for_plus_with_public_inputs<R>(
+pub(crate) fn poseidon_trace_schedule_for_plus_with_public_inputs<R>(
     public_inputs: &[BF<R>],
     params: &WeParams,
     n_lin_proofs: usize,
@@ -777,6 +777,58 @@ fn shape_cache_exists(shape_dir: impl AsRef<std::path::Path>) -> bool {
     dir.join("shape_meta.txt").is_file() && dir.join("merged").join("meta.txt").is_file()
 }
 
+/// Load the cached tiny WE-gate shape from `shape_dir` or build it (cache miss).
+///
+/// This is the **shape-only** entrypoint (instance + public length), intended for:
+/// - lock arming (statement-bound; no witness assignment required)
+/// - any precomputation that only depends on the circuit shape.
+///
+/// Unlike `build_or_load_we_plus_tiny_dr1cs`, this does **not** compute a satisfying assignment.
+///
+/// Notes:
+/// - The shape depends on `trace` (operation schedule) and parameter sizes, but is value-independent.
+/// - `public_inputs_len` is the number of public inputs in the base field (NOT bytes).
+#[cfg(feature = "we_gate")]
+pub fn build_or_load_we_plus_tiny_shape<R>(
+    trace: &PoseidonTranscriptTrace<BF<R>>,
+    params: &WeParams,
+    public_inputs_len: usize,
+    n_lin_proofs: usize,
+    mlen_mats: usize,
+    pairs: &[(usize, usize)],
+    shape_dir: impl AsRef<std::path::Path>,
+) -> Result<WeDr1csShape<F257>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + Field + PrimeField,
+{
+    let ring_dim = R::dimension();
+    if ring_dim != 64 {
+        return Err("build_or_load_we_plus_tiny_shape: only ring_dim=64 supported".to_string());
+    }
+    let shape_dir = shape_dir.as_ref();
+
+    if shape_cache_exists(shape_dir) {
+        eprintln!("[we_gate] shape cache hit: {}", shape_dir.display());
+        return load_we_plus_tiny_shape(shape_dir);
+    }
+
+    eprintln!("[we_gate] shape cache miss — building: {}", shape_dir.display());
+    std::fs::create_dir_all(shape_dir).map_err(|e| format!("create shape_dir failed: {e}"))?;
+    let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
+        trace,
+        params,
+        // Shape builder needs the *count* of base-field public inputs to reserve byte slots.
+        &vec![BF::<R>::ZERO; public_inputs_len],
+        n_lin_proofs,
+        mlen_mats,
+        pairs,
+        shape_dir,
+    )?;
+    save_shape_meta(shape_dir, shape.public_len)?;
+    Ok(shape)
+}
+
 // ---------------------------------------------------------------------------
 // Canonical tiny-field WE gate function (shape caching + assignment-only)
 // ---------------------------------------------------------------------------
@@ -814,28 +866,26 @@ where
     let shape_dir = shape_dir.as_ref();
 
     // ---- Shape: load from cache or build ----------------------------------
-    let shape = if shape_cache_exists(shape_dir) {
-        eprintln!("[we_gate] shape cache hit: {}", shape_dir.display());
-        load_we_plus_tiny_shape(shape_dir)?
-    } else {
-        eprintln!("[we_gate] shape cache miss — building: {}", shape_dir.display());
-        std::fs::create_dir_all(shape_dir)
-            .map_err(|e| format!("create shape_dir failed: {e}"))?;
-        let n_lin_proofs = proof.lproof.len();
-        let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
-            trace,
-            params,
-            // The shape builder needs base-field public inputs (for byte-length computation).
-            // We pass zeros of the correct length; values don't affect the shape.
-            &vec![BF::<R>::ZERO; public_inputs.len() / (((<R::BaseRing as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8)],
-            n_lin_proofs,
-            mlen_mats,
-            pairs,
-            shape_dir,
-        )?;
-        save_shape_meta(shape_dir, shape.public_len)?;
-        shape
-    };
+    // The shape builder needs the *count* of base-field public inputs (NOT bytes).
+    let coeff_bytes = ((<R::BaseRing as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8;
+    if public_inputs.len() % coeff_bytes != 0 {
+        return Err(format!(
+            "build_or_load_we_plus_tiny_dr1cs: public_inputs byte length {} not divisible by base-field byte width {}",
+            public_inputs.len(),
+            coeff_bytes
+        ));
+    }
+    let public_inputs_len = public_inputs.len() / coeff_bytes;
+    let n_lin_proofs = proof.lproof.len();
+    let shape = build_or_load_we_plus_tiny_shape::<R>(
+        trace,
+        params,
+        public_inputs_len,
+        n_lin_proofs,
+        mlen_mats,
+        pairs,
+        shape_dir,
+    )?;
 
     // ---- Assignment: always compute via count-only pass -------------------
     let assignment = build_we_plus_tiny_assignment_only::<R>(
