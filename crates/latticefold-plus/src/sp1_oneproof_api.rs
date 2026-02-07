@@ -355,31 +355,34 @@ pub fn run_sp1_oneproof_we_gate_from_files(
     //
     // After streaming decap, we try both candidates and pick the unique one whose tag validates.
     // This avoids depending on external branch-identification plumbing (e.g. Shamir) in PVUGC.
-    let key32: [u8; 32] = {
-        let mut h = Sha256::new();
-        h.update(b"LFP_ONEPROOF_KEY_V1");
-        h.update(&lock_coin_seed);
-        h.update(&stmt_digest);
-        h.update(&lock_j.to_le_bytes());
-        h.update(&block_id.to_le_bytes());
-        h.update(&rep_id.to_le_bytes());
-        h.finalize().into()
-    };
-    let tag16: [u8; 16] = {
-        let mut h = Sha256::new();
-        h.update(b"LFP_ONEPROOF_TAG_V1");
-        h.update(&key32);
-        h.update(&stmt_digest);
-        let full: [u8; 32] = h.finalize().into();
-        full[0..16].try_into().expect("slice->array")
-    };
-    let payload: [u8; 48] = {
-        let mut p = [0u8; 48];
-        p[0..16].copy_from_slice(&tag16);
-        p[16..48].copy_from_slice(&key32);
-        p
-    };
+    // IMPORTANT: `rep_id` may be incremented on retry. `payload` (and therefore the returned
+    // decapped key) must be derived *inside* the retry loop so it stays consistent with the
+    // lock parameters that were actually armed.
     let lock = loop {
+        let key32: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(b"LFP_ONEPROOF_KEY_V1");
+            h.update(&lock_coin_seed);
+            h.update(&stmt_digest);
+            h.update(&lock_j.to_le_bytes());
+            h.update(&block_id.to_le_bytes());
+            h.update(&rep_id.to_le_bytes());
+            h.finalize().into()
+        };
+        let tag16: [u8; 16] = {
+            let mut h = Sha256::new();
+            h.update(b"LFP_ONEPROOF_TAG_V1");
+            h.update(&key32);
+            h.update(&stmt_digest);
+            let full: [u8; 32] = h.finalize().into();
+            full[0..16].try_into().expect("slice->array")
+        };
+        let payload: [u8; 48] = {
+            let mut p = [0u8; 48];
+            p[0..16].copy_from_slice(&tag16);
+            p[16..48].copy_from_slice(&key32);
+            p
+        };
         match crate::we_tiny_lock::arm_lfplus_ringlwe_lock::<R>(
             shape.clone(),
             &we_params,
