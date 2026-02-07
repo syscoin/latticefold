@@ -2743,8 +2743,9 @@ pub(crate) fn goldilocks_add_mod_p_digits_ir(
     let sum = (a_u as u128) + (c_u as u128);
     let q_u8: u8 = if sum >= (p_u64 as u128) { 1 } else { 0 };
     let r_u: u64 = if q_u8 == 1 { (sum - (p_u64 as u128)) as u64 } else { sum as u64 };
-    // IMPORTANT (shape): allocate `q` as a boolean var (not a host-side constant) so we don't
-    // make variable counts witness-dependent.
+    // IMPORTANT (shape): `q` must not be a host-side constant that changes which base/local var
+    // is referenced by constraints. Allocate it as a boolean var so the constraint wiring is
+    // witness-independent (dummy vs real extra_witness builds).
     let q = alloc_bool_ir(b, q_u8 == 1);
     let r_d = alloc_u64_as_bal16_digits_witness_ir(b, r_u);
     enforce_add_mod_p_relation_bal16_ir(b, a, c, &r_d, q, q_u8, p_d_const);
@@ -2766,8 +2767,7 @@ pub(crate) fn goldilocks_sub_mod_p_digits_ir(
     } else {
         (1u8, (a_u as u128 + (p_u64 as u128) - (c_u as u128)) as u64)
     };
-    // IMPORTANT (shape): allocate `q` as a boolean var (not a host-side constant) so we don't
-    // make variable counts witness-dependent.
+    // See `goldilocks_add_mod_p_digits_ir` for the shape rationale.
     let q = alloc_bool_ir(b, q_u8 == 1);
     let r_d = alloc_u64_as_bal16_digits_witness_ir(b, r_u);
     enforce_sub_mod_p_relation_bal16_ir(b, a, c, &r_d, q, q_u8, p_d_const);
@@ -2929,8 +2929,7 @@ pub(crate) fn goldilocks_add_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[V
     let sum = (a_u as u128) + (c_u as u128);
     let q_u8: u8 = if sum >= (p_u64 as u128) { 1 } else { 0 };
     let r_u: u64 = if q_u8 == 1 { (sum - (p_u64 as u128)) as u64 } else { sum as u64 };
-    // IMPORTANT (shape): allocate `q` as a boolean var (not a host-side constant) so we don't
-    // make variable counts witness-dependent.
+    // See `goldilocks_add_mod_p_digits_ir` for the shape rationale.
     let q = alloc_bool_ir(b, q_u8 == 1);
     // IMPORTANT (soundness): `r4[k]` are the "digit variables" of the base-4 carry chain.
     // Without explicit membership checks `r4[k] ∈ {-2,-1,0,1}`, the carry-chain equation admits
@@ -2950,8 +2949,7 @@ pub(crate) fn goldilocks_sub_mod_p_digits_bal4_ir(b: &mut IrBuilder<'_>, a4: &[V
     } else {
         (1u8, (a_u as u128 + (p_u64 as u128) - (c_u as u128)) as u64)
     };
-    // IMPORTANT (shape): allocate `q` as a boolean var (not a host-side constant) so we don't
-    // make variable counts witness-dependent.
+    // See `goldilocks_add_mod_p_digits_ir` for the shape rationale.
     let q = alloc_bool_ir(b, q_u8 == 1);
     let r4 = alloc_u64_as_bal4_digits_checked_ir(b, r_u);
     enforce_sub_mod_p_relation_bal4_ir(b, a4, c4, &r4, q, q_u8);
@@ -3217,7 +3215,71 @@ pub(crate) fn ring_mul_negacyclic_ntt_goldilocks_d64_bal4_ir(
 #[cfg(test)]
 mod soundness_regression_tests {
     use super::*;
+    use crate::we_gate_tiny::{cm_math, goldilocks};
     use symphony::dpp_sumcheck::Dr1csBuilder;
+
+    /// Demonstrates that the raw digit-domain relation `a + c = q*p + r` (with only `q ∈ {0,1}`)
+    /// enforces correctness **mod p**, but does not force a *canonical* remainder representation.
+    ///
+    /// In particular for `a=p-1, c=1`, the unreduced witness `q=0, r=p` satisfies the relation.
+    #[test]
+    fn test_add_mod_p_relation_allows_unreduced_remainder_without_boundary() {
+        let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+        let p_d_const = goldilocks::goldilocks_p_bal16_digits_le_const();
+
+        // Canonical inputs.
+        let a_u64 = p - 1;
+        let c_u64 = 1u64;
+
+        // Build an IR fragment but choose the "wrong" quotient witness q=0 and unreduced remainder r=p.
+        // This should still satisfy the mod-p relation constraints.
+        let base_asg = [F257::ONE];
+        let mut ib = IrBuilder::new(&base_asg);
+        let a = alloc_u64_as_bal16_digits_witness_ir(&mut ib, a_u64);
+        let c = alloc_u64_as_bal16_digits_witness_ir(&mut ib, c_u64);
+        let q = alloc_bool_ir(&mut ib, false);
+        let r = alloc_u64_as_bal16_digits_witness_ir(&mut ib, p);
+        enforce_add_mod_p_relation_bal16_ir(&mut ib, &a, &c, &r, q, 0u8, &p_d_const);
+
+        let mut gb = Dr1csBuilder::<F257>::new();
+        gb.enforce_var_eq_const(gb.one(), F257::ONE);
+        let _lowered = lower_ir_into_builder(&mut gb, ib.ir);
+        let (inst, asg) = gb.into_instance();
+        inst.check(&asg)
+            .expect("unreduced remainder should satisfy raw mod-p relation (no boundary check)");
+    }
+
+    /// Shows that once the value crosses a byte IO boundary (digits -> canonical bytes), the
+    /// canonicality constraint forces `r < p` and rejects the unreduced witness.
+    #[test]
+    fn test_add_mod_p_relation_unreduced_remainder_rejected_by_canonical_bytes_boundary() {
+        let p = crate::we_goldilocks_poseidon_f257::GOLDILOCKS_P;
+        let p_d_const = goldilocks::goldilocks_p_bal16_digits_le_const();
+
+        let a_u64 = p - 1;
+        let c_u64 = 1u64;
+
+        let base_asg = [F257::ONE];
+        let mut ib = IrBuilder::new(&base_asg);
+        let a = alloc_u64_as_bal16_digits_witness_ir(&mut ib, a_u64);
+        let c = alloc_u64_as_bal16_digits_witness_ir(&mut ib, c_u64);
+        let q = alloc_bool_ir(&mut ib, false);
+        let r = alloc_u64_as_bal16_digits_witness_ir(&mut ib, p);
+        enforce_add_mod_p_relation_bal16_ir(&mut ib, &a, &c, &r, q, 0u8, &p_d_const);
+
+        let mut gb = Dr1csBuilder::<F257>::new();
+        gb.enforce_var_eq_const(gb.one(), F257::ONE);
+        let lowered = lower_ir_into_builder(&mut gb, ib.ir);
+
+        let r_digits: goldilocks::GoldilocksScalar = core::array::from_fn(|i| lowered.map_var(r[i]));
+        let _bytes = cm_math::goldilocks_digits_to_bytes_canonical(&mut gb, &r_digits);
+
+        let (inst, asg) = gb.into_instance();
+        assert!(
+            inst.check(&asg).is_err(),
+            "canonical bytes boundary must reject unreduced remainder r=p"
+        );
+    }
 
     #[test]
     fn test_bal4_to_bal16_roundtrip_preserves_u64() {
