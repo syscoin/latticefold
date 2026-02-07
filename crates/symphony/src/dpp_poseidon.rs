@@ -13,12 +13,13 @@ use crate::poseidon_trace::{permute_in_place, permute_with_round_trace, Poseidon
 use crate::poseidon_trace::{replay_ops, PoseidonReplayError as ReplayErr, PoseidonSpongeReplayResult};
 use crate::transcript::PoseidonTraceOp;
 use crate::file_backed_dr1cs::{
-    fast_prepare_out_dir, FileBackedLayout, FileBackedSparseDr1csInstance, SparseDr1csFileWriter,
+    FileBackedSparseDr1csInstance, SparseDr1csFileWriter,
 };
 #[cfg(unix)]
 use crate::file_backed_dr1cs::FileBackedRangeWriter;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 enum PoseidonInstance<F: PrimeField> {
     InMemory(SparseDr1csInstance<F>),
     FileBacked(FileBackedSparseDr1csInstance<F>),
@@ -26,6 +27,7 @@ enum PoseidonInstance<F: PrimeField> {
 
 
 #[inline]
+#[allow(dead_code)]
 fn poseidon_profile_on() -> bool {
     match std::env::var("LF_PLUS_PROFILE") {
         Ok(v) => v != "0",

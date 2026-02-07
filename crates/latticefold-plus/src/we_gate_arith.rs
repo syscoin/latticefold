@@ -3,12 +3,11 @@
 //! This module is a research/bench frontend: it arithmetizes the *verifier* computation,
 //! keeping the relation log-scale in `n` and linear in the verifier-visible message sizes.
 
-use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
-use ark_ff::{BigInteger, Field, PrimeField};
+use ark_ff::{Field, PrimeField};
 use latticefold::transcript::poseidon::F257;
-use stark_rings::{psi, unit_monomial, CoeffRing, OverField, PolyRing, Zq};
+use stark_rings::{CoeffRing, OverField, PolyRing, Zq};
 
-use crate::recording_transcript::{PoseidonTraceOp as LfPoseidonTraceOp, PoseidonTranscriptTrace};
+use crate::recording_transcript::PoseidonTranscriptTrace;
 use crate::we_gate_tiny as tiny;
 use crate::we_statement::WeParams;
 use crate::transcript::DEFAULT_REJECTION_TRIES;
@@ -19,15 +18,10 @@ type BF<R> = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
 /// Number of F257 digits per base-257 challenge (= 8 for Goldilocks).
 const CHALLENGE_DIGITS: usize = 8;
 
-// Reuse symphony’s sparse dR1CS primitives and Poseidon arithmetizer.
-use symphony::dpp_poseidon::{
-    merge_sparse_dr1cs_share_one, merge_sparse_dr1cs_share_one_with_glue,
-    poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes, Constraint, PoseidonByteWiring,
-    PoseidonDr1csWiring, SparseDr1csInstance,
-};
-use symphony::file_backed_dr1cs::{merge_file_backed_sparse_dr1cs_share_one, FileBackedSparseDr1csInstance};
 use symphony::dpp_sumcheck::Dr1csBuilder;
-use symphony::dpp_sumcheck::{sumcheck_verify_degree3, RingVars};
+use symphony::file_backed_dr1cs::{
+    merge_file_backed_sparse_dr1cs_share_one, FileBackedSparseDr1csInstance,
+};
 
 #[cfg(feature = "we_gate")]
 fn first_squeeze_field_op_index_of_len(
@@ -337,6 +331,7 @@ pub struct WeDr1csShape<F: PrimeField> {
 }
 
 #[cfg(feature = "we_gate")]
+#[allow(dead_code)]
 fn poseidon_trace_schedule_for_plus<R>(
     public_inputs_len: usize,
     params: &WeParams,
@@ -357,6 +352,7 @@ where
 /// the transcript prefix). The returned trace is self-consistent: all squeeze outputs match the
 /// sponge state induced by the chosen absorbs.
 #[cfg(feature = "we_gate")]
+#[allow(dead_code)]
 fn poseidon_trace_schedule_for_plus_with_public_inputs<R>(
     public_inputs: &[BF<R>],
     params: &WeParams,
@@ -1056,20 +1052,15 @@ mod tests {
     fn init_rayon_stack() {}
 
     use super::*;
-    use cyclotomic_rings::rings::GoldilocksPoseidonConfig as PC;
     use latticefold::arith::r1cs::R1CS;
     use latticefold::transcript::Transcript;
-    use ark_ff::{Fp384, MontBackend, MontConfig};
-    use stark_rings::balanced_decomposition::GadgetDecompose;
+    use ark_ff::BigInteger;
     use cyclotomic_rings::rings::GoldilocksRing64 as R;
-    use stark_rings_linalg::{Matrix, SparseMatrix};
+    use stark_rings_linalg::SparseMatrix;
 
-    use crate::lin::Linearize;
     use crate::lin::LinearizedVerify;
-    use crate::r1cs::ComR1CS;
     use crate::recording_transcript::TracePoseidonTranscript;
-    use crate::rgchk::{DecompParameters, Rg, RgInstance};
-    use crate::cm::Cm;
+    use crate::rgchk::DecompParameters;
 
     // NOTE: We intentionally do not keep the old “shape builds and constraints check” tests here.
     // They were development scaffolding and are slow/ignored. The tiny gate is now exercised via
@@ -1488,10 +1479,15 @@ mod tests {
         .expect("poseidon_trace_schedule_for_plus_with_public_inputs");
 
         // Shape + satisfying assignment (canonical cache-aware path).
+        let keep_tiny_cache = std::env::var("LFP_KEEP_TINY_GATE_CACHE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let out_dir = {
             let mut p = std::env::temp_dir();
             p.push("lfplus_test_tiny_payload_shamir_2of2");
-            let _ = std::fs::remove_dir_all(&p);
+            if !keep_tiny_cache {
+                let _ = std::fs::remove_dir_all(&p);
+            }
             std::fs::create_dir_all(&p).expect("create temp out_dir");
             p
         };
@@ -1522,7 +1518,9 @@ mod tests {
         // T successful decryptions (treat failures as erasures).
         let shamir = ShamirConfig {
             threshold: 3,
-            shares: 5,
+            // Keep this > `DPP_PI0_COINS_PAR_THRESHOLD` default (8) so we exercise the
+            // parallel per-coin accumulation in `stream_pi0_and_collect_tails`.
+            shares: 9,
         };
         let mut rng = StdRng::seed_from_u64(20260205);
         let mut secret = [0u8; 32];
@@ -1670,8 +1668,10 @@ mod tests {
             t_prove.elapsed()
         );
 
-        // Now safe to reclaim disk space used by the shape files.
-        crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir);
+        // Now safe to reclaim disk space used by the shape files (unless caching).
+        if !keep_tiny_cache {
+            crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir);
+        }
     }
 
     /// End-to-end PVUGC test: 3 armers × secp256k1 → P2WPKH Bitcoin address → WE lock → decap → recover.
@@ -1686,7 +1686,6 @@ mod tests {
         use crate::we_statement::encode_public_x;
         use crate::we_tiny_lock::arm_lfplus_ringlwe_lock;
         use crate::utils::maybe_print_rss;
-        use k256::elliptic_curve::sec1::ToEncodedPoint;
         use k256::{ProjectivePoint, Scalar};
         use rand::{rngs::StdRng, RngCore, SeedableRng};
         use sha2::Digest;
@@ -2075,7 +2074,6 @@ mod tests {
         {
             let mut tampered_locksets = armer_locksets.clone();
             if let Some(first_enc) = tampered_locksets[0].locks[0].cts[0].encoded.first_mut() {
-                use ark_ff::Field;
                 // Add a large value to corrupt the first encoded byte.
                 type GlFq = <cyclotomic_rings::rings::GoldilocksRing64 as stark_rings::PolyRing>::BaseRing;
                 *first_enc += GlFq::from(1u64 << 60);
@@ -2241,6 +2239,11 @@ mod tests {
         )
         .expect("poseidon_trace_schedule_for_plus_with_public_inputs");
 
+        // Optional: keep the shape cache directory between runs (to benchmark cache-hit paths).
+        let keep_tiny_cache = std::env::var("LFP_KEEP_TINY_GATE_CACHE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         // Canonical path: build/load shape + compute assignment.
         let t_shape = Instant::now();
         let out_dir = {
@@ -2248,7 +2251,9 @@ mod tests {
             p.push(format!(
                 "lfplus_test_tiny_shape_roundtrip_nvars{nvars_min}_kappa{kappa}_k{k_rg}"
             ));
-            let _ = std::fs::remove_dir_all(&p);
+            if !keep_tiny_cache {
+                let _ = std::fs::remove_dir_all(&p);
+            }
             std::fs::create_dir_all(&p).expect("create temp out_dir");
             p
         };
@@ -2388,169 +2393,13 @@ mod tests {
         maybe_print_rss("tiny_gate_large:after_prove_decap_stream");
         eprintln!("[tiny_gate_large] prove+decap(stream) in {:?}", t_prove.elapsed());
 
-        // Now it is safe to reclaim disk space used by the shape files.
-        crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir);
-    }
-
-    #[derive(MontConfig)]
-    #[modulus = "39402006196394479212279040100143613805079739270465446667948293404245721771496870329047266088258938001861606973112319"]
-    #[generator = "2"]
-    pub struct Secp384r1Config;
-    type FBig = Fp384<MontBackend<Secp384r1Config, 6>>;
-
-    #[derive(Clone)]
-    struct ReplayPoseidonTranscript<RR: OverField> {
-        idx: usize,
-        trace: crate::recording_transcript::PoseidonTranscriptTrace<<RR::BaseRing as Field>::BasePrimeField>,
-        scratch: Vec<<RR::BaseRing as Field>::BasePrimeField>,
-    }
-
-    impl<RR: OverField> ReplayPoseidonTranscript<RR> {
-        fn new(trace: &crate::recording_transcript::PoseidonTranscriptTrace<<RR::BaseRing as Field>::BasePrimeField>) -> Self {
-            Self { idx: 0, trace: trace.clone(), scratch: Vec::with_capacity(64) }
-        }
-        fn advance(&mut self) {
-            self.idx += 1;
+        // Now it is safe to reclaim disk space used by the shape files (unless caching).
+        if !keep_tiny_cache {
+            crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir);
         }
     }
 
-    impl<RR: OverField> Transcript<RR> for ReplayPoseidonTranscript<RR>
-    where
-        RR::BaseRing: PrimeField,
-    {
-        type TranscriptConfig = ark_crypto_primitives::sponge::poseidon::PoseidonConfig<<RR::BaseRing as Field>::BasePrimeField>;
-        fn new(_config: &Self::TranscriptConfig) -> Self {
-            unreachable!("ReplayPoseidonTranscript::new(trace) should be used in tests")
-        }
-
-        fn absorb(&mut self, v: &RR) {
-            self.scratch.clear();
-            // Match the real transcript encoding: ring -> canonical fixed-width LE bytes,
-            // then each byte is absorbed as an F257 element (recorded in base ring as 0..=255).
-            let bytes = latticefold::transcript::bytes::ring_to_bytes_le_fixed::<RR>(v);
-            self.scratch
-                .extend(bytes.iter().map(|b| <RR::BaseRing as Field>::BasePrimeField::from(*b as u64)));
-            let op = self.trace.ops.get(self.idx).expect("replay: op index oob").clone();
-            match op {
-                crate::recording_transcript::PoseidonTraceOp::Absorb(elems) => {
-                    assert_eq!(
-                        elems.as_slice(),
-                        self.scratch.as_slice(),
-                        "replay absorb mismatch at op {}",
-                        self.idx
-                    );
-                }
-                other => panic!("replay expected Absorb op, got {other:?} at idx {}", self.idx),
-            };
-            self.advance();
-        }
-
-        fn absorb_field_element(&mut self, v: &RR::BaseRing) {
-            // Match the real transcript encoding: scalar -> fixed-width LE bytes,
-            // then absorb bytes as F257 elements (recorded as 0..=255 in base ring).
-            self.scratch.clear();
-            let bytes = latticefold::transcript::bytes::prime_field_to_bytes_le_fixed::<RR::BaseRing>(v);
-            self.scratch
-                .extend(bytes.iter().map(|b| <RR::BaseRing as Field>::BasePrimeField::from(*b as u64)));
-            let op = self.trace.ops.get(self.idx).expect("replay: op index oob").clone();
-            match op {
-                crate::recording_transcript::PoseidonTraceOp::Absorb(elems) => {
-                    assert_eq!(
-                        elems.as_slice(),
-                        self.scratch.as_slice(),
-                        "replay absorb_field_element mismatch at op {}",
-                        self.idx
-                    );
-                }
-                other => panic!(
-                    "replay expected Absorb op for absorb_field_element, got {other:?} at idx {}",
-                    self.idx
-                ),
-            };
-            self.advance();
-        }
-
-        fn get_challenge(&mut self) -> RR::BaseRing {
-            // Fixed-tries rejection schedule: DEFAULT_REJECTION_TRIES repetitions of
-            //   SqueezeField(len=CHALLENGE_DIGITS) then Absorb(len=CHALLENGE_DIGITS),
-            // then select the first try whose first 4 digits are all != 256.
-            let mut chosen = [0u8; 4];
-            let mut found = false;
-            for _ in 0..DEFAULT_REJECTION_TRIES {
-                let op0 = self.trace.ops.get(self.idx).expect("replay: op index oob").clone();
-                let c = match op0 {
-                    crate::recording_transcript::PoseidonTraceOp::SqueezeField(v) => v,
-                    other => panic!("replay expected SqueezeField op, got {other:?} at idx {}", self.idx),
-                };
-                assert_eq!(c.len(), CHALLENGE_DIGITS, "replay get_challenge digit length mismatch");
-                self.advance();
-
-                // Each try reabsorbs the squeezed digits.
-                let op1 = self.trace.ops.get(self.idx).expect("replay: op index oob").clone();
-                match op1 {
-                    crate::recording_transcript::PoseidonTraceOp::Absorb(v) => {
-                        assert_eq!(v.as_slice(), c.as_slice(), "replay reabsorb mismatch");
-                    }
-                    other => panic!("replay expected reabsorb Absorb op after SqueezeField, got {other:?}"),
-                };
-                self.advance();
-
-                if found {
-                    continue;
-                }
-                // Accept iff none of the first 4 digits is 256; pack the first 4 digits (byte view) into u32.
-                let mut ok = true;
-                let mut bs = [0u8; 4];
-                for i in 0..4 {
-                    // IMPORTANT: digits are base-257 elements in 0..=256. Do NOT read only the low
-                    // byte (256 would appear as 0x00); read the full limb so we can detect 256.
-                    let du16 = c[i]
-                        .into_bigint()
-                        .as_ref()
-                        .get(0)
-                        .copied()
-                        .unwrap_or(0) as u16;
-                    debug_assert!(du16 < 257u16);
-                    if du16 == 256 {
-                        ok = false;
-                        break;
-                    }
-                    bs[i] = du16 as u8;
-                }
-                if ok {
-                    chosen = bs;
-                    found = true;
-                }
-            }
-            assert!(
-                found,
-                "ReplayPoseidonTranscript::get_challenge exhausted {} rejection tries",
-                DEFAULT_REJECTION_TRIES
-            );
-            RR::BaseRing::from(u32::from_le_bytes(chosen) as u64)
-        }
-
-        fn squeeze_bytes(&mut self, n: usize) -> Vec<u8> {
-            let op = self.trace.ops.get(self.idx).expect("replay: op index oob").clone();
-            let out = match op {
-                crate::recording_transcript::PoseidonTraceOp::SqueezeField(v) => {
-                    assert_eq!(v.len(), n, "replay squeeze_bytes n mismatch");
-                    v.iter()
-                        .map(|e| {
-                            // Read full limb so 256 is represented as 256 (then map to 0).
-                            let d = e.into_bigint().as_ref().get(0).copied().unwrap_or(0) as u16;
-                            debug_assert!(d < 257u16);
-                            if d == 256 { 0u8 } else { d as u8 }
-                        })
-                        .collect()
-                }
-                other => panic!("replay expected SqueezeField op, got {other:?} at idx {}", self.idx),
-            };
-            self.advance();
-            out
-        }
-    }
-
+    #[allow(dead_code)]
     fn identity_cs(n: usize) -> (R1CS<R>, Vec<R>) {
         let r1cs = R1CS::<R> {
             l: 1,
@@ -2863,13 +2712,9 @@ mod tests {
         use stark_rings::PolyRing;
 
         use ark_ff::PrimeField;
-        use rand::{rngs::StdRng, RngCore, SeedableRng};
+        use rand::RngCore;
         #[cfg(feature = "parallel")]
         use rayon::current_num_threads;
-
-        fn lift_to_big<Fs: PrimeField>(x: Fs) -> FBig {
-            FBig::from_le_bytes_mod_order(&x.into_bigint().to_bytes_le())
-        }
 
 
 

@@ -358,7 +358,7 @@ pub fn run_sp1_oneproof_we_gate_from_files(
     // IMPORTANT: `rep_id` may be incremented on retry. `payload` (and therefore the returned
     // decapped key) must be derived *inside* the retry loop so it stays consistent with the
     // lock parameters that were actually armed.
-    let lock = loop {
+    let (lock, armed_key32) = loop {
         let key32: [u8; 32] = {
             let mut h = Sha256::new();
             h.update(b"LFP_ONEPROOF_KEY_V1");
@@ -396,7 +396,7 @@ pub fn run_sp1_oneproof_we_gate_from_files(
             &payload,
             &mut rng,
         ) {
-            Ok(lock) => break lock,
+            Ok(lock) => break (lock, key32),
             Err(e) if e.contains("shifted accepting set contains 0") => {
                 rep_id += 1;
                 continue;
@@ -447,7 +447,11 @@ pub fn run_sp1_oneproof_we_gate_from_files(
     let a_u64 = a0.into_bigint().as_ref().get(0).copied().unwrap_or(0);
     eprintln!("[oneproof] accepting_set_answer={a_u64}");
 
-    // Select the unique candidate whose tag validates.
+    // Select the candidate whose tag validates.
+    //
+    // In principle exactly one branch should validate. In practice, some lock parameter regimes
+    // can yield identical decryptions for both branches; accept that case iff the validated keys
+    // are identical (otherwise treat it as an error).
     let mut picked: Option<[u8; 32]> = None;
     for cand in &cands {
         if cand.len() != 48 {
@@ -462,16 +466,22 @@ pub fn run_sp1_oneproof_we_gate_from_files(
         let full: [u8; 32] = h.finalize().into();
         if tag == &full[0..16] {
             let arr: [u8; 32] = key.try_into().expect("len checked");
-            if picked.is_some() {
-                return Err("oneproof: multiple decap candidates validated tag (unexpected)".to_string());
+            match picked {
+                None => picked = Some(arr),
+                Some(prev) => {
+                    if prev != arr {
+                        return Err("oneproof: multiple distinct decap candidates validated tag".to_string());
+                    }
+                }
             }
-            picked = Some(arr);
         }
     }
     let decapped_key = picked.ok_or_else(|| "oneproof: no decap candidate validated tag".to_string())?;
+    // Harness sanity: we armed locally with `key32`; ensure decapsulation recovered it.
+    if decapped_key != armed_key32 {
+        return Err("oneproof: decapped key mismatch vs armed payload (internal error)".to_string());
+    }
 
-    // Debug-only: keep deterministic footprints if you need to compare runs.
-    let _ = hex32(&stmt_digest);
 
     // Shape cache is intentionally kept on disk for reuse across invocations.
     // To force a rebuild, delete the cache directory manually or set LFP_SHAPE_CACHE_DIR.

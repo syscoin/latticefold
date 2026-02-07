@@ -5089,7 +5089,6 @@ fn build_direct_to_merged_unix(
     )?;
 
     // Canonicality constraints: parallel shards (parts 2..).
-    let t = Instant::now();
     let canonical_glues = build_canonicality_shards(
         &TinyGateBuildMode::RangeBase,
         2,
@@ -5206,7 +5205,6 @@ fn build_direct_to_merged_unix(
     lf_profile_log(&format!("Pass1 cm_shared_precomp_base elapsed={:?}", t.elapsed()));
 
     // CM modules: parts (2+canon_len) and (2+canon_len+1).
-    let t = Instant::now();
     let cm_extra_glues = build_cm_shards(
         &TinyGateBuildMode::RangeBase,
         2 + canonical_glues.len(),

@@ -151,6 +151,7 @@ impl<R> InstanceEvals<R> {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn rows(&self) -> &[[R; 4]] {
         &self.0
     }

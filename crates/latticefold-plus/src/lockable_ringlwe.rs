@@ -25,7 +25,7 @@
 //! `⟨embed(q), embed(π)⟩_GL = a + 257k` as bounded extra noise. With short secrets (centered
 //! binomial, |coeff| ≤ η), the carry `s·257k` is bounded and absorbed by Frodo-style rounding.
 
-use ark_ff::{BigInteger, Field, PrimeField};
+use ark_ff::{Field, PrimeField};
 use cyclotomic_rings::rings::GoldilocksRing64;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
@@ -59,15 +59,6 @@ fn query_row_to_ring(row: &[Fq]) -> GoldilocksRing64 {
     GoldilocksRing64::from(coeffs)
 }
 
-/// Pack a proof chunk into a ring element (coefficients are the embedded F257 values).
-fn pi_row_to_ring(row: &[Fq]) -> GoldilocksRing64 {
-    let mut coeffs = vec![Fq::ZERO; RING_D];
-    for i in 0..RING_D.min(row.len()) {
-        coeffs[i] = row[i];
-    }
-    GoldilocksRing64::from(coeffs)
-}
-
 /// Scale a ring element by a scalar (coefficientwise). O(d), no NTT.
 /// This is much faster than full ring multiply when one operand is a constant polynomial.
 #[inline]
@@ -76,17 +67,19 @@ fn ring_scale(r: &GoldilocksRing64, s: Fq) -> GoldilocksRing64 {
     GoldilocksRing64::from(coeffs)
 }
 
-/// Extract coefficient 0 of the negacyclic ring product a * b in O(d).
+/// Extract coefficient 0 of a * b when b is provided in coefficient form.
 ///
-/// For R = Z_q[x]/(x^d+1): coeff0(a·b) = a[0]*b[0] - Σ_{i=1}^{d-1} a[i]*b[d-i].
-/// This avoids the full NTT ring multiply (which computes all d coefficients).
-fn coeff0_mul(a: &GoldilocksRing64, b: &GoldilocksRing64) -> Fq {
+/// This avoids allocating a temporary `GoldilocksRing64` for each proof block.
+#[inline]
+fn coeff0_mul_row(a: &GoldilocksRing64, row: &[Fq]) -> Fq {
     let ac = a.coeffs();
-    let bc = b.coeffs();
     let d = ac.len();
-    let mut acc = ac[0] * bc[0];
+    let mut acc = if row.is_empty() { Fq::ZERO } else { ac[0] * row[0] };
     for i in 1..d {
-        acc -= ac[i] * bc[d - i];
+        let idx = d - i;
+        if idx < row.len() {
+            acc -= ac[i] * row[idx];
+        }
     }
     acc
 }
@@ -306,14 +299,6 @@ fn sample_nonzero_short_scalar(rng: &mut impl RngCore, k: u32) -> Fq {
     }
 }
 
-/// Sample a short ring element (SECRET) with CBD coefficients.
-fn sample_short_ring(rng: &mut impl RngCore, k: u32) -> GoldilocksRing64 {
-    let coeffs: Vec<Fq> = (0..RING_D)
-        .map(|_| fq_from_i16(centered_binomial(rng, k)))
-        .collect();
-    GoldilocksRing64::from(coeffs)
-}
-
 
 /// Sample a NOISE ring element with uniform box coefficients in [-2^{log2_sigma}, 2^{log2_sigma}].
 ///
@@ -349,6 +334,7 @@ pub struct RingLweDecapStreamState<'a, F: PrimeField> {
     /// We accumulate BOTH branches simultaneously so π is scanned only once.
     branches: [BranchAccum<'a>; 2],
     block_idx: usize,
+    pos_in_block: usize,
     filled: usize,
     coeffs: Vec<Fq>,
 }
@@ -378,37 +364,85 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
                 },
             ],
             block_idx: 0,
+            pos_in_block: 0,
             filled: 0,
             coeffs: Vec::with_capacity(PACK_D),
         })
     }
 
     #[inline]
-    fn maybe_process_full_block(&mut self) -> Result<(), String> {
-        if self.coeffs.len() != self.d {
-            return Ok(());
+    fn next_needed_block(&self) -> Option<usize> {
+        let a = self.branches[0].sparse.get(self.branches[0].sparse_pos).map(|t| t.0);
+        let b = self.branches[1].sparse.get(self.branches[1].sparse_pos).map(|t| t.0);
+        match (a, b) {
+            (None, None) => None,
+            (Some(x), None) => Some(x),
+            (None, Some(y)) => Some(y),
+            (Some(x), Some(y)) => Some(x.min(y)),
         }
-        let pi_ring = pi_row_to_ring(self.coeffs.as_slice());
+    }
+
+    #[inline]
+    fn process_current_block(&mut self, row: &[Fq]) {
         for br in &mut self.branches {
             if br.sparse_pos < br.sparse.len() && br.sparse[br.sparse_pos].0 == self.block_idx {
                 let h = &br.sparse[br.sparse_pos].1;
-                br.y += coeff0_mul(h, &pi_ring);
+                br.y += coeff0_mul_row(h, row);
                 br.sparse_pos += 1;
             }
         }
+    }
+
+    #[inline]
+    fn maybe_process_full_block(&mut self) -> Result<(), String> {
+        if self.pos_in_block != self.d {
+            return Ok(());
+        }
+        debug_assert!(self.coeffs.is_empty() || self.coeffs.len() == self.d);
+        if !self.coeffs.is_empty() {
+            // Avoid borrowing `self` mutably while a slice into `self.coeffs` is live.
+            let row = core::mem::take(&mut self.coeffs);
+            self.process_current_block(row.as_slice());
+        }
         self.block_idx += 1;
-        self.coeffs.clear();
+        self.pos_in_block = 0;
         Ok(())
     }
 
     pub fn absorb_chunk(&mut self, chunk: &[F]) -> Result<(), String> {
-        for v in chunk {
+        let mut i = 0usize;
+        while i < chunk.len() {
             if self.filled >= self.lock.pi_len {
                 return Err("ringlwe_decap_stream: too many π elements".to_string());
             }
-            self.coeffs.push(embed_f_to_fq(v));
-            self.filled += 1;
-            self.maybe_process_full_block()?;
+            let need = self.next_needed_block() == Some(self.block_idx);
+            let rem_chunk = chunk.len() - i;
+            let rem_pi = self.lock.pi_len - self.filled;
+            let rem_block = self.d - self.pos_in_block;
+            let take = rem_chunk.min(rem_pi).min(rem_block);
+            debug_assert!(take > 0);
+
+            if need {
+                // Collect coefficients for this block only (hinted blocks).
+                for v in &chunk[i..i + take] {
+                    self.coeffs.push(embed_f_to_fq(v));
+                }
+                self.pos_in_block += take;
+                self.filled += take;
+                i += take;
+                self.maybe_process_full_block()?;
+            } else {
+                // Skip uninterested blocks in bulk: advance counters without embedding/converting.
+                self.pos_in_block += take;
+                self.filled += take;
+                i += take;
+                if self.pos_in_block == self.d {
+                    // Fast-path block boundary update (no coeffs to process).
+                    self.block_idx += 1;
+                    self.pos_in_block = 0;
+                    self.coeffs.clear();
+                }
+            }
         }
         Ok(())
     }
@@ -419,19 +453,16 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
             return Err("ringlwe_decap_stream: bad π length".to_string());
         }
         // Flush remaining partial block.
-        if !self.coeffs.is_empty() {
-            while self.coeffs.len() < self.d {
-                self.coeffs.push(Fq::ZERO);
-            }
-            let pi_ring = pi_row_to_ring(self.coeffs.as_slice());
-            for br in &mut self.branches {
-                if br.sparse_pos < br.sparse.len() && br.sparse[br.sparse_pos].0 == self.block_idx {
-                    let h = &br.sparse[br.sparse_pos].1;
-                    br.y += coeff0_mul(h, &pi_ring);
-                    br.sparse_pos += 1;
-                }
+        if self.pos_in_block != 0 {
+            debug_assert_eq!(self.pos_in_block, self.filled % self.d);
+            if !self.coeffs.is_empty() {
+                // Current block was needed, so we collected its (partial) coefficients.
+                // Avoid borrowing `self` mutably while a slice into `self.coeffs` is live.
+                let row = core::mem::take(&mut self.coeffs);
+                self.process_current_block(row.as_slice());
             }
             self.block_idx += 1;
+            self.pos_in_block = 0;
             self.coeffs.clear();
         }
         let nblocks = (self.lock.pi_len + self.d - 1) / self.d;
