@@ -65,6 +65,7 @@ fn main() {
 
     println!("stmt_digest=0x{}", hex32(out.stmt_digest));
     println!("lock_coin_seed=0x{}", hex32(out.lock_coin_seed));
+    println!("decapped_key=0x{}", hex32(out.decapped_key));
     eprintln!("[oneproof] total_elapsed={:?}", t_total.elapsed());
 }
 
