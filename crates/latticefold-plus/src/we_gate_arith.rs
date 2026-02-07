@@ -3,12 +3,11 @@
 //! This module is a research/bench frontend: it arithmetizes the *verifier* computation,
 //! keeping the relation log-scale in `n` and linear in the verifier-visible message sizes.
 
-use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
-use ark_ff::{BigInteger, Field, PrimeField};
+use ark_ff::{Field, PrimeField};
 use latticefold::transcript::poseidon::F257;
-use stark_rings::{psi, unit_monomial, CoeffRing, OverField, PolyRing, Zq};
+use stark_rings::{CoeffRing, OverField, PolyRing, Zq};
 
-use crate::recording_transcript::{PoseidonTraceOp as LfPoseidonTraceOp, PoseidonTranscriptTrace};
+use crate::recording_transcript::PoseidonTranscriptTrace;
 use crate::we_gate_tiny as tiny;
 use crate::we_statement::WeParams;
 use crate::transcript::DEFAULT_REJECTION_TRIES;
@@ -19,15 +18,10 @@ type BF<R> = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
 /// Number of F257 digits per base-257 challenge (= 8 for Goldilocks).
 const CHALLENGE_DIGITS: usize = 8;
 
-// Reuse symphony’s sparse dR1CS primitives and Poseidon arithmetizer.
-use symphony::dpp_poseidon::{
-    merge_sparse_dr1cs_share_one, merge_sparse_dr1cs_share_one_with_glue,
-    poseidon_sponge_dr1cs_from_ops_with_wiring_and_bytes, Constraint, PoseidonByteWiring,
-    PoseidonDr1csWiring, SparseDr1csInstance,
-};
-use symphony::file_backed_dr1cs::{merge_file_backed_sparse_dr1cs_share_one, FileBackedSparseDr1csInstance};
 use symphony::dpp_sumcheck::Dr1csBuilder;
-use symphony::dpp_sumcheck::{sumcheck_verify_degree3, RingVars};
+use symphony::file_backed_dr1cs::{
+    merge_file_backed_sparse_dr1cs_share_one, FileBackedSparseDr1csInstance,
+};
 
 #[cfg(feature = "we_gate")]
 fn first_squeeze_field_op_index_of_len(
@@ -337,6 +331,7 @@ pub struct WeDr1csShape<F: PrimeField> {
 }
 
 #[cfg(feature = "we_gate")]
+#[allow(dead_code)]
 fn poseidon_trace_schedule_for_plus<R>(
     public_inputs_len: usize,
     params: &WeParams,
@@ -357,6 +352,7 @@ where
 /// the transcript prefix). The returned trace is self-consistent: all squeeze outputs match the
 /// sponge state induced by the chosen absorbs.
 #[cfg(feature = "we_gate")]
+#[allow(dead_code)]
 fn poseidon_trace_schedule_for_plus_with_public_inputs<R>(
     public_inputs: &[BF<R>],
     params: &WeParams,
@@ -1056,20 +1052,15 @@ mod tests {
     fn init_rayon_stack() {}
 
     use super::*;
-    use cyclotomic_rings::rings::GoldilocksPoseidonConfig as PC;
     use latticefold::arith::r1cs::R1CS;
     use latticefold::transcript::Transcript;
     use ark_ff::{Fp384, MontBackend, MontConfig};
-    use stark_rings::balanced_decomposition::GadgetDecompose;
     use cyclotomic_rings::rings::GoldilocksRing64 as R;
-    use stark_rings_linalg::{Matrix, SparseMatrix};
+    use stark_rings_linalg::SparseMatrix;
 
-    use crate::lin::Linearize;
     use crate::lin::LinearizedVerify;
-    use crate::r1cs::ComR1CS;
     use crate::recording_transcript::TracePoseidonTranscript;
-    use crate::rgchk::{DecompParameters, Rg, RgInstance};
-    use crate::cm::Cm;
+    use crate::rgchk::DecompParameters;
 
     // NOTE: We intentionally do not keep the old “shape builds and constraints check” tests here.
     // They were development scaffolding and are slow/ignored. The tiny gate is now exercised via

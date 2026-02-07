@@ -88,6 +88,7 @@ pub(crate) fn goldilocks_bytes_to_digits(gb: &mut Dr1csBuilder<F257>, bytes_le: 
 /// Soundness:
 /// - Allocates byte vars from the witness implied by `x_digits`.
 /// - Enforces each byte is 8-bit, enforces `< p`, then re-parses the bytes back into digits and equates them to `x_digits`.
+#[allow(dead_code)]
 pub(crate) fn goldilocks_digits_to_bytes_canonical(
     gb: &mut Dr1csBuilder<F257>,
     x_digits: &GoldilocksScalar,

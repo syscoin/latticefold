@@ -25,7 +25,7 @@
 //! `⟨embed(q), embed(π)⟩_GL = a + 257k` as bounded extra noise. With short secrets (centered
 //! binomial, |coeff| ≤ η), the carry `s·257k` is bounded and absorbed by Frodo-style rounding.
 
-use ark_ff::{BigInteger, Field, PrimeField};
+use ark_ff::{Field, PrimeField};
 use cyclotomic_rings::rings::GoldilocksRing64;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
@@ -297,14 +297,6 @@ fn sample_nonzero_short_scalar(rng: &mut impl RngCore, k: u32) -> Fq {
             return fq_from_i16(v);
         }
     }
-}
-
-/// Sample a short ring element (SECRET) with CBD coefficients.
-fn sample_short_ring(rng: &mut impl RngCore, k: u32) -> GoldilocksRing64 {
-    let coeffs: Vec<Fq> = (0..RING_D)
-        .map(|_| fq_from_i16(centered_binomial(rng, k)))
-        .collect();
-    GoldilocksRing64::from(coeffs)
 }
 
 
