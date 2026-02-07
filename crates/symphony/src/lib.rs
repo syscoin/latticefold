@@ -22,7 +22,6 @@ pub mod we_statement;
 pub mod poseidon_trace;
 pub mod dpp_poseidon;
 pub mod dpp_ajtai;
-pub mod we_gate_arith;
 pub mod dpp_sumcheck;
 pub mod dpp_pifold_math;
 pub mod file_backed_dr1cs;
