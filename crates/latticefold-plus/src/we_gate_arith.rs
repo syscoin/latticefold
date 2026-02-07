@@ -2241,6 +2241,11 @@ mod tests {
         )
         .expect("poseidon_trace_schedule_for_plus_with_public_inputs");
 
+        // Optional: keep the shape cache directory between runs (to benchmark cache-hit paths).
+        let keep_tiny_cache = std::env::var("LFP_KEEP_TINY_GATE_CACHE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         // Canonical path: build/load shape + compute assignment.
         let t_shape = Instant::now();
         let out_dir = {
@@ -2248,7 +2253,9 @@ mod tests {
             p.push(format!(
                 "lfplus_test_tiny_shape_roundtrip_nvars{nvars_min}_kappa{kappa}_k{k_rg}"
             ));
-            let _ = std::fs::remove_dir_all(&p);
+            if !keep_tiny_cache {
+                let _ = std::fs::remove_dir_all(&p);
+            }
             std::fs::create_dir_all(&p).expect("create temp out_dir");
             p
         };
@@ -2388,8 +2395,10 @@ mod tests {
         maybe_print_rss("tiny_gate_large:after_prove_decap_stream");
         eprintln!("[tiny_gate_large] prove+decap(stream) in {:?}", t_prove.elapsed());
 
-        // Now it is safe to reclaim disk space used by the shape files.
-        crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir);
+        // Now it is safe to reclaim disk space used by the shape files (unless caching).
+        if !keep_tiny_cache {
+            crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir);
+        }
     }
 
     #[derive(MontConfig)]
