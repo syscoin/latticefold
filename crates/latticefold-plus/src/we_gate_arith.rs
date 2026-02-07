@@ -2716,11 +2716,6 @@ mod tests {
         #[cfg(feature = "parallel")]
         use rayon::current_num_threads;
 
-        #[allow(dead_code)]
-        fn lift_to_big<Fs: PrimeField>(x: Fs) -> FBig {
-            FBig::from_le_bytes_mod_order(&x.into_bigint().to_bytes_le())
-        }
-
 
 
         // Default to the historical large-scale setting (n=2^20), but allow smaller for scaling studies.
