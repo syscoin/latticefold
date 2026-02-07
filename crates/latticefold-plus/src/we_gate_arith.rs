@@ -2402,10 +2402,13 @@ mod tests {
     #[derive(MontConfig)]
     #[modulus = "39402006196394479212279040100143613805079739270465446667948293404245721771496870329047266088258938001861606973112319"]
     #[generator = "2"]
+    #[allow(dead_code)]
     pub struct Secp384r1Config;
+    #[allow(dead_code)]
     type FBig = Fp384<MontBackend<Secp384r1Config, 6>>;
 
     #[derive(Clone)]
+    #[allow(dead_code)]
     struct ReplayPoseidonTranscript<RR: OverField> {
         idx: usize,
         trace: crate::recording_transcript::PoseidonTranscriptTrace<<RR::BaseRing as Field>::BasePrimeField>,
@@ -2413,9 +2416,11 @@ mod tests {
     }
 
     impl<RR: OverField> ReplayPoseidonTranscript<RR> {
+        #[allow(dead_code)]
         fn new(trace: &crate::recording_transcript::PoseidonTranscriptTrace<<RR::BaseRing as Field>::BasePrimeField>) -> Self {
             Self { idx: 0, trace: trace.clone(), scratch: Vec::with_capacity(64) }
         }
+        #[allow(dead_code)]
         fn advance(&mut self) {
             self.idx += 1;
         }
@@ -2558,6 +2563,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn identity_cs(n: usize) -> (R1CS<R>, Vec<R>) {
         let r1cs = R1CS::<R> {
             l: 1,
@@ -2870,10 +2876,11 @@ mod tests {
         use stark_rings::PolyRing;
 
         use ark_ff::PrimeField;
-        use rand::{RngCore, SeedableRng};
+        use rand::RngCore;
         #[cfg(feature = "parallel")]
         use rayon::current_num_threads;
 
+        #[allow(dead_code)]
         fn lift_to_big<Fs: PrimeField>(x: Fs) -> FBig {
             FBig::from_le_bytes_mod_order(&x.into_bigint().to_bytes_le())
         }
