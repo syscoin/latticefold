@@ -900,7 +900,7 @@ fn write_lock_package_to_writer(
 fn read_lock_package_from_reader(
     r: &mut impl Read,
 ) -> std::io::Result<(Sp1OneProofWeGateLockPkgManifest, Vec<u32>, Vec<RingLweLockArtifact<F257>>)> {
-    let mut magic = [0u8; 9];
+    let mut magic = [0u8; 10];
     r.read_exact(&mut magic)?;
     if &magic != b"LFP1LOCK64" {
         return Err(std::io::Error::new(
