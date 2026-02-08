@@ -1,11 +1,12 @@
 //! LF+ one-proof harness for SP1 shrink verifier R1LF (API-driven).
 //!
 //! This example is intentionally a **thin wrapper** over:
-//! `latticefold_plus::sp1_oneproof_api::run_sp1_oneproof_we_gate_from_files`.
+//! `latticefold_plus::sp1_oneproof_api::decap_sp1_oneproof_we_gate_from_files_with_lock_package`.
 //!
 //! Usage:
 //!   SP1_R1LF=/path/to/shrink_verifier.r1lf \
 //!   SP1_WITNESS=/path/to/shrink_verifier.witness.bundle \
+//!   LFP_ONEPROOF_LOCK_PKG_IN=/path/to/lock_pkg.bin \
 //!     cargo run -p latticefold-plus --example lf_plus_sp1_oneproof --features we_gate --release
 
 #![cfg(feature = "we_gate")]
@@ -56,12 +57,15 @@ fn main() {
     let r1lf_path = std::env::var("SP1_R1LF").expect("Set SP1_R1LF=/path/to/shrink.r1lf");
     let witness_path =
         std::env::var("SP1_WITNESS").expect("Set SP1_WITNESS=/path/to/shrink_verifier.witness.bundle");
+    let lock_pkg_in = std::env::var("LFP_ONEPROOF_LOCK_PKG_IN")
+        .expect("Set LFP_ONEPROOF_LOCK_PKG_IN=/path/to/lock_pkg.bin");
 
-    let out = latticefold_plus::sp1_oneproof_api::run_sp1_oneproof_we_gate_from_files(
+    let out = latticefold_plus::sp1_oneproof_api::decap_sp1_oneproof_we_gate_from_files_with_lock_package(
         &r1lf_path,
         &witness_path,
+        &lock_pkg_in,
     )
-    .expect("run_sp1_oneproof_we_gate_from_files");
+    .expect("decap_sp1_oneproof_we_gate_from_files_with_lock_package");
 
     println!("stmt_digest=0x{}", hex32(out.stmt_digest));
     println!("lock_coin_seed=0x{}", hex32(out.lock_coin_seed));

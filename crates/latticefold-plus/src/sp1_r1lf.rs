@@ -71,7 +71,19 @@ pub fn sp1_default_we_params_for_r1lf_cache<R: PolyRing>(
 where
     R::BaseRing: PrimeField,
 {
-    let nvars = nvars_from_ncols_pow2(cache.ncols)?;
+    sp1_default_we_params_for_pbb_and_ncols::<R>(cache.stats.p_bb, cache.ncols, kappa, mlen)
+}
+
+fn sp1_default_we_params_for_pbb_and_ncols<R: PolyRing>(
+    p_bb: u64,
+    ncols: usize,
+    kappa: u64,
+    mlen: u64,
+) -> Result<WeParams, String>
+where
+    R::BaseRing: PrimeField,
+{
+    let nvars = nvars_from_ncols_pow2(ncols)?;
     // log_{d'}(q) where d' = d/2
     let lnq = (R::BaseRing::MODULUS_BIT_SIZE as f64) * std::f64::consts::LN_2;
     let d = R::dimension() as u64;
@@ -112,7 +124,6 @@ where
     // more margin for *multiplication-row* no-wrap bounds (quadratic in M), while still staying
     // below q_goldilocks/(2*p_bb) ≈ 4,581,298,445.7 for the aux term.
     const SP1_P_BB: u64 = 2013265921;
-    let p_bb = cache.stats.p_bb;
     if d == 64 && p_bb == SP1_P_BB {
         let decomp_b: u64 = 12;
         let k: u64 = 8;
@@ -123,7 +134,9 @@ where
             let digit_max: u128 = (d / 2 - 1) as u128; // 31
             println!(
                 "[sp1_default_we_params] SP1/Goldilocks64 hardcoded safe params: decomp_b={}, k={}, l={}, max_bound={}",
-                decomp_b, k, l,
+                decomp_b,
+                k,
+                l,
                 digit_max * ((decomp_b as u128).pow(k as u32) - 1) / (decomp_b as u128 - 1)
             );
         }
@@ -141,21 +154,6 @@ where
         });
     }
 
-    // Production boundedness strategy:
-    // Use the existing monomial-based rgchk/setchk pipeline, so we must choose a digit base
-    // compatible with `exp(digit)`. We set `decomp_b = d/2` and choose `k` based on `d` so that
-    // the implied bound on lifted values stays well below Goldilocks modulus and avoids wraparound.
-    //
-    // IMPORTANT:
-    // `balanced_decomposition::decompose_to(b, out[k])` requires `out.len()` to be large enough to
-    // represent the value. If `k` is too small, it will write past the end (panic).
-    //
-    // Here we pick `k` to cover SP1's centered BabyBear values, which are bounded by p_bb/2.
-    // For balanced digits with base B (even), digits satisfy |d_i| <= floor(B/2), so the max
-    // representable magnitude with k digits is:
-    //   max(k) = floor(B/2) * (B^k - 1) / (B - 1).
-    //
-    // We choose the smallest k such that max(k) >= bound, where bound := p_bb/2.
     fn min_k_for_bound(base: u64, bound: u64) -> u64 {
         debug_assert!(base >= 2 && base % 2 == 0);
         if bound == 0 {
@@ -177,7 +175,6 @@ where
         }
     }
 
-    let p_bb = cache.stats.p_bb;
     let bound = p_bb / 2;
     let k_raw: u64 = min_k_for_bound(d_prime, bound);
     let k: u64 = next_power_of_two(k_raw as usize) as u64;
@@ -185,7 +182,9 @@ where
     // Log the chosen parameters (matches LF_PLUS_PROFILE pattern).
     let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
     if profile {
-        let max_bound = (d_prime / 2) as u128 * ((d_prime as u128).pow(k as u32) - 1) / (d_prime as u128 - 1);
+        let max_bound = (d_prime / 2) as u128
+            * ((d_prime as u128).pow(k as u32) - 1)
+            / (d_prime as u128 - 1);
         println!(
             "[sp1_default_we_params] generic path: d={}, decomp_b={}, k_raw={}, k={}, l={}, max_bound={}",
             d, d_prime, k_raw, k, l, max_bound
@@ -204,6 +203,23 @@ where
         l,
         mlen,
     })
+}
+
+/// Same as `sp1_default_we_params_for_r1lf_cache`, but parameterized by the parsed R1LF header and
+/// the padded witness column count `ncols`.
+///
+/// This is intended for **WE arming** paths that must remain statement-only and therefore should
+/// not build the on-disk chunk cache.
+pub fn sp1_default_we_params_for_r1lf_header_and_ncols<R: PolyRing>(
+    header: &R1LfHeader,
+    ncols: usize,
+    kappa: u64,
+    mlen: u64,
+) -> Result<WeParams, String>
+where
+    R::BaseRing: PrimeField,
+{
+    sp1_default_we_params_for_pbb_and_ncols::<R>(header.p_bb, ncols, kappa, mlen)
 }
 
 /// Metadata parsed from the R1LF header.

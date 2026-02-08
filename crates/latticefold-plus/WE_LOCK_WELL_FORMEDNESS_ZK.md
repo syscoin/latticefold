@@ -78,7 +78,7 @@ For each armer \(j\):
   - `offset`,
   - for each lock instance in the lockset:
     - `q_blocks` are *not* published directly in the current artifact; the public artifact includes:
-    - hint blocks `branch_hints[b].hint0_blocks_sparse` and `branch_hints[b].hint1_blocks_sparse` (two sparse ring-hint vectors per branch),
+    - hint blocks `branch_hints[b].hint_blocks_sparse` (one sparse ring-hint vector per branch),
     - ciphertexts `cts[b].nonce` and `cts[b].ct` (bytes).
 
 ### Witness (what the armer proves knowledge of)
@@ -243,7 +243,7 @@ For each branch \(b\in\{0,1\}\), the armer publishes:
 
 - a nonce `cts[b].nonce`,
 - a ciphertext `cts[b].ct`,
-- and hint material which determines (under a valid proof stream) seed components \((y_{b,i} \bmod 257)\) used for key derivation.
+- and hint material which determines (under a valid proof stream) a seed value \((y_b \bmod 257)\) used for key derivation.
 
 Let `K_b` be the derived 32-byte key computed from the published statement binding and the recovered seeds (exact KDF specified by the implementation; in current code it is SHA-256 over domain label, statement binding, coins, and the seed components).
 
@@ -263,7 +263,7 @@ In this design, correctness requires that the **center lift be stable**, i.e. th
 
 Therefore, the well-formedness proof MUST include a public “no-wrap” bound \(B_{\text{wrap}} < q/2\) and enforce:
 
-- for each branch \(b\) and each seed component used by the DEM key derivation (e.g. \(y_{b,0}, y_{b,1}\) or \(2P\) components for \(P\) packed channels),
+- for each branch \(b\) and each seed component used by the DEM key derivation (in the current code: one component \(y_b\); for packed-channel variants, this generalizes to multiple components),
   \[
   |\tilde{y}_{b,i}| \le B_{\text{wrap}}.
   \]
@@ -326,8 +326,7 @@ B_{\text{wrap}} \;<\; \frac{q}{2}.
 
 **Notes:**
 
-- If the lock uses **two hint vectors per branch** (e.g. `hint0` and `hint1` / two seed components), compute \(B_{\text{wrap}}\) **separately**
-  for each component \(i\in\{0,1\}\).
+- If the lock uses multiple seed components (e.g. packed-channel variants), compute \(B_{\text{wrap}}\) **separately** for each component.
 - If the lock packs **P channels**, compute the bound for each channel/component, or conservatively sum the \(\ell_1\) norms across channels.
 - This bound is conservative but **fully arm-before-proof**: it uses only public artifacts plus the representation bound \(\|\pi\|_\infty\le 128\).
 

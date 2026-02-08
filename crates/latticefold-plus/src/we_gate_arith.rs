@@ -348,12 +348,11 @@ where
 
 /// Schedule generator with explicit public inputs.
 ///
-/// This is useful for tests that want to validate *statement binding* (public inputs absorbed into
-/// the transcript prefix). The returned trace is self-consistent: all squeeze outputs match the
-/// sponge state induced by the chosen absorbs.
+/// This is useful for any caller that wants *statement binding* (public inputs absorbed into the
+/// transcript prefix) without having to run the prover. The returned trace is self-consistent:
+/// all squeeze outputs match the sponge state induced by the chosen absorbs.
 #[cfg(feature = "we_gate")]
-#[allow(dead_code)]
-fn poseidon_trace_schedule_for_plus_with_public_inputs<R>(
+pub(crate) fn poseidon_trace_schedule_for_plus_with_public_inputs<R>(
     public_inputs: &[BF<R>],
     params: &WeParams,
     n_lin_proofs: usize,
@@ -527,7 +526,7 @@ where
 }
 
 #[cfg(feature = "we_gate")]
-fn dummy_plus_proof_shape<R>(
+pub(crate) fn dummy_plus_proof_shape<R>(
     params: &WeParams,
     mlen_mats: usize,
     n_lin_proofs: usize,
@@ -855,6 +854,51 @@ where
     }
 
     Ok((shape, assignment))
+}
+
+/// Build or load **only the WE gate shape** (no assignment).
+///
+/// This is the correct entrypoint for **WE arming**: the armer needs the statement-bound
+/// constraint system, but must not depend on any prover/witness material.
+#[cfg(feature = "we_gate")]
+pub fn build_or_load_we_plus_tiny_shape<R>(
+    trace: &PoseidonTranscriptTrace<BF<R>>,
+    params: &WeParams,
+    public_inputs_basefield: &[BF<R>],
+    n_lin_proofs: usize,
+    mlen_mats: usize,
+    pairs: &[(usize, usize)],
+    shape_dir: impl AsRef<std::path::Path>,
+) -> Result<WeDr1csShape<F257>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + Field + PrimeField,
+{
+    let ring_dim = R::dimension();
+    if ring_dim != 64 {
+        return Err("build_or_load_we_plus_tiny_shape: only ring_dim=64 supported".to_string());
+    }
+    let shape_dir = shape_dir.as_ref();
+
+    if shape_cache_exists(shape_dir) {
+        eprintln!("[we_gate] shape cache hit: {}", shape_dir.display());
+        return load_we_plus_tiny_shape(shape_dir);
+    }
+
+    eprintln!("[we_gate] shape cache miss — building: {}", shape_dir.display());
+    std::fs::create_dir_all(shape_dir).map_err(|e| format!("create shape_dir failed: {e}"))?;
+
+    let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
+        trace,
+        params,
+        public_inputs_basefield,
+        n_lin_proofs,
+        mlen_mats,
+        pairs,
+        shape_dir,
+    )?;
+    save_shape_meta(shape_dir, shape.public_len)?;
+    Ok(shape)
 }
 
 /// Compute only the assignment vector (no shape, no disk writes).
@@ -1516,11 +1560,14 @@ mod tests {
         // This is the *intended* usage in the design docs: decapsulation under noise is
         // probabilistic (AEAD may fail). We publish R independent share-locks and only need
         // T successful decryptions (treat failures as erasures).
+        // For the 1-hint RingLWE lock variant, we want to understand the *scaling* of
+        // arming/decap and artifact size as we increase the number of locks per armer.
+        //
+        // Keep T small for test runtime, but set R=16 so we exercise the "16 locks per armer"
+        // storage/perf profile end-to-end.
         let shamir = ShamirConfig {
             threshold: 3,
-            // Keep this > `DPP_PI0_COINS_PAR_THRESHOLD` default (8) so we exercise the
-            // parallel per-coin accumulation in `stream_pi0_and_collect_tails`.
-            shares: 9,
+            shares: 16,
         };
         let mut rng = StdRng::seed_from_u64(20260205);
         let mut secret = [0u8; 32];
@@ -1787,9 +1834,43 @@ mod tests {
         // Phase 1: ARMING (3 armers, each with a secp256k1 secret)
         // =====================================================================
         let mut rng = StdRng::seed_from_u64(20260206);
-        let shamir = ShamirConfig { threshold: 3, shares: 5 };
+        // Same 16-lock-per-armer setting as the small harness above (T stays small for runtime).
+        let shamir = ShamirConfig { threshold: 3, shares: 16 };
         let ringlwe_params = RingLweParams::default();
         let stmt_digest = [5u8; 32];
+
+        fn estimate_lock_artifact_storage_bytes<F: PrimeField>(
+            lock: &crate::lockable_ringlwe::RingLweLockArtifact<F>,
+        ) -> usize {
+            // Rough, serialization-agnostic estimate meant for comparing variants.
+            // - F257 elements treated as u16 (2 bytes).
+            // - One hinted block treated as:
+            //     block_idx(u32:4) + coeffs(64 bytes) + mask(u64:8) = 76 bytes.
+            // - Ignore Vec/struct overhead.
+            let bytes_per_f257 = 2usize;
+            let bytes_per_hint_block = 4usize + 64usize + 8usize;
+
+            let mut sum = 0usize;
+            // Small fixed fields (dominated by hints).
+            sum += lock.c_stmt.len() * bytes_per_f257;
+            sum += 2 * bytes_per_f257; // accepting_set[2]
+            sum += bytes_per_f257; // offset
+            sum += 8 + 3 * bytes_per_f257; // coins: idx(u64) + 3 field elems
+            sum += 4 + 32; // params: reserved0(u32) + domain_label(32)
+
+            // Hints: 2 branches, each a sparse list of hinted blocks.
+            for b in 0..2 {
+                sum += lock.branch_hints[b].hint_blocks_sparse.len() * bytes_per_hint_block;
+            }
+
+            // Ciphertexts: 2 branches.
+            for b in 0..2 {
+                sum += lock.cts[b].nonce.len();
+                sum += lock.cts[b].ct.len();
+            }
+
+            sum
+        }
 
         // Each armer samples a secret scalar. Individual P_j = s_j·G are NEVER published.
         // Only the combined P_combined is public (derived Bitcoin address).
@@ -1873,6 +1954,21 @@ mod tests {
                 indices.push(shares[i].index);
                 locks.push(lock);
             }
+            // Print rough storage footprint + hint density for this armer's lockset.
+            let total_bytes: usize = locks.iter().map(estimate_lock_artifact_storage_bytes).sum();
+            let total_hinted_blocks: usize = locks
+                .iter()
+                .map(|l| {
+                    l.branch_hints[0].hint_blocks_sparse.len()
+                        + l.branch_hints[1].hint_blocks_sparse.len()
+                })
+                .sum();
+            eprintln!(
+                "[btc_3armer] armer {j}: lockset storage est ≈ {} bytes; hinted_blocks(total across 2 branches across {} locks) = {}",
+                total_bytes,
+                locks.len(),
+                total_hinted_blocks
+            );
             armer_locksets.push(ArmerLockset { locks, share_indices: indices });
         }
         eprintln!(

@@ -24,9 +24,12 @@ use std::time::Instant;
 use rand::{rngs::StdRng, SeedableRng};
 
 use crate::lin::LinearizedVerify;
-use crate::lockable_ringlwe::RingLweParams;
+use crate::lockable_ringlwe::{PackedF257Block64, RingLweLockArtifact, RingLweParams};
 use crate::utils::maybe_print_rss;
 use crate::we_statement::{encode_public_x, we_statement_hash_lf_plus, LFP_WE_GATE_DIGEST_V1};
+use std::io::{Read, Write};
+
+type BFSmall = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
 
 /// Structured output for downstream wiring (no stdout parsing).
 #[derive(Clone, Debug)]
@@ -41,6 +44,25 @@ pub struct Sp1OneProofWeGateOutput {
     pub decapped_key: [u8; 32],
 }
 
+/// Manifest embedded in the public lock package file.
+///
+/// This is the canonical public metadata needed to sanity-check decapsulation is using the
+/// correct package for a given statement/proof stream.
+#[derive(Clone, Debug)]
+pub struct Sp1OneProofWeGateLockPkgManifest {
+    pub stmt_digest: [u8; 32],
+    pub lock_coin_seed: [u8; 32],
+}
+
+/// Structured output for the **arming** endpoint (write lock packages to disk).
+#[derive(Clone, Debug)]
+pub struct Sp1OneProofWeGateArmingOutput {
+    pub manifest: Sp1OneProofWeGateLockPkgManifest,
+    pub k_locks: usize,
+    /// Size (bytes) of the written lock package file.
+    pub lock_pkg_bytes: u64,
+}
+
 fn hex32(bytes: &[u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(64);
@@ -51,15 +73,243 @@ fn hex32(bytes: &[u8; 32]) -> String {
     out
 }
 
-/// Run the SP1 oneproof + WE gate path from on-disk artifacts.
+/// Arm the OneProof WE-gate lock(s) and write the lock package to disk.
 ///
-/// Inputs are the same formats the example consumes:
-/// - `r1lf_path`: SP1 shrink verifier `.r1lf`
-/// - `witness_path`: SP1 witness bundle `.bundle` ("SP1W")
-pub fn run_sp1_oneproof_we_gate_from_files(
+/// This is the **arm-before-proof** endpoint: it produces the public lock artifacts
+/// (hint blocks + ciphertexts) and writes them to `lock_pkg_out_path`.
+///
+/// Decapsulation can later be run (in a separate process) by loading the package with
+/// `decap_sp1_oneproof_we_gate_from_files_with_lock_package`.
+pub fn arm_sp1_oneproof_we_gate_write_lock_package(
+    r1lf_path: &str,
+    vk_hash: [u8; 32],
+    public_inputs: &[BFSmall],
+    lock_pkg_out_path: &str,
+    k_locks: usize,
+) -> Result<Sp1OneProofWeGateArmingOutput, String> {
+    // WE arming: statement-only.
+    // - reads only public `.r1lf` header stats
+    // - uses provided statement public inputs
+    // - builds/loads WE-gate *shape only* (no assignment, no prover)
+    // - arms locks and writes the public lock package to disk
+
+    let r1lf_file_bytes = std::fs::metadata(r1lf_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    eprintln!("[oneproof:size] input_files: r1lf_bytes={}", r1lf_file_bytes);
+
+    let pad_cols_to_multiple_of: usize = std::env::var("PAD_COLS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
+
+    let hdr = crate::sp1_r1lf::read_r1lf_stats(r1lf_path)
+        .map_err(|e| format!("read_r1lf_stats: {e}"))?;
+    if hdr.num_public == 0 {
+        return Err("SP1 R1LF exports num_public=0; statement binding requires public inputs".to_string());
+    }
+    if public_inputs.len() != hdr.num_public {
+        return Err(format!(
+            "public_inputs length mismatch: got={} expected_num_public={}",
+            public_inputs.len(),
+            hdr.num_public
+        ));
+    }
+
+    // Keep this aligned with the decap path parameters.
+    let kappa_expose: u64 = 8;
+    let kappa_random: u64 = 8;
+    let kappa: u64 = kappa_expose + kappa_random;
+    // For this OneProof→LF+ pipeline we assume a single committed matrix family.
+    let mlen_mats: u64 = 1;
+
+    let ncols = crate::sp1_r1lf::padded_ncols_from_header(&hdr, pad_cols_to_multiple_of)?;
+    let we_params = crate::sp1_r1lf::sp1_default_we_params_for_r1lf_header_and_ncols::<R>(
+        &hdr,
+        ncols,
+        kappa,
+        mlen_mats,
+    )
+    .map_err(|e| format!("sp1_default_we_params_for_r1lf_header_and_ncols: {e}"))?;
+
+    let r1cs_digest = hdr.digest;
+    let stmt_digest =
+        we_statement_hash_lf_plus::<R>(vk_hash, r1cs_digest, LFP_WE_GATE_DIGEST_V1, &we_params, public_inputs);
+
+    // Derive one representative coin seed (j=0) like the example.
+    const ARMER_SEED: [u8; 32] = *b"LFP_ARMER_SEED_V1_00000000000000";
+    let lock_j: u64 = 0;
+    let lock_coin_seed: [u8; 32] = {
+        let mut h = Sha256::new();
+        h.update(b"LFP_LOCK_COIN_V1");
+        h.update(&ARMER_SEED);
+        h.update(&stmt_digest);
+        h.update(&lock_j.to_le_bytes());
+        h.finalize().into()
+    };
+
+    // WE arming must not run the prover or compute an assignment.
+    //
+    // Instead, we generate a self-consistent verifier transcript schedule and build/load the
+    // statement-bound tiny-gate *shape only*.
+    let n_lin_proofs = 1usize;
+    let trace = crate::we_gate_arith::poseidon_trace_schedule_for_plus_with_public_inputs::<R>(
+        public_inputs,
+        &we_params,
+        n_lin_proofs,
+        mlen_mats as usize,
+    )?;
+
+    // Shape cache directory.
+    let out_dir = {
+        let base = std::env::var("LFP_SHAPE_CACHE_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                let mut p = std::env::temp_dir();
+                p.push("lfplus_sp1_oneproof_tiny_gate");
+                p
+            });
+        std::fs::create_dir_all(&base).map_err(|e| format!("create shape cache dir failed: {e}"))?;
+        base
+    };
+
+    let pairs: Vec<(usize, usize)> = vec![(0, 0)];
+
+    // Map statement public inputs into tiny-gate public prefix bytes (F257).
+    let public_inputs_f257: Vec<F257> = public_inputs
+        .iter()
+        .flat_map(|x| {
+            field_to_bytes_le_fixed::<BFSmall>(x)
+                .into_iter()
+                .map(|b| F257::from(b as u64))
+        })
+        .collect();
+
+    // WE arming must not depend on a satisfying assignment.
+    let shape = crate::we_gate_arith::build_or_load_we_plus_tiny_shape::<R>(
+        &trace,
+        &we_params,
+        public_inputs,
+        n_lin_proofs,
+        mlen_mats as usize,
+        &pairs,
+        &out_dir,
+    )
+    .map_err(|e| format!("build_or_load_we_plus_tiny_shape: {e}"))?;
+
+    // Arm the lock package(s).
+    let block_id = 0usize;
+    let ringlwe_params = RingLweParams::default();
+    let mut rng = StdRng::from_seed(lock_coin_seed);
+
+    let t_arm = Instant::now();
+    let mut locks: Vec<RingLweLockArtifact<F257>> = Vec::with_capacity(k_locks);
+    for j in 0..k_locks {
+        let lock_j = j as u64;
+        let mut rep_id = j as u64;
+        let lock = loop {
+            let key32: [u8; 32] = {
+                let mut h = Sha256::new();
+                h.update(b"LFP_ONEPROOF_KEY_V1");
+                h.update(&lock_coin_seed);
+                h.update(&stmt_digest);
+                h.update(&lock_j.to_le_bytes());
+                h.update(&block_id.to_le_bytes());
+                h.update(&rep_id.to_le_bytes());
+                h.finalize().into()
+            };
+            let tag16: [u8; 16] = {
+                let mut h = Sha256::new();
+                h.update(b"LFP_ONEPROOF_TAG_V1");
+                h.update(&key32);
+                h.update(&stmt_digest);
+                let full: [u8; 32] = h.finalize().into();
+                full[0..16].try_into().expect("slice->array")
+            };
+            let payload: [u8; 48] = {
+                let mut p = [0u8; 48];
+                p[0..16].copy_from_slice(&tag16);
+                p[16..48].copy_from_slice(&key32);
+                p
+            };
+            match crate::we_tiny_lock::arm_lfplus_ringlwe_lock::<R>(
+                shape.clone(),
+                &we_params,
+                &public_inputs_f257,
+                stmt_digest,
+                ARMER_SEED,
+                lock_j,
+                block_id,
+                rep_id,
+                ringlwe_params.clone(),
+                &payload,
+                &mut rng,
+            ) {
+                Ok(lock) => break lock,
+                Err(e) if e.contains("shifted accepting set contains 0") => {
+                    rep_id += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        locks.push(lock);
+    }
+    eprintln!(
+        "[oneproof] armed {} locks in {:?}",
+        locks.len(),
+        t_arm.elapsed()
+    );
+
+    let manifest = Sp1OneProofWeGateLockPkgManifest {
+        stmt_digest,
+        lock_coin_seed,
+    };
+    write_lock_package(lock_pkg_out_path, &manifest, &locks)
+        .map_err(|e| format!("oneproof: write lock package failed: {e}"))?;
+    let file_bytes = std::fs::metadata(lock_pkg_out_path).map(|m| m.len()).unwrap_or(0);
+    eprintln!(
+        "[oneproof:size] wrote_lock_pkg: path={} bytes={}",
+        lock_pkg_out_path, file_bytes
+    );
+
+    Ok(Sp1OneProofWeGateArmingOutput {
+        manifest,
+        k_locks,
+        lock_pkg_bytes: file_bytes,
+    })
+}
+
+/// Decapsulate a OneProof WE-gate lock package from disk.
+///
+/// This is the **decap** endpoint: it reads the public lock artifacts from `lock_pkg_in_path`,
+/// then runs the proof-induced streaming decapsulation and returns the recovered key.
+pub fn decap_sp1_oneproof_we_gate_from_files_with_lock_package(
     r1lf_path: &str,
     witness_path: &str,
+    lock_pkg_in_path: &str,
 ) -> Result<Sp1OneProofWeGateOutput, String> {
+    decap_sp1_oneproof_we_gate_from_files_inner(r1lf_path, witness_path, lock_pkg_in_path)
+}
+
+fn decap_sp1_oneproof_we_gate_from_files_inner(
+    r1lf_path: &str,
+    witness_path: &str,
+    lock_pkg_in_path: &str,
+) -> Result<Sp1OneProofWeGateOutput, String> {
+    // Print basic input sizes (useful for production sizing).
+    let r1lf_file_bytes = std::fs::metadata(r1lf_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let witness_file_bytes = std::fs::metadata(witness_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    eprintln!(
+        "[oneproof:size] input_files: r1lf_bytes={} witness_bundle_bytes={}",
+        r1lf_file_bytes, witness_file_bytes
+    );
+
     // Keep defaults aligned with the example (but avoid printing / panics).
     let chunk_size: usize = std::env::var("CHUNK_SIZE")
         .ok()
@@ -118,7 +368,6 @@ pub fn run_sp1_oneproof_we_gate_from_files(
             1 + l_pub
         ));
     }
-    type BFSmall = <<R as PolyRing>::BaseRing as ark_ff::Field>::BasePrimeField;
     let mut public_inputs: Vec<BFSmall> = w_host[1..1 + l_pub].to_vec();
     // Debug knob parity with the historical harness: mutate a public input and ensure things fail.
     if !public_inputs.is_empty()
@@ -336,82 +585,53 @@ pub fn run_sp1_oneproof_we_gate_from_files(
         return Err("oneproof: satisfying assignment public prefix mismatch".to_string());
     }
     let z_w = &assignment[public_len..];
-
-    let lock_j = 0u64;
-    let block_id = 0usize;
-    let mut rep_id = 0u64;
-    // Deterministic by default; production should set σ>0 and enable reconciliation/rounding.
-    let ringlwe_params = RingLweParams::default();
-    // Deterministic RNG seed derived from the statement-binding lock coin seed.
-    let mut rng = StdRng::from_seed(lock_coin_seed);
-
-    let t_arm = Instant::now();
-    // Payload (research harness):
-    // We want this API to return a single decapped key (not 2 unauthenticated candidates).
-    //
-    // So we arm the lock with a payload containing:
-    //   payload = tag16 || key32
-    // where tag16 = H("LFP_ONEPROOF_TAG_V1" || key32 || stmt_digest)[0..16].
-    //
-    // After streaming decap, we try both candidates and pick the unique one whose tag validates.
-    // This avoids depending on external branch-identification plumbing (e.g. Shamir) in PVUGC.
-    // IMPORTANT: `rep_id` may be incremented on retry. `payload` (and therefore the returned
-    // decapped key) must be derived *inside* the retry loop so it stays consistent with the
-    // lock parameters that were actually armed.
-    let (lock, armed_key32) = loop {
-        let key32: [u8; 32] = {
-            let mut h = Sha256::new();
-            h.update(b"LFP_ONEPROOF_KEY_V1");
-            h.update(&lock_coin_seed);
-            h.update(&stmt_digest);
-            h.update(&lock_j.to_le_bytes());
-            h.update(&block_id.to_le_bytes());
-            h.update(&rep_id.to_le_bytes());
-            h.finalize().into()
-        };
-        let tag16: [u8; 16] = {
-            let mut h = Sha256::new();
-            h.update(b"LFP_ONEPROOF_TAG_V1");
-            h.update(&key32);
-            h.update(&stmt_digest);
-            let full: [u8; 32] = h.finalize().into();
-            full[0..16].try_into().expect("slice->array")
-        };
-        let payload: [u8; 48] = {
-            let mut p = [0u8; 48];
-            p[0..16].copy_from_slice(&tag16);
-            p[16..48].copy_from_slice(&key32);
-            p
-        };
-        match crate::we_tiny_lock::arm_lfplus_ringlwe_lock::<R>(
-            shape.clone(),
-            &we_params,
-            &public_inputs_f257,
-            stmt_digest,
-            ARMER_SEED,
-            lock_j,
-            block_id,
-            rep_id,
-            ringlwe_params.clone(),
-            &payload,
-            &mut rng,
-        ) {
-            Ok(lock) => break (lock, key32),
-            Err(e) if e.contains("shifted accepting set contains 0") => {
-                rep_id += 1;
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
-    };
+    let (m, locks) = read_lock_package(lock_pkg_in_path)
+        .map_err(|e| format!("oneproof: read lock package failed: {e}"))?;
+    if m.stmt_digest != stmt_digest {
+        return Err("oneproof: lock package stmt_digest mismatch".to_string());
+    }
+    if m.lock_coin_seed != lock_coin_seed {
+        return Err("oneproof: lock package lock_coin_seed mismatch".to_string());
+    }
+    if locks.is_empty() {
+        return Err("oneproof: lock package contained 0 locks".to_string());
+    }
+    let lock = &locks[0];
     let prover = crate::we_tiny_lock::we_ringlwe_prover_from_dr1cs::<F257>(
         shape.inst.clone(),
         shape.public_len,
     )?;
+    // Production sizing note:
+    // `proof_len` here is the number of streamed π elements over F257. If transmitted as raw bytes,
+    // the π stream is ~1 byte/element.
+    let pi_len = prover.proof_len();
+    let pi_stream_bytes = pi_len as u128;
+    let pi_stream_gib = (pi_stream_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+    let pi_blocks = (pi_len + (64 - 1)) / 64;
+
+    // Lock artifact sizing (hints dominate).
+    // Packed F257 per hinted block: block_idx(u32:4) + coeffs(64 bytes) + mask(u64:8) = 76 bytes.
+    let bytes_per_hint_block = 4usize + 64usize + 8usize;
+    let mut hinted_blocks_total = 0usize;
+    let mut ct_bytes_total = 0usize;
+    for l in &locks {
+        hinted_blocks_total += l.branch_hints[0].hint_blocks_sparse.len();
+        hinted_blocks_total += l.branch_hints[1].hint_blocks_sparse.len();
+        ct_bytes_total += l.cts[0].nonce.len()
+            + l.cts[0].ct.len()
+            + l.cts[1].nonce.len()
+            + l.cts[1].ct.len();
+    }
+    let hint_bytes_est = hinted_blocks_total.saturating_mul(bytes_per_hint_block);
     eprintln!(
-        "[oneproof] armed ringlwe in {:?}: proof_len={}",
-        t_arm.elapsed(),
-        prover.proof_len()
+        "[oneproof:size] pi_len={} (~{:.2} GiB if 1 byte/elem) pi_blocks={} locks={} hinted_blocks_total={} hint_bytes_est≈{} ct_bytes_total={}",
+        pi_len,
+        pi_stream_gib,
+        pi_blocks,
+        locks.len(),
+        hinted_blocks_total,
+        hint_bytes_est,
+        ct_bytes_total
     );
 
     let t_prove = Instant::now();
@@ -470,10 +690,6 @@ pub fn run_sp1_oneproof_we_gate_from_files(
     }
     let decapped_key = picked.ok_or_else(|| "oneproof: no decap candidate validated tag".to_string())?;
 
-    // Harness sanity: we armed locally with `armed_key32`; ensure decapsulation recovered it.
-    if decapped_key != armed_key32 {
-        return Err("oneproof: decapped key mismatch vs armed payload (internal error)".to_string());
-    }
     // Shape cache is intentionally kept on disk for reuse across invocations.
     // To force a rebuild, delete the cache directory manually or set LFP_SHAPE_CACHE_DIR.
 
@@ -496,3 +712,227 @@ fn babybear_u64_to_centered_host<F: ark_ff::Field>(x: u64, p_bb: u64) -> F {
     }
 }
 
+// ---------------------------------------------------------------------------
+// OneProof lock package IO (research endpoint plumbing)
+// ---------------------------------------------------------------------------
+
+fn f257_to_u16(f: &F257) -> u16 {
+    (f.into_bigint().as_ref()[0] % 257) as u16
+}
+
+fn u16_to_f257(x: u16) -> F257 {
+    F257::from((x % 257) as u64)
+}
+
+fn write_u32(w: &mut impl Write, v: u32) -> std::io::Result<()> {
+    w.write_all(&v.to_le_bytes())
+}
+
+fn write_u64(w: &mut impl Write, v: u64) -> std::io::Result<()> {
+    w.write_all(&v.to_le_bytes())
+}
+
+fn read_u32(r: &mut impl Read) -> std::io::Result<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(u32::from_le_bytes(b))
+}
+
+fn read_u64(r: &mut impl Read) -> std::io::Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_le_bytes(b))
+}
+
+fn write_lock_package_to_writer(
+    w: &mut impl Write,
+    manifest: &Sp1OneProofWeGateLockPkgManifest,
+    locks: &[RingLweLockArtifact<F257>],
+) -> std::io::Result<()> {
+    w.write_all(b"LFP1LOCKPKG")?;
+    // Embedded manifest (canonical public metadata).
+    w.write_all(&manifest.stmt_digest)?;
+    w.write_all(&manifest.lock_coin_seed)?;
+    write_u32(w, locks.len() as u32)?;
+    for lock in locks {
+        // c_stmt
+        write_u32(w, lock.c_stmt.len() as u32)?;
+        for f in &lock.c_stmt {
+            w.write_all(&f257_to_u16(f).to_le_bytes())?;
+        }
+        // accepting_set + offset
+        w.write_all(&f257_to_u16(&lock.accepting_set[0]).to_le_bytes())?;
+        w.write_all(&f257_to_u16(&lock.accepting_set[1]).to_le_bytes())?;
+        w.write_all(&f257_to_u16(&lock.offset).to_le_bytes())?;
+        // sizes
+        write_u32(w, lock.x_len as u32)?;
+        write_u32(w, lock.pi_len as u32)?;
+        write_u32(w, lock.len as u32)?;
+        // coins
+        write_u64(w, lock.coins.idx as u64)?;
+        w.write_all(&f257_to_u16(&lock.coins.lambda).to_le_bytes())?;
+        w.write_all(&f257_to_u16(&lock.coins.rho).to_le_bytes())?;
+        w.write_all(&f257_to_u16(&lock.coins.sigma).to_le_bytes())?;
+        // params
+        write_u32(w, lock.params._reserved0)?;
+        w.write_all(&lock.params.domain_label)?;
+        // branch hints
+        for b in 0..2 {
+            write_u32(w, lock.branch_hints[b].hint_blocks_sparse.len() as u32)?;
+            for (block_idx, blk) in &lock.branch_hints[b].hint_blocks_sparse {
+                write_u32(w, *block_idx as u32)?;
+                w.write_all(&blk.coeffs)?;
+                write_u64(w, blk.mask_256)?;
+            }
+        }
+        // ciphertexts
+        for b in 0..2 {
+            w.write_all(&lock.cts[b].nonce)?;
+            write_u32(w, lock.cts[b].ct.len() as u32)?;
+            w.write_all(&lock.cts[b].ct)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_lock_package_from_reader(
+    r: &mut impl Read,
+) -> std::io::Result<(Sp1OneProofWeGateLockPkgManifest, Vec<RingLweLockArtifact<F257>>)> {
+    let mut magic = [0u8; 11];
+    r.read_exact(&mut magic)?;
+    if &magic != b"LFP1LOCKPKG" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad lock pkg magic",
+        ));
+    }
+
+    // Embedded manifest (canonical public metadata).
+    let mut stmt_digest = [0u8; 32];
+    let mut lock_coin_seed = [0u8; 32];
+    r.read_exact(&mut stmt_digest)?;
+    r.read_exact(&mut lock_coin_seed)?;
+    let manifest = Sp1OneProofWeGateLockPkgManifest {
+        stmt_digest,
+        lock_coin_seed,
+    };
+
+    let n = read_u32(r)? as usize;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        // c_stmt
+        let c_len = read_u32(r)? as usize;
+        let mut c_stmt = Vec::with_capacity(c_len);
+        for _ in 0..c_len {
+            let mut b = [0u8; 2];
+            r.read_exact(&mut b)?;
+            c_stmt.push(u16_to_f257(u16::from_le_bytes(b)));
+        }
+        // accepting_set + offset
+        let mut b2 = [0u8; 2];
+        r.read_exact(&mut b2)?;
+        let a0 = u16::from_le_bytes(b2);
+        r.read_exact(&mut b2)?;
+        let a1 = u16::from_le_bytes(b2);
+        r.read_exact(&mut b2)?;
+        let off = u16::from_le_bytes(b2);
+        // sizes
+        let x_len = read_u32(r)? as usize;
+        let pi_len = read_u32(r)? as usize;
+        let len = read_u32(r)? as usize;
+        // coins
+        let idx = read_u64(r)? as usize;
+        r.read_exact(&mut b2)?;
+        let lambda = u16::from_le_bytes(b2);
+        r.read_exact(&mut b2)?;
+        let rho = u16::from_le_bytes(b2);
+        r.read_exact(&mut b2)?;
+        let sigma = u16::from_le_bytes(b2);
+        // params
+        let reserved0 = read_u32(r)?;
+        let mut domain_label = [0u8; 32];
+        r.read_exact(&mut domain_label)?;
+        let params = RingLweParams {
+            _reserved0: reserved0,
+            domain_label,
+        };
+        // hints
+        let mut branch_hints = [
+            crate::lockable_ringlwe::BranchHints {
+                hint_blocks_sparse: Vec::new(),
+            },
+            crate::lockable_ringlwe::BranchHints {
+                hint_blocks_sparse: Vec::new(),
+            },
+        ];
+        for bi in 0..2 {
+            let nh = read_u32(r)? as usize;
+            let mut v = Vec::with_capacity(nh);
+            for _ in 0..nh {
+                let block_idx = read_u32(r)? as usize;
+                let mut coeffs = [0u8; 64];
+                r.read_exact(&mut coeffs)?;
+                let mask_256 = read_u64(r)?;
+                v.push((block_idx, PackedF257Block64 { coeffs, mask_256 }));
+            }
+            branch_hints[bi].hint_blocks_sparse = v;
+        }
+        // ciphertexts
+        let mut cts = [
+            crate::lockable_ringlwe::LockCiphertext {
+                nonce: [0u8; 12],
+                ct: Vec::new(),
+            },
+            crate::lockable_ringlwe::LockCiphertext {
+                nonce: [0u8; 12],
+                ct: Vec::new(),
+            },
+        ];
+        for bi in 0..2 {
+            let mut nonce = [0u8; 12];
+            r.read_exact(&mut nonce)?;
+            let ct_len = read_u32(r)? as usize;
+            let mut ct = vec![0u8; ct_len];
+            r.read_exact(&mut ct)?;
+            cts[bi] = crate::lockable_ringlwe::LockCiphertext { nonce, ct };
+        }
+        out.push(RingLweLockArtifact {
+            c_stmt,
+            accepting_set: [u16_to_f257(a0), u16_to_f257(a1)],
+            offset: u16_to_f257(off),
+            x_len,
+            pi_len,
+            len,
+            coins: dpp::theorem43::Theorem43Coins::<F257> {
+                idx,
+                lambda: u16_to_f257(lambda),
+                rho: u16_to_f257(rho),
+                sigma: u16_to_f257(sigma),
+            },
+            params,
+            branch_hints,
+            cts,
+        });
+    }
+    Ok((manifest, out))
+}
+
+fn write_lock_package(
+    path: &str,
+    manifest: &Sp1OneProofWeGateLockPkgManifest,
+    locks: &[RingLweLockArtifact<F257>],
+) -> std::io::Result<()> {
+    let f = std::fs::File::create(path)?;
+    let mut w = std::io::BufWriter::new(f);
+    write_lock_package_to_writer(&mut w, manifest, locks)?;
+    w.flush()?;
+    Ok(())
+}
+
+fn read_lock_package(
+    path: &str,
+) -> std::io::Result<(Sp1OneProofWeGateLockPkgManifest, Vec<RingLweLockArtifact<F257>>)> {
+    let f = std::fs::File::open(path)?;
+    let mut r = std::io::BufReader::new(f);
+    read_lock_package_from_reader(&mut r)
+}
