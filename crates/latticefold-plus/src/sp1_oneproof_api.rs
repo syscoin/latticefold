@@ -25,6 +25,7 @@ use rand::{rngs::StdRng, SeedableRng};
 
 use crate::lin::LinearizedVerify;
 use crate::lockable_ringlwe::{PackedF257Block64, RingLweLockArtifact, RingLweParams};
+use crate::shamir_gf256::{reconstruct_secret_32, split_secret_32, ShamirConfig, ShamirShare};
 use crate::utils::maybe_print_rss;
 use crate::we_statement::{encode_public_x, we_statement_hash_lf_plus, LFP_WE_GATE_DIGEST_V1};
 use std::io::{Read, Write};
@@ -52,6 +53,18 @@ pub struct Sp1OneProofWeGateOutput {
 pub struct Sp1OneProofWeGateLockPkgManifest {
     pub stmt_digest: [u8; 32],
     pub lock_coin_seed: [u8; 32],
+    /// Combine scheme identifier (format-level, forward-compatible).
+    ///
+    /// `1` = combine_v1 (current implementation uses Shamir over GF(256); may change to XOR-based).
+    pub combine_scheme: u32,
+    /// Threshold \(T\) for T-of-R reconstruction.
+    pub combine_threshold: u32,
+    /// Number of locks / shares \(R\).
+    pub combine_shares: u32,
+    /// Public tag binding the combined key to the statement.
+    ///
+    /// This lets decap select the unique valid reconstruction without any per-lock oracle.
+    pub combined_key_tag: [u8; 32],
 }
 
 /// Structured output for the **arming** endpoint (write lock packages to disk).
@@ -120,8 +133,10 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
     let kappa_expose: u64 = 8;
     let kappa_random: u64 = 8;
     let kappa: u64 = kappa_expose + kappa_random;
-    // For this OneProof→LF+ pipeline we assume a single committed matrix family.
-    let mlen_mats: u64 = 1;
+    // For this OneProof→LF+ pipeline we commit the base R1CS matrices (A,B,C).
+    //
+    // This must match the decap path's `m0.len()` (see `ComR1CSXBase::matrices_arc_base`).
+    let mlen_mats: u64 = 3;
 
     let ncols = crate::sp1_r1lf::padded_ncols_from_header(&hdr, pad_cols_to_multiple_of)?;
     let we_params = crate::sp1_r1lf::sp1_default_we_params_for_r1lf_header_and_ncols::<R>(
@@ -203,36 +218,43 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
     let ringlwe_params = RingLweParams::default();
     let mut rng = StdRng::from_seed(lock_coin_seed);
 
+    // Combine-v1: split a single 32-byte secret into R shares with threshold T.
+    // This is statement-bound (seeded by lock_coin_seed + stmt_digest) and proof-agnostic.
+    let threshold: usize = std::env::var("LFP_ONEPROOF_T")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3)
+        .min(k_locks)
+        .max(2);
+    let combine_cfg = ShamirConfig {
+        threshold,
+        shares: k_locks,
+    };
+    let combined_key32: [u8; 32] = {
+        let mut h = Sha256::new();
+        h.update(b"LFP_ONEPROOF_COMBINED_KEY_V1");
+        h.update(&lock_coin_seed);
+        h.update(&stmt_digest);
+        h.finalize().into()
+    };
+    let shares = split_secret_32(&mut rng, &combine_cfg, combined_key32)
+        .map_err(|e| format!("split_secret_32: {e}"))?;
+    let combined_key_tag: [u8; 32] = {
+        let mut h = Sha256::new();
+        h.update(b"LFP_ONEPROOF_COMBINED_TAG_V1");
+        h.update(&combined_key32);
+        h.update(&stmt_digest);
+        h.finalize().into()
+    };
+
     let t_arm = Instant::now();
     let mut locks: Vec<RingLweLockArtifact<F257>> = Vec::with_capacity(k_locks);
+    let mut share_indices: Vec<u32> = Vec::with_capacity(k_locks);
     for j in 0..k_locks {
         let lock_j = j as u64;
         let mut rep_id = j as u64;
+        share_indices.push(shares[j].index);
         let lock = loop {
-            let key32: [u8; 32] = {
-                let mut h = Sha256::new();
-                h.update(b"LFP_ONEPROOF_KEY_V1");
-                h.update(&lock_coin_seed);
-                h.update(&stmt_digest);
-                h.update(&lock_j.to_le_bytes());
-                h.update(&block_id.to_le_bytes());
-                h.update(&rep_id.to_le_bytes());
-                h.finalize().into()
-            };
-            let tag16: [u8; 16] = {
-                let mut h = Sha256::new();
-                h.update(b"LFP_ONEPROOF_TAG_V1");
-                h.update(&key32);
-                h.update(&stmt_digest);
-                let full: [u8; 32] = h.finalize().into();
-                full[0..16].try_into().expect("slice->array")
-            };
-            let payload: [u8; 48] = {
-                let mut p = [0u8; 48];
-                p[0..16].copy_from_slice(&tag16);
-                p[16..48].copy_from_slice(&key32);
-                p
-            };
             match crate::we_tiny_lock::arm_lfplus_ringlwe_lock::<R>(
                 shape.clone(),
                 &we_params,
@@ -243,7 +265,7 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
                 block_id,
                 rep_id,
                 ringlwe_params.clone(),
-                &payload,
+                shares[j].value.as_slice(),
                 &mut rng,
             ) {
                 Ok(lock) => break lock,
@@ -265,8 +287,12 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
     let manifest = Sp1OneProofWeGateLockPkgManifest {
         stmt_digest,
         lock_coin_seed,
+        combine_scheme: 1,
+        combine_threshold: threshold as u32,
+        combine_shares: k_locks as u32,
+        combined_key_tag,
     };
-    write_lock_package(lock_pkg_out_path, &manifest, &locks)
+    write_lock_package(lock_pkg_out_path, &manifest, &share_indices, &locks)
         .map_err(|e| format!("oneproof: write lock package failed: {e}"))?;
     let file_bytes = std::fs::metadata(lock_pkg_out_path).map(|m| m.len()).unwrap_or(0);
     eprintln!(
@@ -585,7 +611,7 @@ fn decap_sp1_oneproof_we_gate_from_files_inner(
         return Err("oneproof: satisfying assignment public prefix mismatch".to_string());
     }
     let z_w = &assignment[public_len..];
-    let (m, locks) = read_lock_package(lock_pkg_in_path)
+    let (m, share_indices, locks) = read_lock_package(lock_pkg_in_path)
         .map_err(|e| format!("oneproof: read lock package failed: {e}"))?;
     if m.stmt_digest != stmt_digest {
         return Err("oneproof: lock package stmt_digest mismatch".to_string());
@@ -596,7 +622,30 @@ fn decap_sp1_oneproof_we_gate_from_files_inner(
     if locks.is_empty() {
         return Err("oneproof: lock package contained 0 locks".to_string());
     }
-    let lock = &locks[0];
+    if share_indices.len() != locks.len() {
+        return Err("oneproof: lock package share_indices/locks length mismatch".to_string());
+    }
+    if m.combine_scheme != 1 {
+        return Err(format!(
+            "oneproof: unsupported combine_scheme {}",
+            m.combine_scheme
+        ));
+    }
+    if m.combine_shares as usize != locks.len() {
+        return Err(format!(
+            "oneproof: combine_shares mismatch (header={} locks={})",
+            m.combine_shares,
+            locks.len()
+        ));
+    }
+    let t = m.combine_threshold as usize;
+    if t < 2 || t > locks.len() {
+        return Err(format!(
+            "oneproof: invalid combine_threshold={} for locks_len={}",
+            t,
+            locks.len()
+        ));
+    }
     let prover = crate::we_tiny_lock::we_ringlwe_prover_from_dr1cs::<F257>(
         shape.inst.clone(),
         shape.public_len,
@@ -636,59 +685,100 @@ fn decap_sp1_oneproof_we_gate_from_files_inner(
 
     let t_prove = Instant::now();
     maybe_print_rss("oneproof:before_prove_decap_stream");
-    let mut st = lock.decap_state(&x)?;
+    let mut states: Vec<_> = Vec::with_capacity(locks.len());
+    for (i, l) in locks.iter().enumerate() {
+        let st = l
+            .decap_state(&x)
+            .map_err(|e| format!("oneproof: decap_state[{i}] failed: {e}"))?;
+        states.push(st);
+    }
+    let coins_list = locks.iter().map(|l| l.coins.clone()).collect::<Vec<_>>();
     let mut err: Option<String> = None;
-    let tails = prover.stream_pi0_and_collect_tails(
-        &x,
-        z_w,
-        std::slice::from_ref(&lock.coins),
-        &mut |chunk| {
-            if err.is_some() {
-                return;
-            }
+    let tails = prover.stream_pi0_and_collect_tails(&x, z_w, &coins_list, &mut |chunk| {
+        if err.is_some() {
+            return;
+        }
+        for st in &mut states {
             if let Err(e) = st.absorb_chunk(chunk) {
                 err = Some(e);
+                break;
             }
-        },
-    )?;
+        }
+    })?;
     if let Some(e) = err {
         return Err(format!("oneproof: stream decap absorb failed: {e}"));
     }
-    if tails.len() != 1 {
-        return Err(format!("oneproof: expected 1 tail, got {}", tails.len()));
+    if tails.len() != states.len() {
+        return Err(format!(
+            "oneproof: tails/locks mismatch (tails={} locks={})",
+            tails.len(),
+            states.len()
+        ));
     }
-    st.absorb_chunk(&tails[0])?;
-    let cands = st.finish_decrypt_candidates()?;
+    for (i, st) in states.iter_mut().enumerate() {
+        st.absorb_chunk(&tails[i])?;
+    }
     maybe_print_rss("oneproof:after_prove_decap_stream");
     eprintln!("[oneproof] prove+decap(stream) in {:?}", t_prove.elapsed());
-    // With unauthenticated encryption, branch identification is deferred to Shamir reconstruction.
-    // The accepting set structure is verified from the lock artifact directly.
-    let a0 = lock.accepting_set[0] + lock.offset;
-    let a_u64 = a0.into_bigint().as_ref().get(0).copied().unwrap_or(0);
-    eprintln!("[oneproof] accepting_set_answer={a_u64}");
 
-    // Select the unique candidate whose tag validates.
-    let mut picked: Option<[u8; 32]> = None;
-    for cand in &cands {
-        if cand.len() != 48 {
-            continue;
+    // Decrypt all locks: each produces 2 candidate 32-byte share payloads (unauthenticated).
+    let mut candidates_per_lock: Vec<(u32, [[u8; 32]; 2])> = Vec::with_capacity(locks.len());
+    for (i, st) in states.into_iter().enumerate() {
+        let [pt0, pt1] = st
+            .finish_decrypt_candidates()
+            .map_err(|e| format!("oneproof: finish_decrypt_candidates[{i}]: {e}"))?;
+        if pt0.len() != 32 || pt1.len() != 32 {
+            return Err(format!(
+                "oneproof: share candidate wrong length at lock[{i}] ({} / {})",
+                pt0.len(),
+                pt1.len()
+            ));
         }
-        let tag = &cand[0..16];
-        let key = &cand[16..48];
-        let mut h = Sha256::new();
-        h.update(b"LFP_ONEPROOF_TAG_V1");
-        h.update(key);
-        h.update(&stmt_digest);
-        let full: [u8; 32] = h.finalize().into();
-        if tag == &full[0..16] {
-            let arr: [u8; 32] = key.try_into().expect("len checked");
-            if picked.is_some() {
-                return Err("oneproof: multiple decap candidates validated tag (unexpected)".to_string());
+        let mut c0 = [0u8; 32];
+        let mut c1 = [0u8; 32];
+        c0.copy_from_slice(&pt0);
+        c1.copy_from_slice(&pt1);
+        candidates_per_lock.push((share_indices[i], [c0, c1]));
+    }
+
+    // Combine-v1: try 2^T branch assignments on the first T locks and pick the unique candidate
+    // whose combined-key tag matches the package header.
+    let subset = &candidates_per_lock[..t];
+    let n_cands = subset.len();
+    let combine_cfg = ShamirConfig {
+        threshold: t,
+        shares: locks.len(),
+    };
+    let mut picked: Option<[u8; 32]> = None;
+    for mask in 0u64..(1u64 << n_cands) {
+        let selected: Vec<ShamirShare> = subset
+            .iter()
+            .enumerate()
+            .map(|(i, (idx, cands))| {
+                let branch = ((mask >> i) & 1) as usize;
+                ShamirShare {
+                    index: *idx,
+                    value: cands[branch],
+                }
+            })
+            .collect();
+        if let Ok(candidate) = reconstruct_secret_32(&combine_cfg, &selected) {
+            let tag: [u8; 32] = {
+                let mut h = Sha256::new();
+                h.update(b"LFP_ONEPROOF_COMBINED_TAG_V1");
+                h.update(&candidate);
+                h.update(&stmt_digest);
+                h.finalize().into()
+            };
+            if tag == m.combined_key_tag {
+                if picked.is_some() {
+                    return Err("oneproof: multiple combined-key candidates matched tag (unexpected)".to_string());
+                }
+                picked = Some(candidate);
             }
-            picked = Some(arr);
         }
     }
-    let decapped_key = picked.ok_or_else(|| "oneproof: no decap candidate validated tag".to_string())?;
+    let decapped_key = picked.ok_or_else(|| "oneproof: failed to reconstruct combined key".to_string())?;
 
     // Shape cache is intentionally kept on disk for reuse across invocations.
     // To force a rebuild, delete the cache directory manually or set LFP_SHAPE_CACHE_DIR.
@@ -747,14 +837,26 @@ fn read_u64(r: &mut impl Read) -> std::io::Result<u64> {
 fn write_lock_package_to_writer(
     w: &mut impl Write,
     manifest: &Sp1OneProofWeGateLockPkgManifest,
+    share_indices: &[u32],
     locks: &[RingLweLockArtifact<F257>],
 ) -> std::io::Result<()> {
     w.write_all(b"LFP1LOCKPKG")?;
     // Embedded manifest (canonical public metadata).
     w.write_all(&manifest.stmt_digest)?;
     w.write_all(&manifest.lock_coin_seed)?;
+    w.write_all(&manifest.combine_scheme.to_le_bytes())?;
+    w.write_all(&manifest.combine_threshold.to_le_bytes())?;
+    w.write_all(&manifest.combine_shares.to_le_bytes())?;
+    w.write_all(&manifest.combined_key_tag)?;
     write_u32(w, locks.len() as u32)?;
-    for lock in locks {
+    if share_indices.len() != locks.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "share_indices/locks length mismatch",
+        ));
+    }
+    for (i, lock) in locks.iter().enumerate() {
+        w.write_all(&share_indices[i].to_le_bytes())?;
         // c_stmt
         write_u32(w, lock.c_stmt.len() as u32)?;
         for f in &lock.c_stmt {
@@ -797,7 +899,7 @@ fn write_lock_package_to_writer(
 
 fn read_lock_package_from_reader(
     r: &mut impl Read,
-) -> std::io::Result<(Sp1OneProofWeGateLockPkgManifest, Vec<RingLweLockArtifact<F257>>)> {
+) -> std::io::Result<(Sp1OneProofWeGateLockPkgManifest, Vec<u32>, Vec<RingLweLockArtifact<F257>>)> {
     let mut magic = [0u8; 11];
     r.read_exact(&mut magic)?;
     if &magic != b"LFP1LOCKPKG" {
@@ -812,14 +914,31 @@ fn read_lock_package_from_reader(
     let mut lock_coin_seed = [0u8; 32];
     r.read_exact(&mut stmt_digest)?;
     r.read_exact(&mut lock_coin_seed)?;
+    let mut b4 = [0u8; 4];
+    r.read_exact(&mut b4)?;
+    let combine_scheme = u32::from_le_bytes(b4);
+    r.read_exact(&mut b4)?;
+    let combine_threshold = u32::from_le_bytes(b4);
+    r.read_exact(&mut b4)?;
+    let combine_shares = u32::from_le_bytes(b4);
+    let mut combined_key_tag = [0u8; 32];
+    r.read_exact(&mut combined_key_tag)?;
     let manifest = Sp1OneProofWeGateLockPkgManifest {
         stmt_digest,
         lock_coin_seed,
+        combine_scheme,
+        combine_threshold,
+        combine_shares,
+        combined_key_tag,
     };
 
     let n = read_u32(r)? as usize;
+    let mut share_indices: Vec<u32> = Vec::with_capacity(n);
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
+        let mut b = [0u8; 4];
+        r.read_exact(&mut b)?;
+        share_indices.push(u32::from_le_bytes(b));
         // c_stmt
         let c_len = read_u32(r)? as usize;
         let mut c_stmt = Vec::with_capacity(c_len);
@@ -914,24 +1033,25 @@ fn read_lock_package_from_reader(
             cts,
         });
     }
-    Ok((manifest, out))
+    Ok((manifest, share_indices, out))
 }
 
 fn write_lock_package(
     path: &str,
     manifest: &Sp1OneProofWeGateLockPkgManifest,
+    share_indices: &[u32],
     locks: &[RingLweLockArtifact<F257>],
 ) -> std::io::Result<()> {
     let f = std::fs::File::create(path)?;
     let mut w = std::io::BufWriter::new(f);
-    write_lock_package_to_writer(&mut w, manifest, locks)?;
+    write_lock_package_to_writer(&mut w, manifest, share_indices, locks)?;
     w.flush()?;
     Ok(())
 }
 
 fn read_lock_package(
     path: &str,
-) -> std::io::Result<(Sp1OneProofWeGateLockPkgManifest, Vec<RingLweLockArtifact<F257>>)> {
+) -> std::io::Result<(Sp1OneProofWeGateLockPkgManifest, Vec<u32>, Vec<RingLweLockArtifact<F257>>)> {
     let f = std::fs::File::open(path)?;
     let mut r = std::io::BufReader::new(f);
     read_lock_package_from_reader(&mut r)
