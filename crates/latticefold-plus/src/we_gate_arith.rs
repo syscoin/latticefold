@@ -180,8 +180,12 @@ where
     let out_dir = out_dir.as_ref();
     let mut b_params = Dr1csBuilder::<F257>::new_file_backed(out_dir.join("params_prefix"))
         .map_err(|e| format!("tiny gate: params prefix new_file_backed failed: {e}"))?;
-    // Make the constant-1 slot explicit for standalone soundness.
-    b_params.enforce_var_eq_const(b_params.one(), F257::ONE);
+    // IMPORTANT (disk footprint / reuse-base fast path):
+    // Keep this prefix module **constraint-free** so the outer file-backed merge can reuse the
+    // dominant tiny-gate part directory as the final `merged/` output (zero-copy on unix).
+    //
+    // The constant-1 slot is already enforced by the main tiny-gate relation; and the merge code
+    // requires `assignment[0] == 1` for every part.
     for &x in &params.to_field_vec::<F257>() {
         b_params.new_var(x);
     }
