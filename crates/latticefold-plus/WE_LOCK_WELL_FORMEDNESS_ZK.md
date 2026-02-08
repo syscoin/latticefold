@@ -10,7 +10,7 @@ The construction implemented in this repo is:
 
 - **DPP**: Theorem 4.3 “hidden-query lockable DPP” over \( \mathbb{F}_{257} \) (arm-before-proof).
 - **Lock**: Goldilocks-modulus ring arithmetic used only *outside* the tiny gate; no per-lock MAC/tag.
-- **Payload encoding**: Frodo/Regev-style **additive encoding** of share bytes; decap does rounding decode.
+- **Payload encoding**: unauthenticated XOR-stream **DEM** under a derived key; decap derives the key and decrypts (no per-lock MAC/tag).
 - **Amplification**: Batch Shamir reconstruction + a single global check (e.g. against the armer’s EC public key contribution).
 
 Relevant code:
@@ -78,8 +78,8 @@ For each armer \(j\):
   - `offset`,
   - for each lock instance in the lockset:
     - `q_blocks` are *not* published directly in the current artifact; the public artifact includes:
-      - hint blocks `branch_hints[b].hint_blocks_sparse` (sparse ring elements per branch),
-      - ciphertext encodings `cts[b].encoded` (Goldilocks field elements per payload byte).
+    - hint blocks `branch_hints[b].hint0_blocks_sparse` and `branch_hints[b].hint1_blocks_sparse` (two sparse ring-hint vectors per branch),
+    - ciphertexts `cts[b].nonce` and `cts[b].ct` (bytes).
 
 ### Witness (what the armer proves knowledge of)
 
@@ -209,84 +209,136 @@ where:
 - `s_const,b` is the constant-polynomial embedding of the scalar secret `s_scalar_b`,
 - `e_{b,block}` is the ring error.
 
-##### (D3) Hint-noise bound (for rounding correctness)
+##### (D3) Hint-noise bound (for seed-extraction stability)
 
-Prove the magnitude bound needed for correctness (liveness). A simple sufficient condition is:
+Prove the magnitude bound needed for correctness (liveness).
 
-- each coefficient of `e_{b,block}` is within a public bound \(B_e\) (e.g. \(6\sigma\) if sampling Gaussian with tail cut, or a fixed box bound if using bounded noise-by-construction).
+In our current `lockable_ringlwe.rs` design, payload recovery is performed by:
 
-This prevents a malicious armer from setting `e` so large that even a valid proof yields `C - y` outside the rounding radius.
+- streaming a decapsulation signal \(y \in \mathbb{F}_q\) (Goldilocks),
+- center-lifting \(y\) to an integer \(\tilde{y}\in(-q/2,q/2]\),
+- reducing \(\tilde{y} \bmod 257\) to obtain small-field seed(s),
+- deriving a DEM key via SHA-256, and
+- decrypting an unauthenticated XOR-stream ciphertext.
+
+Therefore, the hint/noise bounds are used to ensure **seed-extraction stability** (no wraparound in the center lift), rather than any Frodo-style per-byte rounding.
+
+A simple sufficient condition is:
+
+- each coefficient of each hint error block satisfies \(|e_{b,block}[t]| \le B_e\), for a public bound \(B_e\),
+- and the public “no-wrap” bound in **(D5)** holds for all derived seed components.
+
+This prevents a malicious armer from setting `e` so large that even a valid proof yields a wrapped decapsulation signal and bricks key derivation.
 
 Importantly: this is an **upper bound** check. An armer using *less* noise (even zero) does not brick decap; it may impact confidentiality, but that is outside the liveness goal of this statement.
 
-##### (D4) Ciphertext correctness (additive encoding)
+##### (D4) Ciphertext correctness (XOR-DEM under derived key)
 
 (This matches `arm_ringlwe_lock` in `lockable_ringlwe.rs`.)
 
 For each lock instance \(\ell\), define its associated Shamir share index \(i_\ell \in \{1,\dots,R\}\).
 Let `payload_ℓ` be the 32-byte share string `share_{i_ℓ}`.
 
-For each branch \(b\in\{0,1\}\), let:
+For each branch \(b\in\{0,1\}\), the armer publishes:
 
-- \(a_b\) be the **shifted accepting element** `accepting_set_shifted[b]` (an \( \mathbb{F}_{257} \) element),
-- \(a_b^{(q)} = \texttt{embed\_f\_to\_fq}(a_b)\) be its Goldilocks embedding (currently centered \([-128,128]\)),
-- \(s_b \in \mathbb{F}_q\) be the branch secret scalar `s_scalar_b` (sampled short; nonzero is recommended),
-- `cts[b].encoded[j]` be the published Goldilocks element encoding byte `payload_ℓ[j]`.
+- a nonce `cts[b].nonce`,
+- a ciphertext `cts[b].ct`,
+- and hint material which determines (under a valid proof stream) seed components \((y_{b,i} \bmod 257)\) used for key derivation.
 
-Prove for every byte index \(j\):
+Let `K_b` be the derived 32-byte key computed from the published statement binding and the recovered seeds (exact KDF specified by the implementation; in current code it is SHA-256 over domain label, statement binding, coins, and the seed components).
 
-\[
-\texttt{cts}_b[j] = s_b \cdot a_b^{(q)} + \mathrm{Enc}(\mu_j) + e'_{b,j}
-\]
+The well-formedness proof MUST enforce that:
 
-where:
+- `cts[b].ct == XOR_STREAM(K_b, cts[b].nonce, payload_ℓ)` for both branches \(b\),
 
-- \(\mu_j := \texttt{payload}_\ell[j] \in \{0,\dots,255\}\),
-- \(\mathrm{Enc}(\mu) = \left\lfloor \dfrac{(2\mu+1)\,q}{512} \right\rfloor\) (midpoint bucket encoding),
-- \(e'_{b,j}\) is the per-byte ciphertext noise (in code: `centered_binomial(k)` embedded to Goldilocks).
+where `XOR_STREAM` is the unauthenticated stream cipher used by the implementation.
 
-This prevents an armer from publishing ciphertexts that are not encryptions of the intended Shamir share bytes under the branch signal used by decap.
+This prevents an armer from publishing ciphertext bytes that are unrelated to the intended Shamir share payload under the key the decapper will derive.
 
-##### (D5) Ciphertext-noise bound (for rounding correctness)
+##### (D5) Seed-extraction stability (no-wrap for mod‑257 key seeds)
 
-Correctness of `frodo_decode_byte` holds if the total additive error is \(< q/512\) from the correct bucket midpoint.
+Our current design reduces a center-lifted decapsulation signal modulo 257 to obtain key seeds.
 
-In decap, for a valid proof stream, the decapper computes (per branch \(b\)):
+In this design, correctness requires that the **center lift be stable**, i.e. that the “true” intended integer signal does **not** wrap modulo \(q\). Otherwise, \(\tilde{y}\) can differ by \(\pm q\), and since \(q \not\equiv 0 \pmod{257}\), the extracted seed \((\tilde{y} \bmod 257)\) can change, bricking decapsulation.
 
-- \(y_b := \texttt{coeff0\_mul}(\pi_{\text{ring}}, h_b)\),
+Therefore, the well-formedness proof MUST include a public “no-wrap” bound \(B_{\text{wrap}} < q/2\) and enforce:
 
-and then decodes each byte as:
-
-- \(\mu'_j := \mathrm{Dec}(\texttt{cts}_b[j] - y_b)\) with \(\mathrm{Dec}(z)=\left\lfloor \dfrac{z\cdot 256}{q}\right\rfloor\).
-
-Under the hint equation \(h_b = q\_{\text{ring}}\cdot s_b^{\text{const}} + e_b\) and correctness of the DPP relation, we have:
-
-\[
-y_b = s_b \cdot a_b^{(q)} + \underbrace{\texttt{coeff0\_mul}(\pi_{\text{ring}}, e_b)}_{\text{hint-noise term}}
-\]
-
-Therefore the decoded value is correct if:
-
-\[
-\left|\; e'_{b,j} - \texttt{coeff0\_mul}(\pi_{\text{ring}}, e_b)\;\right| < q/512
-\]
-
-The armer cannot know \(\pi\) at arming time, so the well-formedness proof must enforce a **uniform bound** that guarantees correctness for all valid \(\pi\) (or for all \(\pi\) in the allowed value range).
-
-A simple sufficient public bound is:
-
-- fix \(B_\pi := 128\) (because `embed_f_to_fq` maps any F257 value to magnitude \(\le 128\)),
-- require each coefficient of each hint error block satisfies \(|e_{b,block}[t]| \le B_e\),
-- and each ciphertext noise satisfies \(|e'_{b,j}|\le B_{e'}\),
-- then require the public inequality:
+- for each branch \(b\) and each seed component used by the DEM key derivation (e.g. \(y_{b,0}, y_{b,1}\) or \(2P\) components for \(P\) packed channels),
   \[
-  B_{e'} + d \cdot B_\pi \cdot B_e < q/512
+  |\tilde{y}_{b,i}| \le B_{\text{wrap}}.
   \]
-  where \(d=64\) is the ring dimension used by `GoldilocksRing64`.
 
-This blocks the sabotage “choose noise so large that honest decap always mis-rounds.”
+**Operational note (arm-time retry):** armers MAY resample secrets/noise (and, if applicable, repetition coins) until the produced artifact satisfies the no-wrap bound. The ZK proof does not prove “a retry happened”; it proves the **final artifact** lies in the no-wrap region.
 
-> Note: you can tighten this bound substantially using the exact `coeff0_mul` structure and the actual sparsity/blocking; but the proof obligation stays the same: publish a bound, prove the witness is within it, and ensure the bound implies \(<q/512\).
+###### (D5.1) How to choose / compute a sound public no-wrap bound (arm-before-proof)
+
+The key point is that we need a **worst-case** bound that does not depend on the future proof stream \(\pi\) itself.
+This is possible in our current implementation because:
+
+- the decapper embeds each streamed \(\pi\) coefficient from \( \mathbb{F}_{257} \) into Goldilocks using **centered representatives**,
+  so each embedded coefficient satisfies
+  \[
+  |\pi_j^{(\text{emb})}| \le 128,
+  \]
+  independent of the witness/proof value (this is a *representation* bound, not a soundness claim).
+- per lock, the decapsulation accumulator only processes **hinted blocks** (sparse), and each processed block contributes a signed dot-product
+  `coeff0_mul_row(h_block, pi_row)` where the signs/permutation are fixed by the packing convention.
+
+Let a processed hint block have Goldilocks coefficients \(h[0..d-1]\) and the corresponding embedded \(\pi\) row be \(r[0..d-1]\).
+In the negacyclic coefficient-0 formula used by the implementation,
+each term is of the form \(\pm h[i]\cdot r[j]\), so by the triangle inequality:
+
+\[
+\big|\langle h, r\rangle_{\pm}\big|
+\le \sum_{j=0}^{d-1} |h[j]|\,|r[j]|
+\le \|r\|_\infty \cdot \sum_{j=0}^{d-1} |h[j]|
+\le 128 \cdot \|h\|_1.
+\]
+
+Now sum over **all processed (hinted) blocks** for that branch/component:
+
+\[
+|\tilde{y}_{b,i}| \le 128 \cdot \sum_{\text{hinted blocks}} \|h_{b,i,\text{block}}\|_1.
+\]
+
+This yields a sound, arm-time-computable public bound:
+
+- define the centered-lift magnitude for a Goldilocks coefficient \(c\in\mathbb{F}_q\) as
+  \[
+  |c|_{\text{cent}} := \min(c_{\text{u64}},\, q - c_{\text{u64}}),
+  \]
+  where \(c_{\text{u64}}\in[0,q)\) is the canonical u64 representative;
+- compute
+  \[
+  \|h\|_1 := \sum_{j=0}^{d-1} |h[j]|_{\text{cent}}
+  \]
+  for each published hint block;
+- set
+  \[
+  B_{\text{wrap}} := 128 \cdot \sum_{\text{hinted blocks}} \|h_{b,i,\text{block}}\|_1.
+  \]
+
+Finally require
+
+\[
+B_{\text{wrap}} \;<\; \frac{q}{2}.
+\]
+
+**Notes:**
+
+- If the lock uses **two hint vectors per branch** (e.g. `hint0` and `hint1` / two seed components), compute \(B_{\text{wrap}}\) **separately**
+  for each component \(i\in\{0,1\}\).
+- If the lock packs **P channels**, compute the bound for each channel/component, or conservatively sum the \(\ell_1\) norms across channels.
+- This bound is conservative but **fully arm-before-proof**: it uses only public artifacts plus the representation bound \(\|\pi\|_\infty\le 128\).
+
+###### (D5.2) Where this lives (ZK vs public check)
+
+This “no-wrap” condition is a pure predicate over the **public hint coefficients** and public parameters, so it can be:
+
+- enforced **inside** the ZK well-formedness circuit (as the doc’s minimal statement requires), or
+- enforced as a **public pre-check** alongside verifying the ZK proof.
+
+Either way, the security/liveness meaning is the same: the verifier rejects artifacts whose hints are so large that they can wrap the centered lift and brick mod‑257 seed extraction.
 
 ---
 
@@ -331,10 +383,10 @@ Below is an exhaustive list of armer moves whose *only purpose* is to make decap
 
 ### 6) “Choose noise so large that rounding always fails”
 
-- **Attack**: pick very large hint error or ciphertext noise so that even with the correct witness/proof, `frodo_decode_byte` mis-rounds.
+- **Attack**: pick very large hint error (or other artifact parameters) so that even with the correct witness/proof, the decapsulation signal’s center-lift wraps modulo \(q\), changing \((\tilde{y}\bmod 257)\) and bricking key derivation / XOR-DEM decryption.
 - **Blocked by**:
   - **(D3)** per-coefficient hint-noise bound,
-  - **(D5)** ciphertext-noise bound + the public inequality ensuring total error \(<q/512\).
+  - **(D5)** the public no-wrap bound ensuring seed-extraction stability.
 
 ### 7) “Encrypt the wrong payload (not the Shamir share)”
 
@@ -372,7 +424,7 @@ Below is an exhaustive list of armer moves whose *only purpose* is to make decap
 - **Must keep (A)** if the only global check is the armer’s EC public key. Otherwise, an armer can encrypt shares of some other scalar and still “well-form” the lock layer.
 - **Must keep (B)** (or an equivalent binding of payload to `s_j`) or the armer can encrypt random bytes that never reconstruct the armer scalar.
 - **Must keep (C2–C3)** (or publish the hidden-query seed, which is usually unacceptable) or the armer can arm to a different query than the later proof stream.
-- **Must keep (D1–D5)** or the armer can mismatch embeddings, publish arbitrary hints, or set noise so rounding fails.
+- **Must keep (D1–D5)** or the armer can mismatch embeddings, publish arbitrary hints, publish ciphertexts that do not decrypt to the intended share under the derived key, or set parameters so seed extraction wraps and decap fails.
 
 You may be able to simplify:
 
