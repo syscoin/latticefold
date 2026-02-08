@@ -2073,10 +2073,8 @@ mod tests {
         // --- ADV 2: Tampered ciphertext (bit flip in armer 0's first lock) ---
         {
             let mut tampered_locksets = armer_locksets.clone();
-            if let Some(first_enc) = tampered_locksets[0].locks[0].cts[0].encoded.first_mut() {
-                // Add a large value to corrupt the first encoded byte.
-                type GlFq = <cyclotomic_rings::rings::GoldilocksRing64 as stark_rings::PolyRing>::BaseRing;
-                *first_enc += GlFq::from(1u64 << 60);
+            if let Some(first_byte) = tampered_locksets[0].locks[0].cts[0].ct.first_mut() {
+                *first_byte ^= 0x80;
             }
             // Restream with tampered lockset.
             let tampered_all_locks: Vec<&crate::lockable_ringlwe::RingLweLockArtifact<F257>> =

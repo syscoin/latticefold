@@ -150,6 +150,26 @@ Split into what is publicly checkable vs what needs ZK:
 
 This prevents an armer from using a different query/offset than the one the decapper will evaluate against a valid proof stream.
 
+#### (C4) Multi-channel (“P channels”) domain separation (if used)
+
+Some lock variants “pack” \(P\) independent *channels* inside a single lock instance, with the intent that the payload key is derived from **all** channels (e.g. KDF over \(2P\) small-field seeds).
+
+If the lock uses packed channels, the well-formedness statement MUST treat the following as part of the public binding:
+
+- the integer `P` (number of channels),
+- a canonical channel index `part_id ∈ {0,1,...,P-1}` for each channel.
+
+And the ZK proof MUST enforce **per-channel** transcript binding:
+
+- **(C4.1) Per-channel public coins correctness:** for each `part_id`, the published coins for that channel equal the canonical Fiat–Shamir derivation from `(c_stmt, x, block_id, rep_id, part_id)` (domain-separated).
+- **(C4.2) Per-channel hidden-query correctness:** for each `part_id`, the hidden-query randomness (`coeffs` / UV bits / Sq coefficients) is derived by the canonical transcript from
+  \[
+  (c\_\text{stmt}, x, block\_id, rep\_id, part\_id, coins, armer\_secret),
+  \]
+  matching the implementation.
+
+**Security note:** the proof does not (and cannot) “prove independence.” Independence across channels is an *assumption* that the transcript hash / PRF behaves independently under distinct `part_id`s. The proof’s job is to prevent accidental or malicious *correlation-by-construction* (e.g., reusing the same query across channels) by enforcing correct domain separation and per-channel derivations.
+
 #### (D) Lock artifact correctness (hints + ciphertext encodings + bounds)
 
 This is the liveness-critical part: it prevents “publish artifacts that can’t decode.”
