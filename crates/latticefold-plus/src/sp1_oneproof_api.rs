@@ -840,7 +840,7 @@ fn write_lock_package_to_writer(
     share_indices: &[u32],
     locks: &[RingLweLockArtifact<F257>],
 ) -> std::io::Result<()> {
-    w.write_all(b"LFP1LOCKPKG")?;
+    w.write_all(b"LFP1LOCK64")?;
     // Embedded manifest (canonical public metadata).
     w.write_all(&manifest.stmt_digest)?;
     w.write_all(&manifest.lock_coin_seed)?;
@@ -867,9 +867,9 @@ fn write_lock_package_to_writer(
         w.write_all(&f257_to_u16(&lock.accepting_set[1]).to_le_bytes())?;
         w.write_all(&f257_to_u16(&lock.offset).to_le_bytes())?;
         // sizes
-        write_u32(w, lock.x_len as u32)?;
-        write_u32(w, lock.pi_len as u32)?;
-        write_u32(w, lock.len as u32)?;
+        write_u64(w, lock.x_len as u64)?;
+        write_u64(w, lock.pi_len as u64)?;
+        write_u64(w, lock.len as u64)?;
         // coins
         write_u64(w, lock.coins.idx as u64)?;
         w.write_all(&f257_to_u16(&lock.coins.lambda).to_le_bytes())?;
@@ -900,9 +900,9 @@ fn write_lock_package_to_writer(
 fn read_lock_package_from_reader(
     r: &mut impl Read,
 ) -> std::io::Result<(Sp1OneProofWeGateLockPkgManifest, Vec<u32>, Vec<RingLweLockArtifact<F257>>)> {
-    let mut magic = [0u8; 11];
+    let mut magic = [0u8; 9];
     r.read_exact(&mut magic)?;
-    if &magic != b"LFP1LOCKPKG" {
+    if &magic != b"LFP1LOCK64" {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "bad lock pkg magic",
@@ -956,9 +956,15 @@ fn read_lock_package_from_reader(
         r.read_exact(&mut b2)?;
         let off = u16::from_le_bytes(b2);
         // sizes
-        let x_len = read_u32(r)? as usize;
-        let pi_len = read_u32(r)? as usize;
-        let len = read_u32(r)? as usize;
+        let x_len: usize = read_u64(r)?
+            .try_into()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "x_len overflow"))?;
+        let pi_len: usize = read_u64(r)?
+            .try_into()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "pi_len overflow"))?;
+        let len: usize = read_u64(r)?
+            .try_into()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "len overflow"))?;
         // coins
         let idx = read_u64(r)? as usize;
         r.read_exact(&mut b2)?;
