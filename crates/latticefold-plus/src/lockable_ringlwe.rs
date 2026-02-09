@@ -66,65 +66,151 @@ fn inv_mod257(a: u16) -> Result<u16, String> {
     Ok(pow_mod257(a % MOD_257, 255))
 }
 
-/// Sparse encoding of up to 64 coefficients in F257.
+/// Packed encoding of up to 64 coefficients in F257 (per hinted block).
 ///
-/// Each entry is 2 bytes:
-/// - `pos_flags`: low 6 bits = position in 0..63; bit6 = "is 256" flag; bit7 reserved.
-/// - `coeff`: `v % 256` (0..255). If bit6 is set, the value is interpreted as 256.
+/// We support a dual-format representation:
+/// - Sparse: omit zeros; store `(pos_flags, coeff)` pairs.
+/// - Dense: store 64 bytes + a 64-bit mask for coefficients equal to 256.
 ///
-/// We omit zero coefficients, so this representation is much smaller than dense `[u8;64]` when
-/// within-block sparsity is high.
-#[derive(Clone, Debug, Default)]
-pub struct PackedF257SparseBlock64 {
-    pub entries: Vec<(u8, u8)>,
+/// This reduces the "dense block is worst case for sparse encoding" outliers, which in turn
+/// reduces the need for hint-budget-driven rejection sampling (and its distributional bias).
+#[derive(Clone, Debug)]
+pub enum PackedF257Block64 {
+    /// Sparse encoding:
+    /// - `pos_flags`: low 6 bits = position in 0..63; bit6 = "is 256" flag; bit7 reserved.
+    /// - `coeff`: `v % 256` (0..255). If bit6 is set, the value is interpreted as 256.
+    Sparse { entries: Vec<(u8, u8)> },
+    /// Dense encoding:
+    /// - `vals[i]`: `v % 256` (0..255)
+    /// - if bit i in `is256_mask` is set, value is interpreted as 256 (regardless of vals[i])
+    Dense { vals: [u8; PACK_D], is256_mask: u64 },
 }
 
-impl PackedF257SparseBlock64 {
+impl Default for PackedF257Block64 {
+    fn default() -> Self {
+        Self::Sparse { entries: Vec::new() }
+    }
+}
+
+impl PackedF257Block64 {
+    // Serialization cost model used for in-memory packing decisions.
+    // - Sparse on disk: fmt(1) + nnz(1) + 2*nnz
+    // - Dense on disk:  fmt(1) + vals(64) + is256_mask(u64)
+    const DENSE_ON_DISK_BYTES: usize = 1 + PACK_D + 8;
+
     #[inline]
-    pub fn from_dense_u16s(vals: &[u16; PACK_D]) -> Self {
-        let mut entries: Vec<(u8, u8)> = Vec::new();
-        for i in 0..PACK_D {
-            let v = vals[i] % MOD_257;
-            if v == 0 {
-                continue;
-            }
-            if v == 256 {
-                entries.push(((i as u8) | (1u8 << 6), 0u8));
-            } else {
-                entries.push((i as u8, v as u8));
+    pub fn nnz(&self) -> usize {
+        match self {
+            Self::Sparse { entries } => entries.len(),
+            Self::Dense { vals, is256_mask } => {
+                let mut n = is256_mask.count_ones() as usize;
+                // Count nonzero bytes where not overridden by 256-mask.
+                let mut m = *is256_mask;
+                for i in 0..PACK_D {
+                    let masked = (m & 1) != 0;
+                    if !masked && vals[i] != 0 {
+                        n += 1;
+                    }
+                    m >>= 1;
+                }
+                n
             }
         }
-        Self { entries }
     }
 
     #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = (usize, u16)> + '_ {
-        self.entries.iter().map(|&(pos_flags, coeff)| {
-            let pos = (pos_flags & 0x3f) as usize;
-            let is_256 = ((pos_flags >> 6) & 1) != 0;
-            let v = if is_256 { 256u16 } else { coeff as u16 };
-            (pos, v)
-        })
+    pub fn on_disk_bytes(&self) -> usize {
+        match self {
+            Self::Sparse { entries } => 1 + 1 + 2 * entries.len(),
+            Self::Dense { .. } => Self::DENSE_ON_DISK_BYTES,
+        }
+    }
+
+    #[inline]
+    pub fn from_dense_u16s(vals: &[u16; PACK_D]) -> Self {
+        // Decide sparse vs dense by comparing serialized sizes.
+        let mut nnz = 0usize;
+        for i in 0..PACK_D {
+            if (vals[i] % MOD_257) != 0 {
+                nnz += 1;
+            }
+        }
+        let sparse_bytes = 1 + 1 + 2 * nnz;
+        if sparse_bytes >= Self::DENSE_ON_DISK_BYTES {
+            // Dense wins (or ties): keep fixed size.
+            let mut out_vals = [0u8; PACK_D];
+            let mut is256_mask: u64 = 0;
+            for i in 0..PACK_D {
+                let v = vals[i] % MOD_257;
+                if v == 256 {
+                    is256_mask |= 1u64 << i;
+                    out_vals[i] = 0;
+                } else {
+                    out_vals[i] = (v % 256) as u8;
+                }
+            }
+            Self::Dense {
+                vals: out_vals,
+                is256_mask,
+            }
+        } else {
+            // Sparse wins.
+            let mut entries: Vec<(u8, u8)> = Vec::with_capacity(nnz);
+            for i in 0..PACK_D {
+                let v = vals[i] % MOD_257;
+                if v == 0 {
+                    continue;
+                }
+                if v == 256 {
+                    entries.push(((i as u8) | (1u8 << 6), 0u8));
+                } else {
+                    entries.push((i as u8, v as u8));
+                }
+            }
+            Self::Sparse { entries }
+        }
+    }
+
+    #[inline]
+    fn get_at_dense(vals: &[u8; PACK_D], is256_mask: u64, i: usize) -> u16 {
+        let bit = (is256_mask >> i) & 1;
+        if bit != 0 {
+            256u16
+        } else {
+            vals[i] as u16
+        }
     }
 
     #[inline]
     pub fn scale_mod257(&self, s: u16) -> Self {
-        let mut out: Vec<(u8, u8)> = Vec::with_capacity(self.entries.len());
-        for &(pos_flags, coeff) in &self.entries {
-            let pos = pos_flags & 0x3f;
-            let is_256 = ((pos_flags >> 6) & 1) != 0;
-            let v = if is_256 { 256u16 } else { coeff as u16 };
-            let w = mul_mod257(v, s);
-            if w == 0 {
-                continue;
+        match self {
+            Self::Sparse { entries } => {
+                let mut out: Vec<(u8, u8)> = Vec::with_capacity(entries.len());
+                for &(pos_flags, coeff) in entries {
+                    let pos = pos_flags & 0x3f;
+                    let is_256 = ((pos_flags >> 6) & 1) != 0;
+                    let v = if is_256 { 256u16 } else { coeff as u16 };
+                    let w = mul_mod257(v, s);
+                    if w == 0 {
+                        continue;
+                    }
+                    if w == 256 {
+                        out.push((pos | (1u8 << 6), 0u8));
+                    } else {
+                        out.push((pos, w as u8));
+                    }
+                }
+                Self::Sparse { entries: out }
             }
-            if w == 256 {
-                out.push((pos | (1u8 << 6), 0u8));
-            } else {
-                out.push((pos, w as u8));
+            Self::Dense { vals, is256_mask } => {
+                let mut tmp = [0u16; PACK_D];
+                for i in 0..PACK_D {
+                    let v = Self::get_at_dense(vals, *is256_mask, i);
+                    tmp[i] = mul_mod257(v, s);
+                }
+                Self::from_dense_u16s(&tmp)
             }
         }
-        Self { entries: out }
     }
 }
 
@@ -132,7 +218,7 @@ impl PackedF257SparseBlock64 {
 ///
 /// Direct (non-ring) convention:
 /// - out[i] = row[i] for i=0..d-1, with implicit zero-padding.
-fn query_row_to_packed_f257(row: &[u16]) -> PackedF257SparseBlock64 {
+fn query_row_to_packed_f257(row: &[u16]) -> PackedF257Block64 {
     let mut tmp = [0u16; PACK_D];
     if !row.is_empty() {
         let lim = PACK_D.min(row.len());
@@ -140,18 +226,36 @@ fn query_row_to_packed_f257(row: &[u16]) -> PackedF257SparseBlock64 {
             tmp[i] = row[i] % MOD_257;
         }
     }
-    PackedF257SparseBlock64::from_dense_u16s(&tmp)
+    PackedF257Block64::from_dense_u16s(&tmp)
 }
 
 /// Direct dot product for packed F257 blocks:
 ///
 /// `acc = Σ_{i=0..d-1} h[i]*row[i]` over F257 (with implicit zero-padding).
 #[inline]
-fn dot_row_mod257(h: &PackedF257SparseBlock64, row: &[u16]) -> u16 {
+fn dot_row_mod257(h: &PackedF257Block64, row: &[u16]) -> u16 {
     let mut acc = 0u16;
-    for (pos, v) in h.iter() {
-        if pos < row.len() {
-            acc = add_mod257(acc, mul_mod257(v, row[pos]));
+    match h {
+        PackedF257Block64::Sparse { entries } => {
+            for &(pos_flags, coeff) in entries {
+                let pos = (pos_flags & 0x3f) as usize;
+                if pos >= row.len() {
+                    continue;
+                }
+                let is_256 = ((pos_flags >> 6) & 1) != 0;
+                let v = if is_256 { 256u16 } else { coeff as u16 };
+                acc = add_mod257(acc, mul_mod257(v, row[pos]));
+            }
+        }
+        PackedF257Block64::Dense { vals, is256_mask } => {
+            let lim = PACK_D.min(row.len());
+            for i in 0..lim {
+                let v = PackedF257Block64::get_at_dense(vals, *is256_mask, i);
+                if v == 0 {
+                    continue;
+                }
+                acc = add_mod257(acc, mul_mod257(v, row[i]));
+            }
         }
     }
     acc
@@ -240,8 +344,8 @@ pub struct RingLweParams {
 impl Default for RingLweParams {
     fn default() -> Self {
         Self {
-            // Single canonical encoding: sparse-in-block hints.
-            _reserved0: 1,
+            // Single canonical encoding: dual-format sparse/dense-in-block hints.
+            _reserved0: 2,
             domain_label: *b"LFP_RINGLWE_V2_00000000000000000",
         }
     }
@@ -271,7 +375,7 @@ pub struct RingLweLockArtifact<F: PrimeField> {
 /// Hint material: one hint vector per lock.
 #[derive(Clone, Debug)]
 pub struct BranchHints {
-    pub hint_blocks_sparse: Vec<(usize, PackedF257SparseBlock64)>,
+    pub hint_blocks_sparse: Vec<(usize, PackedF257Block64)>,
 }
 
 /// Per-branch ciphertext: unauthenticated stream cipher (XOR) under a derived key.
@@ -365,7 +469,7 @@ pub struct RingLweDecapStreamState<'a, F: PrimeField> {
     ///
     /// If the DPP guarantees `⟨q, π⟩ ∈ {a0, a1}`, and `h = q*s`, then `y = s*⟨q,π⟩ = s*a_true`.
     y: u16,
-    sparse: &'a [(usize, PackedF257SparseBlock64)],
+    sparse: &'a [(usize, PackedF257Block64)],
     sparse_pos: usize,
     block_idx: usize,
     pos_in_block: usize,
@@ -552,7 +656,7 @@ impl<F: PrimeField> QueryBlockAccumulator<F> {
         Ok(())
     }
 
-    pub(crate) fn into_sparse_blocks(&mut self) -> Vec<(usize, PackedF257SparseBlock64)> {
+    pub(crate) fn into_sparse_blocks(&mut self) -> Vec<(usize, PackedF257Block64)> {
         let blocks = std::mem::take(&mut self.blocks);
         blocks
             .into_iter()
@@ -579,7 +683,7 @@ pub fn arm_ringlwe_lock<F: PrimeField>(
     offset: F,
     x_len: usize,
     pi_len: usize,
-    q_blocks: Vec<(usize, PackedF257SparseBlock64)>,
+    q_blocks: Vec<(usize, PackedF257Block64)>,
     params: RingLweParams,
     payload: &[u8],
     rng: &mut impl RngCore,
@@ -594,7 +698,7 @@ pub fn arm_ringlwe_lock<F: PrimeField>(
     let s_u16: u16 = sample_nonzero_f257_scalar(rng);
 
     // Deterministic hint blocks: h = q * s (mod 257).
-    let h_blocks: Vec<(usize, PackedF257SparseBlock64)> = q_blocks
+    let h_blocks: Vec<(usize, PackedF257Block64)> = q_blocks
         .iter()
         .map(|(block_idx, q)| (*block_idx, q.scale_mod257(s_u16)))
         .collect();
@@ -653,7 +757,7 @@ mod tests {
         let offset = F257::ZERO;
         let x_len = 1usize;
         let pi_len = 1usize;
-        let q_blocks: Vec<(usize, PackedF257SparseBlock64)> = Vec::new();
+        let q_blocks: Vec<(usize, PackedF257Block64)> = Vec::new();
         let params = RingLweParams::default();
 
         // Dummy coins (not used by ciphertext encoding).
