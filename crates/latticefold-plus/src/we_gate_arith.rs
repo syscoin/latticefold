@@ -1862,16 +1862,12 @@ mod tests {
             sum += 8 + 3 * bytes_per_f257; // coins: idx(u64) + 3 field elems
             sum += 4 + 32; // params: reserved0(u32) + domain_label(32)
 
-            // Hints: 2 branches, each a sparse list of hinted blocks.
-            for b in 0..2 {
-                sum += lock.branch_hints[b].hint_blocks_sparse.len() * bytes_per_hint_block;
-            }
+            // Hints: single sparse list of hinted blocks.
+            sum += lock.hints.hint_blocks_sparse.len() * bytes_per_hint_block;
 
-            // Ciphertexts: 2 branches.
-            for b in 0..2 {
-                sum += lock.cts[b].nonce.len();
-                sum += lock.cts[b].ct.len();
-            }
+            // Ciphertext: single branch.
+            sum += lock.ct.nonce.len();
+            sum += lock.ct.ct.len();
 
             sum
         }
@@ -1960,13 +1956,8 @@ mod tests {
             }
             // Print rough storage footprint + hint density for this armer's lockset.
             let total_bytes: usize = locks.iter().map(estimate_lock_artifact_storage_bytes).sum();
-            let total_hinted_blocks: usize = locks
-                .iter()
-                .map(|l| {
-                    l.branch_hints[0].hint_blocks_sparse.len()
-                        + l.branch_hints[1].hint_blocks_sparse.len()
-                })
-                .sum();
+            let total_hinted_blocks: usize =
+                locks.iter().map(|l| l.hints.hint_blocks_sparse.len()).sum();
             eprintln!(
                 "[btc_3armer] armer {j}: lockset storage est ≈ {} bytes; hinted_blocks(total across 2 branches across {} locks) = {}",
                 total_bytes,
@@ -2173,7 +2164,7 @@ mod tests {
         // --- ADV 2: Tampered ciphertext (bit flip in armer 0's first lock) ---
         {
             let mut tampered_locksets = armer_locksets.clone();
-            if let Some(first_byte) = tampered_locksets[0].locks[0].cts[0].ct.first_mut() {
+            if let Some(first_byte) = tampered_locksets[0].locks[0].ct.ct.first_mut() {
                 *first_byte ^= 0x80;
             }
             // Restream with tampered lockset.

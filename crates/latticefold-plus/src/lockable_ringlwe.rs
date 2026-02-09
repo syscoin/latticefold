@@ -37,93 +37,121 @@ fn add_mod257(a: u16, b: u16) -> u16 {
     if s >= MOD_257 { s - MOD_257 } else { s }
 }
 
-#[inline]
-fn sub_mod257(a: u16, b: u16) -> u16 {
-    if a >= b { a - b } else { a + MOD_257 - b }
-}
+// NOTE: keep `sub_mod257` only if we reintroduce a subtraction-based packing.
 
 #[inline]
 fn mul_mod257(a: u16, b: u16) -> u16 {
     ((a as u32 * b as u32) % (MOD_257 as u32)) as u16
 }
 
-/// Pack 64 coefficients in F257 using 1 byte + an "is-256" bitmask.
-///
-/// We store `v % 256` in `coeffs[i]` and use `mask_256` bit i to disambiguate `0` vs `256`.
-#[derive(Clone, Copy, Debug)]
-pub struct PackedF257Block64 {
-    pub coeffs: [u8; PACK_D],
-    pub mask_256: u64,
+#[inline]
+fn pow_mod257(mut a: u16, mut e: u16) -> u16 {
+    // MOD_257 is prime (257), so inverse is a^(255) for a!=0.
+    let mut acc = 1u16;
+    while e > 0 {
+        if (e & 1) != 0 {
+            acc = mul_mod257(acc, a);
+        }
+        a = mul_mod257(a, a);
+        e >>= 1;
+    }
+    acc
 }
 
-impl PackedF257Block64 {
+#[inline]
+fn inv_mod257(a: u16) -> Result<u16, String> {
+    if a % MOD_257 == 0 {
+        return Err("inv_mod257: inverse of 0".to_string());
+    }
+    Ok(pow_mod257(a % MOD_257, 255))
+}
+
+/// Sparse encoding of up to 64 coefficients in F257.
+///
+/// Each entry is 2 bytes:
+/// - `pos_flags`: low 6 bits = position in 0..63; bit6 = "is 256" flag; bit7 reserved.
+/// - `coeff`: `v % 256` (0..255). If bit6 is set, the value is interpreted as 256.
+///
+/// We omit zero coefficients, so this representation is much smaller than dense `[u8;64]` when
+/// within-block sparsity is high.
+#[derive(Clone, Debug, Default)]
+pub struct PackedF257SparseBlock64 {
+    pub entries: Vec<(u8, u8)>,
+}
+
+impl PackedF257SparseBlock64 {
     #[inline]
-    pub fn from_u16s(vals: &[u16; PACK_D]) -> Self {
-        let mut coeffs = [0u8; PACK_D];
-        let mut mask = 0u64;
+    pub fn from_dense_u16s(vals: &[u16; PACK_D]) -> Self {
+        let mut entries: Vec<(u8, u8)> = Vec::new();
         for i in 0..PACK_D {
-            let v = vals[i];
-            debug_assert!(v < MOD_257);
+            let v = vals[i] % MOD_257;
+            if v == 0 {
+                continue;
+            }
             if v == 256 {
-                // Store 0 with mask bit set.
-                coeffs[i] = 0;
-                mask |= 1u64 << i;
+                entries.push(((i as u8) | (1u8 << 6), 0u8));
             } else {
-                coeffs[i] = v as u8;
+                entries.push((i as u8, v as u8));
             }
         }
-        Self { coeffs, mask_256: mask }
+        Self { entries }
     }
 
     #[inline]
-    pub fn get(&self, i: usize) -> u16 {
-        let v = self.coeffs[i] as u16;
-        if ((self.mask_256 >> i) & 1) != 0 { 256 } else { v }
+    pub fn iter(&self) -> impl Iterator<Item = (usize, u16)> + '_ {
+        self.entries.iter().map(|&(pos_flags, coeff)| {
+            let pos = (pos_flags & 0x3f) as usize;
+            let is_256 = ((pos_flags >> 6) & 1) != 0;
+            let v = if is_256 { 256u16 } else { coeff as u16 };
+            (pos, v)
+        })
     }
 
     #[inline]
     pub fn scale_mod257(&self, s: u16) -> Self {
-        let mut out = [0u16; PACK_D];
-        for i in 0..PACK_D {
-            out[i] = mul_mod257(self.get(i), s);
+        let mut out: Vec<(u8, u8)> = Vec::with_capacity(self.entries.len());
+        for &(pos_flags, coeff) in &self.entries {
+            let pos = pos_flags & 0x3f;
+            let is_256 = ((pos_flags >> 6) & 1) != 0;
+            let v = if is_256 { 256u16 } else { coeff as u16 };
+            let w = mul_mod257(v, s);
+            if w == 0 {
+                continue;
+            }
+            if w == 256 {
+                out.push((pos | (1u8 << 6), 0u8));
+            } else {
+                out.push((pos, w as u8));
+            }
         }
-        Self::from_u16s(&out)
+        Self { entries: out }
     }
 }
 
-/// Pack a row of d coefficients (in 0..257) into the block format used by `coeff0_mul_row_mod257`.
+/// Pack a row of d coefficients (in 0..257) into the block format used by `dot_row_mod257`.
 ///
-/// This matches the historical ring packing convention:
-/// - out[0] = row[0]
-/// - out[d-i] = -row[i] for i=1..d-1
-fn query_row_to_packed_f257(row: &[u16]) -> PackedF257Block64 {
+/// Direct (non-ring) convention:
+/// - out[i] = row[i] for i=0..d-1, with implicit zero-padding.
+fn query_row_to_packed_f257(row: &[u16]) -> PackedF257SparseBlock64 {
     let mut tmp = [0u16; PACK_D];
     if !row.is_empty() {
-        tmp[0] = row[0] % MOD_257;
         let lim = PACK_D.min(row.len());
-        for i in 1..lim {
-            let v = row[i] % MOD_257;
-            tmp[PACK_D - i] = if v == 0 { 0 } else { MOD_257 - v };
+        for i in 0..lim {
+            tmp[i] = row[i] % MOD_257;
         }
     }
-    PackedF257Block64::from_u16s(&tmp)
+    PackedF257SparseBlock64::from_dense_u16s(&tmp)
 }
 
-/// Coeff0-style dot product for packed F257 blocks, matching the existing packing convention:
+/// Direct dot product for packed F257 blocks:
 ///
-/// `acc = h[0]*row[0] - Σ_{i=1..d-1} h[i]*row[d-i]` over F257.
+/// `acc = Σ_{i=0..d-1} h[i]*row[i]` over F257 (with implicit zero-padding).
 #[inline]
-fn coeff0_mul_row_mod257(h: &PackedF257Block64, row: &[u16]) -> u16 {
-    if row.is_empty() {
-        return 0;
-    }
-    let d = PACK_D;
-    let mut acc = mul_mod257(h.get(0), row[0]);
-    for i in 1..d {
-        let idx = d - i;
-        if idx < row.len() {
-            let term = mul_mod257(h.get(i), row[idx]);
-            acc = sub_mod257(acc, term);
+fn dot_row_mod257(h: &PackedF257SparseBlock64, row: &[u16]) -> u16 {
+    let mut acc = 0u16;
+    for (pos, v) in h.iter() {
+        if pos < row.len() {
+            acc = add_mod257(acc, mul_mod257(v, row[pos]));
         }
     }
     acc
@@ -212,7 +240,8 @@ pub struct RingLweParams {
 impl Default for RingLweParams {
     fn default() -> Self {
         Self {
-            _reserved0: 0,
+            // Single canonical encoding: sparse-in-block hints.
+            _reserved0: 1,
             domain_label: *b"LFP_RINGLWE_V2_00000000000000000",
         }
     }
@@ -228,17 +257,21 @@ pub struct RingLweLockArtifact<F: PrimeField> {
     pub len: usize,
     pub coins: dpp::theorem43::Theorem43Coins<F>,
     pub params: RingLweParams,
-    /// Per-branch hints stored sparsely as `(block_idx, packed_coeffs)`, where each block has
+    /// Hint material stored sparsely as `(block_idx, packed_coeffs)`, where each block has
     /// `PACK_D=64` coefficients over F257 packed as 1 byte + an `is_256` mask.
-    pub branch_hints: [BranchHints; 2],
-    /// Two unauthenticated ciphertexts (one per accepting-set branch).
-    pub cts: [LockCiphertext; 2],
+    pub hints: BranchHints,
+    /// Single unauthenticated ciphertext.
+    ///
+    /// IMPORTANT: we intentionally publish **only one** ciphertext. Publishing two ciphertexts of
+    /// the same payload under keys from a tiny space (mod-257) creates a per-lock equality oracle
+    /// (meet-in-the-middle intersection), which collapses amplification.
+    pub ct: LockCiphertext,
 }
 
-/// Per-branch hint material: one hint vector per branch.
+/// Hint material: one hint vector per lock.
 #[derive(Clone, Debug)]
 pub struct BranchHints {
-    pub hint_blocks_sparse: Vec<(usize, PackedF257Block64)>,
+    pub hint_blocks_sparse: Vec<(usize, PackedF257SparseBlock64)>,
 }
 
 /// Per-branch ciphertext: unauthenticated stream cipher (XOR) under a derived key.
@@ -328,18 +361,16 @@ fn sample_nonzero_f257_scalar(rng: &mut impl RngCore) -> u16 {
 pub struct RingLweDecapStreamState<'a, F: PrimeField> {
     lock: &'a RingLweLockArtifact<F>,
     d: usize,
-    /// We accumulate BOTH branches simultaneously so π is scanned only once.
-    branches: [BranchAccum<'a>; 2],
+    /// Accumulated mod-257 dot product `y = ⟨h, π⟩`.
+    ///
+    /// If the DPP guarantees `⟨q, π⟩ ∈ {a0, a1}`, and `h = q*s`, then `y = s*⟨q,π⟩ = s*a_true`.
+    y: u16,
+    sparse: &'a [(usize, PackedF257SparseBlock64)],
+    sparse_pos: usize,
     block_idx: usize,
     pos_in_block: usize,
     filled: usize,
     coeffs: Vec<u16>,
-}
-
-struct BranchAccum<'a> {
-    sparse: &'a [(usize, PackedF257Block64)],
-    sparse_pos: usize,
-    y: u16,
 }
 
 impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
@@ -350,18 +381,9 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
         Ok(Self {
             lock,
             d: PACK_D,
-            branches: [
-                BranchAccum {
-                    sparse: lock.branch_hints[0].hint_blocks_sparse.as_slice(),
-                    sparse_pos: 0,
-                    y: 0,
-                },
-                BranchAccum {
-                    sparse: lock.branch_hints[1].hint_blocks_sparse.as_slice(),
-                    sparse_pos: 0,
-                    y: 0,
-                },
-            ],
+            y: 0,
+            sparse: lock.hints.hint_blocks_sparse.as_slice(),
+            sparse_pos: 0,
             block_idx: 0,
             pos_in_block: 0,
             filled: 0,
@@ -371,27 +393,17 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
 
     #[inline]
     fn next_needed_block(&self) -> Option<usize> {
-        let mut out: Option<usize> = None;
-        for br in &self.branches {
-            if let Some(idx) = br.sparse.get(br.sparse_pos).map(|t| t.0) {
-                out = Some(match out {
-                    None => idx,
-                    Some(prev) => prev.min(idx),
-                });
-            }
-        }
-        out
+        self.sparse.get(self.sparse_pos).map(|t| t.0)
     }
 
     #[inline]
     fn process_current_block(&mut self, row: &[u16]) {
-        for br in &mut self.branches {
-            if br.sparse_pos < br.sparse.len() && br.sparse[br.sparse_pos].0 == self.block_idx {
-                let h = &br.sparse[br.sparse_pos].1;
-                let inc = coeff0_mul_row_mod257(h, row);
-                br.y = add_mod257(br.y, inc);
-                br.sparse_pos += 1;
-            }
+        if self.sparse_pos < self.sparse.len() && self.sparse[self.sparse_pos].0 == self.block_idx
+        {
+            let h = &self.sparse[self.sparse_pos].1;
+            let inc = dot_row_mod257(h, row);
+            self.y = add_mod257(self.y, inc);
+            self.sparse_pos += 1;
         }
     }
 
@@ -451,7 +463,7 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
     }
 
     /// Finalize streaming and return per-branch key material seeds.
-    fn finish_key_seeds_mod257(mut self) -> Result<[u16; 2], String> {
+    fn finish_y_mod257(mut self) -> Result<u16, String> {
         if self.filled != self.lock.pi_len {
             return Err("ringlwe_decap_stream: bad π length".to_string());
         }
@@ -472,36 +484,34 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
         if self.block_idx != nblocks {
             return Err("ringlwe_decap_stream: internal block count mismatch".to_string());
         }
-        for br in &self.branches {
-            if br.sparse_pos != br.sparse.len() {
-                return Err("ringlwe_decap_stream: did not consume all sparse blocks".to_string());
-            }
+        if self.sparse_pos != self.sparse.len() {
+            return Err("ringlwe_decap_stream: did not consume all sparse blocks".to_string());
         }
-        let mut out = [0u16; 2];
-        for (b, br) in self.branches.iter().enumerate() {
-            out[b] = br.y;
-        }
-        Ok(out)
+        Ok(self.y)
     }
 
-    /// Finish streaming and return both candidate decryptions (unauthenticated).
+    /// Finish streaming and return two candidate decryptions (unauthenticated).
     ///
-    /// Each branch b yields a key derived from the modulo-257 reduced signals, then decrypts its
-    /// branch ciphertext. Exactly one branch gives the correct Shamir share; the other is garbage.
+    /// We publish a single ciphertext under a key derived from the hidden scalar `s` (mod 257).
+    /// The witness stream yields `y = s * a_true` where `a_true ∈ {a0, a1}`. The decapper tries
+    /// both candidates `s0 = y * inv(a0)` and `s1 = y * inv(a1)`.
     pub fn finish_decrypt_candidates(self) -> Result<[Vec<u8>; 2], String> {
         let lock = self.lock;
-        let seeds = self.finish_key_seeds_mod257()?;
-        let mut out = [Vec::new(), Vec::new()];
-        for b in 0..2 {
-            let key = derive_payload_key_bytes(
-                &lock.params.domain_label,
-                &lock.c_stmt,
-                &lock.coins,
-                seeds[b],
-            );
-            out[b] = xor_stream_decrypt(&key, &lock.cts[b].nonce, &lock.cts[b].ct);
-        }
-        Ok(out)
+        let y = self.finish_y_mod257()?;
+        let a0 = (f_to_u64(&lock.accepting_set[0]) % 257) as u16;
+        let a1 = (f_to_u64(&lock.accepting_set[1]) % 257) as u16;
+        let inv0 = inv_mod257(a0)?;
+        let inv1 = inv_mod257(a1)?;
+        let s0 = mul_mod257(y, inv0);
+        let s1 = mul_mod257(y, inv1);
+
+        let key0 =
+            derive_payload_key_bytes(&lock.params.domain_label, &lock.c_stmt, &lock.coins, s0);
+        let key1 =
+            derive_payload_key_bytes(&lock.params.domain_label, &lock.c_stmt, &lock.coins, s1);
+        let pt0 = xor_stream_decrypt(&key0, &lock.ct.nonce, &lock.ct.ct);
+        let pt1 = xor_stream_decrypt(&key1, &lock.ct.nonce, &lock.ct.ct);
+        Ok([pt0, pt1])
     }
 
 }
@@ -542,7 +552,7 @@ impl<F: PrimeField> QueryBlockAccumulator<F> {
         Ok(())
     }
 
-    pub(crate) fn into_sparse_blocks(&mut self) -> Vec<(usize, PackedF257Block64)> {
+    pub(crate) fn into_sparse_blocks(&mut self) -> Vec<(usize, PackedF257SparseBlock64)> {
         let blocks = std::mem::take(&mut self.blocks);
         blocks
             .into_iter()
@@ -569,50 +579,35 @@ pub fn arm_ringlwe_lock<F: PrimeField>(
     offset: F,
     x_len: usize,
     pi_len: usize,
-    q_blocks: Vec<(usize, PackedF257Block64)>,
+    q_blocks: Vec<(usize, PackedF257SparseBlock64)>,
     params: RingLweParams,
     payload: &[u8],
     rng: &mut impl RngCore,
 ) -> Result<RingLweLockArtifact<F>, String> {
-    // Per-branch: independent scalar secrets and independent hints (deterministic mod-257).
-    let mut branch_hints: [BranchHints; 2] = [
-        BranchHints { hint_blocks_sparse: Vec::new() },
-        BranchHints { hint_blocks_sparse: Vec::new() },
-    ];
-    let mut cts: [LockCiphertext; 2] = [
-        LockCiphertext { nonce: [0u8; 12], ct: Vec::new() },
-        LockCiphertext { nonce: [0u8; 12], ct: Vec::new() },
-    ];
-
-    for (b, a) in accepting_set_shifted.iter().enumerate() {
-        if a.is_zero() {
-            return Err("arm_ringlwe_lock: shifted accepting set contains 0; resample rep_id".to_string());
-        }
-
-        // Fresh independent scalar secret for this branch.
-        let s_u16: u16 = sample_nonzero_f257_scalar(rng);
-
-        // Deterministic hint blocks: h = q * s (mod 257).
-        let h_blocks: Vec<(usize, PackedF257Block64)> = q_blocks
-            .iter()
-            .map(|(block_idx, q)| (*block_idx, q.scale_mod257(s_u16)))
-            .collect();
-        branch_hints[b] = BranchHints {
-            hint_blocks_sparse: h_blocks,
-        };
-
-        // Derive a per-branch DEM key from the small-field seeds s*a (mod 257).
-        //
-        // Note: `a` is an F257 element; treat it mod 257. This is exactly what the decapper
-        // recovers by reducing the streamed Goldilocks signals mod 257.
-        let a_u16 = (f_to_u64(a) % 257) as u16;
-        let y = ((s_u16 as u32 * a_u16 as u32) % 257) as u16;
-        let key = derive_payload_key_bytes(&params.domain_label, &c_stmt, &coins, y);
-        let mut nonce = [0u8; 12];
-        rng.fill_bytes(&mut nonce);
-        let ct = xor_stream_encrypt(&key, &nonce, payload);
-        cts[b] = LockCiphertext { nonce, ct };
+    if accepting_set_shifted[0].is_zero() || accepting_set_shifted[1].is_zero() {
+        return Err(
+            "arm_ringlwe_lock: shifted accepting set contains 0; resample rep_id".to_string(),
+        );
     }
+
+    // Single secret scalar per lock.
+    let s_u16: u16 = sample_nonzero_f257_scalar(rng);
+
+    // Deterministic hint blocks: h = q * s (mod 257).
+    let h_blocks: Vec<(usize, PackedF257SparseBlock64)> = q_blocks
+        .iter()
+        .map(|(block_idx, q)| (*block_idx, q.scale_mod257(s_u16)))
+        .collect();
+    let hints = BranchHints {
+        hint_blocks_sparse: h_blocks,
+    };
+
+    // Encrypt payload once under a key derived from `s` (NOT from `s*a`).
+    let key = derive_payload_key_bytes(&params.domain_label, &c_stmt, &coins, s_u16);
+    let mut nonce = [0u8; 12];
+    rng.fill_bytes(&mut nonce);
+    let ct = xor_stream_encrypt(&key, &nonce, payload);
+    let ct = LockCiphertext { nonce, ct };
 
     Ok(RingLweLockArtifact {
         c_stmt,
@@ -623,8 +618,8 @@ pub fn arm_ringlwe_lock<F: PrimeField>(
         len: x_len + pi_len,
         coins,
         params,
-        branch_hints,
-        cts,
+        hints,
+        ct,
     })
 }
 
@@ -658,7 +653,7 @@ mod tests {
         let offset = F257::ZERO;
         let x_len = 1usize;
         let pi_len = 1usize;
-        let q_blocks: Vec<(usize, PackedF257Block64)> = Vec::new();
+        let q_blocks: Vec<(usize, PackedF257SparseBlock64)> = Vec::new();
         let params = RingLweParams::default();
 
         // Dummy coins (not used by ciphertext encoding).
@@ -683,12 +678,10 @@ mod tests {
         )
         .expect("arm_ringlwe_lock");
 
-        for b in 0..2 {
-            assert_ne!(
-                lock.cts[b].ct.as_slice(),
-                payload.as_slice(),
-                "ciphertext should not equal payload for branch {b}"
-            );
-        }
+        assert_ne!(
+            lock.ct.ct.as_slice(),
+            payload.as_slice(),
+            "ciphertext should not equal payload"
+        );
     }
 }
