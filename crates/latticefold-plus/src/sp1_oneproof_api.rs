@@ -18,6 +18,7 @@ use stark_rings::PolyRing;
 use stark_rings_linalg::SparseMatrix;
 
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -1106,6 +1107,8 @@ fn read_lock_package_from_reader(
     r: &mut impl Read,
 ) -> std::io::Result<(Sp1OneProofWeGateLockPkgManifest, Vec<u32>, Vec<RingLweLockArtifact<F257>>)> {
     const MAX_LOCKS_DEFAULT: usize = 4096;
+    const MAX_COMBINE_SHARES_DEFAULT: usize = 1024;
+    const MAX_COMBINE_THRESHOLD_DEFAULT: usize = 1024;
     const MAX_C_STMT_LEN_DEFAULT: usize = 1 << 20;
     const MAX_CT_BYTES_DEFAULT: usize = 1 << 20;
 
@@ -1138,6 +1141,14 @@ fn read_lock_package_from_reader(
         combine_shares,
     };
 
+    let max_combine_shares = std::env::var("LFP_ONEPROOF_LOCKPKG_MAX_COMBINE_SHARES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(MAX_COMBINE_SHARES_DEFAULT);
+    let max_combine_threshold = std::env::var("LFP_ONEPROOF_LOCKPKG_MAX_COMBINE_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(MAX_COMBINE_THRESHOLD_DEFAULT);
     let max_locks = std::env::var("LFP_ONEPROOF_LOCKPKG_MAX_LOCKS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -1151,11 +1162,47 @@ fn read_lock_package_from_reader(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(MAX_CT_BYTES_DEFAULT);
 
+    let k = manifest.combine_shares as usize;
+    let t = manifest.combine_threshold as usize;
+    if k == 0 || k > max_combine_shares {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "combine_shares exceeds limit (k={} max={})",
+                k, max_combine_shares
+            ),
+        ));
+    }
+    if t == 0 || t > max_combine_threshold {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "combine_threshold exceeds limit (t={} max={})",
+                t, max_combine_threshold
+            ),
+        ));
+    }
+    if t > k {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid combine params (threshold={} shares={})", t, k),
+        ));
+    }
+
     let n = read_u32(r)? as usize;
     if n > max_locks {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("lock count exceeds limit (n={} max={})", n, max_locks),
+        ));
+    }
+    if n > max_combine_shares {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "lock count exceeds combine_shares cap (n={} max={})",
+                n, max_combine_shares
+            ),
         ));
     }
     let mut share_indices: Vec<u32> = Vec::with_capacity(n);
@@ -1251,6 +1298,7 @@ fn read_lock_package_from_reader(
                 ));
             }
             let mut hint_blocks_sparse = Vec::with_capacity(nh);
+            let mut seen_block_indices: HashSet<usize> = HashSet::with_capacity(nh);
             for _ in 0..nh {
                 let block_idx = read_u32(r)? as usize;
                 if block_idx >= max_blocks {
@@ -1262,6 +1310,12 @@ fn read_lock_package_from_reader(
                         ),
                     ));
                 }
+                if !seen_block_indices.insert(block_idx) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("duplicate hint block index in sublock (idx={})", block_idx),
+                    ));
+                }
                 // Canonical per-block encoding.
                 let mut fmt = [0u8; 1];
                 r.read_exact(&mut fmt)?;
@@ -1271,9 +1325,28 @@ fn read_lock_package_from_reader(
                         r.read_exact(&mut b1)?;
                         let nnz = b1[0] as usize;
                         let mut entries: Vec<(u8, u8)> = Vec::with_capacity(nnz);
+                        let mut seen_pos = [false; 64];
                         for _ in 0..nnz {
                             let mut pair = [0u8; 2];
                             r.read_exact(&mut pair)?;
+                            // Canonical sparse form:
+                            // - bit7 must be 0 (reserved)
+                            // - low 6 bits are position 0..63
+                            // - positions must be unique within the block
+                            if (pair[0] & 0x80) != 0 {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "non-canonical sparse pos_flags: bit7 must be 0",
+                                ));
+                            }
+                            let pos = (pair[0] & 0x3f) as usize;
+                            if seen_pos[pos] {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("duplicate sparse position in block (pos={})", pos),
+                                ));
+                            }
+                            seen_pos[pos] = true;
                             entries.push((pair[0], pair[1]));
                         }
                         PackedF257Block64::Sparse { entries }
@@ -1284,6 +1357,19 @@ fn read_lock_package_from_reader(
                         let mut b8 = [0u8; 8];
                         r.read_exact(&mut b8)?;
                         let is256_mask = u64::from_le_bytes(b8);
+                        // Canonical dense form:
+                        // if mask bit is set (coefficient=256), byte payload must be 0.
+                        for (i, v) in vals.iter().enumerate() {
+                            if ((is256_mask >> i) & 1) != 0 && *v != 0 {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!(
+                                        "non-canonical dense encoding: vals[{}] must be 0 when is256_mask bit is set",
+                                        i
+                                    ),
+                                ));
+                            }
+                        }
                         PackedF257Block64::Dense { vals, is256_mask }
                     }
                     _ => {

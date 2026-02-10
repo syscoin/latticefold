@@ -311,67 +311,26 @@ fn dot_row_mod257(h: &PackedF257Block64, row: &[u16]) -> u16 {
 // Amplification parameters
 // ---------------------------------------------------------------------------
 
-/// Amplification parameters for the T-of-R threshold lockset.
-#[derive(Clone, Debug)]
-pub struct AmplificationParams {
-    pub r: usize,
-    pub t: usize,
-    /// Per-lock brute-force candidates (conservative bound).
-    /// This is a heuristic estimate for the nonstandard distribution used here.
-    /// The actual per-lock hardness is NOT reduced to standard RLWE; this bound should
-    /// be set conservatively and the system security validated via `security_bits_*()`.
-    pub candidates_per_lock: u64,
+/// Classical brute-force bits under the global-check-only model.
+///
+/// Security accounting is driven by the number of independent 8-bit channel secrets that
+/// must be guessed jointly before one global check is available:
+///   classical_bits = 8 * P * L
+/// where P = channels per lock, L = required locks.
+pub fn classical_bits_global_check_only(p_channels: u16, required_locks: usize) -> f64 {
+    8.0 * (p_channels as f64) * (required_locks as f64)
 }
 
-impl Default for AmplificationParams {
-    fn default() -> Self {
-        Self {
-            r: 64,
-            t: 7,
-            candidates_per_lock: 1 << 20, // heuristic; nonstandard distribution, not a BKZ claim
-        }
-    }
+/// Grover bits under the same model:
+///   grover_bits = classical_bits / 2 = 4 * P * L
+pub fn grover_bits_global_check_only(p_channels: u16, required_locks: usize) -> f64 {
+    0.5 * classical_bits_global_check_only(p_channels, required_locks)
 }
 
-impl AmplificationParams {
-    // Assumed threat model: single global verifier, no per-lock oracle.
-    pub fn security_bits_single_armer(&self) -> f64 {
-        let t = self.t as f64;
-        let bits_per_lock = (self.candidates_per_lock as f64).log2();
-        let binom = ln_binom(self.r, self.t) / std::f64::consts::LN_2;
-        t * bits_per_lock + binom
-    }
-
-    pub fn security_bits_system(&self, n_armers: usize) -> f64 {
-        self.security_bits_single_armer() * (n_armers as f64)
-    }
-
-    pub fn security_bits_outer_threshold(&self, n_armers: usize, t_armers: usize) -> f64 {
-        let inner = self.security_bits_single_armer();
-        let binom_outer = ln_binom(n_armers, t_armers) / std::f64::consts::LN_2;
-        (t_armers as f64) * inner - binom_outer
-    }
-
-    pub fn print_summary(&self, n_armers: usize) {
-        let bits_1 = self.security_bits_single_armer();
-        let bits_n = self.security_bits_system(n_armers);
-        eprintln!(
-            "[amplification] R={}, T={}, cands/lock=2^{:.0}, bits/armer={:.1}, bits/system(N={})={:.1}",
-            self.r, self.t, (self.candidates_per_lock as f64).log2(), bits_1, n_armers, bits_n
-        );
-    }
-}
-
-fn ln_binom(n: usize, k: usize) -> f64 {
-    if k > n {
-        return f64::NEG_INFINITY;
-    }
-    let k = k.min(n - k);
-    let mut acc = 0.0f64;
-    for i in 0..k {
-        acc += ((n - i) as f64).ln() - ((i + 1) as f64).ln();
-    }
-    acc
+/// Heuristic PQ-128 condition under Grover-only accounting:
+///   P * L >= 32  <=>  grover_bits >= 128
+pub fn meets_pq128_grover_global_check_only(p_channels: u16, required_locks: usize) -> bool {
+    (p_channels as usize) * required_locks >= 32
 }
 
 // ---------------------------------------------------------------------------

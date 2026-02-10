@@ -1748,13 +1748,18 @@ mod tests {
         let recovered = reconstruct_secret_32(&shamir, &selected).expect("reconstruct_secret_32");
         assert_eq!(recovered, secret, "failed to reconstruct correct secret");
 
-        // Print amplification security summary.
-        let amp = crate::lockable_ringlwe::AmplificationParams {
-            r: shamir.shares,
-            t: shamir.threshold,
-            ..Default::default()
-        };
-        amp.print_summary(1);
+        // Print global-check-only security accounting.
+        let p = locks[0].p_channels;
+        let l_required = shamir.threshold;
+        let classical_bits =
+            crate::lockable_ringlwe::classical_bits_global_check_only(p, l_required);
+        let grover_bits = crate::lockable_ringlwe::grover_bits_global_check_only(p, l_required);
+        let meets_pq128 =
+            crate::lockable_ringlwe::meets_pq128_grover_global_check_only(p, l_required);
+        eprintln!(
+            "[amplification] model=global_check_only P={}, required_locks={}, cands=2^{:.0}, grover_bits={:.1}, pq128={}",
+            p, l_required, classical_bits, grover_bits, meets_pq128
+        );
 
         maybe_print_rss("tiny_payload_shamir:after_prove_decap_stream");
         eprintln!(
@@ -1775,7 +1780,7 @@ mod tests {
     #[test]
     #[ignore = "very slow in debug: runs full DPP prove+decap for 3 armers; run with `--release`"]
     fn test_pvugc_3armer_btc_address_we_lock_e2e() {
-        use crate::lockable_ringlwe::{RingLweParams, AmplificationParams};
+        use crate::lockable_ringlwe::RingLweParams;
         use crate::shamir_gf256::{reconstruct_secret_32, split_secret_32, ShamirConfig, ShamirShare};
         use crate::we_statement::encode_public_x;
         use crate::we_tiny_lock::arm_lfplus_ringlwe_lock;
@@ -1881,8 +1886,11 @@ mod tests {
         // Phase 1: ARMING (3 armers, each with a secp256k1 secret)
         // =====================================================================
         let mut rng = StdRng::seed_from_u64(20260206);
-        // Same 16-lock-per-armer setting as the small harness above (T stays small for runtime).
-        let shamir = ShamirConfig { threshold: 3, shares: 16 };
+        // Full K-of-K in the BTC e2e harness.
+        let shamir = ShamirConfig {
+            threshold: 16,
+            shares: 16,
+        };
         let ringlwe_params = RingLweParams::default();
         let stmt_digest = [5u8; 32];
 
@@ -2087,12 +2095,30 @@ mod tests {
         maybe_print_rss("btc_3armer:after_decap");
         eprintln!("[btc_3armer] decap + reconstruct + verify in {:?}", t_decap.elapsed());
 
-        let amp = AmplificationParams {
-            r: shamir.shares,
-            t: shamir.threshold,
-            ..Default::default()
-        };
-        amp.print_summary(N_ARMERS);
+        let p = all_locks[0].p_channels;
+        let l_required_per_armer = shamir.threshold;
+        let l_required_system = shamir.threshold * N_ARMERS;
+        let classical_bits_per_armer =
+            crate::lockable_ringlwe::classical_bits_global_check_only(p, l_required_per_armer);
+        let grover_bits_per_armer =
+            crate::lockable_ringlwe::grover_bits_global_check_only(p, l_required_per_armer);
+        let classical_bits_system =
+            crate::lockable_ringlwe::classical_bits_global_check_only(p, l_required_system);
+        let grover_bits_system =
+            crate::lockable_ringlwe::grover_bits_global_check_only(p, l_required_system);
+        let meets_pq128_system =
+            crate::lockable_ringlwe::meets_pq128_grover_global_check_only(p, l_required_system);
+        eprintln!(
+            "[amplification] model=global_check_only P={}, required_locks_per_armer={}, required_locks_system={}, cands_per_armer=2^{:.0}, grover_bits_per_armer={:.1}, cands_system=2^{:.0}, grover_bits_system={:.1}, pq128_system={}",
+            p,
+            l_required_per_armer,
+            l_required_system,
+            classical_bits_per_armer,
+            grover_bits_per_armer,
+            classical_bits_system,
+            grover_bits_system,
+            meets_pq128_system
+        );
 
         // =====================================================================
         // Adversarial tests: verify the lock rejects corrupted inputs.
