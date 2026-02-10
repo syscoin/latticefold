@@ -933,7 +933,6 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
         for rep in 0..r_reps {
             let mut tries = 0usize;
             let mut best_sl: Option<RingLweSubLock<F>> = None;
-            let mut best_hint_bytes: usize = usize::MAX;
             while tries < max_rep_tries {
                 tries += 1;
                 let rep_id = derive_rep_id_try(
@@ -996,21 +995,28 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                         hint_blocks_sparse: h_blocks,
                     },
                 };
-                if hint_bytes < best_hint_bytes {
-                    best_hint_bytes = hint_bytes;
-                    best_sl = Some(sl.clone());
-                }
-                if let Some(budget) = policy.hint_budget_bytes {
-                    if hint_bytes > budget {
-                        continue;
-                    }
+                let within_budget = match policy.hint_budget_bytes {
+                    Some(budget) => hint_bytes <= budget,
+                    None => true,
+                };
+                // Enforce hard-cap semantics when a hint budget is configured:
+                // only in-budget candidates are eligible for selection.
+                if !within_budget {
+                    continue;
                 }
                 best_sl = Some(sl);
                 break;
             }
             let sl = best_sl.ok_or_else(|| {
-                "arm_we_ringlwe_lock_from_dr1cs: failed to arm sublock within retry budget"
-                    .to_string()
+                if let Some(budget) = policy.hint_budget_bytes {
+                    format!(
+                        "arm_we_ringlwe_lock_from_dr1cs: failed to find in-budget sublock within retry budget (hint_budget_bytes={})",
+                        budget
+                    )
+                } else {
+                    "arm_we_ringlwe_lock_from_dr1cs: failed to arm sublock within retry budget"
+                        .to_string()
+                }
             })?;
             let ratio_class =
                 ratio_class_mod257_u16(&sl.accepting_set[0], &sl.accepting_set[1])?;
