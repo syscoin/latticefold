@@ -41,6 +41,9 @@ Assumptions / non-goals:
 - The decapper is local (no external decryption oracle).
 - We intentionally publish **no per-lock MAC/tag** (to avoid a per-lock verification oracle).
 - We are not trying to prove “best possible” confidentiality here; only **non-bricking decappability**.
+- At arming/ceremony time, the final WE witness is typically **not** available yet. This
+  well-formedness proof is checked now so that later, **if** a valid WE proof stream \( \pi \) is
+  provided for the bound statement, decapsulation succeeds.
 - A malicious armer can always DoS by not publishing, or by publishing invalid proofs. This statement
   only says: **if** the well-formedness proof verifies, the artifact is decapsulatable.
 
@@ -105,7 +108,10 @@ For each published lock package, the verifier sees:
 
 ### Witness
 
-The witness proves knowledge of *the secrets that make the artifact a real arming output*:
+This is the **well-formedness (arming-time) witness**, not the eventual WE witness used later to
+produce \( \pi \).
+
+It proves knowledge of *the secrets that make the artifact a real arming output*:
 
 1. **Combined key** `combined_key32` (32 bytes).
 2. **Combine scheme witness** (current combine-v1 is Shamir over GF(256)):
