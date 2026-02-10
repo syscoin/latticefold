@@ -4,7 +4,7 @@
 //!
 //! This module provides the lock layer for the arm-before-proof WE scheme:
 //! - arming publishes sparse hint blocks over F257 (one hint vector per accepting-set branch)
-//!   and two ciphertexts per lock (one per element of the shifted accepting set A').
+//!   and a **single** unauthenticated ciphertext per lock (XOR-stream under a derived key).
 //! - decapsulation is streaming: absorb proof chunks, then `finish_decrypt_candidates()`.
 //!
 //! # Security model
@@ -64,6 +64,52 @@ fn inv_mod257(a: u16) -> Result<u16, String> {
         return Err("inv_mod257: inverse of 0".to_string());
     }
     Ok(pow_mod257(a % MOD_257, 255))
+}
+
+/// Compute the canonical ratio class `min(r, r^{-1})` where `r = a1/a0 (mod 257)`.
+///
+/// Used to enforce that repetitions within a channel have distinct accepting-set ratios, so the
+/// intersection of 2-candidate sets collapses deterministically for an honest decapper (given π).
+pub(crate) fn ratio_class_mod257_u16<F: PrimeField>(a0: &F, a1: &F) -> Result<u16, String> {
+    let a0u = (f_to_u64(a0) % 257) as u16;
+    let a1u = (f_to_u64(a1) % 257) as u16;
+    if a0u == 0 || a1u == 0 {
+        return Err("ratio_class_mod257_u16: zero accepting element".to_string());
+    }
+    let r = mul_mod257(a1u, inv_mod257(a0u)?);
+    let rinv = inv_mod257(r)?;
+    Ok(r.min(rinv))
+}
+
+/// Public non-bricking policy check (required for deterministic disambiguation at `R=2`).
+///
+/// Ensures that the shifted accepting-set ratio class is distinct across repetitions within each
+/// channel. If violated, the per-channel intersection of 2-candidate sets can remain ambiguous and
+/// blow up the downstream enumeration cap.
+pub(crate) fn check_ratio_class_distinctness_per_channel<F: PrimeField>(
+    lock: &RingLweLockArtifact<F>,
+) -> Result<(), String> {
+    let p = lock.p_channels as usize;
+    let r = lock.r_reps as usize;
+    if p == 0 || r == 0 {
+        return Err("ringlwe: invalid (P,R)".to_string());
+    }
+    if lock.sublocks.len() != p.saturating_mul(r) {
+        return Err("ringlwe: sublocks length mismatch".to_string());
+    }
+    let mut seen: Vec<Vec<u16>> = vec![Vec::with_capacity(r); p];
+    for sl in &lock.sublocks {
+        let ch = sl.channel_id as usize;
+        if ch >= p {
+            return Err("ringlwe: sublock channel_id out of range".to_string());
+        }
+        let rc = ratio_class_mod257_u16(&sl.accepting_set[0], &sl.accepting_set[1])?;
+        if seen[ch].contains(&rc) {
+            return Err("ringlwe: duplicate accepting-set ratio class within a channel".to_string());
+        }
+        seen[ch].push(rc);
+    }
+    Ok(())
 }
 
 /// Packed encoding of up to 64 coefficients in F257 (per hinted block).
@@ -354,16 +400,16 @@ impl Default for RingLweParams {
 #[derive(Clone, Debug)]
 pub struct RingLweLockArtifact<F: PrimeField> {
     pub c_stmt: Vec<F>,
-    pub accepting_set: [F; 2],
-    pub offset: F,
     pub x_len: usize,
     pub pi_len: usize,
     pub len: usize,
-    pub coins: dpp::theorem43::Theorem43Coins<F>,
     pub params: RingLweParams,
-    /// Hint material stored sparsely as `(block_idx, packed_coeffs)`, where each block has
-    /// `PACK_D=64` coefficients over F257 packed as 1 byte + an `is_256` mask.
-    pub hints: BranchHints,
+    /// Number of independent scalar channels \(P\).
+    pub p_channels: u16,
+    /// Number of repetitions per channel \(R\).
+    pub r_reps: u16,
+    /// DPP sublocks (one per `(channel,rep)`), each with its own hidden query.
+    pub sublocks: Vec<RingLweSubLock<F>>,
     /// Single unauthenticated ciphertext.
     ///
     /// IMPORTANT: we intentionally publish **only one** ciphertext. Publishing two ciphertexts of
@@ -388,6 +434,23 @@ pub struct LockCiphertext {
     pub ct: Vec<u8>,
 }
 
+/// One DPP instance (hidden query) inside a share-lock.
+///
+/// Each sublock corresponds to a distinct hidden query \(q^{(channel,rep)}\), with its own
+/// accepting set and mod-257 hints. All sublocks within a share-lock share a single ciphertext,
+/// keyed by the tuple of per-channel secrets.
+#[derive(Clone, Debug)]
+pub struct RingLweSubLock<F: PrimeField> {
+    /// Channel id in `[0..P)`.
+    pub channel_id: u16,
+    /// Shifted accepting set (mod 257), must be nonzero.
+    pub accepting_set: [F; 2],
+    /// Public coins for Theorem-4.3 (prover needs these).
+    pub coins: dpp::theorem43::Theorem43Coins<F>,
+    /// Deterministic hint blocks `h = q * s_channel (mod 257)`.
+    pub hints: BranchHints,
+}
+
 // ---------------------------------------------------------------------------
 // Cryptographic helpers
 // ---------------------------------------------------------------------------
@@ -402,30 +465,49 @@ fn sha256_32(chunks: &[&[u8]]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Derive a 32-byte payload key from two 8-bit seeds and context binding.
-fn derive_payload_key_bytes<F: PrimeField>(
+/// Derive a 32-byte payload key from the tuple of per-channel secrets and public context binding.
+fn derive_payload_key_bytes_multi<F: PrimeField>(
     domain_label: &[u8; 32],
     c_stmt: &[F],
-    coins: &dpp::theorem43::Theorem43Coins<F>,
-    y_mod257: u16,
+    p_channels: u16,
+    r_reps: u16,
+    sublocks: &[RingLweSubLock<F>],
+    s_channels_mod257: &[u16],
 ) -> [u8; 32] {
-    let mut coins_bytes = Vec::with_capacity(8 * 4);
-    coins_bytes.extend_from_slice(&(coins.idx as u64).to_le_bytes());
-    coins_bytes.extend_from_slice(&f_to_u64(&coins.lambda).to_le_bytes());
-    coins_bytes.extend_from_slice(&f_to_u64(&coins.rho).to_le_bytes());
-    coins_bytes.extend_from_slice(&f_to_u64(&coins.sigma).to_le_bytes());
-
+    use sha2::Digest;
     let mut stmt_bytes = Vec::with_capacity(c_stmt.len() * 8);
     for f in c_stmt {
         stmt_bytes.extend_from_slice(&f_to_u64(f).to_le_bytes());
     }
 
+    // Bind the key to all public per-sublock coins and accepting sets, to avoid cross-lock keystream
+    // reuse even if some channels accidentally repeat.
+    let mut bind = sha2::Sha256::new();
+    bind.update(b"LFP_RINGLWE_LOCK_BIND_V1");
+    bind.update(domain_label);
+    bind.update(stmt_bytes.as_slice());
+    bind.update(&p_channels.to_le_bytes());
+    bind.update(&r_reps.to_le_bytes());
+    for sl in sublocks {
+        bind.update(&sl.channel_id.to_le_bytes());
+        bind.update(&f_to_u64(&sl.accepting_set[0]).to_le_bytes());
+        bind.update(&f_to_u64(&sl.accepting_set[1]).to_le_bytes());
+        bind.update(&(sl.coins.idx as u64).to_le_bytes());
+        bind.update(&f_to_u64(&sl.coins.lambda).to_le_bytes());
+        bind.update(&f_to_u64(&sl.coins.rho).to_le_bytes());
+        bind.update(&f_to_u64(&sl.coins.sigma).to_le_bytes());
+    }
+    let lock_bind: [u8; 32] = bind.finalize().into();
+
+    let mut s_bytes = Vec::with_capacity(2 * s_channels_mod257.len());
+    for &s in s_channels_mod257 {
+        s_bytes.extend_from_slice(&s.to_le_bytes());
+    }
+
     sha256_32(&[
-        b"LFP_RINGLWE_PAYLOAD_KEY_V3",
-        domain_label,
-        stmt_bytes.as_slice(),
-        coins_bytes.as_slice(),
-        &y_mod257.to_le_bytes(),
+        b"LFP_RINGLWE_PAYLOAD_KEY_V4",
+        &lock_bind,
+        s_bytes.as_slice(),
     ])
 }
 
@@ -453,7 +535,7 @@ fn xor_stream_decrypt(key: &[u8; 32], nonce: &[u8; 12], ct: &[u8]) -> Vec<u8> {
 
 /// Sample a nonzero secret scalar in `{1,2,...,256}` (viewed mod 257).
 #[inline]
-fn sample_nonzero_f257_scalar(rng: &mut impl RngCore) -> u16 {
+pub(crate) fn sample_nonzero_f257_scalar(rng: &mut impl RngCore) -> u16 {
     let v = (rng.next_u32() & 0xFF) as u16; // 0..255
     v + 1 // 1..256
 }
@@ -464,6 +546,7 @@ fn sample_nonzero_f257_scalar(rng: &mut impl RngCore) -> u16 {
 
 pub struct RingLweDecapStreamState<'a, F: PrimeField> {
     lock: &'a RingLweLockArtifact<F>,
+    sublock: &'a RingLweSubLock<F>,
     d: usize,
     /// Accumulated mod-257 dot product `y = ⟨h, π⟩`.
     ///
@@ -478,15 +561,20 @@ pub struct RingLweDecapStreamState<'a, F: PrimeField> {
 }
 
 impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
-    fn new(lock: &'a RingLweLockArtifact<F>, x: &[F]) -> Result<Self, String> {
+    fn new(
+        lock: &'a RingLweLockArtifact<F>,
+        sublock: &'a RingLweSubLock<F>,
+        x: &[F],
+    ) -> Result<Self, String> {
         if x.len() != lock.x_len || x.len() + lock.pi_len != lock.len {
             return Err("ringlwe_decap_state: bad x length".to_string());
         }
         Ok(Self {
             lock,
+            sublock,
             d: PACK_D,
             y: 0,
-            sparse: lock.hints.hint_blocks_sparse.as_slice(),
+            sparse: sublock.hints.hint_blocks_sparse.as_slice(),
             sparse_pos: 0,
             block_idx: 0,
             pos_in_block: 0,
@@ -594,28 +682,17 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
         Ok(self.y)
     }
 
-    /// Finish streaming and return two candidate decryptions (unauthenticated).
-    ///
-    /// We publish a single ciphertext under a key derived from the hidden scalar `s` (mod 257).
-    /// The witness stream yields `y = s * a_true` where `a_true ∈ {a0, a1}`. The decapper tries
-    /// both candidates `s0 = y * inv(a0)` and `s1 = y * inv(a1)`.
-    pub fn finish_decrypt_candidates(self) -> Result<[Vec<u8>; 2], String> {
-        let lock = self.lock;
+    /// Finish streaming and return the channel id and two candidate scalars `s` (mod 257).
+    pub fn finish_s_candidates(self) -> Result<(u16, [u16; 2]), String> {
+        let sl = self.sublock;
         let y = self.finish_y_mod257()?;
-        let a0 = (f_to_u64(&lock.accepting_set[0]) % 257) as u16;
-        let a1 = (f_to_u64(&lock.accepting_set[1]) % 257) as u16;
+        let a0 = (f_to_u64(&sl.accepting_set[0]) % 257) as u16;
+        let a1 = (f_to_u64(&sl.accepting_set[1]) % 257) as u16;
         let inv0 = inv_mod257(a0)?;
         let inv1 = inv_mod257(a1)?;
         let s0 = mul_mod257(y, inv0);
         let s1 = mul_mod257(y, inv1);
-
-        let key0 =
-            derive_payload_key_bytes(&lock.params.domain_label, &lock.c_stmt, &lock.coins, s0);
-        let key1 =
-            derive_payload_key_bytes(&lock.params.domain_label, &lock.c_stmt, &lock.coins, s1);
-        let pt0 = xor_stream_decrypt(&key0, &lock.ct.nonce, &lock.ct.ct);
-        let pt1 = xor_stream_decrypt(&key1, &lock.ct.nonce, &lock.ct.ct);
-        Ok([pt0, pt1])
+        Ok((sl.channel_id, [s0, s1]))
     }
 
 }
@@ -670,44 +747,194 @@ impl<F: PrimeField> QueryBlockAccumulator<F> {
 // ---------------------------------------------------------------------------
 
 impl<F: PrimeField> RingLweLockArtifact<F> {
-    pub fn decap_state<'a>(&'a self, x: &[F]) -> Result<RingLweDecapStreamState<'a, F>, String> {
-        RingLweDecapStreamState::new(self, x)
+    pub(crate) fn payload_key_bytes(&self, s_channels_mod257: &[u16]) -> Result<[u8; 32], String> {
+        if s_channels_mod257.len() != self.p_channels as usize {
+            return Err("ringlwe: payload_key_bytes: channel secret length mismatch".to_string());
+        }
+        Ok(derive_payload_key_bytes_multi(
+            &self.params.domain_label,
+            &self.c_stmt,
+            self.p_channels,
+            self.r_reps,
+            self.sublocks.as_slice(),
+            s_channels_mod257,
+        ))
     }
+
+    pub(crate) fn decrypt_payload(&self, s_channels_mod257: &[u16]) -> Result<Vec<u8>, String> {
+        let key = self.payload_key_bytes(s_channels_mod257)?;
+        Ok(xor_stream_decrypt(&key, &self.ct.nonce, &self.ct.ct))
+    }
+
+    pub fn decap_states<'a>(
+        &'a self,
+        x: &[F],
+    ) -> Result<Vec<RingLweDecapStreamState<'a, F>>, String> {
+        let mut out = Vec::with_capacity(self.sublocks.len());
+        for sl in &self.sublocks {
+            out.push(RingLweDecapStreamState::new(self, sl, x)?);
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decap helpers (candidate intersection + payload candidate enumeration)
+// ---------------------------------------------------------------------------
+
+fn intersect_2cands_across_reps(reps: &[[u16; 2]]) -> Result<Vec<u16>, String> {
+    if reps.is_empty() {
+        return Err("ringlwe: empty reps list".to_string());
+    }
+    let mut cur: Vec<u16> = vec![reps[0][0], reps[0][1]];
+    cur.sort_unstable();
+    cur.dedup();
+    for rep in reps.iter().skip(1) {
+        let mut nxt: Vec<u16> = vec![rep[0], rep[1]];
+        nxt.sort_unstable();
+        nxt.dedup();
+        let mut inter: Vec<u16> = Vec::new();
+        for &a in &cur {
+            if nxt.contains(&a) {
+                inter.push(a);
+            }
+        }
+        cur = inter;
+    }
+    Ok(cur)
+}
+
+/// Given per-sublock `s` candidates (mod 257), intersect across repetitions within each channel,
+/// then decrypt the lock payload under the resulting (unique) per-channel secret tuple.
+///
+/// Canonical policy: **no branching**. If intersections do not collapse to singletons,
+/// this returns an error.
+///
+/// `sublock_s_candidates` must be in the same order as `lock.sublocks` (one entry per sublock).
+pub(crate) fn decrypt_payload_from_sublock_s_candidates<F: PrimeField>(
+    lock: &RingLweLockArtifact<F>,
+    sublock_s_candidates: &[(u16, [u16; 2])],
+) -> Result<Vec<u8>, String> {
+    let p = lock.p_channels as usize;
+    let r = lock.r_reps as usize;
+    if p == 0 || r == 0 {
+        return Err("ringlwe: invalid (P,R)".to_string());
+    }
+    if lock.sublocks.len() != p.saturating_mul(r) {
+        return Err("ringlwe: sublocks length mismatch".to_string());
+    }
+    if sublock_s_candidates.len() != lock.sublocks.len() {
+        return Err("ringlwe: sublock_s_candidates length mismatch".to_string());
+    }
+
+    // Group 2-candidate sets by channel, preserving the canonical sublock order.
+    let mut per_channel_reps: Vec<Vec<[u16; 2]>> = vec![Vec::with_capacity(r); p];
+    for (i, (ch, cands)) in sublock_s_candidates.iter().enumerate() {
+        let sl = lock
+            .sublocks
+            .get(i)
+            .ok_or_else(|| "ringlwe: internal sublock index mismatch".to_string())?;
+        if *ch != sl.channel_id {
+            return Err("ringlwe: sublock channel_id mismatch".to_string());
+        }
+        let ch_usize = *ch as usize;
+        if ch_usize >= p {
+            return Err("ringlwe: channel_id out of range".to_string());
+        }
+        per_channel_reps[ch_usize].push(*cands);
+    }
+    for ch in 0..p {
+        if per_channel_reps[ch].len() != r {
+            return Err("ringlwe: missing repetitions for some channel".to_string());
+        }
+    }
+
+    // Intersect across reps within a channel.
+    let mut channel_sets: Vec<Vec<u16>> = Vec::with_capacity(p);
+    for ch in 0..p {
+        let mut cur = intersect_2cands_across_reps(per_channel_reps[ch].as_slice())?;
+        cur.sort_unstable();
+        cur.dedup();
+        if cur.is_empty() {
+            return Err("ringlwe: empty intersection for some channel".to_string());
+        }
+        if cur.len() > 2 {
+            return Err("ringlwe: internal error (intersection >2)".to_string());
+        }
+        channel_sets.push(cur);
+    }
+
+    // Enumerate cartesian product over per-channel candidates.
+    let mut total: u64 = 1;
+    for set in &channel_sets {
+        total = total.saturating_mul(set.len() as u64);
+    }
+    // Canonical policy: no branching. If the per-channel intersections do not collapse to
+    // singletons, the lock is not deterministically decapsulatable without an external global
+    // disambiguation predicate (which we intentionally avoid at the lock layer).
+    //
+    if total != 1 {
+        let lens: Vec<usize> = channel_sets.iter().map(|s| s.len()).collect();
+        return Err(format!(
+            "ringlwe: ambiguous per-channel intersections (P={p} R={r} channel_set_lens={lens:?} total_tuples={total}); lock must satisfy ratio-class distinctness policy"
+        ));
+    }
+
+    let s_channels: Vec<u16> = channel_sets
+        .iter()
+        .map(|set| {
+            debug_assert_eq!(set.len(), 1);
+            set[0]
+        })
+        .collect();
+    lock.decrypt_payload(s_channels.as_slice())
 }
 
 /// Arm (create) a lock artifact with deterministic mod-257 hints + unauthenticated XOR.
 pub fn arm_ringlwe_lock<F: PrimeField>(
     c_stmt: Vec<F>,
-    accepting_set_shifted: [F; 2],
-    coins: dpp::theorem43::Theorem43Coins<F>,
-    offset: F,
     x_len: usize,
     pi_len: usize,
-    q_blocks: Vec<(usize, PackedF257Block64)>,
     params: RingLweParams,
+    p_channels: u16,
+    r_reps: u16,
+    sublocks: Vec<RingLweSubLock<F>>,
     payload: &[u8],
+    s_channels_mod257: &[u16],
     rng: &mut impl RngCore,
 ) -> Result<RingLweLockArtifact<F>, String> {
-    if accepting_set_shifted[0].is_zero() || accepting_set_shifted[1].is_zero() {
-        return Err(
-            "arm_ringlwe_lock: shifted accepting set contains 0; resample rep_id".to_string(),
-        );
+    if p_channels == 0 || r_reps == 0 {
+        return Err("arm_ringlwe_lock: invalid (P,R)".to_string());
+    }
+    if sublocks.len() != (p_channels as usize) * (r_reps as usize) {
+        return Err("arm_ringlwe_lock: sublocks length mismatch".to_string());
+    }
+    if s_channels_mod257.len() != p_channels as usize {
+        return Err("arm_ringlwe_lock: channel secrets length mismatch".to_string());
+    }
+    for &s in s_channels_mod257 {
+        if s == 0 || s > 256 {
+            return Err("arm_ringlwe_lock: bad channel secret scalar".to_string());
+        }
+    }
+    for sl in &sublocks {
+        if sl.accepting_set[0].is_zero() || sl.accepting_set[1].is_zero() {
+            return Err("arm_ringlwe_lock: shifted accepting set contains 0".to_string());
+        }
+        if sl.channel_id >= p_channels {
+            return Err("arm_ringlwe_lock: sublock channel_id out of range".to_string());
+        }
     }
 
-    // Single secret scalar per lock.
-    let s_u16: u16 = sample_nonzero_f257_scalar(rng);
-
-    // Deterministic hint blocks: h = q * s (mod 257).
-    let h_blocks: Vec<(usize, PackedF257Block64)> = q_blocks
-        .iter()
-        .map(|(block_idx, q)| (*block_idx, q.scale_mod257(s_u16)))
-        .collect();
-    let hints = BranchHints {
-        hint_blocks_sparse: h_blocks,
-    };
-
-    // Encrypt payload once under a key derived from `s` (NOT from `s*a`).
-    let key = derive_payload_key_bytes(&params.domain_label, &c_stmt, &coins, s_u16);
+    // Encrypt payload once under a key derived from the tuple of per-channel secrets.
+    let key = derive_payload_key_bytes_multi(
+        &params.domain_label,
+        &c_stmt,
+        p_channels,
+        r_reps,
+        sublocks.as_slice(),
+        s_channels_mod257,
+    );
     let mut nonce = [0u8; 12];
     rng.fill_bytes(&mut nonce);
     let ct = xor_stream_encrypt(&key, &nonce, payload);
@@ -715,14 +942,13 @@ pub fn arm_ringlwe_lock<F: PrimeField>(
 
     Ok(RingLweLockArtifact {
         c_stmt,
-        accepting_set: accepting_set_shifted,
-        offset,
         x_len,
         pi_len,
         len: x_len + pi_len,
-        coins,
         params,
-        hints,
+        p_channels,
+        r_reps,
+        sublocks,
         ct,
     })
 }
@@ -753,11 +979,8 @@ mod tests {
         rng.fill_bytes(&mut payload);
 
         let c_stmt: Vec<F257> = Vec::new();
-        let accepting_set_shifted = [F257::from(1u64), F257::from(2u64)];
-        let offset = F257::ZERO;
         let x_len = 1usize;
         let pi_len = 1usize;
-        let q_blocks: Vec<(usize, PackedF257Block64)> = Vec::new();
         let params = RingLweParams::default();
 
         // Dummy coins (not used by ciphertext encoding).
@@ -768,16 +991,25 @@ mod tests {
             sigma: F257::ONE,
         };
 
+        let s = sample_nonzero_f257_scalar(&mut rng);
+        let sub = RingLweSubLock::<F257> {
+            channel_id: 0,
+            accepting_set: [F257::from(1u64), F257::from(2u64)],
+            coins,
+            hints: BranchHints {
+                hint_blocks_sparse: Vec::new(),
+            },
+        };
         let lock = arm_ringlwe_lock::<F257>(
             c_stmt,
-            accepting_set_shifted,
-            coins,
-            offset,
             x_len,
             pi_len,
-            q_blocks,
             params,
+            1,
+            1,
+            vec![sub],
             payload.as_slice(),
+            &[s],
             &mut rng,
         )
         .expect("arm_ringlwe_lock");

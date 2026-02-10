@@ -24,7 +24,9 @@ use std::time::Instant;
 use rand::{rngs::OsRng, rngs::StdRng, RngCore, SeedableRng};
 
 use crate::lin::LinearizedVerify;
-use crate::lockable_ringlwe::{PackedF257Block64, RingLweLockArtifact, RingLweParams};
+use crate::lockable_ringlwe::{
+    BranchHints, PackedF257Block64, RingLweLockArtifact, RingLweParams, RingLweSubLock,
+};
 use crate::shamir_gf256::{reconstruct_secret_32, split_secret_32, ShamirConfig, ShamirShare};
 use crate::utils::maybe_print_rss;
 use crate::we_statement::{encode_public_x, we_statement_hash_lf_plus, LFP_WE_GATE_DIGEST_V1};
@@ -39,9 +41,9 @@ pub struct Sp1OneProofWeGateOutput {
     pub lock_coin_seed: [u8; 32],
     /// The decapsulated 32-byte key derived from the proof.
     ///
-    /// This is a research harness convenience: the underlying RingLWE lock has two branches, so
-    /// we embed a short self-authenticating tag into the lock payload and pick the unique branch
-    /// whose payload validates.
+    /// This is a research harness convenience. In the canonical RxP lock path, honest decap is
+    /// non-branching at the share level (by construction / arming-time policy), and the protocol
+    /// performs a single global check (e.g. EC/address binding) across armers.
     pub decapped_key: [u8; 32],
 }
 
@@ -61,10 +63,6 @@ pub struct Sp1OneProofWeGateLockPkgManifest {
     pub combine_threshold: u32,
     /// Number of locks / shares \(R\).
     pub combine_shares: u32,
-    /// Public tag binding the combined key to the statement.
-    ///
-    /// This lets decap select the unique valid reconstruction without any per-lock oracle.
-    pub combined_key_tag: [u8; 32],
 }
 
 /// Structured output for the **arming** endpoint (write lock packages to disk).
@@ -84,6 +82,31 @@ fn hex32(bytes: &[u8; 32]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+#[inline]
+fn derive_rep_id_try(
+    secret_dpp_seed32: &[u8; 32],
+    stmt_digest: &[u8; 32],
+    lock_j: u64,
+    block_id: usize,
+    channel_id: u16,
+    rep: u16,
+    try_idx: u64,
+) -> u64 {
+    // Pseudorandom per-try rep_id, derived from secret DPP seed + statement binding.
+    // This avoids "incrementing rep_id" structure and enables arming-time filtering.
+    let mut h = Sha256::new();
+    h.update(b"LFP_ONEPROOF_REP_ID_V1");
+    h.update(secret_dpp_seed32);
+    h.update(stmt_digest);
+    h.update(&lock_j.to_le_bytes());
+    h.update(&(block_id as u64).to_le_bytes());
+    h.update(&channel_id.to_le_bytes());
+    h.update(&rep.to_le_bytes());
+    h.update(&try_idx.to_le_bytes());
+    let out: [u8; 32] = h.finalize().into();
+    u64::from_le_bytes(out[0..8].try_into().unwrap())
 }
 
 fn parse_hex32(mut s: &str) -> Result<[u8; 32], String> {
@@ -303,22 +326,28 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
         };
     let shares = split_secret_32(&mut secret_master_rng, &combine_cfg, combined_key32)
         .map_err(|e| format!("split_secret_32: {e}"))?;
-    let combined_key_tag: [u8; 32] = {
-        let mut h = Sha256::new();
-        h.update(b"LFP_ONEPROOF_COMBINED_TAG_V1");
-        h.update(&combined_key32);
-        h.update(&stmt_digest);
-        h.finalize().into()
-    };
-
     let t_arm = Instant::now();
     let mut locks: Vec<RingLweLockArtifact<F257>> = Vec::with_capacity(k_locks);
     let mut share_indices: Vec<u32> = Vec::with_capacity(k_locks);
+    // Channels/repetitions:
+    // - P channels gives ~8P bits/lock (classical) against attackers without π (global-check-only).
+    // - R repetitions per channel allow the honest decapper (with π) to disambiguate without
+    //   per-lock oracles, by intersecting 2-candidate sets across reps.
+    let p_channels: usize = std::env::var("LFP_ONEPROOF_P")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2)
+        .max(1);
+    let r_reps: usize = std::env::var("LFP_ONEPROOF_R")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2)
+        .max(1);
     // Sizing policy:
     // - Use a moderate hint budget with a small max retry count to reject only pathological
     //   outliers (low bias, fast arming).
-    // - Randomize the starting rep_id offset using secret arming RNG so we do not deterministically
-    //   "grind from j upward" (which can create systematic selection effects).
+    // - Sample `rep_id` pseudorandomly per try from a secret seed, rather than incrementing.
+    //   This avoids selection structure and lets us resample on bad offsets/budgets.
     let hint_budget_bytes_opt: Option<usize> = std::env::var("LFP_ONEPROOF_HINT_BUDGET_BYTES")
         .ok()
         .and_then(|s| s.parse().ok());
@@ -327,130 +356,210 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
         .and_then(|s| s.parse().ok())
         .unwrap_or(32)
         .max(1);
+    // Public x encoding used by all sublocks.
+    let x = encode_public_x::<F257>(&we_params, &public_inputs_f257);
     for j in 0..k_locks {
         let lock_j = j as u64;
-        // Secret-random starting offset.
-        let rep_start = j as u64 + (secret_master_rng.next_u64() % (max_rep_tries as u64));
-        let mut rep_id = rep_start;
         share_indices.push(shares[j].index);
-        let mut tries = 0usize;
-        let mut rejected_zero = 0usize;
-        let mut rejected_budget = 0usize;
-        let mut best_lock: Option<RingLweLockArtifact<F257>> = None;
-        let mut best_rep_id: u64 = rep_id;
-        let mut best_hint_bytes: usize = usize::MAX;
-
-        // Try up to `max_rep_tries`, but do not "grind for minimum".
-        // If none fit the budget, fail open by taking the smallest hint_bytes seen.
-        while tries < max_rep_tries {
-            tries += 1;
-            let lock = match crate::we_tiny_lock::arm_lfplus_ringlwe_lock::<R>(
-                shape.clone(),
-                &we_params,
-                &public_inputs_f257,
-                stmt_digest,
-                secret_dpp_seed32,
-                lock_j,
-                block_id,
-                rep_id,
-                ringlwe_params.clone(),
-                shares[j].value.as_slice(),
+        // Per-channel secrets s^(i) ∈ {1..=256} (mod 257).
+        let mut s_channels: Vec<u16> = Vec::with_capacity(p_channels);
+        for _ in 0..p_channels {
+            s_channels.push(crate::lockable_ringlwe::sample_nonzero_f257_scalar(
                 &mut secret_master_rng,
-            ) {
-                Ok(lock) => lock,
-                Err(e) if e.contains("shifted accepting set contains 0") => {
-                    rejected_zero += 1;
-                    rep_id += 1;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
+            ));
+        }
 
-            let hinted_blocks = lock.hints.hint_blocks_sparse.len();
-            let hint_bytes: usize = lock
-                .hints
-                .hint_blocks_sparse
-                .iter()
-                .map(|(_bi, blk)| 4 + blk.on_disk_bytes())
-                .sum();
+        let mut sublocks: Vec<RingLweSubLock<F257>> = Vec::with_capacity(p_channels * r_reps);
+        // Enforce distinct ratio classes within each channel so honest disambiguation is
+        // deterministic (intersection of 2-sets collapses).
+        let mut ratio_seen: Vec<Vec<u16>> = vec![Vec::with_capacity(r_reps); p_channels];
+        let mut c_stmt_opt: Option<Vec<F257>> = None;
+        let mut pi_len_opt: Option<usize> = None;
+        let mut try_idx: u64 = 0;
+        let mut rejected_zero = 0usize;
+        let mut rejected_ratio = 0usize;
+        let mut rejected_budget = 0usize;
 
-            // Track best-so-far for fail-open fallback.
-            if hint_bytes < best_hint_bytes {
-                best_hint_bytes = hint_bytes;
-                best_rep_id = rep_id;
-                best_lock = Some(lock.clone());
-            }
+        for ch in 0..p_channels {
+            for rep in 0..r_reps {
+                let mut tries = 0usize;
+                let mut best_sl: Option<RingLweSubLock<F257>> = None;
+                let mut best_hint_bytes: usize = usize::MAX;
+                let mut best_rep_id: u64 = 0;
+                let mut best_tries: usize = 0;
 
-            if let Some(budget) = hint_budget_bytes_opt {
-                if hint_bytes > budget {
-                    rejected_budget += 1;
-                    if std::env::var("LFP_ONEPROOF_PRINT_LOCK_STATS").ok().as_deref() == Some("1")
-                    {
-                        eprintln!(
-                            "[oneproof:arm] lock_j={} rep_id={} rejected_by_budget hint_bytes≈{} budget_bytes={} tries={} rejected_budget={} rejected_zero={} hinted_blocks={}",
-                            lock_j,
-                            rep_id,
-                            hint_bytes,
-                            budget,
-                            tries,
-                            rejected_budget,
-                            rejected_zero,
-                            hinted_blocks
-                        );
+                while tries < max_rep_tries {
+                    tries += 1;
+                    let rep_id = derive_rep_id_try(
+                        &secret_dpp_seed32,
+                        &stmt_digest,
+                        lock_j,
+                        block_id,
+                        ch as u16,
+                        rep as u16,
+                        try_idx,
+                    );
+                    try_idx = try_idx.wrapping_add(1);
+
+                    let out = match crate::we_tiny_lock::arm_we_ringlwe_sublock_from_dr1cs::<F257>(
+                        shape.inst.clone(),
+                        shape.public_len,
+                        stmt_digest,
+                        &x,
+                        secret_dpp_seed32,
+                        lock_j,
+                        block_id,
+                        rep_id,
+                    ) {
+                        Ok(o) => o,
+                        Err(e) if e.contains("shifted accepting set contains 0") => {
+                            rejected_zero += 1;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if c_stmt_opt.is_none() {
+                        c_stmt_opt = Some(out.c_stmt.clone());
                     }
-                    rep_id += 1;
-                    continue;
+                    if pi_len_opt.is_none() {
+                        pi_len_opt = Some(out.pi_len);
+                    }
+
+                    let ratio_class = match crate::lockable_ringlwe::ratio_class_mod257_u16(
+                        &out.accepting_set_shifted[0],
+                        &out.accepting_set_shifted[1],
+                    ) {
+                        Ok(rc) => rc,
+                        Err(_) => {
+                            rejected_zero += 1;
+                            continue;
+                        }
+                    };
+                    if ratio_seen[ch].contains(&ratio_class) {
+                        rejected_ratio += 1;
+                        continue;
+                    }
+
+                    // Scale q by the chosen per-channel secret.
+                    let s = s_channels[ch];
+                    let h_blocks: Vec<(usize, PackedF257Block64)> = out
+                        .q_blocks
+                        .iter()
+                        .map(|(block_idx, q)| (*block_idx, q.scale_mod257(s)))
+                        .collect();
+                    let hint_bytes: usize = h_blocks
+                        .iter()
+                        .map(|(_bi, blk)| 4 + blk.on_disk_bytes())
+                        .sum();
+
+                    let sl = RingLweSubLock::<F257> {
+                        channel_id: ch as u16,
+                        accepting_set: out.accepting_set_shifted,
+                        coins: out.coins,
+                        hints: BranchHints {
+                            hint_blocks_sparse: h_blocks,
+                        },
+                    };
+
+                    // Track best-so-far (for fail-open budget fallback).
+                    if hint_bytes < best_hint_bytes {
+                        best_hint_bytes = hint_bytes;
+                        best_rep_id = rep_id;
+                        best_tries = tries;
+                        best_sl = Some(sl.clone());
+                    }
+
+                    if let Some(budget) = hint_budget_bytes_opt {
+                        if hint_bytes > budget {
+                            rejected_budget += 1;
+                            if std::env::var("LFP_ONEPROOF_PRINT_LOCK_STATS")
+                                .ok()
+                                .as_deref()
+                                == Some("1")
+                            {
+                                eprintln!(
+                                    "[oneproof:arm] lock_j={} ch={} rep={} rep_id={} rejected_by_budget hint_bytes≈{} budget_bytes={} tries={} rejected_budget={} rejected_zero={} rejected_ratio={}",
+                                    lock_j,
+                                    ch,
+                                    rep,
+                                    rep_id,
+                                    hint_bytes,
+                                    budget,
+                                    tries,
+                                    rejected_budget,
+                                    rejected_zero,
+                                    rejected_ratio
+                                );
+                            }
+                            continue;
+                        }
+                    }
+
+                    // Accept.
+                    best_sl = Some(sl);
+                    best_rep_id = rep_id;
+                    best_tries = tries;
+                    break;
                 }
-            }
 
-            // Accept.
-            if std::env::var("LFP_ONEPROOF_PRINT_LOCK_STATS")
-                .ok()
-                .as_deref()
-                == Some("1")
-            {
-                eprintln!(
-                    "[oneproof:arm] lock_j={} rep_id={} accepted tries={} rejected_zero={} rejected_budget={} hinted_blocks={} hint_bytes≈{}",
-                    lock_j,
-                    rep_id,
-                    tries,
-                    rejected_zero,
-                    rejected_budget,
-                    hinted_blocks,
-                    hint_bytes
-                );
+                let sl = best_sl.ok_or_else(|| "oneproof: internal error (no sublock)".to_string())?;
+                // Record ratio class for this channel/rep (must be distinct).
+                let rc = crate::lockable_ringlwe::ratio_class_mod257_u16(
+                    &sl.accepting_set[0],
+                    &sl.accepting_set[1],
+                )
+                .map_err(|e| format!("oneproof: ratio_class: {e}"))?;
+                if ratio_seen[ch].contains(&rc) {
+                    return Err("oneproof: ratio filter failure (duplicate ratio class)".to_string());
+                }
+                ratio_seen[ch].push(rc);
+
+                if std::env::var("LFP_ONEPROOF_PRINT_LOCK_STATS")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
+                    let hinted_blocks = sl.hints.hint_blocks_sparse.len();
+                    let hint_bytes: usize = sl
+                        .hints
+                        .hint_blocks_sparse
+                        .iter()
+                        .map(|(_bi, blk)| 4 + blk.on_disk_bytes())
+                        .sum();
+                    eprintln!(
+                        "[oneproof:arm] lock_j={} ch={} rep={} rep_id={} accepted tries={} hinted_blocks={} hint_bytes≈{}",
+                        lock_j,
+                        ch,
+                        rep,
+                        best_rep_id,
+                        best_tries,
+                        hinted_blocks,
+                        hint_bytes
+                    );
+                }
+
+                sublocks.push(sl);
             }
-            best_lock = Some(lock);
-            best_rep_id = rep_id;
-            break;
         }
 
-        let lock = best_lock.ok_or_else(|| "oneproof: internal error (no lock)".to_string())?;
-
-        if std::env::var("LFP_ONEPROOF_PRINT_LOCK_STATS")
-            .ok()
-            .as_deref()
-            == Some("1")
-        {
-            let hinted_blocks = lock.hints.hint_blocks_sparse.len();
-            let hint_bytes: usize = lock
-                .hints
-                .hint_blocks_sparse
-                .iter()
-                .map(|(_bi, blk)| 4 + blk.on_disk_bytes())
-                .sum();
-            eprintln!(
-                "[oneproof:arm] lock_j={} rep_id={} tries={} rejected_zero={} rejected_budget={} hinted_blocks={} hint_bytes≈{} rep_start={}",
-                lock_j,
-                best_rep_id,
-                tries,
-                rejected_zero,
-                rejected_budget,
-                hinted_blocks,
-                hint_bytes,
-                rep_start
-            );
-        }
+        // The lock payload is the (unauthenticated) 32-byte Shamir share.
+        let c_stmt = c_stmt_opt
+            .ok_or_else(|| "oneproof: internal error (missing c_stmt)".to_string())?;
+        let pi_len = pi_len_opt
+            .ok_or_else(|| "oneproof: internal error (missing pi_len)".to_string())?;
+        let lock = crate::lockable_ringlwe::arm_ringlwe_lock::<F257>(
+            c_stmt,
+            x.len(),
+            pi_len,
+            ringlwe_params.clone(),
+            p_channels as u16,
+            r_reps as u16,
+            sublocks,
+            shares[j].value.as_slice(),
+            s_channels.as_slice(),
+            &mut secret_master_rng,
+        )?;
+        crate::lockable_ringlwe::check_ratio_class_distinctness_per_channel(&lock)?;
 
         locks.push(lock);
     }
@@ -466,7 +575,6 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
         combine_scheme: 1,
         combine_threshold: threshold as u32,
         combine_shares: k_locks as u32,
-        combined_key_tag,
     };
     write_lock_package(lock_pkg_out_path, &manifest, &share_indices, &locks)
         .map_err(|e| format!("oneproof: write lock package failed: {e}"))?;
@@ -802,6 +910,10 @@ fn decap_sp1_oneproof_we_gate_from_files_inner(
     if share_indices.len() != locks.len() {
         return Err("oneproof: lock package share_indices/locks length mismatch".to_string());
     }
+    for (li, l) in locks.iter().enumerate() {
+        crate::lockable_ringlwe::check_ratio_class_distinctness_per_channel(l)
+            .map_err(|e| format!("oneproof: lock[{li}] ratio-class policy failed: {e}"))?;
+    }
     if m.combine_scheme != 1 {
         return Err(format!(
             "oneproof: unsupported combine_scheme {}",
@@ -827,46 +939,27 @@ fn decap_sp1_oneproof_we_gate_from_files_inner(
         shape.inst.clone(),
         shape.public_len,
     )?;
-    // Production sizing note:
-    // `proof_len` here is the number of streamed π elements over F257. If transmitted as raw bytes,
-    // the π stream is ~1 byte/element.
-    let pi_len = prover.proof_len();
-    let pi_stream_bytes = pi_len as u128;
-    let pi_stream_gib = (pi_stream_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
-    let pi_blocks = (pi_len + (64 - 1)) / 64;
-
-    let mut hinted_blocks_total = 0usize;
-    let mut hint_bytes_est = 0usize;
-    let mut ct_bytes_total = 0usize;
-    for l in &locks {
-        hinted_blocks_total += l.hints.hint_blocks_sparse.len();
-        for (_block_idx, blk) in &l.hints.hint_blocks_sparse {
-            // include block_idx(u32) + encoded block bytes
-            hint_bytes_est = hint_bytes_est.saturating_add(4 + blk.on_disk_bytes());
-        }
-        ct_bytes_total += l.ct.nonce.len() + l.ct.ct.len();
-    }
-    eprintln!(
-        "[oneproof:size] pi_len={} (~{:.2} GiB if 1 byte/elem) pi_blocks={} locks={} hinted_blocks_total={} hint_bytes_est≈{} ct_bytes_total={}",
-        pi_len,
-        pi_stream_gib,
-        pi_blocks,
-        locks.len(),
-        hinted_blocks_total,
-        hint_bytes_est,
-        ct_bytes_total
-    );
 
     let t_prove = Instant::now();
     maybe_print_rss("oneproof:before_prove_decap_stream");
-    let mut states: Vec<_> = Vec::with_capacity(locks.len());
-    for (i, l) in locks.iter().enumerate() {
-        let st = l
-            .decap_state(&x)
-            .map_err(|e| format!("oneproof: decap_state[{i}] failed: {e}"))?;
-        states.push(st);
+    let total_sublks: usize = locks.iter().map(|l| l.sublocks.len()).sum();
+    let mut states: Vec<_> = Vec::with_capacity(total_sublks);
+    let mut state_meta: Vec<(usize, usize, u16)> = Vec::with_capacity(total_sublks); // (lock_i, sublock_i, channel_id)
+    let mut coins_list: Vec<_> = Vec::with_capacity(total_sublks);
+    for (li, l) in locks.iter().enumerate() {
+        let sts = l
+            .decap_states(&x)
+            .map_err(|e| format!("oneproof: decap_states[{li}] failed: {e}"))?;
+        for (si, st) in sts.into_iter().enumerate() {
+            let sl = l
+                .sublocks
+                .get(si)
+                .ok_or_else(|| "oneproof: internal sublock index mismatch".to_string())?;
+            coins_list.push(sl.coins.clone());
+            state_meta.push((li, si, sl.channel_id));
+            states.push(st);
+        }
     }
-    let coins_list = locks.iter().map(|l| l.coins.clone()).collect::<Vec<_>>();
     let mut err: Option<String> = None;
     let tails = prover.stream_pi0_and_collect_tails(&x, z_w, &coins_list, &mut |chunk| {
             if err.is_some() {
@@ -895,64 +988,83 @@ fn decap_sp1_oneproof_we_gate_from_files_inner(
     maybe_print_rss("oneproof:after_prove_decap_stream");
     eprintln!("[oneproof] prove+decap(stream) in {:?}", t_prove.elapsed());
 
-    // Decrypt all locks: each produces 2 candidate 32-byte share payloads (unauthenticated).
-    let mut candidates_per_lock: Vec<(u32, [[u8; 32]; 2])> = Vec::with_capacity(locks.len());
-    for (i, st) in states.into_iter().enumerate() {
-        let [pt0, pt1] = st
-            .finish_decrypt_candidates()
-            .map_err(|e| format!("oneproof: finish_decrypt_candidates[{i}]: {e}"))?;
-        if pt0.len() != 32 || pt1.len() != 32 {
-            return Err(format!(
-                "oneproof: share candidate wrong length at lock[{i}] ({} / {})",
-                pt0.len(),
-                pt1.len()
-            ));
+    // Recover per-sublock scalar candidates, then per-lock decrypt candidates.
+    let mut candidates_per_lock: Vec<(u32, Vec<[u8; 32]>)> = Vec::with_capacity(locks.len());
+    let mut per_lock_sublock_cands: Vec<Vec<Option<(u16, [u16; 2])>>> = locks
+        .iter()
+        .map(|l| vec![None; l.sublocks.len()])
+        .collect();
+    for (si, st) in states.into_iter().enumerate() {
+        let (li, local_si, ch) = state_meta
+            .get(si)
+            .copied()
+            .ok_or_else(|| "oneproof: internal state_meta mismatch".to_string())?;
+        let (ch2, cands) = st
+            .finish_s_candidates()
+            .map_err(|e| format!("oneproof: finish_s_candidates[{si}]: {e}"))?;
+        if ch2 != ch {
+            return Err("oneproof: internal channel_id mismatch".to_string());
         }
-        let mut c0 = [0u8; 32];
-        let mut c1 = [0u8; 32];
-        c0.copy_from_slice(&pt0);
-        c1.copy_from_slice(&pt1);
-        candidates_per_lock.push((share_indices[i], [c0, c1]));
+        let slots = per_lock_sublock_cands
+            .get_mut(li)
+            .ok_or_else(|| "oneproof: internal lock index mismatch".to_string())?;
+        if local_si >= slots.len() {
+            return Err("oneproof: internal sublock index mismatch".to_string());
+        }
+        slots[local_si] = Some((ch2, cands));
     }
 
-    // Combine-v1: try 2^T branch assignments on the first T locks and pick the unique candidate
-    // whose combined-key tag matches the package header.
-    let subset = &candidates_per_lock[..t];
-    let n_cands = subset.len();
+    // For each lock, intersect candidate sets per channel across repetitions, then decrypt.
+    for (li, l) in locks.iter().enumerate() {
+        let slots = per_lock_sublock_cands
+            .get(li)
+            .ok_or_else(|| "oneproof: internal lock index mismatch".to_string())?;
+        let mut sublock_cands: Vec<(u16, [u16; 2])> = Vec::with_capacity(slots.len());
+        for (i, v) in slots.iter().enumerate() {
+            let vv = v.ok_or_else(|| {
+                format!("oneproof: missing sublock candidate (lock[{li}] sublock[{i}])")
+            })?;
+            sublock_cands.push(vv);
+        }
+        let pt = crate::lockable_ringlwe::decrypt_payload_from_sublock_s_candidates(
+            l,
+            sublock_cands.as_slice(),
+        )
+        .map_err(|e| format!("oneproof: lock[{li}] decrypt candidates: {e}"))?;
+        let mut share_cands: Vec<[u8; 32]> = Vec::with_capacity(1);
+        if pt.len() != 32 {
+            return Err(format!(
+                "oneproof: share candidate wrong length at lock[{li}] ({})",
+                pt.len()
+            ));
+        }
+        let mut c = [0u8; 32];
+        c.copy_from_slice(&pt);
+        share_cands.push(c);
+        share_cands.sort_unstable();
+        share_cands.dedup();
+        candidates_per_lock.push((share_indices[li], share_cands));
+    }
+
     let combine_cfg = ShamirConfig {
         threshold: t,
         shares: locks.len(),
     };
-    let mut picked: Option<[u8; 32]> = None;
-    for mask in 0u64..(1u64 << n_cands) {
-        let selected: Vec<ShamirShare> = subset
-            .iter()
-            .enumerate()
-            .map(|(i, (idx, cands))| {
-                let branch = ((mask >> i) & 1) as usize;
-                ShamirShare {
-                    index: *idx,
-                    value: cands[branch],
-                }
-            })
-            .collect();
-        if let Ok(candidate) = reconstruct_secret_32(&combine_cfg, &selected) {
-            let tag: [u8; 32] = {
-        let mut h = Sha256::new();
-                h.update(b"LFP_ONEPROOF_COMBINED_TAG_V1");
-                h.update(&candidate);
-        h.update(&stmt_digest);
-                h.finalize().into()
-            };
-            if tag == m.combined_key_tag {
-            if picked.is_some() {
-                    return Err("oneproof: multiple combined-key candidates matched tag (unexpected)".to_string());
-                }
-                picked = Some(candidate);
-            }
-        }
+    // Without a per-armer tag, decap must be non-branching at the share level.
+    // Enforce: the first T locks each have exactly one candidate share payload.
+    let subset = &candidates_per_lock[..t];
+    if !subset.iter().all(|(_idx, c)| c.len() == 1) {
+        return Err("oneproof: ambiguous share candidates".to_string());
     }
-    let decapped_key = picked.ok_or_else(|| "oneproof: failed to reconstruct combined key".to_string())?;
+    let selected: Vec<ShamirShare> = subset
+        .iter()
+        .map(|(idx, cands)| ShamirShare {
+            index: *idx,
+            value: cands[0],
+        })
+        .collect();
+    let decapped_key = reconstruct_secret_32(&combine_cfg, &selected)
+        .map_err(|e| format!("oneproof: reconstruct_secret_32 failed: {e:?}"))?;
 
     // Shape cache is intentionally kept on disk for reuse across invocations.
     // To force a rebuild, delete the cache directory manually or set LFP_SHAPE_CACHE_DIR.
@@ -1026,7 +1138,6 @@ fn write_lock_package_to_writer(
     w.write_all(&manifest.combine_scheme.to_le_bytes())?;
     w.write_all(&manifest.combine_threshold.to_le_bytes())?;
     w.write_all(&manifest.combine_shares.to_le_bytes())?;
-    w.write_all(&manifest.combined_key_tag)?;
     write_u32(w, locks.len() as u32)?;
     if share_indices.len() != locks.len() {
         return Err(std::io::Error::new(
@@ -1041,55 +1152,61 @@ fn write_lock_package_to_writer(
         for f in &lock.c_stmt {
             w.write_all(&f257_to_u16(f).to_le_bytes())?;
         }
-        // accepting_set + offset
-        w.write_all(&f257_to_u16(&lock.accepting_set[0]).to_le_bytes())?;
-        w.write_all(&f257_to_u16(&lock.accepting_set[1]).to_le_bytes())?;
-        w.write_all(&f257_to_u16(&lock.offset).to_le_bytes())?;
         // sizes
         write_u64(w, lock.x_len as u64)?;
         write_u64(w, lock.pi_len as u64)?;
         write_u64(w, lock.len as u64)?;
-        // coins
-        write_u64(w, lock.coins.idx as u64)?;
-        w.write_all(&f257_to_u16(&lock.coins.lambda).to_le_bytes())?;
-        w.write_all(&f257_to_u16(&lock.coins.rho).to_le_bytes())?;
-        w.write_all(&f257_to_u16(&lock.coins.sigma).to_le_bytes())?;
         // params
         write_u32(w, lock.params._reserved0)?;
         w.write_all(&lock.params.domain_label)?;
-        // hints
-        write_u32(w, lock.hints.hint_blocks_sparse.len() as u32)?;
-        for (block_idx, blk) in &lock.hints.hint_blocks_sparse {
-            write_u32(w, *block_idx as u32)?;
-            if lock.params._reserved0 != 2 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "non-canonical hint encoding (expected params._reserved0=2)",
-                ));
-            }
-            // Canonical per-block encoding: fmt(u8) + payload.
-            //
-            // fmt=0: sparse (nnz(u8) + nnz*(pos_flags, coeff))
-            // fmt=1: dense (vals[64] + is256_mask(u64 little-endian))
-            match blk {
-                PackedF257Block64::Sparse { entries } => {
-                    w.write_all(&[0u8])?;
-                    let nnz = entries.len();
-                    if nnz > 255 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "hint block too many nnz entries",
-                        ));
-                    }
-                    w.write_all(&[nnz as u8])?;
-                    for &(pos_flags, coeff) in entries {
-                        w.write_all(&[pos_flags, coeff])?;
-                    }
+        // (P,R) and sublocks
+        w.write_all(&lock.p_channels.to_le_bytes())?;
+        w.write_all(&lock.r_reps.to_le_bytes())?;
+        write_u32(w, lock.sublocks.len() as u32)?;
+        for sl in &lock.sublocks {
+            w.write_all(&sl.channel_id.to_le_bytes())?;
+            // accepting_set
+            w.write_all(&f257_to_u16(&sl.accepting_set[0]).to_le_bytes())?;
+            w.write_all(&f257_to_u16(&sl.accepting_set[1]).to_le_bytes())?;
+            // coins
+            write_u64(w, sl.coins.idx as u64)?;
+            w.write_all(&f257_to_u16(&sl.coins.lambda).to_le_bytes())?;
+            w.write_all(&f257_to_u16(&sl.coins.rho).to_le_bytes())?;
+            w.write_all(&f257_to_u16(&sl.coins.sigma).to_le_bytes())?;
+            // hints
+            write_u32(w, sl.hints.hint_blocks_sparse.len() as u32)?;
+            for (block_idx, blk) in &sl.hints.hint_blocks_sparse {
+                write_u32(w, *block_idx as u32)?;
+                if lock.params._reserved0 != 2 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "non-canonical hint encoding (expected params._reserved0=2)",
+                    ));
                 }
-                PackedF257Block64::Dense { vals, is256_mask } => {
-                    w.write_all(&[1u8])?;
-                    w.write_all(vals)?;
-                    w.write_all(&is256_mask.to_le_bytes())?;
+                // Canonical per-block encoding: fmt(u8) + payload.
+                //
+                // fmt=0: sparse (nnz(u8) + nnz*(pos_flags, coeff))
+                // fmt=1: dense (vals[64] + is256_mask(u64 little-endian))
+                match blk {
+                    PackedF257Block64::Sparse { entries } => {
+                        w.write_all(&[0u8])?;
+                        let nnz = entries.len();
+                        if nnz > 255 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "hint block too many nnz entries",
+                            ));
+                        }
+                        w.write_all(&[nnz as u8])?;
+                        for &(pos_flags, coeff) in entries {
+                            w.write_all(&[pos_flags, coeff])?;
+                        }
+                    }
+                    PackedF257Block64::Dense { vals, is256_mask } => {
+                        w.write_all(&[1u8])?;
+                        w.write_all(vals)?;
+                        w.write_all(&is256_mask.to_le_bytes())?;
+                    }
                 }
             }
         }
@@ -1125,15 +1242,12 @@ fn read_lock_package_from_reader(
     let combine_threshold = u32::from_le_bytes(b4);
     r.read_exact(&mut b4)?;
     let combine_shares = u32::from_le_bytes(b4);
-    let mut combined_key_tag = [0u8; 32];
-    r.read_exact(&mut combined_key_tag)?;
     let manifest = Sp1OneProofWeGateLockPkgManifest {
         stmt_digest,
         lock_coin_seed,
         combine_scheme,
         combine_threshold,
         combine_shares,
-        combined_key_tag,
     };
 
     let n = read_u32(r)? as usize;
@@ -1151,14 +1265,7 @@ fn read_lock_package_from_reader(
             r.read_exact(&mut b)?;
             c_stmt.push(u16_to_f257(u16::from_le_bytes(b)));
         }
-        // accepting_set + offset
         let mut b2 = [0u8; 2];
-        r.read_exact(&mut b2)?;
-        let a0 = u16::from_le_bytes(b2);
-        r.read_exact(&mut b2)?;
-        let a1 = u16::from_le_bytes(b2);
-        r.read_exact(&mut b2)?;
-        let off = u16::from_le_bytes(b2);
         // sizes
         let x_len: usize = read_u64(r)?
             .try_into()
@@ -1169,14 +1276,6 @@ fn read_lock_package_from_reader(
         let len: usize = read_u64(r)?
             .try_into()
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "len overflow"))?;
-        // coins
-        let idx = read_u64(r)? as usize;
-        r.read_exact(&mut b2)?;
-        let lambda = u16::from_le_bytes(b2);
-        r.read_exact(&mut b2)?;
-        let rho = u16::from_le_bytes(b2);
-        r.read_exact(&mut b2)?;
-        let sigma = u16::from_le_bytes(b2);
         // params
         let reserved0 = read_u32(r)?;
         if reserved0 != 2 {
@@ -1191,45 +1290,85 @@ fn read_lock_package_from_reader(
             _reserved0: reserved0,
             domain_label,
         };
-        // hints
-        let nh = read_u32(r)? as usize;
-        let mut hint_blocks_sparse = Vec::with_capacity(nh);
-            for _ in 0..nh {
-            let block_idx = read_u32(r)? as usize;
-            // Canonical per-block encoding.
-            let mut fmt = [0u8; 1];
-            r.read_exact(&mut fmt)?;
-            let blk = match fmt[0] {
-                0 => {
-                    let mut b1 = [0u8; 1];
-                    r.read_exact(&mut b1)?;
-                    let nnz = b1[0] as usize;
-                    let mut entries: Vec<(u8, u8)> = Vec::with_capacity(nnz);
-                    for _ in 0..nnz {
-                        let mut pair = [0u8; 2];
-                        r.read_exact(&mut pair)?;
-                        entries.push((pair[0], pair[1]));
-                    }
-                    PackedF257Block64::Sparse { entries }
-                }
-                1 => {
-                    let mut vals = [0u8; 64];
-                    r.read_exact(&mut vals)?;
-                    let mut b8 = [0u8; 8];
-                    r.read_exact(&mut b8)?;
-                    let is256_mask = u64::from_le_bytes(b8);
-                    PackedF257Block64::Dense { vals, is256_mask }
-                }
-                _ => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "unknown hint block encoding fmt",
-                    ))
-                }
-            };
-            hint_blocks_sparse.push((block_idx, blk));
+        // (P,R) and sublocks
+        r.read_exact(&mut b2)?;
+        let p_channels = u16::from_le_bytes(b2);
+        r.read_exact(&mut b2)?;
+        let r_reps = u16::from_le_bytes(b2);
+        let ns = read_u32(r)? as usize;
+        if ns != (p_channels as usize) * (r_reps as usize) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "sublocks length mismatch",
+            ));
         }
-        let hints = crate::lockable_ringlwe::BranchHints { hint_blocks_sparse };
+        let mut sublocks: Vec<RingLweSubLock<F257>> = Vec::with_capacity(ns);
+        for _ in 0..ns {
+            r.read_exact(&mut b2)?;
+            let channel_id = u16::from_le_bytes(b2);
+            // accepting_set
+            r.read_exact(&mut b2)?;
+            let a0 = u16::from_le_bytes(b2);
+            r.read_exact(&mut b2)?;
+            let a1 = u16::from_le_bytes(b2);
+            // coins
+            let idx = read_u64(r)? as usize;
+            r.read_exact(&mut b2)?;
+            let lambda = u16::from_le_bytes(b2);
+            r.read_exact(&mut b2)?;
+            let rho = u16::from_le_bytes(b2);
+            r.read_exact(&mut b2)?;
+            let sigma = u16::from_le_bytes(b2);
+            // hints
+            let nh = read_u32(r)? as usize;
+            let mut hint_blocks_sparse = Vec::with_capacity(nh);
+            for _ in 0..nh {
+                let block_idx = read_u32(r)? as usize;
+                // Canonical per-block encoding.
+                let mut fmt = [0u8; 1];
+                r.read_exact(&mut fmt)?;
+                let blk = match fmt[0] {
+                    0 => {
+                        let mut b1 = [0u8; 1];
+                        r.read_exact(&mut b1)?;
+                        let nnz = b1[0] as usize;
+                        let mut entries: Vec<(u8, u8)> = Vec::with_capacity(nnz);
+                        for _ in 0..nnz {
+                            let mut pair = [0u8; 2];
+                            r.read_exact(&mut pair)?;
+                            entries.push((pair[0], pair[1]));
+                        }
+                        PackedF257Block64::Sparse { entries }
+                    }
+                    1 => {
+                        let mut vals = [0u8; 64];
+                        r.read_exact(&mut vals)?;
+                        let mut b8 = [0u8; 8];
+                        r.read_exact(&mut b8)?;
+                        let is256_mask = u64::from_le_bytes(b8);
+                        PackedF257Block64::Dense { vals, is256_mask }
+                    }
+                    _ => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "unknown hint block encoding fmt",
+                        ))
+                    }
+                };
+                hint_blocks_sparse.push((block_idx, blk));
+            }
+            sublocks.push(RingLweSubLock::<F257> {
+                channel_id,
+                accepting_set: [u16_to_f257(a0), u16_to_f257(a1)],
+                coins: dpp::theorem43::Theorem43Coins::<F257> {
+                    idx,
+                    lambda: u16_to_f257(lambda),
+                    rho: u16_to_f257(rho),
+                    sigma: u16_to_f257(sigma),
+                },
+                hints: crate::lockable_ringlwe::BranchHints { hint_blocks_sparse },
+            });
+        }
 
         // ciphertext (single)
             let mut nonce = [0u8; 12];
@@ -1240,19 +1379,13 @@ fn read_lock_package_from_reader(
         let ct = crate::lockable_ringlwe::LockCiphertext { nonce, ct };
         out.push(RingLweLockArtifact {
             c_stmt,
-            accepting_set: [u16_to_f257(a0), u16_to_f257(a1)],
-            offset: u16_to_f257(off),
             x_len,
             pi_len,
             len,
-            coins: dpp::theorem43::Theorem43Coins::<F257> {
-                idx,
-                lambda: u16_to_f257(lambda),
-                rho: u16_to_f257(rho),
-                sigma: u16_to_f257(sigma),
-            },
             params,
-            hints,
+            p_channels,
+            r_reps,
+            sublocks,
             ct,
         });
     }

@@ -8,6 +8,7 @@
 //! hardness layer. The hardness is intended to come from the upstream DPP→(R)LWE “decap” mechanism.
 
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug)]
@@ -161,6 +162,102 @@ pub fn reconstruct_secret_32(
         secret[b] = acc;
     }
     Ok(secret)
+}
+
+// ---------------------------------------------------------------------------
+// WE lockset helper: reconstruction disambiguation via a single global tag
+// ---------------------------------------------------------------------------
+
+/// Canonical tag binding the combined key to a statement digest (combine-v1).
+///
+/// This is intentionally a **single global check**, not a per-lock oracle.
+pub fn combined_key_tag_v1(combined_key32: &[u8; 32], stmt_digest: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"LFP_ONEPROOF_COMBINED_TAG_V1");
+    h.update(combined_key32);
+    h.update(stmt_digest);
+    h.finalize().into()
+}
+
+/// Recover the unique 32-byte combined key by enumerating share candidates and checking the global tag.
+///
+/// - `candidates_per_lock[i] = (share_index, candidates)` for lock `i`
+/// - Only the **first `cfg.threshold` locks** are used (policy: avoid 2^K enumeration).
+/// - `enum_cap` bounds the worst-case product of candidate set sizes.
+pub fn reconstruct_combined_key_by_tag_v1_from_candidates(
+    cfg: &ShamirConfig,
+    stmt_digest: &[u8; 32],
+    expected_tag: &[u8; 32],
+    candidates_per_lock: &[(u32, Vec<[u8; 32]>)],
+    enum_cap: u64,
+) -> Result<[u8; 32], String> {
+    let t = cfg.threshold;
+    if t < 2 {
+        return Err("combine: threshold < 2".to_string());
+    }
+    if candidates_per_lock.len() < t {
+        return Err("combine: insufficient locks for threshold".to_string());
+    }
+    let subset = &candidates_per_lock[..t];
+
+    // Fast path: all unambiguous → one reconstruction.
+    let all_single = subset.iter().all(|(_idx, c)| c.len() == 1);
+    if all_single {
+        let selected: Vec<ShamirShare> = subset
+            .iter()
+            .map(|(idx, cands)| ShamirShare {
+                index: *idx,
+                value: cands[0],
+            })
+            .collect();
+        let candidate = reconstruct_secret_32(cfg, &selected).map_err(|e| format!("{e}"))?;
+        let tag = combined_key_tag_v1(&candidate, stmt_digest);
+        if &tag == expected_tag {
+            return Ok(candidate);
+        }
+        // Fall through to enumeration (should be rare but preserves behavior).
+    }
+
+    // Enumerate combinations; cap to avoid blowups.
+    let mut total: u64 = 1;
+    for (_idx, cands) in subset {
+        total = total.saturating_mul(cands.len() as u64);
+    }
+    if total > enum_cap {
+        return Err(format!(
+            "combine: too many combinations in fallback enumeration (total={total} cap={enum_cap})"
+        ));
+    }
+
+    let mut picked: Option<[u8; 32]> = None;
+    for mut counter in 0u64..total {
+        let mut selected: Vec<ShamirShare> = Vec::with_capacity(t);
+        for (idx, cands) in subset {
+            let n = cands.len() as u64;
+            if n == 0 {
+                return Err("combine: empty candidate set for some lock".to_string());
+            }
+            let choice = (counter % n) as usize;
+            counter /= n;
+            selected.push(ShamirShare {
+                index: *idx,
+                value: cands[choice],
+            });
+        }
+        let candidate = match reconstruct_secret_32(cfg, &selected) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let tag = combined_key_tag_v1(&candidate, stmt_digest);
+        if &tag == expected_tag {
+            if picked.is_some() {
+                return Err("combine: multiple candidates matched tag (unexpected)".to_string());
+            }
+            picked = Some(candidate);
+        }
+    }
+
+    picked.ok_or_else(|| "combine: failed to reconstruct combined key".to_string())
 }
 
 // ------------------------- GF(256) arithmetic -------------------------
