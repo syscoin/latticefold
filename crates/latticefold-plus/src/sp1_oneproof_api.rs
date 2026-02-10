@@ -306,16 +306,28 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
     // - P channels gives ~8P bits/lock (classical) against attackers without π (global-check-only).
     // - R repetitions per channel allow the honest decapper (with π) to disambiguate without
     //   per-lock oracles, by intersecting 2-candidate sets across reps.
-    let p_channels: usize = std::env::var("LFP_ONEPROOF_P")
+    let p_channels_raw: usize = std::env::var("LFP_ONEPROOF_P")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2)
         .max(1);
-    let r_reps: usize = std::env::var("LFP_ONEPROOF_R")
+    let r_reps_raw: usize = std::env::var("LFP_ONEPROOF_R")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2)
         .max(1);
+    let p_channels: u16 = p_channels_raw.try_into().map_err(|_| {
+        format!(
+            "LFP_ONEPROOF_P out of range for u16 (value={})",
+            p_channels_raw
+        )
+    })?;
+    let r_reps: u16 = r_reps_raw.try_into().map_err(|_| {
+        format!(
+            "LFP_ONEPROOF_R out of range for u16 (value={})",
+            r_reps_raw
+        )
+    })?;
     // Sizing policy:
     // - Use a moderate hint budget with a small max retry count to reject only pathological
     //   outliers (low bias, fast arming).
@@ -364,8 +376,8 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
                 hint_budget_bytes: hint_budget_bytes_opt,
             },
             ringlwe_params.clone(),
-            p_channels as u16,
-            r_reps as u16,
+            p_channels,
+            r_reps,
             shares[j].value.as_slice(),
             &mut secret_master_rng,
         )?;
