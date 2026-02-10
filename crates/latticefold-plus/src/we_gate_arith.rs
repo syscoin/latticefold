@@ -180,8 +180,12 @@ where
     let out_dir = out_dir.as_ref();
     let mut b_params = Dr1csBuilder::<F257>::new_file_backed(out_dir.join("params_prefix"))
         .map_err(|e| format!("tiny gate: params prefix new_file_backed failed: {e}"))?;
-    // Make the constant-1 slot explicit for standalone soundness.
-    b_params.enforce_var_eq_const(b_params.one(), F257::ONE);
+    // IMPORTANT (disk footprint / reuse-base fast path):
+    // Keep this prefix module **constraint-free** so the outer file-backed merge can reuse the
+    // dominant tiny-gate part directory as the final `merged/` output (zero-copy on unix).
+    //
+    // The constant-1 slot is already enforced by the main tiny-gate relation; and the merge code
+    // requires `assignment[0] == 1` for every part.
     for &x in &params.to_field_vec::<F257>() {
         b_params.new_var(x);
     }
@@ -348,12 +352,11 @@ where
 
 /// Schedule generator with explicit public inputs.
 ///
-/// This is useful for tests that want to validate *statement binding* (public inputs absorbed into
-/// the transcript prefix). The returned trace is self-consistent: all squeeze outputs match the
-/// sponge state induced by the chosen absorbs.
+/// This is useful for any caller that wants *statement binding* (public inputs absorbed into the
+/// transcript prefix) without having to run the prover. The returned trace is self-consistent:
+/// all squeeze outputs match the sponge state induced by the chosen absorbs.
 #[cfg(feature = "we_gate")]
-#[allow(dead_code)]
-fn poseidon_trace_schedule_for_plus_with_public_inputs<R>(
+pub(crate) fn poseidon_trace_schedule_for_plus_with_public_inputs<R>(
     public_inputs: &[BF<R>],
     params: &WeParams,
     n_lin_proofs: usize,
@@ -527,7 +530,7 @@ where
 }
 
 #[cfg(feature = "we_gate")]
-fn dummy_plus_proof_shape<R>(
+pub(crate) fn dummy_plus_proof_shape<R>(
     params: &WeParams,
     mlen_mats: usize,
     n_lin_proofs: usize,
@@ -855,6 +858,51 @@ where
     }
 
     Ok((shape, assignment))
+}
+
+/// Build or load **only the WE gate shape** (no assignment).
+///
+/// This is the correct entrypoint for **WE arming**: the armer needs the statement-bound
+/// constraint system, but must not depend on any prover/witness material.
+#[cfg(feature = "we_gate")]
+pub fn build_or_load_we_plus_tiny_shape<R>(
+    trace: &PoseidonTranscriptTrace<BF<R>>,
+    params: &WeParams,
+    public_inputs_basefield: &[BF<R>],
+    n_lin_proofs: usize,
+    mlen_mats: usize,
+    pairs: &[(usize, usize)],
+    shape_dir: impl AsRef<std::path::Path>,
+) -> Result<WeDr1csShape<F257>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + Field + PrimeField,
+{
+    let ring_dim = R::dimension();
+    if ring_dim != 64 {
+        return Err("build_or_load_we_plus_tiny_shape: only ring_dim=64 supported".to_string());
+    }
+    let shape_dir = shape_dir.as_ref();
+
+    if shape_cache_exists(shape_dir) {
+        eprintln!("[we_gate] shape cache hit: {}", shape_dir.display());
+        return load_we_plus_tiny_shape(shape_dir);
+    }
+
+    eprintln!("[we_gate] shape cache miss — building: {}", shape_dir.display());
+    std::fs::create_dir_all(shape_dir).map_err(|e| format!("create shape_dir failed: {e}"))?;
+
+    let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
+        trace,
+        params,
+        public_inputs_basefield,
+        n_lin_proofs,
+        mlen_mats,
+        pairs,
+        shape_dir,
+    )?;
+    save_shape_meta(shape_dir, shape.public_len)?;
+    Ok(shape)
 }
 
 /// Compute only the assignment vector (no shape, no disk writes).
@@ -1312,12 +1360,18 @@ mod tests {
                 armer_seed,
                 lock_j,
                 0,
-                rep0,
+                crate::we_tiny_lock::WeRingLweLockArmingPolicy {
+                    base_rep_id: rep0,
+                    max_rep_tries: usize::MAX,
+                    hint_budget_bytes: None,
+                },
                 ringlwe_params.clone(),
+                2,
+                2,
                 &dummy_payload,
                 &mut rng,
             ) {
-                Ok(lock) => break lock,
+                Ok(lock_out) => break lock_out.lock,
                 Err(e) if e.contains("shifted accepting set contains 0") => {
                     rep0 += 1;
                     continue;
@@ -1335,12 +1389,18 @@ mod tests {
                 armer_seed,
                 lock_j,
                 0,
-                rep1,
+                crate::we_tiny_lock::WeRingLweLockArmingPolicy {
+                    base_rep_id: rep1,
+                    max_rep_tries: usize::MAX,
+                    hint_budget_bytes: None,
+                },
                 ringlwe_params.clone(),
+                2,
+                2,
                 &dummy_payload,
                 &mut rng,
             ) {
-                Ok(lock) => break lock,
+                Ok(lock_out) => break lock_out.lock,
                 Err(e) if e.contains("shifted accepting set contains 0") => {
                     rep1 += 1;
                     continue;
@@ -1361,29 +1421,38 @@ mod tests {
 
         let t_prove = Instant::now();
         maybe_print_rss("tiny_gate:before_prove_decap_stream");
-        let mut st0 = lock0.decap_state(&x).expect("decap_state0");
-        let mut st1 = lock1.decap_state(&x).expect("decap_state1");
-        let mut st_bad = lock0.decap_state(&x).expect("decap_state_bad");
+        let sts0 = lock0.decap_states(&x).expect("decap_states0");
+        let sts1 = lock1.decap_states(&x).expect("decap_states1");
+
+        // Flatten sublocks across both locks into one streaming pass.
+        let mut states: Vec<_> = Vec::with_capacity(sts0.len() + sts1.len());
+        let mut coins_list: Vec<_> = Vec::with_capacity(sts0.len() + sts1.len());
+        let mut meta: Vec<(usize, usize)> = Vec::with_capacity(sts0.len() + sts1.len()); // (lock_id, sublock_idx)
+        for (si, st) in sts0.into_iter().enumerate() {
+            coins_list.push(lock0.sublocks[si].coins.clone());
+            meta.push((0, si));
+            states.push(st);
+        }
+        for (si, st) in sts1.into_iter().enumerate() {
+            coins_list.push(lock1.sublocks[si].coins.clone());
+            meta.push((1, si));
+            states.push(st);
+        }
         let mut err: Option<String> = None;
         let tails = prover
             .stream_pi0_and_collect_tails(
                 &x,
                 &z_w,
-                &[lock0.coins.clone(), lock1.coins.clone()],
+                &coins_list,
                 &mut |chunk| {
                     if err.is_some() {
                         return;
                     }
-                    if let Err(e) = st0.absorb_chunk(chunk) {
-                        err = Some(e);
-                        return;
-                    }
-                    if let Err(e) = st1.absorb_chunk(chunk) {
-                        err = Some(e);
-                        return;
-                    }
-                    if let Err(e) = st_bad.absorb_chunk(chunk) {
-                        err = Some(e);
+                    for st in &mut states {
+                        if let Err(e) = st.absorb_chunk(chunk) {
+                            err = Some(e);
+                            break;
+                        }
                     }
                 },
             )
@@ -1391,35 +1460,49 @@ mod tests {
         if let Some(e) = err {
             panic!("stream decap absorb failed: {e}");
         }
-        assert_eq!(tails.len(), 2);
-        st0.absorb_chunk(&tails[0]).expect("absorb tail0");
-        st1.absorb_chunk(&tails[1]).expect("absorb tail1");
+        assert_eq!(tails.len(), states.len());
+        for (i, st) in states.iter_mut().enumerate() {
+            st.absorb_chunk(&tails[i]).expect("absorb tail");
+        }
 
-        // Verify both locks produce candidate decryptions (unauthenticated — both branches decrypt).
-        let _cands0 = st0.finish_decrypt_candidates().expect("decap_finish0");
-        let _cands1 = st1.finish_decrypt_candidates().expect("decap_finish1");
-        // Accepting set structure: both locks' accepting_set elements + offset should be in {1,2}.
+        // Collect per-sublock scalar candidates for each lock, then decrypt deterministically.
+        let mut cands0: Vec<Option<(u16, [u16; 2])>> = vec![None; lock0.sublocks.len()];
+        let mut cands1: Vec<Option<(u16, [u16; 2])>> = vec![None; lock1.sublocks.len()];
+        for (gi, st) in states.into_iter().enumerate() {
+            let (lock_id, si) = meta[gi];
+            let (ch, cands) = st.finish_s_candidates().expect("finish_s_candidates");
+            match lock_id {
+                0 => cands0[si] = Some((ch, cands)),
+                1 => cands1[si] = Some((ch, cands)),
+                _ => unreachable!(),
+            }
+        }
+        let sublock_cands0: Vec<(u16, [u16; 2])> = cands0.into_iter().map(|x| x.unwrap()).collect();
+        let sublock_cands1: Vec<(u16, [u16; 2])> = cands1.into_iter().map(|x| x.unwrap()).collect();
+        let pt0 = crate::lockable_ringlwe::decrypt_payload_from_sublock_s_candidates(&lock0, &sublock_cands0)
+            .expect("decrypt_payload lock0");
+        let pt1 = crate::lockable_ringlwe::decrypt_payload_from_sublock_s_candidates(&lock1, &sublock_cands1)
+            .expect("decrypt_payload lock1");
+        assert!(pt0.is_empty());
+        assert!(pt1.is_empty());
+
+        // Accepting set structure: for every sublock, shifted set satisfies a1 = a0 + 1.
         for lock in [&lock0, &lock1] {
-            let a0 = lock.accepting_set[0] + lock.offset;
-            let a1 = lock.accepting_set[1] + lock.offset;
-            assert!(a0 == F257::from(1u64) || a0 == F257::from(2u64));
-            assert!(a1 == F257::from(1u64) || a1 == F257::from(2u64));
+            for sl in &lock.sublocks {
+                let a0 = sl.accepting_set[0];
+                let a1 = sl.accepting_set[1];
+                assert!(a0 != F257::ZERO && a1 != F257::ZERO);
+                assert_eq!(a1, a0 + F257::ONE);
+            }
         }
 
         maybe_print_rss("tiny_gate:after_prove_decap_stream");
         eprintln!("[tiny_gate] prove+decap(stream) in {:?}", t_prove.elapsed());
 
-        // Negative check: tweak the (small) tail and verify streaming still completes
-        // (unauthenticated encryption doesn't error on wrong keys — it just produces garbage).
-        let mut tail_bad = tails[0].clone();
-        tail_bad[0] += F257::ONE;
-        st_bad.absorb_chunk(&tail_bad).expect("absorb tweaked tail");
-        let _bad_cands = st_bad.finish_decrypt_candidates().expect("finish with bad tail should not error");
-
         // Negative check: wrong x length must fail immediately.
         let mut x_bad = x.clone();
         x_bad.push(F257::ONE);
-        assert!(lock0.decap_state(&x_bad).is_err());
+        assert!(lock0.decap_states(&x_bad).is_err());
 
         // Now it is safe to reclaim disk space used by the shape files.
         crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir);
@@ -1516,11 +1599,14 @@ mod tests {
         // This is the *intended* usage in the design docs: decapsulation under noise is
         // probabilistic (AEAD may fail). We publish R independent share-locks and only need
         // T successful decryptions (treat failures as erasures).
+        // For the 1-hint RingLWE lock variant, we want to understand the *scaling* of
+        // arming/decap and artifact size as we increase the number of locks per armer.
+        //
+        // Keep T small for test runtime, but set R=16 so we exercise the "16 locks per armer"
+        // storage/perf profile end-to-end.
         let shamir = ShamirConfig {
             threshold: 3,
-            // Keep this > `DPP_PI0_COINS_PAR_THRESHOLD` default (8) so we exercise the
-            // parallel per-coin accumulation in `stream_pi0_and_collect_tails`.
-            shares: 9,
+            shares: 16,
         };
         let mut rng = StdRng::seed_from_u64(20260205);
         let mut secret = [0u8; 32];
@@ -1555,12 +1641,18 @@ mod tests {
                     [11u8.wrapping_add(i as u8); 32],
                     lock_j,
                     0,
-                    rep_id,
+                    crate::we_tiny_lock::WeRingLweLockArmingPolicy {
+                        base_rep_id: rep_id,
+                        max_rep_tries: usize::MAX,
+                        hint_budget_bytes: None,
+                    },
                     ringlwe_params.clone(),
+                    2,
+                    2,
                     &shares[i].value,
                     &mut rng,
                 ) {
-                    Ok(lock) => break lock,
+                    Ok(lock_out) => break lock_out.lock,
                     Err(e) if e.contains("shifted accepting set contains 0") => {
                         rep_id += 1;
                         continue;
@@ -1582,17 +1674,26 @@ mod tests {
         // Prove once (π0 streamed), decap R times (tails differ).
         let t_prove = Instant::now();
         maybe_print_rss("tiny_payload_shamir:before_prove_decap_stream");
-        let mut states: Vec<_> = locks
-            .iter()
-            .enumerate()
-            .map(|(i, l)| l.decap_state(&x).unwrap_or_else(|_| panic!("decap_state[{i}]")))
-            .collect();
+        // Flatten all sublocks across all locks into one streaming pass.
+        let mut states: Vec<_> = Vec::new();
+        let mut coins_list: Vec<_> = Vec::new();
+        let mut meta: Vec<(usize, usize)> = Vec::new(); // (lock_i, sublock_i)
+        for (li, l) in locks.iter().enumerate() {
+            let sts = l
+                .decap_states(&x)
+                .unwrap_or_else(|_| panic!("decap_states[{li}]"));
+            for (si, st) in sts.into_iter().enumerate() {
+                coins_list.push(l.sublocks[si].coins.clone());
+                meta.push((li, si));
+                states.push(st);
+            }
+        }
         let mut err: Option<String> = None;
         let tails = prover
             .stream_pi0_and_collect_tails(
                 &x,
                 &z_w,
-                &locks.iter().map(|l| l.coins.clone()).collect::<Vec<_>>(),
+                &coins_list,
                 &mut |chunk| {
                     if err.is_some() {
                         return;
@@ -1609,7 +1710,7 @@ mod tests {
         if let Some(e) = err {
             panic!("stream decap absorb failed: {e}");
         }
-        assert_eq!(tails.len(), shamir.shares);
+        assert_eq!(tails.len(), states.len());
 
         // Absorb tails (no corruption — with unauthenticated encryption, "erasures" manifest as
         // wrong decryptions that fail at batch reconstruction, not per-lock AEAD failures).
@@ -1617,50 +1718,48 @@ mod tests {
             st.absorb_chunk(&tails[i]).unwrap_or_else(|_| panic!("absorb tail[{i}]"));
         }
 
-        // Decrypt all R locks: each produces 2 candidate shares (unauthenticated).
-        // NO per-armer hash is published — verification is deferred to the combined key level.
-        let mut candidates_per_lock: Vec<(u32, [[u8; 32]; 2])> = Vec::with_capacity(shamir.shares);
-        for (i, st) in states.into_iter().enumerate() {
-            let [pt0, pt1] = st.finish_decrypt_candidates()
-                .unwrap_or_else(|e| panic!("finish_decrypt_candidates[{i}]: {e}"));
-            assert_eq!(pt0.len(), 32, "share candidate 0 wrong length");
-            assert_eq!(pt1.len(), 32, "share candidate 1 wrong length");
-            let mut c0 = [0u8; 32];
-            let mut c1 = [0u8; 32];
-            c0.copy_from_slice(&pt0);
-            c1.copy_from_slice(&pt1);
-            candidates_per_lock.push((shares[i].index, [c0, c1]));
+        // Collect per-sublock candidates per lock, then decrypt deterministically (no branching).
+        let mut per_lock_slots: Vec<Vec<Option<(u16, [u16; 2])>>> =
+            locks.iter().map(|l| vec![None; l.sublocks.len()]).collect();
+        for (gi, st) in states.into_iter().enumerate() {
+            let (li, si) = meta[gi];
+            let (ch, cands) = st
+                .finish_s_candidates()
+                .unwrap_or_else(|e| panic!("finish_s_candidates[{gi}]: {e}"));
+            per_lock_slots[li][si] = Some((ch, cands));
         }
-
-        // Try 2^T combinations — NO published hash to check against.
-        // In production, verification happens at the combined-key level (Bitcoin address).
-        // For this unit test, we verify using the known secret (test-only, not published).
-        let subset = &candidates_per_lock[..shamir.threshold];
-        let n_cands = subset.len();
-        let mut found = false;
-        for mask in 0u64..(1u64 << n_cands) {
-            let selected: Vec<ShamirShare> = subset.iter().enumerate()
-                .map(|(i, (idx, cands))| {
-                    let branch = ((mask >> i) & 1) as usize;
-                    ShamirShare { index: *idx, value: cands[branch] }
-                })
-                .collect();
-            if let Ok(candidate) = reconstruct_secret_32(&shamir, &selected) {
-                if candidate == secret {
-                    found = true;
-                    break;
-                }
-            }
+        let mut selected: Vec<ShamirShare> = Vec::with_capacity(shamir.threshold);
+        for li in 0..shamir.threshold {
+            let sublock_cands: Vec<(u16, [u16; 2])> =
+                per_lock_slots[li].iter().map(|x| x.unwrap()).collect();
+            let pt = crate::lockable_ringlwe::decrypt_payload_from_sublock_s_candidates(
+                &locks[li],
+                &sublock_cands,
+            )
+            .expect("decrypt_payload");
+            assert_eq!(pt.len(), 32, "share wrong length");
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&pt);
+            selected.push(ShamirShare {
+                index: shares[li].index,
+                value: b,
+            });
         }
-        assert!(found, "failed to reconstruct the correct secret from 2^T search");
+        let recovered = reconstruct_secret_32(&shamir, &selected).expect("reconstruct_secret_32");
+        assert_eq!(recovered, secret, "failed to reconstruct correct secret");
 
-        // Print amplification security summary.
-        let amp = crate::lockable_ringlwe::AmplificationParams {
-            r: shamir.shares,
-            t: shamir.threshold,
-            ..Default::default()
-        };
-        amp.print_summary(1);
+        // Print global-check-only security accounting.
+        let p = locks[0].p_channels;
+        let l_required = shamir.threshold;
+        let classical_bits =
+            crate::lockable_ringlwe::classical_bits_global_check_only(p, l_required);
+        let grover_bits = crate::lockable_ringlwe::grover_bits_global_check_only(p, l_required);
+        let meets_pq128 =
+            crate::lockable_ringlwe::meets_pq128_grover_global_check_only(p, l_required);
+        eprintln!(
+            "[amplification] model=global_check_only P={}, required_locks={}, cands=2^{:.0}, grover_bits={:.1}, pq128={}",
+            p, l_required, classical_bits, grover_bits, meets_pq128
+        );
 
         maybe_print_rss("tiny_payload_shamir:after_prove_decap_stream");
         eprintln!(
@@ -1681,7 +1780,7 @@ mod tests {
     #[test]
     #[ignore = "very slow in debug: runs full DPP prove+decap for 3 armers; run with `--release`"]
     fn test_pvugc_3armer_btc_address_we_lock_e2e() {
-        use crate::lockable_ringlwe::{RingLweParams, AmplificationParams};
+        use crate::lockable_ringlwe::RingLweParams;
         use crate::shamir_gf256::{reconstruct_secret_32, split_secret_32, ShamirConfig, ShamirShare};
         use crate::we_statement::encode_public_x;
         use crate::we_tiny_lock::arm_lfplus_ringlwe_lock;
@@ -1787,7 +1886,11 @@ mod tests {
         // Phase 1: ARMING (3 armers, each with a secp256k1 secret)
         // =====================================================================
         let mut rng = StdRng::seed_from_u64(20260206);
-        let shamir = ShamirConfig { threshold: 3, shares: 5 };
+        // Full K-of-K in the BTC e2e harness.
+        let shamir = ShamirConfig {
+            threshold: 16,
+            shares: 16,
+        };
         let ringlwe_params = RingLweParams::default();
         let stmt_digest = [5u8; 32];
 
@@ -1857,12 +1960,18 @@ mod tests {
                         },
                         0,
                         0,
-                        rep_id,
+                        crate::we_tiny_lock::WeRingLweLockArmingPolicy {
+                            base_rep_id: rep_id,
+                            max_rep_tries: usize::MAX,
+                            hint_budget_bytes: None,
+                        },
                         ringlwe_params.clone(),
+                        2,
+                        2,
                         &shares[i].value,
                         &mut rng,
                     ) {
-                        Ok(lock) => break lock,
+                        Ok(lock_out) => break lock_out.lock,
                         Err(e) if e.contains("shifted accepting set contains 0") => {
                             rep_id += 1;
                             continue;
@@ -1886,113 +1995,97 @@ mod tests {
         let t_decap = Instant::now();
         maybe_print_rss("btc_3armer:before_decap");
 
-        // Flatten all locks across all armers into one state list.
-        // Track which armer each state belongs to.
+        // Flatten all locks across all armers.
         let all_locks: Vec<&crate::lockable_ringlwe::RingLweLockArtifact<F257>> = armer_locksets
             .iter()
             .flat_map(|ls| ls.locks.iter())
             .collect();
-        let all_coins: Vec<_> = all_locks.iter().map(|l| l.coins.clone()).collect();
-        let mut all_states: Vec<_> = all_locks
-            .iter()
-            .enumerate()
-            .map(|(i, l)| l.decap_state(&x).unwrap_or_else(|_| panic!("decap_state[{i}]")))
-            .collect();
 
-        // Stream π₀ ONCE — all N×R locks absorb the same chunks simultaneously.
+        // Flatten all sublocks across all locks into one streaming pass.
+        let mut coins_list: Vec<_> = Vec::new();
+        let mut states: Vec<_> = Vec::new();
+        let mut meta: Vec<(usize, usize)> = Vec::new(); // (lock_idx, sublock_idx)
+        for (li, lock) in all_locks.iter().enumerate() {
+            let sts = lock
+                .decap_states(&x)
+                .unwrap_or_else(|e| panic!("decap_states[{li}] failed: {e}"));
+            for (si, st) in sts.into_iter().enumerate() {
+                coins_list.push(lock.sublocks[si].coins.clone());
+                meta.push((li, si));
+                states.push(st);
+            }
+        }
+
+        // Stream π₀ ONCE — all sublocks absorb the same chunks simultaneously.
         let mut err: Option<String> = None;
-        let tails = prover.stream_pi0_and_collect_tails(
-            &x, &z_w, &all_coins,
-            &mut |chunk| {
-                if err.is_some() { return; }
-                for st in &mut all_states {
+        let tails = prover
+            .stream_pi0_and_collect_tails(&x, &z_w, &coins_list, &mut |chunk| {
+                if err.is_some() {
+                    return;
+                }
+                for st in &mut states {
                     if let Err(e) = st.absorb_chunk(chunk) {
                         err = Some(e);
                         break;
                     }
                 }
-            },
-        ).expect("stream_pi0_and_collect_tails");
-        if let Some(e) = err { panic!("stream failed: {e}"); }
-
-        // Absorb per-lock tails.
-        for (i, st) in all_states.iter_mut().enumerate() {
-            st.absorb_chunk(&tails[i]).unwrap_or_else(|_| panic!("absorb tail[{i}]"));
+            })
+            .expect("stream_pi0_and_collect_tails");
+        if let Some(e) = err {
+            panic!("stream failed: {e}");
+        }
+        assert_eq!(tails.len(), states.len());
+        for (i, st) in states.iter_mut().enumerate() {
+            st.absorb_chunk(&tails[i])
+                .unwrap_or_else(|_| panic!("absorb tail[{i}]"));
         }
 
-        // Collect candidates, grouped by armer.
-        let mut armer_candidate_secrets: Vec<Vec<[u8; 32]>> = Vec::with_capacity(N_ARMERS);
-        let mut state_iter = all_states.into_iter();
-        for (j, lockset) in armer_locksets.iter().enumerate() {
-            let mut cands_per_lock: Vec<(u32, [[u8; 32]; 2])> = Vec::with_capacity(shamir.shares);
-            for i in 0..shamir.shares {
-                let st = state_iter.next().unwrap();
-                let [pt0, pt1] = st.finish_decrypt_candidates()
-                    .unwrap_or_else(|e| panic!("finish armer[{j}] lock[{i}]: {e}"));
-                let mut c0 = [0u8; 32];
-                let mut c1 = [0u8; 32];
-                c0.copy_from_slice(&pt0);
-                c1.copy_from_slice(&pt1);
-                cands_per_lock.push((lockset.share_indices[i], [c0, c1]));
-            }
-
-            // Try 2^T combinations for this armer's secret.
-            let subset = &cands_per_lock[..shamir.threshold];
-            let n_cands = subset.len();
-            let mut found_secrets: Vec<[u8; 32]> = Vec::new();
-            for mask in 0u64..(1u64 << n_cands) {
-                let selected: Vec<ShamirShare> = subset.iter().enumerate()
-                    .map(|(i, (idx, cands))| {
-                        let branch = ((mask >> i) & 1) as usize;
-                        ShamirShare { index: *idx, value: cands[branch] }
-                    })
-                    .collect();
-                if let Ok(secret) = reconstruct_secret_32(&shamir, &selected) {
-                    found_secrets.push(secret);
-                }
-            }
-            found_secrets.sort();
-            found_secrets.dedup();
-            eprintln!("[btc_3armer] armer {j}: {} candidate secrets from 2^{} search", found_secrets.len(), n_cands);
-            armer_candidate_secrets.push(found_secrets);
+        // Per lock: collect sublock candidates in canonical order, then decrypt deterministically.
+        let mut per_lock_sublock_cands: Vec<Vec<Option<(u16, [u16; 2])>>> = all_locks
+            .iter()
+            .map(|l| vec![None; l.sublocks.len()])
+            .collect();
+        for (gi, st) in states.into_iter().enumerate() {
+            let (li, si) = meta[gi];
+            let (ch, cands) = st.finish_s_candidates().unwrap();
+            per_lock_sublock_cands[li][si] = Some((ch, cands));
         }
 
-        // =====================================================================
-        // Phase 3: Meet-in-the-middle across N armers to find s_combined matching P_combined.
-        // =====================================================================
-        eprintln!("[btc_3armer] meet-in-the-middle: {} × {} × {} candidates",
-            armer_candidate_secrets[0].len(),
-            armer_candidate_secrets[1].len(),
-            armer_candidate_secrets[2].len(),
-        );
-
-        // For 3 armers with small candidate sets: just enumerate all combinations.
-        let mut found = false;
-        let mut s_combined_found = [0u8; 32];
-        'outer: for s0 in &armer_candidate_secrets[0] {
-            let sc0 = scalar_from_bytes_mod_order(s0);
-            for s1 in &armer_candidate_secrets[1] {
-                let sc1 = scalar_from_bytes_mod_order(s1);
-                for s2 in &armer_candidate_secrets[2] {
-                    let sc2 = scalar_from_bytes_mod_order(s2);
-                    let sc_combined = sc0 + sc1 + sc2;
-                    let pk_candidate = ProjectivePoint::GENERATOR * sc_combined;
-                    let pk_compressed = point_to_compressed(&pk_candidate);
-                    let hash_candidate = pubkey_to_p2wpkh_hash(&pk_compressed);
-                    if hash_candidate == address_hash {
-                        s_combined_found = sc_combined.to_bytes().into();
-                        found = true;
-                        break 'outer;
-                    }
-                }
-            }
+        let mut per_lock_share_bytes: Vec<[u8; 32]> = Vec::with_capacity(all_locks.len());
+        for (li, lock) in all_locks.iter().enumerate() {
+            let slots = &per_lock_sublock_cands[li];
+            let sublock_cands: Vec<(u16, [u16; 2])> =
+                slots.iter().map(|x| x.unwrap()).collect();
+            let pt =
+                crate::lockable_ringlwe::decrypt_payload_from_sublock_s_candidates(lock, &sublock_cands)
+                    .unwrap_or_else(|e| panic!("lock[{li}] decrypt_payload: {e}"));
+            assert_eq!(pt.len(), 32);
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&pt);
+            per_lock_share_bytes.push(b);
         }
 
-        assert!(found, "failed to find s_combined matching the Bitcoin address");
+        // Reconstruct each armer's secret deterministically (no branching).
+        let mut armer_decapped_secrets: Vec<[u8; 32]> = Vec::with_capacity(N_ARMERS);
+        for j in 0..N_ARMERS {
+            let mut selected: Vec<ShamirShare> = Vec::with_capacity(shamir.threshold);
+            for i in 0..shamir.threshold {
+                let global_li = j * shamir.shares + i;
+                selected.push(ShamirShare {
+                    index: armer_locksets[j].share_indices[i],
+                    value: per_lock_share_bytes[global_li],
+                });
+            }
+            let secret = reconstruct_secret_32(&shamir, &selected).expect("reconstruct_secret_32");
+            armer_decapped_secrets.push(secret);
+        }
 
-        // Verify: the found combined scalar produces the correct combined public key.
-        let sc_verify = scalar_from_bytes_mod_order(&s_combined_found);
-        let pk_verify = ProjectivePoint::GENERATOR * sc_verify;
+        // Combine armers and verify address binding.
+        let mut sc_sum = Scalar::ZERO;
+        for s in &armer_decapped_secrets {
+            sc_sum = sc_sum + scalar_from_bytes_mod_order(s);
+        }
+        let pk_verify = ProjectivePoint::GENERATOR * sc_sum;
         assert_eq!(
             point_to_compressed(&pk_verify),
             p_combined_compressed,
@@ -2002,132 +2095,224 @@ mod tests {
         maybe_print_rss("btc_3armer:after_decap");
         eprintln!("[btc_3armer] decap + reconstruct + verify in {:?}", t_decap.elapsed());
 
-        let amp = AmplificationParams {
-            r: shamir.shares,
-            t: shamir.threshold,
-            ..Default::default()
-        };
-        amp.print_summary(N_ARMERS);
+        let p = all_locks[0].p_channels;
+        let l_required_per_armer = shamir.threshold;
+        let l_required_system = shamir.threshold * N_ARMERS;
+        let classical_bits_per_armer =
+            crate::lockable_ringlwe::classical_bits_global_check_only(p, l_required_per_armer);
+        let grover_bits_per_armer =
+            crate::lockable_ringlwe::grover_bits_global_check_only(p, l_required_per_armer);
+        let classical_bits_system =
+            crate::lockable_ringlwe::classical_bits_global_check_only(p, l_required_system);
+        let grover_bits_system =
+            crate::lockable_ringlwe::grover_bits_global_check_only(p, l_required_system);
+        let meets_pq128_system =
+            crate::lockable_ringlwe::meets_pq128_grover_global_check_only(p, l_required_system);
+        eprintln!(
+            "[amplification] model=global_check_only P={}, required_locks_per_armer={}, required_locks_system={}, cands_per_armer=2^{:.0}, grover_bits_per_armer={:.1}, cands_system=2^{:.0}, grover_bits_system={:.1}, pq128_system={}",
+            p,
+            l_required_per_armer,
+            l_required_system,
+            classical_bits_per_armer,
+            grover_bits_per_armer,
+            classical_bits_system,
+            grover_bits_system,
+            meets_pq128_system
+        );
 
         // =====================================================================
         // Adversarial tests: verify the lock rejects corrupted inputs.
         // =====================================================================
 
         // --- ADV 1: Corrupted proof tail (one bit flip in first tail) ---
-        // Restream with a corrupted tail for armer 0. Should produce garbage candidates
-        // that don't match the Bitcoin address.
+        // Restream with a corrupted tail. Should fail to recover the Bitcoin address.
         {
-            let mut adv_states: Vec<_> = all_locks.iter()
-                .map(|l| l.decap_state(&x).unwrap())
-                .collect();
-            let mut adv_err: Option<String> = None;
-            let adv_tails = prover.stream_pi0_and_collect_tails(
-                &x, &z_w, &all_coins,
-                &mut |chunk| {
-                    if adv_err.is_some() { return; }
-                    for st in &mut adv_states {
-                        if let Err(e) = st.absorb_chunk(chunk) { adv_err = Some(e); break; }
-                    }
-                },
-            ).expect("adv stream");
-            // Corrupt armer 0's first tail.
-            let mut bad_tails = adv_tails;
-            bad_tails[0][0] += F257::from(42u64);
-            for (i, st) in adv_states.iter_mut().enumerate() {
-                st.absorb_chunk(&bad_tails[i]).unwrap();
-            }
-            // Collect candidates from corrupted stream.
-            let mut adv_state_iter = adv_states.into_iter();
-            let mut adv_cands_armer0: Vec<[u8; 32]> = Vec::new();
-            for i in 0..shamir.shares {
-                let st = adv_state_iter.next().unwrap();
-                let [pt0, pt1] = st.finish_decrypt_candidates().unwrap();
-                if i < shamir.threshold {
-                    let mut c = [0u8; 32];
-                    c.copy_from_slice(&pt0);
-                    adv_cands_armer0.push(c);
-                    c.copy_from_slice(&pt1);
-                    adv_cands_armer0.push(c);
+            // Flatten sublocks.
+            let mut adv_coins: Vec<_> = Vec::new();
+            let mut adv_states: Vec<_> = Vec::new();
+            let mut adv_meta: Vec<(usize, usize)> = Vec::new();
+            for (li, lock) in all_locks.iter().enumerate() {
+                let sts = lock.decap_states(&x).unwrap();
+                for (si, st) in sts.into_iter().enumerate() {
+                    adv_coins.push(lock.sublocks[si].coins.clone());
+                    adv_meta.push((li, si));
+                    adv_states.push(st);
                 }
             }
-            // Try all candidate scalars from the corrupted armer 0 against the real armers 1,2.
-            let mut adv_found = false;
-            for s0_bad in &adv_cands_armer0 {
-                let sc0 = scalar_from_bytes_mod_order(s0_bad);
-                for s1 in &armer_candidate_secrets[1] {
-                    let sc1 = scalar_from_bytes_mod_order(s1);
-                    for s2 in &armer_candidate_secrets[2] {
-                        let sc2 = scalar_from_bytes_mod_order(s2);
-                        let sc_comb = sc0 + sc1 + sc2;
-                        let pk = ProjectivePoint::GENERATOR * sc_comb;
-                        if pubkey_to_p2wpkh_hash(&point_to_compressed(&pk)) == address_hash {
-                            adv_found = true;
+
+            let mut adv_err: Option<String> = None;
+            let mut adv_tails = prover
+                .stream_pi0_and_collect_tails(&x, &z_w, &adv_coins, &mut |chunk| {
+                    if adv_err.is_some() {
+                        return;
+                    }
+                    for st in &mut adv_states {
+                        if let Err(e) = st.absorb_chunk(chunk) {
+                            adv_err = Some(e);
+                            break;
                         }
                     }
-                }
+                })
+                .expect("adv stream");
+            assert!(adv_err.is_none());
+            // Corrupt the first tail element.
+            adv_tails[0][0] += F257::from(42u64);
+            for (i, st) in adv_states.iter_mut().enumerate() {
+                st.absorb_chunk(&adv_tails[i]).unwrap();
             }
-            assert!(!adv_found, "ADV1: corrupted tail should NOT recover the Bitcoin address");
+
+            let mut per_lock_slots: Vec<Vec<Option<(u16, [u16; 2])>>> =
+                all_locks.iter().map(|l| vec![None; l.sublocks.len()]).collect();
+            for (gi, st) in adv_states.into_iter().enumerate() {
+                let (li, si) = adv_meta[gi];
+                let (ch, cands) = st.finish_s_candidates().unwrap();
+                per_lock_slots[li][si] = Some((ch, cands));
+            }
+
+            let mut ok = true;
+            let mut shares: Vec<[u8; 32]> = Vec::with_capacity(all_locks.len());
+            for (li, lock) in all_locks.iter().enumerate() {
+                let sublock_cands: Vec<(u16, [u16; 2])> =
+                    per_lock_slots[li].iter().map(|x| x.unwrap()).collect();
+                let pt = match crate::lockable_ringlwe::decrypt_payload_from_sublock_s_candidates(
+                    lock,
+                    &sublock_cands,
+                ) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                };
+                if pt.len() != 32 {
+                    ok = false;
+                    break;
+                }
+                let mut b = [0u8; 32];
+                b.copy_from_slice(&pt);
+                shares.push(b);
+            }
+
+            if ok {
+                let mut sc_sum = Scalar::ZERO;
+                for j in 0..N_ARMERS {
+                    let mut selected: Vec<ShamirShare> = Vec::with_capacity(shamir.threshold);
+                    for i in 0..shamir.threshold {
+                        let global_li = j * shamir.shares + i;
+                        selected.push(ShamirShare {
+                            index: armer_locksets[j].share_indices[i],
+                            value: shares[global_li],
+                        });
+                    }
+                    let s = reconstruct_secret_32(&shamir, &selected).unwrap();
+                    sc_sum = sc_sum + scalar_from_bytes_mod_order(&s);
+                }
+                let pk = ProjectivePoint::GENERATOR * sc_sum;
+                assert_ne!(
+                    pubkey_to_p2wpkh_hash(&point_to_compressed(&pk)),
+                    address_hash,
+                    "ADV1: corrupted tail should NOT recover the Bitcoin address"
+                );
+            }
             eprintln!("[btc_3armer] ADV1 (corrupted tail): correctly rejected");
         }
 
         // --- ADV 2: Tampered ciphertext (bit flip in armer 0's first lock) ---
         {
             let mut tampered_locksets = armer_locksets.clone();
-            if let Some(first_enc) = tampered_locksets[0].locks[0].cts[0].encoded.first_mut() {
-                // Add a large value to corrupt the first encoded byte.
-                type GlFq = <cyclotomic_rings::rings::GoldilocksRing64 as stark_rings::PolyRing>::BaseRing;
-                *first_enc += GlFq::from(1u64 << 60);
+            if let Some(first_byte) = tampered_locksets[0].locks[0].ct.ct.first_mut() {
+                *first_byte ^= 0x80;
             }
-            // Restream with tampered lockset.
             let tampered_all_locks: Vec<&crate::lockable_ringlwe::RingLweLockArtifact<F257>> =
                 tampered_locksets.iter().flat_map(|ls| ls.locks.iter()).collect();
-            let tampered_coins: Vec<_> = tampered_all_locks.iter().map(|l| l.coins.clone()).collect();
-            let mut tam_states: Vec<_> = tampered_all_locks.iter()
-                .map(|l| l.decap_state(&x).unwrap())
-                .collect();
+
+            // Flatten sublocks.
+            let mut tam_coins: Vec<_> = Vec::new();
+            let mut tam_states: Vec<_> = Vec::new();
+            let mut tam_meta: Vec<(usize, usize)> = Vec::new();
+            for (li, lock) in tampered_all_locks.iter().enumerate() {
+                let sts = lock.decap_states(&x).unwrap();
+                for (si, st) in sts.into_iter().enumerate() {
+                    tam_coins.push(lock.sublocks[si].coins.clone());
+                    tam_meta.push((li, si));
+                    tam_states.push(st);
+                }
+            }
+
             let mut tam_err: Option<String> = None;
-            let tam_tails = prover.stream_pi0_and_collect_tails(
-                &x, &z_w, &tampered_coins,
-                &mut |chunk| {
-                    if tam_err.is_some() { return; }
-                    for st in &mut tam_states {
-                        if let Err(e) = st.absorb_chunk(chunk) { tam_err = Some(e); break; }
+            let tam_tails = prover
+                .stream_pi0_and_collect_tails(&x, &z_w, &tam_coins, &mut |chunk| {
+                    if tam_err.is_some() {
+                        return;
                     }
-                },
-            ).expect("tam stream");
+                    for st in &mut tam_states {
+                        if let Err(e) = st.absorb_chunk(chunk) {
+                            tam_err = Some(e);
+                            break;
+                        }
+                    }
+                })
+                .expect("tam stream");
+            assert!(tam_err.is_none());
             for (i, st) in tam_states.iter_mut().enumerate() {
                 st.absorb_chunk(&tam_tails[i]).unwrap();
             }
-            let mut tam_iter = tam_states.into_iter();
-            let mut tam_cands: Vec<[u8; 32]> = Vec::new();
-            for i in 0..shamir.shares {
-                let st = tam_iter.next().unwrap();
-                let [pt0, pt1] = st.finish_decrypt_candidates().unwrap();
-                if i < shamir.threshold {
-                    let mut c = [0u8; 32];
-                    c.copy_from_slice(&pt0);
-                    tam_cands.push(c);
-                    c.copy_from_slice(&pt1);
-                    tam_cands.push(c);
-                }
+
+            let mut per_lock_slots: Vec<Vec<Option<(u16, [u16; 2])>>> = tampered_all_locks
+                .iter()
+                .map(|l| vec![None; l.sublocks.len()])
+                .collect();
+            for (gi, st) in tam_states.into_iter().enumerate() {
+                let (li, si) = tam_meta[gi];
+                let (ch, cands) = st.finish_s_candidates().unwrap();
+                per_lock_slots[li][si] = Some((ch, cands));
             }
-            // Check that none of the tampered candidates for armer 0 + correct armer 1,2 match.
-            let mut tam_found = false;
-            for s0_bad in &tam_cands {
-                let sc0 = scalar_from_bytes_mod_order(s0_bad);
-                for s1 in &armer_candidate_secrets[1] {
-                    let sc1 = scalar_from_bytes_mod_order(s1);
-                    for s2 in &armer_candidate_secrets[2] {
-                        let sc2 = scalar_from_bytes_mod_order(s2);
-                        let sc_comb = sc0 + sc1 + sc2;
-                        let pk = ProjectivePoint::GENERATOR * sc_comb;
-                        if pubkey_to_p2wpkh_hash(&point_to_compressed(&pk)) == address_hash {
-                            tam_found = true;
-                        }
+
+            let mut ok = true;
+            let mut shares: Vec<[u8; 32]> = Vec::with_capacity(tampered_all_locks.len());
+            for (li, lock) in tampered_all_locks.iter().enumerate() {
+                let sublock_cands: Vec<(u16, [u16; 2])> =
+                    per_lock_slots[li].iter().map(|x| x.unwrap()).collect();
+                let pt = match crate::lockable_ringlwe::decrypt_payload_from_sublock_s_candidates(
+                    lock,
+                    &sublock_cands,
+                ) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        ok = false;
+                        break;
                     }
+                };
+                if pt.len() != 32 {
+                    ok = false;
+                    break;
                 }
+                let mut b = [0u8; 32];
+                b.copy_from_slice(&pt);
+                shares.push(b);
             }
-            assert!(!tam_found, "ADV2: tampered ciphertext should NOT recover the Bitcoin address");
+
+            if ok {
+                let mut sc_sum = Scalar::ZERO;
+                for j in 0..N_ARMERS {
+                    let mut selected: Vec<ShamirShare> = Vec::with_capacity(shamir.threshold);
+                    for i in 0..shamir.threshold {
+                        let global_li = j * shamir.shares + i;
+                        selected.push(ShamirShare {
+                            index: tampered_locksets[j].share_indices[i],
+                            value: shares[global_li],
+                        });
+                    }
+                    let s = reconstruct_secret_32(&shamir, &selected).unwrap();
+                    sc_sum = sc_sum + scalar_from_bytes_mod_order(&s);
+                }
+                let pk = ProjectivePoint::GENERATOR * sc_sum;
+                assert_ne!(
+                    pubkey_to_p2wpkh_hash(&point_to_compressed(&pk)),
+                    address_hash,
+                    "ADV2: tampered ciphertext should NOT recover the Bitcoin address"
+                );
+            }
             eprintln!("[btc_3armer] ADV2 (tampered ciphertext): correctly rejected");
         }
 
@@ -2140,7 +2325,7 @@ mod tests {
             assert_ne!(wrong_hash, address_hash, "sanity: wrong address should differ");
             // The correctly recovered s_combined should NOT match the wrong address.
             let wrong_check = pubkey_to_p2wpkh_hash(&point_to_compressed(
-                &(ProjectivePoint::GENERATOR * sc_verify)
+                &pk_verify
             ));
             assert_ne!(wrong_check, wrong_hash, "ADV3: correct key should not match wrong address");
             eprintln!("[btc_3armer] ADV3 (wrong address): correctly rejected");
@@ -2305,12 +2490,18 @@ mod tests {
                 armer_seed,
                 lock_j,
                 0,
-                rep0,
+                crate::we_tiny_lock::WeRingLweLockArmingPolicy {
+                    base_rep_id: rep0,
+                    max_rep_tries: usize::MAX,
+                    hint_budget_bytes: None,
+                },
                 ringlwe_params.clone(),
+                2,
+                2,
                 &dummy_payload,
                 &mut rng,
             ) {
-                Ok(lock) => break lock,
+                Ok(lock_out) => break lock_out.lock,
                 Err(e) if e.contains("shifted accepting set contains 0") => {
                     rep0 += 1;
                     continue;
@@ -2328,12 +2519,18 @@ mod tests {
                 armer_seed,
                 lock_j,
                 0,
-                rep1,
+                crate::we_tiny_lock::WeRingLweLockArmingPolicy {
+                    base_rep_id: rep1,
+                    max_rep_tries: usize::MAX,
+                    hint_budget_bytes: None,
+                },
                 ringlwe_params.clone(),
+                2,
+                2,
                 &dummy_payload,
                 &mut rng,
             ) {
-                Ok(lock) => break lock,
+                Ok(lock_out) => break lock_out.lock,
                 Err(e) if e.contains("shifted accepting set contains 0") => {
                     rep1 += 1;
                     continue;
@@ -2354,14 +2551,27 @@ mod tests {
 
         let t_prove = Instant::now();
         maybe_print_rss("tiny_gate_large:before_prove_decap_stream");
-        let mut st0 = lock0.decap_state(&x).expect("decap_state0");
-        let mut st1 = lock1.decap_state(&x).expect("decap_state1");
+        let mut st0 = lock0
+            .decap_states(&x)
+            .expect("decap_states0")
+            .into_iter()
+            .next()
+            .expect("lock0 expected 1 sublock");
+        let mut st1 = lock1
+            .decap_states(&x)
+            .expect("decap_states1")
+            .into_iter()
+            .next()
+            .expect("lock1 expected 1 sublock");
         let mut err: Option<String> = None;
         let tails = prover
             .stream_pi0_and_collect_tails(
                 &x,
                 &z_w,
-                &[lock0.coins.clone(), lock1.coins.clone()],
+                &[
+                    lock0.sublocks[0].coins.clone(),
+                    lock1.sublocks[0].coins.clone(),
+                ],
                 &mut |chunk| {
                     if err.is_some() {
                         return;
@@ -2382,13 +2592,14 @@ mod tests {
         assert_eq!(tails.len(), 2);
         st0.absorb_chunk(&tails[0]).expect("absorb tail0");
         st1.absorb_chunk(&tails[1]).expect("absorb tail1");
-        let _cands0 = st0.finish_decrypt_candidates().expect("decap_finish0");
-        let _cands1 = st1.finish_decrypt_candidates().expect("decap_finish1");
+        let (_ch0, _s0) = st0.finish_s_candidates().expect("decap_finish0");
+        let (_ch1, _s1) = st1.finish_s_candidates().expect("decap_finish1");
         for lock in [&lock0, &lock1] {
-            let a0 = lock.accepting_set[0] + lock.offset;
-            let a1 = lock.accepting_set[1] + lock.offset;
-            assert!(a0 == F257::from(1u64) || a0 == F257::from(2u64));
-            assert!(a1 == F257::from(1u64) || a1 == F257::from(2u64));
+            assert_eq!(lock.sublocks.len(), 1);
+            let a0 = lock.sublocks[0].accepting_set[0];
+            let a1 = lock.sublocks[0].accepting_set[1];
+            assert!(a0 != F257::ZERO && a1 != F257::ZERO);
+            assert_eq!(a1, a0 + F257::ONE);
         }
         maybe_print_rss("tiny_gate_large:after_prove_decap_stream");
         eprintln!("[tiny_gate_large] prove+decap(stream) in {:?}", t_prove.elapsed());
