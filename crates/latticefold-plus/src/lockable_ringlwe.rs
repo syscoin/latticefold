@@ -98,16 +98,23 @@ pub(crate) fn check_ratio_class_distinctness_per_channel<F: PrimeField>(
         return Err("ringlwe: sublocks length mismatch".to_string());
     }
     let mut seen: Vec<Vec<u16>> = vec![Vec::with_capacity(r); p];
+    let mut per_channel_counts: Vec<usize> = vec![0; p];
     for sl in &lock.sublocks {
         let ch = sl.channel_id as usize;
         if ch >= p {
             return Err("ringlwe: sublock channel_id out of range".to_string());
         }
+        per_channel_counts[ch] += 1;
         let rc = ratio_class_mod257_u16(&sl.accepting_set[0], &sl.accepting_set[1])?;
         if seen[ch].contains(&rc) {
             return Err("ringlwe: duplicate accepting-set ratio class within a channel".to_string());
         }
         seen[ch].push(rc);
+    }
+    for count in per_channel_counts {
+        if count != r {
+            return Err("ringlwe: malformed per-channel repetition distribution".to_string());
+        }
     }
     Ok(())
 }
