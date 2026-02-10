@@ -1118,9 +1118,9 @@ fn write_lock_package_to_writer(
 fn read_lock_package_from_reader(
     r: &mut impl Read,
 ) -> std::io::Result<(Sp1OneProofWeGateLockPkgManifest, Vec<u32>, Vec<RingLweLockArtifact<F257>>)> {
+    // GF(256) Shamir backend supports only nonzero x-coordinates in 1..=255.
+    const SHAMIR_GFSHARE_MAX: usize = 255;
     const MAX_LOCKS_DEFAULT: usize = 4096;
-    const MAX_COMBINE_SHARES_DEFAULT: usize = 1024;
-    const MAX_COMBINE_THRESHOLD_DEFAULT: usize = 1024;
     const MAX_C_STMT_LEN_DEFAULT: usize = 1 << 20;
     const MAX_CT_BYTES_DEFAULT: usize = 1 << 20;
 
@@ -1152,15 +1152,16 @@ fn read_lock_package_from_reader(
         combine_threshold,
         combine_shares,
     };
+    if manifest.combine_scheme != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "unsupported combine_scheme {} (expected 1 for Shamir GF(256))",
+                manifest.combine_scheme
+            ),
+        ));
+    }
 
-    let max_combine_shares = std::env::var("LFP_ONEPROOF_LOCKPKG_MAX_COMBINE_SHARES")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(MAX_COMBINE_SHARES_DEFAULT);
-    let max_combine_threshold = std::env::var("LFP_ONEPROOF_LOCKPKG_MAX_COMBINE_THRESHOLD")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(MAX_COMBINE_THRESHOLD_DEFAULT);
     let max_locks = std::env::var("LFP_ONEPROOF_LOCKPKG_MAX_LOCKS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -1176,21 +1177,21 @@ fn read_lock_package_from_reader(
 
     let k = manifest.combine_shares as usize;
     let t = manifest.combine_threshold as usize;
-    if k == 0 || k > max_combine_shares {
+    if k == 0 || k > SHAMIR_GFSHARE_MAX {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "combine_shares exceeds limit (k={} max={})",
-                k, max_combine_shares
+                "combine_shares exceeds Shamir GF(256) backend limit (k={} max={})",
+                k, SHAMIR_GFSHARE_MAX
             ),
         ));
     }
-    if t == 0 || t > max_combine_threshold {
+    if t == 0 || t > SHAMIR_GFSHARE_MAX {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "combine_threshold exceeds limit (t={} max={})",
-                t, max_combine_threshold
+                "combine_threshold exceeds Shamir GF(256) backend limit (t={} max={})",
+                t, SHAMIR_GFSHARE_MAX
             ),
         ));
     }
@@ -1202,19 +1203,19 @@ fn read_lock_package_from_reader(
     }
 
     let n = read_u32(r)? as usize;
+    if n != k {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "combine_shares mismatch (manifest k={} lock_count n={})",
+                k, n
+            ),
+        ));
+    }
     if n > max_locks {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("lock count exceeds limit (n={} max={})", n, max_locks),
-        ));
-    }
-    if n > max_combine_shares {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "lock count exceeds combine_shares cap (n={} max={})",
-                n, max_combine_shares
-            ),
         ));
     }
     let mut share_indices: Vec<u32> = Vec::with_capacity(n);
