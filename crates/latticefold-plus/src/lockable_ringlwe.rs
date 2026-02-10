@@ -334,11 +334,12 @@ impl Default for AmplificationParams {
 }
 
 impl AmplificationParams {
+    // Assumed threat model: single global verifier, no per-lock oracle.
     pub fn security_bits_single_armer(&self) -> f64 {
         let t = self.t as f64;
         let bits_per_lock = (self.candidates_per_lock as f64).log2();
         let binom = ln_binom(self.r, self.t) / std::f64::consts::LN_2;
-        t * bits_per_lock - binom
+        t * bits_per_lock + binom
     }
 
     pub fn security_bits_system(&self, n_armers: usize) -> f64 {
@@ -469,6 +470,9 @@ fn sha256_32(chunks: &[&[u8]]) -> [u8; 32] {
 fn derive_payload_key_bytes_multi<F: PrimeField>(
     domain_label: &[u8; 32],
     c_stmt: &[F],
+    x_len: usize,
+    pi_len: usize,
+    len: usize,
     p_channels: u16,
     r_reps: u16,
     sublocks: &[RingLweSubLock<F>],
@@ -485,7 +489,12 @@ fn derive_payload_key_bytes_multi<F: PrimeField>(
     let mut bind = sha2::Sha256::new();
     bind.update(b"LFP_RINGLWE_LOCK_BIND_V1");
     bind.update(domain_label);
+    bind.update(&(c_stmt.len() as u64).to_le_bytes());
     bind.update(stmt_bytes.as_slice());
+    bind.update(&(sublocks.len() as u64).to_le_bytes());
+    bind.update(&(x_len as u64).to_le_bytes());
+    bind.update(&(pi_len as u64).to_le_bytes());
+    bind.update(&(len as u64).to_le_bytes());
     bind.update(&p_channels.to_le_bytes());
     bind.update(&r_reps.to_le_bytes());
     for sl in sublocks {
@@ -754,6 +763,9 @@ impl<F: PrimeField> RingLweLockArtifact<F> {
         Ok(derive_payload_key_bytes_multi(
             &self.params.domain_label,
             &self.c_stmt,
+            self.x_len,
+            self.pi_len,
+            self.len,
             self.p_channels,
             self.r_reps,
             self.sublocks.as_slice(),
@@ -930,6 +942,9 @@ pub fn arm_ringlwe_lock<F: PrimeField>(
     let key = derive_payload_key_bytes_multi(
         &params.domain_label,
         &c_stmt,
+        x_len,
+        pi_len,
+        x_len + pi_len,
         p_channels,
         r_reps,
         sublocks.as_slice(),

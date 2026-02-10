@@ -1360,14 +1360,18 @@ mod tests {
                 armer_seed,
                 lock_j,
                 0,
-                rep0,
+                crate::we_tiny_lock::WeRingLweLockArmingPolicy {
+                    base_rep_id: rep0,
+                    max_rep_tries: usize::MAX,
+                    hint_budget_bytes: None,
+                },
                 ringlwe_params.clone(),
                 2,
                 2,
                 &dummy_payload,
                 &mut rng,
             ) {
-                Ok(lock) => break lock,
+                Ok(lock_out) => break lock_out.lock,
                 Err(e) if e.contains("shifted accepting set contains 0") => {
                     rep0 += 1;
                     continue;
@@ -1385,14 +1389,18 @@ mod tests {
                 armer_seed,
                 lock_j,
                 0,
-                rep1,
+                crate::we_tiny_lock::WeRingLweLockArmingPolicy {
+                    base_rep_id: rep1,
+                    max_rep_tries: usize::MAX,
+                    hint_budget_bytes: None,
+                },
                 ringlwe_params.clone(),
                 2,
                 2,
                 &dummy_payload,
                 &mut rng,
             ) {
-                Ok(lock) => break lock,
+                Ok(lock_out) => break lock_out.lock,
                 Err(e) if e.contains("shifted accepting set contains 0") => {
                     rep1 += 1;
                     continue;
@@ -1633,14 +1641,18 @@ mod tests {
                     [11u8.wrapping_add(i as u8); 32],
                     lock_j,
                     0,
-                    rep_id,
+                    crate::we_tiny_lock::WeRingLweLockArmingPolicy {
+                        base_rep_id: rep_id,
+                        max_rep_tries: usize::MAX,
+                        hint_budget_bytes: None,
+                    },
                     ringlwe_params.clone(),
                     2,
                     2,
                     &shares[i].value,
                     &mut rng,
                 ) {
-                    Ok(lock) => break lock,
+                    Ok(lock_out) => break lock_out.lock,
                     Err(e) if e.contains("shifted accepting set contains 0") => {
                         rep_id += 1;
                         continue;
@@ -1940,14 +1952,18 @@ mod tests {
                         },
                         0,
                         0,
-                        rep_id,
+                        crate::we_tiny_lock::WeRingLweLockArmingPolicy {
+                            base_rep_id: rep_id,
+                            max_rep_tries: usize::MAX,
+                            hint_budget_bytes: None,
+                        },
                         ringlwe_params.clone(),
                         2,
                         2,
                         &shares[i].value,
                         &mut rng,
                     ) {
-                        Ok(lock) => break lock,
+                        Ok(lock_out) => break lock_out.lock,
                         Err(e) if e.contains("shifted accepting set contains 0") => {
                             rep_id += 1;
                             continue;
@@ -2448,14 +2464,18 @@ mod tests {
                 armer_seed,
                 lock_j,
                 0,
-                rep0,
+                crate::we_tiny_lock::WeRingLweLockArmingPolicy {
+                    base_rep_id: rep0,
+                    max_rep_tries: usize::MAX,
+                    hint_budget_bytes: None,
+                },
                 ringlwe_params.clone(),
                 2,
                 2,
                 &dummy_payload,
                 &mut rng,
             ) {
-                Ok(lock) => break lock,
+                Ok(lock_out) => break lock_out.lock,
                 Err(e) if e.contains("shifted accepting set contains 0") => {
                     rep0 += 1;
                     continue;
@@ -2473,14 +2493,18 @@ mod tests {
                 armer_seed,
                 lock_j,
                 0,
-                rep1,
+                crate::we_tiny_lock::WeRingLweLockArmingPolicy {
+                    base_rep_id: rep1,
+                    max_rep_tries: usize::MAX,
+                    hint_budget_bytes: None,
+                },
                 ringlwe_params.clone(),
                 2,
                 2,
                 &dummy_payload,
                 &mut rng,
             ) {
-                Ok(lock) => break lock,
+                Ok(lock_out) => break lock_out.lock,
                 Err(e) if e.contains("shifted accepting set contains 0") => {
                     rep1 += 1;
                     continue;

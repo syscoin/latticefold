@@ -18,9 +18,10 @@ use dpp::theorem43::{Theorem43Coins, Theorem43Dpp, Theorem43LockArtifact};
 use dpp::SparseVec;
 use symphony::file_backed_dr1cs::{cfg_read_buf_bytes, FileBackedSparseDr1csInstance};
 
+use crate::lockable_ringlwe::QueryBlockAccumulator;
 use crate::lockable_ringlwe::{
-    arm_ringlwe_lock, ratio_class_mod257_u16, sample_nonzero_f257_scalar, QueryBlockAccumulator,
-    RingLweLockArtifact, RingLweParams, RingLweSubLock,
+    arm_ringlwe_lock, ratio_class_mod257_u16, sample_nonzero_f257_scalar, RingLweLockArtifact,
+    RingLweParams, RingLweSubLock,
 };
 
 pub use crate::we_statement::arm_theorem43_from_statement;
@@ -853,7 +854,7 @@ pub(crate) fn arm_we_ringlwe_sublock_from_dr1cs<F: PrimeField + FftField>(
 }
 
 #[inline]
-fn derive_rep_id_try(
+pub(crate) fn derive_rep_id_try(
     armer_seed32: &[u8; 32],
     stmt_digest: &[u8; 32],
     lock_j: u64,
@@ -878,11 +879,22 @@ fn derive_rep_id_try(
     u64::from_le_bytes(out[0..8].try_into().unwrap())
 }
 
+pub(crate) struct WeRingLweLockArmingPolicy {
+    pub base_rep_id: u64,
+    pub max_rep_tries: usize,
+    pub hint_budget_bytes: Option<usize>,
+}
+
+pub(crate) struct WeRingLweLockArmOut<F: PrimeField> {
+    pub lock: RingLweLockArtifact<F>,
+    pub s_channels_mod257: Vec<u16>,
+}
+
 /// Arm (publish) a RingLWE lock artifact from a public DR1CS instance and statement `x`.
 ///
 /// Canonical arming uses `(P channels) × (R reps)` sublocks and enforces per-channel ratio-class
 /// distinctness (so honest decap is non-branching).
-pub(crate) fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
+fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
     dr1cs: FileBackedSparseDr1csInstance<F>,
     public_len: usize,
     stmt_digest: [u8; 32],
@@ -890,16 +902,17 @@ pub(crate) fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
     armer_seed: [u8; 32],
     lock_j: u64,
     block_id: usize,
-    base_rep_id: u64,
+    policy: WeRingLweLockArmingPolicy,
     params: RingLweParams,
     p_channels: u16,
     r_reps: u16,
     payload: &[u8],
     rng: &mut impl rand::RngCore,
-) -> Result<RingLweLockArtifact<F>, String> {
+) -> Result<WeRingLweLockArmOut<F>, String> {
     if p_channels == 0 || r_reps == 0 {
         return Err("arm_we_ringlwe_lock_from_dr1cs: invalid (P,R)".to_string());
     }
+    let max_rep_tries = policy.max_rep_tries.max(1);
 
     // Sample per-channel secrets.
     let mut s_channels: Vec<u16> = Vec::with_capacity(p_channels as usize);
@@ -913,22 +926,27 @@ pub(crate) fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
     let mut c_stmt: Option<Vec<F>> = None;
     let mut x_len: Option<usize> = None;
     let mut pi_len: Option<usize> = None;
+    let mut global_try_idx: u64 = 0;
 
     for ch in 0..p_channels {
         let mut used_ratio_classes: Vec<u16> = Vec::with_capacity(r_reps as usize);
         for rep in 0..r_reps {
-            let mut try_idx = 0u64;
-            loop {
+            let mut tries = 0usize;
+            let mut best_sl: Option<RingLweSubLock<F>> = None;
+            let mut best_hint_bytes: usize = usize::MAX;
+            while tries < max_rep_tries {
+                tries += 1;
                 let rep_id = derive_rep_id_try(
                     &armer_seed,
                     &stmt_digest,
                     lock_j,
                     block_id,
-                    base_rep_id,
+                    policy.base_rep_id,
                     ch,
                     rep,
-                    try_idx,
+                    global_try_idx,
                 );
+                global_try_idx = global_try_idx.wrapping_add(1);
                 let out = match arm_we_ringlwe_sublock_from_dr1cs::<F>(
                     dr1cs.clone(),
                     public_len,
@@ -941,7 +959,6 @@ pub(crate) fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                 ) {
                     Ok(v) => v,
                     Err(e) if e.contains("shifted accepting set contains 0") => {
-                        try_idx += 1;
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -952,10 +969,8 @@ pub(crate) fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                     &out.accepting_set_shifted[1],
                 )?;
                 if used_ratio_classes.contains(&ratio_class) {
-                    try_idx += 1;
                     continue;
                 }
-                used_ratio_classes.push(ratio_class);
 
                 if c_stmt.is_none() {
                     c_stmt = Some(out.c_stmt.clone());
@@ -969,20 +984,47 @@ pub(crate) fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                     .iter()
                     .map(|(block_idx, q)| (*block_idx, q.scale_mod257(s)))
                     .collect();
-                sublocks.push(RingLweSubLock::<F> {
+                let hint_bytes: usize = h_blocks
+                    .iter()
+                    .map(|(_bi, blk)| 4 + blk.on_disk_bytes())
+                    .sum();
+                let sl = RingLweSubLock::<F> {
                     channel_id: ch,
                     accepting_set: out.accepting_set_shifted,
                     coins: out.coins.clone(),
                     hints: crate::lockable_ringlwe::BranchHints {
                         hint_blocks_sparse: h_blocks,
                     },
-                });
+                };
+                if hint_bytes < best_hint_bytes {
+                    best_hint_bytes = hint_bytes;
+                    best_sl = Some(sl.clone());
+                }
+                if let Some(budget) = policy.hint_budget_bytes {
+                    if hint_bytes > budget {
+                        continue;
+                    }
+                }
+                best_sl = Some(sl);
                 break;
             }
+            let sl = best_sl.ok_or_else(|| {
+                "arm_we_ringlwe_lock_from_dr1cs: failed to arm sublock within retry budget"
+                    .to_string()
+            })?;
+            let ratio_class =
+                ratio_class_mod257_u16(&sl.accepting_set[0], &sl.accepting_set[1])?;
+            if used_ratio_classes.contains(&ratio_class) {
+                return Err(
+                    "arm_we_ringlwe_lock_from_dr1cs: duplicate ratio class after retries".to_string(),
+                );
+            }
+            used_ratio_classes.push(ratio_class);
+            sublocks.push(sl);
         }
     }
 
-    arm_ringlwe_lock(
+    let lock = arm_ringlwe_lock(
         c_stmt.ok_or_else(|| "arm_we_ringlwe_lock_from_dr1cs: missing c_stmt".to_string())?,
         x_len.ok_or_else(|| "arm_we_ringlwe_lock_from_dr1cs: missing x_len".to_string())?,
         pi_len.ok_or_else(|| "arm_we_ringlwe_lock_from_dr1cs: missing pi_len".to_string())?,
@@ -993,7 +1035,11 @@ pub(crate) fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
         payload,
         s_channels.as_slice(),
         rng,
-    )
+    )?;
+    Ok(WeRingLweLockArmOut {
+        lock,
+        s_channels_mod257: s_channels,
+    })
 }
 
 /// Arm the **LF+ tiny-field WE gate** (Poseidon(F257) + CM-coin surfaces) as a Theorem-4.3 lock.
@@ -1016,13 +1062,13 @@ pub(crate) fn arm_lfplus_ringlwe_lock<R>(
     armer_seed: [u8; 32],
     lock_j: u64,
     block_id: usize,
-    base_rep_id: u64,
+    policy: WeRingLweLockArmingPolicy,
     ringlwe_params: RingLweParams,
     p_channels: u16,
     r_reps: u16,
     payload: &[u8],
     rng: &mut impl rand::RngCore,
-) -> Result<RingLweLockArtifact<F257>, String>
+) -> Result<WeRingLweLockArmOut<F257>, String>
 where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + ark_ff::Field + ark_ff::PrimeField,
@@ -1044,7 +1090,7 @@ where
         armer_seed,
         lock_j,
         block_id,
-        base_rep_id,
+        policy,
         ringlwe_params,
         p_channels,
         r_reps,
