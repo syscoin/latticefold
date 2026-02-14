@@ -1606,6 +1606,10 @@ pub fn merge_file_backed_sparse_dr1cs_share_one<F: PrimeField + CanonicalSeriali
             // Auto-select base part:
             // - If part0 has no constraints/terms (common for prefix-only modules), reuse part1 (huge).
             // - Else reuse part0.
+            //
+            // IMPORTANT: reuse-base is only safe when the base part's rows/terms start at offset 0
+            // in the merged files. If earlier parts contribute any rows/terms, the base part would
+            // need its coefficient/row pools shifted within the files (not supported here).
             let base_idx: usize = if reuse_base
                 && parts.len() > 1
                 && parts[0].0.layout.nconstraints == 0

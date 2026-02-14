@@ -536,7 +536,7 @@ pub struct RingLweDecapStreamState<'a, F: PrimeField> {
 }
 
 impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
-    fn new(
+    pub(crate) fn new(
         lock: &'a RingLweLockArtifact<F>,
         sublock: &'a RingLweSubLock<F>,
         x: &[F],
@@ -866,6 +866,124 @@ pub(crate) fn decrypt_payload_from_sublock_s_candidates<F: PrimeField>(
         })
         .collect();
     lock.decrypt_payload(s_channels.as_slice())
+}
+
+/// Statement-aware decrypt path: derive the payload key from the **decap-side statement** `x`.
+///
+/// This is the binding needed for attacker-controlled decap: if `x_decap != x_arm`, payload
+/// recovery must fail *cryptographically* (i.e. decrypt under a different key), not just via
+/// optional manifest guards.
+///
+/// Convention for LF+ WE tiny gate:
+/// - `x = [ONE] || stmt_digest(32)`
+/// - lock artifacts store `c_stmt` corresponding to the statement digest lane.
+///
+/// We derive the payload key using `x[1..]` (the decap-side statement digest), not `lock.c_stmt`.
+pub(crate) fn decrypt_payload_from_sublock_s_candidates_for_stmt<F: PrimeField>(
+    lock: &RingLweLockArtifact<F>,
+    sublock_s_candidates: &[(u16, [u16; 2])],
+    x: &[F],
+) -> Result<Vec<u8>, String> {
+    if x.len() != lock.x_len {
+        return Err("ringlwe: decrypt_for_stmt: bad x length".to_string());
+    }
+    if x.len() < 2 {
+        return Err("ringlwe: decrypt_for_stmt: x too short".to_string());
+    }
+    let c_stmt_for_key = x
+        .get(1..)
+        .ok_or_else(|| "ringlwe: decrypt_for_stmt: missing stmt digest in x".to_string())?;
+    if c_stmt_for_key.len() != lock.c_stmt.len() {
+        return Err(format!(
+            "ringlwe: decrypt_for_stmt: stmt digest length mismatch (x_tail={} lock_c_stmt={})",
+            c_stmt_for_key.len(),
+            lock.c_stmt.len()
+        ));
+    }
+
+    // Reuse the canonical candidate-intersection logic to recover s_channels.
+    let p = lock.p_channels as usize;
+    let r = lock.r_reps as usize;
+    if p == 0 || r == 0 {
+        return Err("ringlwe: invalid (P,R)".to_string());
+    }
+    if lock.sublocks.len() != p.saturating_mul(r) {
+        return Err("ringlwe: sublocks length mismatch".to_string());
+    }
+    if sublock_s_candidates.len() != lock.sublocks.len() {
+        return Err("ringlwe: sublock_s_candidates length mismatch".to_string());
+    }
+
+    // Group 2-candidate sets by channel, preserving the canonical sublock order.
+    let mut per_channel_reps: Vec<Vec<[u16; 2]>> = vec![Vec::with_capacity(r); p];
+    for (i, (ch, cands)) in sublock_s_candidates.iter().enumerate() {
+        let sl = lock
+            .sublocks
+            .get(i)
+            .ok_or_else(|| "ringlwe: internal sublock index mismatch".to_string())?;
+        if *ch != sl.channel_id {
+            return Err("ringlwe: sublock channel_id mismatch".to_string());
+        }
+        let ch_usize = *ch as usize;
+        if ch_usize >= p {
+            return Err("ringlwe: channel_id out of range".to_string());
+        }
+        per_channel_reps[ch_usize].push(*cands);
+    }
+    for ch in 0..p {
+        if per_channel_reps[ch].len() != r {
+            return Err("ringlwe: missing repetitions for some channel".to_string());
+        }
+    }
+
+    // Intersect across reps within a channel.
+    let mut channel_sets: Vec<Vec<u16>> = Vec::with_capacity(p);
+    for ch in 0..p {
+        let mut cur = intersect_2cands_across_reps(per_channel_reps[ch].as_slice())?;
+        cur.sort_unstable();
+        cur.dedup();
+        if cur.is_empty() {
+            return Err("ringlwe: empty intersection for some channel".to_string());
+        }
+        if cur.len() > 2 {
+            return Err("ringlwe: internal error (intersection >2)".to_string());
+        }
+        channel_sets.push(cur);
+    }
+
+    // Canonical policy: no branching.
+    let mut total: u64 = 1;
+    for set in &channel_sets {
+        total = total.saturating_mul(set.len() as u64);
+    }
+    if total != 1 {
+        let lens: Vec<usize> = channel_sets.iter().map(|s| s.len()).collect();
+        return Err(format!(
+            "ringlwe: ambiguous per-channel intersections (P={p} R={r} channel_set_lens={lens:?} total_tuples={total}); lock must satisfy ratio-class distinctness policy"
+        ));
+    }
+
+    let s_channels: Vec<u16> = channel_sets
+        .iter()
+        .map(|set| {
+            debug_assert_eq!(set.len(), 1);
+            set[0]
+        })
+        .collect();
+
+    // Derive payload key from **decap-side statement digest**.
+    let key = derive_payload_key_bytes_multi(
+        &lock.params.domain_label,
+        c_stmt_for_key,
+        lock.x_len,
+        lock.pi_len,
+        lock.len,
+        lock.p_channels,
+        lock.r_reps,
+        lock.sublocks.as_slice(),
+        s_channels.as_slice(),
+    );
+    Ok(xor_stream_decrypt(&key, &lock.ct.nonce, &lock.ct.ct))
 }
 
 /// Arm (create) a lock artifact with deterministic mod-257 hints + unauthenticated XOR.

@@ -305,7 +305,49 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
         //
         // IMPORTANT (host-side only): avoid `squeeze_bytes()` for F257 when you need uniform sampling.
         // We sample integers using base-257 digits and **range rejection** (see `squeeze_usize_mod_base257`).
-        let local_idx = squeeze_usize_mod_base257(&mut sp_coins, ell_local)?;
+        //
+        // Additional rejection for the tensor-RS Layout-A multiplication code:
+        // we must avoid sampling an `idx` that lands inside the *systematic* E* witness grid
+        // (the "(2k0-1)^t low grid", aka `witness_positions_star()`), because for those indices
+        // the FLPCP query becomes independent of the `Cz - w_low` consistency term and is
+        // therefore vacuous for C-side soundness.
+        //
+        // For our production parameters (F257, base_n=256, base_k=48, rank=3):
+        // - side = 2*base_k - 1 = 95
+        // - any coordinate in the band [base_k, side) makes the corresponding 1D Lagrange vector
+        //   a selector outside the low cube, which forces *all* low-cube coefficients to 0.
+        //
+        // This rejection sampling is cheap (expected <2 iterations) and restores soundness against
+        // hint-minimizing arming policies that would otherwise bias toward such “C-blind” points.
+        let local_idx = loop {
+            let cand = squeeze_usize_mod_base257(&mut sp_coins, ell_local)?;
+            if is_f257_field::<F>() {
+                const BASE_N: usize = 256;
+                const BASE_K: usize = 48;
+                const RANK: usize = 3;
+                const SIDE: usize = 2 * BASE_K - 1; // 95
+                // Reject any coordinate that falls into the "side-but-not-low" band:
+                //   BASE_K <= c < SIDE
+                //
+                // For such coordinates the 1D Lagrange vector over the `SIDE` points becomes a
+                // selector at an index >= BASE_K, which makes *all* low-cube coefficients zero
+                // in `row_e_star_stream` and thus erases the `Cz - w_low` consistency term.
+                let mut tmp = cand;
+                let mut bad = false;
+                for _ in 0..RANK {
+                    let c = tmp % BASE_N;
+                    if c >= BASE_K && c < SIDE {
+                        bad = true;
+                        break;
+                    }
+                    tmp /= BASE_N;
+                }
+                if bad {
+                    continue;
+                }
+            }
+            break cand;
+        };
         let idx = block_id
             .checked_mul(ell_local)
             .and_then(|v| v.checked_add(local_idx))
@@ -314,9 +356,27 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
             return Err("derived idx out of range".to_string());
         }
 
-        let lambda = f257_to_f::<F>(sp_coins.squeeze_field_elements::<F257>(1)[0]);
-        let rho = f257_to_f::<F>(sp_coins.squeeze_field_elements::<F257>(1)[0]);
-        let sigma = f257_to_f::<F>(sp_coins.squeeze_field_elements::<F257>(1)[0]);
+        fn squeeze_f257_as_f_reject_digits<F: PrimeField>(
+            sp: &mut PoseidonSponge<F257>,
+            reject: &[u16],
+        ) -> Result<F, String> {
+            loop {
+                let x = sp.squeeze_field_elements::<F257>(1)[0];
+                let d = f257_digit_u16(x)?;
+                if !reject.contains(&d) {
+                    return Ok(f257_to_f::<F>(x));
+                }
+            }
+        }
+        // Reject a small set of degenerate digits. Rationale:
+        // - lambda==0: drops C-side (Cx2) contribution in outer query
+        // - lambda==1: cancels the low-cube w_eval contribution (coeff = (1-lambda)c), which can
+        //              make γ blind for constraints whose C row is sparse/empty (e.g. glue constraints)
+        // - rho==0: makes check independent of α (A-side)
+        // - sigma==0: makes check independent of β (B-side)
+        let lambda = squeeze_f257_as_f_reject_digits::<F>(&mut sp_coins, &[0, 1])?;
+        let rho = squeeze_f257_as_f_reject_digits::<F>(&mut sp_coins, &[0])?;
+        let sigma = squeeze_f257_as_f_reject_digits::<F>(&mut sp_coins, &[0])?;
 
         let coins = Theorem43Coins { idx, lambda, rho, sigma };
 

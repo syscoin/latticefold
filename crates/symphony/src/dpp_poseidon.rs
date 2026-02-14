@@ -1306,6 +1306,33 @@ pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes<F: PrimeField + Canon
         .map(|(inst, asg, _replay, _bytes, wiring, _bw)| (inst, asg, wiring))
 }
 
+/// WE/arm-before-proof mode (**no bytes**) but writing a **file-backed** dR1CS instance into `out_dir`.
+///
+/// This is useful when composing large file-backed instances: callers can build a small Poseidon
+/// sub-gadget as a file-backed part and later merge it using the file-backed merge helpers.
+pub fn poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_file_backed<
+    F: PrimeField + CanonicalSerialize,
+>(
+    cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<F>,
+    ops: &[PoseidonTraceOp<F>],
+    out_dir: impl AsRef<Path>,
+) -> Result<(FileBackedSparseDr1csInstance<F>, Vec<F>, PoseidonDr1csWiring), ReplayErr> {
+    let (inst, asg, _replay, _bytes, wiring, _bw) = poseidon_sponge_dr1cs_from_trace_impl_any(
+        cfg,
+        ops,
+        false,
+        PoseidonArithMode::WeWitness,
+        Some(out_dir.as_ref()),
+    )?;
+    match inst {
+        PoseidonInstance::FileBacked(fb) => Ok((fb, asg, wiring)),
+        PoseidonInstance::InMemory(_) => Err(ReplayErr::Invalid(
+            "poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_file_backed: expected file-backed instance"
+                .to_string(),
+        )),
+    }
+}
+
 /// Like `poseidon_sponge_dr1cs_from_trace_with_wiring`, but also **arithmetizes `SqueezeBytes`**:
 /// - allocates byte variables,
 /// - constrains each byte is 8-bit,

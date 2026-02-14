@@ -4,6 +4,7 @@
 //! keeping the relation log-scale in `n` and linear in the verifier-visible message sizes.
 
 use ark_ff::{Field, PrimeField};
+use latticefold::transcript::poseidon::f257_poseidon_config;
 use latticefold::transcript::poseidon::F257;
 use stark_rings::{CoeffRing, OverField, PolyRing, Zq};
 
@@ -17,11 +18,110 @@ type BF<R> = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
 
 /// Number of F257 digits per base-257 challenge (= 8 for Goldilocks).
 const CHALLENGE_DIGITS: usize = 8;
+const BIND_DIGEST_BYTES: usize = 32;
+const CV_PREFIX_BYTES: usize = 64; // 8 Goldilocks elems × 8 bytes each
+
+#[derive(Clone, Debug)]
+pub struct WeStatementBindingWitness {
+    pub vk_hash: [u8; 32],
+    pub r1cs_digest: [u8; 32],
+    pub gate_digest: [u8; 32],
+    /// The **exact bytes absorbed** by the verifier transcript for the first 8 SP1 public words,
+    /// i.e. the 8 fixed-width (8-byte) little-endian encodings of the centered-embedded Goldilocks
+    /// base-field elements.
+    ///
+    /// This is the binding bridge: LF+/sumcheck verifies over transcript absorbs; we bind this
+    /// absorbed prefix to the statement digest.
+    pub committed_values_prefix_bytes: [u8; CV_PREFIX_BYTES],
+}
+
+#[cfg(feature = "we_gate")]
+fn stmt_hash_ops_ids_only(
+    vk_hash: [u8; 32],
+    r1cs_digest: [u8; 32],
+    gate_digest: [u8; 32],
+) -> Vec<symphony::transcript::PoseidonTraceOp<F257>> {
+    use symphony::transcript::PoseidonTraceOp;
+    let mut ops: Vec<PoseidonTraceOp<F257>> = Vec::new();
+    ops.push(PoseidonTraceOp::Absorb(vec![F257::from(1u64)])); // domain=1
+    ops.push(PoseidonTraceOp::Absorb(
+        vk_hash.iter().map(|&b| F257::from(b as u64)).collect(),
+    ));
+    ops.push(PoseidonTraceOp::Absorb(
+        r1cs_digest.iter().map(|&b| F257::from(b as u64)).collect(),
+    ));
+    ops.push(PoseidonTraceOp::Absorb(
+        gate_digest.iter().map(|&b| F257::from(b as u64)).collect(),
+    ));
+    ops.push(PoseidonTraceOp::SqueezeField(vec![F257::ZERO; BIND_DIGEST_BYTES]));
+    ops
+}
+
+#[cfg(feature = "we_gate")]
+fn stmt_hash_ops_stmt_only(
+    params: &WeParams,
+    committed_values_prefix_bytes: [u8; CV_PREFIX_BYTES],
+) -> Vec<symphony::transcript::PoseidonTraceOp<F257>> {
+    use symphony::transcript::PoseidonTraceOp;
+    let mut ops: Vec<PoseidonTraceOp<F257>> = Vec::new();
+    let params_f257 = params.to_field_vec::<F257>();
+    ops.push(PoseidonTraceOp::Absorb(vec![F257::from(2u64)])); // domain=2
+    // h_ids absorb is 32 elems (filled at witness time via extra_eqs to ids_hash squeeze outputs)
+    ops.push(PoseidonTraceOp::Absorb(vec![F257::ZERO; BIND_DIGEST_BYTES]));
+    ops.push(PoseidonTraceOp::Absorb(params_f257));
+    ops.push(PoseidonTraceOp::Absorb(
+        committed_values_prefix_bytes
+            .iter()
+            .map(|&b| F257::from(b as u64))
+            .collect(),
+    ));
+    ops.push(PoseidonTraceOp::SqueezeField(vec![F257::ZERO; BIND_DIGEST_BYTES]));
+    ops
+}
 
 use symphony::dpp_sumcheck::Dr1csBuilder;
 use symphony::file_backed_dr1cs::{
     merge_file_backed_sparse_dr1cs_share_one, FileBackedSparseDr1csInstance,
 };
+
+#[cfg(feature = "we_gate")]
+fn collect_nonreabsorb_absorb_ranges(
+    ops: &[symphony::transcript::PoseidonTraceOp<F257>],
+    pose_wiring: &symphony::dpp_poseidon::PoseidonDr1csWiring,
+) -> Result<Vec<(usize, usize)>, String> {
+    use symphony::transcript::PoseidonTraceOp;
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut absorb_idx = 0usize;
+    let mut expect_reabsorb = false;
+    for (op_i, op) in ops.iter().enumerate() {
+        match op {
+            PoseidonTraceOp::SqueezeField(v) => {
+                expect_reabsorb = v.len() == CHALLENGE_DIGITS
+                    && matches!(
+                        ops.get(op_i + 1),
+                        Some(PoseidonTraceOp::Absorb(a)) if a.len() == CHALLENGE_DIGITS
+                    );
+            }
+            PoseidonTraceOp::Absorb(_v) => {
+                let (ab_start, ab_len) = *pose_wiring
+                    .absorb_ranges
+                    .get(absorb_idx)
+                    .ok_or("tiny gate: pose_wiring.absorb_ranges oob (collect_nonreabsorb_absorb_ranges)")?;
+                absorb_idx += 1;
+                let is_reabsorb = expect_reabsorb;
+                expect_reabsorb = false;
+                if is_reabsorb {
+                    continue;
+                }
+                out.push((ab_start, ab_len));
+            }
+            PoseidonTraceOp::SqueezeBytes { .. } => {
+                expect_reabsorb = false;
+            }
+        }
+    }
+    Ok(out)
+}
 
 #[cfg(feature = "we_gate")]
 fn first_squeeze_field_op_index_of_len(
@@ -89,7 +189,7 @@ fn collect_get_challenge_squeeze_field_indices(
 fn build_we_dr1cs_for_plus_proof_shape_tiny<R>(
     trace: &PoseidonTranscriptTrace<BF<R>>,
     params: &WeParams,
-    public_inputs: &[BF<R>],
+    _public_inputs: &[BF<R>],
     n_lin_proofs: usize,
     mlen_mats: usize,
     pairs: &[(usize, usize)],
@@ -99,8 +199,8 @@ where
     R: OverField + CoeffRing + PolyRing,
     R::BaseRing: Zq + Field + PrimeField,
 {
-    // Public inputs are absorbed as fixed-width base-field bytes in the transcript.
-    let public_inputs_elems = public_inputs.len();
+    // Statement public surface is exactly `stmt_digest` as 32 F257 elements.
+    let public_inputs_len = BIND_DIGEST_BYTES;
 
     // Shape-only must still build the **full faithful** tiny-gate relation.
     //
@@ -175,7 +275,8 @@ where
             },
         )?;
 
-    // Public statement prefix (arm-time bound): [ONE] || [10×WeParams] || [public_inputs...]
+    // Public statement prefix (arm-time bound): [ONE] || [stmt_digest(32)].
+    // WeParams are statement constants in-circuit, but not public inputs.
     // Build as a file-backed instance so the full tiny-shape pipeline is file-backed.
     let out_dir = out_dir.as_ref();
     let mut b_params = Dr1csBuilder::<F257>::new_file_backed(out_dir.join("params_prefix"))
@@ -186,134 +287,207 @@ where
     //
     // The constant-1 slot is already enforced by the main tiny-gate relation; and the merge code
     // requires `assignment[0] == 1` for every part.
+    // Reserve public slots for stmt_digest field elements.
+    for _ in 0..public_inputs_len {
+        b_params.new_var(F257::from(0u64));
+    }
+    // Append WeParams as fixed witness-side constants.
     for &x in &params.to_field_vec::<F257>() {
         b_params.new_var(x);
-    }
-    // Reserve slots for public input **bytes** (statement-defined); values are provided at proof time.
-    let coeff_bytes = ((<R::BaseRing as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8;
-    let public_inputs_bytes_len = public_inputs_elems
-        .checked_mul(coeff_bytes)
-        .ok_or_else(|| "tiny gate: public input byte length overflow".to_string())?;
-    for _ in 0..public_inputs_bytes_len {
-        b_params.new_var(F257::from(0u64));
     }
     let (params_inst, params_asg) = b_params
         .into_file_backed_instance()
         .map_err(|e| format!("tiny gate: params prefix into_file_backed_instance failed: {e}"))?;
 
-    // Optional third part: constrain the transcript prefix absorb bytes to match the public prefix.
-    // We encode these constraints in a small additional file-backed module and glue it to:
-    // - params prefix vars (public inputs)
-    // - Poseidon absorb byte vars inside the tiny-gate instance
+    // Glue constraints between params prefix public digest slots and inner Poseidon vars.
     let mut extra_eqs: Vec<(usize, usize)> = Vec::new();
     let mut parts: Vec<(FileBackedSparseDr1csInstance<F257>, Vec<F257>)> =
         vec![(params_inst, params_asg), (inst_pose, asg_pose_shape)];
+    {
+        let _params_nvars = parts[0].1.len();
+        let _tiny_nvars = parts[1].1.len();
 
-    if public_inputs_elems > 0 {
-        // IMPORTANT: The transcript trace includes **Fiat–Shamir re-absorbs** for each
-        // `get_challenge()` (SqueezeField(len=CHALLENGE_DIGITS) then Absorb(len=CHALLENGE_DIGITS)).
-        // Those absorb ops contain **base-257 digits** in 0..=256 and must NOT be mistaken for
-        // "byte absorbs" that correspond to statement/public-input prefix absorption.
+        // Binding subrelation (must match `we_statement_hash_lf_plus` in `we_statement.rs`):
         //
-        // Therefore, bind public-input bytes to the first `public_inputs_elems` **non-reabsorb**
-        // Absorb ops.
-        let canonical_absorb_ranges: Vec<(usize, usize)> = {
-            let mut out: Vec<(usize, usize)> = Vec::new();
-            let mut absorb_idx = 0usize;
-            let mut expect_reabsorb = false;
-            for (op_i, op) in ops_f257.iter().enumerate() {
-                match op {
-                    symphony::transcript::PoseidonTraceOp::SqueezeField(v) => {
-                        expect_reabsorb = v.len() == crate::transcript::CHALLENGE_DIGITS
-                            && matches!(
-                                ops_f257.get(op_i + 1),
-                                Some(symphony::transcript::PoseidonTraceOp::Absorb(a))
-                                    if a.len() == crate::transcript::CHALLENGE_DIGITS
-                            );
-                    }
-                    symphony::transcript::PoseidonTraceOp::Absorb(_v) => {
-                        let (ab_start, ab_len) = *pose_wiring
-                            .absorb_ranges
-                            .get(absorb_idx)
-                            .ok_or("tiny gate: pose_wiring.absorb_ranges oob (public inputs)")?;
-                        absorb_idx += 1;
-                        let is_reabsorb = expect_reabsorb;
-                        expect_reabsorb = false;
-                        if is_reabsorb {
-                            continue;
-                        }
-                        out.push((ab_start, ab_len));
-                    }
-                    symphony::transcript::PoseidonTraceOp::SqueezeBytes { .. } => {
-                        expect_reabsorb = false;
-                    }
-                }
-            }
-            out
-        };
-        if canonical_absorb_ranges.len() < public_inputs_elems {
-            return Err("tiny gate: not enough non-reabsorb Absorb ops for public inputs".to_string());
+        // IMPORTANT: statement hashing must be **proof-agnostic**. It must NOT be computed as a
+        // continuation of the verifier transcript sponge (which depends on the proof).
+        //
+        // We therefore arithmetize independent Poseidon sponge gadgets (fresh sponges):
+        // - ids_hash:  h_ids = Poseidon(ds=1 || vk_hash || r1cs_digest || gate_digest)
+        // - stmt_hash: stmt  = Poseidon(ds=2 || h_ids || params(10) || committed_values_prefix_bytes(64))
+        // and constrain `stmt == stmt_digest` (public statement).
+        let cfg = f257_poseidon_config();
+        let ops_ids = stmt_hash_ops_ids_only([0u8; 32], [0u8; 32], [0u8; 32]);
+        let (inst_ids, asg_ids, wiring_ids) =
+            symphony::dpp_poseidon::poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_file_backed::<F257>(
+                &cfg,
+                &ops_ids,
+                out_dir.join("ids_hash"),
+            )
+            .map_err(|e| format!("tiny gate: ids_hash poseidon build failed: {e:?}"))?;
+
+        let ops_stmt = stmt_hash_ops_stmt_only(params, [0u8; CV_PREFIX_BYTES]);
+        let (inst_stmt, asg_stmt, wiring_stmt) =
+            symphony::dpp_poseidon::poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes_file_backed::<F257>(
+                &cfg,
+                &ops_stmt,
+                out_dir.join("stmt_hash"),
+            )
+            .map_err(|e| format!("tiny gate: stmt_hash poseidon build failed: {e:?}"))?;
+
+        // ---------------------------------------------------------------------
+        // Bind SP1 committed-values digest lane to the verifier transcript prefix.
+        //
+        // The verifier transcript (and thus sumcheck/CM verification) depends on the absorbed
+        // public-input prefix. We bind the first 8 absorbed public inputs (the committed-values
+        // digest lane) to the exact 64 bytes absorbed by the transcript for those 8 elements.
+        const CV_WORDS: usize = 8;
+        let coeff_bytes = ((<R::BaseRing as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8;
+        if coeff_bytes != 8 {
+            return Err(format!(
+                "tiny gate: expected 8-byte fixed-width encoding for base-field absorbs (got coeff_bytes={})",
+                coeff_bytes
+            ));
         }
+        let canon_absorb_ranges = collect_nonreabsorb_absorb_ranges(&ops_f257, &pose_wiring)?;
+        let absorb_len8_ranges: Vec<(usize, usize)> = canon_absorb_ranges
+            .into_iter()
+            .filter(|&(_st, ln)| ln == coeff_bytes)
+            .collect();
+        let cv_start_idx: usize = 0;
+        if absorb_len8_ranges.len() < cv_start_idx.saturating_add(CV_WORDS) {
+            return Err(format!(
+                "tiny gate: need {} absorbed public-input elements of {} bytes to bind committed_values_prefix_bytes (found={} start_idx={})",
+                CV_WORDS,
+                coeff_bytes,
+                absorb_len8_ranges.len(),
+                cv_start_idx,
+            ));
+        }
+        let cv_absorb_ranges: Vec<(usize, usize)> =
+            absorb_len8_ranges[cv_start_idx..cv_start_idx + CV_WORDS].to_vec();
 
-        let (params_asg, tiny_asg) = (&parts[0].1, &parts[1].1);
-        let params_nvars = params_asg.len();
-        let tiny_nvars = tiny_asg.len();
-        let offsets = [0usize, params_nvars.saturating_sub(1), params_nvars.saturating_sub(1).saturating_add(tiny_nvars.saturating_sub(1))];
-        let remap = |part: usize, local: usize, offsets: &[usize; 3]| -> usize {
-            if local == 0 { 0 } else { local + offsets[part] }
+        // Glue module enforcing:
+        // - absorbed bytes for the first 8 public-input elements equal `committed_values_prefix_bytes`
+        let mut gb = Dr1csBuilder::<F257>::new_file_backed(out_dir.join("cv_prefix_glue"))
+            .map_err(|e| format!("tiny gate: cv_prefix_glue new_file_backed failed: {e}"))?;
+        gb.enforce_var_eq_const(gb.one(), F257::ONE);
+        let mut digest_locals: Vec<usize> = Vec::with_capacity(CV_PREFIX_BYTES);
+        for _ in 0..CV_PREFIX_BYTES {
+            digest_locals.push(gb.new_var(F257::ZERO));
+        }
+        let mut absorb_locals: Vec<usize> = Vec::with_capacity(CV_WORDS * coeff_bytes);
+        for _ in 0..(CV_WORDS * coeff_bytes) {
+            absorb_locals.push(gb.new_var(F257::ZERO));
+        }
+        for i in 0..(CV_WORDS * coeff_bytes) {
+            let v_ab = absorb_locals[i];
+            let v_d = digest_locals[i];
+            gb.enforce_lc_times_one_eq_const(vec![(F257::ONE, v_ab), (-F257::ONE, v_d)]);
+        }
+        let (glue_inst, glue_asg) = gb
+            .into_file_backed_instance()
+            .map_err(|e| format!("tiny gate: cv_prefix_glue into_file_backed_instance failed: {e}"))?;
+        parts.push((glue_inst, glue_asg));
+        parts.push((inst_ids, asg_ids));
+        parts.push((inst_stmt, asg_stmt));
+
+        // Compute per-part variable tail offsets for remapping local var indices into merged space.
+        let mut var_tail_off: Vec<usize> = Vec::with_capacity(parts.len());
+        let mut cur: usize = 0;
+        for (inst, _asg) in &parts {
+            var_tail_off.push(cur);
+            cur = cur.saturating_add(inst.nvars.saturating_sub(1));
+        }
+        let remap = |part: usize, local: usize, var_tail_off: &[usize]| -> usize {
+            if local == 0 { 0 } else { local + var_tail_off[part] }
         };
 
-        let mut gb_pub = Dr1csBuilder::<F257>::new_file_backed(out_dir.join("public_inputs_glue"))
-            .map_err(|e| format!("tiny gate: public_inputs_glue new_file_backed failed: {e}"))?;
-        gb_pub.enforce_var_eq_const(gb_pub.one(), F257::ONE);
-
-        // Allocate module-local copies of the public vars (one per public input byte).
-        let mut pub_locals: Vec<usize> = Vec::with_capacity(public_inputs_bytes_len);
-        for _ in 0..public_inputs_bytes_len {
-            pub_locals.push(gb_pub.new_var(F257::ZERO));
+        // Glue digest locals to the prefix-byte vars inside the stmt_hash absorb (cv_prefix bytes).
+        let (stmt_cv_ab_start, stmt_cv_ab_len) = *wiring_stmt
+            .absorb_ranges
+            .last()
+            .ok_or("tiny gate: stmt_hash missing absorb_ranges")?;
+        if stmt_cv_ab_len != CV_PREFIX_BYTES {
+            return Err("tiny gate: stmt_hash cv_prefix absorb length mismatch".to_string());
         }
-
-        // Allocate module-local copies of absorb-byte vars as needed.
-        let mut absorb_local_map: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
-
-        for i in 0..public_inputs_elems {
-            let (ab_start, ab_len) = canonical_absorb_ranges[i];
-            if ab_len != coeff_bytes {
-                return Err(format!(
-                    "tiny gate: public input absorb len mismatch (got {ab_len}, expected {coeff_bytes})"
+        for i in 0..CV_PREFIX_BYTES {
+            let digest_byte_var = wiring_stmt.absorb_vars[stmt_cv_ab_start + i];
+            extra_eqs.push((
+                remap(4, digest_byte_var, &var_tail_off),
+                remap(2, digest_locals[i], &var_tail_off),
+            ));
+        }
+        // Glue absorbed public-input bytes (first 8 elements) to absorb_locals.
+        for i in 0..CV_WORDS {
+            let (ab_start, ab_len) = cv_absorb_ranges[i];
+            debug_assert_eq!(ab_len, coeff_bytes);
+            for j in 0..coeff_bytes {
+                let pub_byte_var = pose_wiring.absorb_vars[ab_start + j];
+                extra_eqs.push((
+                    remap(1, pub_byte_var, &var_tail_off),
+                    remap(2, absorb_locals[i * coeff_bytes + j], &var_tail_off),
                 ));
             }
-            for j in 0..ab_len {
-                let v_ab_local = pose_wiring.absorb_vars[ab_start + j];
-                if v_ab_local == 0 {
-                    continue;
-                }
-                let ab_local = *absorb_local_map.entry(v_ab_local).or_insert_with(|| gb_pub.new_var(tiny_asg[v_ab_local]));
-                // Bind each absorbed byte to the corresponding statement public byte var.
-                let pub_idx = i * coeff_bytes + j;
-                gb_pub.enforce_lc_times_one_eq_const(vec![
-                    (F257::ONE, ab_local),
-                    (-F257::ONE, pub_locals[pub_idx]),
-                ]);
-            }
-
-            // Glue pub_locals byte vars to params prefix vars.
-            for j in 0..coeff_bytes {
-                let pub_idx = i * coeff_bytes + j;
-                let pub_var = 1usize + 10usize + pub_idx;
-                extra_eqs.push((remap(0, pub_var, &offsets), remap(2, pub_locals[pub_idx], &offsets)));
-            }
         }
 
-        // Glue absorb-byte locals to tiny-gate absorb-byte vars.
-        for (v_ab_local, ab_local) in absorb_local_map {
-            extra_eqs.push((remap(1, v_ab_local, &offsets), remap(2, ab_local, &offsets)));
+        // Glue stmt_hash h_ids absorb vars to ids_hash squeeze outputs.
+        let (ids_sf_start, ids_sf_len) = *wiring_ids
+            .squeeze_field_ranges
+            .last()
+            .ok_or("tiny gate: ids_hash missing squeeze_field_ranges")?;
+        if ids_sf_len != BIND_DIGEST_BYTES {
+            return Err("tiny gate: ids_hash squeeze len mismatch".to_string());
+        }
+        let (stmt_ids_ab_start, stmt_ids_ab_len) = *wiring_stmt
+            .absorb_ranges
+            .get(1)
+            .ok_or("tiny gate: stmt_hash missing h_ids absorb range")?;
+        if stmt_ids_ab_len != BIND_DIGEST_BYTES {
+            return Err("tiny gate: stmt_hash h_ids absorb len mismatch".to_string());
+        }
+        for j in 0..BIND_DIGEST_BYTES {
+            let ids_sf_var = wiring_ids.squeeze_field_vars[ids_sf_start + j];
+            let stmt_ids_var = wiring_stmt.absorb_vars[stmt_ids_ab_start + j];
+            extra_eqs.push((
+                remap(3, ids_sf_var, &var_tail_off),
+                remap(4, stmt_ids_var, &var_tail_off),
+            ));
         }
 
-        let (pub_inst, pub_asg) = gb_pub
-            .into_file_backed_instance()
-            .map_err(|e| format!("tiny gate: public_inputs_glue into_file_backed_instance failed: {e}"))?;
-        parts.push((pub_inst, pub_asg));
+        // Enforce stmt_hash output equals stmt_digest public vars in params_prefix.
+        let (stmt_sf_start, stmt_sf_len) = *wiring_stmt
+            .squeeze_field_ranges
+            .last()
+            .ok_or("tiny gate: stmt_hash missing squeeze_field_ranges")?;
+        if stmt_sf_len != BIND_DIGEST_BYTES {
+            return Err("tiny gate: stmt_hash squeeze len mismatch".to_string());
+        }
+        for j in 0..BIND_DIGEST_BYTES {
+            let stmt_sf_var = wiring_stmt.squeeze_field_vars[stmt_sf_start + j];
+            let pub_var = 1usize + j;
+            extra_eqs.push((
+                remap(4, stmt_sf_var, &var_tail_off),
+                remap(0, pub_var, &var_tail_off),
+            ));
+        }
+
+        // Enforce stmt_hash params absorb equals params vars in params_prefix.
+        let (stmt_params_ab_start, stmt_params_ab_len) = *wiring_stmt
+            .absorb_ranges
+            .get(2)
+            .ok_or("tiny gate: stmt_hash missing params absorb range")?;
+        if stmt_params_ab_len != 10 {
+            return Err("tiny gate: stmt_hash params absorb len mismatch".to_string());
+        }
+        for j in 0..10usize {
+            let stmt_params_var = wiring_stmt.absorb_vars[stmt_params_ab_start + j];
+            let params_var = 1usize + 32usize + j;
+            extra_eqs.push((
+                remap(4, stmt_params_var, &var_tail_off),
+                remap(0, params_var, &var_tail_off),
+            ));
+        }
     }
 
     let (inst, _asg) = merge_file_backed_sparse_dr1cs_share_one::<F257>(
@@ -321,7 +495,7 @@ where
         out_dir.join("merged"),
         &extra_eqs,
     )?;
-    Ok(WeDr1csShape { inst, public_len: 1 + 10 + public_inputs_bytes_len })
+    Ok(WeDr1csShape { inst, public_len: 1 + public_inputs_len })
 }
 
 
@@ -796,7 +970,8 @@ fn shape_cache_exists(shape_dir: impl AsRef<std::path::Path>) -> bool {
 pub fn build_or_load_we_plus_tiny_dr1cs<R>(
     trace: &PoseidonTranscriptTrace<BF<R>>,
     params: &WeParams,
-    public_inputs: &[F257], // statement public **bytes** in F257
+    stmt_digest: &[F257; 32], // statement public digest in F257
+    binding_witness: &WeStatementBindingWitness,
     proof: &crate::plus::PlusProof<R, crate::r1cs::ComR1CSProof<R>>,
     mlen_mats: usize,
     pairs: &[(usize, usize)],
@@ -824,9 +999,8 @@ where
         let shape = build_we_dr1cs_for_plus_proof_shape_tiny::<R>(
             trace,
             params,
-            // The shape builder needs base-field public inputs (for byte-length computation).
-            // We pass zeros of the correct length; values don't affect the shape.
-            &vec![BF::<R>::ZERO; public_inputs.len() / (((<R::BaseRing as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8)],
+            // Shape is value-agnostic for the 32-field stmt_digest public lane.
+            &[],
             n_lin_proofs,
             mlen_mats,
             pairs,
@@ -840,7 +1014,8 @@ where
     let assignment = build_we_plus_tiny_assignment_only::<R>(
         trace,
         params,
-        public_inputs,
+        stmt_digest,
+        binding_witness,
         proof,
         mlen_mats,
         pairs,
@@ -908,12 +1083,13 @@ where
 /// Compute only the assignment vector (no shape, no disk writes).
 ///
 /// Runs the count-only builder pass (Pass 0) for the inner tiny gate, then assembles
-/// the outer merge: `[ONE] ++ params_prefix[1..] ++ tiny_gate_asg[1..] ++ pub_glue[1..]`.
+/// the outer merge: `[ONE] ++ params_prefix[1..] ++ tiny_gate_asg[1..]`.
 #[cfg(feature = "we_gate")]
 fn build_we_plus_tiny_assignment_only<R>(
     trace: &PoseidonTranscriptTrace<BF<R>>,
     params: &WeParams,
-    public_inputs: &[F257],
+    stmt_digest: &[F257; 32],
+    binding_witness: &WeStatementBindingWitness,
     proof: &crate::plus::PlusProof<R, crate::r1cs::ComR1CSProof<R>>,
     mlen_mats: usize,
     pairs: &[(usize, usize)],
@@ -925,7 +1101,7 @@ where
     let ring_dim = R::dimension();
     let extra = tiny_extra_witness_from_plus_proof::<R>(params, proof, mlen_mats)?;
 
-    // Lift recorded ops and infer wiring (same as build_we_plus_tiny_dr1cs).
+    // Lift recorded ops and infer wiring for the verifier transcript tiny gate.
     let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<R>>(&trace.ops)?;
     let k = params.k as usize;
     let log_kappa = ark_std::log2((params.kappa as usize).next_power_of_two()) as usize;
@@ -968,101 +1144,123 @@ where
     )?;
 
     // ---- Params prefix assignment -----------------------------------------
-    // Layout: [ONE, 10×WeParams, public_input_bytes...]
-    let mut params_asg: Vec<F257> = Vec::with_capacity(1 + 10 + public_inputs.len());
+    // Layout: [ONE, stmt_digest(32), 10×WeParams]
+    let mut params_asg: Vec<F257> = Vec::with_capacity(1 + stmt_digest.len() + 10);
     params_asg.push(F257::ONE);
+    params_asg.extend_from_slice(stmt_digest);
     params_asg.extend(params.to_field_vec::<F257>());
-    for &pi in public_inputs {
-        params_asg.push(pi);
+
+    // ---- Committed-values digest prefix glue assignment --------------------
+    //
+    // Must match the shape builder's `cv_prefix_glue` part:
+    // - 64 prefix bytes (from `binding_witness.committed_values_prefix_bytes`)
+    // - 8×8 absorbed bytes for the first 8 non-reabsorb Absorb(len=8) ranges in the transcript.
+    const CV_WORDS: usize = 8;
+    let coeff_bytes = ((<R::BaseRing as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8;
+    if coeff_bytes != 8 {
+        return Err(format!(
+            "assignment_only: expected coeff_bytes=8 for base-field absorbs (got={})",
+            coeff_bytes
+        ));
+    }
+    let canon_absorb_ranges = collect_nonreabsorb_absorb_ranges(&ops_f257, &pose_wiring)?;
+    let absorb_len8_ranges: Vec<(usize, usize)> = canon_absorb_ranges
+        .into_iter()
+        .filter(|&(_st, ln)| ln == coeff_bytes)
+        .collect();
+    let cv_start_idx: usize = 0;
+    if absorb_len8_ranges.len() < cv_start_idx.saturating_add(CV_WORDS) {
+        return Err(format!(
+            "assignment_only: need {} absorbed public-input elements of {} bytes to bind committed_values_prefix_bytes (found={} start_idx={})",
+            CV_WORDS,
+            coeff_bytes,
+            absorb_len8_ranges.len(),
+            cv_start_idx,
+        ));
+    }
+    let cv_absorb_ranges: Vec<(usize, usize)> =
+        absorb_len8_ranges[cv_start_idx..cv_start_idx + CV_WORDS].to_vec();
+
+    let mut glue_asg: Vec<F257> = Vec::with_capacity(1 + CV_PREFIX_BYTES + CV_WORDS * coeff_bytes);
+    glue_asg.push(F257::ONE);
+    for &b in &binding_witness.committed_values_prefix_bytes {
+        glue_asg.push(F257::from(b as u64));
+    }
+    for i in 0..CV_WORDS {
+        let (ab_start, ab_len) = cv_absorb_ranges[i];
+        debug_assert_eq!(ab_len, coeff_bytes);
+        for j in 0..ab_len {
+            let v = pose_wiring.absorb_vars[ab_start + j];
+            let val = if v == 0 { F257::ONE } else { asg_pose[v] };
+            glue_asg.push(val);
+        }
     }
 
-    // ---- Public inputs glue assignment ------------------------------------
-    // Layout: [ONE, public_bytes_copies..., absorb_var_copies...]
-    // This replicates the assignment logic from build_we_plus_tiny_dr1cs but without
-    // creating constraints (we only need values).
-    let mut pub_glue_asg: Vec<F257> = Vec::new();
-    if !public_inputs.is_empty() {
-        pub_glue_asg.push(F257::ONE);
-        // Public byte copies
-        for &pi in public_inputs {
-            pub_glue_asg.push(pi);
-        }
-        // Absorb var copies (from asg_pose, indexed via pose_wiring)
-        let coeff_bytes = ((<R::BaseRing as PrimeField>::MODULUS_BIT_SIZE as usize) + 7) / 8;
-        let public_inputs_bytes_len = public_inputs.len();
-        if (public_inputs_bytes_len % coeff_bytes) != 0 {
-            return Err("assignment_only: public input byte len not divisible by coeff_bytes".to_string());
-        }
-        let public_inputs_elems = public_inputs_bytes_len / coeff_bytes;
+    // ---- Independent statement-hash gadget assignments ---------------------
+    // Must match the shape builder merge order: ids_hash then stmt_hash.
+    let cfg = f257_poseidon_config();
 
-        // Compute canonical absorb ranges (skip Fiat-Shamir re-absorbs).
-        let canonical_absorb_ranges: Vec<(usize, usize)> = {
-            let mut out: Vec<(usize, usize)> = Vec::new();
-            let mut absorb_idx = 0usize;
-            let mut expect_reabsorb = false;
-            for (op_i, op) in ops_f257.iter().enumerate() {
-                match op {
-                    symphony::transcript::PoseidonTraceOp::SqueezeField(v) => {
-                        expect_reabsorb = v.len() == crate::transcript::CHALLENGE_DIGITS
-                            && matches!(
-                                ops_f257.get(op_i + 1),
-                                Some(symphony::transcript::PoseidonTraceOp::Absorb(a))
-                                    if a.len() == crate::transcript::CHALLENGE_DIGITS
-                            );
-                    }
-                    symphony::transcript::PoseidonTraceOp::Absorb(_v) => {
-                        let (ab_start, ab_len) = *pose_wiring
-                            .absorb_ranges
-                            .get(absorb_idx)
-                            .ok_or("assignment_only: pose_wiring.absorb_ranges oob")?;
-                        absorb_idx += 1;
-                        let is_reabsorb = expect_reabsorb;
-                        expect_reabsorb = false;
-                        if is_reabsorb {
-                            continue;
-                        }
-                        out.push((ab_start, ab_len));
-                    }
-                    symphony::transcript::PoseidonTraceOp::SqueezeBytes { .. } => {
-                        expect_reabsorb = false;
-                    }
-                }
-            }
-            out
-        };
-
-        // Collect absorb var values (deduplicated, same order as the shape builder).
-        let mut absorb_local_map: std::collections::BTreeMap<usize, usize> =
-            std::collections::BTreeMap::new();
-        for i in 0..public_inputs_elems {
-            let (ab_start, ab_len) = canonical_absorb_ranges[i];
-            for j in 0..ab_len {
-                let v_ab_local = pose_wiring.absorb_vars[ab_start + j];
-                if v_ab_local == 0 {
-                    continue;
-                }
-                absorb_local_map.entry(v_ab_local).or_insert_with(|| {
-                    let idx = pub_glue_asg.len();
-                    pub_glue_asg.push(asg_pose[v_ab_local]);
-                    idx
-                });
-            }
-        }
+    // ids_hash assignment
+    let ops_ids = stmt_hash_ops_ids_only(
+        binding_witness.vk_hash,
+        binding_witness.r1cs_digest,
+        binding_witness.gate_digest,
+    );
+    let (_inst_ids, asg_ids, wiring_ids) =
+        symphony::dpp_poseidon::poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes::<F257>(
+            &cfg, &ops_ids,
+        )
+        .map_err(|e| format!("assignment_only: ids_hash poseidon build failed: {e:?}"))?;
+    let (ids_sf_start, ids_sf_len) = *wiring_ids
+        .squeeze_field_ranges
+        .last()
+        .ok_or("assignment_only: ids_hash missing squeeze_field_ranges")?;
+    if ids_sf_len != BIND_DIGEST_BYTES {
+        return Err("assignment_only: ids_hash squeeze len mismatch".to_string());
     }
+    let mut h_ids = [F257::ZERO; BIND_DIGEST_BYTES];
+    for j in 0..BIND_DIGEST_BYTES {
+        let v = wiring_ids.squeeze_field_vars[ids_sf_start + j];
+        h_ids[j] = asg_ids[v];
+    }
+
+    // stmt_hash assignment (absorb computed h_ids)
+    use symphony::transcript::PoseidonTraceOp;
+    let params_f257 = params.to_field_vec::<F257>();
+    let cvprefix_f257: Vec<F257> = binding_witness
+        .committed_values_prefix_bytes
+        .iter()
+        .map(|&b| F257::from(b as u64))
+        .collect();
+    let ops_stmt: Vec<PoseidonTraceOp<F257>> = vec![
+        PoseidonTraceOp::Absorb(vec![F257::from(2u64)]),
+        PoseidonTraceOp::Absorb(h_ids.to_vec()),
+        PoseidonTraceOp::Absorb(params_f257),
+        PoseidonTraceOp::Absorb(cvprefix_f257),
+        PoseidonTraceOp::SqueezeField(vec![F257::ZERO; BIND_DIGEST_BYTES]),
+    ];
+    let (_inst_stmt, asg_stmt, _wiring_stmt) =
+        symphony::dpp_poseidon::poseidon_sponge_dr1cs_from_ops_with_wiring_no_bytes::<F257>(
+            &cfg, &ops_stmt,
+        )
+        .map_err(|e| format!("assignment_only: stmt_hash poseidon build failed: {e:?}"))?;
 
     // ---- Merged assignment ------------------------------------------------
     // Same merge order as merge_file_backed_sparse_dr1cs_share_one:
-    // [ONE] ++ params_prefix[1..] ++ asg_pose[1..] ++ pub_glue[1..]
+    // [ONE] ++ params_prefix[1..] ++ asg_pose[1..] ++ cv_prefix_glue[1..] ++ ids_hash[1..] ++ stmt_hash[1..]
     let mut merged: Vec<F257> = Vec::with_capacity(
-        1 + (params_asg.len() - 1) + (asg_pose.len() - 1)
-            + if pub_glue_asg.is_empty() { 0 } else { pub_glue_asg.len() - 1 },
+        1 + (params_asg.len() - 1)
+            + (asg_pose.len() - 1)
+            + (glue_asg.len() - 1)
+            + (asg_ids.len() - 1)
+            + (asg_stmt.len() - 1),
     );
     merged.push(F257::ONE);
     merged.extend_from_slice(&params_asg[1..]);
     merged.extend_from_slice(&asg_pose[1..]);
-    if !pub_glue_asg.is_empty() {
-        merged.extend_from_slice(&pub_glue_asg[1..]);
-    }
+    merged.extend_from_slice(&glue_asg[1..]);
+    merged.extend_from_slice(&asg_ids[1..]);
+    merged.extend_from_slice(&asg_stmt[1..]);
 
     Ok(merged)
 }
@@ -1280,7 +1478,7 @@ mod tests {
             public_inputs_bf[0] = BF0::ZERO;
         }
         // Tiny-gate statement public prefix uses the byte encoding (8 bytes per base-field element).
-        let public_inputs_bytes_f257: Vec<F257> = public_inputs_bf
+        let _public_inputs_bytes_f257: Vec<F257> = public_inputs_bf
             .iter()
             .flat_map(|x| {
                 let bytes = latticefold::transcript::bytes::prime_field_to_bytes_le_fixed::<BF0>(x);
@@ -1308,17 +1506,52 @@ mod tests {
         };
         let proof =
             dummy_plus_proof_shape::<R>(&params, mlen_mats, n_lin_proofs).expect("dummy_plus_proof_shape");
+        let vk_hash = [1u8; 32];
+        let r1cs_digest = [2u8; 32];
+        let gate_digest = [3u8; 32];
+        let committed_values_digest = [4u8; 32];
+        // In the SP1 path, the first 8 public inputs are the committed-values digest lane.
+        // In this unit test, bind to the *actual* transcript-absorbed bytes for the first 8
+        // public inputs so the gate glue is satisfiable.
+        let committed_values_prefix_bytes: [u8; CV_PREFIX_BYTES] = {
+            let mut out = [0u8; CV_PREFIX_BYTES];
+            let pis = public_inputs_bf
+                .get(0..8)
+                .expect("test requires at least 8 public inputs for committed-values prefix");
+            for i in 0..8usize {
+                let bytes =
+                    latticefold::transcript::bytes::prime_field_to_bytes_le_fixed::<BF0>(&pis[i]);
+                out[8 * i..8 * i + 8].copy_from_slice(&bytes);
+            }
+            out
+        };
+        let committed_values_prefix_f257: [F257; CV_PREFIX_BYTES] =
+            committed_values_prefix_bytes.map(|b| F257::from(b as u64));
+        let stmt_digest_f257 = crate::we_statement::we_statement_hash_lf_plus::<R>(
+            vk_hash,
+            committed_values_prefix_f257,
+            r1cs_digest,
+            gate_digest,
+            &params,
+        );
+        let binding = WeStatementBindingWitness {
+            vk_hash,
+            r1cs_digest,
+            gate_digest,
+            committed_values_prefix_bytes,
+        };
         let (shape, asg) = build_or_load_we_plus_tiny_dr1cs::<R>(
             &trace,
             &params,
-            &public_inputs_bytes_f257,
+            &stmt_digest_f257,
+            &binding,
             &proof,
             mlen_mats,
             &pairs,
             &out_dir,
         )
         .expect("build_or_load_we_plus_tiny_dr1cs");
-        assert_eq!(shape.public_len, 1 + 10 + 8 * public_inputs_len);
+        assert_eq!(shape.public_len, 1 + 32);
         assert_eq!(asg.len(), shape.inst.nvars);
         shape.inst.check(&asg).expect("shape should be satisfied by witness assignment");
         eprintln!(
@@ -1330,7 +1563,6 @@ mod tests {
         );
 
         // Arm and then prove+decap using the satisfying assignment split into (x || z_w).
-        let stmt_digest = [3u8; 32];
         let armer_seed = [7u8; 32];
         let lock_j = 0u64;
 
@@ -1354,9 +1586,7 @@ mod tests {
         let lock0 = loop {
             match arm_lfplus_ringlwe_lock::<R>(
                 shape.clone(),
-                &params,
-                &public_inputs_bytes_f257,
-                stmt_digest,
+                &stmt_digest_f257,
                 armer_seed,
                 lock_j,
                 0,
@@ -1383,9 +1613,7 @@ mod tests {
         let lock1 = loop {
             match arm_lfplus_ringlwe_lock::<R>(
                 shape1.clone(),
-                &params,
-                &public_inputs_bytes_f257,
-                stmt_digest,
+                &stmt_digest_f257,
                 armer_seed,
                 lock_j,
                 0,
@@ -1414,7 +1642,7 @@ mod tests {
             prover.proof_len()
         );
 
-        let x = encode_public_x::<F257>(&params, &public_inputs_bytes_f257);
+        let x = encode_public_x::<F257>(&stmt_digest_f257);
         assert_eq!(x.len(), public_len);
         assert_eq!(&asg[..public_len], x.as_slice(), "satisfying assignment public prefix mismatch");
         let z_w = asg[public_len..].to_vec();
@@ -1545,7 +1773,7 @@ mod tests {
         if !public_inputs_bf.is_empty() {
             public_inputs_bf[0] = BF0::ZERO;
         }
-        let public_inputs_bytes_f257: Vec<F257> = public_inputs_bf
+        let _public_inputs_bytes_f257: Vec<F257> = public_inputs_bf
             .iter()
             .flat_map(|x| {
                 let bytes = latticefold::transcript::bytes::prime_field_to_bytes_le_fixed::<BF0>(x);
@@ -1576,10 +1804,42 @@ mod tests {
         };
         let proof =
             dummy_plus_proof_shape::<R>(&params, mlen_mats, n_lin_proofs).expect("dummy_plus_proof_shape");
+        let vk_hash = [1u8; 32];
+        let r1cs_digest = [2u8; 32];
+        let gate_digest = [3u8; 32];
+        let committed_values_digest = [4u8; 32];
+        let committed_values_prefix_bytes: [u8; CV_PREFIX_BYTES] = {
+            let mut out = [0u8; CV_PREFIX_BYTES];
+            let pis = public_inputs_bf
+                .get(0..8)
+                .expect("test requires at least 8 public inputs for committed-values prefix");
+            for i in 0..8usize {
+                let bytes =
+                    latticefold::transcript::bytes::prime_field_to_bytes_le_fixed::<BF0>(&pis[i]);
+                out[8 * i..8 * i + 8].copy_from_slice(&bytes);
+            }
+            out
+        };
+        let committed_values_prefix_f257: [F257; CV_PREFIX_BYTES] =
+            committed_values_prefix_bytes.map(|b| F257::from(b as u64));
+        let stmt_digest_f257 = crate::we_statement::we_statement_hash_lf_plus::<R>(
+            vk_hash,
+            committed_values_prefix_f257,
+            r1cs_digest,
+            gate_digest,
+            &params,
+        );
+        let binding = WeStatementBindingWitness {
+            vk_hash,
+            r1cs_digest,
+            gate_digest,
+            committed_values_prefix_bytes,
+        };
         let (shape, asg) = build_or_load_we_plus_tiny_dr1cs::<R>(
             &trace,
             &params,
-            &public_inputs_bytes_f257,
+            &stmt_digest_f257,
+            &binding,
             &proof,
             mlen_mats,
             &pairs,
@@ -1589,7 +1849,7 @@ mod tests {
         shape.inst.check(&asg).expect("shape should be satisfied by witness assignment");
 
         let public_len = shape.public_len;
-        let x = encode_public_x::<F257>(&params, &public_inputs_bytes_f257);
+        let x = encode_public_x::<F257>(&stmt_digest_f257);
         assert_eq!(x.len(), public_len);
         assert_eq!(&asg[..public_len], x.as_slice());
         let z_w = asg[public_len..].to_vec();
@@ -1625,7 +1885,6 @@ mod tests {
         let ringlwe_params = RingLweParams {
             ..RingLweParams::default()
         };
-        let stmt_digest = [5u8; 32];
         let lock_j = 0u64;
 
         let t_arm = Instant::now();
@@ -1635,9 +1894,7 @@ mod tests {
             let lock = loop {
                 match arm_lfplus_ringlwe_lock::<R>(
                     shape.clone(),
-                    &params,
-                    &public_inputs_bytes_f257,
-                    stmt_digest,
+                    &stmt_digest_f257,
                     [11u8.wrapping_add(i as u8); 32],
                     lock_j,
                     0,
@@ -1842,7 +2099,7 @@ mod tests {
         if !public_inputs_bf.is_empty() {
             public_inputs_bf[0] = BF0::ZERO;
         }
-        let public_inputs_bytes_f257: Vec<F257> = public_inputs_bf
+        let _public_inputs_bytes_f257: Vec<F257> = public_inputs_bf
             .iter()
             .flat_map(|x| {
                 let bytes = latticefold::transcript::bytes::prime_field_to_bytes_le_fixed::<BF0>(x);
@@ -1867,14 +2124,45 @@ mod tests {
         };
         let proof = dummy_plus_proof_shape::<R>(&params, mlen_mats, n_lin_proofs)
             .expect("dummy_plus_proof_shape");
+        let vk_hash = [1u8; 32];
+        let r1cs_digest = [2u8; 32];
+        let gate_digest = [3u8; 32];
+        let committed_values_digest = [4u8; 32];
+        let committed_values_prefix_bytes: [u8; CV_PREFIX_BYTES] = {
+            let mut out = [0u8; CV_PREFIX_BYTES];
+            let pis = public_inputs_bf
+                .get(0..8)
+                .expect("test requires at least 8 public inputs for committed-values prefix");
+            for i in 0..8usize {
+                let bytes =
+                    latticefold::transcript::bytes::prime_field_to_bytes_le_fixed::<BF0>(&pis[i]);
+                out[8 * i..8 * i + 8].copy_from_slice(&bytes);
+            }
+            out
+        };
+        let committed_values_prefix_f257: [F257; CV_PREFIX_BYTES] =
+            committed_values_prefix_bytes.map(|b| F257::from(b as u64));
+        let stmt_digest_f257 = crate::we_statement::we_statement_hash_lf_plus::<R>(
+            vk_hash,
+            committed_values_prefix_f257,
+            r1cs_digest,
+            gate_digest,
+            &params,
+        );
+        let binding = WeStatementBindingWitness {
+            vk_hash,
+            r1cs_digest,
+            gate_digest,
+            committed_values_prefix_bytes,
+        };
         let (shape, asg) = build_or_load_we_plus_tiny_dr1cs::<R>(
-            &trace, &params, &public_inputs_bytes_f257, &proof, mlen_mats, &pairs, &out_dir,
+            &trace, &params, &stmt_digest_f257, &binding, &proof, mlen_mats, &pairs, &out_dir,
         )
         .expect("build_or_load_we_plus_tiny_dr1cs");
         shape.inst.check(&asg).expect("shape satisfied");
 
         let public_len = shape.public_len;
-        let x = encode_public_x::<F257>(&params, &public_inputs_bytes_f257);
+        let x = encode_public_x::<F257>(&stmt_digest_f257);
         let z_w = asg[public_len..].to_vec();
 
         let prover = crate::we_tiny_lock::we_ringlwe_prover_from_dr1cs::<F257>(
@@ -1892,7 +2180,6 @@ mod tests {
             shares: 16,
         };
         let ringlwe_params = RingLweParams::default();
-        let stmt_digest = [5u8; 32];
 
         // Each armer samples a secret scalar. Individual P_j = s_j·G are NEVER published.
         // Only the combined P_combined is public (derived Bitcoin address).
@@ -1947,9 +2234,7 @@ mod tests {
                 let lock = loop {
                     match arm_lfplus_ringlwe_lock::<R>(
                         shape.clone(),
-                        &params,
-                        &public_inputs_bytes_f257,
-                        stmt_digest,
+                        &stmt_digest_f257,
                         // Unique armer seed per (armer, lock).
                         {
                             let mut seed = [0u8; 32];
@@ -2403,7 +2688,7 @@ mod tests {
             public_inputs_bf[i] = BF0::ZERO;
         }
 
-        let public_inputs_bytes_f257: Vec<F257> = public_inputs_bf
+        let _public_inputs_bytes_f257: Vec<F257> = public_inputs_bf
             .iter()
             .flat_map(|x| {
                 let bytes = latticefold::transcript::bytes::prime_field_to_bytes_le_fixed::<BF0>(x);
@@ -2444,10 +2729,42 @@ mod tests {
         };
         let proof =
             dummy_plus_proof_shape::<R>(&params, mlen_mats, n_lin_proofs).expect("dummy_plus_proof_shape");
+        let vk_hash = [1u8; 32];
+        let r1cs_digest = [2u8; 32];
+        let gate_digest = [3u8; 32];
+        let committed_values_digest = [4u8; 32];
+        let committed_values_prefix_bytes: [u8; CV_PREFIX_BYTES] = {
+            let mut out = [0u8; CV_PREFIX_BYTES];
+            let pis = public_inputs_bf
+                .get(0..8)
+                .expect("test requires at least 8 public inputs for committed-values prefix");
+            for i in 0..8usize {
+                let bytes =
+                    latticefold::transcript::bytes::prime_field_to_bytes_le_fixed::<BF0>(&pis[i]);
+                out[8 * i..8 * i + 8].copy_from_slice(&bytes);
+            }
+            out
+        };
+        let committed_values_prefix_f257: [F257; CV_PREFIX_BYTES] =
+            committed_values_prefix_bytes.map(|b| F257::from(b as u64));
+        let stmt_digest_f257 = crate::we_statement::we_statement_hash_lf_plus::<R>(
+            vk_hash,
+            committed_values_prefix_f257,
+            r1cs_digest,
+            gate_digest,
+            &params,
+        );
+        let binding = WeStatementBindingWitness {
+            vk_hash,
+            r1cs_digest,
+            gate_digest,
+            committed_values_prefix_bytes,
+        };
         let (shape, asg) = build_or_load_we_plus_tiny_dr1cs::<R>(
             &trace,
             &params,
-            &public_inputs_bytes_f257,
+            &stmt_digest_f257,
+            &binding,
             &proof,
             mlen_mats,
             &pairs,
@@ -2465,7 +2782,6 @@ mod tests {
         );
 
         // Arm and then prove+decap using the satisfying assignment split into (x || z_w).
-        let stmt_digest = [3u8; 32];
         let armer_seed = [7u8; 32];
         let lock_j = 0u64;
         let ringlwe_params = RingLweParams::default();
@@ -2484,9 +2800,7 @@ mod tests {
         let lock0 = loop {
             match arm_lfplus_ringlwe_lock::<R>(
                 shape.clone(),
-                &params,
-                &public_inputs_bytes_f257,
-                stmt_digest,
+                &stmt_digest_f257,
                 armer_seed,
                 lock_j,
                 0,
@@ -2513,9 +2827,7 @@ mod tests {
         let lock1 = loop {
             match arm_lfplus_ringlwe_lock::<R>(
                 shape1.clone(),
-                &params,
-                &public_inputs_bytes_f257,
-                stmt_digest,
+                &stmt_digest_f257,
                 armer_seed,
                 lock_j,
                 0,
@@ -2544,7 +2856,7 @@ mod tests {
             prover.proof_len()
         );
 
-        let x = encode_public_x::<F257>(&params, &public_inputs_bytes_f257);
+        let x = encode_public_x::<F257>(&stmt_digest_f257);
         assert_eq!(x.len(), public_len);
         assert_eq!(&asg[..public_len], x.as_slice(), "satisfying assignment public prefix mismatch");
         let z_w = asg[public_len..].to_vec();
@@ -2668,7 +2980,7 @@ mod tests {
             p
         };
         let coeff_bytes = ((<RR as PolyRing>::BaseRing::MODULUS_BIT_SIZE as usize) + 7) / 8;
-        let public_inputs_bytes_f257: Vec<F257> =
+        let _public_inputs_bytes_f257: Vec<F257> =
             vec![F257::ZERO; public_inputs_len * coeff_bytes];
 
         let trace0 = poseidon_trace_schedule_for_plus_with_public_inputs::<RR>(
@@ -2679,8 +2991,29 @@ mod tests {
         )
         .expect("poseidon_trace_schedule_for_plus_with_public_inputs(base)");
         let proof0 = dummy_plus_proof_shape::<RR>(&base, 0, n_lin_proofs).expect("dummy_plus_proof_shape(base)");
+        let vk_hash = [1u8; 32];
+        let r1cs_digest = [2u8; 32];
+        let gate_digest = [3u8; 32];
+        let committed_values_digest = [4u8; 32];
+        // This test builds the trace with all-zero public inputs, so the absorbed prefix bytes are zero.
+        let committed_values_prefix_bytes = [0u8; CV_PREFIX_BYTES];
+        let committed_values_prefix_f257: [F257; CV_PREFIX_BYTES] =
+            committed_values_prefix_bytes.map(|b| F257::from(b as u64));
+        let binding = WeStatementBindingWitness {
+            vk_hash,
+            r1cs_digest,
+            gate_digest,
+            committed_values_prefix_bytes,
+        };
+        let stmt_digest_f257 = crate::we_statement::we_statement_hash_lf_plus::<RR>(
+            vk_hash,
+            committed_values_prefix_f257,
+            r1cs_digest,
+            gate_digest,
+            &base,
+        );
         let (s0, _) = build_or_load_we_plus_tiny_dr1cs::<RR>(
-            &trace0, &base, &public_inputs_bytes_f257, &proof0, 0, &pairs, &out_dir0,
+            &trace0, &base, &stmt_digest_f257, &binding, &proof0, 0, &pairs, &out_dir0,
         )
         .expect("shape(base)");
         let trace1 = poseidon_trace_schedule_for_plus_with_public_inputs::<RR>(
@@ -2691,8 +3024,15 @@ mod tests {
         )
         .expect("poseidon_trace_schedule_for_plus_with_public_inputs(alt)");
         let proof1 = dummy_plus_proof_shape::<RR>(&alt, 1, n_lin_proofs).expect("dummy_plus_proof_shape(alt)");
+        let stmt_digest_alt = crate::we_statement::we_statement_hash_lf_plus::<RR>(
+            vk_hash,
+            committed_values_prefix_f257,
+            r1cs_digest,
+            gate_digest,
+            &alt,
+        );
         let (s1, _) = build_or_load_we_plus_tiny_dr1cs::<RR>(
-            &trace1, &alt, &public_inputs_bytes_f257, &proof1, 1, &pairs, &out_dir1,
+            &trace1, &alt, &stmt_digest_alt, &binding, &proof1, 1, &pairs, &out_dir1,
         )
         .expect("shape(alt)");
         assert_ne!(s0.public_len, 0);
@@ -2746,7 +3086,7 @@ mod tests {
             .map(|i| if (i % 3) == 1 { F257::ONE } else { F257::ZERO })
             .collect();
         // Tiny-gate statement public prefix uses byte encoding (8 bytes per base-field element).
-        let public_inputs_bytes: Vec<F257> = public_inputs_elems
+        let _public_inputs_bytes: Vec<F257> = public_inputs_elems
             .iter()
             .flat_map(|x| {
                 let u = x.into_bigint().as_ref().get(0).copied().unwrap_or(0) as u8;
@@ -2778,10 +3118,42 @@ mod tests {
             p
         };
         let proof = dummy_plus_proof_shape::<RR>(&params, mlen_mats, n_lin_proofs).expect("dummy_plus_proof_shape");
+        let vk_hash = [1u8; 32];
+        let r1cs_digest = [2u8; 32];
+        let gate_digest = [3u8; 32];
+        let committed_values_digest = [4u8; 32];
+        let committed_values_prefix_bytes: [u8; CV_PREFIX_BYTES] = {
+            let mut out = [0u8; CV_PREFIX_BYTES];
+            let pis = public_inputs_bf
+                .get(0..8)
+                .expect("test requires at least 8 public inputs for committed-values prefix");
+            for i in 0..8usize {
+                let bytes =
+                    latticefold::transcript::bytes::prime_field_to_bytes_le_fixed::<BF0>(&pis[i]);
+                out[8 * i..8 * i + 8].copy_from_slice(&bytes);
+            }
+            out
+        };
+        let committed_values_prefix_f257: [F257; CV_PREFIX_BYTES] =
+            committed_values_prefix_bytes.map(|b| F257::from(b as u64));
+        let stmt_digest_f257 = crate::we_statement::we_statement_hash_lf_plus::<RR>(
+            vk_hash,
+            committed_values_prefix_f257,
+            r1cs_digest,
+            gate_digest,
+            &params,
+        );
+        let binding = WeStatementBindingWitness {
+            vk_hash,
+            r1cs_digest,
+            gate_digest,
+            committed_values_prefix_bytes,
+        };
         let (shape, asg) = build_or_load_we_plus_tiny_dr1cs::<RR>(
             &trace,
             &params,
-            &public_inputs_bytes,
+            &stmt_digest_f257,
+            &binding,
             &proof,
             mlen_mats,
             &pairs,
@@ -2791,9 +3163,9 @@ mod tests {
         shape.inst.check(&asg).expect("baseline should satisfy");
 
         // Flip the first public input. Public prefix layout:
-        // [ONE] || [10×WeParams] || [public_inputs...]
+        // [ONE] || [stmt_digest(32)].
         let mut bad = asg.clone();
-        let first_pi = 1usize + 10usize;
+        let first_pi = 1usize;
         bad[first_pi] += F257::ONE;
         assert!(
             shape.inst.check(&bad).is_err(),
@@ -2832,7 +3204,7 @@ mod tests {
             poseidon_trace_schedule_for_plus::<RR>(public_inputs_len, &params, n_lin_proofs, mlen_mats)
                 .expect("poseidon_trace_schedule_for_plus");
         let public_inputs_elems: Vec<F257> = vec![F257::ZERO; public_inputs_len];
-        let public_inputs_bytes: Vec<F257> = public_inputs_elems
+        let _public_inputs_bytes: Vec<F257> = public_inputs_elems
             .iter()
             .flat_map(|_x| [0u8, 0, 0, 0, 0, 0, 0, 0].into_iter().map(|b| F257::from(b as u64)))
             .collect();
@@ -2845,10 +3217,32 @@ mod tests {
             p
         };
         let proof = dummy_plus_proof_shape::<RR>(&params, mlen_mats, n_lin_proofs).expect("dummy_plus_proof_shape");
+        let vk_hash = [1u8; 32];
+        let r1cs_digest = [2u8; 32];
+        let gate_digest = [3u8; 32];
+        let committed_values_digest = [4u8; 32];
+        // This test uses an all-zero public input schedule, so the absorbed prefix bytes are zero.
+        let committed_values_prefix_bytes = [0u8; CV_PREFIX_BYTES];
+        let committed_values_prefix_f257: [F257; CV_PREFIX_BYTES] =
+            committed_values_prefix_bytes.map(|b| F257::from(b as u64));
+        let stmt_digest_f257 = crate::we_statement::we_statement_hash_lf_plus::<RR>(
+            vk_hash,
+            committed_values_prefix_f257,
+            r1cs_digest,
+            gate_digest,
+            &params,
+        );
+        let binding = WeStatementBindingWitness {
+            vk_hash,
+            r1cs_digest,
+            gate_digest,
+            committed_values_prefix_bytes,
+        };
         let (shape, asg) = build_or_load_we_plus_tiny_dr1cs::<RR>(
             &trace,
             &params,
-            &public_inputs_bytes,
+            &stmt_digest_f257,
+            &binding,
             &proof,
             mlen_mats,
             &pairs,
@@ -2922,7 +3316,6 @@ mod tests {
         use cyclotomic_rings::rings::GoldilocksRing64 as RR;
         use stark_rings::PolyRing;
 
-        use ark_ff::PrimeField;
         use rand::RngCore;
         #[cfg(feature = "parallel")]
         use rayon::current_num_threads;
@@ -3153,20 +3546,41 @@ mod tests {
                 std::fs::create_dir_all(&p).expect("create temp out_dir");
                 p
             };
-            // Public inputs for the tiny gate are absorbed as bytes (8 bytes per base-field element).
-            // In this benchmark the public inputs are digest bits (0/1), so byte-encoding is trivial.
-            let public_inputs_f257: Vec<F257> = sp1_digest_bits
-                .iter()
-                .flat_map(|x| {
-                    let u = x.into_bigint().as_ref().get(0).copied().unwrap_or(0) as u8;
-                    // 8-byte little-endian encoding of a small integer.
-                    [u, 0, 0, 0, 0, 0, 0, 0].into_iter().map(|b| F257::from(b as u64))
-                })
-                .collect();
+            let vk_hash = [1u8; 32];
+            let r1cs_digest = [2u8; 32];
+            let gate_digest = [3u8; 32];
+            let committed_values_digest = [4u8; 32];
+            let committed_values_prefix_bytes: [u8; CV_PREFIX_BYTES] = {
+                let mut out = [0u8; CV_PREFIX_BYTES];
+                let pis = sp1_digest_bits
+                    .get(0..8)
+                    .expect("test requires at least 8 public inputs for committed-values prefix");
+                for i in 0..8usize {
+                    let bytes = latticefold::transcript::bytes::prime_field_to_bytes_le_fixed::<FSmall>(&pis[i]);
+                    out[8 * i..8 * i + 8].copy_from_slice(&bytes);
+                }
+                out
+            };
+            let committed_values_prefix_f257: [F257; CV_PREFIX_BYTES] =
+                committed_values_prefix_bytes.map(|b| F257::from(b as u64));
+            let stmt_digest_f257 = crate::we_statement::we_statement_hash_lf_plus::<RR>(
+                vk_hash,
+                committed_values_prefix_f257,
+                r1cs_digest,
+                gate_digest,
+                &params,
+            );
+            let binding = WeStatementBindingWitness {
+                vk_hash,
+                r1cs_digest,
+                gate_digest,
+                committed_values_prefix_bytes,
+            };
             let (shape, tiny_asg) = build_or_load_we_plus_tiny_dr1cs::<RR>(
                 &trace,
                 &params,
-                &public_inputs_f257,
+                &stmt_digest_f257,
+                &binding,
                 &proof,
                 m0.len(),
                 &pairs,

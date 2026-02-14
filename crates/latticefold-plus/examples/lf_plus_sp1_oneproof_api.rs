@@ -9,7 +9,7 @@
 //!   LFP_ONEPROOF_LOCK_PKG_OUT=/path/to/lock_pkg.bin \
 //!   LFP_ONEPROOF_K=16 \
 //!   SP1_VK_HASH_HEX=0x... \
-//!   SP1_PUBLIC_INPUTS_U64=1,2,3,... \
+//!   SP1_PUBLIC_VALUES_DIGEST_U64_CSV=u0,u1,u2,u3,u4,u5,u6,u7 \
 //!     cargo run -p latticefold-plus --example lf_plus_sp1_oneproof_api --features we_gate --release
 //!
 //! Or decap (read pre-armed package):
@@ -26,9 +26,8 @@
 
 #![cfg(feature = "we_gate")]
 
-use ark_ff::Field;
-use cyclotomic_rings::rings::GoldilocksRing64 as R;
-use stark_rings::PolyRing;
+use ark_ff::PrimeField;
+use latticefold::transcript::poseidon::F257;
 
 fn hex32(bytes: [u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -36,6 +35,20 @@ fn hex32(bytes: [u8; 32]) -> String {
     for &b in &bytes {
         out.push(HEX[(b >> 4) as usize] as char);
         out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_stmt_digest(fields: [F257; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(128);
+    for f in &fields {
+        let v = (f.into_bigint().as_ref()[0] % 257) as u16;
+        let b = v.to_le_bytes();
+        for &x in &b {
+            out.push(HEX[(x >> 4) as usize] as char);
+            out.push(HEX[(x & 0x0f) as usize] as char);
+        }
     }
     out
 }
@@ -69,18 +82,6 @@ fn init_rayon_stack() {
 
 #[cfg(not(feature = "parallel"))]
 fn init_rayon_stack() {}
-
-#[inline]
-fn babybear_u64_to_centered_host<F: Field>(x: u64, p_bb: u64) -> F {
-    debug_assert!(p_bb > 1);
-    let half = p_bb / 2;
-    if x > half {
-        let neg = p_bb - x;
-        -F::from(neg)
-    } else {
-        F::from(x)
-    }
-}
 
 fn parse_hex_32(mut s: &str) -> [u8; 32] {
     if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
@@ -116,6 +117,11 @@ fn parse_u64_csv(s: &str) -> Vec<u64> {
 
 fn main() {
     init_rayon_stack();
+    eprintln!(
+        "[oneproof] rayon_threads={} RAYON_NUM_THREADS={:?}",
+        rayon::current_num_threads(),
+        std::env::var("RAYON_NUM_THREADS").ok()
+    );
     let t_total = std::time::Instant::now();
     let r1lf_path = std::env::var("SP1_R1LF").expect("Set SP1_R1LF=/path/to/shrink.r1lf");
     let witness_path = std::env::var("SP1_WITNESS")
@@ -138,13 +144,19 @@ fn main() {
         println!("SP1_VK_HASH_HEX=0x{}", hex32(vk_hash));
         let l_pub = hdr.num_public;
         let pub_words = &bundle.witness[1..1 + l_pub];
-        let csv = pub_words
+        if pub_words.len() < 8 {
+            panic!("expected at least 8 public inputs (got={})", pub_words.len());
+        }
+        let digest_words8_csv = pub_words[0..8]
             .iter()
             .map(|x| x.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        println!("SP1_PUBLIC_INPUTS_U64={}", csv);
-        eprintln!("[oneproof] extracted num_public={}", l_pub);
+        println!("SP1_PUBLIC_VALUES_DIGEST_U64_CSV={}", digest_words8_csv);
+        eprintln!(
+            "[oneproof] extracted num_public={} (use first 8 public inputs as public_values.digest words)",
+            l_pub
+        );
         return;
     }
 
@@ -162,33 +174,30 @@ fn main() {
         let vk_hash = parse_hex_32(
             &std::env::var("SP1_VK_HASH_HEX").expect("Set SP1_VK_HASH_HEX=0x... (32-byte hex)"),
         );
-        let pub_u64 = parse_u64_csv(
-            &std::env::var("SP1_PUBLIC_INPUTS_U64")
-                .expect("Set SP1_PUBLIC_INPUTS_U64=comma-separated u64 witness words (len=num_public)"),
-        );
-        if pub_u64.len() != hdr.num_public {
+        let public_values_digest_words8: [u64; 8] = {
+            let csv = std::env::var("SP1_PUBLIC_VALUES_DIGEST_U64_CSV")
+                .expect("Set SP1_PUBLIC_VALUES_DIGEST_U64_CSV=u0,u1,u2,u3,u4,u5,u6,u7");
+            let xs = parse_u64_csv(&csv);
+            assert!(xs.len() == 8, "SP1_PUBLIC_VALUES_DIGEST_U64_CSV must have 8 values");
+            xs.try_into().unwrap()
+        };
+        if hdr.num_public < 8 {
             panic!(
-                "SP1_PUBLIC_INPUTS_U64 length mismatch: got={} expected_num_public={}",
-                pub_u64.len(),
+                "SP1 R1LF num_public too small for public_values.digest lane: num_public={}",
                 hdr.num_public
             );
         }
-        type BFSmall = <<R as PolyRing>::BaseRing as Field>::BasePrimeField;
-        let public_inputs: Vec<BFSmall> = pub_u64
-            .iter()
-            .map(|&x| babybear_u64_to_centered_host::<BFSmall>(x, hdr.p_bb))
-            .collect();
 
         let out = latticefold_plus::sp1_oneproof_api::arm_sp1_oneproof_we_gate_write_lock_package(
             &r1lf_path,
             vk_hash,
-            &public_inputs,
+            public_values_digest_words8,
             &lock_pkg_out,
             k_locks,
         )
         .expect("arm_sp1_oneproof_we_gate_write_lock_package");
 
-        println!("stmt_digest=0x{}", hex32(out.manifest.stmt_digest));
+        println!("stmt_digest_f257_le16=0x{}", hex_stmt_digest(out.manifest.stmt_digest));
         println!("lock_coin_seed=0x{}", hex32(out.manifest.lock_coin_seed));
         println!("k_locks={}", out.k_locks);
         println!("lock_pkg_bytes={}", out.lock_pkg_bytes);
@@ -207,7 +216,7 @@ fn main() {
         )
         .expect("decap_sp1_oneproof_we_gate_from_files_with_lock_package");
 
-    println!("stmt_digest=0x{}", hex32(out.stmt_digest));
+    println!("stmt_digest_f257_le16=0x{}", hex_stmt_digest(out.stmt_digest));
     println!("lock_coin_seed=0x{}", hex32(out.lock_coin_seed));
     println!("decapped_key=0x{}", hex32(out.decapped_key));
     eprintln!("[oneproof] total_elapsed={:?}", t_total.elapsed());

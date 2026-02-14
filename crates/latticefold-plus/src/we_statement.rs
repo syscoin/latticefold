@@ -9,7 +9,9 @@
 //! Importantly, this intentionally does **not** include prover-chosen proof artifacts (e.g. Ajtai
 //! commitments to witness), since arming must be possible without observing a specific proving run.
 
-use ark_ff::{BigInteger, Field, PrimeField};
+use ark_crypto_primitives::sponge::{poseidon::PoseidonSponge, CryptographicSponge};
+use ark_ff::{Field, PrimeField};
+use latticefold::transcript::poseidon::{f257_poseidon_config, F257};
 use sha2::{Digest, Sha256};
 use stark_rings::OverField;
 
@@ -51,49 +53,86 @@ impl WeParams {
     }
 }
 
-/// SHA256 hash of the **public** statement for `R_WE` (LF+).
+/// Tiny-field Poseidon hash wrapper returning 32 native field elements.
+///
+/// - Absorbs input bytes as F257 elements in `[0,255]`.
+/// - Squeezes 32 full F257 elements (`0..=256`) with no byte projection.
+#[inline]
+pub fn tiny_hash32_fields(parts: &[&[u8]]) -> [F257; 32] {
+    let cfg = f257_poseidon_config();
+    let mut sponge = PoseidonSponge::<F257>::new(&cfg);
+    for p in parts {
+        if p.is_empty() {
+            continue;
+        }
+        let elems: Vec<F257> = p.iter().map(|&b| F257::from(b as u64)).collect();
+        sponge.absorb(&elems);
+    }
+    let out_vec = sponge.squeeze_field_elements::<F257>(32);
+    out_vec
+        .try_into()
+        .expect("squeeze_field_elements(32) must return exactly 32 elements")
+}
+
+/// Tiny-field Poseidon hash wrapper (native field outputs) with a compact one-byte domain separator.
+#[inline]
+pub fn tiny_hash32_fields_with_domain(domain: u8, parts: &[&[u8]]) -> [F257; 32] {
+    let domain_buf = [domain];
+    let mut with_domain: Vec<&[u8]> = Vec::with_capacity(parts.len() + 1);
+    with_domain.push(&domain_buf);
+    with_domain.extend_from_slice(parts);
+    tiny_hash32_fields(&with_domain)
+}
+
+/// Tiny-field Poseidon hash wrapper returning 32 native field elements from field-element absorbs.
+#[inline]
+pub fn tiny_hash32_field_elems(parts: &[&[F257]]) -> [F257; 32] {
+    let cfg = f257_poseidon_config();
+    let mut sponge = PoseidonSponge::<F257>::new(&cfg);
+    for p in parts {
+        if p.is_empty() {
+            continue;
+        }
+        sponge.absorb(&p.to_vec());
+    }
+    let out_vec = sponge.squeeze_field_elements::<F257>(32);
+    out_vec
+        .try_into()
+        .expect("squeeze_field_elements(32) must return exactly 32 elements")
+}
+
+/// Tiny-field Poseidon hash wrapper (field absorbs + compact one-element domain separator).
+#[inline]
+pub fn tiny_hash32_field_elems_with_domain(domain: u8, parts: &[&[F257]]) -> [F257; 32] {
+    let domain_elem = [F257::from(domain as u64)];
+    let mut with_domain: Vec<&[F257]> = Vec::with_capacity(parts.len() + 1);
+    with_domain.push(&domain_elem);
+    with_domain.extend_from_slice(parts);
+    tiny_hash32_field_elems(&with_domain)
+}
+
+/// Tiny-field Poseidon hash of the **public** statement for `R_WE` (LF+).
 ///
 /// This intentionally excludes proof artifacts (e.g. witness commitments).
+///
+/// Structure:
+/// - `h_ids = TinyHash(ds=1 || vk_hash || r1cs_digest || gate_digest)`
+/// - `h_params = TinyHash(ds=2 || encode_le(params))`
+/// - `we_core_digest = TinyHash(ds=3 || h_ids || h_params)`
+/// - `stmt_digest = TinyHash(ds=4 || we_core_digest || committed_values_prefix_bytes)`
 pub fn we_statement_hash_lf_plus<R: OverField>(
     vk_hash: [u8; 32],
+    committed_values_prefix_bytes: [F257; 64],
     r1cs_digest: [u8; 32],
     gate_digest: [u8; 32],
     params: &WeParams,
-    public_inputs: &[R::BaseRing],
-) -> [u8; 32]
+) -> [F257; 32]
 where
     R::BaseRing: Field,
 {
-    let mut h = Sha256::new();
-    h.update(b"LATTICEFOLD_PLUS_WE_STATEMENT_V1");
-    h.update(&vk_hash);
-    h.update(&r1cs_digest);
-    h.update(&gate_digest);
-
-    // Bind statement params in the same order as `WeParams::to_field_vec`.
-    for v in [
-        params.nvars_setchk,
-        params.degree_setchk,
-        params.nvars_cm,
-        params.degree_cm,
-        params.kappa,
-        params.ring_dim_d,
-        params.decomp_b,
-        params.k,
-        params.l,
-        params.mlen,
-    ] {
-        h.update(&v.to_le_bytes());
-    }
-
-    h.update(&(public_inputs.len() as u64).to_le_bytes());
-    for x in public_inputs {
-        for fp in x.to_base_prime_field_elements() {
-            h.update(fp.into_bigint().to_bytes_le());
-        }
-    }
-
-    h.finalize().into()
+    let h_ids = tiny_hash32_fields_with_domain(1, &[&vk_hash, &r1cs_digest, &gate_digest]);
+    let h_params = params.to_field_vec::<F257>();
+    tiny_hash32_field_elems_with_domain(2, &[&h_ids, &h_params, &committed_values_prefix_bytes])
 }
 
 /// Canonical encoding for a 32-byte digest as a field element.
@@ -149,11 +188,10 @@ pub const LFP_WE_GATE_DIGEST_V1: [u8; 32] = [
 ///
 /// NOTE: The exact set of extra statement elements is decided by the WE arithmetizer; this module
 /// just provides a stable prefix layout for params.
-pub fn encode_public_x<BF: PrimeField>(params: &WeParams, extra: &[BF]) -> Vec<BF> {
-    let mut out = Vec::with_capacity(1 + 10 + extra.len());
+pub fn encode_public_x<BF: PrimeField>(stmt_digest: &[BF; 32]) -> Vec<BF> {
+    let mut out = Vec::with_capacity(1 + stmt_digest.len());
     out.push(BF::ONE);
-    out.extend(params.to_field_vec::<BF>());
-    out.extend_from_slice(extra);
+    out.extend_from_slice(stmt_digest);
     out
 }
 
