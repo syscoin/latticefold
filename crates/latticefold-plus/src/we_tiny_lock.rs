@@ -749,9 +749,10 @@ impl<F: PrimeField + FftField> WeRingLweProverContext<F> {
         z_w: &[F],
         coins_list: &[Theorem43Coins<F>],
         on_pi0_chunk: &mut dyn FnMut(&[F]),
+        on_tail_elem: &mut dyn FnMut(usize, usize, &F),
     ) -> Result<Vec<dpp::theorem43::Theorem43AbgTail<F>>, String> {
         self.dpp
-            .stream_pi0_and_collect_tails(x, z_w, coins_list, on_pi0_chunk)
+            .stream_pi0_and_collect_tails(x, z_w, coins_list, on_pi0_chunk, on_tail_elem)
     }
 
     pub fn proof_len(&self) -> usize {

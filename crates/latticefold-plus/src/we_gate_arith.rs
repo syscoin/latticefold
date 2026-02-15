@@ -1654,14 +1654,50 @@ mod tests {
             coins_list.push(sl.coins.clone());
             meta.push((1, si));
         }
-        let tails = prover
-            .stream_pi0_and_collect_tails(&x, &z_w, &coins_list, &mut |_chunk| {})
+        // Canonical path: stream tails and fold them immediately (no tail vectors).
+        let mut tail_dots_mod257: Vec<u16> = vec![0u16; coins_list.len()];
+        let mut cur_ci: Option<usize> = None;
+        let mut cur_blk: usize = 0;
+        let mut buf_len: usize = 0;
+        let mut buf64: [u16; 64] = [0u16; 64];
+        let abg_list = prover
+            .stream_pi0_and_collect_tails(
+                &x,
+                &z_w,
+                &coins_list,
+                &mut |_chunk| {},
+                &mut |ci, _ti, t| {
+                    if cur_ci != Some(ci) {
+                        cur_ci = Some(ci);
+                        cur_blk = 0;
+                        buf_len = 0;
+                    }
+                    let td = crate::lockable_ringlwe::field_mod257_u16(t);
+                    buf64[buf_len] = td;
+                    buf_len += 1;
+                    if buf_len == 64 {
+                        let (lock_id, si) = meta[ci];
+                        let sl = match lock_id {
+                            0 => &lock0.sublocks[si],
+                            1 => &lock1.sublocks[si],
+                            _ => unreachable!(),
+                        };
+                        let blk = &sl.hints.tail_scales[cur_blk];
+                        let add = crate::lockable_ringlwe::dot_packed_block_mod257_u16(blk, &buf64);
+                        let acc = &mut tail_dots_mod257[ci];
+                        *acc = crate::lockable_ringlwe::add_mod257_u16(*acc, add);
+                        cur_blk += 1;
+                        buf_len = 0;
+                    }
+                },
+            )
             .expect("stream_pi0_and_collect_tails");
-        assert_eq!(tails.len(), meta.len());
+        assert_eq!(abg_list.len(), meta.len());
+        assert_eq!(buf_len, 0);
         use rayon::prelude::*;
         let mut cands0: Vec<Option<(u16, [u16; 2])>> = vec![None; lock0.sublocks.len()];
         let mut cands1: Vec<Option<(u16, [u16; 2])>> = vec![None; lock1.sublocks.len()];
-        let results: Vec<(usize, usize, u16, [u16; 2])> = tails
+        let results: Vec<(usize, usize, u16, [u16; 2])> = abg_list
             .par_iter()
             .enumerate()
             .map(|(gi, abgt)| {
@@ -1671,8 +1707,8 @@ mod tests {
                     1 => &lock1.sublocks[si],
                     _ => unreachable!(),
                 };
-                let cands =
-                    crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt)
+                let td = tail_dots_mod257[gi];
+                let cands = crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt, td)
                     .expect("sublock candidates");
                 (lock_id, si, sl.channel_id, cands)
             })
@@ -1693,24 +1729,16 @@ mod tests {
         assert!(pt0.is_empty());
         assert!(pt1.is_empty());
 
-        // Accepting set structure: for every sublock, shifted set satisfies a1 = a0 + 1.
+        // Accepting set structure: fixed `{1,2}` for every sublock.
         for lock in [&lock0, &lock1] {
             for sl in &lock.sublocks {
-                let a0 = sl.accepting_set[0];
-                let a1 = sl.accepting_set[1];
-                assert!(a0 != F257::ZERO && a1 != F257::ZERO);
-                assert_eq!(a1, a0 + F257::ONE);
+                assert_eq!(sl.accepting_set[0], F257::ONE);
+                assert_eq!(sl.accepting_set[1], F257::from(2u64));
             }
         }
 
         maybe_print_rss("tiny_gate:after_prove_decap_stream");
         eprintln!("[tiny_gate] prove+decap(stream) in {:?}", t_prove.elapsed());
-
-        // Negative check: wrong x length must fail decryption binding (candidate extraction uses x),
-        // so we should not be able to derive a unique per-channel secret tuple.
-        let mut x_bad = x.clone();
-        x_bad.push(F257::ONE);
-        assert_ne!(x_bad.len(), lock0.x_len);
 
         // Now it is safe to reclaim disk space used by the shape files.
         crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir);
@@ -1919,18 +1947,50 @@ mod tests {
                 meta.push((li, si));
             }
         }
-        let abg_tails = prover
-            .stream_pi0_and_collect_tails(&x, &z_w, &coins_list, &mut |_chunk| {})
+        let mut tail_dots_mod257: Vec<u16> = vec![0u16; coins_list.len()];
+        let mut cur_ci: Option<usize> = None;
+        let mut cur_blk: usize = 0;
+        let mut buf_len: usize = 0;
+        let mut buf64: [u16; 64] = [0u16; 64];
+        let abg_list = prover
+            .stream_pi0_and_collect_tails(
+                &x,
+                &z_w,
+                &coins_list,
+                &mut |_chunk| {},
+                &mut |ci, _ti, t| {
+                    if cur_ci != Some(ci) {
+                        cur_ci = Some(ci);
+                        cur_blk = 0;
+                        buf_len = 0;
+                    }
+                    let td = crate::lockable_ringlwe::field_mod257_u16(t);
+                    buf64[buf_len] = td;
+                    buf_len += 1;
+                    if buf_len == 64 {
+                        let (li, si) = meta[ci];
+                        let sl = &locks[li].sublocks[si];
+                        let blk = &sl.hints.tail_scales[cur_blk];
+                        let add = crate::lockable_ringlwe::dot_packed_block_mod257_u16(blk, &buf64);
+                        let acc = &mut tail_dots_mod257[ci];
+                        *acc = crate::lockable_ringlwe::add_mod257_u16(*acc, add);
+                        cur_blk += 1;
+                        buf_len = 0;
+                    }
+                },
+            )
             .expect("stream_pi0_and_collect_tails");
-        assert_eq!(abg_tails.len(), meta.len());
+        assert_eq!(abg_list.len(), meta.len());
+        assert_eq!(buf_len, 0);
 
         // Collect per-sublock candidates per lock, then decrypt deterministically (no branching).
         let mut per_lock_slots: Vec<Vec<Option<(u16, [u16; 2])>>> =
             locks.iter().map(|l| vec![None; l.sublocks.len()]).collect();
-        for (gi, abgt) in abg_tails.iter().enumerate() {
+        for (gi, abgt) in abg_list.iter().enumerate() {
             let (li, si) = meta[gi];
             let sl = &locks[li].sublocks[si];
-            let cands = crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt)
+            let td = tail_dots_mod257[gi];
+            let cands = crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt, td)
             .unwrap_or_else(|e| panic!("sublock cands[{gi}]: {e}"));
             let ch = sl.channel_id;
             per_lock_slots[li][si] = Some((ch, cands));
@@ -2246,21 +2306,55 @@ mod tests {
         }
 
         // Stream π₀ ONCE — all sublocks absorb the same chunks simultaneously.
-        let tails = prover
-            .stream_pi0_and_collect_tails(&x, &z_w, &coins_list, &mut |_chunk| {})
+        // Canonical path: stream tails and fold them immediately (no tail vectors).
+        let mut tail_dots_mod257: Vec<u16> = vec![0u16; coins_list.len()];
+        let mut cur_ci: Option<usize> = None;
+        let mut cur_blk: usize = 0;
+        let mut buf_len: usize = 0;
+        let mut buf64: [u16; 64] = [0u16; 64];
+        let abg_list = prover
+            .stream_pi0_and_collect_tails(
+                &x,
+                &z_w,
+                &coins_list,
+                &mut |_chunk| {},
+                &mut |ci, _ti, t| {
+                    if cur_ci != Some(ci) {
+                        cur_ci = Some(ci);
+                        cur_blk = 0;
+                        buf_len = 0;
+                    }
+                    let td = crate::lockable_ringlwe::field_mod257_u16(t);
+                    buf64[buf_len] = td;
+                    buf_len += 1;
+                    if buf_len == 64 {
+                        let (li, si) = meta[ci];
+                        let lock = all_locks[li];
+                        let sl = &lock.sublocks[si];
+                        let blk = &sl.hints.tail_scales[cur_blk];
+                        let add = crate::lockable_ringlwe::dot_packed_block_mod257_u16(blk, &buf64);
+                        let acc = &mut tail_dots_mod257[ci];
+                        *acc = crate::lockable_ringlwe::add_mod257_u16(*acc, add);
+                        cur_blk += 1;
+                        buf_len = 0;
+                    }
+                },
+            )
             .expect("stream_pi0_and_collect_tails");
-        assert_eq!(tails.len(), meta.len());
+        assert_eq!(abg_list.len(), meta.len());
+        assert_eq!(buf_len, 0);
 
         // Per lock: collect sublock candidates in canonical order, then decrypt deterministically.
         let mut per_lock_sublock_cands: Vec<Vec<Option<(u16, [u16; 2])>>> = all_locks
             .iter()
             .map(|l| vec![None; l.sublocks.len()])
             .collect();
-        for (gi, abgt) in tails.iter().enumerate() {
+        for (gi, abgt) in abg_list.iter().enumerate() {
             let (li, si) = meta[gi];
             let lock = all_locks[li];
             let sl = &lock.sublocks[si];
-            let cands = crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt)
+            let td = tail_dots_mod257[gi];
+            let cands = crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt, td)
             .unwrap_or_else(|e| panic!("sublock candidates[{gi}]: {e}"));
             let ch = sl.channel_id;
             per_lock_sublock_cands[li][si] = Some((ch, cands));
@@ -2352,20 +2446,57 @@ mod tests {
                 }
             }
 
-            let mut adv_tails = prover
-                .stream_pi0_and_collect_tails(&x, &z_w, &adv_coins, &mut |_chunk| {})
+            // Canonical path: stream tails and fold them immediately (no tail vectors).
+            // We simulate a "corrupted tail element" by perturbing the first visited tail element
+            // for the first coin before folding.
+            let mut tail_dots_mod257: Vec<u16> = vec![0u16; adv_coins.len()];
+            let mut cur_ci: Option<usize> = None;
+            let mut cur_blk: usize = 0;
+            let mut buf_len: usize = 0;
+            let mut buf64: [u16; 64] = [0u16; 64];
+            let adv_abg_list = prover
+                .stream_pi0_and_collect_tails(
+                    &x,
+                    &z_w,
+                    &adv_coins,
+                    &mut |_chunk| {},
+                    &mut |ci, ti, t| {
+                        if cur_ci != Some(ci) {
+                            cur_ci = Some(ci);
+                            cur_blk = 0;
+                            buf_len = 0;
+                        }
+                        let mut td = crate::lockable_ringlwe::field_mod257_u16(t);
+                        if ci == 0 && ti == 0 {
+                            td = crate::lockable_ringlwe::add_mod257_u16(td, 42u16);
+                        }
+                        buf64[buf_len] = td;
+                        buf_len += 1;
+                        if buf_len == 64 {
+                            let (li, si) = adv_meta[ci];
+                            let lock = all_locks[li];
+                            let sl = &lock.sublocks[si];
+                            let blk = &sl.hints.tail_scales[cur_blk];
+                            let add = crate::lockable_ringlwe::dot_packed_block_mod257_u16(blk, &buf64);
+                            let acc = &mut tail_dots_mod257[ci];
+                            *acc = crate::lockable_ringlwe::add_mod257_u16(*acc, add);
+                            cur_blk += 1;
+                            buf_len = 0;
+                        }
+                    },
+                )
                 .expect("adv stream");
-            // Corrupt the first tail element.
-            adv_tails[0].tail[0] += F257::from(42u64);
+            assert_eq!(adv_abg_list.len(), adv_meta.len());
+            assert_eq!(buf_len, 0);
 
             let mut per_lock_slots: Vec<Vec<Option<(u16, [u16; 2])>>> =
                 all_locks.iter().map(|l| vec![None; l.sublocks.len()]).collect();
-            for (gi, abgt) in adv_tails.iter().enumerate() {
+            for (gi, abgt) in adv_abg_list.iter().enumerate() {
                 let (li, si) = adv_meta[gi];
                 let lock = all_locks[li];
                 let sl = &lock.sublocks[si];
-                let cands =
-                    crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt)
+                let td = tail_dots_mod257[gi];
+                let cands = crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt, td)
                     .unwrap();
                 let ch = sl.channel_id;
                 per_lock_slots[li][si] = Some((ch, cands));
@@ -2438,20 +2569,53 @@ mod tests {
                 }
             }
 
-            let tam_tails = prover
-                .stream_pi0_and_collect_tails(&x, &z_w, &tam_coins, &mut |_chunk| {})
+            let mut tail_dots_mod257: Vec<u16> = vec![0u16; tam_coins.len()];
+            let mut cur_ci: Option<usize> = None;
+            let mut cur_blk: usize = 0;
+            let mut buf_len: usize = 0;
+            let mut buf64: [u16; 64] = [0u16; 64];
+            let tam_abg_list = prover
+                .stream_pi0_and_collect_tails(
+                    &x,
+                    &z_w,
+                    &tam_coins,
+                    &mut |_chunk| {},
+                    &mut |ci, _ti, t| {
+                        if cur_ci != Some(ci) {
+                            cur_ci = Some(ci);
+                            cur_blk = 0;
+                            buf_len = 0;
+                        }
+                        let td = crate::lockable_ringlwe::field_mod257_u16(t);
+                        buf64[buf_len] = td;
+                        buf_len += 1;
+                        if buf_len == 64 {
+                            let (li, si) = tam_meta[ci];
+                            let lock = tampered_all_locks[li];
+                            let sl = &lock.sublocks[si];
+                            let blk = &sl.hints.tail_scales[cur_blk];
+                            let add = crate::lockable_ringlwe::dot_packed_block_mod257_u16(blk, &buf64);
+                            let acc = &mut tail_dots_mod257[ci];
+                            *acc = crate::lockable_ringlwe::add_mod257_u16(*acc, add);
+                            cur_blk += 1;
+                            buf_len = 0;
+                        }
+                    },
+                )
                 .expect("tam stream");
+            assert_eq!(tam_abg_list.len(), tam_meta.len());
+            assert_eq!(buf_len, 0);
 
             let mut per_lock_slots: Vec<Vec<Option<(u16, [u16; 2])>>> = tampered_all_locks
                 .iter()
                 .map(|l| vec![None; l.sublocks.len()])
                 .collect();
-            for (gi, abgt) in tam_tails.iter().enumerate() {
+            for (gi, abgt) in tam_abg_list.iter().enumerate() {
                 let (li, si) = tam_meta[gi];
                 let lock = tampered_all_locks[li];
                 let sl = &lock.sublocks[si];
-                let cands =
-                    crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt)
+                let td = tail_dots_mod257[gi];
+                let cands = crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt, td)
                     .unwrap();
                 let ch = sl.channel_id;
                 per_lock_slots[li][si] = Some((ch, cands));
@@ -2766,7 +2930,13 @@ mod tests {
 
         let t_prove = Instant::now();
         maybe_print_rss("tiny_gate_large:before_prove_decap_stream");
-        let tails = prover
+        let meta = [(0usize, 0usize), (1usize, 0usize)];
+        let mut tail_dots_mod257: [u16; 2] = [0u16; 2];
+        let mut cur_ci: Option<usize> = None;
+        let mut cur_blk: usize = 0;
+        let mut buf_len: usize = 0;
+        let mut buf64: [u16; 64] = [0u16; 64];
+        let abg_list = prover
             .stream_pi0_and_collect_tails(
                 &x,
                 &z_w,
@@ -2775,25 +2945,49 @@ mod tests {
                     lock1.sublocks[0].coins.clone(),
                 ],
                 &mut |_chunk| {},
+                &mut |ci, _ti, t| {
+                    if cur_ci != Some(ci) {
+                        cur_ci = Some(ci);
+                        cur_blk = 0;
+                        buf_len = 0;
+                    }
+                    let td = crate::lockable_ringlwe::field_mod257_u16(t);
+                    buf64[buf_len] = td;
+                    buf_len += 1;
+                    if buf_len == 64 {
+                        let (lock_id, si) = meta[ci];
+                        let sl = match lock_id {
+                            0 => &lock0.sublocks[si],
+                            1 => &lock1.sublocks[si],
+                            _ => unreachable!(),
+                        };
+                        let blk = &sl.hints.tail_scales[cur_blk];
+                        let add = crate::lockable_ringlwe::dot_packed_block_mod257_u16(blk, &buf64);
+                        tail_dots_mod257[ci] = crate::lockable_ringlwe::add_mod257_u16(tail_dots_mod257[ci], add);
+                        cur_blk += 1;
+                        buf_len = 0;
+                    }
+                },
             )
             .expect("stream_pi0_and_collect_tails");
-        assert_eq!(tails.len(), 2);
+        assert_eq!(abg_list.len(), 2);
+        assert_eq!(buf_len, 0);
         let _s0 = crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(
             &lock0.sublocks[0],
-            &tails[0],
+            &abg_list[0],
+            tail_dots_mod257[0],
         )
         .expect("decap_finish0");
         let _s1 = crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(
             &lock1.sublocks[0],
-            &tails[1],
+            &abg_list[1],
+            tail_dots_mod257[1],
         )
         .expect("decap_finish1");
         for lock in [&lock0, &lock1] {
             assert_eq!(lock.sublocks.len(), 1);
-            let a0 = lock.sublocks[0].accepting_set[0];
-            let a1 = lock.sublocks[0].accepting_set[1];
-            assert!(a0 != F257::ZERO && a1 != F257::ZERO);
-            assert_eq!(a1, a0 + F257::ONE);
+            assert_eq!(lock.sublocks[0].accepting_set[0], F257::ONE);
+            assert_eq!(lock.sublocks[0].accepting_set[1], F257::from(2u64));
         }
         maybe_print_rss("tiny_gate_large:after_prove_decap_stream");
         eprintln!("[tiny_gate_large] prove+decap(stream) in {:?}", t_prove.elapsed());

@@ -43,14 +43,25 @@ fn collect_streamed_pi0_and_tail(
     pi0_len: usize,
 ) -> (Vec<F257>, Vec<F257>) {
     let mut pi0 = Vec::with_capacity(pi0_len);
+    let mut tail: Vec<F257> = Vec::new();
     let tails = dpp
-        .stream_pi0_and_collect_tails(x, z_w, &[coins.clone()], &mut |chunk| {
-            pi0.extend_from_slice(chunk);
-        })
+        .stream_pi0_and_collect_tails(
+            x,
+            z_w,
+            &[coins.clone()],
+            &mut |chunk| {
+                pi0.extend_from_slice(chunk);
+            },
+            &mut |ci, _ti, t| {
+                if ci == 0 {
+                    tail.push(*t);
+                }
+            },
+        )
         .expect("stream_pi0_and_collect_tails");
     assert_eq!(pi0.len(), pi0_len);
     assert_eq!(tails.len(), 1);
-    (pi0, tails[0].tail.clone())
+    (pi0, tail)
 }
 
 fn collect_streamed_tail_only(
@@ -61,14 +72,25 @@ fn collect_streamed_tail_only(
     pi0_len: usize,
 ) -> Vec<F257> {
     let mut _pi0 = Vec::with_capacity(pi0_len);
+    let mut tail: Vec<F257> = Vec::new();
     let tails = dpp
-        .stream_pi0_and_collect_tails(x, z_w, &[coins.clone()], &mut |chunk| {
-            _pi0.extend_from_slice(chunk);
-        })
+        .stream_pi0_and_collect_tails(
+            x,
+            z_w,
+            &[coins.clone()],
+            &mut |chunk| {
+                _pi0.extend_from_slice(chunk);
+            },
+            &mut |ci, _ti, t| {
+                if ci == 0 {
+                    tail.push(*t);
+                }
+            },
+        )
         .expect("stream_pi0_and_collect_tails");
     assert_eq!(_pi0.len(), pi0_len);
     assert_eq!(tails.len(), 1);
-    tails[0].tail.clone()
+    tail
 }
 
 #[test]

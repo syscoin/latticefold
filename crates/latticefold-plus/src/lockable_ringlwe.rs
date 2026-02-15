@@ -500,36 +500,24 @@ pub(crate) fn s_candidates_from_y_and_accepting_set_mod257<F: PrimeField>(
     Ok([s0, s1])
 }
 
-/// Compute `y mod 257` from compressed hints and streamed `(alpha,beta,gamma,tail)`.
+/// Compute `y mod 257` from compressed hints and streamed `(alpha,beta,gamma)` plus `tail_dot`.
 ///
 /// This is the core decap scalar relation used for candidate extraction:
 /// `y = y_pi + offset_scale  (mod 257)`,
 /// where `offset_scale = s * δ(x_arm)` is baked into the lock package at arming time.
 pub(crate) fn masked_y_mod257_from_compressed_hint_and_tail<F: PrimeField>(
     hc: &BranchHintsCompressed,
-    abgt: &dpp::theorem43::Theorem43AbgTail<F>,
+    abg: &dpp::theorem43::Theorem43AbgTail<F>,
+    tail_dot_mod257: u16,
 ) -> Result<u16, String> {
-    let alpha = field_mod257_u16(&abgt.alpha);
-    let beta = field_mod257_u16(&abgt.beta);
-    let gamma = field_mod257_u16(&abgt.gamma);
-    if abgt.tail.len() != 256 {
-        return Err("ringlwe: bad theorem43 tail length".to_string());
-    }
-    let mut tail_u16 = [0u16; 256];
-    for (i, t) in abgt.tail.iter().enumerate() {
-        tail_u16[i] = field_mod257_u16(t);
-    }
-    let mut tail_dot = 0u16;
-    for bi in 0..4usize {
-        let start = bi * 64;
-        let row64 = &tail_u16[start..start + 64];
-        tail_dot = add_mod257_u16(tail_dot, dot_packed_block_mod257_u16(&hc.tail_scales[bi], row64));
-    }
+    let alpha = field_mod257_u16(&abg.alpha);
+    let beta = field_mod257_u16(&abg.beta);
+    let gamma = field_mod257_u16(&abg.gamma);
     let mut y = 0u16;
     y = add_mod257_u16(y, mul_mod257(hc.abg_scales[0], alpha));
     y = add_mod257_u16(y, mul_mod257(hc.abg_scales[1], beta));
     y = add_mod257_u16(y, mul_mod257(hc.abg_scales[2], gamma));
-    y = add_mod257_u16(y, tail_dot);
+    y = add_mod257_u16(y, tail_dot_mod257 % 257);
     y = add_mod257_u16(y, hc.offset_scale);
     Ok(y)
 }
@@ -537,9 +525,10 @@ pub(crate) fn masked_y_mod257_from_compressed_hint_and_tail<F: PrimeField>(
 /// Convenience: compute the 2 candidates for `s` for one sublock under the compressed-hint scheme.
 pub(crate) fn sublock_s_candidates_from_abg_tail<F: PrimeField>(
     sl: &RingLweSubLock<F>,
-    abgt: &dpp::theorem43::Theorem43AbgTail<F>,
+    abg: &dpp::theorem43::Theorem43AbgTail<F>,
+    tail_dot_mod257: u16,
 ) -> Result<[u16; 2], String> {
-    let y = masked_y_mod257_from_compressed_hint_and_tail(&sl.hints, abgt)?;
+    let y = masked_y_mod257_from_compressed_hint_and_tail(&sl.hints, abg, tail_dot_mod257)?;
     s_candidates_from_y_and_accepting_set_mod257(&sl.accepting_set, y)
 }
 

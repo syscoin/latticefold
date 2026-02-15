@@ -81,14 +81,15 @@ pub struct Theorem43Dpp<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> {
     _marker: PhantomData<F>,
 }
 
-/// Output of `stream_pi0_and_collect_tails`: per-coin `(alpha,beta,gamma)` plus the coin-dependent
-/// proof tail.
+/// Output of `stream_pi0_and_collect_tails`: per-coin `(alpha,beta,gamma)` (π-only).
+///
+/// The coin-dependent tail is streamed via the `on_tail_elem` callback (canonical path: no tail
+/// vectors are allocated/stored by this function).
 #[derive(Clone, Debug)]
 pub struct Theorem43AbgTail<F: PrimeField> {
     pub alpha: F,
     pub beta: F,
     pub gamma: F,
-    pub tail: Vec<F>,
 }
 
 /// Streaming query accumulator that tracks both:
@@ -486,6 +487,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
         z_w: &[F],
         coins_list: &[Theorem43Coins<F>],
         on_pi0_chunk: &mut dyn FnMut(&[F]),
+        on_tail_elem: &mut dyn FnMut(usize, usize, &F),
     ) -> Result<Vec<Theorem43AbgTail<F>>, String> {
         let flpcp = &self.flpcp;
         if x.len() != flpcp.n() {
@@ -577,7 +579,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
         }
 
         let mut out = Vec::with_capacity(accs.len());
-        for a in accs {
+        for (ci, a) in accs.into_iter().enumerate() {
             // For lock equations we expose only the π-only contributions (exclude x terms),
             // to avoid double-counting when the lock separately accounts for `⟨h_x, x⟩`.
             let alpha_pi = a.acc0.acc_pi;
@@ -591,14 +593,13 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             let mu = alpha_full * alpha_full;
             let nu = beta_full * beta_full;
             let u = a.coins.rho * alpha_full + a.coins.sigma * beta_full;
-
-            let mut tail = Vec::with_capacity(2 + self.q_minus_3);
-            tail.push(mu);
-            tail.push(nu);
+            // Tail layout: [mu, nu, u^3..u^{p-1}]
+            on_tail_elem(ci, 0, &mu);
+            on_tail_elem(ci, 1, &nu);
             if self.q_minus_3 > 0 {
                 let mut cur = (u * u) * u; // u^3
-                for _ in 0..self.q_minus_3 {
-                    tail.push(cur);
+                for t in 0..self.q_minus_3 {
+                    on_tail_elem(ci, 2 + t, &cur);
                     cur *= u;
                 }
             }
@@ -607,7 +608,6 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                 alpha: alpha_pi,
                 beta: beta_pi,
                 gamma: gamma_pi,
-                tail,
             });
         }
 

@@ -875,9 +875,46 @@ fn decap_sp1_oneproof_we_gate_from_files_inner(
         }
     }
 
-    let abg_tails = prover.stream_pi0_and_collect_tails(&x, z_w, &coins_list, &mut |_chunk| {})?;
-    if abg_tails.len() != coins_list.len() {
-        return Err("oneproof: internal tails/coins length mismatch".to_string());
+    // Tail-dot only: avoid allocating/storing the 256-element tail vector per sublock.
+    let mut tail_dots_mod257: Vec<u16> = vec![0u16; coins_list.len()];
+    let mut cur_ci: Option<usize> = None;
+    let mut cur_blk: usize = 0;
+    let mut buf_len: usize = 0;
+    let mut buf64: [u16; 64] = [0u16; 64];
+    let abg_list = prover.stream_pi0_and_collect_tails(
+        &x,
+        z_w,
+        &coins_list,
+        &mut |_chunk| {},
+        &mut |ci, _ti, t| {
+            // Tail elements are visited coin-by-coin, in order.
+            if cur_ci != Some(ci) {
+                cur_ci = Some(ci);
+                cur_blk = 0;
+                buf_len = 0;
+            }
+            let td = crate::lockable_ringlwe::field_mod257_u16(t);
+            buf64[buf_len] = td;
+            buf_len += 1;
+            if buf_len == 64 {
+                // Dot this 64-chunk against the corresponding packed coefficients.
+                let (li, local_si, _ch) = state_meta[ci];
+                let sl = &locks[li].sublocks[local_si];
+                let blk = &sl.hints.tail_scales[cur_blk];
+                let add = crate::lockable_ringlwe::dot_packed_block_mod257_u16(blk, &buf64);
+                let acc = &mut tail_dots_mod257[ci];
+                *acc = crate::lockable_ringlwe::add_mod257_u16(*acc, add);
+                cur_blk += 1;
+                buf_len = 0;
+            }
+        },
+    )?;
+    if abg_list.len() != coins_list.len() || tail_dots_mod257.len() != coins_list.len() {
+        return Err("oneproof: internal abgs/coins length mismatch".to_string());
+    }
+    // Final flush sanity: we should end exactly on a chunk boundary.
+    if buf_len != 0 {
+        return Err("oneproof: internal tail-dot buffer misalignment".to_string());
     }
     maybe_print_rss("oneproof:after_prove_decap_stream");
     eprintln!("[oneproof] prove+decap(stream) in {:?}", t_prove.elapsed());
@@ -896,10 +933,11 @@ fn decap_sp1_oneproof_we_gate_from_files_inner(
         let state_meta_ref = &state_meta;
 
         use crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail;
-        let per_state: Vec<(usize, usize, u16, [u16; 2])> = abg_tails
+        let tail_dots_ref = &tail_dots_mod257;
+        let per_state: Vec<(usize, usize, u16, [u16; 2])> = abg_list
             .into_par_iter()
             .enumerate()
-            .map(|(si, abgt)| -> Result<(usize, usize, u16, [u16; 2]), String> {
+            .map(|(si, abg)| -> Result<(usize, usize, u16, [u16; 2]), String> {
                 let (li, local_si, ch_expect) = state_meta_ref
                     .get(si)
                     .copied()
@@ -914,7 +952,10 @@ fn decap_sp1_oneproof_we_gate_from_files_inner(
                 if sl.channel_id != ch_expect {
                     return Err("oneproof: internal channel_id mismatch".to_string());
                 }
-                let cands = sublock_s_candidates_from_abg_tail(sl, &abgt)?;
+                let td = *tail_dots_ref
+                    .get(si)
+                    .ok_or_else(|| "oneproof: internal tail_dot index mismatch".to_string())?;
+                let cands = sublock_s_candidates_from_abg_tail(sl, &abg, td)?;
                 Ok((li, local_si, ch_expect, cands))
             })
             .collect::<Result<Vec<_>, _>>()?;
