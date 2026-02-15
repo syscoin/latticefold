@@ -27,7 +27,6 @@ use latticefold::transcript::poseidon::{f257_poseidon_config, F257};
 use crate::dr1cs_flpcp::{
     f_to_u16, is_f257_field, Dr1csNpFlpcpSparseApi, Dr1csQueryScratch, QuerySink,
 };
-use crate::sparse::SparseVec;
 
 /// Coins defining the single lockable query.
 #[derive(Clone, Debug)]
@@ -100,58 +99,20 @@ pub struct Theorem43AbgTail<F: PrimeField> {
 struct QueryStreamAcc<F: PrimeField> {
     acc_pi: F,
     acc_full: F,
-    block_terms: Vec<Vec<(F, usize)>>,
+    // Sparse per-block terms over the `w_eval[block]` slices in π0.
+    //
+    // In production regimes, each query typically touches very few blocks (often 1), so keeping
+    // this sparse avoids `O(blocks)` per-coin allocations and supports block-grouped streaming.
+    block_terms: Vec<(usize, Vec<(F, usize)>)>,
 }
 
 impl<F: PrimeField> QueryStreamAcc<F> {
-    fn new(
-        q: &SparseVec<F>,
-        x: &[F],
-        z_w: &[F],
-        z_w_len: usize,
-        k_star: usize,
-        blocks: usize,
-    ) -> Result<Self, String> {
-        let mut acc_pi = F::ZERO;
-        let mut acc_full = F::ZERO;
-        let mut block_terms = vec![Vec::new(); blocks];
-        let n = x.len();
-        let m = z_w_len + (k_star * blocks);
-        for (c, idx) in q.terms.iter().copied() {
-            if idx < n {
-                // Full evaluation includes x; π-only evaluation skips x.
-                acc_full += c * x[idx];
-                continue;
-            }
-            let pi_idx = idx - n;
-            if pi_idx >= m {
-                return Err("query index out of range".to_string());
-            }
-            if pi_idx < z_w_len {
-                acc_pi += c * z_w[pi_idx];
-                acc_full += c * z_w[pi_idx];
-                continue;
-            }
-            let off = pi_idx - z_w_len;
-            let block = off / k_star;
-            let pos = off % k_star;
-            if block >= blocks {
-                return Err("query block out of range".to_string());
-            }
-            block_terms[block].push((c, pos));
-        }
-        Ok(Self {
-            acc_pi,
-            acc_full,
-            block_terms,
-        })
-    }
-
     fn add_block(&mut self, block_id: usize, w_eval: &[F]) -> Result<(), String> {
-        if block_id >= self.block_terms.len() {
-            return Err("block id out of range".to_string());
-        }
-        for (c, pos) in &self.block_terms[block_id] {
+        // Sparse: if we don't touch this block, nothing to do.
+        let Some((_b, terms)) = self.block_terms.iter().find(|(b, _)| *b == block_id) else {
+            return Ok(());
+        };
+        for (c, pos) in terms {
             if *pos >= w_eval.len() {
                 return Err("w_eval index out of range".to_string());
             }
@@ -160,6 +121,82 @@ impl<F: PrimeField> QueryStreamAcc<F> {
             self.acc_full += t;
         }
         Ok(())
+    }
+
+    #[inline]
+    fn touched_blocks(&self) -> impl Iterator<Item = usize> + '_ {
+        self.block_terms.iter().map(|(b, _)| *b)
+    }
+}
+
+/// Helper to build `QueryStreamAcc` without materializing query vectors.
+struct QueryStreamAccBuilder<'a, F: PrimeField> {
+    x: &'a [F],
+    z_w: &'a [F],
+    z_w_len: usize,
+    k_star: usize,
+    blocks: usize,
+    n: usize,
+    m: usize,
+    acc_pi: F,
+    acc_full: F,
+    block_terms: Vec<(usize, Vec<(F, usize)>)>,
+}
+
+impl<'a, F: PrimeField> QueryStreamAccBuilder<'a, F> {
+    fn new(x: &'a [F], z_w: &'a [F], z_w_len: usize, k_star: usize, blocks: usize) -> Self {
+        let n = x.len();
+        let m = z_w_len + (k_star * blocks);
+        Self {
+            x,
+            z_w,
+            z_w_len,
+            k_star,
+            blocks,
+            n,
+            m,
+            acc_pi: F::ZERO,
+            acc_full: F::ZERO,
+            block_terms: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn add_term(&mut self, c: F, idx: usize) -> Result<(), String> {
+        if idx < self.n {
+            self.acc_full += c * self.x[idx];
+            return Ok(());
+        }
+        let pi_idx = idx - self.n;
+        if pi_idx >= self.m {
+            return Err("query index out of range".to_string());
+        }
+        if pi_idx < self.z_w_len {
+            let v = self.z_w[pi_idx];
+            self.acc_pi += c * v;
+            self.acc_full += c * v;
+            return Ok(());
+        }
+        let off = pi_idx - self.z_w_len;
+        let block = off / self.k_star;
+        let pos = off % self.k_star;
+        if block >= self.blocks {
+            return Err("query block out of range".to_string());
+        }
+        if let Some((_b, terms)) = self.block_terms.iter_mut().find(|(b, _)| *b == block) {
+            terms.push((c, pos));
+        } else {
+            self.block_terms.push((block, vec![(c, pos)]));
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> QueryStreamAcc<F> {
+        QueryStreamAcc {
+            acc_pi: self.acc_pi,
+            acc_full: self.acc_full,
+            block_terms: self.block_terms,
+        }
     }
 }
 
@@ -232,15 +269,67 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
             return Err("bad tail length".to_string());
         }
 
-        let (qs, _pred) = flpcp
-            .queries_for_coins_sparse(art.coins.idx, art.coins.lambda, x)
-            .map_err(|e| format!("outer coins->queries failed: {e}"))?;
-        debug_assert_eq!(qs.len(), 3);
-
         let z_w = &pi0[..z_w_len];
-        let mut acc0 = QueryStreamAcc::new(&qs[0], x, z_w, z_w_len, k_star, blocks)?;
-        let mut acc1 = QueryStreamAcc::new(&qs[1], x, z_w, z_w_len, k_star, blocks)?;
-        let mut acc2 = QueryStreamAcc::new(&qs[2], x, z_w, z_w_len, k_star, blocks)?;
+        let mut scratch = Dr1csQueryScratch::<F>::new(flpcp.n_total());
+        scratch.clear_all();
+        let mut b0 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
+        let mut b1 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
+        let mut b2 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
+        let mut sink_err: Option<String> = None;
+        struct Sink<'a, 'b, 'e, F: PrimeField> {
+            b0: &'b mut QueryStreamAccBuilder<'a, F>,
+            b1: &'b mut QueryStreamAccBuilder<'a, F>,
+            b2: &'b mut QueryStreamAccBuilder<'a, F>,
+            err: &'e mut Option<String>,
+        }
+        impl<'a, 'b, 'e, F: PrimeField> QuerySink<F> for Sink<'a, 'b, 'e, F> {
+            fn on_q1(&mut self, coeff: F, idx: usize) {
+                if self.err.is_some() {
+                    return;
+                }
+                if let Err(e) = self.b0.add_term(coeff, idx) {
+                    *self.err = Some(e);
+                }
+            }
+            fn on_q2(&mut self, coeff: F, idx: usize) {
+                if self.err.is_some() {
+                    return;
+                }
+                if let Err(e) = self.b1.add_term(coeff, idx) {
+                    *self.err = Some(e);
+                }
+            }
+            fn on_q3(&mut self, coeff: F, idx: usize) {
+                if self.err.is_some() {
+                    return;
+                }
+                if let Err(e) = self.b2.add_term(coeff, idx) {
+                    *self.err = Some(e);
+                }
+            }
+        }
+        {
+            let mut sink = Sink {
+                b0: &mut b0,
+                b1: &mut b1,
+                b2: &mut b2,
+                err: &mut sink_err,
+            };
+            flpcp.stream_queries_for_coins_sparse(
+                art.coins.idx,
+                art.coins.lambda,
+                x,
+                &mut scratch,
+                &mut sink,
+            )
+            .map_err(|e| format!("outer coins->queries failed: {e}"))?;
+        }
+        if let Some(e) = sink_err {
+            return Err(e);
+        }
+        let mut acc0 = b0.finish();
+        let mut acc1 = b1.finish();
+        let mut acc2 = b2.finish();
 
         // Stream w_eval blocks out of π0.
         let mut off = z_w_len;
@@ -286,25 +375,16 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
         Ok(acc + F::ONE)
     }
 
-    /// Arm using a fixed FS transcript for the **full-gate cost shape**, while keeping `q` hidden.
+    /// Deterministically derive the public coins for a given `(c_stmt, block_id, rep_id)`.
     ///
-    /// - Public coins are derived from `(domain_sep, C_stmt, x, block_id, rep_id)`.
-    /// - The hidden query randomness (UV bits) is derived from the same transcript **plus**
-    ///   an armer-private secret salt `armer_secret` (and explicitly binds the public coins).
-    ///
-    /// This is the version you’d arithmetize inside the “full gate” to de-risk constraint cost.
-    /// The permutation is a **toy cost proxy**, not a standardized hash.
-    pub fn arm(
+    /// IMPORTANT: coins are derived from the **package statement commitment** `c_stmt` (not from
+    /// a decap-supplied `x`), to prevent retargeting the public coins under statement override.
+    pub fn derive_public_coins_from_stmt(
         &self,
         c_stmt: &[F],
-        x: &[F],
-        armer_secret: &[F],
         block_id: usize,
         rep_id: u64,
-    ) -> Result<Theorem43LockArtifact<F>, String> {
-        if x.len() != self.flpcp.n() {
-            return Err("bad public input length".to_string());
-        }
+    ) -> Result<Theorem43Coins<F>, String> {
         if block_id >= self.flpcp.blocks() {
             return Err("block_id out of range".to_string());
         }
@@ -313,39 +393,16 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
             return Err("ell_local=0".to_string());
         }
 
-        // NOTE: this is host-side Fiat–Shamir (arm-before-proof), not the in-circuit DPP relation.
-        //
-        // Public coins are deterministic from (statement, x, block_id, rep_id).
-        // Hidden UV/Sq randomness is deterministic from (statement, x, block_id, rep_id, coins, armer_secret).
-
         // 1) Derive PUBLIC coins.
         let cfg = f257_poseidon_config();
         let mut sp_coins = PoseidonSponge::<F257>::new(&cfg);
         let ds = vec![F257::from(43u64), F257::from(1u64)]; // theorem43, coins-v1
         sp_coins.absorb(&ds);
         absorb_field_bytes_as_f257::<F>(&mut sp_coins, c_stmt);
-        absorb_field_bytes_as_f257::<F>(&mut sp_coins, x);
         absorb_usize_base257(&mut sp_coins, block_id);
         absorb_u64_base257(&mut sp_coins, rep_id);
 
-        // Squeeze PUBLIC coins.
-        //
-        // IMPORTANT (host-side only): avoid `squeeze_bytes()` for F257 when you need uniform sampling.
-        // We sample integers using base-257 digits and **range rejection** (see `squeeze_usize_mod_base257`).
-        //
-        // Additional rejection for the tensor-RS Layout-A multiplication code:
-        // we must avoid sampling an `idx` that lands inside the *systematic* E* witness grid
-        // (the "(2k0-1)^t low grid", aka `witness_positions_star()`), because for those indices
-        // the FLPCP query becomes independent of the `Cz - w_low` consistency term and is
-        // therefore vacuous for C-side soundness.
-        //
-        // For our production parameters (F257, base_n=256, base_k=48, rank=3):
-        // - side = 2*base_k - 1 = 95
-        // - any coordinate in the band [base_k, side) makes the corresponding 1D Lagrange vector
-        //   a selector outside the low cube, which forces *all* low-cube coefficients to 0.
-        //
-        // This rejection sampling is cheap (expected <2 iterations) and restores soundness against
-        // hint-minimizing arming policies that would otherwise bias toward such “C-blind” points.
+        // Squeeze PUBLIC coins with rejection sampling (see comments in `arm`).
         let local_idx = loop {
             let cand = squeeze_usize_mod_base257(&mut sp_coins, ell_local)?;
             if is_f257_field::<F>() {
@@ -353,12 +410,6 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
                 const BASE_K: usize = 48;
                 const RANK: usize = 3;
                 const SIDE: usize = 2 * BASE_K - 1; // 95
-                // Reject any coordinate that falls into the "side-but-not-low" band:
-                //   BASE_K <= c < SIDE
-                //
-                // For such coordinates the 1D Lagrange vector over the `SIDE` points becomes a
-                // selector at an index >= BASE_K, which makes *all* low-cube coefficients zero
-                // in `row_e_star_stream` and thus erases the `Cz - w_low` consistency term.
                 let mut tmp = cand;
                 let mut bad = false;
                 for _ in 0..RANK {
@@ -395,24 +446,49 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
                 }
             }
         }
-        // Reject a small set of degenerate digits. Rationale:
-        // - lambda==0: drops C-side (Cx2) contribution in outer query
-        // - lambda==1: cancels the low-cube w_eval contribution (coeff = (1-lambda)c), which can
-        //              make γ blind for constraints whose C row is sparse/empty (e.g. glue constraints)
-        // - rho==0: makes check independent of α (A-side)
-        // - sigma==0: makes check independent of β (B-side)
         let lambda = squeeze_f257_as_f_reject_digits::<F>(&mut sp_coins, &[0, 1])?;
         let rho = squeeze_f257_as_f_reject_digits::<F>(&mut sp_coins, &[0])?;
         let sigma = squeeze_f257_as_f_reject_digits::<F>(&mut sp_coins, &[0])?;
 
-        let coins = Theorem43Coins { idx, lambda, rho, sigma };
+        Ok(Theorem43Coins { idx, lambda, rho, sigma })
+    }
+
+    /// Arm using a fixed FS transcript for the **full-gate cost shape**, while keeping `q` hidden.
+    ///
+    /// - Public coins are derived from `(domain_sep, C_stmt, block_id, rep_id)`.
+    /// - The hidden query randomness (UV bits) is derived from the same transcript **plus**
+    ///   an armer-private secret salt `armer_secret` (and explicitly binds the public coins).
+    ///
+    /// This is the version you’d arithmetize inside the “full gate” to de-risk constraint cost.
+    /// The permutation is a **toy cost proxy**, not a standardized hash.
+    pub fn arm(
+        &self,
+        c_stmt: &[F],
+        x: &[F],
+        armer_secret: &[F],
+        block_id: usize,
+        rep_id: u64,
+    ) -> Result<Theorem43LockArtifact<F>, String> {
+        if x.len() != self.flpcp.n() {
+            return Err("bad public input length".to_string());
+        }
+        if block_id >= self.flpcp.blocks() {
+            return Err("block_id out of range".to_string());
+        }
+
+        // NOTE: this is host-side Fiat–Shamir (arm-before-proof), not the in-circuit DPP relation.
+        //
+        // Public coins are deterministic from (statement commitment, block_id, rep_id).
+        // Hidden UV/Sq randomness is deterministic from (statement commitment, block_id, rep_id, coins, armer_secret).
+
+        let cfg = f257_poseidon_config();
+        let coins = self.derive_public_coins_from_stmt(c_stmt, block_id, rep_id)?;
 
         // 2) Derive HIDDEN UV bits / Sq coefficients, explicitly binding the public coins.
         let mut sp_hidden = PoseidonSponge::<F257>::new(&cfg);
         let ds = vec![F257::from(43u64), F257::from(2u64)]; // theorem43, coeffs-v2
         sp_hidden.absorb(&ds);
         absorb_field_bytes_as_f257::<F>(&mut sp_hidden, c_stmt);
-        absorb_field_bytes_as_f257::<F>(&mut sp_hidden, x);
         absorb_usize_base257(&mut sp_hidden, block_id);
         absorb_u64_base257(&mut sp_hidden, rep_id);
         absorb_usize_base257(&mut sp_hidden, coins.idx);
@@ -514,20 +590,88 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             acc2: QueryStreamAcc<F>,
         }
         let mut accs: Vec<AccSet<F>> = Vec::with_capacity(coins_list.len());
+        let mut scratch = Dr1csQueryScratch::<F>::new(flpcp.n_total());
         for coins in coins_list {
-            let (qs, _pred) = flpcp
-                .queries_for_coins_sparse(coins.idx, coins.lambda, x)
-                .map_err(|e| format!("outer coins->queries failed: {e}"))?;
-            debug_assert_eq!(qs.len(), 3);
-            let acc0 = QueryStreamAcc::new(&qs[0], x, z_w, z_w_len, k_star, blocks)?;
-            let acc1 = QueryStreamAcc::new(&qs[1], x, z_w, z_w_len, k_star, blocks)?;
-            let acc2 = QueryStreamAcc::new(&qs[2], x, z_w, z_w_len, k_star, blocks)?;
+            scratch.clear_all();
+            let mut b0 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
+            let mut b1 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
+            let mut b2 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
+            let mut sink_err: Option<String> = None;
+            struct Sink<'a, 'b, 'e, F: PrimeField> {
+                b0: &'b mut QueryStreamAccBuilder<'a, F>,
+                b1: &'b mut QueryStreamAccBuilder<'a, F>,
+                b2: &'b mut QueryStreamAccBuilder<'a, F>,
+                err: &'e mut Option<String>,
+            }
+            impl<'a, 'b, 'e, F: PrimeField> QuerySink<F> for Sink<'a, 'b, 'e, F> {
+                fn on_q1(&mut self, coeff: F, idx: usize) {
+                    if self.err.is_some() {
+                        return;
+                    }
+                    if let Err(e) = self.b0.add_term(coeff, idx) {
+                        *self.err = Some(e);
+                    }
+                }
+                fn on_q2(&mut self, coeff: F, idx: usize) {
+                    if self.err.is_some() {
+                        return;
+                    }
+                    if let Err(e) = self.b1.add_term(coeff, idx) {
+                        *self.err = Some(e);
+                    }
+                }
+                fn on_q3(&mut self, coeff: F, idx: usize) {
+                    if self.err.is_some() {
+                        return;
+                    }
+                    if let Err(e) = self.b2.add_term(coeff, idx) {
+                        *self.err = Some(e);
+                    }
+                }
+            }
+            {
+                let mut sink = Sink {
+                    b0: &mut b0,
+                    b1: &mut b1,
+                    b2: &mut b2,
+                    err: &mut sink_err,
+                };
+                flpcp
+                    .stream_queries_for_coins_sparse(coins.idx, coins.lambda, x, &mut scratch, &mut sink)
+                    .map_err(|e| format!("outer coins->queries failed: {e}"))?;
+            }
+            if let Some(e) = sink_err {
+                return Err(e);
+            }
+            let acc0 = b0.finish();
+            let acc1 = b1.finish();
+            let acc2 = b2.finish();
             accs.push(AccSet {
                 coins: coins.clone(),
                 acc0,
                 acc1,
                 acc2,
             });
+        }
+
+        // Block-grouped schedule: for each block, which coins need updates from `w_eval[block]`?
+        //
+        // This avoids the `O(blocks * coins)` nested loop in large-block regimes.
+        let mut bucket: Vec<Vec<usize>> = vec![Vec::new(); blocks];
+        for (ci, a) in accs.iter().enumerate() {
+            // Union of touched blocks across (q1,q2,q3). Usually tiny.
+            let mut touched: Vec<usize> = Vec::new();
+            touched.extend(a.acc0.touched_blocks());
+            touched.extend(a.acc1.touched_blocks());
+            touched.extend(a.acc2.touched_blocks());
+            touched.sort_unstable();
+            touched.dedup();
+            for b in touched {
+                if b >= blocks {
+                    return Err("internal: touched block out of range".to_string());
+                }
+                bucket[b].push(ci);
+            }
         }
 
         on_pi0_chunk(z_w);
@@ -557,7 +701,18 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                 if err.is_some() {
                     return;
                 }
-                for a in &mut accs {
+                if b >= bucket.len() {
+                    err = Some("stream_w_eval_blocks: block id out of range".to_string());
+                    return;
+                }
+                for &ci in bucket[b].iter() {
+                    let a = match accs.get_mut(ci) {
+                        Some(v) => v,
+                        None => {
+                            err = Some("stream_w_eval_blocks: bucket coin index out of range".to_string());
+                            return;
+                        }
+                    };
                     if let Err(e) = a.acc0.add_block(b, w_eval) {
                         err = Some(e);
                         return;

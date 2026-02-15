@@ -43,12 +43,31 @@ pub fn split_secret_32(
     secret: [u8; 32],
 ) -> Result<Vec<ShamirShare>, ShamirError> {
     // This GF(256) implementation supports only 255 nonzero x-coordinates.
-    if cfg.threshold < 2
-        || cfg.shares < cfg.threshold
-        || cfg.shares > 255
-        || cfg.shares > u32::MAX as usize
-    {
+    if cfg.shares < cfg.threshold || cfg.shares > 255 || cfg.shares > u32::MAX as usize {
         return Err(ShamirError::InvalidParams);
+    }
+    if cfg.threshold == 0 {
+        return Err(ShamirError::InvalidParams);
+    }
+    // Testing / convenience: support the degenerate 1-of-N case as a degree-0 polynomial.
+    // (This provides no confidentiality; any share reveals the secret.)
+    if cfg.threshold == 1 {
+        let n = cfg.shares;
+        if n == 0 {
+            return Err(ShamirError::InvalidParams);
+        }
+        let mut out = Vec::with_capacity(n);
+        for i in 1..=n {
+            let x = i as u8;
+            if x == 0 || i > 255 {
+                return Err(ShamirError::InvalidParams);
+            }
+            out.push(ShamirShare {
+                index: i as u32,
+                value: secret,
+            });
+        }
+        return Ok(out);
     }
 
     // For each byte position, sample a random degree-(t-1) polynomial with constant term = secret[b].
@@ -93,8 +112,16 @@ pub fn reconstruct_secret_32(
     cfg: &ShamirConfig,
     shares: &[ShamirShare],
 ) -> Result<[u8; 32], ShamirError> {
-    if cfg.threshold < 2 || cfg.shares < cfg.threshold || cfg.shares > 255 {
+    if cfg.threshold == 0 || cfg.shares < cfg.threshold || cfg.shares > 255 {
         return Err(ShamirError::InvalidParams);
+    }
+    // Degenerate 1-of-N: any single valid share equals the secret.
+    if cfg.threshold == 1 {
+        let s = shares.first().ok_or(ShamirError::InsufficientShares)?;
+        if s.index == 0 || (s.index as usize) > cfg.shares || s.index > 255 {
+            return Err(ShamirError::IndexOutOfRange);
+        }
+        return Ok(s.value);
     }
     if shares.len() < cfg.threshold {
         return Err(ShamirError::InsufficientShares);

@@ -332,9 +332,12 @@ pub struct RingLweLockArtifact<F: PrimeField> {
     pub params: RingLweParams,
     /// Number of independent scalar channels \(P\).
     pub p_channels: u16,
-    /// Number of repetitions per channel \(R\).
-    pub r_reps: u16,
-    /// DPP sublocks (one per `(channel,rep)`), each with its own hidden query.
+    /// Number of sublocks per channel.
+    ///
+    /// In the “hits-per-block” design, this is typically `blocks * hits_per_block` and can be
+    /// much larger than `u16`, so we store it as `u32`.
+    pub sublocks_per_channel: u32,
+    /// DPP sublocks (one per `(channel,hit)`), each with its own hidden query.
     pub sublocks: Vec<RingLweSubLock<F>>,
     /// Single unauthenticated ciphertext.
     ///
@@ -381,8 +384,10 @@ pub struct RingLweSubLock<F: PrimeField> {
     pub channel_id: u16,
     /// Shifted accepting set (mod 257), must be nonzero.
     pub accepting_set: [F; 2],
-    /// Public coins for Theorem-4.3 (prover needs these).
-    pub coins: dpp::theorem43::Theorem43Coins<F>,
+    /// Block id selected for this sublock (used to derive Theorem-4.3 public coins).
+    pub block_id: u32,
+    /// Rep-id salt (used to derive Theorem-4.3 public coins and hidden Sq coefficients).
+    pub rep_id: u64,
     /// Deterministic compressed hint material.
     pub hints: BranchHintsCompressed,
 }
@@ -409,7 +414,7 @@ fn derive_payload_key_bytes_multi<F: PrimeField>(
     pi_len: usize,
     len: usize,
     p_channels: u16,
-    r_reps: u16,
+    sublocks_per_channel: u32,
     sublocks: &[RingLweSubLock<F>],
     s_channels_mod257: &[u16],
 ) -> [u8; 32] {
@@ -431,15 +436,13 @@ fn derive_payload_key_bytes_multi<F: PrimeField>(
     bind.update(&(pi_len as u64).to_le_bytes());
     bind.update(&(len as u64).to_le_bytes());
     bind.update(&p_channels.to_le_bytes());
-    bind.update(&r_reps.to_le_bytes());
+    bind.update(&sublocks_per_channel.to_le_bytes());
     for sl in sublocks {
         bind.update(&sl.channel_id.to_le_bytes());
+        bind.update(&sl.block_id.to_le_bytes());
+        bind.update(&sl.rep_id.to_le_bytes());
         bind.update(&f_to_u64(&sl.accepting_set[0]).to_le_bytes());
         bind.update(&f_to_u64(&sl.accepting_set[1]).to_le_bytes());
-        bind.update(&(sl.coins.idx as u64).to_le_bytes());
-        bind.update(&f_to_u64(&sl.coins.lambda).to_le_bytes());
-        bind.update(&f_to_u64(&sl.coins.rho).to_le_bytes());
-        bind.update(&f_to_u64(&sl.coins.sigma).to_le_bytes());
     }
     let lock_bind: [u8; 32] = bind.finalize().into();
 
@@ -544,7 +547,7 @@ impl<F: PrimeField> RingLweLockArtifact<F> {
             self.pi_len,
             self.len,
             self.p_channels,
-            self.r_reps,
+            self.sublocks_per_channel,
             self.sublocks.as_slice(),
             s_channels_mod257,
         ))
@@ -620,9 +623,9 @@ pub(crate) fn decrypt_payload_from_sublock_s_candidates<F: PrimeField>(
     sublock_s_candidates: &[(u16, [u16; 2])],
 ) -> Result<Vec<u8>, String> {
     let p = lock.p_channels as usize;
-    let r = lock.r_reps as usize;
+    let r = lock.sublocks_per_channel as usize;
     if p == 0 || r == 0 {
-        return Err("ringlwe: invalid (P,R)".to_string());
+        return Err("ringlwe: invalid (P,sublocks_per_channel)".to_string());
     }
     if lock.sublocks.len() != p.saturating_mul(r) {
         return Err("ringlwe: sublocks length mismatch".to_string());
@@ -679,7 +682,7 @@ pub(crate) fn decrypt_payload_from_sublock_s_candidates<F: PrimeField>(
             // Report popcount to help parameter tuning.
             let pc = bitset257_popcount(&alive);
             format!(
-                "ringlwe: ambiguous per-channel intersections (P={p} R={r} ch={ch} popcount={pc}); increase sublocks per channel (e.g. full coverage) or increase R"
+                "ringlwe: ambiguous per-channel intersections (P={p} sublocks_per_channel={r} ch={ch} popcount={pc}); increase hits per block / total sublocks per channel"
             )
         })?;
         s_channels.push(s);
@@ -703,16 +706,16 @@ pub fn arm_ringlwe_lock<F: PrimeField>(
     pi_len: usize,
     params: RingLweParams,
     p_channels: u16,
-    r_reps: u16,
+    sublocks_per_channel: u32,
     sublocks: Vec<RingLweSubLock<F>>,
     payload: &[u8],
     s_channels_mod257: &[u16],
     rng: &mut impl RngCore,
 ) -> Result<RingLweLockArtifact<F>, String> {
-    if p_channels == 0 || r_reps == 0 {
-        return Err("arm_ringlwe_lock: invalid (P,R)".to_string());
+    if p_channels == 0 || sublocks_per_channel == 0 {
+        return Err("arm_ringlwe_lock: invalid (P,sublocks_per_channel)".to_string());
     }
-    if sublocks.len() != (p_channels as usize) * (r_reps as usize) {
+    if sublocks.len() != (p_channels as usize) * (sublocks_per_channel as usize) {
         return Err("arm_ringlwe_lock: sublocks length mismatch".to_string());
     }
     if s_channels_mod257.len() != p_channels as usize {
@@ -740,7 +743,7 @@ pub fn arm_ringlwe_lock<F: PrimeField>(
         pi_len,
         x_len + pi_len,
         p_channels,
-        r_reps,
+        sublocks_per_channel,
         sublocks.as_slice(),
         s_channels_mod257,
     );
@@ -756,7 +759,7 @@ pub fn arm_ringlwe_lock<F: PrimeField>(
         len: x_len + pi_len,
         params,
         p_channels,
-        r_reps,
+        sublocks_per_channel,
         sublocks,
         ct,
     })
@@ -772,7 +775,6 @@ pub type DppLockCiphertext = LockCiphertext;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ark_ff::Field;
     use latticefold::transcript::poseidon::F257;
     use rand::{RngCore, SeedableRng};
     use rand_chacha::ChaCha20Rng;
@@ -792,20 +794,13 @@ mod tests {
         let pi_len = 1usize;
         let params = RingLweParams::default();
 
-        // Dummy coins (not used by ciphertext encoding).
-        let coins = dpp::theorem43::Theorem43Coins::<F257> {
-            idx: 0,
-            lambda: F257::ONE,
-            rho: F257::ONE,
-            sigma: F257::ONE,
-        };
-
         let s = sample_nonzero_f257_scalar(&mut rng);
         let zero64 = [0u16; 64];
         let sub = RingLweSubLock::<F257> {
             channel_id: 0,
             accepting_set: [F257::from(1u64), F257::from(2u64)],
-            coins,
+            block_id: 0,
+            rep_id: 0,
             hints: BranchHintsCompressed {
                 abg_scales: [0u16; 3],
                 offset_scale: 0u16,
@@ -818,7 +813,7 @@ mod tests {
             pi_len,
             params,
             1,
-            1,
+            1u32,
             vec![sub],
             payload.as_slice(),
             &[s],

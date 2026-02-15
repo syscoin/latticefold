@@ -758,6 +758,15 @@ impl<F: PrimeField + FftField> WeRingLweProverContext<F> {
     pub fn proof_len(&self) -> usize {
         self.dpp.proof_len()
     }
+
+    pub fn derive_public_coins_from_stmt(
+        &self,
+        c_stmt: &[F],
+        block_id: usize,
+        rep_id: u64,
+    ) -> Result<Theorem43Coins<F>, String> {
+        self.dpp.derive_public_coins_from_stmt(c_stmt, block_id, rep_id)
+    }
 }
 
 fn make_theorem43_dpp_from_dr1cs<F: PrimeField + FftField>(
@@ -782,7 +791,6 @@ pub(crate) fn we_ringlwe_prover_from_dr1cs<F: PrimeField + FftField>(
 pub(crate) struct WeRingLweSubLockArmOut<F: PrimeField> {
     pub c_stmt: Vec<F>,
     pub accepting_set: [F; 2],
-    pub coins: dpp::theorem43::Theorem43Coins<F>,
     // Debug/analysis: Sq coefficients (mod 257) that determine which verifier terms are active.
     pub sq_c1_mod257: u16,
     pub sq_c2_mod257: u16,
@@ -796,6 +804,16 @@ pub(crate) struct WeRingLweSubLockArmOut<F: PrimeField> {
     /// Unscaled tail coefficients (mod 257 digits) in canonical order:
     /// `[coeff_mu, coeff_nu, c3, c4, ..., c_{p-1}]` of length 256 for F257.
     pub tail_coeffs_mod257: Vec<u16>,
+}
+
+/// Arm-time coefficients for one sublock, excluding `c_stmt` (which is constant across sublocks).
+///
+/// This is the fast path used by full-coverage arming to avoid per-hit `c_stmt` allocation/copy.
+pub(crate) struct WeRingLweSubLockArmCoeffs<F: PrimeField> {
+    pub accepting_set: [F; 2],
+    pub abg_coeffs_mod257: [u16; 3],
+    pub delta_x_mod257: u16,
+    pub tail_coeffs_mod257: [u16; 256],
 }
 
 /// Arm (publish) the public data needed for a single sublock (one hidden query).
@@ -927,11 +945,94 @@ pub(crate) fn arm_we_ringlwe_sublock_from_dr1cs<F: PrimeField + FftField>(
     Ok(WeRingLweSubLockArmOut {
         c_stmt,
         accepting_set,
-        coins: art.coins.clone(),
         sq_c1_mod257,
         sq_c2_mod257,
         x_len: x.len(),
         pi_len,
+        abg_coeffs_mod257,
+        delta_x_mod257,
+        tail_coeffs_mod257,
+    })
+}
+
+fn arm_we_ringlwe_sublock_coeffs_from_dpp<F: PrimeField + FftField>(
+    dpp: &Theorem43Dpp<F, FileBackedChunkedMulCodeDr1csNpFlpcpSparse<F, TensorRsMulCode<F>>>,
+    scratch: &mut dpp::dr1cs_flpcp::Dr1csQueryScratch<F>,
+    c_stmt: &[F],
+    x: &[F],
+    armer_secret: &[F],
+    block_id: usize,
+    rep_id: u64,
+) -> Result<WeRingLweSubLockArmCoeffs<F>, String> {
+    scratch.clear_all();
+    let art = dpp.arm(c_stmt, x, armer_secret, block_id, rep_id)?;
+
+    // Reject degenerate Sq coefficients.
+    if art.coeffs.len() < 2 {
+        return Err(
+            "arm_we_ringlwe_sublock_coeffs_from_dpp: bad Sq coeff length; resample rep_id".to_string(),
+        );
+    }
+    if art.coeffs[0].is_zero() || art.coeffs[1].is_zero() {
+        return Err(
+            "arm_we_ringlwe_sublock_coeffs_from_dpp: degenerate Sq coeff (c1==0 or c2==0); resample rep_id"
+                .to_string(),
+        );
+    }
+
+    // Instance-binding: compute `δ(x) = 1 + ⟨q_x, x⟩ (mod 257)` for the arming statement.
+    let mut delta_x_mod257: u16 = 1;
+    dpp.stream_query_terms_for_x(
+        x,
+        &art.coins,
+        &art.coeffs,
+        scratch,
+        &mut |xi, coeff| {
+            if xi >= x.len() {
+                return;
+            }
+            let c = (coeff.into_bigint().as_ref()[0] % 257) as u16;
+            let xj = (x[xi].into_bigint().as_ref()[0] % 257) as u16;
+            delta_x_mod257 = crate::lockable_ringlwe::add_mod257_u16(
+                delta_x_mod257,
+                crate::lockable_ringlwe::mul_mod257_u16(c, xj),
+            );
+        },
+    )?;
+    if delta_x_mod257 == 0 {
+        return Err(
+            "arm_we_ringlwe_sublock_coeffs_from_dpp: delta_x_mod257==0; resample rep_id".to_string(),
+        );
+    }
+
+    // Unscaled combination coefficients (mod 257 digits).
+    let c1 = art.coeffs[0];
+    let c2 = art.coeffs[1];
+    let coeff_alpha = c1 * art.coins.rho;
+    let coeff_beta = c1 * art.coins.sigma;
+    let coeff_gamma = {
+        let two = F::from(2u64);
+        c2 * (two * art.coins.rho * art.coins.sigma)
+    };
+    let abg_coeffs_mod257: [u16; 3] = [
+        (coeff_alpha.into_bigint().as_ref()[0] % 257) as u16,
+        (coeff_beta.into_bigint().as_ref()[0] % 257) as u16,
+        (coeff_gamma.into_bigint().as_ref()[0] % 257) as u16,
+    ];
+
+    // Tail coefficients correspond to `stream_pi0_and_collect_tails` tail layout:
+    // `[mu, nu, u^3..u^{p-1}]` (len=256 for F257).
+    let coeff_mu = c2 * (art.coins.rho * art.coins.rho);
+    let coeff_nu = c2 * (art.coins.sigma * art.coins.sigma);
+    let mut tail_coeffs_mod257: [u16; 256] = [0u16; 256];
+    tail_coeffs_mod257[0] = (coeff_mu.into_bigint().as_ref()[0] % 257) as u16;
+    tail_coeffs_mod257[1] = (coeff_nu.into_bigint().as_ref()[0] % 257) as u16;
+    for (i, c) in art.coeffs.iter().copied().skip(2).enumerate() {
+        tail_coeffs_mod257[2 + i] = (c.into_bigint().as_ref()[0] % 257) as u16;
+    }
+
+    Ok(WeRingLweSubLockArmCoeffs {
+        accepting_set: [F::ONE, F::from(2u64)],
         abg_coeffs_mod257,
         delta_x_mod257,
         tail_coeffs_mod257,
@@ -981,7 +1082,7 @@ pub(crate) struct WeRingLweLockArmOut<F: PrimeField> {
 
 /// Arm (publish) a RingLWE lock artifact from a public DR1CS instance and statement `x`.
 ///
-/// Canonical arming uses `(P channels) × (R reps)` sublocks.
+/// Canonical arming uses `hits_per_block` independent sublocks per FLPCP block.
 fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
     dr1cs: FileBackedSparseDr1csInstance<F>,
     public_len: usize,
@@ -989,86 +1090,30 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
     x: &[F],
     armer_seed: [u8; 32],
     lock_j: u64,
-    block_id: usize,
+    _block_id: usize,
     policy: WeRingLweLockArmingPolicy,
     params: RingLweParams,
-    p_channels: u16,
-    r_reps: u16,
+    hits_per_block: u16,
     payload: &[u8],
     rng: &mut impl rand::RngCore,
 ) -> Result<WeRingLweLockArmOut<F>, String> {
-    if p_channels == 0 || r_reps == 0 {
-        return Err("arm_we_ringlwe_lock_from_dr1cs: invalid (P,R)".to_string());
+    let dpp = make_theorem43_dpp_from_dr1cs::<F>(dr1cs.clone(), public_len)?;
+    let mut scratch = dpp.query_scratch();
+    if hits_per_block == 0 {
+        return Err("arm_we_ringlwe_lock_from_dr1cs: hits_per_block=0".to_string());
     }
+    // Canonical “hits-per-block” design uses a single channel secret.
+    let p_channels: u16 = 1;
     let max_rep_tries = policy.max_rep_tries.max(1);
 
     // Sample per-channel secrets.
-    let mut s_channels: Vec<u16> = Vec::with_capacity(p_channels as usize);
-    for _ in 0..p_channels {
-        s_channels.push(sample_nonzero_f257_scalar(rng));
-    }
+    let s_channels: Vec<u16> = vec![sample_nonzero_f257_scalar(rng)];
 
-    // Block-selection policy.
-    //
-    // Keep these constants consistent with `make_theorem43_dpp_from_dr1cs`.
-    const TENSOR_RS_BASE_K: usize = 48;
-    const TENSOR_RS_RANK: usize = 3;
-    const MIN_NNZ_ROW_E: usize = TENSOR_RS_BASE_K.pow(TENSOR_RS_RANK as u32);
-    const BINDING_REPS_PER_CHANNEL: u16 = 1;
-    let code = TensorRsMulCode::<F>::new(TENSOR_RS_BASE_K, TENSOR_RS_RANK)?;
-    let k: u64 = code.dim_k().max(1) as u64;
-    let nconstraints: u64 = dr1cs.layout.nconstraints;
-    let blocks: usize = ((nconstraints + k - 1) / k) as usize;
-    let ell_local: usize = code.len_l().max(1);
-    if blocks == 0 {
-        return Err("arm_we_ringlwe_lock_from_dr1cs: blocks=0".to_string());
-    }
-    // Bind at least one rep per channel to the block that contains `cv_prefix_glue` (statement binding),
-    // falling back to the *tail* (last) block when part metadata is unavailable.
-    //
-    // Rationale:
-    // - The DPP lock only "sees" constraints in the sampled FLPCP block(s).
-    // - The `cv_prefix_glue` constraints live in a dedicated file-backed part directory during shape build.
-    // - If we can locate that part, we can deterministically target the block that contains it.
-    let binding_block: usize = {
-        fn parse_constraints_from_meta(meta: &str) -> Option<u64> {
-            for line in meta.lines() {
-                if let Some(rest) = line.strip_prefix("constraints=") {
-                    if let Ok(v) = rest.trim().parse::<u64>() {
-                        return Some(v);
-                    }
-                }
-            }
-            None
-        }
-        fn read_constraints_from_part_dir(dir: &std::path::Path) -> Option<u64> {
-            let meta_path = dir.join("meta.txt");
-            let meta = std::fs::read_to_string(meta_path).ok()?;
-            parse_constraints_from_meta(&meta)
-        }
-
-        let mut chosen = blocks.saturating_sub(1);
-        // Best-effort: if the merged instance lives at `<out_dir>/merged`, parts are siblings under `<out_dir>/`.
-        if let Some(parent) = dr1cs.layout.dir.parent() {
-            let dir_params = parent.join("params_prefix");
-            let dir_tiny = parent.join("tiny_gate");
-            // `cv_prefix_glue` contains the exact constraints that bind absorbed public-input bytes to stmt hashing.
-            let dir_glue = parent.join("cv_prefix_glue");
-            if let (Some(c_params), Some(c_tiny), Some(_c_glue)) = (
-                read_constraints_from_part_dir(&dir_params),
-                read_constraints_from_part_dir(&dir_tiny),
-                read_constraints_from_part_dir(&dir_glue),
-            ) {
-                // Glue starts right after params_prefix + tiny_gate in the merge order.
-                let glue_start_row = c_params.saturating_add(c_tiny);
-                let b = (glue_start_row / k) as usize;
-                if b < blocks {
-                    chosen = b;
-                }
-            }
-        }
-        chosen
-    };
+    // Statement commitment and armer secret are constant across all hits.
+    let c_stmt: Vec<F> = stmt_digest
+        .iter()
+        .map(|e| F::from((e.into_bigint().as_ref()[0] % 257) as u64))
+        .collect();
     let stmt_bytes64: [u8; 64] = {
         let mut out = [0u8; 64];
         for (i, e) in stmt_digest.iter().enumerate() {
@@ -1079,45 +1124,67 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
         }
         out
     };
-    let block_id_for = |channel_id: u16, rep: u16| -> usize {
-        if rep < BINDING_REPS_PER_CHANNEL.min(r_reps) {
-            return binding_block;
+    let armer_secret: Vec<F> = {
+        use sha2::Digest;
+        let mut out = Vec::with_capacity(4);
+        for i in 0..4usize {
+            let mut h = sha2::Sha256::new();
+            h.update(b"LFP_ARMER_SECRET_V1");
+            h.update(&armer_seed);
+            h.update(&stmt_bytes64);
+            h.update(&lock_j.to_le_bytes());
+            h.update(&(i as u64).to_le_bytes());
+            let d: [u8; 32] = h.finalize().into();
+            out.push(F::from_le_bytes_mod_order(&d));
         }
-        let mut h = sha2::Sha256::new();
-        h.update(b"LFP_WE_LOCK_BLOCK_ID_V1");
-        h.update(&armer_seed);
-        h.update(&stmt_bytes64);
-        h.update(&lock_j.to_le_bytes());
-        h.update(&policy.base_rep_id.to_le_bytes());
-        h.update(&channel_id.to_le_bytes());
-        h.update(&rep.to_le_bytes());
-        // Preserve the legacy `block_id` parameter as an explicit salt to keep stable tuning knobs.
-        h.update(&(block_id as u64).to_le_bytes());
-        let d: [u8; 32] = h.finalize().into();
-        let u = u64::from_le_bytes(d[0..8].try_into().unwrap());
-        (u as usize) % blocks
+        out
     };
+    let x_len: usize = x.len();
+    let pi_len: usize = dpp.proof_len();
 
-    // Arm sublocks with ratio-class distinctness enforced within each channel.
+    // Block-selection policy.
     //
-    // Note: oneproof parallelizes at the *lock* level. Keeping the inner `(channel,rep)` arming
-    // loop sequential avoids accidental nondeterminism from deep parallelism while we rely on
-    // the higher-level parallelism for throughput.
-    let mut sublocks: Vec<RingLweSubLock<F>> =
-        Vec::with_capacity((p_channels as usize) * (r_reps as usize));
-    let mut c_stmt: Option<Vec<F>> = None;
-    let mut x_len: Option<usize> = None;
-    let mut pi_len: Option<usize> = None;
-    let mut global_try_idx: u64 = 0;
+    // Keep these constants consistent with `make_theorem43_dpp_from_dr1cs`.
+    const TENSOR_RS_BASE_K: usize = 48;
+    const TENSOR_RS_RANK: usize = 3;
+    const MIN_NNZ_ROW_E: usize = TENSOR_RS_BASE_K.pow(TENSOR_RS_RANK as u32);
+    let code = TensorRsMulCode::<F>::new(TENSOR_RS_BASE_K, TENSOR_RS_RANK)?;
+    let k: u64 = code.dim_k().max(1) as u64;
+    let nconstraints: u64 = dr1cs.layout.nconstraints;
+    let blocks: usize = ((nconstraints + k - 1) / k) as usize;
+    let ell_local: usize = code.len_l().max(1);
+    if blocks == 0 {
+        return Err("arm_we_ringlwe_lock_from_dr1cs: blocks=0".to_string());
+    }
+    // Full-coverage schedule: every block gets `hits_per_block` independent hits.
+    let sublocks_per_channel: u32 = (blocks as u64)
+        .saturating_mul(hits_per_block as u64)
+        .try_into()
+        .map_err(|_| "arm_we_ringlwe_lock_from_dr1cs: sublocks_per_channel overflows u32")?;
 
-    for ch in 0..p_channels {
-        for rep in 0..r_reps {
-            let block_id_sl = block_id_for(ch, rep);
+    let mut sublocks: Vec<RingLweSubLock<F>> = Vec::with_capacity(sublocks_per_channel as usize);
+
+    let ch: u16 = 0;
+    let total_sublks: usize = blocks
+        .saturating_mul(hits_per_block as usize);
+    // Parallelize arming over all `(block,hit)` tasks. Determinism is preserved because:
+    // - `rep_id` is derived from `(armer_seed, stmt_digest, lock_j, block_id, rep, try_idx)`
+    // - selection is purely local (min hint size within budget) with a deterministic tie-breaker.
+    let sublocks: Vec<RingLweSubLock<F>> = (0..total_sublks)
+        .into_par_iter()
+        .map_init(|| dpp.query_scratch(), |scratch, lin| -> Result<RingLweSubLock<F>, String> {
+            let block_id_sl: usize = lin / (hits_per_block as usize);
+            let rep_usize: usize = lin % (hits_per_block as usize);
+            let rep: u16 = rep_usize
+                .try_into()
+                .map_err(|_| "arm_we_ringlwe_lock_from_dr1cs: rep overflow".to_string())?;
+
             let mut tries = 0usize;
             let mut best_sl: Option<RingLweSubLock<F>> = None;
             let mut best_hint_bytes: Option<usize> = None;
             while tries < max_rep_tries {
                 tries += 1;
+                let try_idx = (tries - 1) as u64;
                 let rep_id = derive_rep_id_try(
                     &armer_seed,
                     &stmt_digest,
@@ -1126,28 +1193,27 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                     policy.base_rep_id,
                     ch,
                     rep,
-                    global_try_idx,
+                    try_idx,
                 );
-                global_try_idx = global_try_idx.wrapping_add(1);
-                let out = match arm_we_ringlwe_sublock_from_dr1cs::<F>(
-                    dr1cs.clone(),
-                    public_len,
-                    stmt_digest,
+                let out = match arm_we_ringlwe_sublock_coeffs_from_dpp::<F>(
+                    &dpp,
+                    scratch,
+                    c_stmt.as_slice(),
                     x,
-                    armer_seed,
-                    lock_j,
+                    armer_secret.as_slice(),
                     block_id_sl,
                     rep_id,
                 ) {
                     Ok(v) => v,
-                    Err(e) if e.contains("resample rep_id") => {
-                        continue;
-                    }
+                    Err(e) if e.contains("resample rep_id") => continue,
                     Err(e) => return Err(e),
                 };
 
-                let local_idx = out.coins.idx % ell_local;
-                // Apply dense-support quality filtering to all selected blocks.
+                // Derive the public coins exactly as the prover/decapper will.
+                let coins =
+                    dpp.derive_public_coins_from_stmt(c_stmt.as_slice(), block_id_sl, rep_id)?;
+                let local_idx = coins.idx % ell_local;
+                // Apply dense-support quality filtering.
                 let mut nnz: usize = 0;
                 code.row_e_stream(local_idx, &mut |_i, c| {
                     let v = (c.into_bigint().as_ref()[0] % 257) as u16;
@@ -1159,23 +1225,14 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                     continue;
                 }
 
-
-                if c_stmt.is_none() {
-                    c_stmt = Some(out.c_stmt.clone());
-                    x_len = Some(out.x_len);
-                    pi_len = Some(out.pi_len);
-                }
-
-                let s = s_channels[ch as usize];
+                let s = s_channels[0];
                 let abg_scales: [u16; 3] = [
                     crate::lockable_ringlwe::mul_mod257_u16(s, out.abg_coeffs_mod257[0]),
                     crate::lockable_ringlwe::mul_mod257_u16(s, out.abg_coeffs_mod257[1]),
                     crate::lockable_ringlwe::mul_mod257_u16(s, out.abg_coeffs_mod257[2]),
                 ];
-                let offset_scale: u16 = crate::lockable_ringlwe::mul_mod257_u16(s, out.delta_x_mod257);
-                if out.tail_coeffs_mod257.len() != 256 {
-                    return Err("arm_we_ringlwe_lock_from_dr1cs: bad tail coeff length".to_string());
-                }
+                let offset_scale: u16 =
+                    crate::lockable_ringlwe::mul_mod257_u16(s, out.delta_x_mod257);
                 let tail_scales_blocks: [crate::lockable_ringlwe::PackedF257Block64; 4] =
                     core::array::from_fn(|bi| {
                         let mut tmp = [0u16; 64];
@@ -1198,7 +1255,8 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                 let sl = RingLweSubLock::<F> {
                     channel_id: ch,
                     accepting_set: out.accepting_set,
-                    coins: out.coins.clone(),
+                    block_id: block_id_sl as u32,
+                    rep_id,
                     hints: crate::lockable_ringlwe::BranchHintsCompressed {
                         abg_scales,
                         offset_scale,
@@ -1209,12 +1267,9 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                     Some(budget) => hint_bytes <= budget,
                     None => true,
                 };
-                // Enforce hard-cap semantics when a hint budget is configured:
-                // only in-budget candidates are eligible for selection.
                 if !within_budget {
                     continue;
                 }
-                // Minimize hint size among eligible candidates (in-budget if a budget is set).
                 match best_hint_bytes {
                     Some(cur) if hint_bytes >= cur => {}
                     _ => {
@@ -1223,7 +1278,7 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                     }
                 }
             }
-            let sl = best_sl.ok_or_else(|| {
+            best_sl.ok_or_else(|| {
                 if let Some(budget) = policy.hint_budget_bytes {
                     format!(
                         "arm_we_ringlwe_lock_from_dr1cs: failed to find in-budget sublock within retry budget (hint_budget_bytes={})",
@@ -1233,18 +1288,17 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                     "arm_we_ringlwe_lock_from_dr1cs: failed to arm sublock within retry budget"
                         .to_string()
                 }
-            })?;
-            sublocks.push(sl);
-        }
-    }
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
 
     let lock = arm_ringlwe_lock(
-        c_stmt.ok_or_else(|| "arm_we_ringlwe_lock_from_dr1cs: missing c_stmt".to_string())?,
-        x_len.ok_or_else(|| "arm_we_ringlwe_lock_from_dr1cs: missing x_len".to_string())?,
-        pi_len.ok_or_else(|| "arm_we_ringlwe_lock_from_dr1cs: missing pi_len".to_string())?,
+        c_stmt,
+        x_len,
+        pi_len,
         params,
         p_channels,
-        r_reps,
+        sublocks_per_channel,
         sublocks,
         payload,
         s_channels.as_slice(),
@@ -1276,8 +1330,7 @@ pub(crate) fn arm_lfplus_ringlwe_lock<R>(
     block_id: usize,
     policy: WeRingLweLockArmingPolicy,
     ringlwe_params: RingLweParams,
-    p_channels: u16,
-    r_reps: u16,
+    hits_per_block: u16,
     payload: &[u8],
     rng: &mut impl rand::RngCore,
 ) -> Result<WeRingLweLockArmOut<F257>, String>
@@ -1304,8 +1357,7 @@ where
         block_id,
         policy,
         ringlwe_params,
-        p_channels,
-        r_reps,
+        hits_per_block,
         payload,
         rng,
     )

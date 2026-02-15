@@ -357,29 +357,20 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
     let mut locks: Vec<RingLweLockArtifact<F257>> = Vec::with_capacity(k_locks);
     let mut share_indices: Vec<u32> = Vec::with_capacity(k_locks);
     // Channels/repetitions:
-    // - P channels gives ~8P bits/lock (classical) against attackers without π (global-check-only).
-    // - R repetitions per channel allow the honest decapper (with π) to disambiguate without
-    //   per-lock oracles, by intersecting 2-candidate sets across reps.
-    let p_channels_raw: usize = std::env::var("LFP_ONEPROOF_P")
+    // Hits-per-block policy:
+    // - We use a single channel (`P=1`) to minimize format/logic complexity.
+    // - Per-block soundness and disambiguation both come from `hits_per_block` independent hits
+    //   on every FLPCP block (full coverage).
+    let p_channels: u16 = 1;
+    let hits_per_block_raw: usize = std::env::var("LFP_ONEPROOF_HITS_PER_BLOCK")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(2)
+        .unwrap_or(4)
         .max(1);
-    let r_reps_raw: usize = std::env::var("LFP_ONEPROOF_R")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2)
-        .max(1);
-    let p_channels: u16 = p_channels_raw.try_into().map_err(|_| {
+    let hits_per_block: u16 = hits_per_block_raw.try_into().map_err(|_| {
         format!(
-            "LFP_ONEPROOF_P out of range for u16 (value={})",
-            p_channels_raw
-        )
-    })?;
-    let r_reps: u16 = r_reps_raw.try_into().map_err(|_| {
-        format!(
-            "LFP_ONEPROOF_R out of range for u16 (value={})",
-            r_reps_raw
+            "LFP_ONEPROOF_HITS_PER_BLOCK out of range for u16 (value={})",
+            hits_per_block_raw
         )
     })?;
     // Sizing policy:
@@ -431,8 +422,7 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
                 block_id,
                 policy,
                 ringlwe_params.clone(),
-                p_channels,
-                r_reps,
+                hits_per_block,
                 shares[j].value.as_slice(),
                 &mut rng,
             )?;
@@ -870,7 +860,12 @@ fn decap_sp1_oneproof_we_gate_from_files_inner(
     let mut coins_list: Vec<_> = Vec::with_capacity(total_sublks);
     for (li, l) in locks.iter().enumerate() {
         for (si, sl) in l.sublocks.iter().enumerate() {
-            coins_list.push(sl.coins.clone());
+            let coins = prover.derive_public_coins_from_stmt(
+                l.c_stmt.as_slice(),
+                sl.block_id as usize,
+                sl.rep_id,
+            )?;
+            coins_list.push(coins);
             state_meta.push((li, si, sl.channel_id));
         }
     }
@@ -1088,7 +1083,7 @@ fn write_lock_package_to_writer(
     // Canonical lock package v6:
     // - compressed hints only (no sparse hints; no legacy formats).
     // - hints store only `offset_scale = s*δ(x_arm)` rather than masked per-coordinate `h_x`.
-    w.write_all(b"LFP1LOCKV6")?;
+    w.write_all(b"LFP1LOCKV9")?;
     // Embedded manifest (canonical public metadata).
     for f in &manifest.stmt_digest {
         w.write_all(&f257_to_u16(f).to_le_bytes())?;
@@ -1118,20 +1113,18 @@ fn write_lock_package_to_writer(
         // params
         write_u32(w, lock.params._reserved0)?;
         w.write_all(&lock.params.domain_label)?;
-        // (P,R) and sublocks
+        // (P,sublocks_per_channel) and sublocks
         w.write_all(&lock.p_channels.to_le_bytes())?;
-        w.write_all(&lock.r_reps.to_le_bytes())?;
+        w.write_all(&lock.sublocks_per_channel.to_le_bytes())?;
         write_u32(w, lock.sublocks.len() as u32)?;
         for sl in &lock.sublocks {
             w.write_all(&sl.channel_id.to_le_bytes())?;
             // accepting_set
             w.write_all(&f257_to_u16(&sl.accepting_set[0]).to_le_bytes())?;
             w.write_all(&f257_to_u16(&sl.accepting_set[1]).to_le_bytes())?;
-            // coins
-            write_u64(w, sl.coins.idx as u64)?;
-            w.write_all(&f257_to_u16(&sl.coins.lambda).to_le_bytes())?;
-            w.write_all(&f257_to_u16(&sl.coins.rho).to_le_bytes())?;
-            w.write_all(&f257_to_u16(&sl.coins.sigma).to_le_bytes())?;
+            // coin-derivation inputs (canonical): derive public Theorem-4.3 coins from `(c_stmt, block_id, rep_id)`.
+            write_u32(w, sl.block_id)?;
+            write_u64(w, sl.rep_id)?;
             // hints (compressed only)
             if lock.params._reserved0 != 2 {
                 return Err(std::io::Error::new(
@@ -1197,8 +1190,8 @@ fn read_lock_package_from_reader(
 
     let mut magic = [0u8; 10];
     r.read_exact(&mut magic)?;
-    let v6 = &magic == b"LFP1LOCKV6";
-    if !v6 {
+    let v9 = &magic == b"LFP1LOCKV9";
+    if !v9 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "bad lock pkg magic",
@@ -1339,19 +1332,24 @@ fn read_lock_package_from_reader(
             _reserved0: reserved0,
             domain_label,
         };
-        // (P,R) and sublocks
+        // (P,sublocks_per_channel) and sublocks
         r.read_exact(&mut b2)?;
         let p_channels = u16::from_le_bytes(b2);
-        r.read_exact(&mut b2)?;
-        let r_reps = u16::from_le_bytes(b2);
-        if p_channels == 0 || r_reps == 0 {
+        let sublocks_per_channel = read_u32(r)?;
+        if p_channels == 0 || sublocks_per_channel == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "invalid (P,R) in lock package",
+                "invalid (P,sublocks_per_channel) in lock package",
             ));
         }
         let ns = read_u32(r)? as usize;
-        if ns != (p_channels as usize) * (r_reps as usize) {
+        let expected_ns: usize = (p_channels as u64)
+            .saturating_mul(sublocks_per_channel as u64)
+            .try_into()
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "sublocks length overflow")
+            })?;
+        if ns != expected_ns {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "sublocks length mismatch",
@@ -1366,14 +1364,9 @@ fn read_lock_package_from_reader(
             let a0 = u16::from_le_bytes(b2);
             r.read_exact(&mut b2)?;
             let a1 = u16::from_le_bytes(b2);
-            // coins
-            let idx = read_u64(r)? as usize;
-            r.read_exact(&mut b2)?;
-            let lambda = u16::from_le_bytes(b2);
-            r.read_exact(&mut b2)?;
-            let rho = u16::from_le_bytes(b2);
-            r.read_exact(&mut b2)?;
-            let sigma = u16::from_le_bytes(b2);
+            // coin-derivation inputs (canonical)
+            let block_id = read_u32(r)?;
+            let rep_id = read_u64(r)?;
 
             fn read_packed_block(r: &mut impl Read) -> std::io::Result<PackedF257Block64> {
                 // Canonical per-block encoding.
@@ -1467,12 +1460,8 @@ fn read_lock_package_from_reader(
             sublocks.push(RingLweSubLock::<F257> {
                 channel_id,
                 accepting_set: [u16_to_f257(a0), u16_to_f257(a1)],
-                coins: dpp::theorem43::Theorem43Coins::<F257> {
-                    idx,
-                    lambda: u16_to_f257(lambda),
-                    rho: u16_to_f257(rho),
-                    sigma: u16_to_f257(sigma),
-                },
+                block_id,
+                rep_id,
                 hints,
             });
         }
@@ -1500,7 +1489,7 @@ fn read_lock_package_from_reader(
             len,
             params,
             p_channels,
-            r_reps,
+            sublocks_per_channel,
             sublocks,
             ct,
         });
@@ -1533,7 +1522,7 @@ fn write_lock_package(
 
     // Optional wrapper compression:
     // - Outer magic: LFP1LOCKZ3
-    // - Payload: zstd frame whose decompressed bytes begin with inner magic LFP1LOCKV6
+    // - Payload: zstd frame whose decompressed bytes begin with inner magic LFP1LOCKV9
     const MAGIC_ZSTD_V3: &[u8; 10] = b"LFP1LOCKZ3";
 
     let f = std::fs::File::create(path)?;
@@ -1558,15 +1547,15 @@ fn read_lock_package(
 ) -> std::io::Result<(Sp1OneProofWeGateLockPkgManifest, Vec<u32>, Vec<RingLweLockArtifact<F257>>)> {
     use std::io::{Seek, SeekFrom};
 
-    // - Uncompressed: LFP1LOCKV6
-    // - Compressed wrapper: LFP1LOCKZ3 || zstd(LFP1LOCKV6 || ...)
-    const MAGIC_RAW_V6: &[u8; 10] = b"LFP1LOCKV6";
+    // - Uncompressed: LFP1LOCKV9
+    // - Compressed wrapper: LFP1LOCKZ3 || zstd(LFP1LOCKV9 || ...)
+    const MAGIC_RAW_V9: &[u8; 10] = b"LFP1LOCKV9";
     const MAGIC_ZSTD_V3: &[u8; 10] = b"LFP1LOCKZ3";
 
     let mut f = std::fs::File::open(path)?;
     let mut magic = [0u8; 10];
     f.read_exact(&mut magic)?;
-    if &magic == MAGIC_RAW_V6 {
+    if &magic == MAGIC_RAW_V9 {
         f.seek(SeekFrom::Start(0))?;
         let mut r = std::io::BufReader::new(f);
         return read_lock_package_from_reader(&mut r);
