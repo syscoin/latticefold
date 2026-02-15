@@ -30,8 +30,8 @@ pub fn cfg_read_buf_bytes() -> usize {
     let mb: usize = std::env::var("LFP_FILE_BACKED_READ_BUF_MB")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(64);
-    mb.saturating_mul(1024 * 1024).max(64 * 1024 * 1024)
+        .unwrap_or(8);
+    mb.saturating_mul(1024 * 1024).max(8 * 1024 * 1024)
 }
 
 #[derive(Clone, Debug)]
