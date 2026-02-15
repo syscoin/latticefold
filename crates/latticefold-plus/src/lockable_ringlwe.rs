@@ -571,26 +571,52 @@ impl<F: PrimeField> RingLweLockArtifact<F> {
 // Decap helpers (candidate intersection + payload candidate enumeration)
 // ---------------------------------------------------------------------------
 
-fn intersect_2cands_across_reps(reps: &[[u16; 2]]) -> Result<Vec<u16>, String> {
-    if reps.is_empty() {
-        return Err("ringlwe: empty reps list".to_string());
+#[inline]
+fn bitset257_from_2cands(cands: [u16; 2]) -> [u64; 5] {
+    let mut bs = [0u64; 5]; // 5*64 = 320 >= 257
+    for &v in &cands {
+        let idx = (v % 257) as usize;
+        let w = idx >> 6;
+        let b = idx & 63;
+        bs[w] |= 1u64 << b;
     }
-    let mut cur: Vec<u16> = vec![reps[0][0], reps[0][1]];
-    cur.sort_unstable();
-    cur.dedup();
-    for rep in reps.iter().skip(1) {
-        let mut nxt: Vec<u16> = vec![rep[0], rep[1]];
-        nxt.sort_unstable();
-        nxt.dedup();
-        let mut inter: Vec<u16> = Vec::new();
-        for &a in &cur {
-            if nxt.contains(&a) {
-                inter.push(a);
+    bs
+}
+
+#[inline]
+fn bitset257_and_inplace(a: &mut [u64; 5], b: &[u64; 5]) {
+    for i in 0..5 {
+        a[i] &= b[i];
+    }
+}
+
+#[inline]
+fn bitset257_is_empty(a: &[u64; 5]) -> bool {
+    a.iter().all(|&w| w == 0)
+}
+
+#[inline]
+fn bitset257_popcount(a: &[u64; 5]) -> u32 {
+    a.iter().map(|w| w.count_ones()).sum()
+}
+
+#[inline]
+fn bitset257_singleton_value(a: &[u64; 5]) -> Option<u16> {
+    if bitset257_popcount(a) != 1 {
+        return None;
+    }
+    for (wi, &w) in a.iter().enumerate() {
+        if w != 0 {
+            let tz = w.trailing_zeros() as usize;
+            let idx = (wi << 6) | tz;
+            if idx <= 256 {
+                return Some(idx as u16);
+            } else {
+                return None;
             }
         }
-        cur = inter;
     }
-    Ok(cur)
+    None
 }
 
 /// Given per-sublock `s` candidates (mod 257), intersect across repetitions within each channel,
@@ -638,47 +664,46 @@ pub(crate) fn decrypt_payload_from_sublock_s_candidates<F: PrimeField>(
         }
     }
 
-    // Intersect across reps within a channel.
-    let mut channel_sets: Vec<Vec<u16>> = Vec::with_capacity(p);
+    // Intersect across reps within a channel using a 257-bit bitset.
+    let mut s_channels: Vec<u16> = Vec::with_capacity(p);
     for ch in 0..p {
-        let mut cur = intersect_2cands_across_reps(per_channel_reps[ch].as_slice())?;
-        cur.sort_unstable();
-        cur.dedup();
-        if cur.is_empty() {
+        let reps = per_channel_reps[ch].as_slice();
+        debug_assert_eq!(reps.len(), r);
+        let mut alive = bitset257_from_2cands(reps[0]);
+        for rep in reps.iter().skip(1) {
+            let m = bitset257_from_2cands(*rep);
+            bitset257_and_inplace(&mut alive, &m);
+            if bitset257_is_empty(&alive) {
+                break;
+            }
+        }
+        if bitset257_is_empty(&alive) {
             return Err(format!(
                 "ringlwe: empty intersection for some channel (ch={} reps={:?})",
                 ch, per_channel_reps[ch]
             ));
         }
-        if cur.len() > 2 {
-            return Err("ringlwe: internal error (intersection >2)".to_string());
-        }
-        channel_sets.push(cur);
+        let s = bitset257_singleton_value(&alive).ok_or_else(|| {
+            // Canonical policy: no branching. If intersections do not collapse to singletons,
+            // the lock is not deterministically decapsulatable without an external predicate.
+            //
+            // Report popcount to help parameter tuning.
+            let pc = bitset257_popcount(&alive);
+            format!(
+                "ringlwe: ambiguous per-channel intersections (P={p} R={r} ch={ch} popcount={pc}); increase sublocks per channel (e.g. full coverage) or increase R"
+            )
+        })?;
+        s_channels.push(s);
     }
 
-    // Enumerate cartesian product over per-channel candidates.
-    let mut total: u64 = 1;
-    for set in &channel_sets {
-        total = total.saturating_mul(set.len() as u64);
-    }
-    // Canonical policy: no branching. If the per-channel intersections do not collapse to
-    // singletons, the lock is not deterministically decapsulatable without an external global
-    // disambiguation predicate (which we intentionally avoid at the lock layer).
-    //
-    if total != 1 {
-        let lens: Vec<usize> = channel_sets.iter().map(|s| s.len()).collect();
+    // Canonical policy: no branching (already enforced via singleton extraction above).
+    if s_channels.len() != p {
         return Err(format!(
-            "ringlwe: ambiguous per-channel intersections (P={p} R={r} channel_set_lens={lens:?} total_tuples={total}); increase sublocks per channel (e.g. full coverage) or increase R"
+            "ringlwe: internal error (s_channels len mismatch: got={} expected={})",
+            s_channels.len(),
+            p
         ));
     }
-
-    let s_channels: Vec<u16> = channel_sets
-        .iter()
-        .map(|set| {
-            debug_assert_eq!(set.len(), 1);
-            set[0]
-        })
-        .collect();
     lock.decrypt_payload(s_channels.as_slice())
 }
 
