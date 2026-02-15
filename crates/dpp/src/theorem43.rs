@@ -100,33 +100,26 @@ pub struct Theorem43AbgTail<F: PrimeField> {
 struct QueryStreamAcc<F: PrimeField> {
     acc_pi: F,
     acc_full: F,
-    // Sparse per-block terms over the `w_eval[block]` slices in π0.
+    // Sparse terms over the selected block's `w_eval` slice in π0.
     //
-    // In production regimes, each query typically touches very few blocks (often 1), so keeping
-    // this sparse avoids `O(blocks)` per-coin allocations and supports block-grouped streaming.
-    block_terms: Vec<(usize, Vec<(F, usize)>)>,
+    // In the canonical block-grouped schedule, each coin corresponds to exactly one block
+    // (determined by `coins.idx / ell_local`), so we store only local `(coeff, pos)` terms for
+    // that block to avoid per-block heap allocations.
+    w_terms: Vec<(F, usize)>,
 }
 
 impl<F: PrimeField> QueryStreamAcc<F> {
-    fn add_block(&mut self, block_id: usize, w_eval: &[F]) -> Result<(), String> {
-        // Sparse: if we don't touch this block, nothing to do.
-        let Some((_b, terms)) = self.block_terms.iter().find(|(b, _)| *b == block_id) else {
-            return Ok(());
-        };
-        for (c, pos) in terms {
-            if *pos >= w_eval.len() {
+    #[inline]
+    fn add_w_eval(&mut self, w_eval: &[F]) -> Result<(), String> {
+        for (c, pos) in self.w_terms.iter().copied() {
+            if pos >= w_eval.len() {
                 return Err("w_eval index out of range".to_string());
             }
-            let t = *c * w_eval[*pos];
+            let t = c * w_eval[pos];
             self.acc_pi += t;
             self.acc_full += t;
         }
         Ok(())
-    }
-
-    #[inline]
-    fn touched_blocks(&self) -> impl Iterator<Item = usize> + '_ {
-        self.block_terms.iter().map(|(b, _)| *b)
     }
 }
 
@@ -137,15 +130,23 @@ struct QueryStreamAccBuilder<'a, F: PrimeField> {
     z_w_len: usize,
     k_star: usize,
     blocks: usize,
+    block_id: usize,
     n: usize,
     m: usize,
     acc_pi: F,
     acc_full: F,
-    block_terms: Vec<(usize, Vec<(F, usize)>)>,
+    w_terms: Vec<(F, usize)>,
 }
 
 impl<'a, F: PrimeField> QueryStreamAccBuilder<'a, F> {
-    fn new(x: &'a [F], z_w: &'a [F], z_w_len: usize, k_star: usize, blocks: usize) -> Self {
+    fn new(
+        x: &'a [F],
+        z_w: &'a [F],
+        z_w_len: usize,
+        k_star: usize,
+        blocks: usize,
+        block_id: usize,
+    ) -> Self {
         let n = x.len();
         let m = z_w_len + (k_star * blocks);
         Self {
@@ -154,11 +155,12 @@ impl<'a, F: PrimeField> QueryStreamAccBuilder<'a, F> {
             z_w_len,
             k_star,
             blocks,
+            block_id,
             n,
             m,
             acc_pi: F::ZERO,
             acc_full: F::ZERO,
-            block_terms: Vec::new(),
+            w_terms: Vec::new(),
         }
     }
 
@@ -184,11 +186,10 @@ impl<'a, F: PrimeField> QueryStreamAccBuilder<'a, F> {
         if block >= self.blocks {
             return Err("query block out of range".to_string());
         }
-        if let Some((_b, terms)) = self.block_terms.iter_mut().find(|(b, _)| *b == block) {
-            terms.push((c, pos));
-        } else {
-            self.block_terms.push((block, vec![(c, pos)]));
+        if block != self.block_id {
+            return Err("query touched unexpected block".to_string());
         }
+        self.w_terms.push((c, pos));
         Ok(())
     }
 
@@ -196,7 +197,7 @@ impl<'a, F: PrimeField> QueryStreamAccBuilder<'a, F> {
         QueryStreamAcc {
             acc_pi: self.acc_pi,
             acc_full: self.acc_full,
-            block_terms: self.block_terms,
+            w_terms: self.w_terms,
         }
     }
 }
@@ -273,14 +274,24 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
         let z_w = &pi0[..z_w_len];
         let mut scratch = Dr1csQueryScratch::<F>::new(flpcp.n_total());
         scratch.clear_all();
-        let mut b0 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
-        let mut b1 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
-        let mut b2 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
+        let ell_local = flpcp.ell_local();
+        if ell_local == 0 {
+            return Err("ell_local=0".to_string());
+        }
+        let block_id = art.coins.idx / ell_local;
+        if block_id >= blocks {
+            return Err("bad coin block_id".to_string());
+        }
+        let base = x.len() + z_w_len;
+        let mut b0 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks, block_id);
+        let mut b1 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks, block_id);
+        let mut b2 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks, block_id);
         let mut sink_err: Option<String> = None;
         struct Sink<'a, 'b, 'e, F: PrimeField> {
             b0: &'b mut QueryStreamAccBuilder<'a, F>,
             b1: &'b mut QueryStreamAccBuilder<'a, F>,
             b2: &'b mut QueryStreamAccBuilder<'a, F>,
+            base: usize,
             err: &'e mut Option<String>,
         }
         impl<'a, 'b, 'e, F: PrimeField> QuerySink<F> for Sink<'a, 'b, 'e, F> {
@@ -304,6 +315,10 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
                 if self.err.is_some() {
                     return;
                 }
+                // IMPORTANT: do NOT store dense `q3` witness (w_eval) terms.
+                if idx >= self.base {
+                    return;
+                }
                 if let Err(e) = self.b2.add_term(coeff, idx) {
                     *self.err = Some(e);
                 }
@@ -314,6 +329,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
                 b0: &mut b0,
                 b1: &mut b1,
                 b2: &mut b2,
+                base,
                 err: &mut sink_err,
             };
             flpcp.stream_queries_for_coins_sparse(
@@ -333,11 +349,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
         let mut acc2 = b2.finish();
 
         // Stream w_eval blocks out of π0.
-        let ell_local = flpcp.ell_local();
-        if ell_local == 0 {
-            return Err("ell_local=0".to_string());
-        }
-        let q3_block_id = art.coins.idx / ell_local;
+        let q3_block_id = block_id;
         let mut off = z_w_len;
         for b in 0..blocks {
             let end = off + k_star;
@@ -345,10 +357,10 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
                 return Err("bad w_eval slice".to_string());
             }
             let w_eval = &pi0[off..end];
-            acc0.add_block(b, w_eval)?;
-            acc1.add_block(b, w_eval)?;
-            // q3 witness dot for the selected block (file-backed backends omit dense witness terms).
             if b == q3_block_id {
+                acc0.add_w_eval(w_eval)?;
+                acc1.add_w_eval(w_eval)?;
+                // q3 witness dot for the selected block (file-backed backends omit dense witness terms).
                 let dot = flpcp.dot_q3_w_eval(art.coins.idx, art.coins.lambda, x, &mut scratch, w_eval)?;
                 acc2.acc_pi += dot;
                 acc2.acc_full += dot;
@@ -616,9 +628,12 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                     if block_id >= blocks {
                         return Err("bad coin block_id".to_string());
                     }
-                    let mut b0 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
-                    let mut b1 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
-                    let mut b2 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
+                    let mut b0 =
+                        QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks, block_id);
+                    let mut b1 =
+                        QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks, block_id);
+                    let mut b2 =
+                        QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks, block_id);
                     let mut sink_err: Option<String> = None;
                     struct Sink<'a, 'b, 'e, F: PrimeField> {
                         b0: &'b mut QueryStreamAccBuilder<'a, F>,
@@ -684,7 +699,10 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             .collect::<Result<Vec<_>, String>>()?;
 
         // Block-grouped schedule: each coin updates exactly its selected block.
-        let mut bucket: Vec<Vec<usize>> = vec![Vec::new(); blocks];
+        let avg_per_block = (accs.len().saturating_add(blocks).saturating_sub(1)) / blocks.max(1);
+        let mut bucket: Vec<Vec<usize>> = (0..blocks)
+            .map(|_| Vec::with_capacity(avg_per_block.max(1)))
+            .collect();
         for (ci, a) in accs.iter().enumerate() {
             bucket[a.block_id].push(ci);
         }
@@ -729,11 +747,11 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                             return;
                         }
                     };
-                    if let Err(e) = a.acc0.add_block(b, w_eval) {
+                    if let Err(e) = a.acc0.add_w_eval(w_eval) {
                         err = Some(e);
                         return;
                     }
-                    if let Err(e) = a.acc1.add_block(b, w_eval) {
+                    if let Err(e) = a.acc1.add_w_eval(w_eval) {
                         err = Some(e);
                         return;
                     }

@@ -13,7 +13,9 @@ use rayon::prelude::*;
 use sha2::Digest;
 use std::sync::Arc;
 
-use dpp::dr1cs_flpcp::{Dr1csNpFlpcpSparseApi, Dr1csQueryScratch, MulCode, QuerySink, TensorRsMulCode};
+use dpp::dr1cs_flpcp::{
+    reduce_mod257_u64, Dr1csNpFlpcpSparseApi, Dr1csQueryScratch, MulCode, QuerySink, TensorRsMulCode,
+};
 use dpp::packing::FlpcpPredicate;
 use dpp::theorem43::{Theorem43Coins, Theorem43Dpp, Theorem43LockArtifact};
 use dpp::SparseVec;
@@ -579,7 +581,6 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                                 let _c_len = read_u32(&mut rows)? as usize;
 
                                 let (aval, bval): (u16, u16) = {
-                                    const P: u64 = 257;
                                     let mut aval_u: u64 = 0;
                                     for _ in 0..a_len {
                                         let cu16 = read_u16(&mut a_coeffs)? as u64;
@@ -594,7 +595,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                                         let v = if idx < self.l { x_u16[idx] as u64 } else { z_u16[idx - self.l] as u64 };
                                         bval_u = bval_u.wrapping_add(cu16.wrapping_mul(v));
                                     }
-                                    ((aval_u % P) as u16, (bval_u % P) as u16)
+                                    (reduce_mod257_u64(aval_u), reduce_mod257_u64(bval_u))
                                 };
                                 y_a[i] = aval;
                                 y_b[i] = bval;

@@ -337,6 +337,47 @@ fn reduce_mod257_u32(x: u32) -> u16 {
     r as u16
 }
 
+#[inline]
+pub fn reduce_mod257_u64(x: u64) -> u16 {
+    // Same idea as `reduce_mod257_u32`, extended to u64.
+    let b0 = (x & 0xFF) as i32;
+    let b1 = ((x >> 8) & 0xFF) as i32;
+    let b2 = ((x >> 16) & 0xFF) as i32;
+    let b3 = ((x >> 24) & 0xFF) as i32;
+    let b4 = ((x >> 32) & 0xFF) as i32;
+    let b5 = ((x >> 40) & 0xFF) as i32;
+    let b6 = ((x >> 48) & 0xFF) as i32;
+    let b7 = ((x >> 56) & 0xFF) as i32;
+    let mut r = b0 - b1 + b2 - b3 + b4 - b5 + b6 - b7;
+    // r is in [-1020, 1020], so at most 4 adjustments are needed.
+    if r < 0 {
+        r += 257;
+    }
+    if r < 0 {
+        r += 257;
+    }
+    if r < 0 {
+        r += 257;
+    }
+    if r < 0 {
+        r += 257;
+    }
+    if r >= 257 {
+        r -= 257;
+    }
+    if r >= 257 {
+        r -= 257;
+    }
+    if r >= 257 {
+        r -= 257;
+    }
+    if r >= 257 {
+        r -= 257;
+    }
+    debug_assert!((0..257).contains(&r));
+    r as u16
+}
+
 impl<F: PrimeField> TensorRsMulCode<F> {
     pub fn new(base_k: usize, rank: usize) -> Result<Self, String> {
         let base_n = 256usize;
@@ -2377,8 +2418,7 @@ fn sub_mod(a: u16, b: u16) -> u16 {
 }
 
 fn mul_mod(a: u16, b: u16) -> u16 {
-    let p = 257u32;
-    ((a as u32 * b as u32) % p) as u16
+    reduce_mod257_u32((a as u32) * (b as u32))
 }
 
 pub(crate) fn is_f257_field<F: PrimeField>() -> bool {
