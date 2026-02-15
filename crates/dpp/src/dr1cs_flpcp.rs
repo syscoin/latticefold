@@ -796,6 +796,7 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
 
             TENSOR_RS_F257_R3_SCRATCH.with(|cell| {
                 let mut s = cell.borrow_mut();
+                let s: &mut TensorRsF257Rank3Scratch = &mut *s;
 
                 if s.y_u16.len() != k {
                     s.y_u16.resize(k, 0u16);
@@ -809,59 +810,75 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
                     s.t0.resize(t0_len, 0u16);
                 }
                 // Pass 1: interpolate along dim0.
-                for i2 in 0..base_k {
-                    for i1 in 0..base_k {
+                // Layout: contiguous chunks of length `side` per (i1,i2) pair.
+                let y_u16: &[u16] = &s.y_u16;
+                let lam_k_u16: &[u16] = self.lam_k_u16.as_slice();
+                let t0: &mut [u16] = &mut s.t0;
+                t0.par_chunks_mut(side)
+                    .enumerate()
+                    .for_each(|(chunk_idx, out_row)| {
+                        let i1 = chunk_idx % base_k;
+                        let i2 = chunk_idx / base_k;
                         let base_y = i1 * stride_y1 + i2 * stride_y2;
-                        let out_base = stride_g1 * (i1 + base_k * i2);
                         for c0 in 0..side {
-                            let lam0 = &self.lam_k_u16[c0 * base_k..(c0 + 1) * base_k];
+                            let lam0 = &lam_k_u16[c0 * base_k..(c0 + 1) * base_k];
                             let mut acc: u32 = 0;
                             for i0 in 0..base_k {
-                                acc += (lam0[i0] as u32) * (s.y_u16[base_y + i0] as u32);
+                                acc += (lam0[i0] as u32) * (y_u16[base_y + i0] as u32);
                             }
-                            s.t0[out_base + c0] = reduce_mod257_u32(acc);
+                            out_row[c0] = reduce_mod257_u32(acc);
                         }
-                    }
-                }
+                    });
 
                 let t1_len = side * side * base_k;
                 if s.t1.len() != t1_len {
                     s.t1.resize(t1_len, 0u16);
                 }
                 // Pass 2: interpolate along dim1.
-                for i2 in 0..base_k {
-                    for c0 in 0..side {
-                        let out_base = stride_g1 * (c0 + side * i2);
+                // Layout: contiguous chunks of length `side` over c1 for each (c0,i2) pair.
+                let t0: &[u16] = &s.t0;
+                let t1: &mut [u16] = &mut s.t1;
+                t1.par_chunks_mut(side)
+                    .enumerate()
+                    .for_each(|(chunk_idx, out_row)| {
+                        let c0 = chunk_idx % side;
+                        let i2 = chunk_idx / side;
                         for c1 in 0..side {
-                            let lam1 = &self.lam_k_u16[c1 * base_k..(c1 + 1) * base_k];
+                            let lam1 = &lam_k_u16[c1 * base_k..(c1 + 1) * base_k];
                             let mut acc: u32 = 0;
                             for i1 in 0..base_k {
-                                let v = s.t0[c0 + side * (i1 + base_k * i2)];
+                                let v = t0[c0 + side * (i1 + base_k * i2)];
                                 acc += (lam1[i1] as u32) * (v as u32);
                             }
-                            s.t1[out_base + c1] = reduce_mod257_u32(acc);
+                            out_row[c1] = reduce_mod257_u32(acc);
                         }
-                    }
-                }
+                    });
 
                 let grid_len = side * side * side;
                 if s.out_grid.len() != grid_len {
                     s.out_grid.resize(grid_len, 0u16);
                 }
                 // Pass 3: interpolate along dim2.
-                for c2 in 0..side {
-                    let lam2 = &self.lam_k_u16[c2 * base_k..(c2 + 1) * base_k];
-                    for c1 in 0..side {
-                        for c0 in 0..side {
-                            let mut acc: u32 = 0;
-                            for i2 in 0..base_k {
-                                let v = s.t1[c1 + side * (c0 + side * i2)];
-                                acc += (lam2[i2] as u32) * (v as u32);
+                // Layout: contiguous chunk of size `side*side` per c2 slice.
+                let t1: &[u16] = &s.t1;
+                let out_grid: &mut [u16] = &mut s.out_grid;
+                out_grid
+                    .par_chunks_mut(side * side)
+                    .enumerate()
+                    .for_each(|(c2, out_plane)| {
+                        let lam2 = &lam_k_u16[c2 * base_k..(c2 + 1) * base_k];
+                        for c1 in 0..side {
+                            let row = &mut out_plane[c1 * side..(c1 + 1) * side];
+                            for c0 in 0..side {
+                                let mut acc: u32 = 0;
+                                for i2 in 0..base_k {
+                                    let v = t1[c1 + side * (c0 + side * i2)];
+                                    acc += (lam2[i2] as u32) * (v as u32);
+                                }
+                                row[c0] = reduce_mod257_u32(acc);
                             }
-                            s.out_grid[c0 + c1 * stride_g1 + c2 * stride_g2] = reduce_mod257_u32(acc);
                         }
-                    }
-                }
+                    });
 
                 // Emit in the exact order of `witness_positions_star()` (Layout A).
                 let mut w = 0usize;
