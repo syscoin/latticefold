@@ -314,6 +314,108 @@ impl<F: PrimeField, C: MulCode<F> + Sync> FileBackedChunkedMulCodeDr1csNpFlpcpSp
 
         Ok((rows, a_coeffs, a_idx, b_coeffs, b_idx))
     }
+
+    /// Precompute per-row dot products of the public prefix `x` against the sparse A/B/C rows
+    /// for a given block.
+    ///
+    /// Returns `(ax, bx, cx)` where each is length `k` and:
+    /// - `ax[i] = <A_row[i], x> mod 257` using only term indices `< l`
+    /// - `bx[i] = <B_row[i], x> mod 257`
+    /// - `cx[i] = <C_row[i], x> mod 257`
+    ///
+    /// This is the core "shared block precompute" needed for batched arming: for many hits on
+    /// the same block, we scan the block's term pools **once**, then reuse these arrays to compute
+    /// `δ(x) = 1 + <q_x, x>` cheaply per hit.
+    fn precompute_public_x_row_dots_mod257_u16(
+        &self,
+        block_id: usize,
+        x_u16: &[u16],
+    ) -> Result<(Vec<u16>, Vec<u16>, Vec<u16>), String> {
+        use std::io::Read as IoRead;
+
+        fn read_u32(r: &mut impl IoRead) -> Result<u32, String> {
+            let mut buf = [0u8; 4];
+            r.read_exact(&mut buf).map_err(|e| e.to_string())?;
+            Ok(u32::from_le_bytes(buf))
+        }
+        fn read_u16(r: &mut impl IoRead) -> Result<u16, String> {
+            let mut buf = [0u8; 2];
+            r.read_exact(&mut buf).map_err(|e| e.to_string())?;
+            Ok(u16::from_le_bytes(buf))
+        }
+
+        if x_u16.len() != self.l {
+            return Err("precompute_public_x_row_dots_mod257_u16: bad x_u16 length".to_string());
+        }
+        let k = self.k();
+        let row_start = (block_id as u64).saturating_mul(k as u64);
+        let nconstraints = self.nconstraints();
+
+        let (mut rows, mut a_coeffs, mut a_idx, mut b_coeffs, mut b_idx, mut c_coeffs, mut c_idx) =
+            self.open_readers_at_row(row_start)?;
+
+        let mut ax = vec![0u16; k];
+        let mut bx = vec![0u16; k];
+        let mut cx = vec![0u16; k];
+
+        for i in 0..k {
+            let row = row_start.saturating_add(i as u64);
+            if row >= nconstraints {
+                break;
+            }
+            let a_len = read_u32(&mut rows)? as usize;
+            let b_len = read_u32(&mut rows)? as usize;
+            let c_len = read_u32(&mut rows)? as usize;
+
+            let mut acc_a: u16 = 0;
+            for _ in 0..a_len {
+                let cu16 = read_u16(&mut a_coeffs)?;
+                let vidx = read_u32(&mut a_idx)? as usize;
+                if vidx < self.l && cu16 != 0 {
+                    let xv = x_u16[vidx];
+                    if xv != 0 {
+                        acc_a = crate::lockable_ringlwe::add_mod257_u16(
+                            acc_a,
+                            crate::lockable_ringlwe::mul_mod257_u16(cu16, xv),
+                        );
+                    }
+                }
+            }
+            let mut acc_b: u16 = 0;
+            for _ in 0..b_len {
+                let cu16 = read_u16(&mut b_coeffs)?;
+                let vidx = read_u32(&mut b_idx)? as usize;
+                if vidx < self.l && cu16 != 0 {
+                    let xv = x_u16[vidx];
+                    if xv != 0 {
+                        acc_b = crate::lockable_ringlwe::add_mod257_u16(
+                            acc_b,
+                            crate::lockable_ringlwe::mul_mod257_u16(cu16, xv),
+                        );
+                    }
+                }
+            }
+            let mut acc_c: u16 = 0;
+            for _ in 0..c_len {
+                let cu16 = read_u16(&mut c_coeffs)?;
+                let vidx = read_u32(&mut c_idx)? as usize;
+                if vidx < self.l && cu16 != 0 {
+                    let xv = x_u16[vidx];
+                    if xv != 0 {
+                        acc_c = crate::lockable_ringlwe::add_mod257_u16(
+                            acc_c,
+                            crate::lockable_ringlwe::mul_mod257_u16(cu16, xv),
+                        );
+                    }
+                }
+            }
+            ax[i] = acc_a;
+            bx[i] = acc_b;
+            cx[i] = acc_c;
+        }
+
+        Ok((ax, bx, cx))
+    }
 }
 
 impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
@@ -409,7 +511,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
             .and_then(|s| s.parse::<u64>().ok())
             // Default: allow a few GiB of in-flight w_eval blocks. On realistic params
             // (k_star ~ 857k, F257 ~ 8 bytes) one block is ~6.8MiB, so 96 blocks is ~650MiB.
-            .unwrap_or(2048)
+            .unwrap_or(16384)
             .saturating_mul(1024 * 1024);
         if bytes_per_block != 0 {
             let max_by_mem = (max_window_bytes / bytes_per_block).max(1) as usize;
@@ -422,7 +524,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         let blocks_per_task: usize = std::env::var("LF_DPP_BLOCKS_PER_TASK")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(4)
+            .unwrap_or(32)
             .max(1);
 
         let mut b0 = 0usize;
@@ -568,7 +670,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         idx: usize,
         lambda: F,
         x: &[F],
-        scratch: &mut Dr1csQueryScratch<F>,
+        _scratch: &mut Dr1csQueryScratch<F>,
         sink: &mut dyn QuerySink<F>,
     ) -> Result<(), String> {
         use std::io::{Read as IoRead};
@@ -589,12 +691,6 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         }
         let (block_id, local_idx) = self.decode_block_idx(idx)?;
         let k = self.k();
-        let k_star = self.k_star();
-        let z_w_len = self.z_w_len();
-        let base = self.l + z_w_len;
-        let block_offset = base + (block_id * k_star);
-
-        scratch.clear_all();
 
         // Coefficients for A/B rows (length k).
         let mut coeff_ab = vec![F::ZERO; k];
@@ -610,10 +706,11 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
             if j < k {
                 coeff_c[j] = c;
             }
-            let coeff = if j < k { c - (lambda * c) } else { c };
-            if !coeff.is_zero() {
-                sink.on_q3(coeff, block_offset + j);
-            }
+            // IMPORTANT: Do NOT stream dense q3 witness terms over the `w_eval` coordinates.
+            //
+            // In the large-block file-backed regime, these would be ~k_star terms per coin, which
+            // is prohibitively expensive. Callers must account for the q3 witness contribution via
+            // `dot_q3_w_eval(idx, lambda, w_eval)` during block streaming.
         })?;
 
         let row_start = (block_id as u64).saturating_mul(k as u64);
@@ -639,7 +736,8 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                 let vidx = read_u32(&mut a_idx)? as usize;
                 if !cab.is_zero() {
                     let c = coeff_lut[cu16 as usize];
-                    scratch.add_q1_term_on_z(vidx, c * cab);
+                    // NOTE: file-backed variable indices match `v=(x||z_w)` indexing.
+                    sink.on_q1(c * cab, vidx);
                 }
             }
             for _ in 0..b_len {
@@ -647,7 +745,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                 let vidx = read_u32(&mut b_idx)? as usize;
                 if !cab.is_zero() {
                     let c = coeff_lut[cu16 as usize];
-                    scratch.add_q2_term_on_z(vidx, c * cab);
+                    sink.on_q2(c * cab, vidx);
                 }
             }
             let cc = coeff_c[i];
@@ -656,32 +754,42 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                 let vidx = read_u32(&mut c_idx)? as usize;
                 if !cc.is_zero() {
                     let c = coeff_lut[cu16 as usize];
-                    scratch.add_q3_cx2_term_on_z(vidx, c * cc);
+                    // q3 z-side term is scaled by `lambda`.
+                    let t = (c * cc) * lambda;
+                    if !t.is_zero() {
+                        sink.on_q3(t, vidx);
+                    }
                 }
             }
         }
 
-        for (vidx, c) in scratch.take_q1_terms_on_z().into_iter() {
-            let (is_pub, j) = if vidx < self.l { (true, vidx) } else { (false, vidx - self.l) };
-            let v_idx = if is_pub { j } else { self.l + j };
-            sink.on_q1(c, v_idx);
-        }
-        for (vidx, c) in scratch.take_q2_terms_on_z().into_iter() {
-            let (is_pub, j) = if vidx < self.l { (true, vidx) } else { (false, vidx - self.l) };
-            let v_idx = if is_pub { j } else { self.l + j };
-            sink.on_q2(c, v_idx);
-        }
-        for (vidx, c) in scratch.take_q3_cx2_terms_on_z().into_iter() {
-            let cc = lambda * c;
-            if cc.is_zero() {
-                continue;
-            }
-            let (is_pub, j) = if vidx < self.l { (true, vidx) } else { (false, vidx - self.l) };
-            let v_idx = if is_pub { j } else { self.l + j };
-            sink.on_q3(cc, v_idx);
-        }
-
         Ok(())
+    }
+
+    fn dot_q3_w_eval(
+        &self,
+        idx: usize,
+        lambda: F,
+        _x: &[F],
+        _scratch: &mut Dr1csQueryScratch<F>,
+        w_eval: &[F],
+    ) -> Result<F, String> {
+        let (_block_id, local_idx) = self.decode_block_idx(idx)?;
+        let k = self.k();
+        let k_star = self.k_star();
+        if w_eval.len() != k_star {
+            return Err("dot_q3_w_eval: bad w_eval length".to_string());
+        }
+        let mut s_star = F::ZERO;
+        let mut s_low = F::ZERO;
+        self.code.row_e_star_stream(local_idx, &mut |j, c| {
+            let t = c * w_eval[j];
+            s_star += t;
+            if j < k {
+                s_low += t;
+            }
+        })?;
+        Ok(s_star - (lambda * s_low))
     }
 
     fn prove(&self, x: &[F], z_w: &[F]) -> Vec<F> {
@@ -1097,7 +1205,10 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
     payload: &[u8],
     rng: &mut impl rand::RngCore,
 ) -> Result<WeRingLweLockArmOut<F>, String> {
-    let dpp = make_theorem43_dpp_from_dr1cs::<F>(dr1cs.clone(), public_len)?;
+    // Inline canonical construction so we can use the chunked backend for shared per-block precomputes.
+    let code = TensorRsMulCode::<F>::new(48, 3)?;
+    let flpcp = FileBackedChunkedMulCodeDr1csNpFlpcpSparse::<F, _>::new(dr1cs.clone(), public_len, code)?;
+    let dpp = Theorem43Dpp::<F, _>::new(flpcp.clone())?;
     let mut scratch = dpp.query_scratch();
     if hits_per_block == 0 {
         return Err("arm_we_ringlwe_lock_from_dr1cs: hits_per_block=0".to_string());
@@ -1143,16 +1254,9 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
     let pi_len: usize = dpp.proof_len();
 
     // Block-selection policy.
-    //
-    // Keep these constants consistent with `make_theorem43_dpp_from_dr1cs`.
-    const TENSOR_RS_BASE_K: usize = 48;
-    const TENSOR_RS_RANK: usize = 3;
-    const MIN_NNZ_ROW_E: usize = TENSOR_RS_BASE_K.pow(TENSOR_RS_RANK as u32);
-    let code = TensorRsMulCode::<F>::new(TENSOR_RS_BASE_K, TENSOR_RS_RANK)?;
-    let k: u64 = code.dim_k().max(1) as u64;
-    let nconstraints: u64 = dr1cs.layout.nconstraints;
-    let blocks: usize = ((nconstraints + k - 1) / k) as usize;
-    let ell_local: usize = code.len_l().max(1);
+    const MIN_NNZ_ROW_E: usize = 48usize.pow(3); // base_k^rank (keep consistent with constructor above)
+    let blocks: usize = flpcp.blocks();
+    let ell_local: usize = flpcp.ell_local().max(1);
     if blocks == 0 {
         return Err("arm_we_ringlwe_lock_from_dr1cs: blocks=0".to_string());
     }
@@ -1162,135 +1266,180 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
         .try_into()
         .map_err(|_| "arm_we_ringlwe_lock_from_dr1cs: sublocks_per_channel overflows u32")?;
 
-    let mut sublocks: Vec<RingLweSubLock<F>> = Vec::with_capacity(sublocks_per_channel as usize);
-
     let ch: u16 = 0;
-    let total_sublks: usize = blocks
-        .saturating_mul(hits_per_block as usize);
-    // Parallelize arming over all `(block,hit)` tasks. Determinism is preserved because:
-    // - `rep_id` is derived from `(armer_seed, stmt_digest, lock_j, block_id, rep, try_idx)`
-    // - selection is purely local (min hint size within budget) with a deterministic tie-breaker.
-    let sublocks: Vec<RingLweSubLock<F>> = (0..total_sublks)
+    let hits_usize: usize = hits_per_block as usize;
+
+    // Precompute x mod 257 once (public prefix is tiny).
+    let x_u16: Vec<u16> = x
+        .iter()
+        .map(|e| (e.into_bigint().as_ref()[0] % 257) as u16)
+        .collect();
+
+    // Shared-block optimization: scan each block once to get `<A_i,x>,<B_i,x>,<C_i,x>`,
+    // then compute `δ(x)` per hit using tensor-code dot products (no per-hit constraint scanning).
+    let per_block: Vec<Vec<(usize, RingLweSubLock<F>)>> = (0..blocks)
         .into_par_iter()
-        .map_init(|| dpp.query_scratch(), |scratch, lin| -> Result<RingLweSubLock<F>, String> {
-            let block_id_sl: usize = lin / (hits_per_block as usize);
-            let rep_usize: usize = lin % (hits_per_block as usize);
-            let rep: u16 = rep_usize
-                .try_into()
-                .map_err(|_| "arm_we_ringlwe_lock_from_dr1cs: rep overflow".to_string())?;
+        .map_init(|| dpp.query_scratch(), |scratch, block_id_sl| -> Result<Vec<(usize, RingLweSubLock<F>)>, String> {
+            let (ax, bx, cx) = flpcp.precompute_public_x_row_dots_mod257_u16(block_id_sl, &x_u16)?;
+            let mut out_block: Vec<(usize, RingLweSubLock<F>)> = Vec::with_capacity(hits_usize);
 
-            let mut tries = 0usize;
-            let mut best_sl: Option<RingLweSubLock<F>> = None;
-            let mut best_hint_bytes: Option<usize> = None;
-            while tries < max_rep_tries {
-                tries += 1;
-                let try_idx = (tries - 1) as u64;
-                let rep_id = derive_rep_id_try(
-                    &armer_seed,
-                    &stmt_digest,
-                    lock_j,
-                    block_id_sl,
-                    policy.base_rep_id,
-                    ch,
-                    rep,
-                    try_idx,
-                );
-                let out = match arm_we_ringlwe_sublock_coeffs_from_dpp::<F>(
-                    &dpp,
-                    scratch,
-                    c_stmt.as_slice(),
-                    x,
-                    armer_secret.as_slice(),
-                    block_id_sl,
-                    rep_id,
-                ) {
-                    Ok(v) => v,
-                    Err(e) if e.contains("resample rep_id") => continue,
-                    Err(e) => return Err(e),
-                };
+            for rep_usize in 0..hits_usize {
+                let rep: u16 = rep_usize
+                    .try_into()
+                    .map_err(|_| "arm_we_ringlwe_lock_from_dr1cs: rep overflow".to_string())?;
 
-                // Derive the public coins exactly as the prover/decapper will.
-                let coins =
-                    dpp.derive_public_coins_from_stmt(c_stmt.as_slice(), block_id_sl, rep_id)?;
-                let local_idx = coins.idx % ell_local;
-                // Apply dense-support quality filtering.
-                let mut nnz: usize = 0;
-                code.row_e_stream(local_idx, &mut |_i, c| {
-                    let v = (c.into_bigint().as_ref()[0] % 257) as u16;
-                    if v != 0 {
-                        nnz += 1;
+                let mut tries = 0usize;
+                let mut best_sl: Option<RingLweSubLock<F>> = None;
+                let mut best_hint_bytes: Option<usize> = None;
+                while tries < max_rep_tries {
+                    tries += 1;
+                    let try_idx = (tries - 1) as u64;
+                    let rep_id = derive_rep_id_try(
+                        &armer_seed,
+                        &stmt_digest,
+                        lock_j,
+                        block_id_sl,
+                        policy.base_rep_id,
+                        ch,
+                        rep,
+                        try_idx,
+                    );
+
+                    scratch.clear_all();
+                    let art = dpp.arm(c_stmt.as_slice(), x, armer_secret.as_slice(), block_id_sl, rep_id)?;
+
+                    // Reject degenerate Sq coefficients.
+                    if art.coeffs.len() < 2 || art.coeffs[0].is_zero() || art.coeffs[1].is_zero() {
+                        continue;
+                    }
+
+                    let local_idx = art.coins.idx % ell_local;
+                    // Apply dense-support quality filtering (preserve existing behavior).
+                    let nnz = flpcp.code.nnz_row_e_u16(local_idx)?;
+                    if nnz < MIN_NNZ_ROW_E {
+                        continue;
+                    }
+
+                    // Unscaled combination coefficients (mod 257 digits).
+                    let c1 = art.coeffs[0];
+                    let c2 = art.coeffs[1];
+                    let coeff_alpha = c1 * art.coins.rho;
+                    let coeff_beta = c1 * art.coins.sigma;
+                    let coeff_gamma = {
+                        let two = F::from(2u64);
+                        c2 * (two * art.coins.rho * art.coins.sigma)
+                    };
+                    let abg_coeffs_mod257: [u16; 3] = [
+                        (coeff_alpha.into_bigint().as_ref()[0] % 257) as u16,
+                        (coeff_beta.into_bigint().as_ref()[0] % 257) as u16,
+                        (coeff_gamma.into_bigint().as_ref()[0] % 257) as u16,
+                    ];
+
+                    // Compute δ(x) mod 257 using shared per-block row dots.
+                    let sum_a = flpcp.code.dot_row_e_u16(local_idx, &ax)?;
+                    let sum_b = flpcp.code.dot_row_e_u16(local_idx, &bx)?;
+                    let sum_c = flpcp.code.dot_row_e_star_low_u16(local_idx, &cx)?;
+                    let lambda_u16 = (art.coins.lambda.into_bigint().as_ref()[0] % 257) as u16;
+
+                    let mut delta_x_mod257: u16 = 1;
+                    delta_x_mod257 = crate::lockable_ringlwe::add_mod257_u16(
+                        delta_x_mod257,
+                        crate::lockable_ringlwe::mul_mod257_u16(abg_coeffs_mod257[0], sum_a),
+                    );
+                    delta_x_mod257 = crate::lockable_ringlwe::add_mod257_u16(
+                        delta_x_mod257,
+                        crate::lockable_ringlwe::mul_mod257_u16(abg_coeffs_mod257[1], sum_b),
+                    );
+                    let tmp_c = crate::lockable_ringlwe::mul_mod257_u16(lambda_u16, sum_c);
+                    delta_x_mod257 = crate::lockable_ringlwe::add_mod257_u16(
+                        delta_x_mod257,
+                        crate::lockable_ringlwe::mul_mod257_u16(abg_coeffs_mod257[2], tmp_c),
+                    );
+                    if delta_x_mod257 == 0 {
+                        continue;
+                    }
+
+                    // Tail coefficients for `stream_pi0_and_collect_tails`: `[mu, nu, u^3..u^{p-1}]`.
+                    let coeff_mu = c2 * (art.coins.rho * art.coins.rho);
+                    let coeff_nu = c2 * (art.coins.sigma * art.coins.sigma);
+                    let mut tail_coeffs_mod257: [u16; 256] = [0u16; 256];
+                    tail_coeffs_mod257[0] = (coeff_mu.into_bigint().as_ref()[0] % 257) as u16;
+                    tail_coeffs_mod257[1] = (coeff_nu.into_bigint().as_ref()[0] % 257) as u16;
+                    for (i, c) in art.coeffs.iter().copied().skip(2).enumerate() {
+                        tail_coeffs_mod257[2 + i] = (c.into_bigint().as_ref()[0] % 257) as u16;
+                    }
+
+                    let s = s_channels[0];
+                    let abg_scales: [u16; 3] = [
+                        crate::lockable_ringlwe::mul_mod257_u16(s, abg_coeffs_mod257[0]),
+                        crate::lockable_ringlwe::mul_mod257_u16(s, abg_coeffs_mod257[1]),
+                        crate::lockable_ringlwe::mul_mod257_u16(s, abg_coeffs_mod257[2]),
+                    ];
+                    let offset_scale: u16 = crate::lockable_ringlwe::mul_mod257_u16(s, delta_x_mod257);
+                    let tail_scales_blocks: [crate::lockable_ringlwe::PackedF257Block64; 4] =
+                        core::array::from_fn(|bi| {
+                            let mut tmp = [0u16; 64];
+                            let start = bi * 64;
+                            for j in 0..64 {
+                                tmp[j] = crate::lockable_ringlwe::mul_mod257_u16(s, tail_coeffs_mod257[start + j]);
+                            }
+                            crate::lockable_ringlwe::PackedF257Block64::from_dense_u16s(&tmp)
+                        });
+
+                    let hint_bytes: usize = (3 * 2)
+                        + 2
+                        + tail_scales_blocks.iter().map(|blk| blk.on_disk_bytes()).sum::<usize>();
+
+                    let sl = RingLweSubLock::<F> {
+                        channel_id: ch,
+                        accepting_set: [F::ONE, F::from(2u64)],
+                        block_id: block_id_sl as u32,
+                        rep_id,
+                        hints: crate::lockable_ringlwe::BranchHintsCompressed {
+                            abg_scales,
+                            offset_scale,
+                            tail_scales: tail_scales_blocks,
+                        },
+                    };
+
+                    let within_budget = match policy.hint_budget_bytes {
+                        Some(budget) => hint_bytes <= budget,
+                        None => true,
+                    };
+                    if !within_budget {
+                        continue;
+                    }
+                    match best_hint_bytes {
+                        Some(cur) if hint_bytes >= cur => {}
+                        _ => {
+                            best_hint_bytes = Some(hint_bytes);
+                            best_sl = Some(sl);
+                        }
+                    }
+                }
+
+                let sl = best_sl.ok_or_else(|| {
+                    if let Some(budget) = policy.hint_budget_bytes {
+                        format!(
+                            "arm_we_ringlwe_lock_from_dr1cs: failed to find in-budget sublock within retry budget (hint_budget_bytes={})",
+                            budget
+                        )
+                    } else {
+                        "arm_we_ringlwe_lock_from_dr1cs: failed to arm sublock within retry budget".to_string()
                     }
                 })?;
-                if nnz < MIN_NNZ_ROW_E {
-                    continue;
-                }
 
-                let s = s_channels[0];
-                let abg_scales: [u16; 3] = [
-                    crate::lockable_ringlwe::mul_mod257_u16(s, out.abg_coeffs_mod257[0]),
-                    crate::lockable_ringlwe::mul_mod257_u16(s, out.abg_coeffs_mod257[1]),
-                    crate::lockable_ringlwe::mul_mod257_u16(s, out.abg_coeffs_mod257[2]),
-                ];
-                let offset_scale: u16 =
-                    crate::lockable_ringlwe::mul_mod257_u16(s, out.delta_x_mod257);
-                let tail_scales_blocks: [crate::lockable_ringlwe::PackedF257Block64; 4] =
-                    core::array::from_fn(|bi| {
-                        let mut tmp = [0u16; 64];
-                        let start = bi * 64;
-                        for j in 0..64 {
-                            tmp[j] = crate::lockable_ringlwe::mul_mod257_u16(
-                                s,
-                                out.tail_coeffs_mod257[start + j],
-                            );
-                        }
-                        crate::lockable_ringlwe::PackedF257Block64::from_dense_u16s(&tmp)
-                    });
-
-                let hint_bytes: usize = (3 * 2)
-                    + 2 // offset_scale
-                    + tail_scales_blocks
-                        .iter()
-                        .map(|blk| blk.on_disk_bytes())
-                        .sum::<usize>();
-                let sl = RingLweSubLock::<F> {
-                    channel_id: ch,
-                    accepting_set: out.accepting_set,
-                    block_id: block_id_sl as u32,
-                    rep_id,
-                    hints: crate::lockable_ringlwe::BranchHintsCompressed {
-                        abg_scales,
-                        offset_scale,
-                        tail_scales: tail_scales_blocks,
-                    },
-                };
-                let within_budget = match policy.hint_budget_bytes {
-                    Some(budget) => hint_bytes <= budget,
-                    None => true,
-                };
-                if !within_budget {
-                    continue;
-                }
-                match best_hint_bytes {
-                    Some(cur) if hint_bytes >= cur => {}
-                    _ => {
-                        best_hint_bytes = Some(hint_bytes);
-                        best_sl = Some(sl);
-                    }
-                }
+                let lin = block_id_sl.saturating_mul(hits_usize).saturating_add(rep_usize);
+                out_block.push((lin, sl));
             }
-            best_sl.ok_or_else(|| {
-                if let Some(budget) = policy.hint_budget_bytes {
-                    format!(
-                        "arm_we_ringlwe_lock_from_dr1cs: failed to find in-budget sublock within retry budget (hint_budget_bytes={})",
-                        budget
-                    )
-                } else {
-                    "arm_we_ringlwe_lock_from_dr1cs: failed to arm sublock within retry budget"
-                        .to_string()
-                }
-            })
+
+            Ok(out_block)
         })
         .collect::<Result<Vec<_>, String>>()?;
+
+    let mut pairs: Vec<(usize, RingLweSubLock<F>)> = per_block.into_iter().flatten().collect();
+    pairs.sort_unstable_by_key(|(i, _)| *i);
+    let sublocks: Vec<RingLweSubLock<F>> = pairs.into_iter().map(|(_, sl)| sl).collect();
 
     let lock = arm_ringlwe_lock(
         c_stmt,

@@ -64,6 +64,67 @@ pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
         scratch: &mut Dr1csQueryScratch<F>,
         sink: &mut dyn QuerySink<F>,
     ) -> Result<(), String>;
+
+    /// Compute the `q3` contribution against the streamed `w_eval[block]` slice.
+    ///
+    /// This is a **performance hook** to avoid materializing dense q3 witness terms:
+    /// for a given `(idx,lambda)`, `q3` contains a dense component over the `w_eval` coordinates
+    /// of the selected block. Implementations with structure (e.g. tensor-RS) should override
+    /// this to compute the dot product without allocating/query-term emission.
+    ///
+    /// Default implementation is correct but may be slow: it reuses `stream_queries_for_coins_sparse`
+    /// and accumulates only the q3 terms that land in the current block's `w_eval` slice.
+    fn dot_q3_w_eval(
+        &self,
+        idx: usize,
+        lambda: F,
+        x: &[F],
+        scratch: &mut Dr1csQueryScratch<F>,
+        w_eval: &[F],
+    ) -> Result<F, String> {
+        let blocks = self.blocks();
+        let ell_local = self.ell_local();
+        if blocks == 0 || ell_local == 0 {
+            return Err("dot_q3_w_eval: invalid blocks/ell_local".to_string());
+        }
+        let block_id = idx / ell_local;
+        if block_id >= blocks {
+            return Err("dot_q3_w_eval: bad block id".to_string());
+        }
+        let k_star = self.k_star();
+        if w_eval.len() != k_star {
+            return Err("dot_q3_w_eval: bad w_eval length".to_string());
+        }
+        let base = self.n() + self.z_w_len();
+        let w_base = base + block_id.saturating_mul(k_star);
+
+        struct DotSink<'a, F: PrimeField> {
+            w_base: usize,
+            w_eval: &'a [F],
+            acc: F,
+        }
+        impl<'a, F: PrimeField> QuerySink<F> for DotSink<'a, F> {
+            fn on_q1(&mut self, _coeff: F, _idx: usize) {}
+            fn on_q2(&mut self, _coeff: F, _idx: usize) {}
+            fn on_q3(&mut self, coeff: F, idx: usize) {
+                if idx < self.w_base {
+                    return;
+                }
+                let j = idx - self.w_base;
+                if j < self.w_eval.len() {
+                    self.acc += coeff * self.w_eval[j];
+                }
+            }
+        }
+
+        let mut sink = DotSink {
+            w_base,
+            w_eval,
+            acc: F::ZERO,
+        };
+        self.stream_queries_for_coins_sparse(idx, lambda, x, scratch, &mut sink)?;
+        Ok(sink.acc)
+    }
     /// Prover: given public `x` and private witness `z_w`, output π = (z_w || w).
     fn prove(&self, x: &[F], z_w: &[F]) -> Vec<F>;
     /// Deterministic sparse queries for fixed verifier coins.
@@ -299,6 +360,119 @@ impl<F: PrimeField> TensorRsMulCode<F> {
             lam_k_u16,
             lam_star_u16,
         })
+    }
+
+    /// Fast F257-only helper: compute \(\langle \lambda_k(idx), values \rangle\) mod 257,
+    /// where `values` has length `k = dim_k()`.
+    ///
+    /// This avoids allocating the full `row_e(idx)` vector and is intended for batched
+    /// arming/decap paths that work purely mod 257.
+    pub fn dot_row_e_u16(&self, idx: usize, values: &[u16]) -> Result<u16, String> {
+        if idx >= self.len_l() {
+            return Err("dot_row_e_u16: idx out of range".to_string());
+        }
+        if !Self::is_f257() {
+            return Err("dot_row_e_u16: only supported for F257 fast path".to_string());
+        }
+        let k = self.dim_k();
+        if values.len() != k {
+            return Err("dot_row_e_u16: bad values length".to_string());
+        }
+        let coords = self.decompose_index(idx);
+        let mut one_dim: Vec<&[u16]> = Vec::with_capacity(self.rank);
+        for &c in coords.iter() {
+            let start = c * self.base_k;
+            let end = start + self.base_k;
+            one_dim.push(&self.lam_k_u16[start..end]);
+        }
+        let base_k = self.base_k;
+        let mut acc: u32 = 0;
+        for flat in 0..k {
+            let mut coeff = 1u16;
+            let mut tmp = flat;
+            for d in 0..self.rank {
+                let id = tmp % base_k;
+                coeff = mul_mod(coeff, one_dim[d][id]);
+                tmp /= base_k;
+            }
+            if coeff != 0 {
+                acc = acc.wrapping_add((coeff as u32) * (values[flat] as u32));
+            }
+        }
+        Ok(reduce_mod257_u32(acc))
+    }
+
+    /// Fast F257-only helper: compute \(\langle \lambda^*_\\text{low}(idx), values \rangle\) mod 257,
+    /// where `values` has length `k = dim_k()`.
+    ///
+    /// This uses **only the low-cube** portion of `row_e_star(idx)` (the first `k` entries),
+    /// and avoids iterating over the full `k* = dim_k_star()` side-cube.
+    pub fn dot_row_e_star_low_u16(&self, idx: usize, values: &[u16]) -> Result<u16, String> {
+        if idx >= self.len_l() {
+            return Err("dot_row_e_star_low_u16: idx out of range".to_string());
+        }
+        if !Self::is_f257() {
+            return Err("dot_row_e_star_low_u16: only supported for F257 fast path".to_string());
+        }
+        let k = self.dim_k();
+        if values.len() != k {
+            return Err("dot_row_e_star_low_u16: bad values length".to_string());
+        }
+        let coords = self.decompose_index(idx);
+        let side = 2 * self.base_k - 1;
+        let mut one_dim_full: Vec<&[u16]> = Vec::with_capacity(self.rank);
+        for &c in coords.iter() {
+            let start = c * side;
+            let end = start + side;
+            one_dim_full.push(&self.lam_star_u16[start..end]);
+        }
+        let base_k = self.base_k;
+        let mut acc: u32 = 0;
+        for flat in 0..k {
+            let mut coeff = 1u16;
+            let mut tmp = flat;
+            for d in 0..self.rank {
+                let id = tmp % base_k;
+                coeff = mul_mod(coeff, one_dim_full[d][id]);
+                tmp /= base_k;
+            }
+            if coeff != 0 {
+                acc = acc.wrapping_add((coeff as u32) * (values[flat] as u32));
+            }
+        }
+        Ok(reduce_mod257_u32(acc))
+    }
+
+    /// Fast F257-only helper: count the number of nonzero coefficients in `row_e(idx)`.
+    ///
+    /// For the tensor-product RS code, `row_e(idx)` is the Kronecker product of `rank` one-dimensional
+    /// coefficient vectors of length `base_k`. A coefficient is nonzero iff all per-dimension factors
+    /// are nonzero, so the nnz is the product of per-dimension nnz counts.
+    pub fn nnz_row_e_u16(&self, idx: usize) -> Result<usize, String> {
+        if idx >= self.len_l() {
+            return Err("nnz_row_e_u16: idx out of range".to_string());
+        }
+        if !Self::is_f257() {
+            return Err("nnz_row_e_u16: only supported for F257 fast path".to_string());
+        }
+        let coords = self.decompose_index(idx);
+        let mut prod: usize = 1;
+        for &c in coords.iter() {
+            let start = c * self.base_k;
+            let end = start + self.base_k;
+            let slice = &self.lam_k_u16[start..end];
+            let mut nz: usize = 0;
+            for &v in slice {
+                if v != 0 {
+                    nz += 1;
+                }
+            }
+            prod = prod.saturating_mul(nz);
+            if prod == 0 {
+                return Ok(0);
+            }
+        }
+        Ok(prod)
     }
 
     fn pow_usize(base: usize, exp: usize) -> usize {
@@ -1056,6 +1230,33 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         sink: &mut dyn QuerySink<F>,
     ) -> Result<(), String> {
         MulCodeDr1csNpFlpcpSparse::stream_queries_for_coins_sparse(self, idx, lambda, x, scratch, sink)
+    }
+
+    fn dot_q3_w_eval(
+        &self,
+        idx: usize,
+        lambda: F,
+        _x: &[F],
+        _scratch: &mut Dr1csQueryScratch<F>,
+        w_eval: &[F],
+    ) -> Result<F, String> {
+        if idx >= self.code.len_l() {
+            return Err("dot_q3_w_eval: bad coin idx".to_string());
+        }
+        if w_eval.len() != self.code.dim_k_star() {
+            return Err("dot_q3_w_eval: bad w_eval length".to_string());
+        }
+        let k = self.inst.k();
+        let mut s_star = F::ZERO;
+        let mut s_low = F::ZERO;
+        self.code.row_e_star_stream(idx, &mut |j, c| {
+            let t = c * w_eval[j];
+            s_star += t;
+            if j < k {
+                s_low += t;
+            }
+        })?;
+        Ok(s_star - (lambda * s_low))
     }
 
     fn prove(&self, x: &[F], z_w: &[F]) -> Vec<F> {

@@ -332,6 +332,11 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
         let mut acc2 = b2.finish();
 
         // Stream w_eval blocks out of π0.
+        let ell_local = flpcp.ell_local();
+        if ell_local == 0 {
+            return Err("ell_local=0".to_string());
+        }
+        let q3_block_id = art.coins.idx / ell_local;
         let mut off = z_w_len;
         for b in 0..blocks {
             let end = off + k_star;
@@ -341,7 +346,12 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
             let w_eval = &pi0[off..end];
             acc0.add_block(b, w_eval)?;
             acc1.add_block(b, w_eval)?;
-            acc2.add_block(b, w_eval)?;
+            // q3 witness dot for the selected block (file-backed backends omit dense witness terms).
+            if b == q3_block_id {
+                let dot = flpcp.dot_q3_w_eval(art.coins.idx, art.coins.lambda, x, &mut scratch, w_eval)?;
+                acc2.acc_pi += dot;
+                acc2.acc_full += dot;
+            }
             off = end;
         }
         if off != pi0.len() {
@@ -581,10 +591,16 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
 
         let k_star = flpcp.k_star();
         let blocks = flpcp.blocks();
+        let ell_local = flpcp.ell_local();
+        if blocks == 0 || ell_local == 0 {
+            return Err("invalid (blocks,ell_local)".to_string());
+        }
+        let base = x.len() + z_w_len;
 
         // Precompute per-coin query accumulators.
         struct AccSet<F: PrimeField> {
             coins: Theorem43Coins<F>,
+            block_id: usize,
             acc0: QueryStreamAcc<F>,
             acc1: QueryStreamAcc<F>,
             acc2: QueryStreamAcc<F>,
@@ -593,6 +609,10 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
         let mut scratch = Dr1csQueryScratch::<F>::new(flpcp.n_total());
         for coins in coins_list {
             scratch.clear_all();
+            let block_id = coins.idx / ell_local;
+            if block_id >= blocks {
+                return Err("bad coin block_id".to_string());
+            }
             let mut b0 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
             let mut b1 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
             let mut b2 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
@@ -601,6 +621,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                 b0: &'b mut QueryStreamAccBuilder<'a, F>,
                 b1: &'b mut QueryStreamAccBuilder<'a, F>,
                 b2: &'b mut QueryStreamAccBuilder<'a, F>,
+                base: usize,
                 err: &'e mut Option<String>,
             }
             impl<'a, 'b, 'e, F: PrimeField> QuerySink<F> for Sink<'a, 'b, 'e, F> {
@@ -624,6 +645,12 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                     if self.err.is_some() {
                         return;
                     }
+                    // IMPORTANT: do NOT store dense `q3` witness (w_eval) terms.
+                    // We compute their dot product on-the-fly during `stream_w_eval_blocks` via
+                    // `flpcp.dot_q3_w_eval`, to avoid massive per-coin allocations.
+                    if idx >= self.base {
+                        return;
+                    }
                     if let Err(e) = self.b2.add_term(coeff, idx) {
                         *self.err = Some(e);
                     }
@@ -634,6 +661,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                     b0: &mut b0,
                     b1: &mut b1,
                     b2: &mut b2,
+                    base,
                     err: &mut sink_err,
                 };
                 flpcp
@@ -648,30 +676,17 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             let acc2 = b2.finish();
             accs.push(AccSet {
                 coins: coins.clone(),
+                block_id,
                 acc0,
                 acc1,
                 acc2,
             });
         }
 
-        // Block-grouped schedule: for each block, which coins need updates from `w_eval[block]`?
-        //
-        // This avoids the `O(blocks * coins)` nested loop in large-block regimes.
+        // Block-grouped schedule: each coin updates exactly its selected block.
         let mut bucket: Vec<Vec<usize>> = vec![Vec::new(); blocks];
         for (ci, a) in accs.iter().enumerate() {
-            // Union of touched blocks across (q1,q2,q3). Usually tiny.
-            let mut touched: Vec<usize> = Vec::new();
-            touched.extend(a.acc0.touched_blocks());
-            touched.extend(a.acc1.touched_blocks());
-            touched.extend(a.acc2.touched_blocks());
-            touched.sort_unstable();
-            touched.dedup();
-            for b in touched {
-                if b >= blocks {
-                    return Err("internal: touched block out of range".to_string());
-                }
-                bucket[b].push(ci);
-            }
+            bucket[a.block_id].push(ci);
         }
 
         on_pi0_chunk(z_w);
@@ -721,9 +736,16 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                         err = Some(e);
                         return;
                     }
-                    if let Err(e) = a.acc2.add_block(b, w_eval) {
-                        err = Some(e);
-                        return;
+                    // q3 witness dot: compute without materializing dense q3 witness terms.
+                    match flpcp.dot_q3_w_eval(a.coins.idx, a.coins.lambda, x, &mut scratch, w_eval) {
+                        Ok(dot) => {
+                            a.acc2.acc_pi += dot;
+                            a.acc2.acc_full += dot;
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            return;
+                        }
                     }
                 }
                 on_pi0_chunk(w_eval);
