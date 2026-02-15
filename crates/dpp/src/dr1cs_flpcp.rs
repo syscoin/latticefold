@@ -991,17 +991,12 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
                 let mut s = cell.borrow_mut();
                 let s: &mut TensorRsF257Rank3Scratch = &mut *s;
 
-                if s.y_u16.len() != k {
-                    s.y_u16.resize(k, 0u16);
-                }
-                s.y_u16.copy_from_slice(y_u16);
-
                 let t0_len = side * base_k * base_k;
                 if s.t0.len() != t0_len {
                     s.t0.resize(t0_len, 0u16);
                 }
                 // Pass 1: interpolate along dim0.
-                let y_u16: &[u16] = &s.y_u16;
+                let y_u16: &[u16] = y_u16;
                 let lam_k_u16: &[u16] = self.lam_k_u16.as_slice();
                 let t0: &mut [u16] = &mut s.t0;
                 t0.par_chunks_mut(side)
