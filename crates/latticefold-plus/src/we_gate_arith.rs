@@ -1598,17 +1598,11 @@ mod tests {
         );
 
         // Keep deterministic behavior by deriving per-lock RNG seeds sequentially first.
+        // This harness uses a **single lock** (one lock per armer is the intended design).
         let mut seed0 = [0u8; 32];
-        let mut seed1 = [0u8; 32];
         rng.fill_bytes(&mut seed0);
-        rng.fill_bytes(&mut seed1);
         let policy0 = crate::we_tiny_lock::WeRingLweLockArmingPolicy {
             base_rep_id: 0,
-            max_rep_tries: 32,
-            hint_budget_bytes: None,
-        };
-        let policy1 = crate::we_tiny_lock::WeRingLweLockArmingPolicy {
-            base_rep_id: 1,
             max_rep_tries: 32,
             hint_budget_bytes: None,
         };
@@ -1616,50 +1610,29 @@ mod tests {
         for hits_per_block in hits_list {
         let t_arm = Instant::now();
             maybe_print_rss(&format!("tiny_gate:h{hits_per_block}:before_arm"));
-            // Arm two lock contexts in parallel, matching oneproof's per-lock parallelism model.
-            let (lock0, lock1) = rayon::join(
-                || {
-                    let mut rng0 = StdRng::from_seed(seed0);
-                    arm_lfplus_ringlwe_lock::<R>(
-                shape.clone(),
-                &stmt_digest_f257,
-                armer_seed,
-                lock_j,
-                0,
-                        policy0,
-                ringlwe_params.clone(),
-                        hits_per_block,
-                &dummy_payload,
-                        &mut rng0,
-                    )
-                    .unwrap_or_else(|e| panic!("arm ctx0 failed: {e}"))
-                    .lock
-                },
-                || {
-                    let mut rng1 = StdRng::from_seed(seed1);
-                    arm_lfplus_ringlwe_lock::<R>(
-                        shape.clone(),
-                &stmt_digest_f257,
-                armer_seed,
-                lock_j,
-                0,
-                        policy1,
-                ringlwe_params.clone(),
-                        hits_per_block,
-                &dummy_payload,
-                        &mut rng1,
-                    )
-                    .unwrap_or_else(|e| panic!("arm ctx1 failed: {e}"))
-                    .lock
-                },
-            );
+            let lock0 = {
+                let mut rng0 = StdRng::from_seed(seed0);
+                arm_lfplus_ringlwe_lock::<R>(
+                    shape.clone(),
+                    &stmt_digest_f257,
+                    armer_seed,
+                    lock_j,
+                    0,
+                    policy0,
+                    ringlwe_params.clone(),
+                    hits_per_block,
+                    &dummy_payload,
+                    &mut rng0,
+                )
+                .unwrap_or_else(|e| panic!("arm ctx0 failed: {e}"))
+                .lock
+            };
             maybe_print_rss(&format!("tiny_gate:h{hits_per_block}:after_arm"));
         eprintln!(
-                "[tiny_gate] h={} armed in {:?}: sublocks(lock0)={} sublocks(lock1)={} proof_len={}",
+                "[tiny_gate] h={} armed in {:?}: sublocks(lock0)={} proof_len={}",
                 hits_per_block,
             t_arm.elapsed(),
                 lock0.sublocks.len(),
-                lock1.sublocks.len(),
             prover.proof_len()
         );
 
@@ -1674,11 +1647,8 @@ mod tests {
 
         let t_prove = Instant::now();
             maybe_print_rss(&format!("tiny_gate:h{hits_per_block}:before_prove_decap_stream"));
-        // Flatten sublocks across both locks into one streaming pass.
-            let mut coins_list: Vec<_> =
-                Vec::with_capacity(lock0.sublocks.len() + lock1.sublocks.len());
-            let mut meta: Vec<(usize, usize)> =
-                Vec::with_capacity(lock0.sublocks.len() + lock1.sublocks.len()); // (lock_id, sublock_idx)
+        // Single lock: one streaming pass.
+            let mut coins_list: Vec<_> = Vec::with_capacity(lock0.sublocks.len());
             for (si, sl) in lock0.sublocks.iter().enumerate() {
                 coins_list.push(
                     prover
@@ -1689,19 +1659,7 @@ mod tests {
                         )
                         .expect("derive_public_coins_from_stmt lock0"),
                 );
-            meta.push((0, si));
-            }
-            for (si, sl) in lock1.sublocks.iter().enumerate() {
-                coins_list.push(
-                    prover
-                        .derive_public_coins_from_stmt(
-                            lock1.c_stmt.as_slice(),
-                            sl.block_id as usize,
-                            sl.rep_id,
-                        )
-                        .expect("derive_public_coins_from_stmt lock1"),
-                );
-            meta.push((1, si));
+                let _ = si;
             }
             // Canonical path: stream tails and fold them immediately (no tail vectors).
             let mut tail_dots_mod257: Vec<u16> = vec![0u16; coins_list.len()];
@@ -1747,12 +1705,7 @@ mod tests {
                         buf64[buf_len] = td;
                         buf_len += 1;
                         if buf_len == 64 {
-                            let (lock_id, si) = meta[ci];
-                            let sl = match lock_id {
-                                0 => &lock0.sublocks[si],
-                                1 => &lock1.sublocks[si],
-                                _ => unreachable!(),
-                            };
+                            let sl = &lock0.sublocks[ci];
                             let blk = &sl.hints.tail_scales[cur_blk];
                             let add =
                                 crate::lockable_ringlwe::dot_packed_block_mod257_u16(blk, &buf64);
@@ -1764,54 +1717,29 @@ mod tests {
                 },
             )
             .expect("stream_pi0_and_collect_tails");
-            assert_eq!(abg_list.len(), meta.len());
+            assert_eq!(abg_list.len(), lock0.sublocks.len());
             assert_eq!(buf_len, 0);
             use rayon::prelude::*;
-        let mut cands0: Vec<Option<(u16, [u16; 2])>> = vec![None; lock0.sublocks.len()];
-        let mut cands1: Vec<Option<(u16, [u16; 2])>> = vec![None; lock1.sublocks.len()];
-            let results: Vec<(usize, usize, u16, [u16; 2])> = abg_list
+            let results: Vec<(u16, [u16; 2])> = abg_list
                 .par_iter()
                 .enumerate()
                 .map(|(gi, abgt)| {
-            let (lock_id, si) = meta[gi];
-                    let sl = match lock_id {
-                        0 => &lock0.sublocks[si],
-                        1 => &lock1.sublocks[si],
-                        _ => unreachable!(),
-                    };
+                    let sl = &lock0.sublocks[gi];
                     let td = tail_dots_mod257[gi];
                     let cands =
                         crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt, td)
                             .expect("sublock candidates");
-                    (lock_id, si, sl.channel_id, cands)
+                    (sl.channel_id, cands)
                 })
                 .collect();
-            for (lock_id, si, ch, cands) in results {
-            match lock_id {
-                0 => cands0[si] = Some((ch, cands)),
-                1 => cands1[si] = Some((ch, cands)),
-                _ => unreachable!(),
-            }
-        }
-            let sublock_cands0: Vec<(u16, [u16; 2])> =
-                cands0.into_iter().map(|x| x.unwrap()).collect();
-            let sublock_cands1: Vec<(u16, [u16; 2])> =
-                cands1.into_iter().map(|x| x.unwrap()).collect();
-            let pt0 =
-                crate::lockable_ringlwe::decrypt_payload_from_sublock_s_candidates(&lock0, &sublock_cands0)
-            .expect("decrypt_payload lock0");
-            let pt1 =
-                crate::lockable_ringlwe::decrypt_payload_from_sublock_s_candidates(&lock1, &sublock_cands1)
-            .expect("decrypt_payload lock1");
-        assert!(pt0.is_empty());
-        assert!(pt1.is_empty());
+            let pt0 = crate::lockable_ringlwe::decrypt_payload_from_sublock_s_candidates(&lock0, &results)
+                .expect("decrypt_payload lock0");
+            assert!(pt0.is_empty());
 
         // Accepting set structure: fixed `{1,2}` for every sublock.
-        for lock in [&lock0, &lock1] {
-            for sl in &lock.sublocks {
-                assert_eq!(sl.accepting_set[0], F257::ONE);
-                assert_eq!(sl.accepting_set[1], F257::from(2u64));
-            }
+        for sl in &lock0.sublocks {
+            assert_eq!(sl.accepting_set[0], F257::ONE);
+            assert_eq!(sl.accepting_set[1], F257::from(2u64));
         }
 
             maybe_print_rss(&format!("tiny_gate:h{hits_per_block}:after_prove_decap_stream"));
