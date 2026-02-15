@@ -781,6 +781,10 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
                 return Err("eval_e_at_positions_into: bad positions/out length".to_string());
             }
 
+            // F257 conversion LUT (0..=256) to avoid `F::from(u64)` in the hot emission loop.
+            // Building it per-call is cheap (~257 ops) compared to emitting `k_star` elements.
+            let lut: Vec<F> = (0u16..=256u16).map(|d| F::from(d as u64)).collect();
+
             // Tensor layout conventions:
             // - Message y is indexed as flat = i0 + i1*base_k + i2*base_k^2 (dim0 least-significant).
             // - We evaluate E(y) on the side^3 grid of coordinates (c0,c1,c2) with 0<=c*<side.
@@ -866,7 +870,7 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
                     for i1 in 0..base_k {
                         for i0 in 0..base_k {
                             let g = i0 + i1 * stride_g1 + i2 * stride_g2;
-                            out[w] = F::from(s.out_grid[g] as u64);
+                            out[w] = lut[s.out_grid[g] as usize];
                             w += 1;
                         }
                     }
@@ -882,7 +886,7 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
                                 continue;
                             }
                             let g = c0 + c1 * stride_g1 + c2 * stride_g2;
-                            out[w] = F::from(s.out_grid[g] as u64);
+                            out[w] = lut[s.out_grid[g] as usize];
                             w += 1;
                         }
                     }
