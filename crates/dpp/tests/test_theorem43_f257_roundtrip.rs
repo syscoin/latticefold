@@ -50,7 +50,7 @@ fn collect_streamed_pi0_and_tail(
         .expect("stream_pi0_and_collect_tails");
     assert_eq!(pi0.len(), pi0_len);
     assert_eq!(tails.len(), 1);
-    (pi0, tails[0].clone())
+    (pi0, tails[0].tail.clone())
 }
 
 fn collect_streamed_tail_only(
@@ -68,7 +68,7 @@ fn collect_streamed_tail_only(
         .expect("stream_pi0_and_collect_tails");
     assert_eq!(_pi0.len(), pi0_len);
     assert_eq!(tails.len(), 1);
-    tails[0].clone()
+    tails[0].tail.clone()
 }
 
 #[test]

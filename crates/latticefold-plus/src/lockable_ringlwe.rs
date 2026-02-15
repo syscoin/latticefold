@@ -18,7 +18,6 @@
 
 use ark_ff::PrimeField;
 use rand::RngCore;
-use std::collections::BTreeMap;
 
 /// Block packing size for sparse hints and streamed π.
 const PACK_D: usize = 64;
@@ -31,17 +30,27 @@ fn f_to_u64<F: PrimeField>(f: &F) -> u64 {
     f.into_bigint().as_ref()[0]
 }
 
+// NOTE: keep `sub_mod257` only if we reintroduce a subtraction-based packing.
+
 #[inline]
-fn add_mod257(a: u16, b: u16) -> u16 {
+pub(crate) fn field_mod257_u16<F: PrimeField>(f: &F) -> u16 {
+    (f_to_u64(f) % 257) as u16
+}
+
+#[inline]
+pub(crate) fn add_mod257_u16(a: u16, b: u16) -> u16 {
     let s = a + b;
     if s >= MOD_257 { s - MOD_257 } else { s }
 }
 
-// NOTE: keep `sub_mod257` only if we reintroduce a subtraction-based packing.
-
 #[inline]
 fn mul_mod257(a: u16, b: u16) -> u16 {
     ((a as u32 * b as u32) % (MOD_257 as u32)) as u16
+}
+
+#[inline]
+pub(crate) fn mul_mod257_u16(a: u16, b: u16) -> u16 {
+    mul_mod257(a, b)
 }
 
 #[inline]
@@ -81,43 +90,6 @@ pub(crate) fn ratio_class_mod257_u16<F: PrimeField>(a0: &F, a1: &F) -> Result<u1
     Ok(r.min(rinv))
 }
 
-/// Public non-bricking policy check (required for deterministic disambiguation at `R=2`).
-///
-/// Ensures that the shifted accepting-set ratio class is distinct across repetitions within each
-/// channel. If violated, the per-channel intersection of 2-candidate sets can remain ambiguous and
-/// blow up the downstream enumeration cap.
-pub(crate) fn check_ratio_class_distinctness_per_channel<F: PrimeField>(
-    lock: &RingLweLockArtifact<F>,
-) -> Result<(), String> {
-    let p = lock.p_channels as usize;
-    let r = lock.r_reps as usize;
-    if p == 0 || r == 0 {
-        return Err("ringlwe: invalid (P,R)".to_string());
-    }
-    if lock.sublocks.len() != p.saturating_mul(r) {
-        return Err("ringlwe: sublocks length mismatch".to_string());
-    }
-    let mut seen: Vec<Vec<u16>> = vec![Vec::with_capacity(r); p];
-    let mut per_channel_counts: Vec<usize> = vec![0; p];
-    for sl in &lock.sublocks {
-        let ch = sl.channel_id as usize;
-        if ch >= p {
-            return Err("ringlwe: sublock channel_id out of range".to_string());
-        }
-        per_channel_counts[ch] += 1;
-        let rc = ratio_class_mod257_u16(&sl.accepting_set[0], &sl.accepting_set[1])?;
-        if seen[ch].contains(&rc) {
-            return Err("ringlwe: duplicate accepting-set ratio class within a channel".to_string());
-        }
-        seen[ch].push(rc);
-    }
-    for count in per_channel_counts {
-        if count != r {
-            return Err("ringlwe: malformed per-channel repetition distribution".to_string());
-        }
-    }
-    Ok(())
-}
 
 /// Packed encoding of up to 64 coefficients in F257 (per hinted block).
 ///
@@ -137,6 +109,40 @@ pub enum PackedF257Block64 {
     /// - `vals[i]`: `v % 256` (0..255)
     /// - if bit i in `is256_mask` is set, value is interpreted as 256 (regardless of vals[i])
     Dense { vals: [u8; PACK_D], is256_mask: u64 },
+}
+
+/// Compute a mod-257 dot product between a packed block and a 64-wide `u16` row.
+#[inline]
+pub(crate) fn dot_packed_block_mod257_u16(blk: &PackedF257Block64, row64: &[u16]) -> u16 {
+    let mut acc = 0u16;
+    match blk {
+        PackedF257Block64::Sparse { entries } => {
+            for &(pos_flags, coeff) in entries {
+                let pos = (pos_flags & 0x3f) as usize;
+                if pos >= row64.len() {
+                    continue;
+                }
+                let is_256 = ((pos_flags >> 6) & 1) != 0;
+                let v = if is_256 { 256u16 } else { coeff as u16 };
+                if v == 0 {
+                    continue;
+                }
+                acc = add_mod257_u16(acc, mul_mod257(v, row64[pos]));
+            }
+        }
+        PackedF257Block64::Dense { vals, is256_mask } => {
+            let lim = 64usize.min(row64.len());
+            for i in 0..lim {
+                let is256 = ((*is256_mask >> i) & 1) != 0;
+                let v = if is256 { 256u16 } else { vals[i] as u16 };
+                if v == 0 {
+                    continue;
+                }
+                acc = add_mod257_u16(acc, mul_mod257(v, row64[i]));
+            }
+        }
+    }
+    acc
 }
 
 impl Default for PackedF257Block64 {
@@ -267,53 +273,6 @@ impl PackedF257Block64 {
     }
 }
 
-/// Pack a row of d coefficients (in 0..257) into the block format used by `dot_row_mod257`.
-///
-/// Direct (non-ring) convention:
-/// - out[i] = row[i] for i=0..d-1, with implicit zero-padding.
-fn query_row_to_packed_f257(row: &[u16]) -> PackedF257Block64 {
-    let mut tmp = [0u16; PACK_D];
-    if !row.is_empty() {
-        let lim = PACK_D.min(row.len());
-        for i in 0..lim {
-            tmp[i] = row[i] % MOD_257;
-        }
-    }
-    PackedF257Block64::from_dense_u16s(&tmp)
-}
-
-/// Direct dot product for packed F257 blocks:
-///
-/// `acc = Σ_{i=0..d-1} h[i]*row[i]` over F257 (with implicit zero-padding).
-#[inline]
-fn dot_row_mod257(h: &PackedF257Block64, row: &[u16]) -> u16 {
-    let mut acc = 0u16;
-    match h {
-        PackedF257Block64::Sparse { entries } => {
-            for &(pos_flags, coeff) in entries {
-                let pos = (pos_flags & 0x3f) as usize;
-                if pos >= row.len() {
-                    continue;
-                }
-                let is_256 = ((pos_flags >> 6) & 1) != 0;
-                let v = if is_256 { 256u16 } else { coeff as u16 };
-                acc = add_mod257(acc, mul_mod257(v, row[pos]));
-            }
-        }
-        PackedF257Block64::Dense { vals, is256_mask } => {
-            let lim = PACK_D.min(row.len());
-            for i in 0..lim {
-                let v = PackedF257Block64::get_at_dense(vals, *is256_mask, i);
-                if v == 0 {
-                    continue;
-                }
-                acc = add_mod257(acc, mul_mod257(v, row[i]));
-            }
-        }
-    }
-    acc
-}
-
 // ---------------------------------------------------------------------------
 // Amplification parameters
 // ---------------------------------------------------------------------------
@@ -385,10 +344,20 @@ pub struct RingLweLockArtifact<F: PrimeField> {
     pub ct: LockCiphertext,
 }
 
-/// Hint material: one hint vector per lock.
+/// Compressed hint material for one DPP sublock.
+///
+/// This avoids materializing/storing the full masked query vector `h = q * s` over the enormous
+/// Theorem-4.3 proof `π`. Instead, we store only the secret-scaled combination coefficients needed
+/// to reconstruct the masked answer:
+///
+/// - `abg_scales`: `(s*coeff_alpha, s*coeff_beta, s*coeff_gamma)` in mod-257 digits
+/// - `offset_scale`: `s * δ(x_arm)` in mod-257 digits, where `δ(x) = 1 + ⟨q_x, x⟩`
+/// - `tail_scales`: 4 packed blocks holding `s*(coeff_mu, coeff_nu, c_3..c_{p-1})`
 #[derive(Clone, Debug)]
-pub struct BranchHints {
-    pub hint_blocks_sparse: Vec<(usize, PackedF257Block64)>,
+pub struct BranchHintsCompressed {
+    pub abg_scales: [u16; 3],
+    pub offset_scale: u16,
+    pub tail_scales: [PackedF257Block64; 4],
 }
 
 /// Per-branch ciphertext: unauthenticated stream cipher (XOR) under a derived key.
@@ -414,8 +383,8 @@ pub struct RingLweSubLock<F: PrimeField> {
     pub accepting_set: [F; 2],
     /// Public coins for Theorem-4.3 (prover needs these).
     pub coins: dpp::theorem43::Theorem43Coins<F>,
-    /// Deterministic hint blocks `h = q * s_channel (mod 257)`.
-    pub hints: BranchHints,
+    /// Deterministic compressed hint material.
+    pub hints: BranchHintsCompressed,
 }
 
 // ---------------------------------------------------------------------------
@@ -515,211 +484,64 @@ pub(crate) fn sample_nonzero_f257_scalar(rng: &mut impl RngCore) -> u16 {
     v + 1 // 1..256
 }
 
-// ---------------------------------------------------------------------------
-// Streaming decapsulation state
-// ---------------------------------------------------------------------------
-
-pub struct RingLweDecapStreamState<'a, F: PrimeField> {
-    lock: &'a RingLweLockArtifact<F>,
-    sublock: &'a RingLweSubLock<F>,
-    d: usize,
-    /// Accumulated mod-257 dot product `y = ⟨h, π⟩`.
-    ///
-    /// If the DPP guarantees `⟨q, π⟩ ∈ {a0, a1}`, and `h = q*s`, then `y = s*⟨q,π⟩ = s*a_true`.
+/// Compute two candidates for `s` given a mod-257 dot product `y = s * a_true` and a 2-element
+/// accepting set `{a0, a1}` (mod 257).
+#[inline]
+pub(crate) fn s_candidates_from_y_and_accepting_set_mod257<F: PrimeField>(
+    accepting_set: &[F; 2],
     y: u16,
-    sparse: &'a [(usize, PackedF257Block64)],
-    sparse_pos: usize,
-    block_idx: usize,
-    pos_in_block: usize,
-    filled: usize,
-    coeffs: Vec<u16>,
+) -> Result<[u16; 2], String> {
+    let a0 = (f_to_u64(&accepting_set[0]) % 257) as u16;
+    let a1 = (f_to_u64(&accepting_set[1]) % 257) as u16;
+    let inv0 = inv_mod257(a0)?;
+    let inv1 = inv_mod257(a1)?;
+    let s0 = mul_mod257(y, inv0);
+    let s1 = mul_mod257(y, inv1);
+    Ok([s0, s1])
 }
 
-impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
-    pub(crate) fn new(
-        lock: &'a RingLweLockArtifact<F>,
-        sublock: &'a RingLweSubLock<F>,
-        x: &[F],
-    ) -> Result<Self, String> {
-        if x.len() != lock.x_len || x.len() + lock.pi_len != lock.len {
-            return Err("ringlwe_decap_state: bad x length".to_string());
-        }
-        Ok(Self {
-            lock,
-            sublock,
-            d: PACK_D,
-            y: 0,
-            sparse: sublock.hints.hint_blocks_sparse.as_slice(),
-            sparse_pos: 0,
-            block_idx: 0,
-            pos_in_block: 0,
-            filled: 0,
-            coeffs: Vec::with_capacity(PACK_D),
-        })
+/// Compute `y mod 257` from compressed hints and streamed `(alpha,beta,gamma,tail)`.
+///
+/// This is the core decap scalar relation used for candidate extraction:
+/// `y = y_pi + offset_scale  (mod 257)`,
+/// where `offset_scale = s * δ(x_arm)` is baked into the lock package at arming time.
+pub(crate) fn masked_y_mod257_from_compressed_hint_and_tail<F: PrimeField>(
+    hc: &BranchHintsCompressed,
+    abgt: &dpp::theorem43::Theorem43AbgTail<F>,
+) -> Result<u16, String> {
+    let alpha = field_mod257_u16(&abgt.alpha);
+    let beta = field_mod257_u16(&abgt.beta);
+    let gamma = field_mod257_u16(&abgt.gamma);
+    if abgt.tail.len() != 256 {
+        return Err("ringlwe: bad theorem43 tail length".to_string());
     }
-
-    #[inline]
-    fn next_needed_block(&self) -> Option<usize> {
-        self.sparse.get(self.sparse_pos).map(|t| t.0)
+    let mut tail_u16 = [0u16; 256];
+    for (i, t) in abgt.tail.iter().enumerate() {
+        tail_u16[i] = field_mod257_u16(t);
     }
-
-    #[inline]
-    fn process_current_block(&mut self, row: &[u16]) {
-        if self.sparse_pos < self.sparse.len() && self.sparse[self.sparse_pos].0 == self.block_idx
-        {
-            let h = &self.sparse[self.sparse_pos].1;
-            let inc = dot_row_mod257(h, row);
-            self.y = add_mod257(self.y, inc);
-            self.sparse_pos += 1;
-        }
+    let mut tail_dot = 0u16;
+    for bi in 0..4usize {
+        let start = bi * 64;
+        let row64 = &tail_u16[start..start + 64];
+        tail_dot = add_mod257_u16(tail_dot, dot_packed_block_mod257_u16(&hc.tail_scales[bi], row64));
     }
-
-    #[inline]
-    fn maybe_process_full_block(&mut self) -> Result<(), String> {
-        if self.pos_in_block != self.d {
-            return Ok(());
-        }
-        debug_assert!(self.coeffs.is_empty() || self.coeffs.len() == self.d);
-        if !self.coeffs.is_empty() {
-            // Avoid borrowing `self` mutably while a slice into `self.coeffs` is live.
-            let row = core::mem::take(&mut self.coeffs);
-            self.process_current_block(row.as_slice());
-        }
-        self.block_idx += 1;
-        self.pos_in_block = 0;
-        Ok(())
-    }
-
-    pub fn absorb_chunk(&mut self, chunk: &[F]) -> Result<(), String> {
-        let mut i = 0usize;
-        while i < chunk.len() {
-            if self.filled >= self.lock.pi_len {
-                return Err("ringlwe_decap_stream: too many π elements".to_string());
-            }
-            let need = self.next_needed_block() == Some(self.block_idx);
-            let rem_chunk = chunk.len() - i;
-            let rem_pi = self.lock.pi_len - self.filled;
-            let rem_block = self.d - self.pos_in_block;
-            let take = rem_chunk.min(rem_pi).min(rem_block);
-            debug_assert!(take > 0);
-
-            if need {
-                // Collect coefficients for this block only (hinted blocks).
-                for v in &chunk[i..i + take] {
-                    let vv = (f_to_u64(v) % (MOD_257 as u64)) as u16;
-                    self.coeffs.push(vv);
-                }
-                self.pos_in_block += take;
-                self.filled += take;
-                i += take;
-                self.maybe_process_full_block()?;
-            } else {
-                // Skip uninterested blocks in bulk: advance counters without embedding/converting.
-                self.pos_in_block += take;
-                self.filled += take;
-                i += take;
-                if self.pos_in_block == self.d {
-                    // Fast-path block boundary update (no coeffs to process).
-                    self.block_idx += 1;
-                    self.pos_in_block = 0;
-                    self.coeffs.clear();
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Finalize streaming and return per-branch key material seeds.
-    fn finish_y_mod257(mut self) -> Result<u16, String> {
-        if self.filled != self.lock.pi_len {
-            return Err("ringlwe_decap_stream: bad π length".to_string());
-        }
-        // Flush remaining partial block.
-        if self.pos_in_block != 0 {
-            debug_assert_eq!(self.pos_in_block, self.filled % self.d);
-            if !self.coeffs.is_empty() {
-                // Current block was needed, so we collected its (partial) coefficients.
-                // Avoid borrowing `self` mutably while a slice into `self.coeffs` is live.
-                let row = core::mem::take(&mut self.coeffs);
-                self.process_current_block(row.as_slice());
-            }
-            self.block_idx += 1;
-            self.pos_in_block = 0;
-            self.coeffs.clear();
-        }
-        let nblocks = (self.lock.pi_len + self.d - 1) / self.d;
-        if self.block_idx != nblocks {
-            return Err("ringlwe_decap_stream: internal block count mismatch".to_string());
-        }
-        if self.sparse_pos != self.sparse.len() {
-            return Err("ringlwe_decap_stream: did not consume all sparse blocks".to_string());
-        }
-        Ok(self.y)
-    }
-
-    /// Finish streaming and return the channel id and two candidate scalars `s` (mod 257).
-    pub fn finish_s_candidates(self) -> Result<(u16, [u16; 2]), String> {
-        let sl = self.sublock;
-        let y = self.finish_y_mod257()?;
-        let a0 = (f_to_u64(&sl.accepting_set[0]) % 257) as u16;
-        let a1 = (f_to_u64(&sl.accepting_set[1]) % 257) as u16;
-        let inv0 = inv_mod257(a0)?;
-        let inv1 = inv_mod257(a1)?;
-        let s0 = mul_mod257(y, inv0);
-        let s1 = mul_mod257(y, inv1);
-        Ok((sl.channel_id, [s0, s1]))
-    }
-
+    let mut y = 0u16;
+    y = add_mod257_u16(y, mul_mod257(hc.abg_scales[0], alpha));
+    y = add_mod257_u16(y, mul_mod257(hc.abg_scales[1], beta));
+    y = add_mod257_u16(y, mul_mod257(hc.abg_scales[2], gamma));
+    y = add_mod257_u16(y, tail_dot);
+    y = add_mod257_u16(y, hc.offset_scale);
+    Ok(y)
 }
 
-// ---------------------------------------------------------------------------
-// Query accumulator
-// ---------------------------------------------------------------------------
-
-pub(crate) struct QueryBlockAccumulator<F: PrimeField> {
-    pi_len: usize,
-    d: usize,
-    blocks: BTreeMap<usize, Vec<u16>>,
-    _marker: std::marker::PhantomData<F>,
+/// Convenience: compute the 2 candidates for `s` for one sublock under the compressed-hint scheme.
+pub(crate) fn sublock_s_candidates_from_abg_tail<F: PrimeField>(
+    sl: &RingLweSubLock<F>,
+    abgt: &dpp::theorem43::Theorem43AbgTail<F>,
+) -> Result<[u16; 2], String> {
+    let y = masked_y_mod257_from_compressed_hint_and_tail(&sl.hints, abgt)?;
+    s_candidates_from_y_and_accepting_set_mod257(&sl.accepting_set, y)
 }
-
-impl<F: PrimeField> QueryBlockAccumulator<F> {
-    pub(crate) fn new(pi_len: usize) -> Result<Self, String> {
-        Ok(Self {
-            pi_len,
-            d: PACK_D,
-            blocks: BTreeMap::new(),
-            _marker: std::marker::PhantomData,
-        })
-    }
-
-    pub(crate) fn add_term(&mut self, coeff: &F, idx: usize) -> Result<(), String> {
-        if idx >= self.pi_len {
-            return Err("q_pi index out of range".to_string());
-        }
-        let block = idx / self.d;
-        let pos = idx % self.d;
-        let row = self
-            .blocks
-            .entry(block)
-            .or_insert_with(|| vec![0u16; self.d]);
-        let v = (f_to_u64(coeff) % (MOD_257 as u64)) as u16;
-        row[pos] = add_mod257(row[pos], v);
-        Ok(())
-    }
-
-    pub(crate) fn into_sparse_blocks(&mut self) -> Vec<(usize, PackedF257Block64)> {
-        let blocks = std::mem::take(&mut self.blocks);
-        blocks
-            .into_iter()
-            .map(|(idx, row)| (idx, query_row_to_packed_f257(row.as_slice())))
-            .collect()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Lock artifact API
-// ---------------------------------------------------------------------------
 
 impl<F: PrimeField> RingLweLockArtifact<F> {
     pub(crate) fn payload_key_bytes(&self, s_channels_mod257: &[u16]) -> Result<[u8; 32], String> {
@@ -742,17 +564,6 @@ impl<F: PrimeField> RingLweLockArtifact<F> {
     pub(crate) fn decrypt_payload(&self, s_channels_mod257: &[u16]) -> Result<Vec<u8>, String> {
         let key = self.payload_key_bytes(s_channels_mod257)?;
         Ok(xor_stream_decrypt(&key, &self.ct.nonce, &self.ct.ct))
-    }
-
-    pub fn decap_states<'a>(
-        &'a self,
-        x: &[F],
-    ) -> Result<Vec<RingLweDecapStreamState<'a, F>>, String> {
-        let mut out = Vec::with_capacity(self.sublocks.len());
-        for sl in &self.sublocks {
-            out.push(RingLweDecapStreamState::new(self, sl, x)?);
-        }
-        Ok(out)
     }
 }
 
@@ -834,7 +645,10 @@ pub(crate) fn decrypt_payload_from_sublock_s_candidates<F: PrimeField>(
         cur.sort_unstable();
         cur.dedup();
         if cur.is_empty() {
-            return Err("ringlwe: empty intersection for some channel".to_string());
+            return Err(format!(
+                "ringlwe: empty intersection for some channel (ch={} reps={:?})",
+                ch, per_channel_reps[ch]
+            ));
         }
         if cur.len() > 2 {
             return Err("ringlwe: internal error (intersection >2)".to_string());
@@ -854,7 +668,7 @@ pub(crate) fn decrypt_payload_from_sublock_s_candidates<F: PrimeField>(
     if total != 1 {
         let lens: Vec<usize> = channel_sets.iter().map(|s| s.len()).collect();
         return Err(format!(
-            "ringlwe: ambiguous per-channel intersections (P={p} R={r} channel_set_lens={lens:?} total_tuples={total}); lock must satisfy ratio-class distinctness policy"
+            "ringlwe: ambiguous per-channel intersections (P={p} R={r} channel_set_lens={lens:?} total_tuples={total}); increase sublocks per channel (e.g. full coverage) or increase R"
         ));
     }
 
@@ -866,124 +680,6 @@ pub(crate) fn decrypt_payload_from_sublock_s_candidates<F: PrimeField>(
         })
         .collect();
     lock.decrypt_payload(s_channels.as_slice())
-}
-
-/// Statement-aware decrypt path: derive the payload key from the **decap-side statement** `x`.
-///
-/// This is the binding needed for attacker-controlled decap: if `x_decap != x_arm`, payload
-/// recovery must fail *cryptographically* (i.e. decrypt under a different key), not just via
-/// optional manifest guards.
-///
-/// Convention for LF+ WE tiny gate:
-/// - `x = [ONE] || stmt_digest(32)`
-/// - lock artifacts store `c_stmt` corresponding to the statement digest lane.
-///
-/// We derive the payload key using `x[1..]` (the decap-side statement digest), not `lock.c_stmt`.
-pub(crate) fn decrypt_payload_from_sublock_s_candidates_for_stmt<F: PrimeField>(
-    lock: &RingLweLockArtifact<F>,
-    sublock_s_candidates: &[(u16, [u16; 2])],
-    x: &[F],
-) -> Result<Vec<u8>, String> {
-    if x.len() != lock.x_len {
-        return Err("ringlwe: decrypt_for_stmt: bad x length".to_string());
-    }
-    if x.len() < 2 {
-        return Err("ringlwe: decrypt_for_stmt: x too short".to_string());
-    }
-    let c_stmt_for_key = x
-        .get(1..)
-        .ok_or_else(|| "ringlwe: decrypt_for_stmt: missing stmt digest in x".to_string())?;
-    if c_stmt_for_key.len() != lock.c_stmt.len() {
-        return Err(format!(
-            "ringlwe: decrypt_for_stmt: stmt digest length mismatch (x_tail={} lock_c_stmt={})",
-            c_stmt_for_key.len(),
-            lock.c_stmt.len()
-        ));
-    }
-
-    // Reuse the canonical candidate-intersection logic to recover s_channels.
-    let p = lock.p_channels as usize;
-    let r = lock.r_reps as usize;
-    if p == 0 || r == 0 {
-        return Err("ringlwe: invalid (P,R)".to_string());
-    }
-    if lock.sublocks.len() != p.saturating_mul(r) {
-        return Err("ringlwe: sublocks length mismatch".to_string());
-    }
-    if sublock_s_candidates.len() != lock.sublocks.len() {
-        return Err("ringlwe: sublock_s_candidates length mismatch".to_string());
-    }
-
-    // Group 2-candidate sets by channel, preserving the canonical sublock order.
-    let mut per_channel_reps: Vec<Vec<[u16; 2]>> = vec![Vec::with_capacity(r); p];
-    for (i, (ch, cands)) in sublock_s_candidates.iter().enumerate() {
-        let sl = lock
-            .sublocks
-            .get(i)
-            .ok_or_else(|| "ringlwe: internal sublock index mismatch".to_string())?;
-        if *ch != sl.channel_id {
-            return Err("ringlwe: sublock channel_id mismatch".to_string());
-        }
-        let ch_usize = *ch as usize;
-        if ch_usize >= p {
-            return Err("ringlwe: channel_id out of range".to_string());
-        }
-        per_channel_reps[ch_usize].push(*cands);
-    }
-    for ch in 0..p {
-        if per_channel_reps[ch].len() != r {
-            return Err("ringlwe: missing repetitions for some channel".to_string());
-        }
-    }
-
-    // Intersect across reps within a channel.
-    let mut channel_sets: Vec<Vec<u16>> = Vec::with_capacity(p);
-    for ch in 0..p {
-        let mut cur = intersect_2cands_across_reps(per_channel_reps[ch].as_slice())?;
-        cur.sort_unstable();
-        cur.dedup();
-        if cur.is_empty() {
-            return Err("ringlwe: empty intersection for some channel".to_string());
-        }
-        if cur.len() > 2 {
-            return Err("ringlwe: internal error (intersection >2)".to_string());
-        }
-        channel_sets.push(cur);
-    }
-
-    // Canonical policy: no branching.
-    let mut total: u64 = 1;
-    for set in &channel_sets {
-        total = total.saturating_mul(set.len() as u64);
-    }
-    if total != 1 {
-        let lens: Vec<usize> = channel_sets.iter().map(|s| s.len()).collect();
-        return Err(format!(
-            "ringlwe: ambiguous per-channel intersections (P={p} R={r} channel_set_lens={lens:?} total_tuples={total}); lock must satisfy ratio-class distinctness policy"
-        ));
-    }
-
-    let s_channels: Vec<u16> = channel_sets
-        .iter()
-        .map(|set| {
-            debug_assert_eq!(set.len(), 1);
-            set[0]
-        })
-        .collect();
-
-    // Derive payload key from **decap-side statement digest**.
-    let key = derive_payload_key_bytes_multi(
-        &lock.params.domain_label,
-        c_stmt_for_key,
-        lock.x_len,
-        lock.pi_len,
-        lock.len,
-        lock.p_channels,
-        lock.r_reps,
-        lock.sublocks.as_slice(),
-        s_channels.as_slice(),
-    );
-    Ok(xor_stream_decrypt(&key, &lock.ct.nonce, &lock.ct.ct))
 }
 
 /// Arm (create) a lock artifact with deterministic mod-257 hints + unauthenticated XOR.
@@ -1015,7 +711,7 @@ pub fn arm_ringlwe_lock<F: PrimeField>(
     }
     for sl in &sublocks {
         if sl.accepting_set[0].is_zero() || sl.accepting_set[1].is_zero() {
-            return Err("arm_ringlwe_lock: shifted accepting set contains 0".to_string());
+            return Err("arm_ringlwe_lock: accepting set contains 0".to_string());
         }
         if sl.channel_id >= p_channels {
             return Err("arm_ringlwe_lock: sublock channel_id out of range".to_string());
@@ -1091,12 +787,15 @@ mod tests {
         };
 
         let s = sample_nonzero_f257_scalar(&mut rng);
+        let zero64 = [0u16; 64];
         let sub = RingLweSubLock::<F257> {
             channel_id: 0,
             accepting_set: [F257::from(1u64), F257::from(2u64)],
             coins,
-            hints: BranchHints {
-                hint_blocks_sparse: Vec::new(),
+            hints: BranchHintsCompressed {
+                abg_scales: [0u16; 3],
+                offset_scale: 0u16,
+                tail_scales: core::array::from_fn(|_| PackedF257Block64::from_dense_u16s(&zero64)),
             },
         };
         let lock = arm_ringlwe_lock::<F257>(

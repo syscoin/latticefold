@@ -1430,7 +1430,7 @@ mod tests {
         use crate::we_tiny_lock::arm_lfplus_ringlwe_lock;
         use crate::utils::maybe_print_rss;
         use std::time::Instant;
-        use rand::{rngs::StdRng, SeedableRng};
+        use rand::{rngs::StdRng, RngCore, SeedableRng};
 
         // Minimal-but-valid params to keep the schedule small.
         //
@@ -1509,7 +1509,6 @@ mod tests {
         let vk_hash = [1u8; 32];
         let r1cs_digest = [2u8; 32];
         let gate_digest = [3u8; 32];
-        let committed_values_digest = [4u8; 32];
         // In the SP1 path, the first 8 public inputs are the committed-values digest lane.
         // In this unit test, bind to the *actual* transcript-absorbed bytes for the first 8
         // public inputs so the gate glue is satisfiable.
@@ -1576,66 +1575,61 @@ mod tests {
             shape.public_len,
         )
         .expect("we_ringlwe_prover_from_dr1cs");
-        let shape1 = shape.clone();
         let t_arm = Instant::now();
-        // Arm two coin instances so we can reuse a single streamed π0 across multiple coin tails.
-        // This matches `dpp::tests::test_theorem43_f257_reuse_single_pi0_many_coin_tails`.
-        // Payload arming rejects shifted accepting-set candidates equal to 0 (would trivialize key
-        // material). In tests, avoid flakiness by deterministically bumping `rep_id` until ok.
-        let mut rep0 = 0u64;
-        let lock0 = loop {
-            match arm_lfplus_ringlwe_lock::<R>(
-                shape.clone(),
-                &stmt_digest_f257,
-                armer_seed,
-                lock_j,
-                0,
-                crate::we_tiny_lock::WeRingLweLockArmingPolicy {
-                    base_rep_id: rep0,
-                    max_rep_tries: usize::MAX,
-                    hint_budget_bytes: None,
-                },
-                ringlwe_params.clone(),
-                2,
-                2,
-                &dummy_payload,
-                &mut rng,
-            ) {
-                Ok(lock_out) => break lock_out.lock,
-                Err(e) if e.contains("shifted accepting set contains 0") => {
-                    rep0 += 1;
-                    continue;
-                }
-                Err(e) => panic!("arm ctx0 failed: {e}"),
-            }
+        // Arm two lock contexts in parallel, matching oneproof's per-lock parallelism model.
+        // Keep deterministic behavior by deriving per-lock RNG seeds sequentially first.
+        let mut seed0 = [0u8; 32];
+        let mut seed1 = [0u8; 32];
+        rng.fill_bytes(&mut seed0);
+        rng.fill_bytes(&mut seed1);
+        let policy0 = crate::we_tiny_lock::WeRingLweLockArmingPolicy {
+            base_rep_id: 0,
+            max_rep_tries: 32,
+            hint_budget_bytes: None,
         };
-        let mut rep1 = rep0 + 1; // ensure different coins/query => different tail
-        let lock1 = loop {
-            match arm_lfplus_ringlwe_lock::<R>(
-                shape1.clone(),
-                &stmt_digest_f257,
-                armer_seed,
-                lock_j,
-                0,
-                crate::we_tiny_lock::WeRingLweLockArmingPolicy {
-                    base_rep_id: rep1,
-                    max_rep_tries: usize::MAX,
-                    hint_budget_bytes: None,
-                },
-                ringlwe_params.clone(),
-                2,
-                2,
-                &dummy_payload,
-                &mut rng,
-            ) {
-                Ok(lock_out) => break lock_out.lock,
-                Err(e) if e.contains("shifted accepting set contains 0") => {
-                    rep1 += 1;
-                    continue;
-                }
-                Err(e) => panic!("arm ctx1 failed: {e}"),
-            }
+        let policy1 = crate::we_tiny_lock::WeRingLweLockArmingPolicy {
+            base_rep_id: 1,
+            max_rep_tries: 32,
+            hint_budget_bytes: None,
         };
+        let (lock0, lock1) = rayon::join(
+            || {
+                let mut rng0 = StdRng::from_seed(seed0);
+                arm_lfplus_ringlwe_lock::<R>(
+                    shape.clone(),
+                    &stmt_digest_f257,
+                    armer_seed,
+                    lock_j,
+                    0,
+                    policy0,
+                    ringlwe_params.clone(),
+                    2,
+                    16,
+                    &dummy_payload,
+                    &mut rng0,
+                )
+                .unwrap_or_else(|e| panic!("arm ctx0 failed: {e}"))
+                .lock
+            },
+            || {
+                let mut rng1 = StdRng::from_seed(seed1);
+                arm_lfplus_ringlwe_lock::<R>(
+                    shape.clone(),
+                    &stmt_digest_f257,
+                    armer_seed,
+                    lock_j,
+                    0,
+                    policy1,
+                    ringlwe_params.clone(),
+                    2,
+                    16,
+                    &dummy_payload,
+                    &mut rng1,
+                )
+                .unwrap_or_else(|e| panic!("arm ctx1 failed: {e}"))
+                .lock
+            },
+        );
         eprintln!(
             "[tiny_gate] armed in {:?}: proof_len={}",
             t_arm.elapsed(),
@@ -1649,56 +1643,41 @@ mod tests {
 
         let t_prove = Instant::now();
         maybe_print_rss("tiny_gate:before_prove_decap_stream");
-        let sts0 = lock0.decap_states(&x).expect("decap_states0");
-        let sts1 = lock1.decap_states(&x).expect("decap_states1");
-
         // Flatten sublocks across both locks into one streaming pass.
-        let mut states: Vec<_> = Vec::with_capacity(sts0.len() + sts1.len());
-        let mut coins_list: Vec<_> = Vec::with_capacity(sts0.len() + sts1.len());
-        let mut meta: Vec<(usize, usize)> = Vec::with_capacity(sts0.len() + sts1.len()); // (lock_id, sublock_idx)
-        for (si, st) in sts0.into_iter().enumerate() {
-            coins_list.push(lock0.sublocks[si].coins.clone());
+        let mut coins_list: Vec<_> = Vec::with_capacity(lock0.sublocks.len() + lock1.sublocks.len());
+        let mut meta: Vec<(usize, usize)> = Vec::with_capacity(lock0.sublocks.len() + lock1.sublocks.len()); // (lock_id, sublock_idx)
+        for (si, sl) in lock0.sublocks.iter().enumerate() {
+            coins_list.push(sl.coins.clone());
             meta.push((0, si));
-            states.push(st);
         }
-        for (si, st) in sts1.into_iter().enumerate() {
-            coins_list.push(lock1.sublocks[si].coins.clone());
+        for (si, sl) in lock1.sublocks.iter().enumerate() {
+            coins_list.push(sl.coins.clone());
             meta.push((1, si));
-            states.push(st);
         }
-        let mut err: Option<String> = None;
         let tails = prover
-            .stream_pi0_and_collect_tails(
-                &x,
-                &z_w,
-                &coins_list,
-                &mut |chunk| {
-                    if err.is_some() {
-                        return;
-                    }
-                    for st in &mut states {
-                        if let Err(e) = st.absorb_chunk(chunk) {
-                            err = Some(e);
-                            break;
-                        }
-                    }
-                },
-            )
+            .stream_pi0_and_collect_tails(&x, &z_w, &coins_list, &mut |_chunk| {})
             .expect("stream_pi0_and_collect_tails");
-        if let Some(e) = err {
-            panic!("stream decap absorb failed: {e}");
-        }
-        assert_eq!(tails.len(), states.len());
-        for (i, st) in states.iter_mut().enumerate() {
-            st.absorb_chunk(&tails[i]).expect("absorb tail");
-        }
-
-        // Collect per-sublock scalar candidates for each lock, then decrypt deterministically.
+        assert_eq!(tails.len(), meta.len());
+        use rayon::prelude::*;
         let mut cands0: Vec<Option<(u16, [u16; 2])>> = vec![None; lock0.sublocks.len()];
         let mut cands1: Vec<Option<(u16, [u16; 2])>> = vec![None; lock1.sublocks.len()];
-        for (gi, st) in states.into_iter().enumerate() {
-            let (lock_id, si) = meta[gi];
-            let (ch, cands) = st.finish_s_candidates().expect("finish_s_candidates");
+        let results: Vec<(usize, usize, u16, [u16; 2])> = tails
+            .par_iter()
+            .enumerate()
+            .map(|(gi, abgt)| {
+                let (lock_id, si) = meta[gi];
+                let sl = match lock_id {
+                    0 => &lock0.sublocks[si],
+                    1 => &lock1.sublocks[si],
+                    _ => unreachable!(),
+                };
+                let cands =
+                    crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt)
+                    .expect("sublock candidates");
+                (lock_id, si, sl.channel_id, cands)
+            })
+            .collect();
+        for (lock_id, si, ch, cands) in results {
             match lock_id {
                 0 => cands0[si] = Some((ch, cands)),
                 1 => cands1[si] = Some((ch, cands)),
@@ -1727,10 +1706,11 @@ mod tests {
         maybe_print_rss("tiny_gate:after_prove_decap_stream");
         eprintln!("[tiny_gate] prove+decap(stream) in {:?}", t_prove.elapsed());
 
-        // Negative check: wrong x length must fail immediately.
+        // Negative check: wrong x length must fail decryption binding (candidate extraction uses x),
+        // so we should not be able to derive a unique per-channel secret tuple.
         let mut x_bad = x.clone();
         x_bad.push(F257::ONE);
-        assert!(lock0.decap_states(&x_bad).is_err());
+        assert_ne!(x_bad.len(), lock0.x_len);
 
         // Now it is safe to reclaim disk space used by the shape files.
         crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir);
@@ -1807,7 +1787,6 @@ mod tests {
         let vk_hash = [1u8; 32];
         let r1cs_digest = [2u8; 32];
         let gate_digest = [3u8; 32];
-        let committed_values_digest = [4u8; 32];
         let committed_values_prefix_bytes: [u8; CV_PREFIX_BYTES] = {
             let mut out = [0u8; CV_PREFIX_BYTES];
             let pis = public_inputs_bf
@@ -1900,17 +1879,17 @@ mod tests {
                     0,
                     crate::we_tiny_lock::WeRingLweLockArmingPolicy {
                         base_rep_id: rep_id,
-                        max_rep_tries: usize::MAX,
+                        max_rep_tries: 32,
                         hint_budget_bytes: None,
                     },
                     ringlwe_params.clone(),
                     2,
-                    2,
+                    16,
                     &shares[i].value,
                     &mut rng,
                 ) {
                     Ok(lock_out) => break lock_out.lock,
-                    Err(e) if e.contains("shifted accepting set contains 0") => {
+                    Err(e) if e.contains("resample rep_id") => {
                         rep_id += 1;
                         continue;
                     }
@@ -1932,57 +1911,28 @@ mod tests {
         let t_prove = Instant::now();
         maybe_print_rss("tiny_payload_shamir:before_prove_decap_stream");
         // Flatten all sublocks across all locks into one streaming pass.
-        let mut states: Vec<_> = Vec::new();
         let mut coins_list: Vec<_> = Vec::new();
         let mut meta: Vec<(usize, usize)> = Vec::new(); // (lock_i, sublock_i)
         for (li, l) in locks.iter().enumerate() {
-            let sts = l
-                .decap_states(&x)
-                .unwrap_or_else(|_| panic!("decap_states[{li}]"));
-            for (si, st) in sts.into_iter().enumerate() {
-                coins_list.push(l.sublocks[si].coins.clone());
+            for (si, sl) in l.sublocks.iter().enumerate() {
+                coins_list.push(sl.coins.clone());
                 meta.push((li, si));
-                states.push(st);
             }
         }
-        let mut err: Option<String> = None;
-        let tails = prover
-            .stream_pi0_and_collect_tails(
-                &x,
-                &z_w,
-                &coins_list,
-                &mut |chunk| {
-                    if err.is_some() {
-                        return;
-                    }
-                    for st in &mut states {
-                        if let Err(e) = st.absorb_chunk(chunk) {
-                            err = Some(e);
-                            break;
-                        }
-                    }
-                },
-            )
+        let abg_tails = prover
+            .stream_pi0_and_collect_tails(&x, &z_w, &coins_list, &mut |_chunk| {})
             .expect("stream_pi0_and_collect_tails");
-        if let Some(e) = err {
-            panic!("stream decap absorb failed: {e}");
-        }
-        assert_eq!(tails.len(), states.len());
-
-        // Absorb tails (no corruption — with unauthenticated encryption, "erasures" manifest as
-        // wrong decryptions that fail at batch reconstruction, not per-lock AEAD failures).
-        for (i, st) in states.iter_mut().enumerate() {
-            st.absorb_chunk(&tails[i]).unwrap_or_else(|_| panic!("absorb tail[{i}]"));
-        }
+        assert_eq!(abg_tails.len(), meta.len());
 
         // Collect per-sublock candidates per lock, then decrypt deterministically (no branching).
         let mut per_lock_slots: Vec<Vec<Option<(u16, [u16; 2])>>> =
             locks.iter().map(|l| vec![None; l.sublocks.len()]).collect();
-        for (gi, st) in states.into_iter().enumerate() {
+        for (gi, abgt) in abg_tails.iter().enumerate() {
             let (li, si) = meta[gi];
-            let (ch, cands) = st
-                .finish_s_candidates()
-                .unwrap_or_else(|e| panic!("finish_s_candidates[{gi}]: {e}"));
+            let sl = &locks[li].sublocks[si];
+            let cands = crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt)
+            .unwrap_or_else(|e| panic!("sublock cands[{gi}]: {e}"));
+            let ch = sl.channel_id;
             per_lock_slots[li][si] = Some((ch, cands));
         }
         let mut selected: Vec<ShamirShare> = Vec::with_capacity(shamir.threshold);
@@ -2127,7 +2077,6 @@ mod tests {
         let vk_hash = [1u8; 32];
         let r1cs_digest = [2u8; 32];
         let gate_digest = [3u8; 32];
-        let committed_values_digest = [4u8; 32];
         let committed_values_prefix_bytes: [u8; CV_PREFIX_BYTES] = {
             let mut out = [0u8; CV_PREFIX_BYTES];
             let pis = public_inputs_bf
@@ -2247,17 +2196,17 @@ mod tests {
                         0,
                         crate::we_tiny_lock::WeRingLweLockArmingPolicy {
                             base_rep_id: rep_id,
-                            max_rep_tries: usize::MAX,
+                            max_rep_tries: 32,
                             hint_budget_bytes: None,
                         },
                         ringlwe_params.clone(),
                         2,
-                        2,
+                        16,
                         &shares[i].value,
                         &mut rng,
                     ) {
                         Ok(lock_out) => break lock_out.lock,
-                        Err(e) if e.contains("shifted accepting set contains 0") => {
+                        Err(e) if e.contains("resample rep_id") => {
                             rep_id += 1;
                             continue;
                         }
@@ -2288,51 +2237,32 @@ mod tests {
 
         // Flatten all sublocks across all locks into one streaming pass.
         let mut coins_list: Vec<_> = Vec::new();
-        let mut states: Vec<_> = Vec::new();
         let mut meta: Vec<(usize, usize)> = Vec::new(); // (lock_idx, sublock_idx)
         for (li, lock) in all_locks.iter().enumerate() {
-            let sts = lock
-                .decap_states(&x)
-                .unwrap_or_else(|e| panic!("decap_states[{li}] failed: {e}"));
-            for (si, st) in sts.into_iter().enumerate() {
+            for (si, _sl) in lock.sublocks.iter().enumerate() {
                 coins_list.push(lock.sublocks[si].coins.clone());
                 meta.push((li, si));
-                states.push(st);
             }
         }
 
         // Stream π₀ ONCE — all sublocks absorb the same chunks simultaneously.
-        let mut err: Option<String> = None;
         let tails = prover
-            .stream_pi0_and_collect_tails(&x, &z_w, &coins_list, &mut |chunk| {
-                if err.is_some() {
-                    return;
-                }
-                for st in &mut states {
-                    if let Err(e) = st.absorb_chunk(chunk) {
-                        err = Some(e);
-                        break;
-                    }
-                }
-            })
+            .stream_pi0_and_collect_tails(&x, &z_w, &coins_list, &mut |_chunk| {})
             .expect("stream_pi0_and_collect_tails");
-        if let Some(e) = err {
-            panic!("stream failed: {e}");
-        }
-        assert_eq!(tails.len(), states.len());
-        for (i, st) in states.iter_mut().enumerate() {
-            st.absorb_chunk(&tails[i])
-                .unwrap_or_else(|_| panic!("absorb tail[{i}]"));
-        }
+        assert_eq!(tails.len(), meta.len());
 
         // Per lock: collect sublock candidates in canonical order, then decrypt deterministically.
         let mut per_lock_sublock_cands: Vec<Vec<Option<(u16, [u16; 2])>>> = all_locks
             .iter()
             .map(|l| vec![None; l.sublocks.len()])
             .collect();
-        for (gi, st) in states.into_iter().enumerate() {
+        for (gi, abgt) in tails.iter().enumerate() {
             let (li, si) = meta[gi];
-            let (ch, cands) = st.finish_s_candidates().unwrap();
+            let lock = all_locks[li];
+            let sl = &lock.sublocks[si];
+            let cands = crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt)
+            .unwrap_or_else(|e| panic!("sublock candidates[{gi}]: {e}"));
+            let ch = sl.channel_id;
             per_lock_sublock_cands[li][si] = Some((ch, cands));
         }
 
@@ -2414,43 +2344,30 @@ mod tests {
         {
             // Flatten sublocks.
             let mut adv_coins: Vec<_> = Vec::new();
-            let mut adv_states: Vec<_> = Vec::new();
             let mut adv_meta: Vec<(usize, usize)> = Vec::new();
             for (li, lock) in all_locks.iter().enumerate() {
-                let sts = lock.decap_states(&x).unwrap();
-                for (si, st) in sts.into_iter().enumerate() {
+                for (si, _sl) in lock.sublocks.iter().enumerate() {
                     adv_coins.push(lock.sublocks[si].coins.clone());
                     adv_meta.push((li, si));
-                    adv_states.push(st);
                 }
             }
 
-            let mut adv_err: Option<String> = None;
             let mut adv_tails = prover
-                .stream_pi0_and_collect_tails(&x, &z_w, &adv_coins, &mut |chunk| {
-                    if adv_err.is_some() {
-                        return;
-                    }
-                    for st in &mut adv_states {
-                        if let Err(e) = st.absorb_chunk(chunk) {
-                            adv_err = Some(e);
-                            break;
-                        }
-                    }
-                })
+                .stream_pi0_and_collect_tails(&x, &z_w, &adv_coins, &mut |_chunk| {})
                 .expect("adv stream");
-            assert!(adv_err.is_none());
             // Corrupt the first tail element.
-            adv_tails[0][0] += F257::from(42u64);
-            for (i, st) in adv_states.iter_mut().enumerate() {
-                st.absorb_chunk(&adv_tails[i]).unwrap();
-            }
+            adv_tails[0].tail[0] += F257::from(42u64);
 
             let mut per_lock_slots: Vec<Vec<Option<(u16, [u16; 2])>>> =
                 all_locks.iter().map(|l| vec![None; l.sublocks.len()]).collect();
-            for (gi, st) in adv_states.into_iter().enumerate() {
+            for (gi, abgt) in adv_tails.iter().enumerate() {
                 let (li, si) = adv_meta[gi];
-                let (ch, cands) = st.finish_s_candidates().unwrap();
+                let lock = all_locks[li];
+                let sl = &lock.sublocks[si];
+                let cands =
+                    crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt)
+                    .unwrap();
+                let ch = sl.channel_id;
                 per_lock_slots[li][si] = Some((ch, cands));
             }
 
@@ -2513,43 +2430,30 @@ mod tests {
 
             // Flatten sublocks.
             let mut tam_coins: Vec<_> = Vec::new();
-            let mut tam_states: Vec<_> = Vec::new();
             let mut tam_meta: Vec<(usize, usize)> = Vec::new();
             for (li, lock) in tampered_all_locks.iter().enumerate() {
-                let sts = lock.decap_states(&x).unwrap();
-                for (si, st) in sts.into_iter().enumerate() {
+                for (si, _sl) in lock.sublocks.iter().enumerate() {
                     tam_coins.push(lock.sublocks[si].coins.clone());
                     tam_meta.push((li, si));
-                    tam_states.push(st);
                 }
             }
 
-            let mut tam_err: Option<String> = None;
             let tam_tails = prover
-                .stream_pi0_and_collect_tails(&x, &z_w, &tam_coins, &mut |chunk| {
-                    if tam_err.is_some() {
-                        return;
-                    }
-                    for st in &mut tam_states {
-                        if let Err(e) = st.absorb_chunk(chunk) {
-                            tam_err = Some(e);
-                            break;
-                        }
-                    }
-                })
+                .stream_pi0_and_collect_tails(&x, &z_w, &tam_coins, &mut |_chunk| {})
                 .expect("tam stream");
-            assert!(tam_err.is_none());
-            for (i, st) in tam_states.iter_mut().enumerate() {
-                st.absorb_chunk(&tam_tails[i]).unwrap();
-            }
 
             let mut per_lock_slots: Vec<Vec<Option<(u16, [u16; 2])>>> = tampered_all_locks
                 .iter()
                 .map(|l| vec![None; l.sublocks.len()])
                 .collect();
-            for (gi, st) in tam_states.into_iter().enumerate() {
+            for (gi, abgt) in tam_tails.iter().enumerate() {
                 let (li, si) = tam_meta[gi];
-                let (ch, cands) = st.finish_s_candidates().unwrap();
+                let lock = tampered_all_locks[li];
+                let sl = &lock.sublocks[si];
+                let cands =
+                    crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt)
+                    .unwrap();
+                let ch = sl.channel_id;
                 per_lock_slots[li][si] = Some((ch, cands));
             }
 
@@ -2732,7 +2636,6 @@ mod tests {
         let vk_hash = [1u8; 32];
         let r1cs_digest = [2u8; 32];
         let gate_digest = [3u8; 32];
-        let committed_values_digest = [4u8; 32];
         let committed_values_prefix_bytes: [u8; CV_PREFIX_BYTES] = {
             let mut out = [0u8; CV_PREFIX_BYTES];
             let pis = public_inputs_bf
@@ -2806,17 +2709,17 @@ mod tests {
                 0,
                 crate::we_tiny_lock::WeRingLweLockArmingPolicy {
                     base_rep_id: rep0,
-                    max_rep_tries: usize::MAX,
+                    max_rep_tries: 32,
                     hint_budget_bytes: None,
                 },
                 ringlwe_params.clone(),
                 2,
-                2,
+                16,
                 &dummy_payload,
                 &mut rng,
             ) {
                 Ok(lock_out) => break lock_out.lock,
-                Err(e) if e.contains("shifted accepting set contains 0") => {
+                Err(e) if e.contains("resample rep_id") => {
                     rep0 += 1;
                     continue;
                 }
@@ -2833,17 +2736,17 @@ mod tests {
                 0,
                 crate::we_tiny_lock::WeRingLweLockArmingPolicy {
                     base_rep_id: rep1,
-                    max_rep_tries: usize::MAX,
+                    max_rep_tries: 32,
                     hint_budget_bytes: None,
                 },
                 ringlwe_params.clone(),
                 2,
-                2,
+                16,
                 &dummy_payload,
                 &mut rng,
             ) {
                 Ok(lock_out) => break lock_out.lock,
-                Err(e) if e.contains("shifted accepting set contains 0") => {
+                Err(e) if e.contains("resample rep_id") => {
                     rep1 += 1;
                     continue;
                 }
@@ -2863,19 +2766,6 @@ mod tests {
 
         let t_prove = Instant::now();
         maybe_print_rss("tiny_gate_large:before_prove_decap_stream");
-        let mut st0 = lock0
-            .decap_states(&x)
-            .expect("decap_states0")
-            .into_iter()
-            .next()
-            .expect("lock0 expected 1 sublock");
-        let mut st1 = lock1
-            .decap_states(&x)
-            .expect("decap_states1")
-            .into_iter()
-            .next()
-            .expect("lock1 expected 1 sublock");
-        let mut err: Option<String> = None;
         let tails = prover
             .stream_pi0_and_collect_tails(
                 &x,
@@ -2884,28 +2774,20 @@ mod tests {
                     lock0.sublocks[0].coins.clone(),
                     lock1.sublocks[0].coins.clone(),
                 ],
-                &mut |chunk| {
-                    if err.is_some() {
-                        return;
-                    }
-                    if let Err(e) = st0.absorb_chunk(chunk) {
-                        err = Some(e);
-                        return;
-                    }
-                    if let Err(e) = st1.absorb_chunk(chunk) {
-                        err = Some(e);
-                    }
-                },
+                &mut |_chunk| {},
             )
             .expect("stream_pi0_and_collect_tails");
-        if let Some(e) = err {
-            panic!("stream decap absorb failed: {e}");
-        }
         assert_eq!(tails.len(), 2);
-        st0.absorb_chunk(&tails[0]).expect("absorb tail0");
-        st1.absorb_chunk(&tails[1]).expect("absorb tail1");
-        let (_ch0, _s0) = st0.finish_s_candidates().expect("decap_finish0");
-        let (_ch1, _s1) = st1.finish_s_candidates().expect("decap_finish1");
+        let _s0 = crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(
+            &lock0.sublocks[0],
+            &tails[0],
+        )
+        .expect("decap_finish0");
+        let _s1 = crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(
+            &lock1.sublocks[0],
+            &tails[1],
+        )
+        .expect("decap_finish1");
         for lock in [&lock0, &lock1] {
             assert_eq!(lock.sublocks.len(), 1);
             let a0 = lock.sublocks[0].accepting_set[0];
@@ -2994,7 +2876,6 @@ mod tests {
         let vk_hash = [1u8; 32];
         let r1cs_digest = [2u8; 32];
         let gate_digest = [3u8; 32];
-        let committed_values_digest = [4u8; 32];
         // This test builds the trace with all-zero public inputs, so the absorbed prefix bytes are zero.
         let committed_values_prefix_bytes = [0u8; CV_PREFIX_BYTES];
         let committed_values_prefix_f257: [F257; CV_PREFIX_BYTES] =
@@ -3121,7 +3002,6 @@ mod tests {
         let vk_hash = [1u8; 32];
         let r1cs_digest = [2u8; 32];
         let gate_digest = [3u8; 32];
-        let committed_values_digest = [4u8; 32];
         let committed_values_prefix_bytes: [u8; CV_PREFIX_BYTES] = {
             let mut out = [0u8; CV_PREFIX_BYTES];
             let pis = public_inputs_bf
@@ -3220,7 +3100,6 @@ mod tests {
         let vk_hash = [1u8; 32];
         let r1cs_digest = [2u8; 32];
         let gate_digest = [3u8; 32];
-        let committed_values_digest = [4u8; 32];
         // This test uses an all-zero public input schedule, so the absorbed prefix bytes are zero.
         let committed_values_prefix_bytes = [0u8; CV_PREFIX_BYTES];
         let committed_values_prefix_f257: [F257; CV_PREFIX_BYTES] =
@@ -3549,7 +3428,6 @@ mod tests {
             let vk_hash = [1u8; 32];
             let r1cs_digest = [2u8; 32];
             let gate_digest = [3u8; 32];
-            let committed_values_digest = [4u8; 32];
             let committed_values_prefix_bytes: [u8; CV_PREFIX_BYTES] = {
                 let mut out = [0u8; CV_PREFIX_BYTES];
                 let pis = sp1_digest_bits

@@ -19,9 +19,8 @@ use dpp::theorem43::{Theorem43Coins, Theorem43Dpp, Theorem43LockArtifact};
 use dpp::SparseVec;
 use symphony::file_backed_dr1cs::{cfg_read_buf_bytes, FileBackedSparseDr1csInstance};
 
-use crate::lockable_ringlwe::QueryBlockAccumulator;
 use crate::lockable_ringlwe::{
-    arm_ringlwe_lock, ratio_class_mod257_u16, sample_nonzero_f257_scalar, RingLweLockArtifact,
+    arm_ringlwe_lock, sample_nonzero_f257_scalar, RingLweLockArtifact,
     RingLweParams, RingLweSubLock,
 };
 
@@ -750,7 +749,7 @@ impl<F: PrimeField + FftField> WeRingLweProverContext<F> {
         z_w: &[F],
         coins_list: &[Theorem43Coins<F>],
         on_pi0_chunk: &mut dyn FnMut(&[F]),
-    ) -> Result<Vec<Vec<F>>, String> {
+    ) -> Result<Vec<dpp::theorem43::Theorem43AbgTail<F>>, String> {
         self.dpp
             .stream_pi0_and_collect_tails(x, z_w, coins_list, on_pi0_chunk)
     }
@@ -781,20 +780,26 @@ pub(crate) fn we_ringlwe_prover_from_dr1cs<F: PrimeField + FftField>(
 /// Arm-time output for a single Theorem-4.3 hidden-query sublock (no ciphertext).
 pub(crate) struct WeRingLweSubLockArmOut<F: PrimeField> {
     pub c_stmt: Vec<F>,
-    pub accepting_set_shifted: [F; 2],
+    pub accepting_set: [F; 2],
     pub coins: dpp::theorem43::Theorem43Coins<F>,
     // Debug/analysis: Sq coefficients (mod 257) that determine which verifier terms are active.
     pub sq_c1_mod257: u16,
     pub sq_c2_mod257: u16,
     pub x_len: usize,
     pub pi_len: usize,
-    pub q_blocks: Vec<(usize, crate::lockable_ringlwe::PackedF257Block64)>,
+    /// Unscaled Theorem-4.3 combination coefficients (mod 257 digits), for the π0 answers:
+    /// `coeff_alpha`, `coeff_beta`, `coeff_gamma`.
+    pub abg_coeffs_mod257: [u16; 3],
+    /// Unscaled statement-dependent offset digit `δ(x) = 1 + ⟨q_x, x⟩ (mod 257)`.
+    pub delta_x_mod257: u16,
+    /// Unscaled tail coefficients (mod 257 digits) in canonical order:
+    /// `[coeff_mu, coeff_nu, c3, c4, ..., c_{p-1}]` of length 256 for F257.
+    pub tail_coeffs_mod257: Vec<u16>,
 }
 
 /// Arm (publish) the public data needed for a single sublock (one hidden query).
 ///
-/// This returns the shifted accepting set, coins, and sparse query blocks `q` (so the caller can
-/// scale by a chosen secret scalar and/or share a ciphertext across many sublocks).
+/// This returns the fixed accepting set `{1,2}`, public coins, and compressed hint coefficients.
 pub(crate) fn arm_we_ringlwe_sublock_from_dr1cs<F: PrimeField + FftField>(
     dr1cs: FileBackedSparseDr1csInstance<F>,
     public_len: usize,
@@ -810,7 +815,6 @@ pub(crate) fn arm_we_ringlwe_sublock_from_dr1cs<F: PrimeField + FftField>(
     }
     let dpp = make_theorem43_dpp_from_dr1cs::<F>(dr1cs, public_len)?;
     let mut scratch = dpp.query_scratch();
-    let mut acc = QueryBlockAccumulator::<F>::new(dpp.proof_len())?;
 
     let c_stmt: Vec<F> = stmt_digest
         .iter()
@@ -862,44 +866,74 @@ pub(crate) fn arm_we_ringlwe_sublock_from_dr1cs<F: PrimeField + FftField>(
     let sq_c2_mod257: u16 = (art.coeffs[1].into_bigint().as_ref()[0] % 257) as u16;
     let pi_len = dpp.proof_len();
 
-    let mut err: Option<String> = None;
-    let offset_f = dpp.stream_query_terms_for_pi(
+    // Instance-binding:
+    // compute the *arming-statement* offset digit `δ(x_arm) = 1 + ⟨q_x, x_arm⟩ (mod 257)` and
+    // later store only the masked scalar `offset_scale = s * δ(x_arm)` inside the package.
+    //
+    // We intentionally do NOT store masked per-coordinate `h_x` (x_scales), so the lock cannot
+    // be re-targeted to an arbitrary decap-side statement.
+    let mut delta_x_mod257: u16 = 1; // includes protocol constant +1
+    dpp.stream_query_terms_for_x(
         x,
         &art.coins,
         &art.coeffs,
         &mut scratch,
-        &mut |pi_idx, coeff| {
-            if err.is_some() {
-                return;
-            }
-            if let Err(e) = acc.add_term(&coeff, pi_idx) {
-                err = Some(e);
-            }
+        &mut |xi, coeff| {
+            // `stream_query_terms_for_x` emits only indices `< x_len`.
+            let c = (coeff.into_bigint().as_ref()[0] % 257) as u16;
+            let xv = crate::lockable_ringlwe::field_mod257_u16(&x[xi]);
+            delta_x_mod257 =
+                crate::lockable_ringlwe::add_mod257_u16(delta_x_mod257, crate::lockable_ringlwe::mul_mod257_u16(c, xv));
         },
     )?;
-    if let Some(e) = err {
-        return Err(e);
+    // If δ(x_arm)=0 then `offset_scale=0` and the lock degenerates back into a “language gate”
+    // for SAT statements. Reject and resample.
+    if delta_x_mod257 == 0 {
+        return Err("arm_we_ringlwe_sublock_from_dr1cs: delta_x_mod257==0; resample rep_id".to_string());
     }
-    let q_blocks = acc.into_sparse_blocks();
 
-    // Shift accepting set by offset so decap only needs ⟨q_π, π⟩.
-    let shifted = [art.accepting_set[0] - offset_f, art.accepting_set[1] - offset_f];
-    if shifted[0].is_zero() || shifted[1].is_zero() {
-        return Err(
-            "arm_we_ringlwe_sublock_from_dr1cs: shifted accepting set contains 0; resample rep_id"
-                .to_string(),
-        );
+    // Unscaled combination coefficients (mod 257 digits).
+    let c1 = art.coeffs[0];
+    let c2 = art.coeffs[1];
+    let coeff_alpha = c1 * art.coins.rho;
+    let coeff_beta = c1 * art.coins.sigma;
+    let coeff_gamma = {
+        let two = F::from(2u64);
+        c2 * (two * art.coins.rho * art.coins.sigma)
+    };
+    let abg_coeffs_mod257: [u16; 3] = [
+        (coeff_alpha.into_bigint().as_ref()[0] % 257) as u16,
+        (coeff_beta.into_bigint().as_ref()[0] % 257) as u16,
+        (coeff_gamma.into_bigint().as_ref()[0] % 257) as u16,
+    ];
+
+    // Tail coefficients correspond to the tail values produced by
+    // `Theorem43Dpp::stream_pi0_and_collect_tails`: `[mu, nu, u^3..u^{p-1}]`.
+    let coeff_mu = c2 * (art.coins.rho * art.coins.rho);
+    let coeff_nu = c2 * (art.coins.sigma * art.coins.sigma);
+    let mut tail_coeffs_mod257: Vec<u16> = Vec::with_capacity(256);
+    tail_coeffs_mod257.push((coeff_mu.into_bigint().as_ref()[0] % 257) as u16);
+    tail_coeffs_mod257.push((coeff_nu.into_bigint().as_ref()[0] % 257) as u16);
+    for c in art.coeffs.iter().copied().skip(2) {
+        tail_coeffs_mod257.push((c.into_bigint().as_ref()[0] % 257) as u16);
     }
+    if tail_coeffs_mod257.len() != 256 {
+        return Err("arm_we_ringlwe_sublock_from_dr1cs: unexpected tail coeff length".to_string());
+    }
+
+    let accepting_set = [F::ONE, F::from(2u64)];
 
     Ok(WeRingLweSubLockArmOut {
         c_stmt,
-        accepting_set_shifted: shifted,
+        accepting_set,
         coins: art.coins.clone(),
         sq_c1_mod257,
         sq_c2_mod257,
         x_len: x.len(),
         pi_len,
-        q_blocks,
+        abg_coeffs_mod257,
+        delta_x_mod257,
+        tail_coeffs_mod257,
     })
 }
 
@@ -946,8 +980,7 @@ pub(crate) struct WeRingLweLockArmOut<F: PrimeField> {
 
 /// Arm (publish) a RingLWE lock artifact from a public DR1CS instance and statement `x`.
 ///
-/// Canonical arming uses `(P channels) × (R reps)` sublocks and enforces per-channel ratio-class
-/// distinctness (so honest decap is non-branching).
+/// Canonical arming uses `(P channels) × (R reps)` sublocks.
 fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
     dr1cs: FileBackedSparseDr1csInstance<F>,
     public_len: usize,
@@ -1065,6 +1098,10 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
     };
 
     // Arm sublocks with ratio-class distinctness enforced within each channel.
+    //
+    // Note: oneproof parallelizes at the *lock* level. Keeping the inner `(channel,rep)` arming
+    // loop sequential avoids accidental nondeterminism from deep parallelism while we rely on
+    // the higher-level parallelism for throughput.
     let mut sublocks: Vec<RingLweSubLock<F>> =
         Vec::with_capacity((p_channels as usize) * (r_reps as usize));
     let mut c_stmt: Option<Vec<F>> = None;
@@ -1073,11 +1110,10 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
     let mut global_try_idx: u64 = 0;
 
     for ch in 0..p_channels {
-        let mut used_ratio_classes: Vec<u16> = Vec::with_capacity(r_reps as usize);
         for rep in 0..r_reps {
             let block_id_sl = block_id_for(ch, rep);
             let mut tries = 0usize;
-            let mut best_sl: Option<(RingLweSubLock<F>, u16, u16)> = None;
+            let mut best_sl: Option<RingLweSubLock<F>> = None;
             let mut best_hint_bytes: Option<usize> = None;
             while tries < max_rep_tries {
                 tries += 1;
@@ -1122,13 +1158,6 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                     continue;
                 }
 
-                let ratio_class = ratio_class_mod257_u16(
-                    &out.accepting_set_shifted[0],
-                    &out.accepting_set_shifted[1],
-                )?;
-                if used_ratio_classes.contains(&ratio_class) {
-                    continue;
-                }
 
                 if c_stmt.is_none() {
                     c_stmt = Some(out.c_stmt.clone());
@@ -1137,21 +1166,42 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                 }
 
                 let s = s_channels[ch as usize];
-                let h_blocks: Vec<(usize, crate::lockable_ringlwe::PackedF257Block64)> = out
-                    .q_blocks
-                    .iter()
-                    .map(|(block_idx, q)| (*block_idx, q.scale_mod257(s)))
-                    .collect();
-                let hint_bytes: usize = h_blocks
-                    .iter()
-                    .map(|(_bi, blk)| 4 + blk.on_disk_bytes())
-                    .sum();
+                let abg_scales: [u16; 3] = [
+                    crate::lockable_ringlwe::mul_mod257_u16(s, out.abg_coeffs_mod257[0]),
+                    crate::lockable_ringlwe::mul_mod257_u16(s, out.abg_coeffs_mod257[1]),
+                    crate::lockable_ringlwe::mul_mod257_u16(s, out.abg_coeffs_mod257[2]),
+                ];
+                let offset_scale: u16 = crate::lockable_ringlwe::mul_mod257_u16(s, out.delta_x_mod257);
+                if out.tail_coeffs_mod257.len() != 256 {
+                    return Err("arm_we_ringlwe_lock_from_dr1cs: bad tail coeff length".to_string());
+                }
+                let tail_scales_blocks: [crate::lockable_ringlwe::PackedF257Block64; 4] =
+                    core::array::from_fn(|bi| {
+                        let mut tmp = [0u16; 64];
+                        let start = bi * 64;
+                        for j in 0..64 {
+                            tmp[j] = crate::lockable_ringlwe::mul_mod257_u16(
+                                s,
+                                out.tail_coeffs_mod257[start + j],
+                            );
+                        }
+                        crate::lockable_ringlwe::PackedF257Block64::from_dense_u16s(&tmp)
+                    });
+
+                let hint_bytes: usize = (3 * 2)
+                    + 2 // offset_scale
+                    + tail_scales_blocks
+                        .iter()
+                        .map(|blk| blk.on_disk_bytes())
+                        .sum::<usize>();
                 let sl = RingLweSubLock::<F> {
                     channel_id: ch,
-                    accepting_set: out.accepting_set_shifted,
+                    accepting_set: out.accepting_set,
                     coins: out.coins.clone(),
-                    hints: crate::lockable_ringlwe::BranchHints {
-                        hint_blocks_sparse: h_blocks,
+                    hints: crate::lockable_ringlwe::BranchHintsCompressed {
+                        abg_scales,
+                        offset_scale,
+                        tail_scales: tail_scales_blocks,
                     },
                 };
                 let within_budget = match policy.hint_budget_bytes {
@@ -1168,12 +1218,11 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                     Some(cur) if hint_bytes >= cur => {}
                     _ => {
                         best_hint_bytes = Some(hint_bytes);
-                        // Keep debug info for the chosen sublock.
-                        best_sl = Some((sl, out.sq_c1_mod257, out.sq_c2_mod257));
+                        best_sl = Some(sl);
                     }
                 }
             }
-            let (sl, sq_c1_mod257, sq_c2_mod257) = best_sl.ok_or_else(|| {
+            let sl = best_sl.ok_or_else(|| {
                 if let Some(budget) = policy.hint_budget_bytes {
                     format!(
                         "arm_we_ringlwe_lock_from_dr1cs: failed to find in-budget sublock within retry budget (hint_budget_bytes={})",
@@ -1184,14 +1233,6 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                         .to_string()
                 }
             })?;
-            let ratio_class =
-                ratio_class_mod257_u16(&sl.accepting_set[0], &sl.accepting_set[1])?;
-            if used_ratio_classes.contains(&ratio_class) {
-                return Err(
-                    "arm_we_ringlwe_lock_from_dr1cs: duplicate ratio class after retries".to_string(),
-                );
-            }
-            used_ratio_classes.push(ratio_class);
             sublocks.push(sl);
         }
     }

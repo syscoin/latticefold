@@ -81,8 +81,24 @@ pub struct Theorem43Dpp<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> {
     _marker: PhantomData<F>,
 }
 
+/// Output of `stream_pi0_and_collect_tails`: per-coin `(alpha,beta,gamma)` plus the coin-dependent
+/// proof tail.
+#[derive(Clone, Debug)]
+pub struct Theorem43AbgTail<F: PrimeField> {
+    pub alpha: F,
+    pub beta: F,
+    pub gamma: F,
+    pub tail: Vec<F>,
+}
+
+/// Streaming query accumulator that tracks both:
+/// - `acc_pi`: contribution from `π0` only (z_w + w_eval blocks)
+/// - `acc_full`: contribution from `(x || π0)`
+///
+/// This is used to support statement-bound lock equations without double-counting `x`.
 struct QueryStreamAcc<F: PrimeField> {
-    acc: F,
+    acc_pi: F,
+    acc_full: F,
     block_terms: Vec<Vec<(F, usize)>>,
 }
 
@@ -95,13 +111,15 @@ impl<F: PrimeField> QueryStreamAcc<F> {
         k_star: usize,
         blocks: usize,
     ) -> Result<Self, String> {
-        let mut acc = F::ZERO;
+        let mut acc_pi = F::ZERO;
+        let mut acc_full = F::ZERO;
         let mut block_terms = vec![Vec::new(); blocks];
         let n = x.len();
         let m = z_w_len + (k_star * blocks);
         for (c, idx) in q.terms.iter().copied() {
             if idx < n {
-                acc += c * x[idx];
+                // Full evaluation includes x; π-only evaluation skips x.
+                acc_full += c * x[idx];
                 continue;
             }
             let pi_idx = idx - n;
@@ -109,7 +127,8 @@ impl<F: PrimeField> QueryStreamAcc<F> {
                 return Err("query index out of range".to_string());
             }
             if pi_idx < z_w_len {
-                acc += c * z_w[pi_idx];
+                acc_pi += c * z_w[pi_idx];
+                acc_full += c * z_w[pi_idx];
                 continue;
             }
             let off = pi_idx - z_w_len;
@@ -120,7 +139,11 @@ impl<F: PrimeField> QueryStreamAcc<F> {
             }
             block_terms[block].push((c, pos));
         }
-        Ok(Self { acc, block_terms })
+        Ok(Self {
+            acc_pi,
+            acc_full,
+            block_terms,
+        })
     }
 
     fn add_block(&mut self, block_id: usize, w_eval: &[F]) -> Result<(), String> {
@@ -131,7 +154,9 @@ impl<F: PrimeField> QueryStreamAcc<F> {
             if *pos >= w_eval.len() {
                 return Err("w_eval index out of range".to_string());
             }
-            self.acc += *c * w_eval[*pos];
+            let t = *c * w_eval[*pos];
+            self.acc_pi += t;
+            self.acc_full += t;
         }
         Ok(())
     }
@@ -233,9 +258,10 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
             return Err("bad pi0 layout".to_string());
         }
 
-        let alpha = acc0.acc;
-        let beta = acc1.acc;
-        let gamma = acc2.acc;
+        // Verifier check uses the full `(x||π0)` answers.
+        let alpha = acc0.acc_full;
+        let beta = acc1.acc_full;
+        let gamma = acc2.acc_full;
 
         let coeffs = &art.coeffs;
         let c1 = coeffs[0];
@@ -460,7 +486,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
         z_w: &[F],
         coins_list: &[Theorem43Coins<F>],
         on_pi0_chunk: &mut dyn FnMut(&[F]),
-    ) -> Result<Vec<Vec<F>>, String> {
+    ) -> Result<Vec<Theorem43AbgTail<F>>, String> {
         let flpcp = &self.flpcp;
         if x.len() != flpcp.n() {
             return Err("bad public input length".to_string());
@@ -550,15 +576,21 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             return Err(e);
         }
 
-        let mut tails = Vec::with_capacity(accs.len());
+        let mut out = Vec::with_capacity(accs.len());
         for a in accs {
-            let alpha = a.acc0.acc;
-            let beta = a.acc1.acc;
-            let gamma = a.acc2.acc;
+            // For lock equations we expose only the π-only contributions (exclude x terms),
+            // to avoid double-counting when the lock separately accounts for `⟨h_x, x⟩`.
+            let alpha_pi = a.acc0.acc_pi;
+            let beta_pi = a.acc1.acc_pi;
+            let gamma_pi = a.acc2.acc_pi;
+            // Tail generation must follow the theorem43 transcript relation, which depends on
+            // the full `(x||π0)` query answers.
+            let alpha_full = a.acc0.acc_full;
+            let beta_full = a.acc1.acc_full;
 
-            let mu = alpha * alpha;
-            let nu = beta * beta;
-            let u = a.coins.rho * alpha + a.coins.sigma * beta;
+            let mu = alpha_full * alpha_full;
+            let nu = beta_full * beta_full;
+            let u = a.coins.rho * alpha_full + a.coins.sigma * beta_full;
 
             let mut tail = Vec::with_capacity(2 + self.q_minus_3);
             tail.push(mu);
@@ -570,11 +602,16 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                     cur *= u;
                 }
             }
-            let _ = gamma;
-            tails.push(tail);
+            // NOTE: `alpha/beta/gamma` returned here are π-only.
+            out.push(Theorem43AbgTail {
+                alpha: alpha_pi,
+                beta: beta_pi,
+                gamma: gamma_pi,
+                tail,
+            });
         }
 
-        Ok(tails)
+        Ok(out)
     }
 
     pub fn query_scratch(&self) -> Dr1csQueryScratch<F> {
@@ -681,6 +718,94 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
         }
 
         Ok(offset)
+    }
+
+    /// Stream the combined x-query terms (the coefficients that multiply the public prefix `x`)
+    /// for a given coin instance and Sq coefficients.
+    ///
+    /// This is used by the lock layer to publish masked x-coefficients `h_x = s*q_x`, so decap
+    /// can compute the statement-dependent contribution inside the masked dot product.
+    ///
+    /// Notes:
+    /// - This emits only the x-side terms (indices `< x_len`) after applying the linearization
+    ///   weights `(coeff_alpha, coeff_beta, coeff_gamma)`.
+    /// - It does **not** include the protocol constant `+1` (the caller can treat it as an
+    ///   additional coefficient on `x[0]=1` if desired).
+    pub fn stream_query_terms_for_x(
+        &self,
+        x: &[F],
+        coins: &Theorem43Coins<F>,
+        coeffs: &[F],
+        scratch: &mut Dr1csQueryScratch<F>,
+        on_x_term: &mut dyn FnMut(usize, F),
+    ) -> Result<(), String> {
+        let flpcp = &self.flpcp;
+        if x.len() != flpcp.n() {
+            return Err("bad public input length".to_string());
+        }
+        if coins.idx >= flpcp.ell() {
+            return Err("bad idx coin".to_string());
+        }
+        if coeffs.len() != (self.p as usize) - 1 {
+            return Err("bad Sq coeff length".to_string());
+        }
+
+        let c1 = coeffs[0];
+        let c2 = coeffs[1];
+        let coeff_alpha = c1 * coins.rho;
+        let coeff_beta = c1 * coins.sigma;
+        let coeff_gamma = {
+            let two = F::from(2u64);
+            c2 * (two * coins.rho * coins.sigma)
+        };
+
+        struct XQuerySink<'a, F: PrimeField> {
+            x_len: usize,
+            coeff_alpha: F,
+            coeff_beta: F,
+            coeff_gamma: F,
+            on_x_term: &'a mut dyn FnMut(usize, F),
+        }
+        impl<'a, F: PrimeField> QuerySink<F> for XQuerySink<'a, F> {
+            fn on_q1(&mut self, coeff: F, idx: usize) {
+                let coeff = coeff * self.coeff_alpha;
+                if coeff.is_zero() {
+                    return;
+                }
+                if idx < self.x_len {
+                    (self.on_x_term)(idx, coeff);
+                }
+            }
+            fn on_q2(&mut self, coeff: F, idx: usize) {
+                let coeff = coeff * self.coeff_beta;
+                if coeff.is_zero() {
+                    return;
+                }
+                if idx < self.x_len {
+                    (self.on_x_term)(idx, coeff);
+                }
+            }
+            fn on_q3(&mut self, coeff: F, idx: usize) {
+                let coeff = coeff * self.coeff_gamma;
+                if coeff.is_zero() {
+                    return;
+                }
+                if idx < self.x_len {
+                    (self.on_x_term)(idx, coeff);
+                }
+            }
+        }
+
+        let x_len = x.len();
+        let mut sink = XQuerySink {
+            x_len,
+            coeff_alpha,
+            coeff_beta,
+            coeff_gamma,
+            on_x_term,
+        };
+        flpcp.stream_queries_for_coins_sparse(coins.idx, coins.lambda, x, scratch, &mut sink)?;
+        Ok(())
     }
 }
 
