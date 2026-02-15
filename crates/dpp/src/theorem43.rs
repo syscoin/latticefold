@@ -19,6 +19,7 @@
 
 use ark_crypto_primitives::sponge::{poseidon::PoseidonSponge, CryptographicSponge};
 use ark_ff::{BigInteger, PrimeField};
+use rayon::prelude::*;
 use std::marker::PhantomData;
 
 use latticefold::transcript::bytes::field_to_bytes_le_fixed;
@@ -605,83 +606,82 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             acc1: QueryStreamAcc<F>,
             acc2: QueryStreamAcc<F>,
         }
-        let mut accs: Vec<AccSet<F>> = Vec::with_capacity(coins_list.len());
-        let mut scratch = Dr1csQueryScratch::<F>::new(flpcp.n_total());
-        for coins in coins_list {
-            scratch.clear_all();
-            let block_id = coins.idx / ell_local;
-            if block_id >= blocks {
-                return Err("bad coin block_id".to_string());
-            }
-            let mut b0 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
-            let mut b1 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
-            let mut b2 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
-            let mut sink_err: Option<String> = None;
-            struct Sink<'a, 'b, 'e, F: PrimeField> {
-                b0: &'b mut QueryStreamAccBuilder<'a, F>,
-                b1: &'b mut QueryStreamAccBuilder<'a, F>,
-                b2: &'b mut QueryStreamAccBuilder<'a, F>,
-                base: usize,
-                err: &'e mut Option<String>,
-            }
-            impl<'a, 'b, 'e, F: PrimeField> QuerySink<F> for Sink<'a, 'b, 'e, F> {
-                fn on_q1(&mut self, coeff: F, idx: usize) {
-                    if self.err.is_some() {
-                        return;
+        let mut accs: Vec<AccSet<F>> = coins_list
+            .par_iter()
+            .map_init(
+                || Dr1csQueryScratch::<F>::new(flpcp.n_total()),
+                |scratch, coins| -> Result<AccSet<F>, String> {
+                    scratch.clear_all();
+                    let block_id = coins.idx / ell_local;
+                    if block_id >= blocks {
+                        return Err("bad coin block_id".to_string());
                     }
-                    if let Err(e) = self.b0.add_term(coeff, idx) {
-                        *self.err = Some(e);
+                    let mut b0 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
+                    let mut b1 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
+                    let mut b2 = QueryStreamAccBuilder::<F>::new(x, z_w, z_w_len, k_star, blocks);
+                    let mut sink_err: Option<String> = None;
+                    struct Sink<'a, 'b, 'e, F: PrimeField> {
+                        b0: &'b mut QueryStreamAccBuilder<'a, F>,
+                        b1: &'b mut QueryStreamAccBuilder<'a, F>,
+                        b2: &'b mut QueryStreamAccBuilder<'a, F>,
+                        base: usize,
+                        err: &'e mut Option<String>,
                     }
-                }
-                fn on_q2(&mut self, coeff: F, idx: usize) {
-                    if self.err.is_some() {
-                        return;
+                    impl<'a, 'b, 'e, F: PrimeField> QuerySink<F> for Sink<'a, 'b, 'e, F> {
+                        fn on_q1(&mut self, coeff: F, idx: usize) {
+                            if self.err.is_some() {
+                                return;
+                            }
+                            if let Err(e) = self.b0.add_term(coeff, idx) {
+                                *self.err = Some(e);
+                            }
+                        }
+                        fn on_q2(&mut self, coeff: F, idx: usize) {
+                            if self.err.is_some() {
+                                return;
+                            }
+                            if let Err(e) = self.b1.add_term(coeff, idx) {
+                                *self.err = Some(e);
+                            }
+                        }
+                        fn on_q3(&mut self, coeff: F, idx: usize) {
+                            if self.err.is_some() {
+                                return;
+                            }
+                            // IMPORTANT: do NOT store dense `q3` witness (w_eval) terms.
+                            if idx >= self.base {
+                                return;
+                            }
+                            if let Err(e) = self.b2.add_term(coeff, idx) {
+                                *self.err = Some(e);
+                            }
+                        }
                     }
-                    if let Err(e) = self.b1.add_term(coeff, idx) {
-                        *self.err = Some(e);
+                    {
+                        let mut sink = Sink {
+                            b0: &mut b0,
+                            b1: &mut b1,
+                            b2: &mut b2,
+                            base,
+                            err: &mut sink_err,
+                        };
+                        flpcp
+                            .stream_queries_for_coins_sparse(coins.idx, coins.lambda, x, scratch, &mut sink)
+                            .map_err(|e| format!("outer coins->queries failed: {e}"))?;
                     }
-                }
-                fn on_q3(&mut self, coeff: F, idx: usize) {
-                    if self.err.is_some() {
-                        return;
+                    if let Some(e) = sink_err {
+                        return Err(e);
                     }
-                    // IMPORTANT: do NOT store dense `q3` witness (w_eval) terms.
-                    // We compute their dot product on-the-fly during `stream_w_eval_blocks` via
-                    // `flpcp.dot_q3_w_eval`, to avoid massive per-coin allocations.
-                    if idx >= self.base {
-                        return;
-                    }
-                    if let Err(e) = self.b2.add_term(coeff, idx) {
-                        *self.err = Some(e);
-                    }
-                }
-            }
-            {
-                let mut sink = Sink {
-                    b0: &mut b0,
-                    b1: &mut b1,
-                    b2: &mut b2,
-                    base,
-                    err: &mut sink_err,
-                };
-                flpcp
-                    .stream_queries_for_coins_sparse(coins.idx, coins.lambda, x, &mut scratch, &mut sink)
-                    .map_err(|e| format!("outer coins->queries failed: {e}"))?;
-            }
-            if let Some(e) = sink_err {
-                return Err(e);
-            }
-            let acc0 = b0.finish();
-            let acc1 = b1.finish();
-            let acc2 = b2.finish();
-            accs.push(AccSet {
-                coins: coins.clone(),
-                block_id,
-                acc0,
-                acc1,
-                acc2,
-            });
-        }
+                    Ok(AccSet {
+                        coins: coins.clone(),
+                        block_id,
+                        acc0: b0.finish(),
+                        acc1: b1.finish(),
+                        acc2: b2.finish(),
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, String>>()?;
 
         // Block-grouped schedule: each coin updates exactly its selected block.
         let mut bucket: Vec<Vec<usize>> = vec![Vec::new(); blocks];
@@ -706,6 +706,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
         };
 
         let mut err: Option<String> = None;
+        let mut dot_scratch = Dr1csQueryScratch::<F>::new(flpcp.n_total());
         flpcp.stream_w_eval_blocks(
             &witness_pos,
             x,
@@ -737,7 +738,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                         return;
                     }
                     // q3 witness dot: compute without materializing dense q3 witness terms.
-                    match flpcp.dot_q3_w_eval(a.coins.idx, a.coins.lambda, x, &mut scratch, w_eval) {
+                    match flpcp.dot_q3_w_eval(a.coins.idx, a.coins.lambda, x, &mut dot_scratch, w_eval) {
                         Ok(dot) => {
                             a.acc2.acc_pi += dot;
                             a.acc2.acc_full += dot;
