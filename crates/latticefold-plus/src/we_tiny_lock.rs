@@ -543,7 +543,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
             let out_chunks: Vec<Vec<F>> = ranges
                 .into_par_iter()
                 .map_init(
-                    || (vec![F::ZERO; k], vec![F::ZERO; k], vec![0u16; k_star], vec![0u16; k_star]),
+                    || (vec![0u16; k], vec![0u16; k], vec![0u16; k_star], vec![0u16; k_star]),
                     |(y_a, y_b, ea_u16, eb_u16), (bs, be)| -> Result<Vec<F>, String> {
                         let n_blocks = be.saturating_sub(bs);
                         let mut out = vec![F::ZERO; n_blocks.saturating_mul(k_star)];
@@ -567,8 +567,8 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                             if row_start >= nconstraints {
                                 break;
                             }
-                            y_a.fill(F::ZERO);
-                            y_b.fill(F::ZERO);
+                            y_a.fill(0u16);
+                            y_b.fill(0u16);
                             for i in 0..k {
                                 let row = row_start.saturating_add(i as u64);
                                 if row >= nconstraints {
@@ -578,7 +578,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                                 let b_len = read_u32(&mut rows)? as usize;
                                 let _c_len = read_u32(&mut rows)? as usize;
 
-                                let (aval, bval) = {
+                                let (aval, bval): (u16, u16) = {
                                     const P: u64 = 257;
                                     let mut aval_u: u64 = 0;
                                     for _ in 0..a_len {
@@ -594,7 +594,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                                         let v = if idx < self.l { x_u16[idx] as u64 } else { z_u16[idx - self.l] as u64 };
                                         bval_u = bval_u.wrapping_add(cu16.wrapping_mul(v));
                                     }
-                                    (F::from((aval_u % P) as u64), F::from((bval_u % P) as u64))
+                                    ((aval_u % P) as u16, (bval_u % P) as u16)
                                 };
                                 y_a[i] = aval;
                                 y_b[i] = bval;

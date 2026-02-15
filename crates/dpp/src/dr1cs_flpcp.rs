@@ -234,26 +234,23 @@ pub trait MulCode<F: PrimeField> {
     /// This exists to keep the `w_eval` pipeline in `u16` and avoid materializing two huge
     /// `Vec<F>` buffers (and doing field multiplications) on tiny-field instances.
     ///
-    /// Default implementation is correct but slow: it calls `eval_e_at_positions_into` and then
-    /// converts `F -> u16` elementwise. Structured code families should override it.
+    /// Default implementation is intentionally **not provided**.
+    ///
+    /// This API is meant as an explicit, F257-specific fast path. Implementations must override
+    /// it (e.g. tensor-RS rank=3 over F257). Callers that need a generic path should use
+    /// `eval_e_at_positions_into` instead.
     fn eval_e_at_positions_into_u16(
         &self,
         positions: &[usize],
-        y: &[F],
+        y_u16: &[u16],
         out_u16: &mut [u16],
     ) -> Result<(), String>
     where
         Self: Sync,
     {
-        if out_u16.len() != positions.len() {
-            return Err("eval_e_at_positions_into_u16: out len != positions len".to_string());
-        }
-        let mut tmp = vec![F::ZERO; positions.len()];
-        self.eval_e_at_positions_into(positions, y, &mut tmp)?;
-        for (o, t) in out_u16.iter_mut().zip(tmp.into_iter()) {
-            *o = f_to_u16(t);
-        }
-        Ok(())
+        let _ = (positions, y_u16, out_u16);
+        Err("eval_e_at_positions_into_u16: not implemented for this MulCode; override this method for F257 fast path"
+            .to_string())
     }
 
     /// Stream coefficients for E(·)[idx] without allocating a full vector.
@@ -953,7 +950,7 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
     fn eval_e_at_positions_into_u16(
         &self,
         positions: &[usize],
-        y: &[F],
+        y_u16: &[u16],
         out_u16: &mut [u16],
     ) -> Result<(), String>
     where
@@ -977,7 +974,7 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
                 return Err("eval_e_at_positions_into_u16: side out of range".to_string());
             }
             let k = self.dim_k();
-            if y.len() != k {
+            if y_u16.len() != k {
                 return Err("eval_e_at_positions_into_u16: bad y length".to_string());
             }
             let k_star = self.dim_k_star();
@@ -997,9 +994,7 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
                 if s.y_u16.len() != k {
                     s.y_u16.resize(k, 0u16);
                 }
-                for (i, yi) in y.iter().copied().enumerate() {
-                    s.y_u16[i] = f_to_u16(yi);
-                }
+                s.y_u16.copy_from_slice(y_u16);
 
                 let t0_len = side * base_k * base_k;
                 if s.t0.len() != t0_len {
@@ -1105,7 +1100,7 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
                 Ok(())
             })
         } else {
-            <Self as MulCode<F>>::eval_e_at_positions_into_u16(self, positions, y, out_u16)
+            <Self as MulCode<F>>::eval_e_at_positions_into_u16(self, positions, y_u16, out_u16)
         }
     }
 
@@ -1414,10 +1409,12 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         if is_f257_field::<F>() {
             let mut ea_u16 = vec![0u16; k_star];
             let mut eb_u16 = vec![0u16; k_star];
+            let y_a_u16 = y_a.iter().copied().map(f_to_u16).collect::<Vec<_>>();
+            let y_b_u16 = y_b.iter().copied().map(f_to_u16).collect::<Vec<_>>();
             self.code
-                .eval_e_at_positions_into_u16(witness_pos, &y_a, &mut ea_u16)?;
+                .eval_e_at_positions_into_u16(witness_pos, &y_a_u16, &mut ea_u16)?;
             self.code
-                .eval_e_at_positions_into_u16(witness_pos, &y_b, &mut eb_u16)?;
+                .eval_e_at_positions_into_u16(witness_pos, &y_b_u16, &mut eb_u16)?;
 
             if k_star >= 256 {
                 eb_u16
