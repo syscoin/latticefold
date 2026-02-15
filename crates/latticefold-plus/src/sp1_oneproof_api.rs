@@ -1504,14 +1504,16 @@ fn write_lock_package(
     locks: &[RingLweLockArtifact<F257>],
 ) -> std::io::Result<()> {
     fn zstd_enabled_for_path(path: &str) -> bool {
-        if std::env::var("LFP_ONEPROOF_LOCKPKG_ZSTD")
+        let _ = path;
+        // Canonical behavior: compress lock packages with zstd by default.
+        //
+        // The lock package is public and large; zstd reduces disk+network IO significantly.
+        // Readers auto-detect compression via outer magic, so file extensions are not required.
+        //
+        // Set `LFP_ONEPROOF_LOCKPKG_ZSTD=0` to force raw (debug only).
+        !std::env::var("LFP_ONEPROOF_LOCKPKG_ZSTD")
             .ok()
-            .is_some_and(|v| v != "0")
-        {
-            return true;
-        }
-        let p = path.to_ascii_lowercase();
-        p.ends_with(".zst") || p.ends_with(".zstd")
+            .is_some_and(|v| v == "0")
     }
     fn zstd_level() -> i32 {
         std::env::var("LFP_ONEPROOF_LOCKPKG_ZSTD_LEVEL")
