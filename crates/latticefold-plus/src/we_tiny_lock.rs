@@ -490,6 +490,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
             return Err("stream_w_eval_blocks: only F257 fast path is supported".to_string());
         }
         let (x_u16, z_u16) = (x_u16.unwrap(), z_u16.unwrap());
+        let lut: Vec<F> = (0u16..=256u16).map(|d| F::from(d as u64)).collect();
 
         let do_prof_w_eval = std::env::var("LF_PROFILE_DPP_W_EVAL").ok().as_deref() == Some("1");
         let open_ns = std::sync::atomic::AtomicU64::new(0);
@@ -542,8 +543,8 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
             let out_chunks: Vec<Vec<F>> = ranges
                 .into_par_iter()
                 .map_init(
-                    || (vec![F::ZERO; k], vec![F::ZERO; k], vec![F::ZERO; k_star], vec![F::ZERO; k_star]),
-                    |(y_a, y_b, ea_buf, eb_buf), (bs, be)| -> Result<Vec<F>, String> {
+                    || (vec![F::ZERO; k], vec![F::ZERO; k], vec![0u16; k_star], vec![0u16; k_star]),
+                    |(y_a, y_b, ea_u16, eb_u16), (bs, be)| -> Result<Vec<F>, String> {
                         let n_blocks = be.saturating_sub(bs);
                         let mut out = vec![F::ZERO; n_blocks.saturating_mul(k_star)];
                         let row_start0 = (bs as u64).saturating_mul(k as u64);
@@ -601,9 +602,9 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
 
                             let t_eval = std::time::Instant::now();
                             self.code
-                                .eval_e_at_positions_into(witness_pos, y_a.as_slice(), ea_buf.as_mut_slice())?;
+                                .eval_e_at_positions_into_u16(witness_pos, y_a.as_slice(), ea_u16.as_mut_slice())?;
                             self.code
-                                .eval_e_at_positions_into(witness_pos, y_b.as_slice(), eb_buf.as_mut_slice())?;
+                                .eval_e_at_positions_into_u16(witness_pos, y_b.as_slice(), eb_u16.as_mut_slice())?;
                             if do_prof_w_eval {
                                 let dt = t_eval.elapsed();
                                 eval_ns.fetch_add(
@@ -613,9 +614,10 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                             }
                             let dst = &mut out[bi * k_star..(bi + 1) * k_star];
                             let t_mul = std::time::Instant::now();
-                            // keep this multiply *sequential* to avoid nested Rayon overhead.
+                            // keep this multiply+convert *sequential* to avoid nested Rayon overhead.
                             for j in 0..k_star {
-                                dst[j] = ea_buf[j] * eb_buf[j];
+                                let prod = ((ea_u16[j] as u32) * (eb_u16[j] as u32)) % 257u32;
+                                dst[j] = lut[prod as usize];
                             }
                             if do_prof_w_eval {
                                 let dt = t_mul.elapsed();

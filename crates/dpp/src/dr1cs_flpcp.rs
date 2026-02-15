@@ -229,6 +229,33 @@ pub trait MulCode<F: PrimeField> {
         Ok(())
     }
 
+    /// F257-oriented hot path: evaluate `E(y)[positions[j]]` into `u16` residues mod 257.
+    ///
+    /// This exists to keep the `w_eval` pipeline in `u16` and avoid materializing two huge
+    /// `Vec<F>` buffers (and doing field multiplications) on tiny-field instances.
+    ///
+    /// Default implementation is correct but slow: it calls `eval_e_at_positions_into` and then
+    /// converts `F -> u16` elementwise. Structured code families should override it.
+    fn eval_e_at_positions_into_u16(
+        &self,
+        positions: &[usize],
+        y: &[F],
+        out_u16: &mut [u16],
+    ) -> Result<(), String>
+    where
+        Self: Sync,
+    {
+        if out_u16.len() != positions.len() {
+            return Err("eval_e_at_positions_into_u16: out len != positions len".to_string());
+        }
+        let mut tmp = vec![F::ZERO; positions.len()];
+        self.eval_e_at_positions_into(positions, y, &mut tmp)?;
+        for (o, t) in out_u16.iter_mut().zip(tmp.into_iter()) {
+            *o = f_to_u16(t);
+        }
+        Ok(())
+    }
+
     /// Stream coefficients for E(·)[idx] without allocating a full vector.
     fn row_e_stream(&self, idx: usize, f: &mut dyn FnMut(usize, F)) -> Result<(), String> {
         let row = self.row_e(idx)?;
@@ -923,6 +950,165 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
         }
     }
 
+    fn eval_e_at_positions_into_u16(
+        &self,
+        positions: &[usize],
+        y: &[F],
+        out_u16: &mut [u16],
+    ) -> Result<(), String>
+    where
+        Self: Sync,
+    {
+        if Self::is_f257() && self.rank == 3 {
+            // This fast path assumes the canonical Layout A evaluation order, i.e.
+            // `positions == witness_positions_star()`.
+            if let Ok(expected) = self.witness_positions_star() {
+                if positions != expected.as_slice() {
+                    return Err(
+                        "eval_e_at_positions_into_u16: F257 rank=3 fast path requires positions == witness_positions_star()"
+                            .to_string(),
+                    );
+                }
+            }
+
+            let base_k = self.base_k;
+            let side = 2 * base_k - 1;
+            if side > self.base_n {
+                return Err("eval_e_at_positions_into_u16: side out of range".to_string());
+            }
+            let k = self.dim_k();
+            if y.len() != k {
+                return Err("eval_e_at_positions_into_u16: bad y length".to_string());
+            }
+            let k_star = self.dim_k_star();
+            if positions.len() != k_star || out_u16.len() != k_star {
+                return Err("eval_e_at_positions_into_u16: bad positions/out length".to_string());
+            }
+
+            let stride_y1 = base_k;
+            let stride_y2 = base_k * base_k;
+            let stride_g1 = side;
+            let stride_g2 = side * side;
+
+            TENSOR_RS_F257_R3_SCRATCH.with(|cell| {
+                let mut s = cell.borrow_mut();
+                let s: &mut TensorRsF257Rank3Scratch = &mut *s;
+
+                if s.y_u16.len() != k {
+                    s.y_u16.resize(k, 0u16);
+                }
+                for (i, yi) in y.iter().copied().enumerate() {
+                    s.y_u16[i] = f_to_u16(yi);
+                }
+
+                let t0_len = side * base_k * base_k;
+                if s.t0.len() != t0_len {
+                    s.t0.resize(t0_len, 0u16);
+                }
+                // Pass 1: interpolate along dim0.
+                let y_u16: &[u16] = &s.y_u16;
+                let lam_k_u16: &[u16] = self.lam_k_u16.as_slice();
+                let t0: &mut [u16] = &mut s.t0;
+                t0.par_chunks_mut(side)
+                    .enumerate()
+                    .for_each(|(chunk_idx, out_row)| {
+                        let i1 = chunk_idx % base_k;
+                        let i2 = chunk_idx / base_k;
+                        let base_y = i1 * stride_y1 + i2 * stride_y2;
+                        for c0 in 0..side {
+                            let lam0 = &lam_k_u16[c0 * base_k..(c0 + 1) * base_k];
+                            let mut acc: u32 = 0;
+                            for i0 in 0..base_k {
+                                acc += (lam0[i0] as u32) * (y_u16[base_y + i0] as u32);
+                            }
+                            out_row[c0] = reduce_mod257_u32(acc);
+                        }
+                    });
+
+                let t1_len = side * side * base_k;
+                if s.t1.len() != t1_len {
+                    s.t1.resize(t1_len, 0u16);
+                }
+                // Pass 2: interpolate along dim1.
+                let t0: &[u16] = &s.t0;
+                let t1: &mut [u16] = &mut s.t1;
+                t1.par_chunks_mut(side)
+                    .enumerate()
+                    .for_each(|(chunk_idx, out_row)| {
+                        let c0 = chunk_idx % side;
+                        let i2 = chunk_idx / side;
+                        for c1 in 0..side {
+                            let lam1 = &lam_k_u16[c1 * base_k..(c1 + 1) * base_k];
+                            let mut acc: u32 = 0;
+                            for i1 in 0..base_k {
+                                let v = t0[c0 + side * (i1 + base_k * i2)];
+                                acc += (lam1[i1] as u32) * (v as u32);
+                            }
+                            out_row[c1] = reduce_mod257_u32(acc);
+                        }
+                    });
+
+                let grid_len = side * side * side;
+                if s.out_grid.len() != grid_len {
+                    s.out_grid.resize(grid_len, 0u16);
+                }
+                // Pass 3: interpolate along dim2.
+                let t1: &[u16] = &s.t1;
+                let out_grid: &mut [u16] = &mut s.out_grid;
+                out_grid
+                    .par_chunks_mut(side * side)
+                    .enumerate()
+                    .for_each(|(c2, out_plane)| {
+                        let lam2 = &lam_k_u16[c2 * base_k..(c2 + 1) * base_k];
+                        for c1 in 0..side {
+                            let row = &mut out_plane[c1 * side..(c1 + 1) * side];
+                            for c0 in 0..side {
+                                let mut acc: u32 = 0;
+                                for i2 in 0..base_k {
+                                    let v = t1[c1 + side * (c0 + side * i2)];
+                                    acc += (lam2[i2] as u32) * (v as u32);
+                                }
+                                row[c0] = reduce_mod257_u32(acc);
+                            }
+                        }
+                    });
+
+                // Emit in the exact order of `witness_positions_star()` (Layout A), but as u16.
+                let mut w = 0usize;
+                for i2 in 0..base_k {
+                    for i1 in 0..base_k {
+                        for i0 in 0..base_k {
+                            let g = i0 + i1 * stride_g1 + i2 * stride_g2;
+                            out_u16[w] = s.out_grid[g];
+                            w += 1;
+                        }
+                    }
+                }
+                if w != k {
+                    return Err("eval_e_at_positions_into_u16: low cube length mismatch".to_string());
+                }
+                for c2 in 0..side {
+                    for c1 in 0..side {
+                        for c0 in 0..side {
+                            if c0 < base_k && c1 < base_k && c2 < base_k {
+                                continue;
+                            }
+                            let g = c0 + c1 * stride_g1 + c2 * stride_g2;
+                            out_u16[w] = s.out_grid[g];
+                            w += 1;
+                        }
+                    }
+                }
+                if w != k_star {
+                    return Err("eval_e_at_positions_into_u16: total length mismatch".to_string());
+                }
+                Ok(())
+            })
+        } else {
+            <Self as MulCode<F>>::eval_e_at_positions_into_u16(self, positions, y, out_u16)
+        }
+    }
+
     fn witness_positions_star(&self) -> Result<Vec<usize>, String> {
         let k = self.dim_k();
         let k_star = self.dim_k_star();
@@ -1222,6 +1408,45 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         if y_a.len() != k || y_b.len() != k {
             return Err("stream_w_eval_blocks: bad mat-vec size".to_string());
         }
+
+        // F257 hot path: keep `ea/eb` as `u16` and multiply in `u16` (mod 257),
+        // converting to `F` exactly once for the streamed `w_eval`.
+        if is_f257_field::<F>() {
+            let mut ea_u16 = vec![0u16; k_star];
+            let mut eb_u16 = vec![0u16; k_star];
+            self.code
+                .eval_e_at_positions_into_u16(witness_pos, &y_a, &mut ea_u16)?;
+            self.code
+                .eval_e_at_positions_into_u16(witness_pos, &y_b, &mut eb_u16)?;
+
+            if k_star >= 256 {
+                eb_u16
+                    .par_iter_mut()
+                    .zip(ea_u16.par_iter())
+                    .for_each(|(b, a)| *b = mul_mod(*a, *b));
+            } else {
+                for j in 0..k_star {
+                    eb_u16[j] = mul_mod(ea_u16[j], eb_u16[j]);
+                }
+            }
+
+            let lut: Vec<F> = (0u16..=256u16).map(|d| F::from(d as u64)).collect();
+            let mut w_eval = vec![F::ZERO; k_star];
+            if k_star >= 256 {
+                w_eval
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(j, out)| *out = lut[eb_u16[j] as usize]);
+            } else {
+                for j in 0..k_star {
+                    w_eval[j] = lut[eb_u16[j] as usize];
+                }
+            }
+            on_block(0, &w_eval);
+            return Ok(());
+        }
+
+        // Generic fallback: materialize `ea/eb` in the field and multiply in-field.
         let ea = self.code.eval_e_at_positions(witness_pos, &y_a)?;
         let eb = self.code.eval_e_at_positions(witness_pos, &y_b)?;
         if ea.len() != k_star || eb.len() != k_star {
