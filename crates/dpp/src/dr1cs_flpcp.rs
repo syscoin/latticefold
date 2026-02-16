@@ -55,7 +55,10 @@ pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
         z_w: &[F],
         x_u16: Option<&[u16]>,
         z_u16: Option<&[u16]>,
-        on_block_hook: Option<&(dyn Fn(usize, &[F]) -> Result<(), String> + Sync)>,
+        // Optional thread-safe hook that runs per block. Implementations may also provide
+        // `w_eval_u16` (same Layout-A block reduced mod 257) to avoid expensive `F -> u16`
+        // conversions in downstream hot loops.
+        on_block_hook: Option<&(dyn Fn(usize, &[F], &[u16]) -> Result<(), String> + Sync)>,
         on_block: &mut dyn FnMut(usize, &[F]),
     ) -> Result<(), String>;
 
@@ -85,6 +88,7 @@ pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
         x: &[F],
         scratch: &mut Dr1csQueryScratch<F>,
         w_eval: &[F],
+        w_eval_u16: &[u16],
     ) -> Result<F, String> {
         let blocks = self.blocks();
         let ell_local = self.ell_local();
@@ -98,6 +102,9 @@ pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
         let k_star = self.k_star();
         if w_eval.len() != k_star {
             return Err("dot_q3_w_eval: bad w_eval length".to_string());
+        }
+        if w_eval_u16.len() != k_star {
+            return Err("dot_q3_w_eval: bad w_eval_u16 length".to_string());
         }
         let base = self.n() + self.z_w_len();
         let w_base = base + block_id.saturating_mul(k_star);
@@ -141,13 +148,14 @@ pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
         x: &[F],
         scratch: &mut Dr1csQueryScratch<F>,
         w_eval: &[F],
+        w_eval_u16: &[u16],
         out: &mut [F],
     ) -> Result<(), String> {
         if idxs.len() != lambdas.len() || idxs.len() != out.len() {
             return Err("dot_q3_w_eval_many: length mismatch".to_string());
         }
         for i in 0..idxs.len() {
-            out[i] = self.dot_q3_w_eval(idxs[i], lambdas[i], x, scratch, w_eval)?;
+            out[i] = self.dot_q3_w_eval(idxs[i], lambdas[i], x, scratch, w_eval, w_eval_u16)?;
         }
         Ok(())
     }
@@ -288,14 +296,14 @@ pub trait MulCode<F: PrimeField> {
     fn dot_row_e_star_many_mod257_u16(
         &self,
         idxs: &[usize],
-        w_eval: &[F],
+        w_eval_u16: &[u16],
         out_star_u16: &mut [u16],
         out_low_u16: &mut [u16],
     ) -> Result<(), String>
     where
         Self: Sync,
     {
-        let _ = (idxs, w_eval, out_star_u16, out_low_u16);
+        let _ = (idxs, w_eval_u16, out_star_u16, out_low_u16);
         Err("dot_row_e_star_many_mod257_u16: not implemented for this MulCode; override this method for F257 tensor fast path"
             .to_string())
     }
@@ -350,7 +358,9 @@ struct TensorRsF257Rank3Scratch {
     out_grid: Vec<u16>,
     // Batched q3 dot scratch (Layout A traversal).
     coords: Vec<usize>,
-    lam01: Vec<u16>,
+    // lam01 transposed: contiguous in batch for each (c1,c0) position.
+    lam01_t: Vec<u16>,
+    lam2_vec: Vec<u16>,
     acc_star_u16: Vec<u16>,
     acc_low_u16: Vec<u16>,
     tmp_star_u32: Vec<u32>,
@@ -1057,7 +1067,7 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
     fn dot_row_e_star_many_mod257_u16(
         &self,
         idxs: &[usize],
-        w_eval: &[F],
+        w_eval_u16: &[u16],
         out_star_u16: &mut [u16],
         out_low_u16: &mut [u16],
     ) -> Result<(), String>
@@ -1068,7 +1078,7 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
             return <Self as MulCode<F>>::dot_row_e_star_many_mod257_u16(
                 self,
                 idxs,
-                w_eval,
+                w_eval_u16,
                 out_star_u16,
                 out_low_u16,
             );
@@ -1081,8 +1091,8 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
             return Ok(());
         }
         let k_star = self.dim_k_star();
-        if w_eval.len() != k_star {
-            return Err("dot_row_e_star_many_mod257_u16: bad w_eval length".to_string());
+        if w_eval_u16.len() != k_star {
+            return Err("dot_row_e_star_many_mod257_u16: bad w_eval_u16 length".to_string());
         }
         let ell = self.len_l();
         for &idx in idxs {
@@ -1097,9 +1107,16 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
         let k = self.dim_k();
 
         #[inline]
-        fn f257_u16<F: PrimeField>(x: &F) -> u16 {
-            // F257 values are always < 257 in our pipeline; take the least limb mod 257.
-            (x.into_bigint().as_ref()[0] % 257) as u16
+        fn mul_mod257_u16_fast(a: u16, b: u16) -> u16 {
+            // 257 = 2^8 + 1, and 256 ≡ -1 (mod 257).
+            let prod = (a as u32) * (b as u32); // <= 65536
+            let low = (prod & 0xFF) as i32; // 0..255
+            let high = (prod >> 8) as i32; // 0..256
+            let mut r = low - high; // -256..255
+            if r < 0 {
+                r += 257;
+            }
+            r as u16
         }
 
         #[inline]
@@ -1129,7 +1146,8 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
             let s: &mut TensorRsF257Rank3Scratch = &mut *s;
 
             s.coords.resize(batch * 3, 0);
-            s.lam01.resize(batch * side2, 0);
+            s.lam01_t.resize(batch * side2, 0);
+            s.lam2_vec.resize(batch, 0);
             s.acc_star_u16.resize(batch, 0);
             s.acc_low_u16.resize(batch, 0);
             s.tmp_star_u32.resize(batch, 0);
@@ -1147,7 +1165,8 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
                 *v = 0;
             }
 
-            // Precompute per-idx coordinates and lam01(c1,c0)=lam0[c0]*lam1[c1].
+            // Precompute per-idx coordinates and lam01^T(pos,i) = lam0[c0]*lam1[c1] mod 257,
+            // stored as contiguous `[pos*batch + i]` to enable vectorization across `i`.
             for (i, &idx) in idxs.iter().enumerate() {
                 let coords = self.decompose_index(idx);
                 debug_assert_eq!(coords.len(), 3);
@@ -1160,12 +1179,11 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
 
                 let lam0 = &self.lam_star_u16[(c0 * side)..(c0 * side + side)];
                 let lam1 = &self.lam_star_u16[(c1 * side)..(c1 * side + side)];
-                let lam01 = &mut s.lam01[(i * side2)..(i * side2 + side2)];
                 for j1 in 0..side {
                     let l1 = lam1[j1];
-                    let row = &mut lam01[(j1 * side)..(j1 * side + side)];
                     for j0 in 0..side {
-                        row[j0] = mul_mod(lam0[j0], l1);
+                        let pos = j1 * side + j0;
+                        s.lam01_t[pos * batch + i] = mul_mod257_u16_fast(lam0[j0], l1);
                     }
                 }
             }
@@ -1177,16 +1195,21 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
 
             // Low cube (also contributes to low).
             for c2 in 0..base_k {
+                // Precompute lam2 per coin for this c2.
+                for i in 0..batch {
+                    let base2 = s.coords[i * 3 + 2] * side;
+                    s.lam2_vec[i] = self.lam_star_u16[base2 + c2];
+                }
                 for c1 in 0..base_k {
                     for c0 in 0..base_k {
-                        let w = f257_u16(&w_eval[w_idx]);
+                        let w = w_eval_u16[w_idx] % 257;
                         if w != 0 {
+                            let pos = c1 * side + c0;
+                            let lam01_pos = &s.lam01_t[(pos * batch)..(pos * batch + batch)];
                             for i in 0..batch {
-                                let lam01 = &s.lam01[(i * side2)..(i * side2 + side2)];
-                                let coeff01 = lam01[c1 * side + c0];
+                                let coeff01 = lam01_pos[i];
                                 if coeff01 != 0 {
-                                    let base2 = s.coords[i * 3 + 2] * side;
-                                    let coeff = mul_mod(coeff01, self.lam_star_u16[base2 + c2]);
+                                    let coeff = mul_mod257_u16_fast(coeff01, s.lam2_vec[i]);
                                     if coeff != 0 {
                                         let prod = (coeff as u32) * (w as u32);
                                         s.tmp_star_u32[i] = s.tmp_star_u32[i].wrapping_add(prod);
@@ -1214,19 +1237,23 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
 
             // Rest of side-cube, skipping low cube points.
             for c2 in 0..side {
+                for i in 0..batch {
+                    let base2 = s.coords[i * 3 + 2] * side;
+                    s.lam2_vec[i] = self.lam_star_u16[base2 + c2];
+                }
                 for c1 in 0..side {
                     for c0 in 0..side {
                         if c0 < base_k && c1 < base_k && c2 < base_k {
                             continue;
                         }
-                        let w = f257_u16(&w_eval[w_idx]);
+                        let w = w_eval_u16[w_idx] % 257;
                         if w != 0 {
+                            let pos = c1 * side + c0;
+                            let lam01_pos = &s.lam01_t[(pos * batch)..(pos * batch + batch)];
                             for i in 0..batch {
-                                let lam01 = &s.lam01[(i * side2)..(i * side2 + side2)];
-                                let coeff01 = lam01[c1 * side + c0];
+                                let coeff01 = lam01_pos[i];
                                 if coeff01 != 0 {
-                                    let base2 = s.coords[i * 3 + 2] * side;
-                                    let coeff = mul_mod(coeff01, self.lam_star_u16[base2 + c2]);
+                                    let coeff = mul_mod257_u16_fast(coeff01, s.lam2_vec[i]);
                                     if coeff != 0 {
                                         let prod = (coeff as u32) * (w as u32);
                                         s.tmp_star_u32[i] = s.tmp_star_u32[i].wrapping_add(prod);
@@ -1552,7 +1579,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         z_w: &[F],
         x_u16: Option<&[u16]>,
         z_u16: Option<&[u16]>,
-        on_block_hook: Option<&(dyn Fn(usize, &[F]) -> Result<(), String> + Sync)>,
+        on_block_hook: Option<&(dyn Fn(usize, &[F], &[u16]) -> Result<(), String> + Sync)>,
         on_block: &mut dyn FnMut(usize, &[F]),
     ) -> Result<(), String> {
         // Single-block backend: compute one `w_eval` and stream it as block 0.
@@ -1605,7 +1632,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                 }
             }
             if let Some(h) = on_block_hook {
-                h(0, &w_eval)?;
+                h(0, &w_eval, eb_u16.as_slice())?;
             }
             on_block(0, &w_eval);
             return Ok(());
@@ -1629,7 +1656,10 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
             }
         }
         if let Some(h) = on_block_hook {
-            h(0, &w_eval)?;
+            // Best-effort: provide mod-257 residues of `w_eval`. This is only performance-critical
+            // for the F257 fast path above (which provides a zero-cost u16 slice).
+            let w_eval_u16: Vec<u16> = w_eval.iter().copied().map(f_to_u16).collect();
+            h(0, &w_eval, w_eval_u16.as_slice())?;
         }
         on_block(0, &w_eval);
         Ok(())
@@ -1653,6 +1683,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         _x: &[F],
         _scratch: &mut Dr1csQueryScratch<F>,
         w_eval: &[F],
+        w_eval_u16: &[u16],
     ) -> Result<F, String> {
         if idx >= self.code.len_l() {
             return Err("dot_q3_w_eval: bad coin idx".to_string());
@@ -1660,17 +1691,17 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         if w_eval.len() != self.code.dim_k_star() {
             return Err("dot_q3_w_eval: bad w_eval length".to_string());
         }
-        let k = self.inst.k();
-        let mut s_star = F::ZERO;
-        let mut s_low = F::ZERO;
-        self.code.row_e_star_stream(idx, &mut |j, c| {
-            let t = c * w_eval[j];
-            s_star += t;
-            if j < k {
-                s_low += t;
-            }
-        })?;
-        Ok(s_star - (lambda * s_low))
+        if w_eval_u16.len() != w_eval.len() {
+            return Err("dot_q3_w_eval: bad w_eval_u16 length".to_string());
+        }
+        let mut star = [0u16; 1];
+        let mut low = [0u16; 1];
+        self.code
+            .dot_row_e_star_many_mod257_u16(&[idx], w_eval_u16, &mut star, &mut low)?;
+        let lam_u16 = (lambda.into_bigint().as_ref()[0] % 257) as u16;
+        let prod = mul_mod(lam_u16, low[0]);
+        let dot_u16 = sub_mod(star[0], prod);
+        Ok(F::from(dot_u16 as u64))
     }
 
     fn prove(&self, x: &[F], z_w: &[F]) -> Vec<F> {
@@ -2172,7 +2203,7 @@ impl<F: PrimeField + FftField> Dr1csNpFlpcpSparseApi<F> for RsDr1csNpFlpcpSparse
         z_w: &[F],
         _x_u16: Option<&[u16]>,
         _z_u16: Option<&[u16]>,
-        on_block_hook: Option<&(dyn Fn(usize, &[F]) -> Result<(), String> + Sync)>,
+        on_block_hook: Option<&(dyn Fn(usize, &[F], &[u16]) -> Result<(), String> + Sync)>,
         on_block: &mut dyn FnMut(usize, &[F]),
     ) -> Result<(), String> {
         let pi = RsDr1csNpFlpcpSparse::prove(self, x, z_w);
@@ -2181,7 +2212,8 @@ impl<F: PrimeField + FftField> Dr1csNpFlpcpSparseApi<F> for RsDr1csNpFlpcpSparse
         }
         let w = &pi[z_w.len()..];
         if let Some(h) = on_block_hook {
-            h(0, w)?;
+            let w_u16: Vec<u16> = w.iter().copied().map(f_to_u16).collect();
+            h(0, w, w_u16.as_slice())?;
         }
         on_block(0, w);
         Ok(())

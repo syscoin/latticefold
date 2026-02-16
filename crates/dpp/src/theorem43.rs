@@ -361,7 +361,9 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
                 acc0.add_w_eval(w_eval)?;
                 acc1.add_w_eval(w_eval)?;
                 // q3 witness dot for the selected block (file-backed backends omit dense witness terms).
-                let dot = flpcp.dot_q3_w_eval(art.coins.idx, art.coins.lambda, x, &mut scratch, w_eval)?;
+                let w_eval_u16: Vec<u16> = w_eval.iter().copied().map(f_to_u16).collect();
+                let dot =
+                    flpcp.dot_q3_w_eval(art.coins.idx, art.coins.lambda, x, &mut scratch, w_eval, &w_eval_u16)?;
                 acc2.acc_pi += dot;
                 acc2.acc_full += dot;
             }
@@ -753,13 +755,16 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             .collect();
 
         let accs_ro: &[AccSet<F>] = accs.as_slice();
-        let on_block_hook = |b: usize, w_eval: &[F]| -> Result<(), String> {
+        let on_block_hook = |b: usize, w_eval: &[F], w_eval_u16: &[u16]| -> Result<(), String> {
             if b >= bucket.len() {
                 return Err("stream_w_eval_blocks_with_hook: block id out of range".to_string());
             }
             let coins_b = &bucket[b];
             if coins_b.is_empty() {
                 return Ok(());
+            }
+            if w_eval_u16.len() != w_eval.len() {
+                return Err("stream_w_eval_blocks_with_hook: w_eval_u16 length mismatch".to_string());
             }
             let mut guard = per_block
                 .get(b)
@@ -824,6 +829,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                     x,
                     &mut scratch,
                     w_eval,
+                    w_eval_u16,
                     &mut dots.q3_w[off..end],
                 )?;
                 off = end;

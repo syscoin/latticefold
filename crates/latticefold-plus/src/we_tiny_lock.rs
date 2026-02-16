@@ -458,7 +458,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         z_w: &[F],
         x_u16: Option<&[u16]>,
         z_u16: Option<&[u16]>,
-        on_block_hook: Option<&(dyn Fn(usize, &[F]) -> Result<(), String> + Sync)>,
+        on_block_hook: Option<&(dyn Fn(usize, &[F], &[u16]) -> Result<(), String> + Sync)>,
         on_block: &mut dyn FnMut(usize, &[F]),
     ) -> Result<(), String> {
         use std::io::Read as IoRead;
@@ -637,7 +637,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                             // Run the hook **inside the parallel block worker**, so expensive
                             // per-block computations can scale with threads.
                             if let Some(h) = on_block_hook {
-                                h(b, dst)?;
+                                h(b, dst, eb_u16.as_slice())?;
                             }
                         }
 
@@ -789,6 +789,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         _x: &[F],
         _scratch: &mut Dr1csQueryScratch<F>,
         w_eval: &[F],
+        w_eval_u16: &[u16],
     ) -> Result<F, String> {
         let k_star = self.k_star();
         if w_eval.len() != k_star {
@@ -800,7 +801,15 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         let (_block_id, local_idx) = self.decode_block_idx(idx)?;
         let mut star_u16 = [0u16; 1];
         let mut low_u16 = [0u16; 1];
-        self.code.dot_row_e_star_many_mod257_u16(&[local_idx], w_eval, &mut star_u16, &mut low_u16)?;
+        if w_eval_u16.len() != w_eval.len() {
+            return Err("dot_q3_w_eval: w_eval_u16 length mismatch".to_string());
+        }
+        self.code.dot_row_e_star_many_mod257_u16(
+            &[local_idx],
+            w_eval_u16,
+            &mut star_u16,
+            &mut low_u16,
+        )?;
         let lam_u16 = (lambda.into_bigint().as_ref()[0] % 257) as u16;
         let prod = crate::lockable_ringlwe::mul_mod257_u16(lam_u16, low_u16[0]);
         let dot_u16 = if star_u16[0] >= prod { star_u16[0] - prod } else { star_u16[0] + 257 - prod };
@@ -814,6 +823,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         _x: &[F],
         _scratch: &mut Dr1csQueryScratch<F>,
         w_eval: &[F],
+        w_eval_u16: &[u16],
         out: &mut [F],
     ) -> Result<(), String> {
         if idxs.len() != lambdas.len() || idxs.len() != out.len() {
@@ -842,6 +852,10 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
             if a >= b { a - b } else { a + 257 - b }
         }
 
+        if w_eval_u16.len() != w_eval.len() {
+            return Err("dot_q3_w_eval_many: w_eval_u16 length mismatch".to_string());
+        }
+
         // Batch in chunks to avoid large stack arrays and keep code paths predictable.
         const CHUNK: usize = 64;
         let mut locals: Vec<usize> = Vec::with_capacity(CHUNK);
@@ -860,7 +874,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
 
             self.code.dot_row_e_star_many_mod257_u16(
                 &locals,
-                w_eval,
+                w_eval_u16,
                 &mut star_u16[..n],
                 &mut low_u16[..n],
             )?;
