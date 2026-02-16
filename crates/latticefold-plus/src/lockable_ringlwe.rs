@@ -45,7 +45,19 @@ pub(crate) fn add_mod257_u16(a: u16, b: u16) -> u16 {
 
 #[inline]
 fn mul_mod257(a: u16, b: u16) -> u16 {
-    ((a as u32 * b as u32) % (MOD_257 as u32)) as u16
+    // Fast reduction mod 257 using 256 ≡ -1 (mod 257).
+    //
+    // Precondition in the WE pipeline: values are always reduced to 0..=256.
+    debug_assert!(a < MOD_257 && b < MOD_257);
+    let prod = (a as u32) * (b as u32); // <= 65536
+    let low = (prod & 0xFF) as i32; // 0..255
+    let high = (prod >> 8) as i32; // 0..256
+    let mut r = low - high; // -256..255
+    if r < 0 {
+        r += 257;
+    }
+    debug_assert!((0..257).contains(&r));
+    r as u16
 }
 
 #[inline]
