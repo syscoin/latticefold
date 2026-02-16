@@ -707,29 +707,6 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             bucket[a.block_id].push(ci);
         }
 
-        // Precompute per-block (idx,lambda) lists for q3 dots in the same order as `bucket[b]`.
-        // This is read-only and avoids borrowing `accs` inside the parallel hook.
-        let mut q3_idxs_per_block: Vec<Vec<usize>> = (0..blocks)
-            .map(|_| Vec::with_capacity(avg_per_block.max(1)))
-            .collect();
-        let mut q3_lambdas_per_block: Vec<Vec<F>> = (0..blocks)
-            .map(|_| Vec::with_capacity(avg_per_block.max(1)))
-            .collect();
-        for b in 0..blocks {
-            let coins_b = &bucket[b];
-            let mut idxs = Vec::with_capacity(coins_b.len());
-            let mut lambdas = Vec::with_capacity(coins_b.len());
-            for &ci in coins_b.iter() {
-                let a = accs
-                    .get(ci)
-                    .ok_or_else(|| "q3_idxs_per_block: coin index out of range".to_string())?;
-                idxs.push(a.coins.idx);
-                lambdas.push(a.coins.lambda);
-            }
-            q3_idxs_per_block[b] = idxs;
-            q3_lambdas_per_block[b] = lambdas;
-        }
-
         on_pi0_chunk(z_w);
 
         let witness_pos = flpcp.witness_positions_star()?;
@@ -747,32 +724,111 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
         };
 
         let mut err: Option<String> = None;
-        // Precompute q3 witness dots inside the FLPCP backend's parallel workers, storing one
-        // vector of dots per block. This avoids doing the dense work in the in-order streaming callback.
-        let dots_per_block: Vec<std::sync::OnceLock<Vec<F>>> =
-            (0..blocks).map(|_| std::sync::OnceLock::new()).collect();
 
+        // Per-block, preallocated buffers for all witness-dependent contributions:
+        // - q1: w_eval dot for alpha
+        // - q2: w_eval dot for beta
+        // - q3: dense witness dot (batched)
+        //
+        // These buffers are filled inside the backend's parallel block workers (via hook), so
+        // the in-order streaming callback can stay lightweight and avoid per-hit work.
+        struct BlockDots<F: PrimeField> {
+            q1_w: Vec<F>,
+            q2_w: Vec<F>,
+            q3_w: Vec<F>,
+        }
+        let per_block: Vec<std::sync::Mutex<Option<BlockDots<F>>>> = (0..blocks)
+            .map(|b| {
+                let n = bucket.get(b).map(|v| v.len()).unwrap_or(0);
+                if n == 0 {
+                    std::sync::Mutex::new(None)
+                } else {
+                    std::sync::Mutex::new(Some(BlockDots {
+                        q1_w: vec![F::ZERO; n],
+                        q2_w: vec![F::ZERO; n],
+                        q3_w: vec![F::ZERO; n],
+                    }))
+                }
+            })
+            .collect();
+
+        let accs_ro: &[AccSet<F>] = accs.as_slice();
         let on_block_hook = |b: usize, w_eval: &[F]| -> Result<(), String> {
             if b >= bucket.len() {
                 return Err("stream_w_eval_blocks_with_hook: block id out of range".to_string());
             }
-            let idxs = &q3_idxs_per_block[b];
-            if idxs.is_empty() {
-                // Leave unset; in-order callback will skip.
+            let coins_b = &bucket[b];
+            if coins_b.is_empty() {
                 return Ok(());
             }
-            let lambdas = &q3_lambdas_per_block[b];
-            if lambdas.len() != idxs.len() {
-                return Err("stream_w_eval_blocks_with_hook: q3 idx/lambda length mismatch".to_string());
-            }
-            let mut out = vec![F::ZERO; idxs.len()];
-            // Backend-specific fast path: for our file-backed F257 path, this ignores scratch.
-            let mut scratch = Dr1csQueryScratch::<F>::new(0);
-            flpcp.dot_q3_w_eval_many(idxs, lambdas, x, &mut scratch, w_eval, &mut out)?;
-            let cell = dots_per_block
+            let mut guard = per_block
                 .get(b)
-                .ok_or_else(|| "stream_w_eval_blocks_with_hook: dots cell out of range".to_string())?;
-            let _ = cell.set(out);
+                .ok_or_else(|| "stream_w_eval_blocks_with_hook: per_block out of range".to_string())?
+                .lock()
+                .map_err(|_| "stream_w_eval_blocks_with_hook: per_block mutex poisoned".to_string())?;
+            let dots = guard
+                .as_mut()
+                .ok_or_else(|| "stream_w_eval_blocks_with_hook: missing per-block dots buffer".to_string())?;
+            if dots.q1_w.len() != coins_b.len()
+                || dots.q2_w.len() != coins_b.len()
+                || dots.q3_w.len() != coins_b.len()
+            {
+                return Err("stream_w_eval_blocks_with_hook: per-block dots length mismatch".to_string());
+            }
+
+            // q1/q2 witness contributions: purely from each coin's `w_terms` (sparse, local to block).
+            for (j, &ci) in coins_b.iter().enumerate() {
+                let a = accs_ro
+                    .get(ci)
+                    .ok_or_else(|| "stream_w_eval_blocks_with_hook: coin index out of range".to_string())?;
+
+                let mut s1 = F::ZERO;
+                for (c, pos) in a.acc0.w_terms.iter().copied() {
+                    if pos >= w_eval.len() {
+                        return Err("stream_w_eval_blocks_with_hook: q1 w_eval index out of range".to_string());
+                    }
+                    s1 += c * w_eval[pos];
+                }
+                dots.q1_w[j] = s1;
+
+                let mut s2 = F::ZERO;
+                for (c, pos) in a.acc1.w_terms.iter().copied() {
+                    if pos >= w_eval.len() {
+                        return Err("stream_w_eval_blocks_with_hook: q2 w_eval index out of range".to_string());
+                    }
+                    s2 += c * w_eval[pos];
+                }
+                dots.q2_w[j] = s2;
+            }
+
+            // q3 witness dot: heavy dense part, batched in chunks (no heap allocation).
+            const MAX_BATCH: usize = 64;
+            let mut idxs = [0usize; MAX_BATCH];
+            let mut lambdas = [F::ZERO; MAX_BATCH];
+            let mut off = 0usize;
+            while off < coins_b.len() {
+                let end = (off + MAX_BATCH).min(coins_b.len());
+                let n = end - off;
+                for t in 0..n {
+                    let ci = coins_b[off + t];
+                    let a = accs_ro
+                        .get(ci)
+                        .ok_or_else(|| "stream_w_eval_blocks_with_hook: coin index out of range (q3)".to_string())?;
+                    idxs[t] = a.coins.idx;
+                    lambdas[t] = a.coins.lambda;
+                }
+                let mut scratch = Dr1csQueryScratch::<F>::new(0);
+                flpcp.dot_q3_w_eval_many(
+                    &idxs[..n],
+                    &lambdas[..n],
+                    x,
+                    &mut scratch,
+                    w_eval,
+                    &mut dots.q3_w[off..end],
+                )?;
+                off = end;
+            }
+
             Ok(())
         };
 
@@ -791,61 +847,46 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                     err = Some("stream_w_eval_blocks: block id out of range".to_string());
                     return;
                 }
-                let coins_b = &bucket[b];
-                // Update (q1,q2) witness contributions (cheap) in-order.
-                for &ci in coins_b.iter() {
-                    let a = match accs.get_mut(ci) {
-                        Some(v) => v,
-                        None => {
-                            err = Some("stream_w_eval_blocks: bucket coin index out of range".to_string());
-                            return;
-                        }
-                    };
-                    if let Err(e) = a.acc0.add_w_eval(w_eval) {
-                        err = Some(e);
-                        return;
-                    }
-                    if let Err(e) = a.acc1.add_w_eval(w_eval) {
-                        err = Some(e);
-                        return;
-                    }
-                }
-                // Apply precomputed q3 witness dots (computed inside parallel backend workers).
-                if !coins_b.is_empty() {
-                    let maybe = match dots_per_block.get(b) {
-                        Some(v) => v.get(),
-                        None => None,
-                    };
-                    let dots = match maybe {
-                        Some(v) => v,
-                        None => {
-                            err = Some("stream_w_eval_blocks: missing precomputed q3 dots".to_string());
-                            return;
-                        }
-                    };
-                    if dots.len() != coins_b.len() {
-                        err = Some("stream_w_eval_blocks: bad q3 dots length".to_string());
-                        return;
-                    }
-                    for (j, &ci) in coins_b.iter().enumerate() {
-                        let a = match accs.get_mut(ci) {
-                            Some(v) => v,
-                            None => {
-                                err =
-                                    Some("stream_w_eval_blocks: bucket coin index out of range (q3 apply)".to_string());
-                                return;
-                            }
-                        };
-                        let dot = dots[j];
-                        a.acc2.acc_pi += dot;
-                        a.acc2.acc_full += dot;
-                    }
-                }
                 on_pi0_chunk(w_eval);
             },
         )?;
         if let Some(e) = err {
             return Err(e);
+        }
+
+        // Apply all witness-dependent contributions to accumulators after streaming completes.
+        // This keeps the in-order streaming callback lightweight and avoids borrow conflicts.
+        for b in 0..blocks {
+            let coins_b = &bucket[b];
+            if coins_b.is_empty() {
+                continue;
+            }
+            let mut guard = per_block[b]
+                .lock()
+                .map_err(|_| "stream_w_eval_blocks: per_block mutex poisoned (apply)".to_string())?;
+            let dots = guard
+                .take()
+                .ok_or_else(|| "stream_w_eval_blocks: missing per-block dots buffer (apply)".to_string())?;
+            if dots.q1_w.len() != coins_b.len()
+                || dots.q2_w.len() != coins_b.len()
+                || dots.q3_w.len() != coins_b.len()
+            {
+                return Err("stream_w_eval_blocks: per-block dots length mismatch (apply)".to_string());
+            }
+            for (j, &ci) in coins_b.iter().enumerate() {
+                let a = accs
+                    .get_mut(ci)
+                    .ok_or_else(|| "stream_w_eval_blocks: bucket coin index out of range (apply)".to_string())?;
+                let t1 = dots.q1_w[j];
+                a.acc0.acc_pi += t1;
+                a.acc0.acc_full += t1;
+                let t2 = dots.q2_w[j];
+                a.acc1.acc_pi += t2;
+                a.acc1.acc_full += t2;
+                let t3 = dots.q3_w[j];
+                a.acc2.acc_pi += t3;
+                a.acc2.acc_full += t3;
+            }
         }
 
         let mut out = Vec::with_capacity(accs.len());
