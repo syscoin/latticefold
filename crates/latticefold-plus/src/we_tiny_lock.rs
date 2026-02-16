@@ -1193,7 +1193,12 @@ pub(crate) struct WeRingLweLockArmOut<F: PrimeField> {
 
 /// Arm (publish) a RingLWE lock artifact from a public DR1CS instance and statement `x`.
 ///
-/// Canonical arming uses `hits_per_block` independent sublocks per FLPCP block.
+/// Canonical arming uses `hits_per_block` independent sublocks per FLPCP block (full coverage).
+///
+/// Security note:
+/// - `hits_per_block` is used for **soundness amplification** (independent DPP checks per block).
+/// - We also set `P = hits_per_block` channels, so the payload key depends on `P` independent
+///   mod-257 secrets (to avoid trivial 256-try offline brute force when plaintext is checkable).
 fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
     dr1cs: FileBackedSparseDr1csInstance<F>,
     public_len: usize,
@@ -1216,12 +1221,15 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
     if hits_per_block == 0 {
         return Err("arm_we_ringlwe_lock_from_dr1cs: hits_per_block=0".to_string());
     }
-    // Canonical “hits-per-block” design uses a single channel secret.
-    let p_channels: u16 = 1;
+    // Canonical “hits-per-block” design uses `P = hits_per_block` independent channels.
+    let p_channels: u16 = hits_per_block;
     let max_rep_tries = policy.max_rep_tries.max(1);
 
     // Sample per-channel secrets.
-    let s_channels: Vec<u16> = vec![sample_nonzero_f257_scalar(rng)];
+    let mut s_channels: Vec<u16> = Vec::with_capacity(p_channels as usize);
+    for _ in 0..(p_channels as usize) {
+        s_channels.push(sample_nonzero_f257_scalar(rng));
+    }
 
     // Statement commitment and armer secret are constant across all hits.
     let c_stmt: Vec<F> = stmt_digest
@@ -1263,14 +1271,12 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
     if blocks == 0 {
         return Err("arm_we_ringlwe_lock_from_dr1cs: blocks=0".to_string());
     }
-    // Full-coverage schedule: every block gets `hits_per_block` independent hits.
+    // Full-coverage schedule: every block gets `hits_per_block` independent hits, distributed
+    // across channels: each channel gets exactly one sublock per block.
     let sublocks_per_channel: u32 = (blocks as u64)
-        .saturating_mul(hits_per_block as u64)
         .try_into()
         .map_err(|_| "arm_we_ringlwe_lock_from_dr1cs: sublocks_per_channel overflows u32")?;
-
-    let ch: u16 = 0;
-    let hits_usize: usize = hits_per_block as usize;
+    let p_usize: usize = p_channels as usize;
 
     // Precompute x mod 257 once (public prefix is tiny).
     let x_u16: Vec<u16> = x
@@ -1284,12 +1290,15 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
         .into_par_iter()
         .map_init(|| dpp.query_scratch(), |scratch, block_id_sl| -> Result<Vec<(usize, RingLweSubLock<F>)>, String> {
             let (ax, bx, cx) = flpcp.precompute_public_x_row_dots_mod257_u16(block_id_sl, &x_u16)?;
-            let mut out_block: Vec<(usize, RingLweSubLock<F>)> = Vec::with_capacity(hits_usize);
+            let mut out_block: Vec<(usize, RingLweSubLock<F>)> = Vec::with_capacity(p_usize);
 
-            for rep_usize in 0..hits_usize {
-                let rep: u16 = rep_usize
+            // For this block, create exactly one sublock per channel.
+            for ch_usize in 0..p_usize {
+                let ch: u16 = ch_usize
                     .try_into()
-                    .map_err(|_| "arm_we_ringlwe_lock_from_dr1cs: rep overflow".to_string())?;
+                    .map_err(|_| "arm_we_ringlwe_lock_from_dr1cs: channel_id overflow".to_string())?;
+                // Keep `rep` fixed; we use `(block_id, channel_id, try_idx)` for resampling.
+                let rep: u16 = 0;
 
                 let mut tries = 0usize;
                 let mut best_sl: Option<RingLweSubLock<F>> = None;
@@ -1372,7 +1381,9 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                         tail_coeffs_mod257[2 + i] = (c.into_bigint().as_ref()[0] % 257) as u16;
                     }
 
-                    let s = s_channels[0];
+                    let s = *s_channels
+                        .get(ch_usize)
+                        .ok_or_else(|| "arm_we_ringlwe_lock_from_dr1cs: channel secret OOB".to_string())?;
                     let abg_scales: [u16; 3] = [
                         crate::lockable_ringlwe::mul_mod257_u16(s, abg_coeffs_mod257[0]),
                         crate::lockable_ringlwe::mul_mod257_u16(s, abg_coeffs_mod257[1]),
@@ -1432,7 +1443,8 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                     }
                 })?;
 
-                let lin = block_id_sl.saturating_mul(hits_usize).saturating_add(rep_usize);
+                // Deterministic global sublock order: channel-major then block-major.
+                let lin = ch_usize.saturating_mul(blocks).saturating_add(block_id_sl);
                 out_block.push((lin, sl));
             }
 
