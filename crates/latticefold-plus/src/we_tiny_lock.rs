@@ -10,7 +10,6 @@
 
 use ark_ff::{FftField, PrimeField};
 use rayon::prelude::*;
-use sha2::Digest;
 use std::sync::Arc;
 
 use dpp::dr1cs_flpcp::{
@@ -458,8 +457,8 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         z_w: &[F],
         x_u16: Option<&[u16]>,
         z_u16: Option<&[u16]>,
-        on_block_hook: Option<&(dyn Fn(usize, &[F], &[u16]) -> Result<(), String> + Sync)>,
-        on_block: &mut dyn FnMut(usize, &[F]),
+        on_block_hook: Option<&(dyn Fn(usize, &[u16]) -> Result<(), String> + Sync)>,
+        mut on_block: Option<&mut dyn FnMut(usize, &[F])>,
     ) -> Result<(), String> {
         use std::io::Read as IoRead;
 
@@ -475,13 +474,13 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         }
 
         if x.len() != self.l {
-            return Err("stream_w_eval_blocks_with_hook: bad x length".to_string());
+            return Err("stream_w_eval_blocks: bad x length".to_string());
         }
         if z_w.len() != self.z_w_len() {
-            return Err("stream_w_eval_blocks_with_hook: bad z_w length".to_string());
+            return Err("stream_w_eval_blocks: bad z_w length".to_string());
         }
         if witness_pos.len() != self.k_star() {
-            return Err("stream_w_eval_blocks_with_hook: witness positions length mismatch".to_string());
+            return Err("stream_w_eval_blocks: witness positions length mismatch".to_string());
         }
 
         let k = self.k();
@@ -489,14 +488,32 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         let blocks = self.blocks();
         let nconstraints = self.nconstraints();
         if !dpp::dr1cs_flpcp::is_f257_field::<F>() {
-            return Err("stream_w_eval_blocks_with_hook: unsupported field (tiny-lock requires F257)".to_string());
+            return Err("stream_w_eval_blocks: unsupported field (tiny-lock requires F257)".to_string());
         }
         let f257_fast = x_u16.is_some() && z_u16.is_some();
         if !f257_fast {
-            return Err("stream_w_eval_blocks_with_hook: only F257 fast path is supported".to_string());
+            return Err("stream_w_eval_blocks: only F257 fast path is supported".to_string());
         }
         let (x_u16, z_u16) = (x_u16.unwrap(), z_u16.unwrap());
-        let lut: Vec<F> = (0u16..=256u16).map(|d| F::from(d as u64)).collect();
+        let want_f = on_block.is_some();
+        let lut: Vec<F> = if want_f {
+            (0u16..=256u16).map(|d| F::from(d as u64)).collect()
+        } else {
+            Vec::new()
+        };
+
+        #[inline(always)]
+        fn mul_mod257_u16_fast(a: u16, b: u16) -> u16 {
+            // 257 = 2^8 + 1, and 256 ≡ -1 (mod 257).
+            let prod = (a as u32) * (b as u32); // <= 65536
+            let low = (prod & 0xFF) as i32; // 0..255
+            let high = (prod >> 8) as i32; // 0..256
+            let mut r = low - high; // -256..255
+            if r < 0 {
+                r += 257;
+            }
+            r as u16
+        }
 
         let do_prof_w_eval = std::env::var("LF_PROFILE_DPP_W_EVAL").ok().as_deref() == Some("1");
         let open_ns = std::sync::atomic::AtomicU64::new(0);
@@ -533,127 +550,237 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                 ranges.push((s, e));
                 s = e;
             }
-
-            let out_chunks: Vec<Vec<F>> = ranges
-                .into_par_iter()
-                .map_init(
-                    || (vec![0u16; k], vec![0u16; k], vec![0u16; k_star], vec![0u16; k_star]),
-                    |(y_a, y_b, ea_u16, eb_u16), (bs, be)| -> Result<Vec<F>, String> {
-                        let n_blocks = be.saturating_sub(bs);
-                        let mut out = vec![F::ZERO; n_blocks.saturating_mul(k_star)];
-                        let row_start0 = (bs as u64).saturating_mul(k as u64);
-                        if row_start0 >= nconstraints {
-                            return Ok(out);
-                        }
-                        let t_open = std::time::Instant::now();
-                        let (mut rows, mut a_coeffs, mut a_idx, mut b_coeffs, mut b_idx) =
-                            self.open_readers_ab_at_row(row_start0)?;
-                        if do_prof_w_eval {
-                            let dt = t_open.elapsed();
-                            open_ns.fetch_add(
-                                dt.as_nanos().min(u64::MAX as u128) as u64,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                        }
-
-                        for (bi, b) in (bs..be).enumerate() {
-                            let row_start = (b as u64).saturating_mul(k as u64);
-                            if row_start >= nconstraints {
-                                break;
+            if want_f {
+                let out_chunks: Vec<Vec<F>> = ranges
+                    .into_par_iter()
+                    .map_init(
+                        || (vec![0u16; k], vec![0u16; k], vec![0u16; k_star], vec![0u16; k_star]),
+                        |(y_a, y_b, ea_u16, eb_u16), (bs, be)| -> Result<Vec<F>, String> {
+                            let n_blocks = be.saturating_sub(bs);
+                            let mut out = vec![F::ZERO; n_blocks.saturating_mul(k_star)];
+                            let row_start0 = (bs as u64).saturating_mul(k as u64);
+                            if row_start0 >= nconstraints {
+                                return Ok(out);
                             }
-                            y_a.fill(0u16);
-                            y_b.fill(0u16);
-                            for i in 0..k {
-                                let row = row_start.saturating_add(i as u64);
-                                if row >= nconstraints {
+                            let t_open = std::time::Instant::now();
+                            let (mut rows, mut a_coeffs, mut a_idx, mut b_coeffs, mut b_idx) =
+                                self.open_readers_ab_at_row(row_start0)?;
+                            if do_prof_w_eval {
+                                let dt = t_open.elapsed();
+                                open_ns.fetch_add(
+                                    dt.as_nanos().min(u64::MAX as u128) as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+
+                            for (bi, b) in (bs..be).enumerate() {
+                                let row_start = (b as u64).saturating_mul(k as u64);
+                                if row_start >= nconstraints {
                                     break;
                                 }
-                                let a_len = read_u32(&mut rows)? as usize;
-                                let b_len = read_u32(&mut rows)? as usize;
-                                let _c_len = read_u32(&mut rows)? as usize;
-
-                                let (aval, bval): (u16, u16) = {
-                                    let mut aval_u: u64 = 0;
-                                    for _ in 0..a_len {
-                                        let cu16 = read_u16(&mut a_coeffs)? as u64;
-                                        let idx = read_u32(&mut a_idx)? as usize;
-                                        let v = if idx < self.l {
-                                            x_u16[idx] as u64
-                                        } else {
-                                            z_u16[idx - self.l] as u64
-                                        };
-                                        aval_u = aval_u.wrapping_add(cu16.wrapping_mul(v));
+                                y_a.fill(0u16);
+                                y_b.fill(0u16);
+                                for i in 0..k {
+                                    let row = row_start.saturating_add(i as u64);
+                                    if row >= nconstraints {
+                                        break;
                                     }
-                                    let mut bval_u: u64 = 0;
-                                    for _ in 0..b_len {
-                                        let cu16 = read_u16(&mut b_coeffs)? as u64;
-                                        let idx = read_u32(&mut b_idx)? as usize;
-                                        let v = if idx < self.l {
-                                            x_u16[idx] as u64
-                                        } else {
-                                            z_u16[idx - self.l] as u64
-                                        };
-                                        bval_u = bval_u.wrapping_add(cu16.wrapping_mul(v));
-                                    }
-                                    (reduce_mod257_u64(aval_u), reduce_mod257_u64(bval_u))
-                                };
-                                y_a[i] = aval;
-                                y_b[i] = bval;
+                                    let a_len = read_u32(&mut rows)? as usize;
+                                    let b_len = read_u32(&mut rows)? as usize;
+                                    let _c_len = read_u32(&mut rows)? as usize;
+
+                                    let (aval, bval): (u16, u16) = {
+                                        let mut aval_u: u64 = 0;
+                                        for _ in 0..a_len {
+                                            let cu16 = read_u16(&mut a_coeffs)? as u64;
+                                            let idx = read_u32(&mut a_idx)? as usize;
+                                            let v = if idx < self.l {
+                                                x_u16[idx] as u64
+                                            } else {
+                                                z_u16[idx - self.l] as u64
+                                            };
+                                            aval_u = aval_u.wrapping_add(cu16.wrapping_mul(v));
+                                        }
+                                        let mut bval_u: u64 = 0;
+                                        for _ in 0..b_len {
+                                            let cu16 = read_u16(&mut b_coeffs)? as u64;
+                                            let idx = read_u32(&mut b_idx)? as usize;
+                                            let v = if idx < self.l {
+                                                x_u16[idx] as u64
+                                            } else {
+                                                z_u16[idx - self.l] as u64
+                                            };
+                                            bval_u = bval_u.wrapping_add(cu16.wrapping_mul(v));
+                                        }
+                                        (reduce_mod257_u64(aval_u), reduce_mod257_u64(bval_u))
+                                    };
+                                    y_a[i] = aval;
+                                    y_b[i] = bval;
+                                }
+
+                                let t_eval = std::time::Instant::now();
+                                self.code.eval_e_at_positions_into_u16(
+                                    witness_pos,
+                                    y_a.as_slice(),
+                                    ea_u16.as_mut_slice(),
+                                )?;
+                                self.code.eval_e_at_positions_into_u16(
+                                    witness_pos,
+                                    y_b.as_slice(),
+                                    eb_u16.as_mut_slice(),
+                                )?;
+                                if do_prof_w_eval {
+                                    let dt = t_eval.elapsed();
+                                    eval_ns.fetch_add(
+                                        dt.as_nanos().min(u64::MAX as u128) as u64,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+                                let t_mul = std::time::Instant::now();
+                                for j in 0..k_star {
+                                    let prod = mul_mod257_u16_fast(ea_u16[j], eb_u16[j]);
+                                    // Overwrite `eb_u16` with `w_eval_u16` (Layout A) so downstream
+                                    // hooks can consume the correct mod-257 witness values.
+                                    eb_u16[j] = prod;
+                                    out[bi * k_star + j] = lut[prod as usize];
+                                }
+                                if do_prof_w_eval {
+                                    let dt = t_mul.elapsed();
+                                    mul_ns.fetch_add(
+                                        dt.as_nanos().min(u64::MAX as u128) as u64,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    blocks_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+
+                                if let Some(h) = on_block_hook {
+                                    h(b, eb_u16.as_slice())?;
+                                }
                             }
 
-                            let t_eval = std::time::Instant::now();
-                            self.code.eval_e_at_positions_into_u16(
-                                witness_pos,
-                                y_a.as_slice(),
-                                ea_u16.as_mut_slice(),
-                            )?;
-                            self.code.eval_e_at_positions_into_u16(
-                                witness_pos,
-                                y_b.as_slice(),
-                                eb_u16.as_mut_slice(),
-                            )?;
-                            if do_prof_w_eval {
-                                let dt = t_eval.elapsed();
-                                eval_ns.fetch_add(
-                                    dt.as_nanos().min(u64::MAX as u128) as u64,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                            }
-                            let dst = &mut out[bi * k_star..(bi + 1) * k_star];
-                            let t_mul = std::time::Instant::now();
-                            for j in 0..k_star {
-                                let prod = ((ea_u16[j] as u32) * (eb_u16[j] as u32)) % 257u32;
-                                dst[j] = lut[prod as usize];
-                            }
-                            if do_prof_w_eval {
-                                let dt = t_mul.elapsed();
-                                mul_ns.fetch_add(
-                                    dt.as_nanos().min(u64::MAX as u128) as u64,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                                blocks_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
+                            Ok(out)
+                        },
+                    )
+                    .collect::<Result<Vec<_>, _>>()?;
 
-                            // Run the hook **inside the parallel block worker**, so expensive
-                            // per-block computations can scale with threads.
-                            if let Some(h) = on_block_hook {
-                                h(b, dst, eb_u16.as_slice())?;
-                            }
+                if let Some(cb) = on_block.as_deref_mut() {
+                    let mut b_emit = b0;
+                    for chunk in out_chunks.iter() {
+                        for blk in 0..(chunk.len() / k_star) {
+                            let s0 = blk * k_star;
+                            let s1 = s0 + k_star;
+                            cb(b_emit, &chunk[s0..s1]);
+                            b_emit += 1;
                         }
-
-                        Ok(out)
-                    },
-                )
-                .collect::<Result<Vec<_>, _>>()?;
-
-            let mut b_emit = b0;
-            for chunk in out_chunks.iter() {
-                for blk in 0..(chunk.len() / k_star) {
-                    let s0 = blk * k_star;
-                    let s1 = s0 + k_star;
-                    on_block(b_emit, &chunk[s0..s1]);
-                    b_emit += 1;
+                    }
                 }
+            } else {
+                // No-π0 mode: run only the u16 pipeline + hook, avoiding any `F` materialization.
+                ranges
+                    .into_par_iter()
+                    .try_for_each_init(
+                        || (vec![0u16; k], vec![0u16; k], vec![0u16; k_star], vec![0u16; k_star]),
+                        |(y_a, y_b, ea_u16, eb_u16), (bs, be)| -> Result<(), String> {
+                            let row_start0 = (bs as u64).saturating_mul(k as u64);
+                            if row_start0 >= nconstraints {
+                                return Ok(());
+                            }
+                            let t_open = std::time::Instant::now();
+                            let (mut rows, mut a_coeffs, mut a_idx, mut b_coeffs, mut b_idx) =
+                                self.open_readers_ab_at_row(row_start0)?;
+                            if do_prof_w_eval {
+                                let dt = t_open.elapsed();
+                                open_ns.fetch_add(
+                                    dt.as_nanos().min(u64::MAX as u128) as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+
+                            for b in bs..be {
+                                let row_start = (b as u64).saturating_mul(k as u64);
+                                if row_start >= nconstraints {
+                                    break;
+                                }
+                                y_a.fill(0u16);
+                                y_b.fill(0u16);
+                                for i in 0..k {
+                                    let row = row_start.saturating_add(i as u64);
+                                    if row >= nconstraints {
+                                        break;
+                                    }
+                                    let a_len = read_u32(&mut rows)? as usize;
+                                    let b_len = read_u32(&mut rows)? as usize;
+                                    let _c_len = read_u32(&mut rows)? as usize;
+
+                                    let (aval, bval): (u16, u16) = {
+                                        let mut aval_u: u64 = 0;
+                                        for _ in 0..a_len {
+                                            let cu16 = read_u16(&mut a_coeffs)? as u64;
+                                            let idx = read_u32(&mut a_idx)? as usize;
+                                            let v = if idx < self.l {
+                                                x_u16[idx] as u64
+                                            } else {
+                                                z_u16[idx - self.l] as u64
+                                            };
+                                            aval_u = aval_u.wrapping_add(cu16.wrapping_mul(v));
+                                        }
+                                        let mut bval_u: u64 = 0;
+                                        for _ in 0..b_len {
+                                            let cu16 = read_u16(&mut b_coeffs)? as u64;
+                                            let idx = read_u32(&mut b_idx)? as usize;
+                                            let v = if idx < self.l {
+                                                x_u16[idx] as u64
+                                            } else {
+                                                z_u16[idx - self.l] as u64
+                                            };
+                                            bval_u = bval_u.wrapping_add(cu16.wrapping_mul(v));
+                                        }
+                                        (reduce_mod257_u64(aval_u), reduce_mod257_u64(bval_u))
+                                    };
+                                    y_a[i] = aval;
+                                    y_b[i] = bval;
+                                }
+
+                                let t_eval = std::time::Instant::now();
+                                self.code.eval_e_at_positions_into_u16(
+                                    witness_pos,
+                                    y_a.as_slice(),
+                                    ea_u16.as_mut_slice(),
+                                )?;
+                                self.code.eval_e_at_positions_into_u16(
+                                    witness_pos,
+                                    y_b.as_slice(),
+                                    eb_u16.as_mut_slice(),
+                                )?;
+                                if do_prof_w_eval {
+                                    let dt = t_eval.elapsed();
+                                    eval_ns.fetch_add(
+                                        dt.as_nanos().min(u64::MAX as u128) as u64,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+
+                                let t_mul = std::time::Instant::now();
+                                for j in 0..k_star {
+                                    let prod = mul_mod257_u16_fast(ea_u16[j], eb_u16[j]);
+                                    eb_u16[j] = prod;
+                                }
+                                if do_prof_w_eval {
+                                    let dt = t_mul.elapsed();
+                                    mul_ns.fetch_add(
+                                        dt.as_nanos().min(u64::MAX as u128) as u64,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    blocks_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+
+                                if let Some(h) = on_block_hook {
+                                    h(b, eb_u16.as_slice())?;
+                                }
+                            }
+                            Ok(())
+                        },
+                    )?;
             }
             b0 = b1;
         }
@@ -787,22 +914,17 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         idx: usize,
         lambda: F,
         _x: &[F],
-        _scratch: &mut Dr1csQueryScratch<F>,
-        w_eval: &[F],
         w_eval_u16: &[u16],
     ) -> Result<F, String> {
         let k_star = self.k_star();
-        if w_eval.len() != k_star {
-            return Err("dot_q3_w_eval: bad w_eval length".to_string());
-        }
         if !dpp::dr1cs_flpcp::is_f257_field::<F>() {
             return Err("dot_q3_w_eval: unsupported field (tiny-lock requires F257)".to_string());
         }
         let (_block_id, local_idx) = self.decode_block_idx(idx)?;
         let mut star_u16 = [0u16; 1];
         let mut low_u16 = [0u16; 1];
-        if w_eval_u16.len() != w_eval.len() {
-            return Err("dot_q3_w_eval: w_eval_u16 length mismatch".to_string());
+        if w_eval_u16.len() != k_star {
+            return Err("dot_q3_w_eval: bad w_eval_u16 length".to_string());
         }
         self.code.dot_row_e_star_many_mod257_u16(
             &[local_idx],
@@ -821,8 +943,6 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         idxs: &[usize],
         lambdas: &[F],
         _x: &[F],
-        _scratch: &mut Dr1csQueryScratch<F>,
-        w_eval: &[F],
         w_eval_u16: &[u16],
         out: &mut [F],
     ) -> Result<(), String> {
@@ -852,8 +972,8 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
             if a >= b { a - b } else { a + 257 - b }
         }
 
-        if w_eval_u16.len() != w_eval.len() {
-            return Err("dot_q3_w_eval_many: w_eval_u16 length mismatch".to_string());
+        if w_eval_u16.len() != self.k_star() {
+            return Err("dot_q3_w_eval_many: bad w_eval_u16 length".to_string());
         }
 
         // Batch in chunks to avoid large stack arrays and keep code paths predictable.
@@ -894,9 +1014,17 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         let mut pi = Vec::with_capacity(self.m());
         pi.extend_from_slice(z_w);
         let witness_pos = self.witness_positions_star().expect("witness_positions_star");
-        self.stream_w_eval_blocks(&witness_pos, x, z_w, None, None, None, &mut |_, w_eval| {
-            pi.extend_from_slice(w_eval);
-        })
+        self.stream_w_eval_blocks(
+            &witness_pos,
+            x,
+            z_w,
+            None,
+            None,
+            None,
+            Some(&mut |_, w_eval| {
+                pi.extend_from_slice(w_eval);
+            }),
+        )
         .expect("stream_w_eval_blocks");
         pi
     }
@@ -954,7 +1082,7 @@ impl<F: PrimeField + FftField> WeRingLweProverContext<F> {
         x: &[F],
         z_w: &[F],
         coins_list: &[Theorem43Coins<F>],
-        on_pi0_chunk: &mut dyn FnMut(&[F]),
+        on_pi0_chunk: Option<&mut dyn FnMut(&[F])>,
         on_tail_elem: &mut dyn FnMut(usize, usize, &F),
     ) -> Result<Vec<dpp::theorem43::Theorem43AbgTail<F>>, String> {
         self.dpp
@@ -1010,239 +1138,6 @@ pub(crate) struct WeRingLweSubLockArmOut<F: PrimeField> {
     /// Unscaled tail coefficients (mod 257 digits) in canonical order:
     /// `[coeff_mu, coeff_nu, c3, c4, ..., c_{p-1}]` of length 256 for F257.
     pub tail_coeffs_mod257: Vec<u16>,
-}
-
-/// Arm-time coefficients for one sublock, excluding `c_stmt` (which is constant across sublocks).
-///
-/// This is the fast path used by full-coverage arming to avoid per-hit `c_stmt` allocation/copy.
-pub(crate) struct WeRingLweSubLockArmCoeffs<F: PrimeField> {
-    pub accepting_set: [F; 2],
-    pub abg_coeffs_mod257: [u16; 3],
-    pub delta_x_mod257: u16,
-    pub tail_coeffs_mod257: [u16; 256],
-}
-
-/// Arm (publish) the public data needed for a single sublock (one hidden query).
-///
-/// This returns the fixed accepting set `{1,2}`, public coins, and compressed hint coefficients.
-pub(crate) fn arm_we_ringlwe_sublock_from_dr1cs<F: PrimeField + FftField>(
-    dr1cs: FileBackedSparseDr1csInstance<F>,
-    public_len: usize,
-    stmt_digest: [F257; 32],
-    x: &[F],
-    armer_seed: [u8; 32],
-    lock_j: u64,
-    block_id: usize,
-    rep_id: u64,
-) -> Result<WeRingLweSubLockArmOut<F>, String> {
-    if x.len() != public_len {
-        return Err("arm_we_ringlwe_sublock_from_dr1cs: x length != public_len".to_string());
-    }
-    let dpp = make_theorem43_dpp_from_dr1cs::<F>(dr1cs, public_len)?;
-    let mut scratch = dpp.query_scratch();
-
-    let c_stmt: Vec<F> = stmt_digest
-        .iter()
-        .map(|e| F::from((e.into_bigint().as_ref()[0] % 257) as u64))
-        .collect();
-    let stmt_bytes64 = {
-        let mut out = [0u8; 64];
-        for (i, e) in stmt_digest.iter().enumerate() {
-            let v = (e.into_bigint().as_ref()[0] % 257) as u16;
-            let b = v.to_le_bytes();
-            out[2 * i] = b[0];
-            out[2 * i + 1] = b[1];
-        }
-        out
-    };
-    let armer_secret = {
-        let mut out = Vec::with_capacity(4);
-        for i in 0..4usize {
-            let mut h = sha2::Sha256::new();
-            h.update(b"LFP_ARMER_SECRET_V1");
-            h.update(&armer_seed);
-            h.update(&stmt_bytes64);
-            h.update(&lock_j.to_le_bytes());
-            h.update(&(i as u64).to_le_bytes());
-            let d: [u8; 32] = h.finalize().into();
-            out.push(F::from_le_bytes_mod_order(&d));
-        }
-        out
-    };
-    let art = dpp.arm(&c_stmt, x, &armer_secret, block_id, rep_id)?;
-    // Reject degenerate Sq coefficients that can erase critical terms (notably the q3/gamma path)
-    // and make UNSAT instances pass with non-negligible probability.
-    //
-    // In particular:
-    // - `c1 = coeffs[0] == 0` removes the alpha/beta linear terms.
-    // - `c2 = coeffs[1] == 0` removes the gamma/mu/nu terms, weakening the check drastically.
-    //
-    // These events occur with probability ~1/257 each over F257 and should be rejected.
-    if art.coeffs.len() < 2 {
-        return Err("arm_we_ringlwe_sublock_from_dr1cs: bad Sq coeff length; resample rep_id".to_string());
-    }
-    if art.coeffs[0].is_zero() || art.coeffs[1].is_zero() {
-        return Err(
-            "arm_we_ringlwe_sublock_from_dr1cs: degenerate Sq coeff (c1==0 or c2==0); resample rep_id"
-                .to_string(),
-        );
-    }
-    let sq_c1_mod257: u16 = (art.coeffs[0].into_bigint().as_ref()[0] % 257) as u16;
-    let sq_c2_mod257: u16 = (art.coeffs[1].into_bigint().as_ref()[0] % 257) as u16;
-    let pi_len = dpp.proof_len();
-
-    // Instance-binding:
-    // compute the *arming-statement* offset digit `δ(x_arm) = 1 + ⟨q_x, x_arm⟩ (mod 257)` and
-    // later store only the masked scalar `offset_scale = s * δ(x_arm)` inside the package.
-    //
-    // We intentionally do NOT store masked per-coordinate `h_x` (x_scales), so the lock cannot
-    // be re-targeted to an arbitrary decap-side statement.
-    let mut delta_x_mod257: u16 = 1; // includes protocol constant +1
-    dpp.stream_query_terms_for_x(
-        x,
-        &art.coins,
-        &art.coeffs,
-        &mut scratch,
-        &mut |xi, coeff| {
-            // `stream_query_terms_for_x` emits only indices `< x_len`.
-            let c = (coeff.into_bigint().as_ref()[0] % 257) as u16;
-            let xv = crate::lockable_ringlwe::field_mod257_u16(&x[xi]);
-            delta_x_mod257 =
-                crate::lockable_ringlwe::add_mod257_u16(delta_x_mod257, crate::lockable_ringlwe::mul_mod257_u16(c, xv));
-        },
-    )?;
-    // If δ(x_arm)=0 then `offset_scale=0` and the lock degenerates back into a “language gate”
-    // for SAT statements. Reject and resample.
-    if delta_x_mod257 == 0 {
-        return Err("arm_we_ringlwe_sublock_from_dr1cs: delta_x_mod257==0; resample rep_id".to_string());
-    }
-
-    // Unscaled combination coefficients (mod 257 digits).
-    let c1 = art.coeffs[0];
-    let c2 = art.coeffs[1];
-    let coeff_alpha = c1 * art.coins.rho;
-    let coeff_beta = c1 * art.coins.sigma;
-    let coeff_gamma = {
-        let two = F::from(2u64);
-        c2 * (two * art.coins.rho * art.coins.sigma)
-    };
-    let abg_coeffs_mod257: [u16; 3] = [
-        (coeff_alpha.into_bigint().as_ref()[0] % 257) as u16,
-        (coeff_beta.into_bigint().as_ref()[0] % 257) as u16,
-        (coeff_gamma.into_bigint().as_ref()[0] % 257) as u16,
-    ];
-
-    // Tail coefficients correspond to the tail values produced by
-    // `Theorem43Dpp::stream_pi0_and_collect_tails`: `[mu, nu, u^3..u^{p-1}]`.
-    let coeff_mu = c2 * (art.coins.rho * art.coins.rho);
-    let coeff_nu = c2 * (art.coins.sigma * art.coins.sigma);
-    let mut tail_coeffs_mod257: Vec<u16> = Vec::with_capacity(256);
-    tail_coeffs_mod257.push((coeff_mu.into_bigint().as_ref()[0] % 257) as u16);
-    tail_coeffs_mod257.push((coeff_nu.into_bigint().as_ref()[0] % 257) as u16);
-    for c in art.coeffs.iter().copied().skip(2) {
-        tail_coeffs_mod257.push((c.into_bigint().as_ref()[0] % 257) as u16);
-    }
-    if tail_coeffs_mod257.len() != 256 {
-        return Err("arm_we_ringlwe_sublock_from_dr1cs: unexpected tail coeff length".to_string());
-    }
-
-    let accepting_set = [F::ONE, F::from(2u64)];
-
-    Ok(WeRingLweSubLockArmOut {
-        c_stmt,
-        accepting_set,
-        sq_c1_mod257,
-        sq_c2_mod257,
-        x_len: x.len(),
-        pi_len,
-        abg_coeffs_mod257,
-        delta_x_mod257,
-        tail_coeffs_mod257,
-    })
-}
-
-fn arm_we_ringlwe_sublock_coeffs_from_dpp<F: PrimeField + FftField>(
-    dpp: &Theorem43Dpp<F, FileBackedChunkedMulCodeDr1csNpFlpcpSparse<F, TensorRsMulCode<F>>>,
-    scratch: &mut dpp::dr1cs_flpcp::Dr1csQueryScratch<F>,
-    c_stmt: &[F],
-    x: &[F],
-    armer_secret: &[F],
-    block_id: usize,
-    rep_id: u64,
-) -> Result<WeRingLweSubLockArmCoeffs<F>, String> {
-    scratch.clear_all();
-    let art = dpp.arm(c_stmt, x, armer_secret, block_id, rep_id)?;
-
-    // Reject degenerate Sq coefficients.
-    if art.coeffs.len() < 2 {
-        return Err(
-            "arm_we_ringlwe_sublock_coeffs_from_dpp: bad Sq coeff length; resample rep_id".to_string(),
-        );
-    }
-    if art.coeffs[0].is_zero() || art.coeffs[1].is_zero() {
-        return Err(
-            "arm_we_ringlwe_sublock_coeffs_from_dpp: degenerate Sq coeff (c1==0 or c2==0); resample rep_id"
-                .to_string(),
-        );
-    }
-
-    // Instance-binding: compute `δ(x) = 1 + ⟨q_x, x⟩ (mod 257)` for the arming statement.
-    let mut delta_x_mod257: u16 = 1;
-    dpp.stream_query_terms_for_x(
-        x,
-        &art.coins,
-        &art.coeffs,
-        scratch,
-        &mut |xi, coeff| {
-            if xi >= x.len() {
-                return;
-            }
-            let c = (coeff.into_bigint().as_ref()[0] % 257) as u16;
-            let xj = (x[xi].into_bigint().as_ref()[0] % 257) as u16;
-            delta_x_mod257 = crate::lockable_ringlwe::add_mod257_u16(
-                delta_x_mod257,
-                crate::lockable_ringlwe::mul_mod257_u16(c, xj),
-            );
-        },
-    )?;
-    if delta_x_mod257 == 0 {
-        return Err(
-            "arm_we_ringlwe_sublock_coeffs_from_dpp: delta_x_mod257==0; resample rep_id".to_string(),
-        );
-    }
-
-    // Unscaled combination coefficients (mod 257 digits).
-    let c1 = art.coeffs[0];
-    let c2 = art.coeffs[1];
-    let coeff_alpha = c1 * art.coins.rho;
-    let coeff_beta = c1 * art.coins.sigma;
-    let coeff_gamma = {
-        let two = F::from(2u64);
-        c2 * (two * art.coins.rho * art.coins.sigma)
-    };
-    let abg_coeffs_mod257: [u16; 3] = [
-        (coeff_alpha.into_bigint().as_ref()[0] % 257) as u16,
-        (coeff_beta.into_bigint().as_ref()[0] % 257) as u16,
-        (coeff_gamma.into_bigint().as_ref()[0] % 257) as u16,
-    ];
-
-    // Tail coefficients correspond to `stream_pi0_and_collect_tails` tail layout:
-    // `[mu, nu, u^3..u^{p-1}]` (len=256 for F257).
-    let coeff_mu = c2 * (art.coins.rho * art.coins.rho);
-    let coeff_nu = c2 * (art.coins.sigma * art.coins.sigma);
-    let mut tail_coeffs_mod257: [u16; 256] = [0u16; 256];
-    tail_coeffs_mod257[0] = (coeff_mu.into_bigint().as_ref()[0] % 257) as u16;
-    tail_coeffs_mod257[1] = (coeff_nu.into_bigint().as_ref()[0] % 257) as u16;
-    for (i, c) in art.coeffs.iter().copied().skip(2).enumerate() {
-        tail_coeffs_mod257[2 + i] = (c.into_bigint().as_ref()[0] % 257) as u16;
-    }
-
-    Ok(WeRingLweSubLockArmCoeffs {
-        accepting_set: [F::ONE, F::from(2u64)],
-        abg_coeffs_mod257,
-        delta_x_mod257,
-        tail_coeffs_mod257,
-    })
 }
 
 #[inline]
@@ -1312,7 +1207,6 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
     let code = TensorRsMulCode::<F>::new(48, 3)?;
     let flpcp = FileBackedChunkedMulCodeDr1csNpFlpcpSparse::<F, _>::new(dr1cs.clone(), public_len, code)?;
     let dpp = Theorem43Dpp::<F, _>::new(flpcp.clone())?;
-    let mut scratch = dpp.query_scratch();
     if hits_per_block == 0 {
         return Err("arm_we_ringlwe_lock_from_dr1cs: hits_per_block=0".to_string());
     }
@@ -1383,7 +1277,7 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
     // then compute `δ(x)` per hit using tensor-code dot products (no per-hit constraint scanning).
     let per_block: Vec<Vec<(usize, RingLweSubLock<F>)>> = (0..blocks)
         .into_par_iter()
-        .map_init(|| dpp.query_scratch(), |scratch, block_id_sl| -> Result<Vec<(usize, RingLweSubLock<F>)>, String> {
+        .map(|block_id_sl| -> Result<Vec<(usize, RingLweSubLock<F>)>, String> {
             let (ax, bx, cx) = flpcp.precompute_public_x_row_dots_mod257_u16(block_id_sl, &x_u16)?;
             let mut out_block: Vec<(usize, RingLweSubLock<F>)> = Vec::with_capacity(p_usize);
 
@@ -1411,7 +1305,6 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                         try_idx,
                     );
 
-                    scratch.clear_all();
                     let art = dpp.arm(c_stmt.as_slice(), x, armer_secret.as_slice(), block_id_sl, rep_id)?;
 
                     // Reject degenerate Sq coefficients.

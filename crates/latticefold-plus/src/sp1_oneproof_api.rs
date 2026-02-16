@@ -880,7 +880,7 @@ fn decap_sp1_oneproof_we_gate_from_files_inner(
         &x,
         z_w,
         &coins_list,
-        &mut |_chunk| {},
+        None,
         &mut |ci, _ti, t| {
             // Tail elements are visited coin-by-coin, in order.
             if cur_ci != Some(ci) {

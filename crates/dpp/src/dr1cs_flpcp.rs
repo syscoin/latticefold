@@ -55,11 +55,13 @@ pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
         z_w: &[F],
         x_u16: Option<&[u16]>,
         z_u16: Option<&[u16]>,
-        // Optional thread-safe hook that runs per block. Implementations may also provide
-        // `w_eval_u16` (same Layout-A block reduced mod 257) to avoid expensive `F -> u16`
-        // conversions in downstream hot loops.
-        on_block_hook: Option<&(dyn Fn(usize, &[F], &[u16]) -> Result<(), String> + Sync)>,
-        on_block: &mut dyn FnMut(usize, &[F]),
+        // Optional thread-safe hook that runs per block, receiving the block's `w_eval` reduced
+        // mod 257 in Layout-A order. This enables hot loops to avoid expensive `F -> u16`
+        // conversions. For non-F257 backends this hook may be unsupported (return Err).
+        on_block_hook: Option<&(dyn Fn(usize, &[u16]) -> Result<(), String> + Sync)>,
+        // Optional in-order callback with the field `w_eval` values. If `None`, implementations
+        // must avoid materializing `w_eval` in `F` where possible (enabling no-π0 WE decap).
+        on_block: Option<&mut dyn FnMut(usize, &[F])>,
     ) -> Result<(), String>;
 
     /// Stream verifier queries for fixed coins without allocating full query vectors.
@@ -86,8 +88,6 @@ pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
         idx: usize,
         lambda: F,
         x: &[F],
-        scratch: &mut Dr1csQueryScratch<F>,
-        w_eval: &[F],
         w_eval_u16: &[u16],
     ) -> Result<F, String> {
         let blocks = self.blocks();
@@ -100,9 +100,6 @@ pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
             return Err("dot_q3_w_eval: bad block id".to_string());
         }
         let k_star = self.k_star();
-        if w_eval.len() != k_star {
-            return Err("dot_q3_w_eval: bad w_eval length".to_string());
-        }
         if w_eval_u16.len() != k_star {
             return Err("dot_q3_w_eval: bad w_eval_u16 length".to_string());
         }
@@ -111,7 +108,7 @@ pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
 
         struct DotSink<'a, F: PrimeField> {
             w_base: usize,
-            w_eval: &'a [F],
+            w_eval_u16: &'a [u16],
             acc: F,
         }
         impl<'a, F: PrimeField> QuerySink<F> for DotSink<'a, F> {
@@ -122,18 +119,21 @@ pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
                     return;
                 }
                 let j = idx - self.w_base;
-                if j < self.w_eval.len() {
-                    self.acc += coeff * self.w_eval[j];
+                if j < self.w_eval_u16.len() {
+                    // Correct but generic (potentially slow): lift u16 residue into the field.
+                    // Structured backends should override `dot_q3_w_eval_many` / `dot_q3_w_eval`.
+                    self.acc += coeff * F::from(self.w_eval_u16[j] as u64);
                 }
             }
         }
 
         let mut sink = DotSink {
             w_base,
-            w_eval,
+            w_eval_u16,
             acc: F::ZERO,
         };
-        self.stream_queries_for_coins_sparse(idx, lambda, x, scratch, &mut sink)?;
+        let mut scratch = Dr1csQueryScratch::<F>::new(self.n_total());
+        self.stream_queries_for_coins_sparse(idx, lambda, x, &mut scratch, &mut sink)?;
         Ok(sink.acc)
     }
 
@@ -146,8 +146,6 @@ pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
         idxs: &[usize],
         lambdas: &[F],
         x: &[F],
-        scratch: &mut Dr1csQueryScratch<F>,
-        w_eval: &[F],
         w_eval_u16: &[u16],
         out: &mut [F],
     ) -> Result<(), String> {
@@ -155,7 +153,7 @@ pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
             return Err("dot_q3_w_eval_many: length mismatch".to_string());
         }
         for i in 0..idxs.len() {
-            out[i] = self.dot_q3_w_eval(idxs[i], lambdas[i], x, scratch, w_eval, w_eval_u16)?;
+            out[i] = self.dot_q3_w_eval(idxs[i], lambdas[i], x, w_eval_u16)?;
         }
         Ok(())
     }
@@ -1579,8 +1577,8 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         z_w: &[F],
         x_u16: Option<&[u16]>,
         z_u16: Option<&[u16]>,
-        on_block_hook: Option<&(dyn Fn(usize, &[F], &[u16]) -> Result<(), String> + Sync)>,
-        on_block: &mut dyn FnMut(usize, &[F]),
+        on_block_hook: Option<&(dyn Fn(usize, &[u16]) -> Result<(), String> + Sync)>,
+        mut on_block: Option<&mut dyn FnMut(usize, &[F])>,
     ) -> Result<(), String> {
         // Single-block backend: compute one `w_eval` and stream it as block 0.
         let k = self.inst.k();
@@ -1619,22 +1617,24 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                 }
             }
 
-            let lut: Vec<F> = (0u16..=256u16).map(|d| F::from(d as u64)).collect();
-            let mut w_eval = vec![F::ZERO; k_star];
-            if k_star >= 256 {
-                w_eval
-                    .par_iter_mut()
-                    .enumerate()
-                    .for_each(|(j, out)| *out = lut[eb_u16[j] as usize]);
-            } else {
-                for j in 0..k_star {
-                    w_eval[j] = lut[eb_u16[j] as usize];
-                }
-            }
             if let Some(h) = on_block_hook {
-                h(0, &w_eval, eb_u16.as_slice())?;
+                h(0, eb_u16.as_slice())?;
             }
-            on_block(0, &w_eval);
+            if let Some(cb) = on_block.as_deref_mut() {
+                let lut: Vec<F> = (0u16..=256u16).map(|d| F::from(d as u64)).collect();
+                let mut w_eval = vec![F::ZERO; k_star];
+                if k_star >= 256 {
+                    w_eval
+                        .par_iter_mut()
+                        .enumerate()
+                        .for_each(|(j, out)| *out = lut[eb_u16[j] as usize]);
+                } else {
+                    for j in 0..k_star {
+                        w_eval[j] = lut[eb_u16[j] as usize];
+                    }
+                }
+                cb(0, &w_eval);
+            }
             return Ok(());
         }
 
@@ -1656,12 +1656,13 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
             }
         }
         if let Some(h) = on_block_hook {
-            // Best-effort: provide mod-257 residues of `w_eval`. This is only performance-critical
-            // for the F257 fast path above (which provides a zero-cost u16 slice).
+            // Best-effort: provide mod-257 residues of `w_eval`.
             let w_eval_u16: Vec<u16> = w_eval.iter().copied().map(f_to_u16).collect();
-            h(0, &w_eval, w_eval_u16.as_slice())?;
+            h(0, w_eval_u16.as_slice())?;
         }
-        on_block(0, &w_eval);
+        if let Some(cb) = on_block.as_deref_mut() {
+            cb(0, &w_eval);
+        }
         Ok(())
     }
 
@@ -1681,17 +1682,13 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         idx: usize,
         lambda: F,
         _x: &[F],
-        _scratch: &mut Dr1csQueryScratch<F>,
-        w_eval: &[F],
         w_eval_u16: &[u16],
     ) -> Result<F, String> {
         if idx >= self.code.len_l() {
             return Err("dot_q3_w_eval: bad coin idx".to_string());
         }
-        if w_eval.len() != self.code.dim_k_star() {
-            return Err("dot_q3_w_eval: bad w_eval length".to_string());
-        }
-        if w_eval_u16.len() != w_eval.len() {
+        let k_star = self.code.dim_k_star();
+        if w_eval_u16.len() != k_star {
             return Err("dot_q3_w_eval: bad w_eval_u16 length".to_string());
         }
         let mut star = [0u16; 1];
@@ -2203,8 +2200,8 @@ impl<F: PrimeField + FftField> Dr1csNpFlpcpSparseApi<F> for RsDr1csNpFlpcpSparse
         z_w: &[F],
         _x_u16: Option<&[u16]>,
         _z_u16: Option<&[u16]>,
-        on_block_hook: Option<&(dyn Fn(usize, &[F], &[u16]) -> Result<(), String> + Sync)>,
-        on_block: &mut dyn FnMut(usize, &[F]),
+        on_block_hook: Option<&(dyn Fn(usize, &[u16]) -> Result<(), String> + Sync)>,
+        mut on_block: Option<&mut dyn FnMut(usize, &[F])>,
     ) -> Result<(), String> {
         let pi = RsDr1csNpFlpcpSparse::prove(self, x, z_w);
         if pi.len() < z_w.len() {
@@ -2213,9 +2210,11 @@ impl<F: PrimeField + FftField> Dr1csNpFlpcpSparseApi<F> for RsDr1csNpFlpcpSparse
         let w = &pi[z_w.len()..];
         if let Some(h) = on_block_hook {
             let w_u16: Vec<u16> = w.iter().copied().map(f_to_u16).collect();
-            h(0, w, w_u16.as_slice())?;
+            h(0, w_u16.as_slice())?;
         }
-        on_block(0, w);
+        if let Some(cb) = on_block.as_deref_mut() {
+            cb(0, w);
+        }
         Ok(())
     }
 

@@ -49,9 +49,9 @@ fn collect_streamed_pi0_and_tail(
             x,
             z_w,
             &[coins.clone()],
-            &mut |chunk| {
+            Some(&mut |chunk| {
                 pi0.extend_from_slice(chunk);
-            },
+            }),
             &mut |ci, _ti, t| {
                 if ci == 0 {
                     tail.push(*t);
@@ -69,18 +69,15 @@ fn collect_streamed_tail_only(
     x: &[F257],
     z_w: &[F257],
     coins: &dpp::Theorem43Coins<F257>,
-    pi0_len: usize,
+    _pi0_len: usize,
 ) -> Vec<F257> {
-    let mut _pi0 = Vec::with_capacity(pi0_len);
     let mut tail: Vec<F257> = Vec::new();
     let tails = dpp
         .stream_pi0_and_collect_tails(
             x,
             z_w,
             &[coins.clone()],
-            &mut |chunk| {
-                _pi0.extend_from_slice(chunk);
-            },
+            None,
             &mut |ci, _ti, t| {
                 if ci == 0 {
                     tail.push(*t);
@@ -88,7 +85,6 @@ fn collect_streamed_tail_only(
             },
         )
         .expect("stream_pi0_and_collect_tails");
-    assert_eq!(_pi0.len(), pi0_len);
     assert_eq!(tails.len(), 1);
     tail
 }

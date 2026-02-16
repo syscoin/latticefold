@@ -362,8 +362,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
                 acc1.add_w_eval(w_eval)?;
                 // q3 witness dot for the selected block (file-backed backends omit dense witness terms).
                 let w_eval_u16: Vec<u16> = w_eval.iter().copied().map(f_to_u16).collect();
-                let dot =
-                    flpcp.dot_q3_w_eval(art.coins.idx, art.coins.lambda, x, &mut scratch, w_eval, &w_eval_u16)?;
+                let dot = flpcp.dot_q3_w_eval(art.coins.idx, art.coins.lambda, x, &w_eval_u16)?;
                 acc2.acc_pi += dot;
                 acc2.acc_full += dot;
             }
@@ -587,7 +586,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
         x: &[F],
         z_w: &[F],
         coins_list: &[Theorem43Coins<F>],
-        on_pi0_chunk: &mut dyn FnMut(&[F]),
+        mut on_pi0_chunk: Option<&mut dyn FnMut(&[F])>,
         on_tail_elem: &mut dyn FnMut(usize, usize, &F),
     ) -> Result<Vec<Theorem43AbgTail<F>>, String> {
         let flpcp = &self.flpcp;
@@ -709,7 +708,10 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             bucket[a.block_id].push(ci);
         }
 
-        on_pi0_chunk(z_w);
+        if let Some(cb) = on_pi0_chunk.as_deref_mut() {
+            cb(z_w);
+        }
+        let emit_pi0 = on_pi0_chunk.is_some();
 
         let witness_pos = flpcp.witness_positions_star()?;
         if witness_pos.len() != k_star {
@@ -755,7 +757,12 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             .collect();
 
         let accs_ro: &[AccSet<F>] = accs.as_slice();
-        let on_block_hook = |b: usize, w_eval: &[F], w_eval_u16: &[u16]| -> Result<(), String> {
+        let lut: Option<Vec<F>> = if is_f257_field::<F>() {
+            Some((0u16..=256u16).map(|d| F::from(d as u64)).collect())
+        } else {
+            None
+        };
+        let on_block_hook = |b: usize, w_eval_u16: &[u16]| -> Result<(), String> {
             if b >= bucket.len() {
                 return Err("stream_w_eval_blocks_with_hook: block id out of range".to_string());
             }
@@ -763,8 +770,8 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             if coins_b.is_empty() {
                 return Ok(());
             }
-            if w_eval_u16.len() != w_eval.len() {
-                return Err("stream_w_eval_blocks_with_hook: w_eval_u16 length mismatch".to_string());
+            if w_eval_u16.len() != k_star {
+                return Err("stream_w_eval_blocks_with_hook: bad w_eval_u16 length".to_string());
             }
             let mut guard = per_block
                 .get(b)
@@ -789,19 +796,29 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
 
                 let mut s1 = F::ZERO;
                 for (c, pos) in a.acc0.w_terms.iter().copied() {
-                    if pos >= w_eval.len() {
-                        return Err("stream_w_eval_blocks_with_hook: q1 w_eval index out of range".to_string());
+                    if pos >= w_eval_u16.len() {
+                        return Err("stream_w_eval_blocks_with_hook: q1 w_eval_u16 index out of range".to_string());
                     }
-                    s1 += c * w_eval[pos];
+                    // Avoid materializing `w_eval` in `F`: lift only the touched positions.
+                    if let Some(lut) = lut.as_ref() {
+                        s1 += c * lut[w_eval_u16[pos] as usize];
+                    } else {
+                        // Non-F257 backends must provide the full `w_eval` via `on_pi0_chunk`.
+                        return Err("stream_w_eval_blocks_with_hook: q1 requires F257 u16 pipeline".to_string());
+                    }
                 }
                 dots.q1_w[j] = s1;
 
                 let mut s2 = F::ZERO;
                 for (c, pos) in a.acc1.w_terms.iter().copied() {
-                    if pos >= w_eval.len() {
-                        return Err("stream_w_eval_blocks_with_hook: q2 w_eval index out of range".to_string());
+                    if pos >= w_eval_u16.len() {
+                        return Err("stream_w_eval_blocks_with_hook: q2 w_eval_u16 index out of range".to_string());
                     }
-                    s2 += c * w_eval[pos];
+                    if let Some(lut) = lut.as_ref() {
+                        s2 += c * lut[w_eval_u16[pos] as usize];
+                    } else {
+                        return Err("stream_w_eval_blocks_with_hook: q2 requires F257 u16 pipeline".to_string());
+                    }
                 }
                 dots.q2_w[j] = s2;
             }
@@ -810,6 +827,8 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             const MAX_BATCH: usize = 64;
             let mut idxs = [0usize; MAX_BATCH];
             let mut lambdas = [F::ZERO; MAX_BATCH];
+            // Hot path (tensor-RS) does not require scratch; keep a single reusable buffer
+            // to satisfy the trait signature without allocating per-batch.
             let mut off = 0usize;
             while off < coins_b.len() {
                 let end = (off + MAX_BATCH).min(coins_b.len());
@@ -822,21 +841,27 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                     idxs[t] = a.coins.idx;
                     lambdas[t] = a.coins.lambda;
                 }
-                let mut scratch = Dr1csQueryScratch::<F>::new(0);
-                flpcp.dot_q3_w_eval_many(
-                    &idxs[..n],
-                    &lambdas[..n],
-                    x,
-                    &mut scratch,
-                    w_eval,
-                    w_eval_u16,
-                    &mut dots.q3_w[off..end],
-                )?;
+                flpcp.dot_q3_w_eval_many(&idxs[..n], &lambdas[..n], x, w_eval_u16, &mut dots.q3_w[off..end])?;
                 off = end;
             }
 
             Ok(())
         };
+
+        let mut on_block_cb = |b: usize, w_eval: &[F]| {
+            if let Some(cb) = on_pi0_chunk.as_deref_mut() {
+                if err.is_some() {
+                    return;
+                }
+                if b >= bucket.len() {
+                    err = Some("stream_w_eval_blocks: block id out of range".to_string());
+                    return;
+                }
+                cb(w_eval);
+            }
+        };
+        let on_block: Option<&mut dyn FnMut(usize, &[F])> =
+            if emit_pi0 { Some(&mut on_block_cb) } else { None };
 
         flpcp.stream_w_eval_blocks(
             &witness_pos,
@@ -845,16 +870,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             x_u16.as_deref(),
             z_u16.as_deref(),
             Some(&on_block_hook),
-            &mut |b, w_eval| {
-                if err.is_some() {
-                    return;
-                }
-                if b >= bucket.len() {
-                    err = Some("stream_w_eval_blocks: block id out of range".to_string());
-                    return;
-                }
-                on_pi0_chunk(w_eval);
-            },
+            on_block,
         )?;
         if let Some(e) = err {
             return Err(e);

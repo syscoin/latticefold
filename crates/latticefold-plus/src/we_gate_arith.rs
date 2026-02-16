@@ -1667,34 +1667,12 @@ mod tests {
             let mut cur_blk: usize = 0;
             let mut buf_len: usize = 0;
             let mut buf64: [u16; 64] = [0u16; 64];
-            // Progress ticker for the streaming `π0` pass: helps confirm we're making forward
-            // progress through blocks when the machine is pegged at 100% CPU.
-            let z_w_len = z_w.len();
-            let mut streamed_blocks: usize = 0;
-            let tick_every: usize = std::env::var("LFP_STREAM_TICK_EVERY")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(128)
-                .max(1);
             let abg_list = prover
             .stream_pi0_and_collect_tails(
                 &x,
                 &z_w,
                 &coins_list,
-                    &mut |chunk| {
-                        // `π0` chunks are: first `z_w`, then one `w_eval` chunk per block.
-                        if chunk.len() != z_w_len {
-                            streamed_blocks += 1;
-                            if (streamed_blocks % tick_every) == 0 {
-                                eprintln!(
-                                    "[tiny_gate] h={} streaming π0: blocks_done={} elapsed={:?}",
-                                    hits_per_block,
-                                    streamed_blocks,
-                                    t_prove.elapsed()
-                                );
-                            }
-                        }
-                    },
+                    None,
                     &mut |ci, _ti, t| {
                         if cur_ci != Some(ci) {
                             cur_ci = Some(ci);
@@ -1970,7 +1948,7 @@ mod tests {
                 &x,
                 &z_w,
                 &coins_list,
-                &mut |_chunk| {},
+                None,
                 &mut |ci, _ti, t| {
                     if cur_ci != Some(ci) {
                         cur_ci = Some(ci);
@@ -2334,7 +2312,7 @@ mod tests {
                 &x,
                 &z_w,
                 &coins_list,
-                &mut |_chunk| {},
+                None,
                 &mut |ci, _ti, t| {
                     if cur_ci != Some(ci) {
                         cur_ci = Some(ci);
@@ -2481,7 +2459,7 @@ mod tests {
                     &x,
                     &z_w,
                     &adv_coins,
-                    &mut |_chunk| {},
+                    None,
                     &mut |ci, ti, t| {
                         if cur_ci != Some(ci) {
                             cur_ci = Some(ci);
@@ -2606,7 +2584,7 @@ mod tests {
                     &x,
                     &z_w,
                     &tam_coins,
-                    &mut |_chunk| {},
+                    None,
                     &mut |ci, _ti, t| {
                         if cur_ci != Some(ci) {
                             cur_ci = Some(ci);
@@ -2981,7 +2959,7 @@ mod tests {
                         )
                         .expect("derive_public_coins_from_stmt lock1"),
                 ],
-                &mut |_chunk| {},
+                None,
                 &mut |ci, _ti, t| {
                     if cur_ci != Some(ci) {
                         cur_ci = Some(ci);
