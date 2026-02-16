@@ -458,18 +458,6 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         z_w: &[F],
         x_u16: Option<&[u16]>,
         z_u16: Option<&[u16]>,
-        on_block: &mut dyn FnMut(usize, &[F]),
-    ) -> Result<(), String> {
-        self.stream_w_eval_blocks_with_hook(witness_pos, x, z_w, x_u16, z_u16, None, on_block)
-    }
-
-    fn stream_w_eval_blocks_with_hook(
-        &self,
-        witness_pos: &[usize],
-        x: &[F],
-        z_w: &[F],
-        x_u16: Option<&[u16]>,
-        z_u16: Option<&[u16]>,
         on_block_hook: Option<&(dyn Fn(usize, &[F]) -> Result<(), String> + Sync)>,
         on_block: &mut dyn FnMut(usize, &[F]),
     ) -> Result<(), String> {
@@ -892,7 +880,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         let mut pi = Vec::with_capacity(self.m());
         pi.extend_from_slice(z_w);
         let witness_pos = self.witness_positions_star().expect("witness_positions_star");
-        self.stream_w_eval_blocks(&witness_pos, x, z_w, None, None, &mut |_, w_eval| {
+        self.stream_w_eval_blocks(&witness_pos, x, z_w, None, None, None, &mut |_, w_eval| {
             pi.extend_from_slice(w_eval);
         })
         .expect("stream_w_eval_blocks");

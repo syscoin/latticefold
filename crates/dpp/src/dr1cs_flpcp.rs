@@ -45,26 +45,10 @@ pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
     ///
     /// Implementations must call `on_block(block_id, w_eval)` for each block_id in `0..blocks()`,
     /// where `w_eval.len() == k_star()`.
+    ///
+    /// `on_block_hook` is an optional, thread-safe per-block hook intended for heavy computations
+    /// that should run inside the backend's internal parallelism (e.g. batched dense q3 dots).
     fn stream_w_eval_blocks(
-        &self,
-        witness_pos: &[usize],
-        x: &[F],
-        z_w: &[F],
-        x_u16: Option<&[u16]>,
-        z_u16: Option<&[u16]>,
-        on_block: &mut dyn FnMut(usize, &[F]),
-    ) -> Result<(), String>;
-
-    /// Stream `w_eval` blocks, optionally running a **thread-safe per-block hook**.
-    ///
-    /// The hook is intended for heavy per-block computations that should run inside
-    /// the backend's internal parallelism (e.g. batched dense q3 dots for all hits in a block),
-    /// while preserving the canonical in-order `on_block` streaming semantics.
-    ///
-    /// Default implementation runs the hook in the same context as `on_block` (potentially
-    /// sequential). Structured backends should override this to run the hook inside their
-    /// per-block parallel workers.
-    fn stream_w_eval_blocks_with_hook(
         &self,
         witness_pos: &[usize],
         x: &[F],
@@ -73,32 +57,7 @@ pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
         z_u16: Option<&[u16]>,
         on_block_hook: Option<&(dyn Fn(usize, &[F]) -> Result<(), String> + Sync)>,
         on_block: &mut dyn FnMut(usize, &[F]),
-    ) -> Result<(), String> {
-        let mut err: Option<String> = None;
-        self.stream_w_eval_blocks(
-            witness_pos,
-            x,
-            z_w,
-            x_u16,
-            z_u16,
-            &mut |b, w_eval| {
-                if err.is_some() {
-                    return;
-                }
-                if let Some(h) = on_block_hook {
-                    if let Err(e) = h(b, w_eval) {
-                        err = Some(e);
-                        return;
-                    }
-                }
-                on_block(b, w_eval);
-            },
-        )?;
-        if let Some(e) = err {
-            return Err(e);
-        }
-        Ok(())
-    }
+    ) -> Result<(), String>;
 
     /// Stream verifier queries for fixed coins without allocating full query vectors.
     fn stream_queries_for_coins_sparse(
@@ -386,7 +345,6 @@ pub struct TensorRsMulCode<F: PrimeField> {
 
 #[derive(Default)]
 struct TensorRsF257Rank3Scratch {
-    y_u16: Vec<u16>,
     t0: Vec<u16>,
     t1: Vec<u16>,
     out_grid: Vec<u16>,
@@ -916,163 +874,24 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
         Self: Sync,
     {
         if Self::is_f257() && self.rank == 3 {
-            // This fast path assumes the canonical Layout A evaluation order, i.e.
-            // `positions == witness_positions_star()`.
-            if let Ok(expected) = self.witness_positions_star() {
-                if positions != expected.as_slice() {
-                    return Err(
-                        "eval_e_at_positions_into: F257 rank=3 fast path requires positions == witness_positions_star()"
-                            .to_string(),
-                    );
-                }
-            }
-
-            let base_k = self.base_k;
-            let side = 2 * base_k - 1;
-            if side > self.base_n {
-                return Err("eval_e_at_positions_into: side out of range".to_string());
-            }
             let k = self.dim_k();
             if y.len() != k {
                 return Err("eval_e_at_positions_into: bad y length".to_string());
             }
-            let k_star = self.dim_k_star();
-            if positions.len() != k_star || out.len() != k_star {
-                return Err("eval_e_at_positions_into: bad positions/out length".to_string());
+            let mut y_u16: Vec<u16> = Vec::with_capacity(k);
+            for &v in y.iter() {
+                y_u16.push(f_to_u16(v));
             }
-
-            // F257 conversion LUT (0..=256) to avoid `F::from(u64)` in the hot emission loop.
-            // Building it per-call is cheap (~257 ops) compared to emitting `k_star` elements.
+            let mut out_u16: Vec<u16> = vec![0u16; positions.len()];
+            self.eval_e_at_positions_into_u16(positions, &y_u16, &mut out_u16)?;
+            if out.len() != out_u16.len() {
+                return Err("eval_e_at_positions_into: out len mismatch".to_string());
+            }
             let lut: Vec<F> = (0u16..=256u16).map(|d| F::from(d as u64)).collect();
-
-            // Tensor layout conventions:
-            // - Message y is indexed as flat = i0 + i1*base_k + i2*base_k^2 (dim0 least-significant).
-            // - We evaluate E(y) on the side^3 grid of coordinates (c0,c1,c2) with 0<=c*<side.
-            // - Output grid is indexed as g = c0 + c1*side + c2*side^2 (same digit order).
-            let stride_y1 = base_k;
-            let stride_y2 = base_k * base_k;
-            let stride_g1 = side;
-            let stride_g2 = side * side;
-
-            TENSOR_RS_F257_R3_SCRATCH.with(|cell| {
-                let mut s = cell.borrow_mut();
-                let s: &mut TensorRsF257Rank3Scratch = &mut *s;
-
-                if s.y_u16.len() != k {
-                    s.y_u16.resize(k, 0u16);
-                }
-                for (i, yi) in y.iter().copied().enumerate() {
-                    s.y_u16[i] = f_to_u16(yi);
-                }
-
-                let t0_len = side * base_k * base_k;
-                if s.t0.len() != t0_len {
-                    s.t0.resize(t0_len, 0u16);
-                }
-                // Pass 1: interpolate along dim0.
-                // Layout: contiguous chunks of length `side` per (i1,i2) pair.
-                let y_u16: &[u16] = &s.y_u16;
-                let lam_k_u16: &[u16] = self.lam_k_u16.as_slice();
-                let t0: &mut [u16] = &mut s.t0;
-                t0.par_chunks_mut(side)
-                    .enumerate()
-                    .for_each(|(chunk_idx, out_row)| {
-                        let i1 = chunk_idx % base_k;
-                        let i2 = chunk_idx / base_k;
-                        let base_y = i1 * stride_y1 + i2 * stride_y2;
-                        for c0 in 0..side {
-                            let lam0 = &lam_k_u16[c0 * base_k..(c0 + 1) * base_k];
-                            let mut acc: u32 = 0;
-                            for i0 in 0..base_k {
-                                acc += (lam0[i0] as u32) * (y_u16[base_y + i0] as u32);
-                            }
-                            out_row[c0] = reduce_mod257_u32(acc);
-                        }
-                    });
-
-                let t1_len = side * side * base_k;
-                if s.t1.len() != t1_len {
-                    s.t1.resize(t1_len, 0u16);
-                }
-                // Pass 2: interpolate along dim1.
-                // Layout: contiguous chunks of length `side` over c1 for each (c0,i2) pair.
-                let t0: &[u16] = &s.t0;
-                let t1: &mut [u16] = &mut s.t1;
-                t1.par_chunks_mut(side)
-                    .enumerate()
-                    .for_each(|(chunk_idx, out_row)| {
-                        let c0 = chunk_idx % side;
-                        let i2 = chunk_idx / side;
-                        for c1 in 0..side {
-                            let lam1 = &lam_k_u16[c1 * base_k..(c1 + 1) * base_k];
-                            let mut acc: u32 = 0;
-                            for i1 in 0..base_k {
-                                let v = t0[c0 + side * (i1 + base_k * i2)];
-                                acc += (lam1[i1] as u32) * (v as u32);
-                            }
-                            out_row[c1] = reduce_mod257_u32(acc);
-                        }
-                    });
-
-                let grid_len = side * side * side;
-                if s.out_grid.len() != grid_len {
-                    s.out_grid.resize(grid_len, 0u16);
-                }
-                // Pass 3: interpolate along dim2.
-                // Layout: contiguous chunk of size `side*side` per c2 slice.
-                let t1: &[u16] = &s.t1;
-                let out_grid: &mut [u16] = &mut s.out_grid;
-                out_grid
-                    .par_chunks_mut(side * side)
-                    .enumerate()
-                    .for_each(|(c2, out_plane)| {
-                        let lam2 = &lam_k_u16[c2 * base_k..(c2 + 1) * base_k];
-                        for c1 in 0..side {
-                            let row = &mut out_plane[c1 * side..(c1 + 1) * side];
-                            for c0 in 0..side {
-                                let mut acc: u32 = 0;
-                                for i2 in 0..base_k {
-                                    let v = t1[c1 + side * (c0 + side * i2)];
-                                    acc += (lam2[i2] as u32) * (v as u32);
-                                }
-                                row[c0] = reduce_mod257_u32(acc);
-                            }
-                        }
-                    });
-
-                // Emit in the exact order of `witness_positions_star()` (Layout A).
-                let mut w = 0usize;
-                // Low cube.
-                for i2 in 0..base_k {
-                    for i1 in 0..base_k {
-                        for i0 in 0..base_k {
-                            let g = i0 + i1 * stride_g1 + i2 * stride_g2;
-                            out[w] = lut[s.out_grid[g] as usize];
-                            w += 1;
-                        }
-                    }
-                }
-                if w != k {
-                    return Err("eval_e_at_positions_into: low cube length mismatch".to_string());
-                }
-                // Rest of side-cube, skipping low cube points.
-                for c2 in 0..side {
-                    for c1 in 0..side {
-                        for c0 in 0..side {
-                            if c0 < base_k && c1 < base_k && c2 < base_k {
-                                continue;
-                            }
-                            let g = c0 + c1 * stride_g1 + c2 * stride_g2;
-                            out[w] = lut[s.out_grid[g] as usize];
-                            w += 1;
-                        }
-                    }
-                }
-                if w != k_star {
-                    return Err("eval_e_at_positions_into: total length mismatch".to_string());
-                }
-                Ok(())
-            })
+            for (o, &u) in out.iter_mut().zip(out_u16.iter()) {
+                *o = lut[u as usize];
+            }
+            Ok(())
         } else {
             let tmp = <Self as MulCode<F>>::eval_e_at_positions(self, positions, y)?;
             if tmp.len() != out.len() {
@@ -1733,6 +1552,7 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         z_w: &[F],
         x_u16: Option<&[u16]>,
         z_u16: Option<&[u16]>,
+        on_block_hook: Option<&(dyn Fn(usize, &[F]) -> Result<(), String> + Sync)>,
         on_block: &mut dyn FnMut(usize, &[F]),
     ) -> Result<(), String> {
         // Single-block backend: compute one `w_eval` and stream it as block 0.
@@ -1784,6 +1604,9 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                     w_eval[j] = lut[eb_u16[j] as usize];
                 }
             }
+            if let Some(h) = on_block_hook {
+                h(0, &w_eval)?;
+            }
             on_block(0, &w_eval);
             return Ok(());
         }
@@ -1804,6 +1627,9 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
             for j in 0..k_star {
                 w_eval[j] = ea[j] * eb[j];
             }
+        }
+        if let Some(h) = on_block_hook {
+            h(0, &w_eval)?;
         }
         on_block(0, &w_eval);
         Ok(())
@@ -2346,6 +2172,7 @@ impl<F: PrimeField + FftField> Dr1csNpFlpcpSparseApi<F> for RsDr1csNpFlpcpSparse
         z_w: &[F],
         _x_u16: Option<&[u16]>,
         _z_u16: Option<&[u16]>,
+        on_block_hook: Option<&(dyn Fn(usize, &[F]) -> Result<(), String> + Sync)>,
         on_block: &mut dyn FnMut(usize, &[F]),
     ) -> Result<(), String> {
         let pi = RsDr1csNpFlpcpSparse::prove(self, x, z_w);
@@ -2353,6 +2180,9 @@ impl<F: PrimeField + FftField> Dr1csNpFlpcpSparseApi<F> for RsDr1csNpFlpcpSparse
             return Err("rs stream_w_eval_blocks: bad proof length".to_string());
         }
         let w = &pi[z_w.len()..];
+        if let Some(h) = on_block_hook {
+            h(0, w)?;
+        }
         on_block(0, w);
         Ok(())
     }

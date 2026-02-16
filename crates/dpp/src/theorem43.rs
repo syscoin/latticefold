@@ -832,7 +832,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             Ok(())
         };
 
-        flpcp.stream_w_eval_blocks_with_hook(
+        flpcp.stream_w_eval_blocks(
             &witness_pos,
             x,
             z_w,
