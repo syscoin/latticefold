@@ -55,6 +55,51 @@ pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
         on_block: &mut dyn FnMut(usize, &[F]),
     ) -> Result<(), String>;
 
+    /// Stream `w_eval` blocks, optionally running a **thread-safe per-block hook**.
+    ///
+    /// The hook is intended for heavy per-block computations that should run inside
+    /// the backend's internal parallelism (e.g. batched dense q3 dots for all hits in a block),
+    /// while preserving the canonical in-order `on_block` streaming semantics.
+    ///
+    /// Default implementation runs the hook in the same context as `on_block` (potentially
+    /// sequential). Structured backends should override this to run the hook inside their
+    /// per-block parallel workers.
+    fn stream_w_eval_blocks_with_hook(
+        &self,
+        witness_pos: &[usize],
+        x: &[F],
+        z_w: &[F],
+        x_u16: Option<&[u16]>,
+        z_u16: Option<&[u16]>,
+        on_block_hook: Option<&(dyn Fn(usize, &[F]) -> Result<(), String> + Sync)>,
+        on_block: &mut dyn FnMut(usize, &[F]),
+    ) -> Result<(), String> {
+        let mut err: Option<String> = None;
+        self.stream_w_eval_blocks(
+            witness_pos,
+            x,
+            z_w,
+            x_u16,
+            z_u16,
+            &mut |b, w_eval| {
+                if err.is_some() {
+                    return;
+                }
+                if let Some(h) = on_block_hook {
+                    if let Err(e) = h(b, w_eval) {
+                        err = Some(e);
+                        return;
+                    }
+                }
+                on_block(b, w_eval);
+            },
+        )?;
+        if let Some(e) = err {
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Stream verifier queries for fixed coins without allocating full query vectors.
     fn stream_queries_for_coins_sparse(
         &self,

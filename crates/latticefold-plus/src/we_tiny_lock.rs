@@ -460,6 +460,19 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         z_u16: Option<&[u16]>,
         on_block: &mut dyn FnMut(usize, &[F]),
     ) -> Result<(), String> {
+        self.stream_w_eval_blocks_with_hook(witness_pos, x, z_w, x_u16, z_u16, None, on_block)
+    }
+
+    fn stream_w_eval_blocks_with_hook(
+        &self,
+        witness_pos: &[usize],
+        x: &[F],
+        z_w: &[F],
+        x_u16: Option<&[u16]>,
+        z_u16: Option<&[u16]>,
+        on_block_hook: Option<&(dyn Fn(usize, &[F]) -> Result<(), String> + Sync)>,
+        on_block: &mut dyn FnMut(usize, &[F]),
+    ) -> Result<(), String> {
         use std::io::Read as IoRead;
 
         fn read_u32(r: &mut impl IoRead) -> Result<u32, String> {
@@ -474,13 +487,13 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         }
 
         if x.len() != self.l {
-            return Err("stream_w_eval_blocks: bad x length".to_string());
+            return Err("stream_w_eval_blocks_with_hook: bad x length".to_string());
         }
         if z_w.len() != self.z_w_len() {
-            return Err("stream_w_eval_blocks: bad z_w length".to_string());
+            return Err("stream_w_eval_blocks_with_hook: bad z_w length".to_string());
         }
         if witness_pos.len() != self.k_star() {
-            return Err("stream_w_eval_blocks: witness positions length mismatch".to_string());
+            return Err("stream_w_eval_blocks_with_hook: witness positions length mismatch".to_string());
         }
 
         let k = self.k();
@@ -488,11 +501,11 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         let blocks = self.blocks();
         let nconstraints = self.nconstraints();
         if !dpp::dr1cs_flpcp::is_f257_field::<F>() {
-            return Err("stream_w_eval_blocks: unsupported field (tiny-lock requires F257)".to_string());
+            return Err("stream_w_eval_blocks_with_hook: unsupported field (tiny-lock requires F257)".to_string());
         }
         let f257_fast = x_u16.is_some() && z_u16.is_some();
         if !f257_fast {
-            return Err("stream_w_eval_blocks: only F257 fast path is supported".to_string());
+            return Err("stream_w_eval_blocks_with_hook: only F257 fast path is supported".to_string());
         }
         let (x_u16, z_u16) = (x_u16.unwrap(), z_u16.unwrap());
         let lut: Vec<F> = (0u16..=256u16).map(|d| F::from(d as u64)).collect();
@@ -503,30 +516,18 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         let mul_ns = std::sync::atomic::AtomicU64::new(0);
         let blocks_done = std::sync::atomic::AtomicU64::new(0);
 
-        // Parallelize across blocks, but preserve in-order streaming output.
-        //
-        // We process bounded "windows" of blocks in parallel and then emit them sequentially
-        // to the callback to preserve proof element order (required by streaming decap).
         let threads = rayon::current_num_threads().max(1);
         let mut window = (threads * 4).clamp(8, 512);
-        // Cap the in-flight window to avoid materializing too much `(window × k_star)` output.
-        // This is crucial when k_star is large (e.g. Tensor-RS rank=3).
         let bytes_per_block = (k_star as u64).saturating_mul(std::mem::size_of::<F>() as u64);
         let max_window_bytes: u64 = std::env::var("LF_DPP_WINDOW_MAX_MB")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            // Default: allow a few GiB of in-flight w_eval blocks. On realistic params
-            // (k_star ~ 857k, F257 ~ 8 bytes) one block is ~6.8MiB, so 96 blocks is ~650MiB.
             .unwrap_or(16384)
             .saturating_mul(1024 * 1024);
         if bytes_per_block != 0 {
             let max_by_mem = (max_window_bytes / bytes_per_block).max(1) as usize;
             window = window.min(max_by_mem);
         }
-
-        // Always process *contiguous* block ranges per rayon task, reusing a single set of open
-        // readers + internal buffers. This significantly reduces `open+seek` overhead for
-        // large instances and avoids nested-parallel overheads in the inner loops.
         let blocks_per_task: usize = std::env::var("LF_DPP_BLOCKS_PER_TASK")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -588,14 +589,22 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                                     for _ in 0..a_len {
                                         let cu16 = read_u16(&mut a_coeffs)? as u64;
                                         let idx = read_u32(&mut a_idx)? as usize;
-                                        let v = if idx < self.l { x_u16[idx] as u64 } else { z_u16[idx - self.l] as u64 };
+                                        let v = if idx < self.l {
+                                            x_u16[idx] as u64
+                                        } else {
+                                            z_u16[idx - self.l] as u64
+                                        };
                                         aval_u = aval_u.wrapping_add(cu16.wrapping_mul(v));
                                     }
                                     let mut bval_u: u64 = 0;
                                     for _ in 0..b_len {
                                         let cu16 = read_u16(&mut b_coeffs)? as u64;
                                         let idx = read_u32(&mut b_idx)? as usize;
-                                        let v = if idx < self.l { x_u16[idx] as u64 } else { z_u16[idx - self.l] as u64 };
+                                        let v = if idx < self.l {
+                                            x_u16[idx] as u64
+                                        } else {
+                                            z_u16[idx - self.l] as u64
+                                        };
                                         bval_u = bval_u.wrapping_add(cu16.wrapping_mul(v));
                                     }
                                     (reduce_mod257_u64(aval_u), reduce_mod257_u64(bval_u))
@@ -605,10 +614,16 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                             }
 
                             let t_eval = std::time::Instant::now();
-                            self.code
-                                .eval_e_at_positions_into_u16(witness_pos, y_a.as_slice(), ea_u16.as_mut_slice())?;
-                            self.code
-                                .eval_e_at_positions_into_u16(witness_pos, y_b.as_slice(), eb_u16.as_mut_slice())?;
+                            self.code.eval_e_at_positions_into_u16(
+                                witness_pos,
+                                y_a.as_slice(),
+                                ea_u16.as_mut_slice(),
+                            )?;
+                            self.code.eval_e_at_positions_into_u16(
+                                witness_pos,
+                                y_b.as_slice(),
+                                eb_u16.as_mut_slice(),
+                            )?;
                             if do_prof_w_eval {
                                 let dt = t_eval.elapsed();
                                 eval_ns.fetch_add(
@@ -618,7 +633,6 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                             }
                             let dst = &mut out[bi * k_star..(bi + 1) * k_star];
                             let t_mul = std::time::Instant::now();
-                            // keep this multiply+convert *sequential* to avoid nested Rayon overhead.
                             for j in 0..k_star {
                                 let prod = ((ea_u16[j] as u32) * (eb_u16[j] as u32)) % 257u32;
                                 dst[j] = lut[prod as usize];
@@ -631,6 +645,12 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                                 );
                                 blocks_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
+
+                            // Run the hook **inside the parallel block worker**, so expensive
+                            // per-block computations can scale with threads.
+                            if let Some(h) = on_block_hook {
+                                h(b, dst)?;
+                            }
                         }
 
                         Ok(out)
@@ -638,7 +658,6 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
                 )
                 .collect::<Result<Vec<_>, _>>()?;
 
-            // Emit in-order.
             let mut b_emit = b0;
             for chunk in out_chunks.iter() {
                 for blk in 0..(chunk.len() / k_star) {

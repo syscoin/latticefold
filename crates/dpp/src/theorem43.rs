@@ -707,6 +707,29 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             bucket[a.block_id].push(ci);
         }
 
+        // Precompute per-block (idx,lambda) lists for q3 dots in the same order as `bucket[b]`.
+        // This is read-only and avoids borrowing `accs` inside the parallel hook.
+        let mut q3_idxs_per_block: Vec<Vec<usize>> = (0..blocks)
+            .map(|_| Vec::with_capacity(avg_per_block.max(1)))
+            .collect();
+        let mut q3_lambdas_per_block: Vec<Vec<F>> = (0..blocks)
+            .map(|_| Vec::with_capacity(avg_per_block.max(1)))
+            .collect();
+        for b in 0..blocks {
+            let coins_b = &bucket[b];
+            let mut idxs = Vec::with_capacity(coins_b.len());
+            let mut lambdas = Vec::with_capacity(coins_b.len());
+            for &ci in coins_b.iter() {
+                let a = accs
+                    .get(ci)
+                    .ok_or_else(|| "q3_idxs_per_block: coin index out of range".to_string())?;
+                idxs.push(a.coins.idx);
+                lambdas.push(a.coins.lambda);
+            }
+            q3_idxs_per_block[b] = idxs;
+            q3_lambdas_per_block[b] = lambdas;
+        }
+
         on_pi0_chunk(z_w);
 
         let witness_pos = flpcp.witness_positions_star()?;
@@ -724,16 +747,42 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
         };
 
         let mut err: Option<String> = None;
-        let mut dot_scratch = Dr1csQueryScratch::<F>::new(flpcp.n_total());
-        let mut dot_idxs: Vec<usize> = Vec::with_capacity(avg_per_block.max(1));
-        let mut dot_lambdas: Vec<F> = Vec::with_capacity(avg_per_block.max(1));
-        let mut dot_out: Vec<F> = Vec::with_capacity(avg_per_block.max(1));
-        flpcp.stream_w_eval_blocks(
+        // Precompute q3 witness dots inside the FLPCP backend's parallel workers, storing one
+        // vector of dots per block. This avoids doing the dense work in the in-order streaming callback.
+        let dots_per_block: Vec<std::sync::OnceLock<Vec<F>>> =
+            (0..blocks).map(|_| std::sync::OnceLock::new()).collect();
+
+        let on_block_hook = |b: usize, w_eval: &[F]| -> Result<(), String> {
+            if b >= bucket.len() {
+                return Err("stream_w_eval_blocks_with_hook: block id out of range".to_string());
+            }
+            let idxs = &q3_idxs_per_block[b];
+            if idxs.is_empty() {
+                // Leave unset; in-order callback will skip.
+                return Ok(());
+            }
+            let lambdas = &q3_lambdas_per_block[b];
+            if lambdas.len() != idxs.len() {
+                return Err("stream_w_eval_blocks_with_hook: q3 idx/lambda length mismatch".to_string());
+            }
+            let mut out = vec![F::ZERO; idxs.len()];
+            // Backend-specific fast path: for our file-backed F257 path, this ignores scratch.
+            let mut scratch = Dr1csQueryScratch::<F>::new(0);
+            flpcp.dot_q3_w_eval_many(idxs, lambdas, x, &mut scratch, w_eval, &mut out)?;
+            let cell = dots_per_block
+                .get(b)
+                .ok_or_else(|| "stream_w_eval_blocks_with_hook: dots cell out of range".to_string())?;
+            let _ = cell.set(out);
+            Ok(())
+        };
+
+        flpcp.stream_w_eval_blocks_with_hook(
             &witness_pos,
             x,
             z_w,
             x_u16.as_deref(),
             z_u16.as_deref(),
+            Some(&on_block_hook),
             &mut |b, w_eval| {
                 if err.is_some() {
                     return;
@@ -743,12 +792,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                     return;
                 }
                 let coins_b = &bucket[b];
-                dot_idxs.clear();
-                dot_lambdas.clear();
-                dot_out.clear();
-                dot_out.resize(coins_b.len(), F::ZERO);
-
-                // First pass: update (q1,q2) witness contributions and collect (idx,lambda) for batched q3.
+                // Update (q1,q2) witness contributions (cheap) in-order.
                 for &ci in coins_b.iter() {
                     let a = match accs.get_mut(ci) {
                         Some(v) => v,
@@ -765,21 +809,22 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                         err = Some(e);
                         return;
                     }
-                    dot_idxs.push(a.coins.idx);
-                    dot_lambdas.push(a.coins.lambda);
                 }
-
-                // Batched q3 witness dots: amortize `w_eval` traversal across all coins hitting this block.
-                if !dot_idxs.is_empty() {
-                    if let Err(e) = flpcp.dot_q3_w_eval_many(
-                        &dot_idxs,
-                        &dot_lambdas,
-                        x,
-                        &mut dot_scratch,
-                        w_eval,
-                        &mut dot_out,
-                    ) {
-                        err = Some(e);
+                // Apply precomputed q3 witness dots (computed inside parallel backend workers).
+                if !coins_b.is_empty() {
+                    let maybe = match dots_per_block.get(b) {
+                        Some(v) => v.get(),
+                        None => None,
+                    };
+                    let dots = match maybe {
+                        Some(v) => v,
+                        None => {
+                            err = Some("stream_w_eval_blocks: missing precomputed q3 dots".to_string());
+                            return;
+                        }
+                    };
+                    if dots.len() != coins_b.len() {
+                        err = Some("stream_w_eval_blocks: bad q3 dots length".to_string());
                         return;
                     }
                     for (j, &ci) in coins_b.iter().enumerate() {
@@ -787,11 +832,11 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                             Some(v) => v,
                             None => {
                                 err =
-                                    Some("stream_w_eval_blocks: bucket coin index out of range (second pass)".to_string());
+                                    Some("stream_w_eval_blocks: bucket coin index out of range (q3 apply)".to_string());
                                 return;
                             }
                         };
-                        let dot = dot_out[j];
+                        let dot = dots[j];
                         a.acc2.acc_pi += dot;
                         a.acc2.acc_full += dot;
                     }
