@@ -1394,8 +1394,7 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                 let rep: u16 = 0;
 
                 let mut tries = 0usize;
-                let mut best_sl: Option<RingLweSubLock<F>> = None;
-                let mut best_hint_bytes: Option<usize> = None;
+                let mut chosen_sl: Option<RingLweSubLock<F>> = None;
                 while tries < max_rep_tries {
                     tries += 1;
                     let try_idx = (tries - 1) as u64;
@@ -1516,16 +1515,15 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                     if !within_budget {
                         continue;
                     }
-                    match best_hint_bytes {
-                        Some(cur) if hint_bytes >= cur => {}
-                        _ => {
-                            best_hint_bytes = Some(hint_bytes);
-                            best_sl = Some(sl);
-                        }
-                    }
+                    // Canonical behavior: **stop at first accepted sample**.
+                    //
+                    // This is standard rejection sampling. Searching for the "best" hint across many
+                    // accepted samples biases the distribution toward smaller hints, which we do not want.
+                    chosen_sl = Some(sl);
+                    break;
                 }
 
-                let sl = best_sl.ok_or_else(|| {
+                let sl = chosen_sl.ok_or_else(|| {
                     if let Some(budget) = policy.hint_budget_bytes {
                         format!(
                             "arm_we_ringlwe_lock_from_dr1cs: failed to find in-budget sublock within retry budget (hint_budget_bytes={})",
