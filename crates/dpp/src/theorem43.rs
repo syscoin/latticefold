@@ -741,17 +741,17 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             q2_w: Vec<F>,
             q3_w: Vec<F>,
         }
-        let per_block: Vec<std::sync::Mutex<Option<BlockDots<F>>>> = (0..blocks)
+        // NOTE: `dpp` forbids `unsafe_code`, so we can't use `UnsafeCell` for lock-free
+        // preallocated mutation. Instead, compute each block's dots once in the hook and
+        // publish them via `OnceLock` (no mutex locking/unlocking in the hot path).
+        let per_block: Vec<Option<std::sync::OnceLock<BlockDots<F>>>> = (0..blocks)
             .map(|b| {
                 let n = bucket.get(b).map(|v| v.len()).unwrap_or(0);
                 if n == 0 {
-                    std::sync::Mutex::new(None)
+                    None
                 } else {
-                    std::sync::Mutex::new(Some(BlockDots {
-                        q1_w: vec![F::ZERO; n],
-                        q2_w: vec![F::ZERO; n],
-                        q3_w: vec![F::ZERO; n],
-                    }))
+                    let _ = n;
+                    Some(std::sync::OnceLock::new())
                 }
             })
             .collect();
@@ -773,20 +773,20 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             if w_eval_u16.len() != k_star {
                 return Err("stream_w_eval_blocks_with_hook: bad w_eval_u16 length".to_string());
             }
-            let mut guard = per_block
+            let cell = per_block
                 .get(b)
                 .ok_or_else(|| "stream_w_eval_blocks_with_hook: per_block out of range".to_string())?
-                .lock()
-                .map_err(|_| "stream_w_eval_blocks_with_hook: per_block mutex poisoned".to_string())?;
-            let dots = guard
-                .as_mut()
+                .as_ref()
                 .ok_or_else(|| "stream_w_eval_blocks_with_hook: missing per-block dots buffer".to_string())?;
-            if dots.q1_w.len() != coins_b.len()
-                || dots.q2_w.len() != coins_b.len()
-                || dots.q3_w.len() != coins_b.len()
-            {
-                return Err("stream_w_eval_blocks_with_hook: per-block dots length mismatch".to_string());
+            if cell.get().is_some() {
+                return Err("stream_w_eval_blocks_with_hook: duplicate block hook invocation".to_string());
             }
+            let n = coins_b.len();
+            let mut dots = BlockDots::<F> {
+                q1_w: vec![F::ZERO; n],
+                q2_w: vec![F::ZERO; n],
+                q3_w: vec![F::ZERO; n],
+            };
 
             // q1/q2 witness contributions: purely from each coin's `w_terms` (sparse, local to block).
             for (j, &ci) in coins_b.iter().enumerate() {
@@ -845,6 +845,8 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                 off = end;
             }
 
+            cell.set(dots)
+                .map_err(|_| "stream_w_eval_blocks_with_hook: once-lock already set".to_string())?;
             Ok(())
         };
 
@@ -883,12 +885,13 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             if coins_b.is_empty() {
                 continue;
             }
-            let mut guard = per_block[b]
-                .lock()
-                .map_err(|_| "stream_w_eval_blocks: per_block mutex poisoned (apply)".to_string())?;
-            let dots = guard
-                .take()
+            let cell = per_block
+                .get(b)
+                .and_then(|x| x.as_ref())
                 .ok_or_else(|| "stream_w_eval_blocks: missing per-block dots buffer (apply)".to_string())?;
+            let dots = cell
+                .get()
+                .ok_or_else(|| "stream_w_eval_blocks: per-block dots not set (apply)".to_string())?;
             if dots.q1_w.len() != coins_b.len()
                 || dots.q2_w.len() != coins_b.len()
                 || dots.q3_w.len() != coins_b.len()
