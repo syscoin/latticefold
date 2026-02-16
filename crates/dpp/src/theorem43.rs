@@ -725,6 +725,9 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
 
         let mut err: Option<String> = None;
         let mut dot_scratch = Dr1csQueryScratch::<F>::new(flpcp.n_total());
+        let mut dot_idxs: Vec<usize> = Vec::with_capacity(avg_per_block.max(1));
+        let mut dot_lambdas: Vec<F> = Vec::with_capacity(avg_per_block.max(1));
+        let mut dot_out: Vec<F> = Vec::with_capacity(avg_per_block.max(1));
         flpcp.stream_w_eval_blocks(
             &witness_pos,
             x,
@@ -739,7 +742,14 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                     err = Some("stream_w_eval_blocks: block id out of range".to_string());
                     return;
                 }
-                for &ci in bucket[b].iter() {
+                let coins_b = &bucket[b];
+                dot_idxs.clear();
+                dot_lambdas.clear();
+                dot_out.clear();
+                dot_out.resize(coins_b.len(), F::ZERO);
+
+                // First pass: update (q1,q2) witness contributions and collect (idx,lambda) for batched q3.
+                for &ci in coins_b.iter() {
                     let a = match accs.get_mut(ci) {
                         Some(v) => v,
                         None => {
@@ -755,16 +765,35 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                         err = Some(e);
                         return;
                     }
-                    // q3 witness dot: compute without materializing dense q3 witness terms.
-                    match flpcp.dot_q3_w_eval(a.coins.idx, a.coins.lambda, x, &mut dot_scratch, w_eval) {
-                        Ok(dot) => {
-                            a.acc2.acc_pi += dot;
-                            a.acc2.acc_full += dot;
-                        }
-                        Err(e) => {
-                            err = Some(e);
-                            return;
-                        }
+                    dot_idxs.push(a.coins.idx);
+                    dot_lambdas.push(a.coins.lambda);
+                }
+
+                // Batched q3 witness dots: amortize `w_eval` traversal across all coins hitting this block.
+                if !dot_idxs.is_empty() {
+                    if let Err(e) = flpcp.dot_q3_w_eval_many(
+                        &dot_idxs,
+                        &dot_lambdas,
+                        x,
+                        &mut dot_scratch,
+                        w_eval,
+                        &mut dot_out,
+                    ) {
+                        err = Some(e);
+                        return;
+                    }
+                    for (j, &ci) in coins_b.iter().enumerate() {
+                        let a = match accs.get_mut(ci) {
+                            Some(v) => v,
+                            None => {
+                                err =
+                                    Some("stream_w_eval_blocks: bucket coin index out of range (second pass)".to_string());
+                                return;
+                            }
+                        };
+                        let dot = dot_out[j];
+                        a.acc2.acc_pi += dot;
+                        a.acc2.acc_full += dot;
                     }
                 }
                 on_pi0_chunk(w_eval);

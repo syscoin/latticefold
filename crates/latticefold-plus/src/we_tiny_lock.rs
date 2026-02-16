@@ -487,6 +487,9 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         let k_star = self.k_star();
         let blocks = self.blocks();
         let nconstraints = self.nconstraints();
+        if !dpp::dr1cs_flpcp::is_f257_field::<F>() {
+            return Err("stream_w_eval_blocks: unsupported field (tiny-lock requires F257)".to_string());
+        }
         let f257_fast = x_u16.is_some() && z_u16.is_some();
         if !f257_fast {
             return Err("stream_w_eval_blocks: only F257 fast path is supported".to_string());
@@ -692,6 +695,9 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         if x.len() != self.l {
             return Err("stream_queries_for_coins_sparse: bad x length".to_string());
         }
+        if !dpp::dr1cs_flpcp::is_f257_field::<F>() {
+            return Err("stream_queries_for_coins_sparse: unsupported field (tiny-lock requires F257)".to_string());
+        }
         let (block_id, local_idx) = self.decode_block_idx(idx)?;
         let k = self.k();
 
@@ -777,22 +783,90 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         _scratch: &mut Dr1csQueryScratch<F>,
         w_eval: &[F],
     ) -> Result<F, String> {
-        let (_block_id, local_idx) = self.decode_block_idx(idx)?;
-        let k = self.k();
         let k_star = self.k_star();
         if w_eval.len() != k_star {
             return Err("dot_q3_w_eval: bad w_eval length".to_string());
         }
-        let mut s_star = F::ZERO;
-        let mut s_low = F::ZERO;
-        self.code.row_e_star_stream(local_idx, &mut |j, c| {
-            let t = c * w_eval[j];
-            s_star += t;
-            if j < k {
-                s_low += t;
+        if !dpp::dr1cs_flpcp::is_f257_field::<F>() {
+            return Err("dot_q3_w_eval: unsupported field (tiny-lock requires F257)".to_string());
+        }
+        let (_block_id, local_idx) = self.decode_block_idx(idx)?;
+        let mut star_u16 = [0u16; 1];
+        let mut low_u16 = [0u16; 1];
+        self.code.dot_row_e_star_many_mod257_u16(&[local_idx], w_eval, &mut star_u16, &mut low_u16)?;
+        let lam_u16 = (lambda.into_bigint().as_ref()[0] % 257) as u16;
+        let prod = crate::lockable_ringlwe::mul_mod257_u16(lam_u16, low_u16[0]);
+        let dot_u16 = if star_u16[0] >= prod { star_u16[0] - prod } else { star_u16[0] + 257 - prod };
+        Ok(F::from(dot_u16 as u64))
+    }
+
+    fn dot_q3_w_eval_many(
+        &self,
+        idxs: &[usize],
+        lambdas: &[F],
+        _x: &[F],
+        _scratch: &mut Dr1csQueryScratch<F>,
+        w_eval: &[F],
+        out: &mut [F],
+    ) -> Result<(), String> {
+        if idxs.len() != lambdas.len() || idxs.len() != out.len() {
+            return Err("dot_q3_w_eval_many: length mismatch".to_string());
+        }
+        if idxs.is_empty() {
+            return Ok(());
+        }
+
+        // Tiny-lock path is **F257-only**. Do not silently fall back to slow generic field logic.
+        if !dpp::dr1cs_flpcp::is_f257_field::<F>() {
+            return Err("dot_q3_w_eval_many: unsupported field (tiny-lock requires F257)".to_string());
+        }
+
+        // All coins must target the same streamed block.
+        let (b0, _) = self.decode_block_idx(idxs[0])?;
+        for &idx in idxs.iter() {
+            let (b, _) = self.decode_block_idx(idx)?;
+            if b != b0 {
+                return Err("dot_q3_w_eval_many: mixed block ids".to_string());
             }
-        })?;
-        Ok(s_star - (lambda * s_low))
+        }
+
+        #[inline]
+        fn sub_mod257_u16(a: u16, b: u16) -> u16 {
+            if a >= b { a - b } else { a + 257 - b }
+        }
+
+        // Batch in chunks to avoid large stack arrays and keep code paths predictable.
+        const CHUNK: usize = 64;
+        let mut locals: Vec<usize> = Vec::with_capacity(CHUNK);
+        let mut star_u16: Vec<u16> = vec![0u16; CHUNK];
+        let mut low_u16: Vec<u16> = vec![0u16; CHUNK];
+
+        let mut off = 0usize;
+        while off < idxs.len() {
+            let end = (off + CHUNK).min(idxs.len());
+            let n = end - off;
+            locals.clear();
+            for &idx in &idxs[off..end] {
+                let (_, local) = self.decode_block_idx(idx)?;
+                locals.push(local);
+            }
+
+            self.code.dot_row_e_star_many_mod257_u16(
+                &locals,
+                w_eval,
+                &mut star_u16[..n],
+                &mut low_u16[..n],
+            )?;
+
+            for j in 0..n {
+                let lam_u16 = (lambdas[off + j].into_bigint().as_ref()[0] % 257) as u16;
+                let prod = crate::lockable_ringlwe::mul_mod257_u16(lam_u16, low_u16[j]);
+                let dot_u16 = sub_mod257_u16(star_u16[j], prod);
+                out[off + j] = F::from(dot_u16 as u64);
+            }
+            off = end;
+        }
+        Ok(())
     }
 
     fn prove(&self, x: &[F], z_w: &[F]) -> Vec<F> {

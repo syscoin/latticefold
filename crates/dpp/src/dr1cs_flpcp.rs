@@ -125,6 +125,28 @@ pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
         self.stream_queries_for_coins_sparse(idx, lambda, x, scratch, &mut sink)?;
         Ok(sink.acc)
     }
+
+    /// Batched version of `dot_q3_w_eval` for a fixed streamed `w_eval[block]`.
+    ///
+    /// Default implementation calls `dot_q3_w_eval` per coin. Structured backends should
+    /// override this to amortize the `w_eval` traversal across many coins (e.g. all hits for a block).
+    fn dot_q3_w_eval_many(
+        &self,
+        idxs: &[usize],
+        lambdas: &[F],
+        x: &[F],
+        scratch: &mut Dr1csQueryScratch<F>,
+        w_eval: &[F],
+        out: &mut [F],
+    ) -> Result<(), String> {
+        if idxs.len() != lambdas.len() || idxs.len() != out.len() {
+            return Err("dot_q3_w_eval_many: length mismatch".to_string());
+        }
+        for i in 0..idxs.len() {
+            out[i] = self.dot_q3_w_eval(idxs[i], lambdas[i], x, scratch, w_eval)?;
+        }
+        Ok(())
+    }
     /// Prover: given public `x` and private witness `z_w`, output π = (z_w || w).
     fn prove(&self, x: &[F], z_w: &[F]) -> Vec<F>;
     /// Deterministic sparse queries for fixed verifier coins.
@@ -253,6 +275,27 @@ pub trait MulCode<F: PrimeField> {
             .to_string())
     }
 
+    /// Fast F257-only helper: for each `idx` in `idxs`, compute the dot products
+    /// \(\langle row_e_star(idx), w_eval \rangle\) and \(\langle row_e_star_low(idx), w_eval_low \rangle\) mod 257,
+    /// where `w_eval` is in **Layout A** (the output layout of `witness_positions_star()` / `stream_w_eval_blocks()`).
+    ///
+    /// Implementations with structure (e.g. tensor-RS) should override this to batch many dots
+    /// while traversing `w_eval` only once (bandwidth win when `|idxs|` is large, e.g. hits-per-block).
+    fn dot_row_e_star_many_mod257_u16(
+        &self,
+        idxs: &[usize],
+        w_eval: &[F],
+        out_star_u16: &mut [u16],
+        out_low_u16: &mut [u16],
+    ) -> Result<(), String>
+    where
+        Self: Sync,
+    {
+        let _ = (idxs, w_eval, out_star_u16, out_low_u16);
+        Err("dot_row_e_star_many_mod257_u16: not implemented for this MulCode; override this method for F257 tensor fast path"
+            .to_string())
+    }
+
     /// Stream coefficients for E(·)[idx] without allocating a full vector.
     fn row_e_stream(&self, idx: usize, f: &mut dyn FnMut(usize, F)) -> Result<(), String> {
         let row = self.row_e(idx)?;
@@ -302,6 +345,13 @@ struct TensorRsF257Rank3Scratch {
     t0: Vec<u16>,
     t1: Vec<u16>,
     out_grid: Vec<u16>,
+    // Batched q3 dot scratch (Layout A traversal).
+    coords: Vec<usize>,
+    lam01: Vec<u16>,
+    acc_star_u16: Vec<u16>,
+    acc_low_u16: Vec<u16>,
+    tmp_star_u32: Vec<u32>,
+    tmp_low_u32: Vec<u32>,
 }
 
 thread_local! {
@@ -1138,6 +1188,220 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
         } else {
             <Self as MulCode<F>>::eval_e_at_positions_into_u16(self, positions, y_u16, out_u16)
         }
+    }
+
+    fn dot_row_e_star_many_mod257_u16(
+        &self,
+        idxs: &[usize],
+        w_eval: &[F],
+        out_star_u16: &mut [u16],
+        out_low_u16: &mut [u16],
+    ) -> Result<(), String>
+    where
+        Self: Sync,
+    {
+        if !Self::is_f257() || self.rank != 3 {
+            return <Self as MulCode<F>>::dot_row_e_star_many_mod257_u16(
+                self,
+                idxs,
+                w_eval,
+                out_star_u16,
+                out_low_u16,
+            );
+        }
+        let batch = idxs.len();
+        if out_star_u16.len() != batch || out_low_u16.len() != batch {
+            return Err("dot_row_e_star_many_mod257_u16: output length mismatch".to_string());
+        }
+        if batch == 0 {
+            return Ok(());
+        }
+        let k_star = self.dim_k_star();
+        if w_eval.len() != k_star {
+            return Err("dot_row_e_star_many_mod257_u16: bad w_eval length".to_string());
+        }
+        let ell = self.len_l();
+        for &idx in idxs {
+            if idx >= ell {
+                return Err("dot_row_e_star_many_mod257_u16: idx out of range".to_string());
+            }
+        }
+
+        let base_k = self.base_k;
+        let side = 2 * base_k - 1;
+        let side2 = side * side;
+        let k = self.dim_k();
+
+        #[inline]
+        fn f257_u16<F: PrimeField>(x: &F) -> u16 {
+            // F257 values are always < 257 in our pipeline; take the least limb mod 257.
+            (x.into_bigint().as_ref()[0] % 257) as u16
+        }
+
+        #[inline]
+        fn flush_chunk(
+            batch: usize,
+            acc_star_u16: &mut [u16],
+            acc_low_u16: &mut [u16],
+            tmp_star_u32: &mut [u32],
+            tmp_low_u32: &mut [u32],
+        ) {
+            for i in 0..batch {
+                let t = reduce_mod257_u32(tmp_star_u32[i]);
+                if t != 0 {
+                    acc_star_u16[i] = add_mod(acc_star_u16[i], t);
+                }
+                tmp_star_u32[i] = 0;
+                let t = reduce_mod257_u32(tmp_low_u32[i]);
+                if t != 0 {
+                    acc_low_u16[i] = add_mod(acc_low_u16[i], t);
+                }
+                tmp_low_u32[i] = 0;
+            }
+        }
+
+        TENSOR_RS_F257_R3_SCRATCH.with(|cell| {
+            let mut s = cell.borrow_mut();
+            let s: &mut TensorRsF257Rank3Scratch = &mut *s;
+
+            s.coords.resize(batch * 3, 0);
+            s.lam01.resize(batch * side2, 0);
+            s.acc_star_u16.resize(batch, 0);
+            s.acc_low_u16.resize(batch, 0);
+            s.tmp_star_u32.resize(batch, 0);
+            s.tmp_low_u32.resize(batch, 0);
+            for v in s.acc_star_u16.iter_mut() {
+                *v = 0;
+            }
+            for v in s.acc_low_u16.iter_mut() {
+                *v = 0;
+            }
+            for v in s.tmp_star_u32.iter_mut() {
+                *v = 0;
+            }
+            for v in s.tmp_low_u32.iter_mut() {
+                *v = 0;
+            }
+
+            // Precompute per-idx coordinates and lam01(c1,c0)=lam0[c0]*lam1[c1].
+            for (i, &idx) in idxs.iter().enumerate() {
+                let coords = self.decompose_index(idx);
+                debug_assert_eq!(coords.len(), 3);
+                let c0 = coords[0];
+                let c1 = coords[1];
+                let c2 = coords[2];
+                s.coords[i * 3] = c0;
+                s.coords[i * 3 + 1] = c1;
+                s.coords[i * 3 + 2] = c2;
+
+                let lam0 = &self.lam_star_u16[(c0 * side)..(c0 * side + side)];
+                let lam1 = &self.lam_star_u16[(c1 * side)..(c1 * side + side)];
+                let lam01 = &mut s.lam01[(i * side2)..(i * side2 + side2)];
+                for j1 in 0..side {
+                    let l1 = lam1[j1];
+                    let row = &mut lam01[(j1 * side)..(j1 * side + side)];
+                    for j0 in 0..side {
+                        row[j0] = mul_mod(lam0[j0], l1);
+                    }
+                }
+            }
+
+            // Traverse `w_eval` once in Layout A and update all batch accumulators.
+            let mut w_idx = 0usize;
+            let mut chunk = 0usize;
+            const CHUNK: usize = 1024;
+
+            // Low cube (also contributes to low).
+            for c2 in 0..base_k {
+                for c1 in 0..base_k {
+                    for c0 in 0..base_k {
+                        let w = f257_u16(&w_eval[w_idx]);
+                        if w != 0 {
+                            for i in 0..batch {
+                                let lam01 = &s.lam01[(i * side2)..(i * side2 + side2)];
+                                let coeff01 = lam01[c1 * side + c0];
+                                if coeff01 != 0 {
+                                    let base2 = s.coords[i * 3 + 2] * side;
+                                    let coeff = mul_mod(coeff01, self.lam_star_u16[base2 + c2]);
+                                    if coeff != 0 {
+                                        let prod = (coeff as u32) * (w as u32);
+                                        s.tmp_star_u32[i] = s.tmp_star_u32[i].wrapping_add(prod);
+                                        s.tmp_low_u32[i] = s.tmp_low_u32[i].wrapping_add(prod);
+                                    }
+                                }
+                            }
+                        }
+                        w_idx += 1;
+                        chunk += 1;
+                        if chunk == CHUNK {
+                            flush_chunk(
+                                batch,
+                                &mut s.acc_star_u16,
+                                &mut s.acc_low_u16,
+                                &mut s.tmp_star_u32,
+                                &mut s.tmp_low_u32,
+                            );
+                            chunk = 0;
+                        }
+                    }
+                }
+            }
+            debug_assert_eq!(w_idx, k);
+
+            // Rest of side-cube, skipping low cube points.
+            for c2 in 0..side {
+                for c1 in 0..side {
+                    for c0 in 0..side {
+                        if c0 < base_k && c1 < base_k && c2 < base_k {
+                            continue;
+                        }
+                        let w = f257_u16(&w_eval[w_idx]);
+                        if w != 0 {
+                            for i in 0..batch {
+                                let lam01 = &s.lam01[(i * side2)..(i * side2 + side2)];
+                                let coeff01 = lam01[c1 * side + c0];
+                                if coeff01 != 0 {
+                                    let base2 = s.coords[i * 3 + 2] * side;
+                                    let coeff = mul_mod(coeff01, self.lam_star_u16[base2 + c2]);
+                                    if coeff != 0 {
+                                        let prod = (coeff as u32) * (w as u32);
+                                        s.tmp_star_u32[i] = s.tmp_star_u32[i].wrapping_add(prod);
+                                    }
+                                }
+                            }
+                        }
+                        w_idx += 1;
+                        chunk += 1;
+                        if chunk == CHUNK {
+                            flush_chunk(
+                                batch,
+                                &mut s.acc_star_u16,
+                                &mut s.acc_low_u16,
+                                &mut s.tmp_star_u32,
+                                &mut s.tmp_low_u32,
+                            );
+                            chunk = 0;
+                        }
+                    }
+                }
+            }
+            if chunk != 0 {
+                flush_chunk(
+                    batch,
+                    &mut s.acc_star_u16,
+                    &mut s.acc_low_u16,
+                    &mut s.tmp_star_u32,
+                    &mut s.tmp_low_u32,
+                );
+            }
+            if w_idx != k_star {
+                return Err("dot_row_e_star_many_mod257_u16: total length mismatch".to_string());
+            }
+
+            out_star_u16.copy_from_slice(&s.acc_star_u16[..batch]);
+            out_low_u16.copy_from_slice(&s.acc_low_u16[..batch]);
+            Ok(())
+        })
     }
 
     fn witness_positions_star(&self) -> Result<Vec<usize>, String> {
@@ -2421,7 +2685,7 @@ fn mul_mod(a: u16, b: u16) -> u16 {
     reduce_mod257_u32((a as u32) * (b as u32))
 }
 
-pub(crate) fn is_f257_field<F: PrimeField>() -> bool {
+pub fn is_f257_field<F: PrimeField>() -> bool {
     let bytes = F::MODULUS.to_bytes_le();
     let mut acc: u64 = 0;
     for (i, b) in bytes.iter().enumerate().take(8) {
