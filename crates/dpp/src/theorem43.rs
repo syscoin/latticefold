@@ -36,6 +36,8 @@ pub struct Theorem43Coins<F: PrimeField> {
     pub lambda: F,
     pub rho: F,
     pub sigma: F,
+    /// Public per-hit accept coin in `{1,2}` (used by the normalization layer).
+    pub c_hit: F,
 }
 
 /// Public arming artifact for the hidden-query lockable DPP.
@@ -396,7 +398,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
         for (i, c) in coeffs.iter().copied().enumerate().skip(2) {
             acc += c * tail[i];
         }
-        Ok(acc + F::ONE)
+        Ok(acc + art.coins.c_hit)
     }
 
     /// Deterministically derive the public coins for a given `(c_stmt, block_id, rep_id)`.
@@ -474,7 +476,19 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
         let rho = squeeze_f257_as_f_reject_digits::<F>(&mut sp_coins, &[0])?;
         let sigma = squeeze_f257_as_f_reject_digits::<F>(&mut sp_coins, &[0])?;
 
-        Ok(Theorem43Coins { idx, lambda, rho, sigma })
+        // Public accept coin in `{1,2}`.
+        //
+        // Sample an unbiased bit from uniform base-257 digits (reject 256), then map to 1/2.
+        let bit = squeeze_unbiased_bits_from_f257_digits(&mut sp_coins, 1)?[0];
+        let c_hit = if bit == 0 { F::ONE } else { F::from(2u64) };
+
+        Ok(Theorem43Coins {
+            idx,
+            lambda,
+            rho,
+            sigma,
+            c_hit,
+        })
     }
 
     /// Arm using a fixed FS transcript for the **full-gate cost shape**, while keeping `q` hidden.
@@ -524,7 +538,16 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
         // We reject digit 256 so accepted digits are uniform in 0..255, making LSB extraction unbiased.
         let q_minus_1 = (self.p as usize) - 1;
         let q_bits = squeeze_unbiased_bits_from_f257_digits(&mut sp_hidden, q_minus_1)?;
-        let coeffs = self.sq_coeffs_from_uv_bits(&q_bits)?;
+        // Normalization layer (GPT PRO):
+        // interpret `raw` as coefficients of `S(u) = Σ_{k=1..256} s_k u^k` (stored as raw[k-1]),
+        // and output `S(u)^2 - S(u)` modulo `u^{257}-u`, which is a cyclic convolution with a +1 shift.
+        //
+        // This codebase treats theorem43 as **F257-only** (tiny-field demo), so we do this
+        // unconditionally.
+        let coeffs = {
+            let raw = self.sq_coeffs_from_uv_bits(&q_bits)?;
+            normalize_sq_coeffs_s2_minus_s(&raw)?
+        };
         let len = x.len() + self.proof_len();
 
         Ok(Theorem43LockArtifact {
@@ -1034,7 +1057,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             let mut sink = PiQuerySink {
                 x,
                 x_len,
-                offset: F::ONE,
+                offset: coins.c_hit,
                 coeff_alpha,
                 coeff_beta,
                 coeff_gamma,
@@ -1143,6 +1166,26 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
         flpcp.stream_queries_for_coins_sparse(coins.idx, coins.lambda, x, scratch, &mut sink)?;
         Ok(())
     }
+}
+
+/// Normalization layer: map `S(u)` coefficients to `S(u)^2 - S(u)` modulo `u^{257}-u`.
+///
+/// Input/output are length-256 vectors interpreted as coefficients of `u^1..u^256`.
+fn normalize_sq_coeffs_s2_minus_s<F: PrimeField>(coeffs: &[F]) -> Result<Vec<F>, String> {
+    if coeffs.len() != 256 {
+        return Err("normalize_sq_coeffs_s2_minus_s: expected 256 coeffs for F257".to_string());
+    }
+    let mut sq = vec![F::ZERO; 256];
+    for i in 0..256usize {
+        for j in 0..256usize {
+            let idx = (i + j + 1) & 255; // mod 256 with +1 shift (see doc)
+            sq[idx] += coeffs[i] * coeffs[j];
+        }
+    }
+    for k in 0..256usize {
+        sq[k] -= coeffs[k];
+    }
+    Ok(sq)
 }
 
 fn field_modulus_u64<F: PrimeField>() -> Option<u64> {

@@ -1340,7 +1340,10 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                     let sum_c = flpcp.code.dot_row_e_star_low_u16(local_idx, &cx)?;
                     let lambda_u16 = (art.coins.lambda.into_bigint().as_ref()[0] % 257) as u16;
 
-                    let mut delta_x_mod257: u16 = 1;
+                    // Normalization layer: the protocol constant is the public per-hit `c_hit ∈ {1,2}`
+                    // (derived from the Theorem-4.3 public coins transcript), not a fixed 1.
+                    let c_hit_u16 = (art.coins.c_hit.into_bigint().as_ref()[0] % 257) as u16;
+                    let mut delta_x_mod257: u16 = c_hit_u16;
                     delta_x_mod257 = crate::lockable_ringlwe::add_mod257_u16(
                         delta_x_mod257,
                         crate::lockable_ringlwe::mul_mod257_u16(abg_coeffs_mod257[0], sum_a),
