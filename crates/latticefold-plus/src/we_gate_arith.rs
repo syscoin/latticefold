@@ -1617,15 +1617,15 @@ mod tests {
             let arm0 = {
                 let mut rng0 = StdRng::from_seed(seed0);
                 arm_lfplus_ringlwe_lock::<R>(
-                    shape.clone(),
-                    &stmt_digest_f257,
-                    armer_seed,
-                    lock_j,
-                    0,
+                shape.clone(),
+                &stmt_digest_f257,
+                armer_seed,
+                lock_j,
+                0,
                     policy0,
-                    ringlwe_params.clone(),
+                ringlwe_params.clone(),
                     hits_per_block,
-                    &dummy_payload,
+                &dummy_payload,
                     &mut rng0,
                 )
                 .unwrap_or_else(|e| panic!("arm ctx0 failed: {e}"))
@@ -3052,8 +3052,10 @@ mod tests {
         .expect("decap_finish1");
         for lock in [&lock0, &lock1] {
             assert_eq!(lock.sublocks.len(), 1);
-            assert_eq!(lock.sublocks[0].accepting_set[0], F257::ONE);
-            assert_eq!(lock.sublocks[0].accepting_set[1], F257::from(2u64));
+            assert_eq!(
+                lock.sublocks[0].accepting_set[1],
+                lock.sublocks[0].accepting_set[0] + F257::ONE
+            );
         }
         maybe_print_rss("tiny_gate_large:after_prove_decap_stream");
         eprintln!("[tiny_gate_large] prove+decap(stream) in {:?}", t_prove.elapsed());

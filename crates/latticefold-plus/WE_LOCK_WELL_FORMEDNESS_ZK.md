@@ -147,7 +147,7 @@ For each sublock:
   \]
   matching `Theorem43Dpp::arm`.
 - **(C3) Streamed query → accepting-set binding (ZK):** run `stream_query_terms_for_pi` logic and prove:
-  - the sublock’s published `accepting_set` equals `[1-offset, 2-offset]` for the streamed `offset`,
+  - the sublock’s published `accepting_set` equals `[c_hit, c_hit+1]` for the derived `c_hit`,
   - both accepting elements are nonzero.
 
 This prevents an armer from publishing mismatched `(accepting_set, coins)` that would make an honest decapper compute the wrong divisions.
@@ -229,7 +229,7 @@ Below is an exhaustive list of armer moves whose *only purpose* is to make decap
 
 - **Attack**: publish a shifted accepting set not equal to `[1-offset, 2-offset]` (or allow a zero element), which breaks the decapper’s division step.
 - **Blocked by**:
-  - **(C3)** `accepting_set_shifted = [1-offset, 2-offset]`,
+  - **(C3)** `accepting_set = [offset, offset+1]`,
   - the explicit **nonzero accepting-set** check (matches `arm_ringlwe_lock`).
 
 ### 4) “Break packing/embedding so the dot product is wrong”

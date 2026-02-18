@@ -154,7 +154,7 @@ fn test_theorem43_f257_arm_prove_split_roundtrip() {
 
     // Arm (FS) without any proof.
     let art = dpp.arm(&c_stmt, &x, &armer_secret, 0, 0).expect("arm");
-    assert_eq!(art.accepting_set, [F257::ONE, F257::from(2u64)]);
+    assert_eq!(art.accepting_set[1], art.accepting_set[0] + F257::ONE);
     assert_eq!(art.len, x.len() + dpp.proof_len());
 
     // Prove later using public coins only (canonical split proof).
@@ -163,7 +163,7 @@ fn test_theorem43_f257_arm_prove_split_roundtrip() {
     let a_full = dpp
         .answer_from_pi0_and_tail(&art, &x, &pi0, &tail)
         .expect("answer_from_pi0_and_tail");
-    assert!(dpp.accept_answer(&a_full));
+    assert!(a_full == art.accepting_set[0] || a_full == art.accepting_set[1]);
 
     eprintln!(
         "theorem43/f257: proof_len={} (m={} + 2 + (p-3)=254), q_nnz={}, a(u8)={}",
@@ -213,10 +213,10 @@ fn test_theorem43_f257_reuse_single_pi0_many_coin_tails() {
     let a0 = dpp
         .answer_from_pi0_and_tail(&art0, &x, &pi0, &tail0)
         .expect("answer_from_pi0_and_tail(0)");
-    assert!(dpp.accept_answer(&a0));
+    assert!(a0 == art0.accepting_set[0] || a0 == art0.accepting_set[1]);
 
     let a1 = dpp
         .answer_from_pi0_and_tail(&art1, &x, &pi0, &tail1)
         .expect("answer_from_pi0_and_tail(1)");
-    assert!(dpp.accept_answer(&a1));
+    assert!(a1 == art1.accepting_set[0] || a1 == art1.accepting_set[1]);
 }

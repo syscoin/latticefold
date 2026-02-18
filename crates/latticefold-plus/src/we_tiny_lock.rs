@@ -1334,6 +1334,7 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
 
     let ell_local: usize = flpcp.ell_local().max(1);
     let mut reps: Vec<RepArm<F>> = Vec::with_capacity(h_global as usize);
+    let mut used_ratio_classes: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
     for rep_j in 0..(h_global as usize) {
         let anchor_block_id: u32 =
             derive_anchor_block_id(&armer_seed, &stmt_digest, lock_j, rep_j, blocks);
@@ -1346,6 +1347,7 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
         let mut rej_deg: usize = 0;
         let mut rej_c2_zero: usize = 0;
         let mut rej_nnz: usize = 0;
+        let mut rej_ratio: usize = 0;
         let mut chosen: Option<(u64, Theorem43LockArtifact<F>)> = None;
         while tries < max_rep_tries {
             tries += 1;
@@ -1381,15 +1383,27 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
                 rej_nnz += 1;
                 continue;
             }
+            // Enforce distinct accepting-set ratio classes across reps (public non-bricking policy).
+            let rc = crate::lockable_ringlwe::ratio_class_mod257_u16(
+                &art.accepting_set[0],
+                &art.accepting_set[1],
+            )?;
+            if used_ratio_classes.contains(&rc) {
+                rej_ratio += 1;
+                continue;
+            }
             chosen = Some((rep_id, art));
             break;
         }
         let (rep_id, art) = chosen.ok_or_else(|| {
             format!(
-                "arm_we_ringlwe_lock_from_dr1cs: failed to arm rep within retry budget (rep_j={}, anchor_block_id={}, tries={}, rej_deg={}, rej_c2_zero={}, rej_nnz={})",
-                rep_j, anchor_block_id, tries, rej_deg, rej_c2_zero, rej_nnz
+                "arm_we_ringlwe_lock_from_dr1cs: failed to arm rep within retry budget (rep_j={}, anchor_block_id={}, tries={}, rej_deg={}, rej_c2_zero={}, rej_nnz={}, rej_ratio={})",
+                rep_j, anchor_block_id, tries, rej_deg, rej_c2_zero, rej_nnz, rej_ratio
             )
         })?;
+        // Safe: ratio class was checked during selection.
+        let rc = crate::lockable_ringlwe::ratio_class_mod257_u16(&art.accepting_set[0], &art.accepting_set[1])?;
+        used_ratio_classes.insert(rc);
 
         // Derive unscaled coefficients.
         let c1 = art.coeffs[0];

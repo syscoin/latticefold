@@ -817,6 +817,24 @@ pub fn arm_ringlwe_lock<F: PrimeField>(
             return Err("arm_ringlwe_lock: sublock channel_id out of range".to_string());
         }
     }
+    // Public non-bricking policy: within each channel, repetitions must have distinct accepting-set
+    // ratio classes so intersections collapse deterministically at small `R`.
+    //
+    // This is enforced at arming time to prevent publishing ambiguous packages.
+    let r = sublocks_per_channel as usize;
+    for ch in 0..(p_channels as usize) {
+        let mut seen: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+        for rep_j in 0..r {
+            let si = ch.saturating_mul(r).saturating_add(rep_j);
+            let sl = sublocks
+                .get(si)
+                .ok_or_else(|| "arm_ringlwe_lock: sublock index OOB".to_string())?;
+            let rc = ratio_class_mod257_u16(&sl.accepting_set[0], &sl.accepting_set[1])?;
+            if !seen.insert(rc) {
+                return Err("arm_ringlwe_lock: duplicate accepting-set ratio class within channel".to_string());
+            }
+        }
+    }
 
     // Encrypt payload once under a key derived from the tuple of per-channel secrets.
     let key = derive_payload_key_bytes_multi(
@@ -881,7 +899,7 @@ mod tests {
         let zero64 = [0u16; 64];
         let sub = RingLweSubLock::<F257> {
             channel_id: 0,
-            accepting_set: [F257::from(1u64), F257::from(2u64)],
+            accepting_set: [F257::from(7u64), F257::from(8u64)],
             anchor_block_id: 0,
             rep_id: 0,
             hints: BranchHintsCompressed {
