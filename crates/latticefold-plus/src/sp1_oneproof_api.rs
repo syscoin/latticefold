@@ -361,7 +361,7 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
     // - We use a single channel (`P=1`) to minimize format/logic complexity.
     // - Per-block soundness and disambiguation both come from `hits_per_block` independent hits
     //   on every FLPCP block (full coverage).
-    let p_channels: u16 = 1;
+    let _p_channels: u16 = 1;
     let hits_per_block_raw: usize = std::env::var("LFP_ONEPROOF_HITS_PER_BLOCK")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -855,148 +855,192 @@ fn decap_sp1_oneproof_we_gate_from_files_inner(
 
     let t_prove = Instant::now();
     maybe_print_rss("oneproof:before_prove_decap_stream");
-    let total_sublks: usize = locks.iter().map(|l| l.sublocks.len()).sum();
-    let mut state_meta: Vec<(usize, usize, u16)> = Vec::with_capacity(total_sublks); // (lock_i, sublock_i, channel_id)
-    let mut coins_list: Vec<_> = Vec::with_capacity(total_sublks);
+
+    let mut candidates_per_lock: Vec<(u32, Vec<[u8; 32]>)> = Vec::with_capacity(locks.len());
+
     for (li, l) in locks.iter().enumerate() {
-        for (si, sl) in l.sublocks.iter().enumerate() {
-            let coins = prover.derive_public_coins_from_stmt(
+        if l.sublocks.is_empty() {
+            return Err("oneproof: lock has zero sublocks".to_string());
+        }
+
+        // Poison is mandatory and is shared across all sublocks in the lock.
+        let poison_blocks: usize = l.sublocks[0].hints.poison_blocks as usize;
+        if poison_blocks == 0 {
+            return Err("oneproof: poison_blocks=0 (poison is mandatory)".to_string());
+        }
+        for sl in &l.sublocks {
+            if sl.hints.poison_blocks as usize != poison_blocks {
+                return Err("oneproof: poison_blocks mismatch across sublocks".to_string());
+            }
+        }
+
+        // Canonical path: compute coins per sublock (no coin reuse assumptions).
+        let mut coins_list: Vec<_> = Vec::with_capacity(l.sublocks.len());
+        for sl in &l.sublocks {
+            coins_list.push(prover.derive_public_coins_from_stmt(
                 l.c_stmt.as_slice(),
-                sl.block_id as usize,
+                sl.anchor_block_id as usize,
                 sl.rep_id,
-            )?;
-            coins_list.push(coins);
-            state_meta.push((li, si, sl.channel_id));
+            )?);
         }
-    }
 
-    // Tail-dot only: avoid allocating/storing the 256-element tail vector per sublock.
-    let mut tail_dots_mod257: Vec<u16> = vec![0u16; coins_list.len()];
-    let mut cur_ci: Option<usize> = None;
-    let mut cur_blk: usize = 0;
-    let mut buf_len: usize = 0;
-    let mut buf64: [u16; 64] = [0u16; 64];
-    let abg_list = prover.stream_pi0_and_collect_tails(
-        &x,
-        z_w,
-        &coins_list,
-        None,
-        &mut |ci, _ti, t| {
-            // Tail elements are visited coin-by-coin, in order.
-            if cur_ci != Some(ci) {
-                cur_ci = Some(ci);
-                cur_blk = 0;
-                buf_len = 0;
-            }
-            let td = crate::lockable_ringlwe::field_mod257_u16(t);
-            buf64[buf_len] = td;
-            buf_len += 1;
-            if buf_len == 64 {
-                // Dot this 64-chunk against the corresponding packed coefficients.
-                let (li, local_si, _ch) = state_meta[ci];
-                let sl = &locks[li].sublocks[local_si];
-                let blk = &sl.hints.tail_scales[cur_blk];
-                let add = crate::lockable_ringlwe::dot_packed_block_mod257_u16(blk, &buf64);
-                let acc = &mut tail_dots_mod257[ci];
-                *acc = crate::lockable_ringlwe::add_mod257_u16(*acc, add);
-                cur_blk += 1;
-                buf_len = 0;
-            }
-        },
-    )?;
-    if abg_list.len() != coins_list.len() || tail_dots_mod257.len() != coins_list.len() {
-        return Err("oneproof: internal abgs/coins length mismatch".to_string());
-    }
-    // Final flush sanity: we should end exactly on a chunk boundary.
-    if buf_len != 0 {
-        return Err("oneproof: internal tail-dot buffer misalignment".to_string());
-    }
-    maybe_print_rss("oneproof:after_prove_decap_stream");
-    eprintln!("[oneproof] prove+decap(stream) in {:?}", t_prove.elapsed());
-
-    // Recover per-sublock scalar candidates, then per-lock decrypt candidates.
-    //
-    // Both stages are embarrassingly parallel (per sublock / per lock).
-    let mut per_lock_sublock_cands: Vec<Vec<Option<(u16, [u16; 2])>>> = locks
-        .iter()
-        .map(|l| vec![None; l.sublocks.len()])
-        .collect();
-    let candidates_per_lock: Vec<(u32, Vec<[u8; 32]>)> = {
-        use rayon::prelude::*;
-
-        // 1) Finish per-sublock candidate extraction (parallel over sublocks).
-        let state_meta_ref = &state_meta;
-
-        use crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail;
-        let tail_dots_ref = &tail_dots_mod257;
-        let per_state: Vec<(usize, usize, u16, [u16; 2])> = abg_list
-            .into_par_iter()
-            .enumerate()
-            .map(|(si, abg)| -> Result<(usize, usize, u16, [u16; 2]), String> {
-                let (li, local_si, ch_expect) = state_meta_ref
-                    .get(si)
-                    .copied()
-                    .ok_or_else(|| "oneproof: internal state_meta mismatch".to_string())?;
-                let l = locks
-                    .get(li)
-                    .ok_or_else(|| "oneproof: internal lock index mismatch".to_string())?;
-                let sl = l
-                    .sublocks
-                    .get(local_si)
-                    .ok_or_else(|| "oneproof: internal sublock index mismatch".to_string())?;
-                if sl.channel_id != ch_expect {
-                    return Err("oneproof: internal channel_id mismatch".to_string());
+        // Tail-dot only: compute per-sublock tail dot without storing tails.
+        let mut tail_dots_mod257: Vec<u16> = vec![0u16; l.sublocks.len()];
+        let mut cur_hi: Option<usize> = None;
+        let mut cur_blk: usize = 0;
+        let mut buf_len: usize = 0;
+        let mut buf64: [u16; 64] = [0u16; 64];
+        let abg_list = prover.stream_pi0_and_collect_tails(
+            &x,
+            z_w,
+            &coins_list,
+            None,
+            &mut |hi, ti, t| {
+                if cur_hi != Some(hi) {
+                    cur_hi = Some(hi);
+                    cur_blk = 0;
+                    buf_len = 0;
                 }
-                let td = *tail_dots_ref
-                    .get(si)
-                    .ok_or_else(|| "oneproof: internal tail_dot index mismatch".to_string())?;
-                let cands = sublock_s_candidates_from_abg_tail(sl, &abg, td)?;
-                Ok((li, local_si, ch_expect, cands))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        for (li, local_si, ch2, cands) in per_state {
-            let slots = per_lock_sublock_cands
-                .get_mut(li)
-                .ok_or_else(|| "oneproof: internal lock index mismatch".to_string())?;
-            if local_si >= slots.len() {
-                return Err("oneproof: internal sublock index mismatch".to_string());
-            }
-            slots[local_si] = Some((ch2, cands));
+                // Tail has exactly 256 elements for F257: indices 0..255 packed into 4×64 blocks.
+                buf64[buf_len] = crate::lockable_ringlwe::field_mod257_u16(t);
+                buf_len += 1;
+                if buf_len == 64 {
+                    let si = hi;
+                    let sl = &l.sublocks[si];
+                    let blk = &sl.hints.tail_scales[cur_blk];
+                    let add = crate::lockable_ringlwe::dot_packed_block_mod257_u16(blk, &buf64);
+                    let acc = &mut tail_dots_mod257[si];
+                    *acc = crate::lockable_ringlwe::add_mod257_u16(*acc, add);
+                    cur_blk += 1;
+                    buf_len = 0;
+                }
+            },
+        )?;
+        if abg_list.len() != l.sublocks.len() {
+            return Err("oneproof: internal abg_list length mismatch".to_string());
+        }
+        if buf_len != 0 {
+            return Err("oneproof: internal tail-dot buffer misalignment".to_string());
         }
 
-        // 2) Decrypt per lock (parallel over locks).
-        locks
+        // ---------------------------------------------------------------------
+        // Poison term: compute `y_err` per (channel,rep) by folding MulEq residuals over all blocks.
+        // ---------------------------------------------------------------------
+        let p = l.p_channels as usize;
+        let r = l.sublocks_per_channel as usize;
+        if p == 0 || r == 0 {
+            return Err("oneproof: invalid (P,R)".to_string());
+        }
+        if l.sublocks.len() != p.saturating_mul(r) {
+            return Err("oneproof: sublocks length mismatch (P*R)".to_string());
+        }
+        let mut y_err_mod257: Vec<u16> = vec![0u16; l.sublocks.len()];
+        for rep_j in 0..r {
+            // Use channel 0's rep_id as the rep identifier (rep_id is shared across channels).
+            let sl0 = &l.sublocks[rep_j];
+            if sl0.channel_id != 0 {
+                return Err("oneproof: expected channel-major ordering with channel 0 first".to_string());
+            }
+            let rep_id = sl0.rep_id;
+
+            // Derive coins for every block for this rep, then stream full ABG (no tails).
+            let mut rep_coins: Vec<_> = Vec::with_capacity(poison_blocks);
+            for b in 0..poison_blocks {
+                rep_coins.push(prover.derive_public_coins_from_stmt(
+                    l.c_stmt.as_slice(),
+                    b,
+                    rep_id,
+                )?);
+            }
+            let abg_full = prover.stream_pi0_and_collect_abg_full(&x, z_w, &rep_coins, None)?;
+            if abg_full.len() != poison_blocks {
+                return Err("oneproof: abg_full length mismatch".to_string());
+            }
+
+            for ch in 0..p {
+                let si = ch.saturating_mul(r).saturating_add(rep_j);
+                let sl = &l.sublocks[si];
+                if sl.rep_id != rep_id {
+                    return Err("oneproof: rep_id mismatch across channels".to_string());
+                }
+                y_err_mod257[si] =
+                    crate::lockable_ringlwe::poison_y_err_mod257_from_abg_full(&sl.hints, &abg_full)?;
+            }
+        }
+
+        // Compute masked `y_main` per sublock (parallel over sublocks), then recover per-channel
+        // secrets via intersection across reps (canonical 2-candidate mode).
+        use rayon::prelude::*;
+        use crate::lockable_ringlwe::masked_y_mod257_main_from_compressed_hint_and_tail;
+        let per_state: Vec<(usize, u16)> = l
+            .sublocks
             .par_iter()
             .enumerate()
-            .map(|(li, l)| -> Result<(u32, Vec<[u8; 32]>), String> {
-                let slots = per_lock_sublock_cands
-                    .get(li)
-                    .ok_or_else(|| "oneproof: internal lock index mismatch".to_string())?;
-                let mut sublock_cands: Vec<(u16, [u16; 2])> = Vec::with_capacity(slots.len());
-                for (i, v) in slots.iter().enumerate() {
-                    let vv = v.ok_or_else(|| {
-                        format!("oneproof: missing sublock candidate (lock[{li}] sublock[{i}])")
-                    })?;
-                    sublock_cands.push(vv);
-                }
-                let pt = crate::lockable_ringlwe::decrypt_payload_from_sublock_s_candidates(
-                    l,
-                    sublock_cands.as_slice(),
-                )
-                .map_err(|e| format!("oneproof: lock[{li}] decrypt candidates: {e}"))?;
-                if pt.len() != 32 {
-                    return Err(format!(
-                        "oneproof: share candidate wrong length at lock[{li}] ({})",
-                        pt.len()
-                    ));
-                }
-                let mut c = [0u8; 32];
-                c.copy_from_slice(&pt);
-                Ok((share_indices[li], vec![c]))
+            .map(|(si, sl)| -> Result<(usize, u16), String> {
+                let td = *tail_dots_mod257
+                    .get(si)
+                    .ok_or_else(|| "oneproof: tail_dot index mismatch".to_string())?;
+                let abg = abg_list
+                    .get(si)
+                    .ok_or_else(|| "oneproof: abg index mismatch".to_string())?;
+                let y_anchor = masked_y_mod257_main_from_compressed_hint_and_tail(&sl.hints, abg, td)?;
+                let y_err = *y_err_mod257
+                    .get(si)
+                    .ok_or_else(|| "oneproof: y_err index out of range".to_string())?;
+                let y_total = crate::lockable_ringlwe::add_mod257_u16(y_anchor, y_err);
+                Ok((si, y_total))
             })
-            .collect::<Result<Vec<_>, _>>()
-    }?;
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut masked_y_main_mod257: Vec<u16> = vec![0u16; l.sublocks.len()];
+        for (si, y_main) in per_state {
+            masked_y_main_mod257[si] = y_main;
+        }
+
+        // Compute per-sublock 2-candidate sets, then intersect within each channel.
+        let mut sublock_cands: Vec<(u16, [u16; 2])> = Vec::with_capacity(l.sublocks.len());
+        for (si, sl) in l.sublocks.iter().enumerate() {
+            let y = *masked_y_main_mod257
+                .get(si)
+                .ok_or_else(|| "oneproof: masked_y index out of range".to_string())?;
+            let cands = crate::lockable_ringlwe::s_candidates_from_y_and_accepting_set_mod257(
+                &sl.accepting_set,
+                y,
+            )?;
+            sublock_cands.push((sl.channel_id, cands));
+        }
+
+        if std::env::var("LFP_WE_POISON_LOG").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[oneproof][poison] lock[{li}] P={} R={} blocks={} (cands per sublock shown as (ch,[a,b]))",
+                p,
+                r,
+                poison_blocks
+            );
+            // Print only the first few to avoid massive logs.
+            let lim = sublock_cands.len().min(32);
+            for i in 0..lim {
+                let (ch, cc) = sublock_cands[i];
+                eprintln!("[oneproof][poison] sublock[{i}] ch={ch} cands={:?}", cc);
+            }
+        }
+
+        // NOTE: intersection errors must not be surfaced as an oracle in WE mode.
+        // For the OneProof harness we keep returning an error (research API); the lock layer
+        // should instead KDF-through-failure when integrating into production decap.
+        let pt = crate::lockable_ringlwe::decrypt_payload_from_sublock_s_candidates(l, &sublock_cands)?;
+        if pt.len() != 32 {
+            return Err(format!(
+                "oneproof: share candidate wrong length at lock[{li}] ({})",
+                pt.len()
+            ));
+        }
+        let mut c = [0u8; 32];
+        c.copy_from_slice(&pt);
+        candidates_per_lock.push((share_indices[li], vec![c]));
+    }
+
+    maybe_print_rss("oneproof:after_prove_decap_stream");
+    eprintln!("[oneproof] prove+decap(stream) in {:?}", t_prove.elapsed());
 
     let combine_cfg = ShamirConfig {
         threshold: t,
@@ -1076,14 +1120,16 @@ fn write_lock_package_to_writer(
     share_indices: &[u32],
     locks: &[RingLweLockArtifact<F257>],
 ) -> std::io::Result<()> {
-    // Canonical lock package v1.
+    // Canonical lock package encoding.
     //
     // IMPORTANT: lock packages are public artifacts and must not be silently mis-decoded.
-    // We bump the magic whenever we change semantics (e.g. length widths, hint packing convention).
-    // Canonical lock package v6:
-    // - compressed hints only (no sparse hints; no legacy formats).
-    // - hints store only `offset_scale = s*δ(x_arm)` rather than masked per-coordinate `h_x`.
-    w.write_all(b"LFP1LOCKV9")?;
+    // We use a single fixed magic and do not support legacy variants.
+    //
+    // Canonical format:
+    // - compressed hints only
+    // - `BranchHintsCompressed` stores a single statement-bound `offset_scale`
+    //   plus 4 packed tail blocks (no dual-offset, no deterministic-per-sublock path).
+    w.write_all(b"LFP1LOCKV10")?;
     // Embedded manifest (canonical public metadata).
     for f in &manifest.stmt_digest {
         w.write_all(&f257_to_u16(f).to_le_bytes())?;
@@ -1122,8 +1168,8 @@ fn write_lock_package_to_writer(
             // accepting_set
             w.write_all(&f257_to_u16(&sl.accepting_set[0]).to_le_bytes())?;
             w.write_all(&f257_to_u16(&sl.accepting_set[1]).to_le_bytes())?;
-            // coin-derivation inputs (canonical): derive public Theorem-4.3 coins from `(c_stmt, block_id, rep_id)`.
-            write_u32(w, sl.block_id)?;
+            // coin-derivation inputs (canonical): derive public Theorem-4.3 coins from `(c_stmt, anchor_block_id, rep_id)`.
+            write_u32(w, sl.anchor_block_id)?;
             write_u64(w, sl.rep_id)?;
             // hints (compressed only)
             if lock.params._reserved0 != 2 {
@@ -1170,6 +1216,24 @@ fn write_lock_package_to_writer(
             for blk in &hc.tail_scales {
                 write_packed_block(w, blk)?;
             }
+            // Canonical poison: always present.
+            if hc.poison_blocks == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid poison_blocks=0 (poison is mandatory)",
+                ));
+            }
+            write_u32(w, hc.poison_blocks)?;
+            let expected_nblk: usize = ((hc.poison_blocks as usize) + 63) / 64;
+            if hc.poison_err_scales.len() != expected_nblk {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "poison_err_scales length mismatch",
+                ));
+            }
+            for blk in &hc.poison_err_scales {
+                write_packed_block(w, blk)?;
+            }
         }
         // ciphertext (single)
         w.write_all(&lock.ct.nonce)?;
@@ -1188,10 +1252,10 @@ fn read_lock_package_from_reader(
     const MAX_C_STMT_LEN_DEFAULT: usize = 1 << 20;
     const MAX_CT_BYTES_DEFAULT: usize = 1 << 20;
 
-    let mut magic = [0u8; 10];
+    let mut magic = [0u8; 11];
     r.read_exact(&mut magic)?;
-    let v9 = &magic == b"LFP1LOCKV9";
-    if !v9 {
+    let v10 = &magic == b"LFP1LOCKV10";
+    if !v10 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "bad lock pkg magic",
@@ -1365,7 +1429,7 @@ fn read_lock_package_from_reader(
             r.read_exact(&mut b2)?;
             let a1 = u16::from_le_bytes(b2);
             // coin-derivation inputs (canonical)
-            let block_id = read_u32(r)?;
+            let anchor_block_id = read_u32(r)?;
             let rep_id = read_u64(r)?;
 
             fn read_packed_block(r: &mut impl Read) -> std::io::Result<PackedF257Block64> {
@@ -1451,16 +1515,32 @@ fn read_lock_package_from_reader(
             for i in 0..4 {
                 tail_scales[i] = read_packed_block(r)?;
             }
+            // Canonical poison: always present. Encoded as `poison_blocks` followed by exactly
+            // ceil(poison_blocks/64) packed blocks.
+            let poison_blocks = read_u32(r)?;
+            if poison_blocks == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid poison_blocks=0 (poison is mandatory)",
+                ));
+            }
+            let poison_nblk: usize = ((poison_blocks as usize) + 63) / 64;
+            let mut poison_err_scales: Vec<PackedF257Block64> = Vec::with_capacity(poison_nblk);
+            for _ in 0..poison_nblk {
+                poison_err_scales.push(read_packed_block(r)?);
+            }
             let hints = crate::lockable_ringlwe::BranchHintsCompressed {
                 abg_scales: abg,
                 offset_scale,
                 tail_scales,
+                poison_blocks,
+                poison_err_scales,
             };
 
             sublocks.push(RingLweSubLock::<F257> {
                 channel_id,
                 accepting_set: [u16_to_f257(a0), u16_to_f257(a1)],
-                block_id,
+                anchor_block_id,
                 rep_id,
                 hints,
             });
@@ -1524,7 +1604,7 @@ fn write_lock_package(
 
     // Optional wrapper compression:
     // - Outer magic: LFP1LOCKZ3
-    // - Payload: zstd frame whose decompressed bytes begin with inner magic LFP1LOCKV9
+    // - Payload: zstd frame whose decompressed bytes begin with inner magic LFP1LOCKV10
     const MAGIC_ZSTD_V3: &[u8; 10] = b"LFP1LOCKZ3";
 
     let f = std::fs::File::create(path)?;
@@ -1549,20 +1629,23 @@ fn read_lock_package(
 ) -> std::io::Result<(Sp1OneProofWeGateLockPkgManifest, Vec<u32>, Vec<RingLweLockArtifact<F257>>)> {
     use std::io::{Seek, SeekFrom};
 
-    // - Uncompressed: LFP1LOCKV9
-    // - Compressed wrapper: LFP1LOCKZ3 || zstd(LFP1LOCKV9 || ...)
-    const MAGIC_RAW_V9: &[u8; 10] = b"LFP1LOCKV9";
+    // - Uncompressed: LFP1LOCKV10
+    // - Compressed wrapper: LFP1LOCKZ3 || zstd(LFP1LOCKV10 || ...)
+    const MAGIC_RAW_V10: &[u8; 11] = b"LFP1LOCKV10";
     const MAGIC_ZSTD_V3: &[u8; 10] = b"LFP1LOCKZ3";
 
     let mut f = std::fs::File::open(path)?;
-    let mut magic = [0u8; 10];
+    // Read enough bytes to disambiguate:
+    // - raw magic is 11 bytes
+    // - zstd wrapper magic is 10 bytes (prefix)
+    let mut magic = [0u8; 11];
     f.read_exact(&mut magic)?;
-    if &magic == MAGIC_RAW_V9 {
+    if &magic == MAGIC_RAW_V10 {
         f.seek(SeekFrom::Start(0))?;
         let mut r = std::io::BufReader::new(f);
         return read_lock_package_from_reader(&mut r);
     }
-    if &magic == MAGIC_ZSTD_V3 {
+    if &magic[0..10] == MAGIC_ZSTD_V3 {
         // Start decoding zstd payload immediately after wrapper magic.
         f.seek(SeekFrom::Start(10))?;
         let r = std::io::BufReader::new(f);

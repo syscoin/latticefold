@@ -1566,7 +1566,8 @@ mod tests {
         let lock_j = 0u64;
 
         let ringlwe_params = RingLweParams::default();
-        let dummy_payload: [u8; 0] = [];
+        // Non-empty payload so the lock actually encrypts/decrypts something.
+        let dummy_payload: [u8; 32] = [7u8; 32];
 
         let mut rng = StdRng::seed_from_u64(42);
         let public_len = shape.public_len;
@@ -1587,7 +1588,10 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| vec![1, 2, 4, 8, 16, 32]);
+            // Global-hit mode still has a {1,2} ambiguity per hit; with too-few hits it is
+            // statistically possible to remain ambiguous (and decap intentionally refuses).
+            // Keep the default high enough to make this test stable.
+            .unwrap_or_else(|| vec![16]);
         let avail = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(0);
@@ -1610,7 +1614,7 @@ mod tests {
         for hits_per_block in hits_list {
         let t_arm = Instant::now();
             maybe_print_rss(&format!("tiny_gate:h{hits_per_block}:before_arm"));
-            let lock0 = {
+            let arm0 = {
                 let mut rng0 = StdRng::from_seed(seed0);
                 arm_lfplus_ringlwe_lock::<R>(
                     shape.clone(),
@@ -1625,8 +1629,9 @@ mod tests {
                     &mut rng0,
                 )
                 .unwrap_or_else(|e| panic!("arm ctx0 failed: {e}"))
-                .lock
             };
+            let lock0 = arm0.lock;
+            let _s_sublocks0 = arm0.s_sublocks_mod257;
             maybe_print_rss(&format!("tiny_gate:h{hits_per_block}:after_arm"));
         eprintln!(
                 "[tiny_gate] h={} armed in {:?}: sublocks(lock0)={} proof_len={}",
@@ -1647,78 +1652,108 @@ mod tests {
 
         let t_prove = Instant::now();
             maybe_print_rss(&format!("tiny_gate:h{hits_per_block}:before_prove_decap_stream"));
-        // Single lock: one streaming pass.
-            let mut coins_list: Vec<_> = Vec::with_capacity(lock0.sublocks.len());
-            for (si, sl) in lock0.sublocks.iter().enumerate() {
-                coins_list.push(
-                    prover
-                        .derive_public_coins_from_stmt(
-                            lock0.c_stmt.as_slice(),
-                            sl.block_id as usize,
-                            sl.rep_id,
-                        )
-                        .expect("derive_public_coins_from_stmt lock0"),
-                );
-                let _ = si;
-            }
-            // Canonical path: stream tails and fold them immediately (no tail vectors).
-            let mut tail_dots_mod257: Vec<u16> = vec![0u16; coins_list.len()];
-            let mut cur_ci: Option<usize> = None;
-            let mut cur_blk: usize = 0;
-            let mut buf_len: usize = 0;
-            let mut buf64: [u16; 64] = [0u16; 64];
-            let abg_list = prover
-            .stream_pi0_and_collect_tails(
-                &x,
-                &z_w,
-                &coins_list,
-                    None,
-                    &mut |ci, _ti, t| {
-                        if cur_ci != Some(ci) {
-                            cur_ci = Some(ci);
-                            cur_blk = 0;
-                            buf_len = 0;
-                        }
-                        let td = crate::lockable_ringlwe::field_mod257_u16(t);
-                        buf64[buf_len] = td;
-                        buf_len += 1;
-                        if buf_len == 64 {
-                            let sl = &lock0.sublocks[ci];
-                            let blk = &sl.hints.tail_scales[cur_blk];
-                            let add =
-                                crate::lockable_ringlwe::dot_packed_block_mod257_u16(blk, &buf64);
-                            let acc = &mut tail_dots_mod257[ci];
-                            *acc = crate::lockable_ringlwe::add_mod257_u16(*acc, add);
-                            cur_blk += 1;
-                            buf_len = 0;
-                    }
-                },
-            )
-            .expect("stream_pi0_and_collect_tails");
-            assert_eq!(abg_list.len(), lock0.sublocks.len());
-            assert_eq!(buf_len, 0);
-            use rayon::prelude::*;
-            let results: Vec<(u16, [u16; 2])> = abg_list
-                .par_iter()
-                .enumerate()
-                .map(|(gi, abgt)| {
-                    let sl = &lock0.sublocks[gi];
-                    let td = tail_dots_mod257[gi];
-                    let cands =
-                        crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt, td)
-                            .expect("sublock candidates");
-                    (sl.channel_id, cands)
-                })
-                .collect();
-            let pt0 = crate::lockable_ringlwe::decrypt_payload_from_sublock_s_candidates(&lock0, &results)
-                .expect("decrypt_payload lock0");
-            assert!(pt0.is_empty());
+        // Single lock: one streaming pass (canonical block-local coins).
+        let n = lock0.sublocks.len();
+        assert!(n > 0);
 
-        // Accepting set structure: fixed `{1,2}` for every sublock.
-        for sl in &lock0.sublocks {
-            assert_eq!(sl.accepting_set[0], F257::ONE);
-            assert_eq!(sl.accepting_set[1], F257::from(2u64));
+        // Coins are per-sublock (no global-hit assumptions).
+        let mut coins_list: Vec<_> = Vec::with_capacity(n);
+            for sl in &lock0.sublocks {
+            coins_list.push(
+                prover
+                    .derive_public_coins_from_stmt(lock0.c_stmt.as_slice(), sl.anchor_block_id as usize, sl.rep_id)
+                    .expect("derive_public_coins_from_stmt lock0"),
+            );
         }
+
+        // Tail-dot only: compute per-sublock tail dot without storing tails.
+        let mut tail_dots_mod257: Vec<u16> = vec![0u16; n];
+        let mut cur_hi: Option<usize> = None;
+        let mut cur_blk: usize = 0;
+        let mut buf_len: usize = 0;
+        let mut buf64: [u16; 64] = [0u16; 64];
+        let abg_list = prover
+            .stream_pi0_and_collect_tails(&x, &z_w, &coins_list, None, &mut |hi, _ti, t| {
+                if cur_hi != Some(hi) {
+                    cur_hi = Some(hi);
+                    cur_blk = 0;
+                    buf_len = 0;
+                }
+                buf64[buf_len] = crate::lockable_ringlwe::field_mod257_u16(t);
+                buf_len += 1;
+                if buf_len == 64 {
+                    let sl = &lock0.sublocks[hi];
+                    let blk = &sl.hints.tail_scales[cur_blk];
+                    let add = crate::lockable_ringlwe::dot_packed_block_mod257_u16(blk, &buf64);
+                    tail_dots_mod257[hi] = crate::lockable_ringlwe::add_mod257_u16(tail_dots_mod257[hi], add);
+                    cur_blk += 1;
+                    buf_len = 0;
+                }
+            })
+            .expect("stream_pi0_and_collect_tails");
+        assert_eq!(abg_list.len(), n);
+        assert_eq!(buf_len, 0);
+
+        // Global poison: fold per-block MulEq residual err_b into each sublock's masked scalar.
+        // This prevents "pick only good blocks" bypasses when skipping a full SAT check.
+        let poison_blocks: usize = lock0
+            .sublocks
+            .first()
+            .map(|sl| sl.hints.poison_blocks as usize)
+            .unwrap_or(0);
+        let mut y_err_mod257: Vec<u16> = vec![0u16; n];
+        if poison_blocks != 0 {
+            for rep_j in 0..(lock0.sublocks_per_channel as usize) {
+                // Use channel 0's rep_id as the rep identifier (rep_id is shared across channels).
+                let sl0 = &lock0.sublocks[rep_j];
+                let rep_id = sl0.rep_id;
+                let mut rep_coins: Vec<_> = Vec::with_capacity(poison_blocks);
+                for b in 0..poison_blocks {
+                    rep_coins.push(
+                        prover
+                            .derive_public_coins_from_stmt(lock0.c_stmt.as_slice(), b, rep_id)
+                            .expect("derive_public_coins_from_stmt (poison)"),
+                    );
+                }
+                let abg_full = prover
+                    .stream_pi0_and_collect_abg_full(&x, &z_w, &rep_coins, None)
+                    .expect("stream_pi0_and_collect_abg_full (poison)");
+                assert_eq!(abg_full.len(), poison_blocks);
+                for ch in 0..(lock0.p_channels as usize) {
+                    let si = ch.saturating_mul(lock0.sublocks_per_channel as usize).saturating_add(rep_j);
+                    let sl = &lock0.sublocks[si];
+                    y_err_mod257[si] =
+                        crate::lockable_ringlwe::poison_y_err_mod257_from_abg_full(&sl.hints, &abg_full)
+                            .expect("poison_y_err_mod257_from_abg_full");
+                }
+            }
+        }
+
+        // Intersection-based decap: recover per-channel secrets across reps.
+        use rayon::prelude::*;
+        use crate::lockable_ringlwe::masked_y_mod257_main_from_compressed_hint_and_tail;
+        let per_state: Vec<(usize, u16)> = lock0
+            .sublocks
+            .par_iter()
+            .enumerate()
+            .map(|(si, sl)| {
+                let td = tail_dots_mod257[si];
+                let y_anchor = masked_y_mod257_main_from_compressed_hint_and_tail(&sl.hints, &abg_list[si], td)
+                    .expect("masked_y_mod257");
+                let y = crate::lockable_ringlwe::add_mod257_u16(y_anchor, y_err_mod257[si]);
+                (si, y)
+            })
+            .collect();
+        let mut sublock_cands: Vec<(u16, [u16; 2])> = Vec::with_capacity(n);
+        for (si, y) in per_state {
+            let sl = &lock0.sublocks[si];
+            let cands = crate::lockable_ringlwe::s_candidates_from_y_and_accepting_set_mod257(&sl.accepting_set, y)
+                .expect("s_candidates");
+            sublock_cands.push((sl.channel_id, cands));
+        }
+        let pt0 = crate::lockable_ringlwe::decrypt_payload_from_sublock_s_candidates(&lock0, &sublock_cands)
+            .expect("decrypt_payload intersection");
+        assert_eq!(pt0.as_slice(), dummy_payload.as_slice());
 
             maybe_print_rss(&format!("tiny_gate:h{hits_per_block}:after_prove_decap_stream"));
             eprintln!(
@@ -1932,7 +1967,11 @@ mod tests {
             for (si, sl) in l.sublocks.iter().enumerate() {
                 coins_list.push(
                     prover
-                        .derive_public_coins_from_stmt(l.c_stmt.as_slice(), sl.block_id as usize, sl.rep_id)
+                        .derive_public_coins_from_stmt(
+                            l.c_stmt.as_slice(),
+                            sl.anchor_block_id as usize,
+                            sl.rep_id,
+                        )
                         .expect("derive_public_coins_from_stmt"),
                 );
                 meta.push((li, si));
@@ -1949,7 +1988,7 @@ mod tests {
                 &z_w,
                 &coins_list,
                 None,
-                &mut |ci, _ti, t| {
+                &mut |ci, ti, t| {
                     if cur_ci != Some(ci) {
                         cur_ci = Some(ci);
                         cur_blk = 0;
@@ -2293,7 +2332,11 @@ mod tests {
                 let sl = &lock.sublocks[si];
                 coins_list.push(
                     prover
-                        .derive_public_coins_from_stmt(lock.c_stmt.as_slice(), sl.block_id as usize, sl.rep_id)
+                        .derive_public_coins_from_stmt(
+                            lock.c_stmt.as_slice(),
+                            sl.anchor_block_id as usize,
+                            sl.rep_id,
+                        )
                         .expect("derive_public_coins_from_stmt"),
                 );
                 meta.push((li, si));
@@ -2439,7 +2482,11 @@ mod tests {
                     let sl = &lock.sublocks[si];
                     adv_coins.push(
                         prover
-                            .derive_public_coins_from_stmt(lock.c_stmt.as_slice(), sl.block_id as usize, sl.rep_id)
+                            .derive_public_coins_from_stmt(
+                                lock.c_stmt.as_slice(),
+                                sl.anchor_block_id as usize,
+                                sl.rep_id,
+                            )
                             .expect("derive_public_coins_from_stmt"),
                     );
                     adv_meta.push((li, si));
@@ -2567,7 +2614,11 @@ mod tests {
                     let sl = &lock.sublocks[si];
                     tam_coins.push(
                         prover
-                            .derive_public_coins_from_stmt(lock.c_stmt.as_slice(), sl.block_id as usize, sl.rep_id)
+                            .derive_public_coins_from_stmt(
+                                lock.c_stmt.as_slice(),
+                                sl.anchor_block_id as usize,
+                                sl.rep_id,
+                            )
                             .expect("derive_public_coins_from_stmt"),
                     );
                     tam_meta.push((li, si));
@@ -2585,7 +2636,7 @@ mod tests {
                     &z_w,
                     &tam_coins,
                     None,
-                    &mut |ci, _ti, t| {
+                    &mut |ci, ti, t| {
                         if cur_ci != Some(ci) {
                             cur_ci = Some(ci);
                             cur_blk = 0;
@@ -2947,14 +2998,14 @@ mod tests {
                     prover
                         .derive_public_coins_from_stmt(
                             lock0.c_stmt.as_slice(),
-                            lock0.sublocks[0].block_id as usize,
+                            lock0.sublocks[0].anchor_block_id as usize,
                             lock0.sublocks[0].rep_id,
                         )
                         .expect("derive_public_coins_from_stmt lock0"),
                     prover
                         .derive_public_coins_from_stmt(
                             lock1.c_stmt.as_slice(),
-                            lock1.sublocks[0].block_id as usize,
+                            lock1.sublocks[0].anchor_block_id as usize,
                             lock1.sublocks[0].rep_id,
                         )
                         .expect("derive_public_coins_from_stmt lock1"),

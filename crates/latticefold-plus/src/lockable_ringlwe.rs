@@ -44,6 +44,13 @@ pub(crate) fn add_mod257_u16(a: u16, b: u16) -> u16 {
 }
 
 #[inline]
+pub(crate) fn sub_mod257_u16(a: u16, b: u16) -> u16 {
+    // Returns (a - b) mod 257 with inputs assumed reduced.
+    debug_assert!(a < MOD_257 && b < MOD_257);
+    if a >= b { a - b } else { a + MOD_257 - b }
+}
+
+#[inline]
 fn mul_mod257(a: u16, b: u16) -> u16 {
     // Fast reduction mod 257 using 256 ≡ -1 (mod 257).
     //
@@ -366,13 +373,23 @@ pub struct RingLweLockArtifact<F: PrimeField> {
 /// to reconstruct the masked answer:
 ///
 /// - `abg_scales`: `(s*coeff_alpha, s*coeff_beta, s*coeff_gamma)` in mod-257 digits
-/// - `offset_scale`: `s * δ(x_arm)` in mod-257 digits, where `δ(x) = 1 + ⟨q_x, x⟩`
+/// - `offset_scale`: `s * δ(x_arm)` in mod-257 digits (statement-bound offset)
 /// - `tail_scales`: 4 packed blocks holding `s*(coeff_mu, coeff_nu, c_3..c_{p-1})`
 #[derive(Clone, Debug)]
 pub struct BranchHintsCompressed {
     pub abg_scales: [u16; 3],
     pub offset_scale: u16,
     pub tail_scales: [PackedF257Block64; 4],
+    /// Optional “global poison” material: secret-scaled per-block weights.
+    ///
+    /// When present, decap computes an additional masked term:
+    ///   y_err = Σ_b err_scales[b] * err_b   (mod 257)
+    /// and adds it to the anchor masked scalar before candidate extraction.
+    ///
+    /// Encoding is canonical packed-in-64s using `PackedF257Block64`.
+    ///
+    pub poison_blocks: u32,
+    pub poison_err_scales: Vec<PackedF257Block64>,
 }
 
 /// Per-branch ciphertext: unauthenticated stream cipher (XOR) under a derived key.
@@ -396,8 +413,8 @@ pub struct RingLweSubLock<F: PrimeField> {
     pub channel_id: u16,
     /// Shifted accepting set (mod 257), must be nonzero.
     pub accepting_set: [F; 2],
-    /// Block id selected for this sublock (used to derive Theorem-4.3 public coins).
-    pub block_id: u32,
+    /// Anchor block id in `[0..blocks)` used to derive Theorem-4.3 public coins for this sublock.
+    pub anchor_block_id: u32,
     /// Rep-id salt (used to derive Theorem-4.3 public coins and hidden Sq coefficients).
     pub rep_id: u64,
     /// Deterministic compressed hint material.
@@ -451,7 +468,7 @@ fn derive_payload_key_bytes_multi<F: PrimeField>(
     bind.update(&sublocks_per_channel.to_le_bytes());
     for sl in sublocks {
         bind.update(&sl.channel_id.to_le_bytes());
-        bind.update(&sl.block_id.to_le_bytes());
+        bind.update(&sl.anchor_block_id.to_le_bytes());
         bind.update(&sl.rep_id.to_le_bytes());
         bind.update(&f_to_u64(&sl.accepting_set[0]).to_le_bytes());
         bind.update(&f_to_u64(&sl.accepting_set[1]).to_le_bytes());
@@ -518,12 +535,13 @@ pub(crate) fn s_candidates_from_y_and_accepting_set_mod257<F: PrimeField>(
 /// Compute `y mod 257` from compressed hints and streamed `(alpha,beta,gamma)` plus `tail_dot`.
 ///
 /// This is the core decap scalar relation used for candidate extraction:
-/// `y = y_pi + offset_scale  (mod 257)`,
-/// where `offset_scale = s * δ(x_arm)` is baked into the lock package at arming time.
-pub(crate) fn masked_y_mod257_from_compressed_hint_and_tail<F: PrimeField>(
+/// `y = y_pi + offset_scale  (mod 257)` for the chosen offset flavor.
+#[inline]
+fn masked_y_mod257_from_compressed_hint_and_tail_with_offset<F: PrimeField>(
     hc: &BranchHintsCompressed,
     abg: &dpp::theorem43::Theorem43AbgTail<F>,
     tail_dot_mod257: u16,
+    offset_scale: u16,
 ) -> Result<u16, String> {
     let alpha = field_mod257_u16(&abg.alpha);
     let beta = field_mod257_u16(&abg.beta);
@@ -533,8 +551,61 @@ pub(crate) fn masked_y_mod257_from_compressed_hint_and_tail<F: PrimeField>(
     y = add_mod257_u16(y, mul_mod257(hc.abg_scales[1], beta));
     y = add_mod257_u16(y, mul_mod257(hc.abg_scales[2], gamma));
     y = add_mod257_u16(y, tail_dot_mod257 % 257);
-    y = add_mod257_u16(y, hc.offset_scale);
+    y = add_mod257_u16(y, offset_scale);
     Ok(y)
+}
+
+pub(crate) fn masked_y_mod257_main_from_compressed_hint_and_tail<F: PrimeField>(
+    hc: &BranchHintsCompressed,
+    abg: &dpp::theorem43::Theorem43AbgTail<F>,
+    tail_dot_mod257: u16,
+) -> Result<u16, String> {
+    masked_y_mod257_from_compressed_hint_and_tail_with_offset(
+        hc,
+        abg,
+        tail_dot_mod257,
+        hc.offset_scale,
+    )
+}
+
+#[inline]
+pub(crate) fn poison_y_err_mod257_from_abg_full<F: PrimeField>(
+    hc: &BranchHintsCompressed,
+    abg_full_all_blocks: &[dpp::theorem43::Theorem43AbgFull<F>],
+) -> Result<u16, String> {
+    let blocks = hc.poison_blocks as usize;
+    if blocks == 0 {
+        return Ok(0u16);
+    }
+    if abg_full_all_blocks.len() != blocks {
+        return Err("ringlwe: poison abg_full length mismatch".to_string());
+    }
+    let nblk = (blocks + 63) / 64;
+    if hc.poison_err_scales.len() != nblk {
+        return Err("ringlwe: poison_err_scales length mismatch".to_string());
+    }
+
+    let mut acc = 0u16;
+    let mut err64 = [0u16; 64];
+    for bi in 0..nblk {
+        let start = bi * 64;
+        for j in 0..64 {
+            let b = start + j;
+            if b >= blocks {
+                err64[j] = 0u16;
+                continue;
+            }
+            let a = field_mod257_u16(&abg_full_all_blocks[b].alpha);
+            let bb = field_mod257_u16(&abg_full_all_blocks[b].beta);
+            let g = field_mod257_u16(&abg_full_all_blocks[b].gamma);
+            let ab = mul_mod257_u16(a, bb);
+            err64[j] = sub_mod257_u16(g, ab);
+        }
+        let blk = &hc.poison_err_scales[bi];
+        let add = dot_packed_block_mod257_u16(blk, &err64);
+        acc = add_mod257_u16(acc, add);
+    }
+    Ok(acc)
 }
 
 /// Convenience: compute the 2 candidates for `s` for one sublock under the compressed-hint scheme.
@@ -543,7 +614,7 @@ pub(crate) fn sublock_s_candidates_from_abg_tail<F: PrimeField>(
     abg: &dpp::theorem43::Theorem43AbgTail<F>,
     tail_dot_mod257: u16,
 ) -> Result<[u16; 2], String> {
-    let y = masked_y_mod257_from_compressed_hint_and_tail(&sl.hints, abg, tail_dot_mod257)?;
+    let y = masked_y_mod257_main_from_compressed_hint_and_tail(&sl.hints, abg, tail_dot_mod257)?;
     s_candidates_from_y_and_accepting_set_mod257(&sl.accepting_set, y)
 }
 
@@ -811,12 +882,14 @@ mod tests {
         let sub = RingLweSubLock::<F257> {
             channel_id: 0,
             accepting_set: [F257::from(1u64), F257::from(2u64)],
-            block_id: 0,
+            anchor_block_id: 0,
             rep_id: 0,
             hints: BranchHintsCompressed {
                 abg_scales: [0u16; 3],
                 offset_scale: 0u16,
                 tail_scales: core::array::from_fn(|_| PackedF257Block64::from_dense_u16s(&zero64)),
+                poison_blocks: 1,
+                poison_err_scales: vec![PackedF257Block64::from_dense_u16s(&zero64)],
             },
         };
         let lock = arm_ringlwe_lock::<F257>(
