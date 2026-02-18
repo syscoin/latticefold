@@ -1419,7 +1419,10 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
             tail_coeffs_mod257[2 + i] = (c.into_bigint().as_ref()[0] % 257) as u16;
         }
 
-        // Compute δ(x) for this (anchor_block, rep): δ(x) = 1 + ⟨q_x, x⟩ (mod 257).
+        // Compute δ(x) for this (anchor_block, rep): δ(x) = c_hit + ⟨q_x, x⟩ (mod 257).
+        //
+        // This must match `theorem43::stream_query_terms_for_pi`, which initializes the x-offset
+        // with `coins.c_hit` (so the accepting set is `{c_hit, c_hit+1}`).
         let local_idx: usize = art.coins.idx % ell_local;
         let (ax, bx, cx) = pub_x_dots
             .get(anchor_block_usize)
@@ -1428,7 +1431,8 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
         let sum_b: u16 = flpcp.code.dot_row_e_u16(local_idx, bx.as_slice())?;
         let sum_c: u16 = flpcp.code.dot_row_e_star_low_u16(local_idx, cx.as_slice())?;
         let lam_u16: u16 = (art.coins.lambda.into_bigint().as_ref()[0] % 257) as u16;
-        let mut delta_x_mod257: u16 = 1u16;
+        let c_hit_u16: u16 = (art.coins.c_hit.into_bigint().as_ref()[0] % 257) as u16;
+        let mut delta_x_mod257: u16 = c_hit_u16;
         delta_x_mod257 = crate::lockable_ringlwe::add_mod257_u16(
             delta_x_mod257,
             crate::lockable_ringlwe::mul_mod257_u16(abg_coeffs_mod257[0], sum_a),

@@ -29,6 +29,68 @@ use crate::dr1cs_flpcp::{
     f_to_u16, is_f257_field, Dr1csNpFlpcpSparseApi, Dr1csQueryScratch, QuerySink,
 };
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_ff::Field;
+
+    // If we ever publish the full vector of scaled Sq coefficients `d_i = s * c_i` where
+    // `c_i = -Σ_{λ∈U} λ^i` for i=1..256 over F257, then the polynomial
+    //   T(u) = Σ_{i=1}^{256} d_i * u^i = s * S(u)
+    // evaluates to either 0 or s on F257^*, so `s` becomes directly recoverable from public data.
+    //
+    // This test documents that algebraic fact.
+    #[test]
+    fn test_scaled_sq_power_sums_leak_scalar_via_indicator_eval() {
+        // Pick a nonempty subset U ⊆ F257^*.
+        let mut u_elems: Vec<F257> = Vec::new();
+        for lam_u in 1u64..=256u64 {
+            // Deterministic pseudo-random-ish subset: include ~half the elements.
+            if (lam_u.wrapping_mul(17) ^ 0x5a) & 1 == 1 {
+                u_elems.push(F257::from(lam_u));
+            }
+        }
+        assert!(!u_elems.is_empty());
+
+        // Compute c_i = -Σ_{λ∈U} λ^i for i=1..256.
+        let mut c: Vec<F257> = vec![F257::from(0u64); 256];
+        for i in 1u64..=256u64 {
+            let mut acc = F257::from(0u64);
+            for &lam in &u_elems {
+                acc += lam.pow([i]);
+            }
+            c[(i - 1) as usize] = -acc;
+        }
+
+        // Choose s ∈ {1..256}.
+        let s = F257::from(154u64);
+        assert_ne!(s, F257::ZERO);
+
+        // d_i = s * c_i
+        let d: Vec<F257> = c.iter().map(|x| *x * s).collect();
+
+        // Evaluate T(u) = Σ d_i u^i for all u in F257^*.
+        let mut nonzero_vals: Vec<F257> = Vec::new();
+        for u_u64 in 1u64..=256u64 {
+            let u = F257::from(u_u64);
+            let mut t = F257::from(0u64);
+            let mut upow = u; // u^1
+            for i in 0..256usize {
+                t += d[i] * upow;
+                upow *= u;
+            }
+            if t != F257::ZERO {
+                nonzero_vals.push(t);
+            }
+        }
+        // For this construction, T(u) should be either 0 or s, so all nonzero evals equal s.
+        assert!(!nonzero_vals.is_empty());
+        for v in nonzero_vals {
+            assert_eq!(v, s);
+        }
+    }
+}
+
 /// Coins defining the single lockable query.
 #[derive(Clone, Debug)]
 pub struct Theorem43Coins<F: PrimeField> {
@@ -36,7 +98,9 @@ pub struct Theorem43Coins<F: PrimeField> {
     pub lambda: F,
     pub rho: F,
     pub sigma: F,
-    /// Public per-hit accept coin in `{1,2}` (used by the normalization layer).
+    /// Public per-instance accepting-set base, so accepting set is `{c_hit, c_hit+1}`.
+    ///
+    /// This is derived deterministically from `(c_stmt, block_id, rep_id)` with domain separation.
     pub c_hit: F,
 }
 
@@ -92,6 +156,26 @@ pub struct Theorem43AbgTail<F: PrimeField> {
     pub alpha: F,
     pub beta: F,
     pub gamma: F,
+}
+
+/// Output of `stream_pi0_and_collect_abg_full`: per-coin `(alpha,beta,gamma)` over the full
+/// vector `(x || π0)`.
+#[derive(Clone, Debug)]
+pub struct Theorem43AbgFull<F: PrimeField> {
+    pub alpha: F,
+    pub beta: F,
+    pub gamma: F,
+}
+
+#[derive(Clone, Debug)]
+struct Theorem43AbgAcc<F: PrimeField> {
+    coins: Theorem43Coins<F>,
+    alpha_pi: F,
+    beta_pi: F,
+    gamma_pi: F,
+    alpha_full: F,
+    beta_full: F,
+    gamma_full: F,
 }
 
 /// Streaming query accumulator that tracks both:
@@ -398,6 +482,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
         for (i, c) in coeffs.iter().copied().enumerate().skip(2) {
             acc += c * tail[i];
         }
+        // Public affine shift so accepting set is `{c_hit, c_hit+1}` instead of `{0,1}`.
         Ok(acc + art.coins.c_hit)
     }
 
@@ -475,12 +560,14 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
         let lambda = squeeze_f257_as_f_reject_digits::<F>(&mut sp_coins, &[0, 1])?;
         let rho = squeeze_f257_as_f_reject_digits::<F>(&mut sp_coins, &[0])?;
         let sigma = squeeze_f257_as_f_reject_digits::<F>(&mut sp_coins, &[0])?;
-
-        // Public accept coin in `{1,2}`.
-        //
-        // Sample an unbiased bit from uniform base-257 digits (reject 256), then map to 1/2.
-        let bit = squeeze_unbiased_bits_from_f257_digits(&mut sp_coins, 1)?[0];
-        let c_hit = if bit == 0 { F::ONE } else { F::from(2u64) };
+        // Derive `c_hit ∈ {1..=127}` to avoid inverse-ratio collisions in `{c,c+1}` decoding.
+        let c_hit: F = loop {
+            let x = sp_coins.squeeze_field_elements::<F257>(1)[0];
+            let d = f257_digit_u16(x)?;
+            if (1..=127).contains(&d) {
+                break F::from(d as u64);
+            }
+        };
 
         Ok(Theorem43Coins {
             idx,
@@ -538,21 +625,12 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
         // We reject digit 256 so accepted digits are uniform in 0..255, making LSB extraction unbiased.
         let q_minus_1 = (self.p as usize) - 1;
         let q_bits = squeeze_unbiased_bits_from_f257_digits(&mut sp_hidden, q_minus_1)?;
-        // Normalization layer (GPT PRO):
-        // interpret `raw` as coefficients of `S(u) = Σ_{k=1..256} s_k u^k` (stored as raw[k-1]),
-        // and output `S(u)^2 - S(u)` modulo `u^{257}-u`, which is a cyclic convolution with a +1 shift.
-        //
-        // This codebase treats theorem43 as **F257-only** (tiny-field demo), so we do this
-        // unconditionally.
-        let coeffs = {
-            let raw = self.sq_coeffs_from_uv_bits(&q_bits)?;
-            normalize_sq_coeffs_s2_minus_s(&raw)?
-        };
+        let coeffs = self.sq_coeffs_from_uv_bits(&q_bits)?;
         let len = x.len() + self.proof_len();
 
         Ok(Theorem43LockArtifact {
             c_stmt: c_stmt.to_vec(),
-            accepting_set: [F::ONE, F::from(2u64)],
+            accepting_set: [coins.c_hit, coins.c_hit + F::ONE],
             len,
             coins,
             stats: Theorem43ArmingStats {
@@ -596,22 +674,13 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
 }
 
 impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
-    /// Stream the coin-independent prefix `π0` once, and return coin-dependent tails for many coins.
-    ///
-    /// Proof layout is `π = (π0 || tail)` where:
-    /// - `π0 = z_w || w_eval[0] || ... || w_eval[blocks-1]` depends only on `(x, z_w)`.
-    /// - `tail = (μ, ν, u^3..u^{p-1})` depends on `coins` (via the hidden sparse query and (ρ,σ)).
-    ///
-    /// This is the asymptotically optimal way to decapsulate many coin instances against the
-    /// same witness: stream `π0` once (to all decaps), then absorb each small tail.
-    pub fn stream_pi0_and_collect_tails(
+    fn stream_pi0_and_collect_abg_accs(
         &self,
         x: &[F],
         z_w: &[F],
         coins_list: &[Theorem43Coins<F>],
         mut on_pi0_chunk: Option<&mut dyn FnMut(&[F])>,
-        on_tail_elem: &mut dyn FnMut(usize, usize, &F),
-    ) -> Result<Vec<Theorem43AbgTail<F>>, String> {
+    ) -> Result<Vec<Theorem43AbgAcc<F>>, String> {
         let flpcp = &self.flpcp;
         if x.len() != flpcp.n() {
             return Err("bad public input length".to_string());
@@ -741,39 +810,19 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             return Err("witness positions length mismatch".to_string());
         }
 
-        let (x_u16, z_u16) = if is_f257_field::<F>() {
-            (
-                Some(x.iter().copied().map(f_to_u16).collect::<Vec<_>>()),
-                Some(z_w.iter().copied().map(f_to_u16).collect::<Vec<_>>()),
-            )
-        } else {
-            (None, None)
-        };
+        let err: Option<String> = None;
 
-        let mut err: Option<String> = None;
-
-        // Per-block, preallocated buffers for all witness-dependent contributions:
-        // - q1: w_eval dot for alpha
-        // - q2: w_eval dot for beta
-        // - q3: dense witness dot (batched)
-        //
-        // These buffers are filled inside the backend's parallel block workers (via hook), so
-        // the in-order streaming callback can stay lightweight and avoid per-hit work.
         struct BlockDots<F: PrimeField> {
             q1_w: Vec<F>,
             q2_w: Vec<F>,
             q3_w: Vec<F>,
         }
-        // NOTE: `dpp` forbids `unsafe_code`, so we can't use `UnsafeCell` for lock-free
-        // preallocated mutation. Instead, compute each block's dots once in the hook and
-        // publish them via `OnceLock` (no mutex locking/unlocking in the hot path).
         let per_block: Vec<Option<std::sync::OnceLock<BlockDots<F>>>> = (0..blocks)
             .map(|b| {
                 let n = bucket.get(b).map(|v| v.len()).unwrap_or(0);
                 if n == 0 {
                     None
                 } else {
-                    let _ = n;
                     Some(std::sync::OnceLock::new())
                 }
             })
@@ -785,6 +834,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
         } else {
             None
         };
+
         let on_block_hook = |b: usize, w_eval_u16: &[u16]| -> Result<(), String> {
             if b >= bucket.len() {
                 return Err("stream_w_eval_blocks_with_hook: block id out of range".to_string());
@@ -811,7 +861,6 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                 q3_w: vec![F::ZERO; n],
             };
 
-            // q1/q2 witness contributions: purely from each coin's `w_terms` (sparse, local to block).
             for (j, &ci) in coins_b.iter().enumerate() {
                 let a = accs_ro
                     .get(ci)
@@ -822,11 +871,9 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                     if pos >= w_eval_u16.len() {
                         return Err("stream_w_eval_blocks_with_hook: q1 w_eval_u16 index out of range".to_string());
                     }
-                    // Avoid materializing `w_eval` in `F`: lift only the touched positions.
                     if let Some(lut) = lut.as_ref() {
                         s1 += c * lut[w_eval_u16[pos] as usize];
                     } else {
-                        // Non-F257 backends must provide the full `w_eval` via `on_pi0_chunk`.
                         return Err("stream_w_eval_blocks_with_hook: q1 requires F257 u16 pipeline".to_string());
                     }
                 }
@@ -846,25 +893,29 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                 dots.q2_w[j] = s2;
             }
 
-            // q3 witness dot: heavy dense part, batched in chunks (no heap allocation).
+            // q3 witness dot: heavy dense part, batched.
             const MAX_BATCH: usize = 64;
             let mut idxs = [0usize; MAX_BATCH];
             let mut lambdas = [F::ZERO; MAX_BATCH];
-            // Hot path (tensor-RS) does not require scratch; keep a single reusable buffer
-            // to satisfy the trait signature without allocating per-batch.
+            let mut out = [F::ZERO; MAX_BATCH];
+
             let mut off = 0usize;
             while off < coins_b.len() {
                 let end = (off + MAX_BATCH).min(coins_b.len());
                 let n = end - off;
-                for t in 0..n {
-                    let ci = coins_b[off + t];
+                for j in 0..n {
                     let a = accs_ro
-                        .get(ci)
+                        .get(coins_b[off + j])
                         .ok_or_else(|| "stream_w_eval_blocks_with_hook: coin index out of range (q3)".to_string())?;
-                    idxs[t] = a.coins.idx;
-                    lambdas[t] = a.coins.lambda;
+                    idxs[j] = a.coins.idx;
+                    lambdas[j] = a.coins.lambda;
                 }
-                flpcp.dot_q3_w_eval_many(&idxs[..n], &lambdas[..n], x, w_eval_u16, &mut dots.q3_w[off..end])?;
+                // Backend expects `w_eval_u16` for this block; structured backends override this
+                // to amortize dense q3 dot products.
+                flpcp.dot_q3_w_eval_many(&idxs[..n], &lambdas[..n], x, w_eval_u16, &mut out[..n])?;
+                for j in 0..n {
+                    dots.q3_w[off + j] = out[j];
+                }
                 off = end;
             }
 
@@ -873,36 +924,28 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             Ok(())
         };
 
-        let mut on_block_cb = |b: usize, w_eval: &[F]| {
+        let mut on_block = |_: usize, w_eval: &[F]| {
             if let Some(cb) = on_pi0_chunk.as_deref_mut() {
-                if err.is_some() {
-                    return;
-                }
-                if b >= bucket.len() {
-                    err = Some("stream_w_eval_blocks: block id out of range".to_string());
-                    return;
-                }
                 cb(w_eval);
             }
         };
-        let on_block: Option<&mut dyn FnMut(usize, &[F])> =
-            if emit_pi0 { Some(&mut on_block_cb) } else { None };
+        flpcp
+            .stream_w_eval_blocks(
+                &witness_pos,
+                x,
+                z_w,
+                None,
+                None,
+                Some(&on_block_hook),
+                if emit_pi0 { Some(&mut on_block) } else { None },
+            )
+            .map_err(|e| format!("stream_w_eval_blocks failed: {e}"))?;
 
-        flpcp.stream_w_eval_blocks(
-            &witness_pos,
-            x,
-            z_w,
-            x_u16.as_deref(),
-            z_u16.as_deref(),
-            Some(&on_block_hook),
-            on_block,
-        )?;
         if let Some(e) = err {
             return Err(e);
         }
 
-        // Apply all witness-dependent contributions to accumulators after streaming completes.
-        // This keeps the in-order streaming callback lightweight and avoids borrow conflicts.
+        // Apply per-block witness dots.
         for b in 0..blocks {
             let coins_b = &bucket[b];
             if coins_b.is_empty() {
@@ -910,7 +953,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             }
             let cell = per_block
                 .get(b)
-                .and_then(|x| x.as_ref())
+                .and_then(|c| c.as_ref())
                 .ok_or_else(|| "stream_w_eval_blocks: missing per-block dots buffer (apply)".to_string())?;
             let dots = cell
                 .get()
@@ -938,21 +981,65 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
         }
 
         let mut out = Vec::with_capacity(accs.len());
-        for (ci, a) in accs.into_iter().enumerate() {
-            // For lock equations we expose only the π-only contributions (exclude x terms),
-            // to avoid double-counting when the lock separately accounts for `⟨h_x, x⟩`.
-            let alpha_pi = a.acc0.acc_pi;
-            let beta_pi = a.acc1.acc_pi;
-            let gamma_pi = a.acc2.acc_pi;
-            // Tail generation must follow the theorem43 transcript relation, which depends on
-            // the full `(x||π0)` query answers.
-            let alpha_full = a.acc0.acc_full;
-            let beta_full = a.acc1.acc_full;
+        for a in accs.into_iter() {
+            out.push(Theorem43AbgAcc {
+                coins: a.coins,
+                alpha_pi: a.acc0.acc_pi,
+                beta_pi: a.acc1.acc_pi,
+                gamma_pi: a.acc2.acc_pi,
+                alpha_full: a.acc0.acc_full,
+                beta_full: a.acc1.acc_full,
+                gamma_full: a.acc2.acc_full,
+            });
+        }
+        Ok(out)
+    }
 
-            let mu = alpha_full * alpha_full;
-            let nu = beta_full * beta_full;
-            let u = a.coins.rho * alpha_full + a.coins.sigma * beta_full;
-            // Tail layout: [mu, nu, u^3..u^{p-1}]
+    /// Stream `π0` once and return full `(alpha,beta,gamma)` for many coins.
+    ///
+    /// This is the same streaming schedule as `stream_pi0_and_collect_tails`, but it **does not**
+    /// generate or stream tails. It exists for the WE "poison" backend, which needs the MulEq
+    /// residual `err = gamma - alpha*beta` across blocks.
+    pub fn stream_pi0_and_collect_abg_full(
+        &self,
+        x: &[F],
+        z_w: &[F],
+        coins_list: &[Theorem43Coins<F>],
+        on_pi0_chunk: Option<&mut dyn FnMut(&[F])>,
+    ) -> Result<Vec<Theorem43AbgFull<F>>, String> {
+        let accs = self.stream_pi0_and_collect_abg_accs(x, z_w, coins_list, on_pi0_chunk)?;
+        Ok(accs
+            .into_iter()
+            .map(|a| Theorem43AbgFull {
+                alpha: a.alpha_full,
+                beta: a.beta_full,
+                gamma: a.gamma_full,
+            })
+            .collect())
+    }
+
+    /// Stream the coin-independent prefix `π0` once, and return coin-dependent tails for many coins.
+    ///
+    /// Proof layout is `π = (π0 || tail)` where:
+    /// - `π0 = z_w || w_eval[0] || ... || w_eval[blocks-1]` depends only on `(x, z_w)`.
+    /// - `tail = (μ, ν, u^3..u^{p-1})` depends on `coins` (via the hidden sparse query and (ρ,σ)).
+    ///
+    /// This is the asymptotically optimal way to decapsulate many coin instances against the
+    /// same witness: stream `π0` once (to all decaps), then absorb each small tail.
+    pub fn stream_pi0_and_collect_tails(
+        &self,
+        x: &[F],
+        z_w: &[F],
+        coins_list: &[Theorem43Coins<F>],
+        on_pi0_chunk: Option<&mut dyn FnMut(&[F])>,
+        on_tail_elem: &mut dyn FnMut(usize, usize, &F),
+    ) -> Result<Vec<Theorem43AbgTail<F>>, String> {
+        let accs = self.stream_pi0_and_collect_abg_accs(x, z_w, coins_list, on_pi0_chunk)?;
+        let mut out = Vec::with_capacity(accs.len());
+        for (ci, a) in accs.into_iter().enumerate() {
+            let mu = a.alpha_full * a.alpha_full;
+            let nu = a.beta_full * a.beta_full;
+            let u = a.coins.rho * a.alpha_full + a.coins.sigma * a.beta_full;
             on_tail_elem(ci, 0, &mu);
             on_tail_elem(ci, 1, &nu);
             if self.q_minus_3 > 0 {
@@ -962,14 +1049,12 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                     cur *= u;
                 }
             }
-            // NOTE: `alpha/beta/gamma` returned here are π-only.
             out.push(Theorem43AbgTail {
-                alpha: alpha_pi,
-                beta: beta_pi,
-                gamma: gamma_pi,
+                alpha: a.alpha_pi,
+                beta: a.beta_pi,
+                gamma: a.gamma_pi,
             });
         }
-
         Ok(out)
     }
 
@@ -1166,26 +1251,6 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
         flpcp.stream_queries_for_coins_sparse(coins.idx, coins.lambda, x, scratch, &mut sink)?;
         Ok(())
     }
-}
-
-/// Normalization layer: map `S(u)` coefficients to `S(u)^2 - S(u)` modulo `u^{257}-u`.
-///
-/// Input/output are length-256 vectors interpreted as coefficients of `u^1..u^256`.
-fn normalize_sq_coeffs_s2_minus_s<F: PrimeField>(coeffs: &[F]) -> Result<Vec<F>, String> {
-    if coeffs.len() != 256 {
-        return Err("normalize_sq_coeffs_s2_minus_s: expected 256 coeffs for F257".to_string());
-    }
-    let mut sq = vec![F::ZERO; 256];
-    for i in 0..256usize {
-        for j in 0..256usize {
-            let idx = (i + j + 1) & 255; // mod 256 with +1 shift (see doc)
-            sq[idx] += coeffs[i] * coeffs[j];
-        }
-    }
-    for k in 0..256usize {
-        sq[k] -= coeffs[k];
-    }
-    Ok(sq)
 }
 
 fn field_modulus_u64<F: PrimeField>() -> Option<u64> {
