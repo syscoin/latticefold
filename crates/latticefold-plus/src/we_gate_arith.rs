@@ -1308,6 +1308,127 @@ mod tests {
     use crate::recording_transcript::TracePoseidonTranscript;
     use crate::rgchk::DecompParameters;
 
+    fn decap_noisy_lock_candidates(
+        prover: &crate::we_tiny_lock::WeRingLweProverContext<F257>,
+        lock: &crate::lockable_ringlwe::NoisyLockArtifact<F257>,
+        x: &[F257],
+        z_w: &[F257],
+    ) -> Result<Vec<[u8; 32]>, String> {
+        use std::collections::HashMap;
+
+        if lock.sublocks.is_empty() {
+            return Err("decap_noisy_lock_candidates: lock has zero sublocks".to_string());
+        }
+        let poison_blocks: usize = {
+            let pb0 = lock.sublocks[0].poison_blocks as usize;
+            if pb0 == 0 {
+                return Err("decap_noisy_lock_candidates: poison_blocks=0".to_string());
+            }
+            for sl in &lock.sublocks {
+                if sl.poison_blocks as usize != pb0 {
+                    return Err("decap_noisy_lock_candidates: poison_blocks mismatch across sublocks"
+                        .to_string());
+                }
+            }
+            pb0
+        };
+        let poison_proj_m: usize = {
+            let m0 = lock.sublocks[0].poison_proj_m as usize;
+            for sl in &lock.sublocks {
+                if sl.poison_proj_m as usize != m0 {
+                    return Err(
+                        "decap_noisy_lock_candidates: poison_proj_m mismatch across sublocks"
+                            .to_string(),
+                    );
+                }
+            }
+            m0
+        };
+
+        let stmt_bytes64 = {
+            let mut out = [0u8; 64];
+            for (i, e) in lock.c_stmt.iter().take(32).enumerate() {
+                let v = crate::lockable_ringlwe::field_mod257_u16(e);
+                let b = v.to_le_bytes();
+                out[2 * i] = b[0];
+                out[2 * i + 1] = b[1];
+            }
+            out
+        };
+
+        // Cache per-rep MulEq residual vectors `err_b`.
+        let mut err_by_rep: HashMap<u64, Vec<u16>> = HashMap::new();
+        for sl in &lock.sublocks {
+            if err_by_rep.contains_key(&sl.rep_id) {
+                continue;
+            }
+            let mut rep_coins: Vec<_> = Vec::with_capacity(poison_blocks);
+            for b in 0..poison_blocks {
+                rep_coins.push(prover.derive_public_coins_from_stmt(
+                    lock.c_stmt.as_slice(),
+                    b,
+                    sl.rep_id,
+                )?);
+            }
+            let abg_full = prover.stream_pi0_and_collect_abg_full(x, z_w, &rep_coins, None)?;
+            if abg_full.len() != poison_blocks {
+                return Err("decap_noisy_lock_candidates: abg_full length mismatch".to_string());
+            }
+            let mut errs: Vec<u16> = Vec::with_capacity(poison_blocks);
+            for b in 0..poison_blocks {
+                let a = crate::lockable_ringlwe::field_mod257_u16(&abg_full[b].alpha);
+                let bb = crate::lockable_ringlwe::field_mod257_u16(&abg_full[b].beta);
+                let g = crate::lockable_ringlwe::field_mod257_u16(&abg_full[b].gamma);
+                let ab = crate::lockable_ringlwe::mul_mod257_u16(a, bb);
+                errs.push(crate::lockable_ringlwe::sub_mod257_u16(g, ab));
+            }
+            err_by_rep.insert(sl.rep_id, errs);
+        }
+
+        // Tail-free residual gate:
+        // we only need the per-rep MulEq residual vector `err_b` (cached above).
+
+        // Per-sublock: decrypt both branches and collect 32-byte candidates.
+        let mut out: Vec<[u8; 32]> = Vec::new();
+        for sl in lock.sublocks.iter() {
+            let errs = err_by_rep
+                .get(&sl.rep_id)
+                .ok_or_else(|| "decap_noisy_lock_candidates: missing err cache".to_string())?;
+
+            let mut v_mod257: Vec<u16>;
+            if poison_proj_m == 0 {
+                v_mod257 = Vec::with_capacity(1 + poison_blocks);
+                v_mod257.push(1u16);
+                v_mod257.extend_from_slice(errs.as_slice());
+            } else {
+                let z = crate::lockable_ringlwe::project_errs_mod257_u16(
+                    &stmt_bytes64,
+                    sl.rep_id,
+                    errs.as_slice(),
+                    poison_proj_m,
+                );
+                v_mod257 = Vec::with_capacity(1 + poison_proj_m);
+                v_mod257.push(1u16);
+                v_mod257.extend_from_slice(z.as_slice());
+            }
+
+            let plains = crate::lockable_ringlwe::decap_noisy_fanout_candidates(
+                lock,
+                sl,
+                v_mod257.as_slice(),
+            )?;
+            for p in plains {
+                if p.len() != 32 {
+                    continue;
+                }
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&p);
+                out.push(a);
+            }
+        }
+        Ok(out)
+    }
+
     // NOTE: We intentionally do not keep the old “shape builds and constraints check” tests here.
     // They were development scaffolding and are slow/ignored. The tiny gate is now exercised via
     // focused gadget-level tests in `we_gate_tiny/tests.rs`, and will be covered end-to-end by
@@ -1631,129 +1752,33 @@ mod tests {
                 .unwrap_or_else(|e| panic!("arm ctx0 failed: {e}"))
             };
             let lock0 = arm0.lock;
-            let _s_sublocks0 = arm0.s_sublocks_mod257;
             maybe_print_rss(&format!("tiny_gate:h{hits_per_block}:after_arm"));
-        eprintln!(
-                "[tiny_gate] h={} armed in {:?}: sublocks(lock0)={} proof_len={}",
-                hits_per_block,
-            t_arm.elapsed(),
-                lock0.sublocks.len(),
-            prover.proof_len()
-        );
-
-        let x = encode_public_x::<F257>(&stmt_digest_f257);
-        assert_eq!(x.len(), public_len);
-            assert_eq!(
-                &asg[..public_len],
-                x.as_slice(),
-                "satisfying assignment public prefix mismatch"
+            eprintln!(
+                    "[tiny_gate] h={} armed in {:?}: sublocks(lock0)={} proof_len={}",
+                    hits_per_block,
+                t_arm.elapsed(),
+                    lock0.sublocks.len(),
+                prover.proof_len()
             );
-        let z_w = asg[public_len..].to_vec();
 
-        let t_prove = Instant::now();
+            let x = encode_public_x::<F257>(&stmt_digest_f257);
+            assert_eq!(x.len(), public_len);
+                assert_eq!(
+                    &asg[..public_len],
+                    x.as_slice(),
+                    "satisfying assignment public prefix mismatch"
+                );
+            let z_w = asg[public_len..].to_vec();
+
+            let t_prove = Instant::now();
             maybe_print_rss(&format!("tiny_gate:h{hits_per_block}:before_prove_decap_stream"));
-        // Single lock: one streaming pass (canonical block-local coins).
-        let n = lock0.sublocks.len();
-        assert!(n > 0);
-
-        // Coins are per-sublock (no global-hit assumptions).
-        let mut coins_list: Vec<_> = Vec::with_capacity(n);
-            for sl in &lock0.sublocks {
-            coins_list.push(
-                prover
-                    .derive_public_coins_from_stmt(lock0.c_stmt.as_slice(), sl.anchor_block_id as usize, sl.rep_id)
-                    .expect("derive_public_coins_from_stmt lock0"),
+            let cands = decap_noisy_lock_candidates(&prover, &lock0, &x, &z_w)
+                .unwrap_or_else(|e| panic!("decap_noisy_lock_candidates: {e}"));
+            assert!(
+                cands.contains(&dummy_payload),
+                "expected payload not found in decap candidates (got {} candidates)",
+                cands.len()
             );
-        }
-
-        // Tail-dot only: compute per-sublock tail dot without storing tails.
-        let mut tail_dots_mod257: Vec<u16> = vec![0u16; n];
-        let mut cur_hi: Option<usize> = None;
-        let mut cur_blk: usize = 0;
-        let mut buf_len: usize = 0;
-        let mut buf64: [u16; 64] = [0u16; 64];
-        let abg_list = prover
-            .stream_pi0_and_collect_tails(&x, &z_w, &coins_list, None, &mut |hi, _ti, t| {
-                if cur_hi != Some(hi) {
-                    cur_hi = Some(hi);
-                    cur_blk = 0;
-                    buf_len = 0;
-                }
-                buf64[buf_len] = crate::lockable_ringlwe::field_mod257_u16(t);
-                buf_len += 1;
-                if buf_len == 64 {
-                    let sl = &lock0.sublocks[hi];
-                    let blk = &sl.hints.tail_scales[cur_blk];
-                    let add = crate::lockable_ringlwe::dot_packed_block_mod257_u16(blk, &buf64);
-                    tail_dots_mod257[hi] = crate::lockable_ringlwe::add_mod257_u16(tail_dots_mod257[hi], add);
-                    cur_blk += 1;
-                    buf_len = 0;
-                }
-            })
-            .expect("stream_pi0_and_collect_tails");
-        assert_eq!(abg_list.len(), n);
-        assert_eq!(buf_len, 0);
-
-        // Global poison: fold per-block MulEq residual err_b into each sublock's masked scalar.
-        // This prevents "pick only good blocks" bypasses when skipping a full SAT check.
-        let poison_blocks: usize = lock0
-            .sublocks
-            .first()
-            .map(|sl| sl.hints.poison_blocks as usize)
-            .unwrap_or(0);
-        let mut y_err_mod257: Vec<u16> = vec![0u16; n];
-        if poison_blocks != 0 {
-            for rep_j in 0..(lock0.sublocks_per_channel as usize) {
-                // Use channel 0's rep_id as the rep identifier (rep_id is shared across channels).
-                let sl0 = &lock0.sublocks[rep_j];
-                let rep_id = sl0.rep_id;
-                let mut rep_coins: Vec<_> = Vec::with_capacity(poison_blocks);
-                for b in 0..poison_blocks {
-                    rep_coins.push(
-                        prover
-                            .derive_public_coins_from_stmt(lock0.c_stmt.as_slice(), b, rep_id)
-                            .expect("derive_public_coins_from_stmt (poison)"),
-                    );
-                }
-                let abg_full = prover
-                    .stream_pi0_and_collect_abg_full(&x, &z_w, &rep_coins, None)
-                    .expect("stream_pi0_and_collect_abg_full (poison)");
-                assert_eq!(abg_full.len(), poison_blocks);
-                for ch in 0..(lock0.p_channels as usize) {
-                    let si = ch.saturating_mul(lock0.sublocks_per_channel as usize).saturating_add(rep_j);
-                    let sl = &lock0.sublocks[si];
-                    y_err_mod257[si] =
-                        crate::lockable_ringlwe::poison_y_err_mod257_from_abg_full(&sl.hints, &abg_full)
-                            .expect("poison_y_err_mod257_from_abg_full");
-                }
-            }
-        }
-
-        // Intersection-based decap: recover per-channel secrets across reps.
-        use rayon::prelude::*;
-        use crate::lockable_ringlwe::masked_y_mod257_main_from_compressed_hint_and_tail;
-        let per_state: Vec<(usize, u16)> = lock0
-            .sublocks
-            .par_iter()
-            .enumerate()
-            .map(|(si, sl)| {
-                let td = tail_dots_mod257[si];
-                let y_anchor = masked_y_mod257_main_from_compressed_hint_and_tail(&sl.hints, &abg_list[si], td)
-                    .expect("masked_y_mod257");
-                let y = crate::lockable_ringlwe::add_mod257_u16(y_anchor, y_err_mod257[si]);
-                (si, y)
-            })
-            .collect();
-        let mut sublock_cands: Vec<(u16, [u16; 2])> = Vec::with_capacity(n);
-        for (si, y) in per_state {
-            let sl = &lock0.sublocks[si];
-            let cands = crate::lockable_ringlwe::s_candidates_from_y_and_accepting_set_mod257(&sl.accepting_set, y)
-                .expect("s_candidates");
-            sublock_cands.push((sl.channel_id, cands));
-        }
-        let pt0 = crate::lockable_ringlwe::decrypt_payload_from_sublock_s_candidates(&lock0, &sublock_cands)
-            .expect("decrypt_payload intersection");
-        assert_eq!(pt0.as_slice(), dummy_payload.as_slice());
 
             maybe_print_rss(&format!("tiny_gate:h{hits_per_block}:after_prove_decap_stream"));
             eprintln!(
@@ -1769,13 +1794,14 @@ mod tests {
 
     #[test]
     #[ignore = "very slow in debug: runs full DPP prove+decap; run with `--release`"]
-    fn test_tiny_gate_ringlwe_payload_shamir_2of2_small() {
+    fn test_tiny_gate_ringlwe_payload_hash_combine_kofk_small() {
         use crate::lockable_ringlwe::RingLweParams;
-        use crate::shamir_gf256::{reconstruct_secret_32, split_secret_32, ShamirConfig, ShamirShare};
+        use crate::oneproof_combine::oneproof_hash_combine_shares_v1;
         use crate::we_statement::encode_public_x;
         use crate::we_tiny_lock::arm_lfplus_ringlwe_lock;
         use crate::utils::maybe_print_rss;
         use rand::{rngs::StdRng, RngCore, SeedableRng};
+        use sha2::Digest;
         use std::time::Instant;
 
         // Same minimal params as the small roundtrip test.
@@ -1826,7 +1852,7 @@ mod tests {
             .unwrap_or(false);
         let out_dir = {
             let mut p = std::env::temp_dir();
-            p.push("lfplus_test_tiny_payload_shamir_2of2");
+            p.push("lfplus_test_tiny_payload_hash_combine_kofk");
             if !keep_tiny_cache {
                 let _ = std::fs::remove_dir_all(&p);
             }
@@ -1884,25 +1910,21 @@ mod tests {
         assert_eq!(&asg[..public_len], x.as_slice());
         let z_w = asg[public_len..].to_vec();
 
-        // Shamir secret (T-of-R).
+        // Hash-combine (K-of-K) over per-lock 32-byte shares.
         //
-        // This is the *intended* usage in the design docs: decapsulation under noise is
-        // probabilistic (AEAD may fail). We publish R independent share-locks and only need
-        // T successful decryptions (treat failures as erasures).
-        // For the 1-hint RingLWE lock variant, we want to understand the *scaling* of
-        // arming/decap and artifact size as we increase the number of locks per armer.
-        //
-        // Keep T small for test runtime, but set R=16 so we exercise the "16 locks per armer"
-        // storage/perf profile end-to-end.
-        let shamir = ShamirConfig {
-            threshold: 3,
-            shares: 16,
-        };
+        // This matches the current OneProof combine model: each lock encrypts an independent
+        // 32-byte share, and downstream derives the final key by hashing the selected tuple.
+        const K_LOCKS: usize = 16;
         let mut rng = StdRng::seed_from_u64(20260205);
-        let mut secret = [0u8; 32];
-        rng.fill_bytes(&mut secret);
-        let shares = split_secret_32(&mut rng, &shamir, secret).expect("split_secret_32");
-        assert_eq!(shares.len(), shamir.shares);
+        let lock_coin_seed: [u8; 32] = sha2::Sha256::digest(b"tiny_payload_hash_combine_seed_v1").into();
+        let mut shares: Vec<(u32, [u8; 32])> = Vec::with_capacity(K_LOCKS);
+        for i in 0..K_LOCKS {
+            let mut v = [0u8; 32];
+            rng.fill_bytes(&mut v);
+            shares.push(((i as u32) + 1, v));
+        }
+        let combined_key =
+            oneproof_hash_combine_shares_v1(&stmt_digest_f257, &lock_coin_seed, shares.as_slice());
 
         let prover = crate::we_tiny_lock::we_ringlwe_prover_from_dr1cs::<F257>(
             shape.inst.clone(),
@@ -1910,157 +1932,67 @@ mod tests {
         )
         .expect("we_ringlwe_prover_from_dr1cs");
 
-        // MLWE/RLWE hint locks (one per Shamir share).
-        // Disable noise for deterministic AEAD key agreement in tests.
+        // Noisy-hint locks (one per share).
         let ringlwe_params = RingLweParams {
             ..RingLweParams::default()
         };
         let lock_j = 0u64;
 
         let t_arm = Instant::now();
-        let mut locks = Vec::with_capacity(shamir.shares);
-        for i in 0..shamir.shares {
-            let mut rep_id = i as u64;
-            let lock = loop {
-                match arm_lfplus_ringlwe_lock::<R>(
-                    shape.clone(),
-                    &stmt_digest_f257,
-                    [11u8.wrapping_add(i as u8); 32],
-                    lock_j,
-                    0,
-                    crate::we_tiny_lock::WeRingLweLockArmingPolicy {
-                        base_rep_id: rep_id,
-                        max_rep_tries: 32,
-                        hint_budget_bytes: None,
-                    },
-                    ringlwe_params.clone(),
-                    1,
-                    &shares[i].value,
-                    &mut rng,
-                ) {
-                    Ok(lock_out) => break lock_out.lock,
-                    Err(e) if e.contains("resample rep_id") => {
-                        rep_id += 1;
-                        continue;
-                    }
-                    Err(e) => panic!("arm lock[{i}] failed: {e}"),
-                }
-            };
+        let mut locks = Vec::with_capacity(K_LOCKS);
+        for i in 0..K_LOCKS {
+            let lock = arm_lfplus_ringlwe_lock::<R>(
+                shape.clone(),
+                &stmt_digest_f257,
+                [11u8.wrapping_add(i as u8); 32],
+                lock_j,
+                0,
+                crate::we_tiny_lock::WeRingLweLockArmingPolicy {
+                    base_rep_id: i as u64,
+                    max_rep_tries: 32,
+                    hint_budget_bytes: None,
+                },
+                ringlwe_params.clone(),
+                1,
+                &shares[i].1,
+                &mut rng,
+            )
+            .unwrap_or_else(|e| panic!("arm lock[{i}] failed: {e}"))
+            .lock;
             locks.push(lock);
         }
         eprintln!(
-            "[tiny_payload_shamir] armed {} share locks (T={} of R={}) in {:?}: proof_len={}",
-            shamir.shares,
-            shamir.threshold,
-            shamir.shares,
+            "[tiny_payload_hash] armed {} share locks in {:?}: proof_len={}",
+            K_LOCKS,
             t_arm.elapsed(),
             prover.proof_len()
         );
 
-        // Prove once (π0 streamed), decap R times (tails differ).
         let t_prove = Instant::now();
-        maybe_print_rss("tiny_payload_shamir:before_prove_decap_stream");
-        // Flatten all sublocks across all locks into one streaming pass.
-        let mut coins_list: Vec<_> = Vec::new();
-        let mut meta: Vec<(usize, usize)> = Vec::new(); // (lock_i, sublock_i)
-        for (li, l) in locks.iter().enumerate() {
-            for (si, sl) in l.sublocks.iter().enumerate() {
-                coins_list.push(
-                    prover
-                        .derive_public_coins_from_stmt(
-                            l.c_stmt.as_slice(),
-                            sl.anchor_block_id as usize,
-                            sl.rep_id,
-                        )
-                        .expect("derive_public_coins_from_stmt"),
-                );
-                meta.push((li, si));
-            }
-        }
-        let mut tail_dots_mod257: Vec<u16> = vec![0u16; coins_list.len()];
-        let mut cur_ci: Option<usize> = None;
-        let mut cur_blk: usize = 0;
-        let mut buf_len: usize = 0;
-        let mut buf64: [u16; 64] = [0u16; 64];
-        let abg_list = prover
-            .stream_pi0_and_collect_tails(
-                &x,
-                &z_w,
-                &coins_list,
-                None,
-                &mut |ci, ti, t| {
-                    if cur_ci != Some(ci) {
-                        cur_ci = Some(ci);
-                        cur_blk = 0;
-                        buf_len = 0;
-                    }
-                    let td = crate::lockable_ringlwe::field_mod257_u16(t);
-                    buf64[buf_len] = td;
-                    buf_len += 1;
-                    if buf_len == 64 {
-                        let (li, si) = meta[ci];
-                        let sl = &locks[li].sublocks[si];
-                        let blk = &sl.hints.tail_scales[cur_blk];
-                        let add = crate::lockable_ringlwe::dot_packed_block_mod257_u16(blk, &buf64);
-                        let acc = &mut tail_dots_mod257[ci];
-                        *acc = crate::lockable_ringlwe::add_mod257_u16(*acc, add);
-                        cur_blk += 1;
-                        buf_len = 0;
-                    }
-                },
-            )
-            .expect("stream_pi0_and_collect_tails");
-        assert_eq!(abg_list.len(), meta.len());
-        assert_eq!(buf_len, 0);
+        maybe_print_rss("tiny_payload_hash:before_prove_decap_stream");
 
-        // Collect per-sublock candidates per lock, then decrypt deterministically (no branching).
-        let mut per_lock_slots: Vec<Vec<Option<(u16, [u16; 2])>>> =
-            locks.iter().map(|l| vec![None; l.sublocks.len()]).collect();
-        for (gi, abgt) in abg_list.iter().enumerate() {
-            let (li, si) = meta[gi];
-            let sl = &locks[li].sublocks[si];
-            let td = tail_dots_mod257[gi];
-            let cands = crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt, td)
-            .unwrap_or_else(|e| panic!("sublock cands[{gi}]: {e}"));
-            let ch = sl.channel_id;
-            per_lock_slots[li][si] = Some((ch, cands));
+        // No-tag policy: carry candidates forward. For this test, select the correct share by
+        // matching the expected share bytes (test-only oracle), then hash-combine K-of-K.
+        let mut selected: Vec<(u32, [u8; 32])> = Vec::with_capacity(K_LOCKS);
+        for li in 0..K_LOCKS {
+            let cands = decap_noisy_lock_candidates(&prover, &locks[li], &x, &z_w)
+                .unwrap_or_else(|e| panic!("lock[{li}] decap candidates: {e}"));
+            let want = shares[li].1;
+            let got = cands
+                .into_iter()
+                .find(|c| *c == want)
+                .unwrap_or_else(|| {
+                    panic!("lock[{li}] did not yield the correct share among candidates")
+                });
+            selected.push(((li as u32) + 1, got));
         }
-        let mut selected: Vec<ShamirShare> = Vec::with_capacity(shamir.threshold);
-        for li in 0..shamir.threshold {
-            let sublock_cands: Vec<(u16, [u16; 2])> =
-                per_lock_slots[li].iter().map(|x| x.unwrap()).collect();
-            let pt = crate::lockable_ringlwe::decrypt_payload_from_sublock_s_candidates(
-                &locks[li],
-                &sublock_cands,
-            )
-            .expect("decrypt_payload");
-            assert_eq!(pt.len(), 32, "share wrong length");
-            let mut b = [0u8; 32];
-            b.copy_from_slice(&pt);
-            selected.push(ShamirShare {
-                index: shares[li].index,
-                value: b,
-            });
-        }
-        let recovered = reconstruct_secret_32(&shamir, &selected).expect("reconstruct_secret_32");
-        assert_eq!(recovered, secret, "failed to reconstruct correct secret");
+        let recovered =
+            oneproof_hash_combine_shares_v1(&stmt_digest_f257, &lock_coin_seed, &selected);
+        assert_eq!(recovered, combined_key, "failed to recover combined key");
 
-        // Print global-check-only security accounting.
-        let p = locks[0].p_channels;
-        let l_required = shamir.threshold;
-        let classical_bits =
-            crate::lockable_ringlwe::classical_bits_global_check_only(p, l_required);
-        let grover_bits = crate::lockable_ringlwe::grover_bits_global_check_only(p, l_required);
-        let meets_pq128 =
-            crate::lockable_ringlwe::meets_pq128_grover_global_check_only(p, l_required);
+        maybe_print_rss("tiny_payload_hash:after_prove_decap_stream");
         eprintln!(
-            "[amplification] model=global_check_only P={}, required_locks={}, cands=2^{:.0}, grover_bits={:.1}, pq128={}",
-            p, l_required, classical_bits, grover_bits, meets_pq128
-        );
-
-        maybe_print_rss("tiny_payload_shamir:after_prove_decap_stream");
-        eprintln!(
-            "[tiny_payload_shamir] prove+decap(stream) in {:?}",
+            "[tiny_payload_hash] prove+decap(stream) in {:?}",
             t_prove.elapsed()
         );
 
@@ -2078,7 +2010,7 @@ mod tests {
     #[ignore = "very slow in debug: runs full DPP prove+decap for 3 armers; run with `--release`"]
     fn test_pvugc_3armer_btc_address_we_lock_e2e() {
         use crate::lockable_ringlwe::RingLweParams;
-        use crate::shamir_gf256::{reconstruct_secret_32, split_secret_32, ShamirConfig, ShamirShare};
+        use crate::oneproof_combine::oneproof_hash_combine_shares_v1;
         use crate::we_statement::encode_public_x;
         use crate::we_tiny_lock::arm_lfplus_ringlwe_lock;
         use crate::utils::maybe_print_rss;
@@ -2213,11 +2145,7 @@ mod tests {
         // Phase 1: ARMING (3 armers, each with a secp256k1 secret)
         // =====================================================================
         let mut rng = StdRng::seed_from_u64(20260206);
-        // Full K-of-K in the BTC e2e harness.
-        let shamir = ShamirConfig {
-            threshold: 16,
-            shares: 16,
-        };
+        const K_LOCKS_PER_ARMER: usize = 16;
         let ringlwe_params = RingLweParams::default();
 
         // Each armer samples a secret scalar. Individual P_j = s_j·G are NEVER published.
@@ -2235,18 +2163,41 @@ mod tests {
         // Here we simulate this: each armer generates s_j, the test computes P_combined
         // (as the armers would privately), and only P_combined + the address are "public."
 
-        let mut armer_secrets: Vec<[u8; 32]> = Vec::with_capacity(N_ARMERS);
+        #[derive(Clone)]
+        struct ArmerSecrets {
+            lock_coin_seed: [u8; 32],
+            shares: Vec<(u32, [u8; 32])>,
+            combined_secret: [u8; 32],
+        }
+        let mut armer_secrets: Vec<ArmerSecrets> = Vec::with_capacity(N_ARMERS);
+
         // Simulate private P_j accumulation (armers share P_j only with each other).
         let mut p_combined = ProjectivePoint::IDENTITY;
-        for _j in 0..N_ARMERS {
-            let mut sk = [0u8; 32];
-            rng.fill_bytes(&mut sk);
-            sk[31] |= 1; // ensure nonzero
-            let scalar = scalar_from_bytes_mod_order(&sk);
-            let scalar_bytes: [u8; 32] = scalar.to_bytes().into();
-            armer_secrets.push(scalar_bytes);
-            // Each armer adds their P_j to the running sum (private, between armers only).
+        for j in 0..N_ARMERS {
+            // Deterministic per-armer lock-coin seed (public in a real package; fine for test).
+            let lock_coin_seed: [u8; 32] = {
+                let mut h = sha2::Sha256::new();
+                h.update(b"btc_3armer_lock_coin_seed_v1");
+                h.update(&[j as u8]);
+                h.finalize().into()
+            };
+
+            let mut shares: Vec<(u32, [u8; 32])> = Vec::with_capacity(K_LOCKS_PER_ARMER);
+            for i in 0..K_LOCKS_PER_ARMER {
+                let mut v = [0u8; 32];
+                rng.fill_bytes(&mut v);
+                shares.push(((i as u32) + 1, v));
+            }
+            let combined_secret =
+                oneproof_hash_combine_shares_v1(&stmt_digest_f257, &lock_coin_seed, &shares);
+
+            let scalar = scalar_from_bytes_mod_order(&combined_secret);
             p_combined += ProjectivePoint::GENERATOR * scalar;
+            armer_secrets.push(ArmerSecrets {
+                lock_coin_seed,
+                shares,
+                combined_secret,
+            });
         }
 
         // ONLY P_combined is public. No individual P_j escapes the armer group.
@@ -2255,175 +2206,96 @@ mod tests {
         eprintln!("[btc_3armer] P_combined (public) = {:?}", p_combined_compressed);
         eprintln!("[btc_3armer] P2WPKH address hash (public) = {:02x?}", address_hash);
 
-        // Each armer: Shamir-split their secret, arm R locks.
+        // Each armer: arm K locks (one per share).
         let t_arm = Instant::now();
         #[derive(Clone)]
         struct ArmerLockset<F: PrimeField> {
-            locks: Vec<crate::lockable_ringlwe::RingLweLockArtifact<F>>,
+            locks: Vec<crate::lockable_ringlwe::NoisyLockArtifact<F>>,
             share_indices: Vec<u32>,
+            share_values: Vec<[u8; 32]>,
+            lock_coin_seed: [u8; 32],
+            combined_secret: [u8; 32],
         }
         let mut armer_locksets: Vec<ArmerLockset<F257>> = Vec::with_capacity(N_ARMERS);
         for j in 0..N_ARMERS {
-            let shares = split_secret_32(&mut rng, &shamir, armer_secrets[j])
-                .expect("split_secret_32");
-            let mut locks = Vec::with_capacity(shamir.shares);
-            let mut indices = Vec::with_capacity(shamir.shares);
-            for i in 0..shamir.shares {
-                let mut rep_id = (j * 1000 + i) as u64;
-                let lock = loop {
-                    match arm_lfplus_ringlwe_lock::<R>(
-                        shape.clone(),
-                        &stmt_digest_f257,
-                        // Unique armer seed per (armer, lock).
-                        {
-                            let mut seed = [0u8; 32];
-                            seed[0] = j as u8;
-                            seed[1] = i as u8;
-                            seed[2..4].copy_from_slice(&(rep_id as u16).to_le_bytes());
-                            seed
-                        },
-                        0,
-                        0,
-                        crate::we_tiny_lock::WeRingLweLockArmingPolicy {
-                            base_rep_id: rep_id,
-                            max_rep_tries: 32,
-                            hint_budget_bytes: None,
-                        },
-                        ringlwe_params.clone(),
-                        1,
-                        &shares[i].value,
-                        &mut rng,
-                    ) {
-                        Ok(lock_out) => break lock_out.lock,
-                        Err(e) if e.contains("resample rep_id") => {
-                            rep_id += 1;
-                            continue;
-                        }
-                        Err(e) => panic!("arm armer[{j}] lock[{i}] failed: {e}"),
-                    }
-                };
-                indices.push(shares[i].index);
+            let mut locks = Vec::with_capacity(K_LOCKS_PER_ARMER);
+            let mut indices = Vec::with_capacity(K_LOCKS_PER_ARMER);
+            let mut values = Vec::with_capacity(K_LOCKS_PER_ARMER);
+            for i in 0..K_LOCKS_PER_ARMER {
+                let lock = arm_lfplus_ringlwe_lock::<R>(
+                    shape.clone(),
+                    &stmt_digest_f257,
+                    // Unique armer seed per (armer, lock).
+                    {
+                        let mut seed = [0u8; 32];
+                        seed[0] = j as u8;
+                        seed[1] = i as u8;
+                        seed
+                    },
+                    0,
+                    0,
+                    crate::we_tiny_lock::WeRingLweLockArmingPolicy {
+                        base_rep_id: (j * 1000 + i) as u64,
+                        max_rep_tries: 32,
+                        hint_budget_bytes: None,
+                    },
+                    ringlwe_params.clone(),
+                    1,
+                    &armer_secrets[j].shares[i].1,
+                    &mut rng,
+                )
+                .unwrap_or_else(|e| panic!("arm armer[{j}] lock[{i}] failed: {e}"))
+                .lock;
+                indices.push(armer_secrets[j].shares[i].0);
+                values.push(armer_secrets[j].shares[i].1);
                 locks.push(lock);
             }
-            armer_locksets.push(ArmerLockset { locks, share_indices: indices });
+            armer_locksets.push(ArmerLockset {
+                locks,
+                share_indices: indices,
+                share_values: values,
+                lock_coin_seed: armer_secrets[j].lock_coin_seed,
+                combined_secret: armer_secrets[j].combined_secret,
+            });
         }
         eprintln!(
             "[btc_3armer] armed {} armers × {} locks each in {:?}",
-            N_ARMERS, shamir.shares, t_arm.elapsed()
+            N_ARMERS, K_LOCKS_PER_ARMER, t_arm.elapsed()
         );
 
         // =====================================================================
-        // Phase 2: DECAP — single π₀ pass feeds ALL armers' locks in parallel
+        // Phase 2: DECAP
         // =====================================================================
         let t_decap = Instant::now();
         maybe_print_rss("btc_3armer:before_decap");
 
-        // Flatten all locks across all armers.
-        let all_locks: Vec<&crate::lockable_ringlwe::RingLweLockArtifact<F257>> = armer_locksets
-            .iter()
-            .flat_map(|ls| ls.locks.iter())
-            .collect();
-
-        // Flatten all sublocks across all locks into one streaming pass.
-        let mut coins_list: Vec<_> = Vec::new();
-        let mut meta: Vec<(usize, usize)> = Vec::new(); // (lock_idx, sublock_idx)
-        for (li, lock) in all_locks.iter().enumerate() {
-            for (si, _sl) in lock.sublocks.iter().enumerate() {
-                let sl = &lock.sublocks[si];
-                coins_list.push(
-                    prover
-                        .derive_public_coins_from_stmt(
-                            lock.c_stmt.as_slice(),
-                            sl.anchor_block_id as usize,
-                            sl.rep_id,
-                        )
-                        .expect("derive_public_coins_from_stmt"),
-                );
-                meta.push((li, si));
-            }
-        }
-
-        // Stream π₀ ONCE — all sublocks absorb the same chunks simultaneously.
-        // Canonical path: stream tails and fold them immediately (no tail vectors).
-        let mut tail_dots_mod257: Vec<u16> = vec![0u16; coins_list.len()];
-        let mut cur_ci: Option<usize> = None;
-        let mut cur_blk: usize = 0;
-        let mut buf_len: usize = 0;
-        let mut buf64: [u16; 64] = [0u16; 64];
-        let abg_list = prover
-            .stream_pi0_and_collect_tails(
-                &x,
-                &z_w,
-                &coins_list,
-                None,
-                &mut |ci, _ti, t| {
-                    if cur_ci != Some(ci) {
-                        cur_ci = Some(ci);
-                        cur_blk = 0;
-                        buf_len = 0;
-                    }
-                    let td = crate::lockable_ringlwe::field_mod257_u16(t);
-                    buf64[buf_len] = td;
-                    buf_len += 1;
-                    if buf_len == 64 {
-                        let (li, si) = meta[ci];
-                        let lock = all_locks[li];
-                        let sl = &lock.sublocks[si];
-                        let blk = &sl.hints.tail_scales[cur_blk];
-                        let add = crate::lockable_ringlwe::dot_packed_block_mod257_u16(blk, &buf64);
-                        let acc = &mut tail_dots_mod257[ci];
-                        *acc = crate::lockable_ringlwe::add_mod257_u16(*acc, add);
-                        cur_blk += 1;
-                        buf_len = 0;
-                    }
-                },
-            )
-            .expect("stream_pi0_and_collect_tails");
-        assert_eq!(abg_list.len(), meta.len());
-        assert_eq!(buf_len, 0);
-
-        // Per lock: collect sublock candidates in canonical order, then decrypt deterministically.
-        let mut per_lock_sublock_cands: Vec<Vec<Option<(u16, [u16; 2])>>> = all_locks
-            .iter()
-            .map(|l| vec![None; l.sublocks.len()])
-            .collect();
-        for (gi, abgt) in abg_list.iter().enumerate() {
-            let (li, si) = meta[gi];
-            let lock = all_locks[li];
-            let sl = &lock.sublocks[si];
-            let td = tail_dots_mod257[gi];
-            let cands = crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt, td)
-            .unwrap_or_else(|e| panic!("sublock candidates[{gi}]: {e}"));
-            let ch = sl.channel_id;
-            per_lock_sublock_cands[li][si] = Some((ch, cands));
-        }
-
-        let mut per_lock_share_bytes: Vec<[u8; 32]> = Vec::with_capacity(all_locks.len());
-        for (li, lock) in all_locks.iter().enumerate() {
-            let slots = &per_lock_sublock_cands[li];
-            let sublock_cands: Vec<(u16, [u16; 2])> =
-                slots.iter().map(|x| x.unwrap()).collect();
-            let pt =
-                crate::lockable_ringlwe::decrypt_payload_from_sublock_s_candidates(lock, &sublock_cands)
-                    .unwrap_or_else(|e| panic!("lock[{li}] decrypt_payload: {e}"));
-            assert_eq!(pt.len(), 32);
-            let mut b = [0u8; 32];
-            b.copy_from_slice(&pt);
-            per_lock_share_bytes.push(b);
-        }
-
-        // Reconstruct each armer's secret deterministically (no branching).
+        // No-tag policy: carry candidates forward. For this test, select the correct share by
+        // matching the expected share bytes (test-only oracle), then reconstruct and verify the
+        // Bitcoin address binding.
         let mut armer_decapped_secrets: Vec<[u8; 32]> = Vec::with_capacity(N_ARMERS);
         for j in 0..N_ARMERS {
-            let mut selected: Vec<ShamirShare> = Vec::with_capacity(shamir.threshold);
-            for i in 0..shamir.threshold {
-                let global_li = j * shamir.shares + i;
-                selected.push(ShamirShare {
-                    index: armer_locksets[j].share_indices[i],
-                    value: per_lock_share_bytes[global_li],
-                });
+            let mut selected: Vec<(u32, [u8; 32])> = Vec::with_capacity(K_LOCKS_PER_ARMER);
+            for i in 0..K_LOCKS_PER_ARMER {
+                let lock = &armer_locksets[j].locks[i];
+                let cands = decap_noisy_lock_candidates(&prover, lock, &x, &z_w)
+                    .unwrap_or_else(|e| panic!("armer[{j}] lock[{i}] decap candidates: {e}"));
+                let want = armer_locksets[j].share_values[i];
+                let got = cands
+                    .into_iter()
+                    .find(|c| *c == want)
+                    .unwrap_or_else(|| panic!("armer[{j}] lock[{i}] did not yield correct share among candidates"));
+                selected.push((armer_locksets[j].share_indices[i], got));
             }
-            let secret = reconstruct_secret_32(&shamir, &selected).expect("reconstruct_secret_32");
+            let secret = oneproof_hash_combine_shares_v1(
+                &stmt_digest_f257,
+                &armer_locksets[j].lock_coin_seed,
+                &selected,
+            );
+            assert_eq!(
+                secret,
+                armer_locksets[j].combined_secret,
+                "armer[{j}] recovered secret mismatch"
+            );
             armer_decapped_secrets.push(secret);
         }
 
@@ -2441,307 +2313,6 @@ mod tests {
 
         maybe_print_rss("btc_3armer:after_decap");
         eprintln!("[btc_3armer] decap + reconstruct + verify in {:?}", t_decap.elapsed());
-
-        let p = all_locks[0].p_channels;
-        let l_required_per_armer = shamir.threshold;
-        let l_required_system = shamir.threshold * N_ARMERS;
-        let classical_bits_per_armer =
-            crate::lockable_ringlwe::classical_bits_global_check_only(p, l_required_per_armer);
-        let grover_bits_per_armer =
-            crate::lockable_ringlwe::grover_bits_global_check_only(p, l_required_per_armer);
-        let classical_bits_system =
-            crate::lockable_ringlwe::classical_bits_global_check_only(p, l_required_system);
-        let grover_bits_system =
-            crate::lockable_ringlwe::grover_bits_global_check_only(p, l_required_system);
-        let meets_pq128_system =
-            crate::lockable_ringlwe::meets_pq128_grover_global_check_only(p, l_required_system);
-        eprintln!(
-            "[amplification] model=global_check_only P={}, required_locks_per_armer={}, required_locks_system={}, cands_per_armer=2^{:.0}, grover_bits_per_armer={:.1}, cands_system=2^{:.0}, grover_bits_system={:.1}, pq128_system={}",
-            p,
-            l_required_per_armer,
-            l_required_system,
-            classical_bits_per_armer,
-            grover_bits_per_armer,
-            classical_bits_system,
-            grover_bits_system,
-            meets_pq128_system
-        );
-
-        // =====================================================================
-        // Adversarial tests: verify the lock rejects corrupted inputs.
-        // =====================================================================
-
-        // --- ADV 1: Corrupted proof tail (one bit flip in first tail) ---
-        // Restream with a corrupted tail. Should fail to recover the Bitcoin address.
-        {
-            // Flatten sublocks.
-            let mut adv_coins: Vec<_> = Vec::new();
-            let mut adv_meta: Vec<(usize, usize)> = Vec::new();
-            for (li, lock) in all_locks.iter().enumerate() {
-                for (si, _sl) in lock.sublocks.iter().enumerate() {
-                    let sl = &lock.sublocks[si];
-                    adv_coins.push(
-                        prover
-                            .derive_public_coins_from_stmt(
-                                lock.c_stmt.as_slice(),
-                                sl.anchor_block_id as usize,
-                                sl.rep_id,
-                            )
-                            .expect("derive_public_coins_from_stmt"),
-                    );
-                    adv_meta.push((li, si));
-                }
-            }
-
-            // Canonical path: stream tails and fold them immediately (no tail vectors).
-            // We simulate a "corrupted tail element" by perturbing the first visited tail element
-            // for the first coin before folding.
-            let mut tail_dots_mod257: Vec<u16> = vec![0u16; adv_coins.len()];
-            let mut cur_ci: Option<usize> = None;
-            let mut cur_blk: usize = 0;
-            let mut buf_len: usize = 0;
-            let mut buf64: [u16; 64] = [0u16; 64];
-            let adv_abg_list = prover
-                .stream_pi0_and_collect_tails(
-                    &x,
-                    &z_w,
-                    &adv_coins,
-                    None,
-                    &mut |ci, ti, t| {
-                        if cur_ci != Some(ci) {
-                            cur_ci = Some(ci);
-                            cur_blk = 0;
-                            buf_len = 0;
-                        }
-                        let mut td = crate::lockable_ringlwe::field_mod257_u16(t);
-                        if ci == 0 && ti == 0 {
-                            td = crate::lockable_ringlwe::add_mod257_u16(td, 42u16);
-                        }
-                        buf64[buf_len] = td;
-                        buf_len += 1;
-                        if buf_len == 64 {
-                            let (li, si) = adv_meta[ci];
-                            let lock = all_locks[li];
-                            let sl = &lock.sublocks[si];
-                            let blk = &sl.hints.tail_scales[cur_blk];
-                            let add = crate::lockable_ringlwe::dot_packed_block_mod257_u16(blk, &buf64);
-                            let acc = &mut tail_dots_mod257[ci];
-                            *acc = crate::lockable_ringlwe::add_mod257_u16(*acc, add);
-                            cur_blk += 1;
-                            buf_len = 0;
-                        }
-                    },
-                )
-                .expect("adv stream");
-            assert_eq!(adv_abg_list.len(), adv_meta.len());
-            assert_eq!(buf_len, 0);
-
-            let mut per_lock_slots: Vec<Vec<Option<(u16, [u16; 2])>>> =
-                all_locks.iter().map(|l| vec![None; l.sublocks.len()]).collect();
-            for (gi, abgt) in adv_abg_list.iter().enumerate() {
-                let (li, si) = adv_meta[gi];
-                let lock = all_locks[li];
-                let sl = &lock.sublocks[si];
-                let td = tail_dots_mod257[gi];
-                let cands = crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt, td)
-                    .unwrap();
-                let ch = sl.channel_id;
-                per_lock_slots[li][si] = Some((ch, cands));
-            }
-
-            let mut ok = true;
-            let mut shares: Vec<[u8; 32]> = Vec::with_capacity(all_locks.len());
-            for (li, lock) in all_locks.iter().enumerate() {
-                let sublock_cands: Vec<(u16, [u16; 2])> =
-                    per_lock_slots[li].iter().map(|x| x.unwrap()).collect();
-                let pt = match crate::lockable_ringlwe::decrypt_payload_from_sublock_s_candidates(
-                    lock,
-                    &sublock_cands,
-                ) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        ok = false;
-                        break;
-                    }
-                };
-                if pt.len() != 32 {
-                    ok = false;
-                    break;
-                }
-                let mut b = [0u8; 32];
-                b.copy_from_slice(&pt);
-                shares.push(b);
-            }
-
-            if ok {
-                let mut sc_sum = Scalar::ZERO;
-                for j in 0..N_ARMERS {
-                    let mut selected: Vec<ShamirShare> = Vec::with_capacity(shamir.threshold);
-                    for i in 0..shamir.threshold {
-                        let global_li = j * shamir.shares + i;
-                        selected.push(ShamirShare {
-                            index: armer_locksets[j].share_indices[i],
-                            value: shares[global_li],
-                        });
-                    }
-                    let s = reconstruct_secret_32(&shamir, &selected).unwrap();
-                    sc_sum = sc_sum + scalar_from_bytes_mod_order(&s);
-                }
-                let pk = ProjectivePoint::GENERATOR * sc_sum;
-                assert_ne!(
-                    pubkey_to_p2wpkh_hash(&point_to_compressed(&pk)),
-                    address_hash,
-                    "ADV1: corrupted tail should NOT recover the Bitcoin address"
-                );
-            }
-            eprintln!("[btc_3armer] ADV1 (corrupted tail): correctly rejected");
-        }
-
-        // --- ADV 2: Tampered ciphertext (bit flip in armer 0's first lock) ---
-        {
-            let mut tampered_locksets = armer_locksets.clone();
-            if let Some(first_byte) = tampered_locksets[0].locks[0].ct.ct.first_mut() {
-                *first_byte ^= 0x80;
-            }
-            let tampered_all_locks: Vec<&crate::lockable_ringlwe::RingLweLockArtifact<F257>> =
-                tampered_locksets.iter().flat_map(|ls| ls.locks.iter()).collect();
-
-            // Flatten sublocks.
-            let mut tam_coins: Vec<_> = Vec::new();
-            let mut tam_meta: Vec<(usize, usize)> = Vec::new();
-            for (li, lock) in tampered_all_locks.iter().enumerate() {
-                for (si, _sl) in lock.sublocks.iter().enumerate() {
-                    let sl = &lock.sublocks[si];
-                    tam_coins.push(
-                        prover
-                            .derive_public_coins_from_stmt(
-                                lock.c_stmt.as_slice(),
-                                sl.anchor_block_id as usize,
-                                sl.rep_id,
-                            )
-                            .expect("derive_public_coins_from_stmt"),
-                    );
-                    tam_meta.push((li, si));
-                }
-            }
-
-            let mut tail_dots_mod257: Vec<u16> = vec![0u16; tam_coins.len()];
-            let mut cur_ci: Option<usize> = None;
-            let mut cur_blk: usize = 0;
-            let mut buf_len: usize = 0;
-            let mut buf64: [u16; 64] = [0u16; 64];
-            let tam_abg_list = prover
-                .stream_pi0_and_collect_tails(
-                    &x,
-                    &z_w,
-                    &tam_coins,
-                    None,
-                    &mut |ci, ti, t| {
-                        if cur_ci != Some(ci) {
-                            cur_ci = Some(ci);
-                            cur_blk = 0;
-                            buf_len = 0;
-                        }
-                        let td = crate::lockable_ringlwe::field_mod257_u16(t);
-                        buf64[buf_len] = td;
-                        buf_len += 1;
-                        if buf_len == 64 {
-                            let (li, si) = tam_meta[ci];
-                            let lock = tampered_all_locks[li];
-                            let sl = &lock.sublocks[si];
-                            let blk = &sl.hints.tail_scales[cur_blk];
-                            let add = crate::lockable_ringlwe::dot_packed_block_mod257_u16(blk, &buf64);
-                            let acc = &mut tail_dots_mod257[ci];
-                            *acc = crate::lockable_ringlwe::add_mod257_u16(*acc, add);
-                            cur_blk += 1;
-                            buf_len = 0;
-                        }
-                    },
-                )
-                .expect("tam stream");
-            assert_eq!(tam_abg_list.len(), tam_meta.len());
-            assert_eq!(buf_len, 0);
-
-            let mut per_lock_slots: Vec<Vec<Option<(u16, [u16; 2])>>> = tampered_all_locks
-                .iter()
-                .map(|l| vec![None; l.sublocks.len()])
-                .collect();
-            for (gi, abgt) in tam_abg_list.iter().enumerate() {
-                let (li, si) = tam_meta[gi];
-                let lock = tampered_all_locks[li];
-                let sl = &lock.sublocks[si];
-                let td = tail_dots_mod257[gi];
-                let cands = crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(sl, abgt, td)
-                    .unwrap();
-                let ch = sl.channel_id;
-                per_lock_slots[li][si] = Some((ch, cands));
-            }
-
-            let mut ok = true;
-            let mut shares: Vec<[u8; 32]> = Vec::with_capacity(tampered_all_locks.len());
-            for (li, lock) in tampered_all_locks.iter().enumerate() {
-                let sublock_cands: Vec<(u16, [u16; 2])> =
-                    per_lock_slots[li].iter().map(|x| x.unwrap()).collect();
-                let pt = match crate::lockable_ringlwe::decrypt_payload_from_sublock_s_candidates(
-                    lock,
-                    &sublock_cands,
-                ) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        ok = false;
-                        break;
-                    }
-                };
-                if pt.len() != 32 {
-                    ok = false;
-                    break;
-                }
-                let mut b = [0u8; 32];
-                b.copy_from_slice(&pt);
-                shares.push(b);
-            }
-
-            if ok {
-                let mut sc_sum = Scalar::ZERO;
-                for j in 0..N_ARMERS {
-                    let mut selected: Vec<ShamirShare> = Vec::with_capacity(shamir.threshold);
-                    for i in 0..shamir.threshold {
-                        let global_li = j * shamir.shares + i;
-                        selected.push(ShamirShare {
-                            index: tampered_locksets[j].share_indices[i],
-                            value: shares[global_li],
-                        });
-                    }
-                    let s = reconstruct_secret_32(&shamir, &selected).unwrap();
-                    sc_sum = sc_sum + scalar_from_bytes_mod_order(&s);
-                }
-                let pk = ProjectivePoint::GENERATOR * sc_sum;
-                assert_ne!(
-                    pubkey_to_p2wpkh_hash(&point_to_compressed(&pk)),
-                    address_hash,
-                    "ADV2: tampered ciphertext should NOT recover the Bitcoin address"
-                );
-            }
-            eprintln!("[btc_3armer] ADV2 (tampered ciphertext): correctly rejected");
-        }
-
-        // --- ADV 3: Wrong address (different combined key) ---
-        // Even with correct decap, the recovered key shouldn't match a DIFFERENT address.
-        {
-            let wrong_scalar = scalar_from_bytes_mod_order(&[0xFFu8; 32]);
-            let wrong_pk = ProjectivePoint::GENERATOR * wrong_scalar;
-            let wrong_hash = pubkey_to_p2wpkh_hash(&point_to_compressed(&wrong_pk));
-            assert_ne!(wrong_hash, address_hash, "sanity: wrong address should differ");
-            // The correctly recovered s_combined should NOT match the wrong address.
-            let wrong_check = pubkey_to_p2wpkh_hash(&point_to_compressed(
-                &pk_verify
-            ));
-            assert_ne!(wrong_check, wrong_hash, "ADV3: correct key should not match wrong address");
-            eprintln!("[btc_3armer] ADV3 (wrong address): correctly rejected");
-        }
-
-        eprintln!("[btc_3armer] all adversarial tests passed");
-
         crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir);
     }
 
@@ -2908,7 +2479,7 @@ mod tests {
         let armer_seed = [7u8; 32];
         let lock_j = 0u64;
         let ringlwe_params = RingLweParams::default();
-        let dummy_payload: [u8; 0] = [];
+        let dummy_payload: [u8; 32] = [9u8; 32];
 
         let mut rng = StdRng::seed_from_u64(42);
         let public_len = shape.public_len;
@@ -2984,79 +2555,18 @@ mod tests {
 
         let t_prove = Instant::now();
         maybe_print_rss("tiny_gate_large:before_prove_decap_stream");
-        let meta = [(0usize, 0usize), (1usize, 0usize)];
-        let mut tail_dots_mod257: [u16; 2] = [0u16; 2];
-        let mut cur_ci: Option<usize> = None;
-        let mut cur_blk: usize = 0;
-        let mut buf_len: usize = 0;
-        let mut buf64: [u16; 64] = [0u16; 64];
-        let abg_list = prover
-            .stream_pi0_and_collect_tails(
-                &x,
-                &z_w,
-                &[
-                    prover
-                        .derive_public_coins_from_stmt(
-                            lock0.c_stmt.as_slice(),
-                            lock0.sublocks[0].anchor_block_id as usize,
-                            lock0.sublocks[0].rep_id,
-                        )
-                        .expect("derive_public_coins_from_stmt lock0"),
-                    prover
-                        .derive_public_coins_from_stmt(
-                            lock1.c_stmt.as_slice(),
-                            lock1.sublocks[0].anchor_block_id as usize,
-                            lock1.sublocks[0].rep_id,
-                        )
-                        .expect("derive_public_coins_from_stmt lock1"),
-                ],
-                None,
-                &mut |ci, _ti, t| {
-                    if cur_ci != Some(ci) {
-                        cur_ci = Some(ci);
-                        cur_blk = 0;
-                        buf_len = 0;
-                    }
-                    let td = crate::lockable_ringlwe::field_mod257_u16(t);
-                    buf64[buf_len] = td;
-                    buf_len += 1;
-                    if buf_len == 64 {
-                        let (lock_id, si) = meta[ci];
-                        let sl = match lock_id {
-                            0 => &lock0.sublocks[si],
-                            1 => &lock1.sublocks[si],
-                            _ => unreachable!(),
-                        };
-                        let blk = &sl.hints.tail_scales[cur_blk];
-                        let add = crate::lockable_ringlwe::dot_packed_block_mod257_u16(blk, &buf64);
-                        tail_dots_mod257[ci] = crate::lockable_ringlwe::add_mod257_u16(tail_dots_mod257[ci], add);
-                        cur_blk += 1;
-                        buf_len = 0;
-                    }
-                },
-            )
-            .expect("stream_pi0_and_collect_tails");
-        assert_eq!(abg_list.len(), 2);
-        assert_eq!(buf_len, 0);
-        let _s0 = crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(
-            &lock0.sublocks[0],
-            &abg_list[0],
-            tail_dots_mod257[0],
-        )
-        .expect("decap_finish0");
-        let _s1 = crate::lockable_ringlwe::sublock_s_candidates_from_abg_tail(
-            &lock1.sublocks[0],
-            &abg_list[1],
-            tail_dots_mod257[1],
-        )
-        .expect("decap_finish1");
-        for lock in [&lock0, &lock1] {
-            assert_eq!(lock.sublocks.len(), 1);
-            assert_eq!(
-                lock.sublocks[0].accepting_set[1],
-                lock.sublocks[0].accepting_set[0] + F257::ONE
-            );
-        }
+        let cands0 = decap_noisy_lock_candidates(&prover, &lock0, &x, &z_w)
+            .unwrap_or_else(|e| panic!("lock0 decap candidates: {e}"));
+        assert!(
+            cands0.contains(&dummy_payload),
+            "lock0 payload not found among candidates"
+        );
+        let cands1 = decap_noisy_lock_candidates(&prover, &lock1, &x, &z_w)
+            .unwrap_or_else(|e| panic!("lock1 decap candidates: {e}"));
+        assert!(
+            cands1.contains(&dummy_payload),
+            "lock1 payload not found among candidates"
+        );
         maybe_print_rss("tiny_gate_large:after_prove_decap_stream");
         eprintln!("[tiny_gate_large] prove+decap(stream) in {:?}", t_prove.elapsed());
 

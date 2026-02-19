@@ -15,7 +15,6 @@ pub mod tensor_eval;
 pub mod transcript;
 pub mod utils;
 pub mod fs_cleanup;
-pub mod shamir_gf256;
 
 // SP1 lift vacuity/soundness regression tests (WE-gate only).
 #[cfg(all(test, feature = "we_gate"))]
@@ -47,3 +46,7 @@ pub mod sp1_witness_io;
 // API wrapper for the SP1 oneproof WE-gate harness (so downstream crates can call it in-process).
 #[cfg(feature = "we_gate")]
 pub mod sp1_oneproof_api;
+
+// Canonical hash-combine rule for OneProof WE-gate (feature-gated, but shared by tests too).
+#[cfg(feature = "we_gate")]
+pub mod oneproof_combine;

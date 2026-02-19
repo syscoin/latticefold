@@ -25,6 +25,11 @@ const PACK_D: usize = 64;
 /// Prime modulus for the tiny field.
 const MOD_257: u16 = 257;
 
+/// Goldilocks prime field modulus (for PVUGC-style noisy hints).
+///
+/// p = 2^64 - 2^32 + 1
+pub(crate) const GOLDILOCKS_P: u64 = 18446744069414584321u64;
+
 #[inline]
 fn f_to_u64<F: PrimeField>(f: &F) -> u64 {
     f.into_bigint().as_ref()[0]
@@ -94,203 +99,269 @@ fn inv_mod257(a: u16) -> Result<u16, String> {
     Ok(pow_mod257(a % MOD_257, 255))
 }
 
-/// Compute the canonical ratio class `min(r, r^{-1})` where `r = a1/a0 (mod 257)`.
-///
-/// Used to enforce that repetitions within a channel have distinct accepting-set ratios, so the
-/// intersection of 2-candidate sets collapses deterministically for an honest decapper (given π).
-pub(crate) fn ratio_class_mod257_u16<F: PrimeField>(a0: &F, a1: &F) -> Result<u16, String> {
-    let a0u = (f_to_u64(a0) % 257) as u16;
-    let a1u = (f_to_u64(a1) % 257) as u16;
-    if a0u == 0 || a1u == 0 {
-        return Err("ratio_class_mod257_u16: zero accepting element".to_string());
-    }
-    let r = mul_mod257(a1u, inv_mod257(a0u)?);
-    let rinv = inv_mod257(r)?;
-    Ok(r.min(rinv))
-}
+// ---------------------------------------------------------------------------
+// Goldilocks helpers (PVUGC-style hint arithmetic)
+// ---------------------------------------------------------------------------
 
-
-/// Packed encoding of up to 64 coefficients in F257 (per hinted block).
-///
-/// We support a dual-format representation:
-/// - Sparse: omit zeros; store `(pos_flags, coeff)` pairs.
-/// - Dense: store 64 bytes + a 64-bit mask for coefficients equal to 256.
-///
-/// This reduces the "dense block is worst case for sparse encoding" outliers, which in turn
-/// reduces the need for hint-budget-driven rejection sampling (and its distributional bias).
-#[derive(Clone, Debug)]
-pub enum PackedF257Block64 {
-    /// Sparse encoding:
-    /// - `pos_flags`: low 6 bits = position in 0..63; bit6 = "is 256" flag; bit7 reserved.
-    /// - `coeff`: `v % 256` (0..255). If bit6 is set, the value is interpreted as 256.
-    Sparse { entries: Vec<(u8, u8)> },
-    /// Dense encoding:
-    /// - `vals[i]`: `v % 256` (0..255)
-    /// - if bit i in `is256_mask` is set, value is interpreted as 256 (regardless of vals[i])
-    Dense { vals: [u8; PACK_D], is256_mask: u64 },
-}
-
-/// Compute a mod-257 dot product between a packed block and a 64-wide `u16` row.
 #[inline]
-pub(crate) fn dot_packed_block_mod257_u16(blk: &PackedF257Block64, row64: &[u16]) -> u16 {
-    let mut acc = 0u16;
-    match blk {
-        PackedF257Block64::Sparse { entries } => {
-            for &(pos_flags, coeff) in entries {
-                let pos = (pos_flags & 0x3f) as usize;
-                if pos >= row64.len() {
-                    continue;
-                }
-                let is_256 = ((pos_flags >> 6) & 1) != 0;
-                let v = if is_256 { 256u16 } else { coeff as u16 };
-                if v == 0 {
-                    continue;
-                }
-                acc = add_mod257_u16(acc, mul_mod257(v, row64[pos]));
-            }
-        }
-        PackedF257Block64::Dense { vals, is256_mask } => {
-            let lim = 64usize.min(row64.len());
-            for i in 0..lim {
-                let is256 = ((*is256_mask >> i) & 1) != 0;
-                let v = if is256 { 256u16 } else { vals[i] as u16 };
-                if v == 0 {
-                    continue;
-                }
-                acc = add_mod257_u16(acc, mul_mod257(v, row64[i]));
-            }
-        }
-    }
-    acc
+pub(crate) fn add_mod_goldilocks(a: u64, b: u64) -> u64 {
+    let p = GOLDILOCKS_P as u128;
+    let s = (a as u128) + (b as u128);
+    (s % p) as u64
 }
 
-impl Default for PackedF257Block64 {
+#[inline]
+pub(crate) fn mul_mod_goldilocks(a: u64, b: u64) -> u64 {
+    let p = GOLDILOCKS_P as u128;
+    let prod = (a as u128) * (b as u128);
+    (prod % p) as u64
+}
+
+#[inline]
+fn goldilocks_from_i64(x: i64) -> u64 {
+    if x >= 0 {
+        (x as u64) % GOLDILOCKS_P
+    } else {
+        let t = ((-x) as u64) % GOLDILOCKS_P;
+        if t == 0 { 0 } else { GOLDILOCKS_P - t }
+    }
+}
+
+#[inline]
+fn sample_nonzero_goldilocks(rng: &mut impl RngCore) -> u64 {
+    loop {
+        let v = rng.next_u64() % GOLDILOCKS_P;
+        if v != 0 {
+            return v;
+        }
+    }
+}
+
+#[inline]
+fn sample_noise_uniform_i64(rng: &mut impl RngCore, bound: i64) -> i64 {
+    if bound <= 0 {
+        return 0;
+    }
+    // Uniform in [-bound, bound].
+    let span: u64 = (2 * (bound as i128) + 1) as u64;
+    let r = rng.next_u64() % span;
+    (r as i64) - bound
+}
+
+/// PVUGC-style noisy hint vectors.
+///
+/// These are the intended replacement for publishing readable masked coefficient blocks
+/// (e.g. `s * tail_coeffs (mod 257)`), which admits chosen-probe / scan-style attacks for tiny-image
+/// carriers (like the current Sq/power-sum gadget).
+#[derive(Clone, Debug)]
+pub struct PvugcNoisyHints {
+    pub modulus: u64,
+    pub hint0: Vec<u64>,
+    pub hint1: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PvugcNoisyHintParams {
+    /// Per-coordinate noise bound B: noise is sampled uniformly from [-B, B].
+    ///
+    /// This is a dependency-free scaffold; production should use a discrete Gaussian + reconciliation.
+    pub noise_bound: i64,
+    /// Reconciliation granularity: we round inner products to the nearest multiple of 2^t.
+    ///
+    /// Correctness sufficient condition (with bounded `s` and no modulus wrap):
+    /// - sample secret scales as multiples of 2^t
+    /// - ensure total noise on the inner product is < 2^(t-1)
+    pub round_bits: u32,
+    /// Sample the (pre-shift) secret scale `r` from `0..2^s_bits`, then set `s = r<<round_bits`.
+    ///
+    /// This keeps the true inner product far from the Goldilocks modulus so arithmetic does not wrap.
+    pub s_bits: u32,
+}
+
+impl Default for PvugcNoisyHintParams {
     fn default() -> Self {
-        Self::Sparse { entries: Vec::new() }
-    }
-}
-
-impl PackedF257Block64 {
-    // Serialization cost model used for in-memory packing decisions.
-    // - Sparse on disk: fmt(1) + nnz(1) + 2*nnz
-    // - Dense on disk:  fmt(1) + vals(64) + is256_mask(u64)
-    const DENSE_ON_DISK_BYTES: usize = 1 + PACK_D + 8;
-
-    #[inline]
-    pub fn nnz(&self) -> usize {
-        match self {
-            Self::Sparse { entries } => entries.len(),
-            Self::Dense { vals, is256_mask } => {
-                let mut n = is256_mask.count_ones() as usize;
-                // Count nonzero bytes where not overridden by 256-mask.
-                let mut m = *is256_mask;
-                for i in 0..PACK_D {
-                    let masked = (m & 1) != 0;
-                    if !masked && vals[i] != 0 {
-                        n += 1;
-                    }
-                    m >>= 1;
-                }
-                n
-            }
-        }
-    }
-
-    #[inline]
-    pub fn on_disk_bytes(&self) -> usize {
-        match self {
-            Self::Sparse { entries } => 1 + 1 + 2 * entries.len(),
-            Self::Dense { .. } => Self::DENSE_ON_DISK_BYTES,
-        }
-    }
-
-    #[inline]
-    pub fn from_dense_u16s(vals: &[u16; PACK_D]) -> Self {
-        // Decide sparse vs dense by comparing serialized sizes.
-        let mut nnz = 0usize;
-        for i in 0..PACK_D {
-            if (vals[i] % MOD_257) != 0 {
-                nnz += 1;
-            }
-        }
-        let sparse_bytes = 1 + 1 + 2 * nnz;
-        if sparse_bytes >= Self::DENSE_ON_DISK_BYTES {
-            // Dense wins (or ties): keep fixed size.
-            let mut out_vals = [0u8; PACK_D];
-            let mut is256_mask: u64 = 0;
-            for i in 0..PACK_D {
-                let v = vals[i] % MOD_257;
-                if v == 256 {
-                    is256_mask |= 1u64 << i;
-                    out_vals[i] = 0;
-                } else {
-                    out_vals[i] = (v % 256) as u8;
-                }
-            }
-            Self::Dense {
-                vals: out_vals,
-                is256_mask,
-            }
-        } else {
-            // Sparse wins.
-            let mut entries: Vec<(u8, u8)> = Vec::with_capacity(nnz);
-            for i in 0..PACK_D {
-                let v = vals[i] % MOD_257;
-                if v == 0 {
-                    continue;
-                }
-                if v == 256 {
-                    entries.push(((i as u8) | (1u8 << 6), 0u8));
-                } else {
-                    entries.push((i as u8, v as u8));
-                }
-            }
-            Self::Sparse { entries }
-        }
-    }
-
-    #[inline]
-    fn get_at_dense(vals: &[u8; PACK_D], is256_mask: u64, i: usize) -> u16 {
-        let bit = (is256_mask >> i) & 1;
-        if bit != 0 {
-            256u16
-        } else {
-            vals[i] as u16
-        }
-    }
-
-    #[inline]
-    pub fn scale_mod257(&self, s: u16) -> Self {
-        match self {
-            Self::Sparse { entries } => {
-                let mut out: Vec<(u8, u8)> = Vec::with_capacity(entries.len());
-                for &(pos_flags, coeff) in entries {
-                    let pos = pos_flags & 0x3f;
-                    let is_256 = ((pos_flags >> 6) & 1) != 0;
-                    let v = if is_256 { 256u16 } else { coeff as u16 };
-                    let w = mul_mod257(v, s);
-                    if w == 0 {
-                        continue;
-                    }
-                    if w == 256 {
-                        out.push((pos | (1u8 << 6), 0u8));
-                    } else {
-                        out.push((pos, w as u8));
-                    }
-                }
-                Self::Sparse { entries: out }
-            }
-            Self::Dense { vals, is256_mask } => {
-                let mut tmp = [0u16; PACK_D];
-                for i in 0..PACK_D {
-                    let v = Self::get_at_dense(vals, *is256_mask, i);
-                    tmp[i] = mul_mod257(v, s);
-                }
-                Self::from_dense_u16s(&tmp)
-            }
+        Self {
+            noise_bound: 8,
+            round_bits: 20,
+            s_bits: 32,
         }
     }
 }
+
+#[inline]
+fn sample_bounded_scale_pow2(
+    rng: &mut impl RngCore,
+    round_bits: u32,
+    s_bits: u32,
+) -> Result<u64, String> {
+    if round_bits >= 63 {
+        return Err("pvugc: round_bits too large".to_string());
+    }
+    if s_bits == 0 || s_bits >= 63 {
+        return Err("pvugc: s_bits out of range".to_string());
+    }
+    let mask = (1u64 << s_bits) - 1;
+    loop {
+        let r = rng.next_u64() & mask;
+        if r == 0 {
+            continue;
+        }
+        let s = r
+            .checked_shl(round_bits)
+            .ok_or_else(|| "pvugc: scale shift overflow".to_string())?;
+        if s == 0 || s >= GOLDILOCKS_P {
+            continue;
+        }
+        return Ok(s);
+    }
+}
+
+/// Arm PVUGC-style noisy hints for a secret coefficient/query vector over mod-257 digits.
+///
+/// Input `q_mod257` is treated as *secret* (it replaces publishing readable `s*q (mod 257)`).
+pub fn arm_pvugc_noisy_hints_goldilocks_from_secret_q_mod257(
+    rng: &mut impl RngCore,
+    params: PvugcNoisyHintParams,
+    q_mod257: &[u16],
+) -> (PvugcNoisyHints, (u64, u64)) {
+    let s0 = sample_bounded_scale_pow2(rng, params.round_bits, params.s_bits)
+        .expect("pvugc: bounded scale sampling failed");
+    let s1 = sample_bounded_scale_pow2(rng, params.round_bits, params.s_bits)
+        .expect("pvugc: bounded scale sampling failed");
+    let mut hint0: Vec<u64> = Vec::with_capacity(q_mod257.len());
+    let mut hint1: Vec<u64> = Vec::with_capacity(q_mod257.len());
+    for &qi_u16 in q_mod257 {
+        let qi = (qi_u16 as u64) % GOLDILOCKS_P;
+        let e0 = goldilocks_from_i64(sample_noise_uniform_i64(rng, params.noise_bound));
+        let e1 = goldilocks_from_i64(sample_noise_uniform_i64(rng, params.noise_bound));
+        hint0.push(add_mod_goldilocks(mul_mod_goldilocks(s0, qi), e0));
+        hint1.push(add_mod_goldilocks(mul_mod_goldilocks(s1, qi), e1));
+    }
+    (
+        PvugcNoisyHints {
+            modulus: GOLDILOCKS_P,
+            hint0,
+            hint1,
+        },
+        (s0, s1),
+    )
+}
+
+#[inline]
+pub(crate) fn round_to_pow2_multiple(x: u64, round_bits: u32) -> u64 {
+    if round_bits == 0 {
+        return x;
+    }
+    let step = 1u64 << round_bits;
+    let half = step >> 1;
+    (x.wrapping_add(half)) & !(step - 1)
+}
+
+// ---------------------------------------------------------------------------
+// Noisy lock artifacts (no readable mod-257 scales)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct FanoutCiphertext2 {
+    pub ct0: LockCiphertext,
+    pub ct1: LockCiphertext,
+}
+
+#[derive(Clone, Debug)]
+pub struct NoisyBranchHints {
+    pub params: PvugcNoisyHintParams,
+    pub hints: PvugcNoisyHints,
+}
+
+#[derive(Clone, Debug)]
+pub struct NoisySubLock<F: PrimeField> {
+    pub accepting_set: [F; 2],
+    pub anchor_block_id: u32,
+    pub rep_id: u64,
+    /// Number of blocks folded into the poison term (for this lock instance).
+    ///
+    /// The sublock's secret coefficient vector `q` includes `poison_blocks` additional coordinates,
+    /// and the decap feature vector `v` appends the per-block MulEq residuals `err_b`.
+    pub poison_blocks: u32,
+    /// If nonzero, decap compresses the full `err_b` vector (length = `poison_blocks`) into
+    /// `poison_proj_m` random linear projections in F257, and uses those as the feature vector
+    /// coordinates (instead of appending all `err_b` directly).
+    ///
+    /// This shrinks PVUGC hint vectors from length `1+poison_blocks` down to `1+poison_proj_m`.
+    pub poison_proj_m: u32,
+    pub hints: NoisyBranchHints,
+    /// Fanout ciphertexts for the two accepting-set branches (no tags).
+    pub cts: FanoutCiphertext2,
+}
+
+#[derive(Clone, Debug)]
+pub struct NoisyLockArtifact<F: PrimeField> {
+    pub c_stmt: Vec<F>,
+    pub x_len: usize,
+    pub pi_len: usize,
+    pub len: usize,
+    pub params: RingLweParams,
+    /// Sublocks (each yields 2 candidate plaintexts).
+    pub sublocks: Vec<NoisySubLock<F>>,
+}
+
+/// Compute the two noisy inner products `(<hint0,v>, <hint1,v>)` where `v` is a mod-257 digit vector.
+pub fn pvugc_noisy_inner_products_goldilocks(
+    hints: &PvugcNoisyHints,
+    v_mod257: &[u16],
+) -> Result<(u64, u64), String> {
+    if hints.modulus != GOLDILOCKS_P {
+        return Err("pvugc_noisy_inner_products_goldilocks: unexpected modulus".to_string());
+    }
+    if hints.hint0.len() != v_mod257.len() || hints.hint1.len() != v_mod257.len() {
+        return Err("pvugc_noisy_inner_products_goldilocks: length mismatch".to_string());
+    }
+    let mut y0: u64 = 0;
+    let mut y1: u64 = 0;
+    for i in 0..v_mod257.len() {
+        let vi = (v_mod257[i] as u64) % GOLDILOCKS_P;
+        y0 = add_mod_goldilocks(y0, mul_mod_goldilocks(hints.hint0[i], vi));
+        y1 = add_mod_goldilocks(y1, mul_mod_goldilocks(hints.hint1[i], vi));
+    }
+    Ok((y0, y1))
+}
+
+/// Compress a per-block residual vector `errs` (mod 257) into `m` random linear projections.
+///
+/// This is a public deterministic map derived from `(stmt_digest_bytes64, rep_id, proj_idx)`.
+/// It is used to reduce PVUGC hint dimension from `O(blocks)` down to `O(m)`.
+pub(crate) fn project_errs_mod257_u16(
+    stmt_digest_bytes64: &[u8; 64],
+    rep_id: u64,
+    errs: &[u16],
+    m: usize,
+) -> Vec<u16> {
+    use rand::{RngCore, SeedableRng};
+    use rand_chacha::ChaCha20Rng;
+    use sha2::Digest;
+
+    let mut out: Vec<u16> = Vec::with_capacity(m);
+    for proj_idx in 0..m {
+        let mut h = sha2::Sha256::new();
+        h.update(b"LFP_POISON_PROJ_V1");
+        h.update(stmt_digest_bytes64);
+        h.update(&rep_id.to_le_bytes());
+        h.update(&(proj_idx as u64).to_le_bytes());
+        let seed: [u8; 32] = h.finalize().into();
+        let mut prg = ChaCha20Rng::from_seed(seed);
+
+        let mut acc: u16 = 0;
+        for &e in errs {
+            // Public projection coefficient in F257 (0..=256).
+            let r = (prg.next_u32() % 257) as u16;
+            let re = mul_mod257_u16(r, e);
+            acc = add_mod257_u16(acc, re);
+        }
+        out.push(acc);
+    }
+    out
+}
+
 
 // ---------------------------------------------------------------------------
 // Amplification parameters
@@ -342,56 +413,6 @@ impl Default for RingLweParams {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct RingLweLockArtifact<F: PrimeField> {
-    pub c_stmt: Vec<F>,
-    pub x_len: usize,
-    pub pi_len: usize,
-    pub len: usize,
-    pub params: RingLweParams,
-    /// Number of independent scalar channels \(P\).
-    pub p_channels: u16,
-    /// Number of sublocks per channel.
-    ///
-    /// In the “hits-per-block” design, this is typically `blocks * hits_per_block` and can be
-    /// much larger than `u16`, so we store it as `u32`.
-    pub sublocks_per_channel: u32,
-    /// DPP sublocks (one per `(channel,hit)`), each with its own hidden query.
-    pub sublocks: Vec<RingLweSubLock<F>>,
-    /// Single unauthenticated ciphertext.
-    ///
-    /// IMPORTANT: we intentionally publish **only one** ciphertext. Publishing two ciphertexts of
-    /// the same payload under keys from a tiny space (mod-257) creates a per-lock equality oracle
-    /// (meet-in-the-middle intersection), which collapses amplification.
-    pub ct: LockCiphertext,
-}
-
-/// Compressed hint material for one DPP sublock.
-///
-/// This avoids materializing/storing the full masked query vector `h = q * s` over the enormous
-/// Theorem-4.3 proof `π`. Instead, we store only the secret-scaled combination coefficients needed
-/// to reconstruct the masked answer:
-///
-/// - `abg_scales`: `(s*coeff_alpha, s*coeff_beta, s*coeff_gamma)` in mod-257 digits
-/// - `offset_scale`: `s * δ(x_arm)` in mod-257 digits (statement-bound offset)
-/// - `tail_scales`: 4 packed blocks holding `s*(coeff_mu, coeff_nu, c_3..c_{p-1})`
-#[derive(Clone, Debug)]
-pub struct BranchHintsCompressed {
-    pub abg_scales: [u16; 3],
-    pub offset_scale: u16,
-    pub tail_scales: [PackedF257Block64; 4],
-    /// Optional “global poison” material: secret-scaled per-block weights.
-    ///
-    /// When present, decap computes an additional masked term:
-    ///   y_err = Σ_b err_scales[b] * err_b   (mod 257)
-    /// and adds it to the anchor masked scalar before candidate extraction.
-    ///
-    /// Encoding is canonical packed-in-64s using `PackedF257Block64`.
-    ///
-    pub poison_blocks: u32,
-    pub poison_err_scales: Vec<PackedF257Block64>,
-}
-
 /// Per-branch ciphertext: unauthenticated stream cipher (XOR) under a derived key.
 ///
 /// Critical: there is **no per-lock authentication tag**, to avoid a per-lock verification oracle
@@ -400,25 +421,6 @@ pub struct BranchHintsCompressed {
 pub struct LockCiphertext {
     pub nonce: [u8; 12],
     pub ct: Vec<u8>,
-}
-
-/// One DPP instance (hidden query) inside a share-lock.
-///
-/// Each sublock corresponds to a distinct hidden query \(q^{(channel,rep)}\), with its own
-/// accepting set and mod-257 hints. All sublocks within a share-lock share a single ciphertext,
-/// keyed by the tuple of per-channel secrets.
-#[derive(Clone, Debug)]
-pub struct RingLweSubLock<F: PrimeField> {
-    /// Channel id in `[0..P)`.
-    pub channel_id: u16,
-    /// Shifted accepting set (mod 257), must be nonzero.
-    pub accepting_set: [F; 2],
-    /// Anchor block id in `[0..blocks)` used to derive Theorem-4.3 public coins for this sublock.
-    pub anchor_block_id: u32,
-    /// Rep-id salt (used to derive Theorem-4.3 public coins and hidden Sq coefficients).
-    pub rep_id: u64,
-    /// Deterministic compressed hint material.
-    pub hints: BranchHintsCompressed,
 }
 
 // ---------------------------------------------------------------------------
@@ -435,56 +437,114 @@ fn sha256_32(chunks: &[&[u8]]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Derive a 32-byte payload key from the tuple of per-channel secrets and public context binding.
-fn derive_payload_key_bytes_multi<F: PrimeField>(
+fn derive_noisy_fanout_key_bytes<F: PrimeField>(
     domain_label: &[u8; 32],
     c_stmt: &[F],
-    x_len: usize,
-    pi_len: usize,
-    len: usize,
-    p_channels: u16,
-    sublocks_per_channel: u32,
-    sublocks: &[RingLweSubLock<F>],
-    s_channels_mod257: &[u16],
+    anchor_block_id: u32,
+    rep_id: u64,
+    branch_id: u8,
+    k0: u64,
+    k1: u64,
 ) -> [u8; 32] {
+    // Key binding:
+    // - statement commitment (c_stmt)
+    // - sublock coin-derivation inputs (anchor_block_id, rep_id)
+    // - branch_id (0/1)
+    // - reconciled inner products k0,k1 (large modulus)
     use sha2::Digest;
     let mut stmt_bytes = Vec::with_capacity(c_stmt.len() * 8);
     for f in c_stmt {
         stmt_bytes.extend_from_slice(&f_to_u64(f).to_le_bytes());
     }
+    let mut h = sha2::Sha256::new();
+    h.update(b"LFP_NOISY_FANOUT_KEY_V1");
+    h.update(domain_label);
+    h.update(&(c_stmt.len() as u64).to_le_bytes());
+    h.update(stmt_bytes.as_slice());
+    h.update(&anchor_block_id.to_le_bytes());
+    h.update(&rep_id.to_le_bytes());
+    h.update(&[branch_id]);
+    h.update(&k0.to_le_bytes());
+    h.update(&k1.to_le_bytes());
+    h.finalize().into()
+}
 
-    // Bind the key to all public per-sublock coins and accepting sets, to avoid cross-lock keystream
-    // reuse even if some channels accidentally repeat.
-    let mut bind = sha2::Sha256::new();
-    bind.update(b"LFP_RINGLWE_LOCK_BIND_V1");
-    bind.update(domain_label);
-    bind.update(&(c_stmt.len() as u64).to_le_bytes());
-    bind.update(stmt_bytes.as_slice());
-    bind.update(&(sublocks.len() as u64).to_le_bytes());
-    bind.update(&(x_len as u64).to_le_bytes());
-    bind.update(&(pi_len as u64).to_le_bytes());
-    bind.update(&(len as u64).to_le_bytes());
-    bind.update(&p_channels.to_le_bytes());
-    bind.update(&sublocks_per_channel.to_le_bytes());
-    for sl in sublocks {
-        bind.update(&sl.channel_id.to_le_bytes());
-        bind.update(&sl.anchor_block_id.to_le_bytes());
-        bind.update(&sl.rep_id.to_le_bytes());
-        bind.update(&f_to_u64(&sl.accepting_set[0]).to_le_bytes());
-        bind.update(&f_to_u64(&sl.accepting_set[1]).to_le_bytes());
+#[inline]
+fn reconcile_k_pair(y0: u64, y1: u64, params: PvugcNoisyHintParams) -> (u64, u64) {
+    // Scaffold reconciliation: round to nearest multiple of 2^t.
+    let k0 = round_to_pow2_multiple(y0, params.round_bits);
+    let k1 = round_to_pow2_multiple(y1, params.round_bits);
+    (k0, k1)
+}
+
+pub fn arm_noisy_fanout_ciphertexts_for_accepting_set<F: PrimeField>(
+    rng: &mut impl RngCore,
+    domain_label: &[u8; 32],
+    c_stmt: &[F],
+    anchor_block_id: u32,
+    rep_id: u64,
+    accepting_set: &[F; 2],
+    s0: u64,
+    s1: u64,
+    payload: &[u8],
+) -> Result<FanoutCiphertext2, String> {
+    // Note: `accepting_set` lives in the tiny field (mod 257 digits in 1..=256).
+    let a0 = (f_to_u64(&accepting_set[0]) % 257) as u64;
+    let a1 = (f_to_u64(&accepting_set[1]) % 257) as u64;
+    if a0 == 0 || a1 == 0 {
+        return Err("arm_noisy_fanout_ciphertexts: accepting set contains 0".to_string());
     }
-    let lock_bind: [u8; 32] = bind.finalize().into();
+    let k00 = mul_mod_goldilocks(s0, a0);
+    let k10 = mul_mod_goldilocks(s1, a0);
+    let k01 = mul_mod_goldilocks(s0, a1);
+    let k11 = mul_mod_goldilocks(s1, a1);
 
-    let mut s_bytes = Vec::with_capacity(2 * s_channels_mod257.len());
-    for &s in s_channels_mod257 {
-        s_bytes.extend_from_slice(&s.to_le_bytes());
-    }
+    let key0 = derive_noisy_fanout_key_bytes(domain_label, c_stmt, anchor_block_id, rep_id, 0u8, k00, k10);
+    let key1 = derive_noisy_fanout_key_bytes(domain_label, c_stmt, anchor_block_id, rep_id, 1u8, k01, k11);
 
-    sha256_32(&[
-        b"LFP_RINGLWE_PAYLOAD_KEY_V4",
-        &lock_bind,
-        s_bytes.as_slice(),
-    ])
+    let mut nonce0 = [0u8; 12];
+    let mut nonce1 = [0u8; 12];
+    rng.fill_bytes(&mut nonce0);
+    rng.fill_bytes(&mut nonce1);
+    let ct0 = LockCiphertext {
+        nonce: nonce0,
+        ct: xor_stream_encrypt(&key0, &nonce0, payload),
+    };
+    let ct1 = LockCiphertext {
+        nonce: nonce1,
+        ct: xor_stream_encrypt(&key1, &nonce1, payload),
+    };
+    Ok(FanoutCiphertext2 { ct0, ct1 })
+}
+
+pub fn decap_noisy_fanout_candidates<F: PrimeField>(
+    lock: &NoisyLockArtifact<F>,
+    sl: &NoisySubLock<F>,
+    v_mod257: &[u16],
+) -> Result<[Vec<u8>; 2], String> {
+    let (y0, y1) = pvugc_noisy_inner_products_goldilocks(&sl.hints.hints, v_mod257)?;
+    let (k0, k1) = reconcile_k_pair(y0, y1, sl.hints.params);
+    let key0 = derive_noisy_fanout_key_bytes(
+        &lock.params.domain_label,
+        &lock.c_stmt,
+        sl.anchor_block_id,
+        sl.rep_id,
+        0u8,
+        k0,
+        k1,
+    );
+    let key1 = derive_noisy_fanout_key_bytes(
+        &lock.params.domain_label,
+        &lock.c_stmt,
+        sl.anchor_block_id,
+        sl.rep_id,
+        1u8,
+        k0,
+        k1,
+    );
+    let p0 = xor_stream_decrypt(&key0, &sl.cts.ct0.nonce, &sl.cts.ct0.ct);
+    let p1 = xor_stream_decrypt(&key1, &sl.cts.ct1.nonce, &sl.cts.ct1.ct);
+    Ok([p0, p1])
 }
 
 /// Unauthenticated XOR stream cipher under a SHA256-derived keystream.
@@ -509,365 +569,6 @@ fn xor_stream_decrypt(key: &[u8; 32], nonce: &[u8; 12], ct: &[u8]) -> Vec<u8> {
     xor_stream_encrypt(key, nonce, ct)
 }
 
-/// Sample a nonzero secret scalar in `{1,2,...,256}` (viewed mod 257).
-#[inline]
-pub(crate) fn sample_nonzero_f257_scalar(rng: &mut impl RngCore) -> u16 {
-    let v = (rng.next_u32() & 0xFF) as u16; // 0..255
-    v + 1 // 1..256
-}
-
-/// Compute two candidates for `s` given a mod-257 dot product `y = s * a_true` and a 2-element
-/// accepting set `{a0, a1}` (mod 257).
-#[inline]
-pub(crate) fn s_candidates_from_y_and_accepting_set_mod257<F: PrimeField>(
-    accepting_set: &[F; 2],
-    y: u16,
-) -> Result<[u16; 2], String> {
-    let a0 = (f_to_u64(&accepting_set[0]) % 257) as u16;
-    let a1 = (f_to_u64(&accepting_set[1]) % 257) as u16;
-    let inv0 = inv_mod257(a0)?;
-    let inv1 = inv_mod257(a1)?;
-    let s0 = mul_mod257(y, inv0);
-    let s1 = mul_mod257(y, inv1);
-    Ok([s0, s1])
-}
-
-/// Compute `y mod 257` from compressed hints and streamed `(alpha,beta,gamma)` plus `tail_dot`.
-///
-/// This is the core decap scalar relation used for candidate extraction:
-/// `y = y_pi + offset_scale  (mod 257)` for the chosen offset flavor.
-#[inline]
-fn masked_y_mod257_from_compressed_hint_and_tail_with_offset<F: PrimeField>(
-    hc: &BranchHintsCompressed,
-    abg: &dpp::theorem43::Theorem43AbgTail<F>,
-    tail_dot_mod257: u16,
-    offset_scale: u16,
-) -> Result<u16, String> {
-    let alpha = field_mod257_u16(&abg.alpha);
-    let beta = field_mod257_u16(&abg.beta);
-    let gamma = field_mod257_u16(&abg.gamma);
-    let mut y = 0u16;
-    y = add_mod257_u16(y, mul_mod257(hc.abg_scales[0], alpha));
-    y = add_mod257_u16(y, mul_mod257(hc.abg_scales[1], beta));
-    y = add_mod257_u16(y, mul_mod257(hc.abg_scales[2], gamma));
-    y = add_mod257_u16(y, tail_dot_mod257 % 257);
-    y = add_mod257_u16(y, offset_scale);
-    Ok(y)
-}
-
-pub(crate) fn masked_y_mod257_main_from_compressed_hint_and_tail<F: PrimeField>(
-    hc: &BranchHintsCompressed,
-    abg: &dpp::theorem43::Theorem43AbgTail<F>,
-    tail_dot_mod257: u16,
-) -> Result<u16, String> {
-    masked_y_mod257_from_compressed_hint_and_tail_with_offset(
-        hc,
-        abg,
-        tail_dot_mod257,
-        hc.offset_scale,
-    )
-}
-
-#[inline]
-pub(crate) fn poison_y_err_mod257_from_abg_full<F: PrimeField>(
-    hc: &BranchHintsCompressed,
-    abg_full_all_blocks: &[dpp::theorem43::Theorem43AbgFull<F>],
-) -> Result<u16, String> {
-    let blocks = hc.poison_blocks as usize;
-    if blocks == 0 {
-        return Ok(0u16);
-    }
-    if abg_full_all_blocks.len() != blocks {
-        return Err("ringlwe: poison abg_full length mismatch".to_string());
-    }
-    let nblk = (blocks + 63) / 64;
-    if hc.poison_err_scales.len() != nblk {
-        return Err("ringlwe: poison_err_scales length mismatch".to_string());
-    }
-
-    let mut acc = 0u16;
-    let mut err64 = [0u16; 64];
-    for bi in 0..nblk {
-        let start = bi * 64;
-        for j in 0..64 {
-            let b = start + j;
-            if b >= blocks {
-                err64[j] = 0u16;
-                continue;
-            }
-            let a = field_mod257_u16(&abg_full_all_blocks[b].alpha);
-            let bb = field_mod257_u16(&abg_full_all_blocks[b].beta);
-            let g = field_mod257_u16(&abg_full_all_blocks[b].gamma);
-            let ab = mul_mod257_u16(a, bb);
-            err64[j] = sub_mod257_u16(g, ab);
-        }
-        let blk = &hc.poison_err_scales[bi];
-        let add = dot_packed_block_mod257_u16(blk, &err64);
-        acc = add_mod257_u16(acc, add);
-    }
-    Ok(acc)
-}
-
-/// Convenience: compute the 2 candidates for `s` for one sublock under the compressed-hint scheme.
-pub(crate) fn sublock_s_candidates_from_abg_tail<F: PrimeField>(
-    sl: &RingLweSubLock<F>,
-    abg: &dpp::theorem43::Theorem43AbgTail<F>,
-    tail_dot_mod257: u16,
-) -> Result<[u16; 2], String> {
-    let y = masked_y_mod257_main_from_compressed_hint_and_tail(&sl.hints, abg, tail_dot_mod257)?;
-    s_candidates_from_y_and_accepting_set_mod257(&sl.accepting_set, y)
-}
-
-impl<F: PrimeField> RingLweLockArtifact<F> {
-    pub(crate) fn payload_key_bytes(&self, s_channels_mod257: &[u16]) -> Result<[u8; 32], String> {
-        if s_channels_mod257.len() != self.p_channels as usize {
-            return Err("ringlwe: payload_key_bytes: channel secret length mismatch".to_string());
-        }
-        Ok(derive_payload_key_bytes_multi(
-            &self.params.domain_label,
-            &self.c_stmt,
-            self.x_len,
-            self.pi_len,
-            self.len,
-            self.p_channels,
-            self.sublocks_per_channel,
-            self.sublocks.as_slice(),
-            s_channels_mod257,
-        ))
-    }
-
-    pub(crate) fn decrypt_payload(&self, s_channels_mod257: &[u16]) -> Result<Vec<u8>, String> {
-        let key = self.payload_key_bytes(s_channels_mod257)?;
-        Ok(xor_stream_decrypt(&key, &self.ct.nonce, &self.ct.ct))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Decap helpers (candidate intersection + payload candidate enumeration)
-// ---------------------------------------------------------------------------
-
-#[inline]
-fn bitset257_from_2cands(cands: [u16; 2]) -> [u64; 5] {
-    let mut bs = [0u64; 5]; // 5*64 = 320 >= 257
-    for &v in &cands {
-        let idx = (v % 257) as usize;
-        let w = idx >> 6;
-        let b = idx & 63;
-        bs[w] |= 1u64 << b;
-    }
-    bs
-}
-
-#[inline]
-fn bitset257_and_inplace(a: &mut [u64; 5], b: &[u64; 5]) {
-    for i in 0..5 {
-        a[i] &= b[i];
-    }
-}
-
-#[inline]
-fn bitset257_is_empty(a: &[u64; 5]) -> bool {
-    a.iter().all(|&w| w == 0)
-}
-
-#[inline]
-fn bitset257_popcount(a: &[u64; 5]) -> u32 {
-    a.iter().map(|w| w.count_ones()).sum()
-}
-
-#[inline]
-fn bitset257_singleton_value(a: &[u64; 5]) -> Option<u16> {
-    if bitset257_popcount(a) != 1 {
-        return None;
-    }
-    for (wi, &w) in a.iter().enumerate() {
-        if w != 0 {
-            let tz = w.trailing_zeros() as usize;
-            let idx = (wi << 6) | tz;
-            if idx <= 256 {
-                return Some(idx as u16);
-            } else {
-                return None;
-            }
-        }
-    }
-    None
-}
-
-/// Given per-sublock `s` candidates (mod 257), intersect across repetitions within each channel,
-/// then decrypt the lock payload under the resulting (unique) per-channel secret tuple.
-///
-/// Canonical policy: **no branching**. If intersections do not collapse to singletons,
-/// this returns an error.
-///
-/// `sublock_s_candidates` must be in the same order as `lock.sublocks` (one entry per sublock).
-pub(crate) fn decrypt_payload_from_sublock_s_candidates<F: PrimeField>(
-    lock: &RingLweLockArtifact<F>,
-    sublock_s_candidates: &[(u16, [u16; 2])],
-) -> Result<Vec<u8>, String> {
-    let p = lock.p_channels as usize;
-    let r = lock.sublocks_per_channel as usize;
-    if p == 0 || r == 0 {
-        return Err("ringlwe: invalid (P,sublocks_per_channel)".to_string());
-    }
-    if lock.sublocks.len() != p.saturating_mul(r) {
-        return Err("ringlwe: sublocks length mismatch".to_string());
-    }
-    if sublock_s_candidates.len() != lock.sublocks.len() {
-        return Err("ringlwe: sublock_s_candidates length mismatch".to_string());
-    }
-
-    // Group 2-candidate sets by channel, preserving the canonical sublock order.
-    let mut per_channel_reps: Vec<Vec<[u16; 2]>> = vec![Vec::with_capacity(r); p];
-    for (i, (ch, cands)) in sublock_s_candidates.iter().enumerate() {
-        let sl = lock
-            .sublocks
-            .get(i)
-            .ok_or_else(|| "ringlwe: internal sublock index mismatch".to_string())?;
-        if *ch != sl.channel_id {
-            return Err("ringlwe: sublock channel_id mismatch".to_string());
-        }
-        let ch_usize = *ch as usize;
-        if ch_usize >= p {
-            return Err("ringlwe: channel_id out of range".to_string());
-        }
-        per_channel_reps[ch_usize].push(*cands);
-    }
-    for ch in 0..p {
-        if per_channel_reps[ch].len() != r {
-            return Err("ringlwe: missing repetitions for some channel".to_string());
-        }
-    }
-
-    // Intersect across reps within a channel using a 257-bit bitset.
-    let mut s_channels: Vec<u16> = Vec::with_capacity(p);
-    for ch in 0..p {
-        let reps = per_channel_reps[ch].as_slice();
-        debug_assert_eq!(reps.len(), r);
-        let mut alive = bitset257_from_2cands(reps[0]);
-        for rep in reps.iter().skip(1) {
-            let m = bitset257_from_2cands(*rep);
-            bitset257_and_inplace(&mut alive, &m);
-            if bitset257_is_empty(&alive) {
-                break;
-            }
-        }
-        if bitset257_is_empty(&alive) {
-            return Err(format!(
-                "ringlwe: empty intersection for some channel (ch={} reps={:?})",
-                ch, per_channel_reps[ch]
-            ));
-        }
-        let s = bitset257_singleton_value(&alive).ok_or_else(|| {
-            // Canonical policy: no branching. If intersections do not collapse to singletons,
-            // the lock is not deterministically decapsulatable without an external predicate.
-            //
-            // Report popcount to help parameter tuning.
-            let pc = bitset257_popcount(&alive);
-            format!(
-                "ringlwe: ambiguous per-channel intersections (P={p} sublocks_per_channel={r} ch={ch} popcount={pc}); increase hits per block / total sublocks per channel"
-            )
-        })?;
-        s_channels.push(s);
-    }
-
-    // Canonical policy: no branching (already enforced via singleton extraction above).
-    if s_channels.len() != p {
-        return Err(format!(
-            "ringlwe: internal error (s_channels len mismatch: got={} expected={})",
-            s_channels.len(),
-            p
-        ));
-    }
-    lock.decrypt_payload(s_channels.as_slice())
-}
-
-/// Arm (create) a lock artifact with deterministic mod-257 hints + unauthenticated XOR.
-pub fn arm_ringlwe_lock<F: PrimeField>(
-    c_stmt: Vec<F>,
-    x_len: usize,
-    pi_len: usize,
-    params: RingLweParams,
-    p_channels: u16,
-    sublocks_per_channel: u32,
-    sublocks: Vec<RingLweSubLock<F>>,
-    payload: &[u8],
-    s_channels_mod257: &[u16],
-    rng: &mut impl RngCore,
-) -> Result<RingLweLockArtifact<F>, String> {
-    if p_channels == 0 || sublocks_per_channel == 0 {
-        return Err("arm_ringlwe_lock: invalid (P,sublocks_per_channel)".to_string());
-    }
-    if sublocks.len() != (p_channels as usize) * (sublocks_per_channel as usize) {
-        return Err("arm_ringlwe_lock: sublocks length mismatch".to_string());
-    }
-    if s_channels_mod257.len() != p_channels as usize {
-        return Err("arm_ringlwe_lock: channel secrets length mismatch".to_string());
-    }
-    for &s in s_channels_mod257 {
-        if s == 0 || s > 256 {
-            return Err("arm_ringlwe_lock: bad channel secret scalar".to_string());
-        }
-    }
-    for sl in &sublocks {
-        if sl.accepting_set[0].is_zero() || sl.accepting_set[1].is_zero() {
-            return Err("arm_ringlwe_lock: accepting set contains 0".to_string());
-        }
-        if sl.channel_id >= p_channels {
-            return Err("arm_ringlwe_lock: sublock channel_id out of range".to_string());
-        }
-    }
-    // Public non-bricking policy: within each channel, repetitions must have distinct accepting-set
-    // ratio classes so intersections collapse deterministically at small `R`.
-    //
-    // This is enforced at arming time to prevent publishing ambiguous packages.
-    let r = sublocks_per_channel as usize;
-    for ch in 0..(p_channels as usize) {
-        let mut seen: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
-        for rep_j in 0..r {
-            let si = ch.saturating_mul(r).saturating_add(rep_j);
-            let sl = sublocks
-                .get(si)
-                .ok_or_else(|| "arm_ringlwe_lock: sublock index OOB".to_string())?;
-            let rc = ratio_class_mod257_u16(&sl.accepting_set[0], &sl.accepting_set[1])?;
-            if !seen.insert(rc) {
-                return Err("arm_ringlwe_lock: duplicate accepting-set ratio class within channel".to_string());
-            }
-        }
-    }
-
-    // Encrypt payload once under a key derived from the tuple of per-channel secrets.
-    let key = derive_payload_key_bytes_multi(
-        &params.domain_label,
-        &c_stmt,
-        x_len,
-        pi_len,
-        x_len + pi_len,
-        p_channels,
-        sublocks_per_channel,
-        sublocks.as_slice(),
-        s_channels_mod257,
-    );
-    let mut nonce = [0u8; 12];
-    rng.fill_bytes(&mut nonce);
-    let ct = xor_stream_encrypt(&key, &nonce, payload);
-    let ct = LockCiphertext { nonce, ct };
-
-    Ok(RingLweLockArtifact {
-        c_stmt,
-        x_len,
-        pi_len,
-        len: x_len + pi_len,
-        params,
-        p_channels,
-        sublocks_per_channel,
-        sublocks,
-        ct,
-    })
-}
-
-// Backward-compat type alias.
-pub type DppLockCiphertext = LockCiphertext;
 
 // ---------------------------------------------------------------------------
 // Tests (attack/sanity harnesses)
@@ -876,58 +577,114 @@ pub type DppLockCiphertext = LockCiphertext;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use latticefold::transcript::poseidon::F257;
     use rand::{RngCore, SeedableRng};
     use rand_chacha::ChaCha20Rng;
 
-    /// Attack check: the ciphertext bytes should not equal the payload in the clear.
-    ///
-    /// This is a very weak negative test (it is not an IND-CPA proof); it simply ensures we are
-    /// not publishing the payload directly in a trivially decodable representation.
+    // This documents a critical weakness of the current "PVUGC noisy hints" scaffold:
+    //
+    // We publish per-coordinate values `hint[i] = s * q[i] + e[i] (mod p)` where:
+    // - `s` is a single global scalar with a large known power-of-two factor (`s = r << t`)
+    // - `q[i]` are tiny digits in 0..=256 (and include many random poison weights in 1..=256)
+    // - `|e[i]|` is tiny, and `p` is huge so there is effectively no wrap
+    //
+    // Under those conditions, a passive attacker can recover `r` (hence `s`) by rounding
+    // to remove the low-bit noise and taking a gcd across coordinates.
     #[test]
-    fn test_ciphertext_is_not_plaintext_default_params() {
-        let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
-        let mut payload = [0u8; 48];
-        rng.fill_bytes(&mut payload);
+    fn test_noisy_hints_scaffold_is_gcd_breakable_passively() {
+        fn center_lift_i128(x: u64) -> i128 {
+            // Map `x ∈ [0,p)` to `(-p/2, p/2]` as a signed integer.
+            let p = GOLDILOCKS_P as i128;
+            let xi = x as i128;
+            if xi > (p / 2) {
+                xi - p
+            } else {
+                xi
+            }
+        }
 
-        let c_stmt: Vec<F257> = Vec::new();
-        let x_len = 1usize;
-        let pi_len = 1usize;
-        let params = RingLweParams::default();
+        fn round_div_pow2_i128(x: i128, bits: u32) -> i128 {
+            if bits == 0 {
+                return x;
+            }
+            let half: i128 = 1i128 << (bits - 1);
+            if x >= 0 {
+                (x + half) >> bits
+            } else {
+                -(((-x) + half) >> bits)
+            }
+        }
 
-        let s = sample_nonzero_f257_scalar(&mut rng);
-        let zero64 = [0u16; 64];
-        let sub = RingLweSubLock::<F257> {
-            channel_id: 0,
-            accepting_set: [F257::from(7u64), F257::from(8u64)],
-            anchor_block_id: 0,
-            rep_id: 0,
-            hints: BranchHintsCompressed {
-                abg_scales: [0u16; 3],
-                offset_scale: 0u16,
-                tail_scales: core::array::from_fn(|_| PackedF257Block64::from_dense_u16s(&zero64)),
-                poison_blocks: 1,
-                poison_err_scales: vec![PackedF257Block64::from_dense_u16s(&zero64)],
-            },
-        };
-        let lock = arm_ringlwe_lock::<F257>(
-            c_stmt,
-            x_len,
-            pi_len,
-            params,
-            1,
-            1u32,
-            vec![sub],
-            payload.as_slice(),
-            &[s],
-            &mut rng,
-        )
-        .expect("arm_ringlwe_lock");
+        fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
+            while b != 0 {
+                let r = a % b;
+                a = b;
+                b = r;
+            }
+            a
+        }
 
-        assert_ne!(
-            lock.ct.ct.as_slice(),
-            payload.as_slice(),
-            "ciphertext should not equal payload"
+        let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
+        let params = PvugcNoisyHintParams::default();
+
+        // Use a moderately large vector and force a coordinate with q=1 so gcd(q)=1.
+        let l = 4096usize;
+        let mut q_mod257: Vec<u16> = Vec::with_capacity(l);
+        q_mod257.push(1u16);
+        for _ in 1..l {
+            // 1..=256
+            q_mod257.push(((rng.next_u32() as u16) & 255u16) + 1u16);
+        }
+
+        let (hints, (s0, s1)) =
+            arm_pvugc_noisy_hints_goldilocks_from_secret_q_mod257(&mut rng, params, &q_mod257);
+        assert_eq!(hints.modulus, GOLDILOCKS_P);
+        assert_eq!(hints.hint0.len(), l);
+        assert_eq!(hints.hint1.len(), l);
+
+        // Recover s0 via rounding + gcd.
+        let t = params.round_bits;
+        let r0_true = (s0 >> t) as u128;
+        let r1_true = (s1 >> t) as u128;
+        assert!(r0_true != 0 && r1_true != 0);
+
+        let mut g0: u128 = 0;
+        let mut g1: u128 = 0;
+        for i in 0..l {
+            let x0 = center_lift_i128(hints.hint0[i]);
+            let x1 = center_lift_i128(hints.hint1[i]);
+            let a0 = round_div_pow2_i128(x0, t).unsigned_abs() as u128;
+            let a1 = round_div_pow2_i128(x1, t).unsigned_abs() as u128;
+            if a0 != 0 {
+                g0 = if g0 == 0 { a0 } else { gcd_u128(g0, a0) };
+            }
+            if a1 != 0 {
+                g1 = if g1 == 0 { a1 } else { gcd_u128(g1, a1) };
+            }
+        }
+
+        assert_eq!(
+            g0, r0_true,
+            "passive gcd recovery failed for s0 (this test documents a known weakness)"
         );
+        assert_eq!(
+            g1, r1_true,
+            "passive gcd recovery failed for s1 (this test documents a known weakness)"
+        );
+
+        // With s0 recovered, q digits are recoverable by rounding hint0[i]/s0.
+        for i in 0..64usize {
+            let x0 = center_lift_i128(hints.hint0[i]);
+            let qi_est = {
+                let num = x0;
+                let den = s0 as i128;
+                // nearest integer to num/den
+                if num >= 0 {
+                    ((num + den / 2) / den) as i128
+                } else {
+                    -(((-num + den / 2) / den) as i128)
+                }
+            };
+            assert_eq!(qi_est as u16, q_mod257[i]);
+        }
     }
 }

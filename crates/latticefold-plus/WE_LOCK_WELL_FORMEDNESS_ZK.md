@@ -147,7 +147,7 @@ For each sublock:
   \]
   matching `Theorem43Dpp::arm`.
 - **(C3) Streamed query → accepting-set binding (ZK):** run `stream_query_terms_for_pi` logic and prove:
-  - the sublock’s published `accepting_set` equals `[c_hit, c_hit+1]` for the derived `c_hit`,
+  - the sublock’s published `accepting_set` equals `[1, 2]` for the derived `1`,
   - both accepting elements are nonzero.
 
 This prevents an armer from publishing mismatched `(accepting_set, coins)` that would make an honest decapper compute the wrong divisions.

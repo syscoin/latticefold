@@ -218,7 +218,14 @@ fn main() {
 
     println!("stmt_digest_f257_le16=0x{}", hex_stmt_digest(out.stmt_digest));
     println!("lock_coin_seed=0x{}", hex32(out.lock_coin_seed));
-    println!("decapped_key=0x{}", hex32(out.decapped_key));
+    println!("share_candidates_len={}", out.share_candidates.len());
+    if let Some((share_idx, cands)) = out.share_candidates.first() {
+        println!("first_share_index={}", share_idx);
+        println!("first_share_candidates={}", cands.len());
+        if let Some(c0) = cands.first() {
+            println!("first_candidate=0x{}", hex32(*c0));
+        }
+    }
     eprintln!("[oneproof] total_elapsed={:?}", t_total.elapsed());
 }
 

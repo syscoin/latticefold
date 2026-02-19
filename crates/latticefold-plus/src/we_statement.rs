@@ -231,29 +231,3 @@ pub fn derive_armer_secret<BF: PrimeField>(
     }
     out
 }
-
-/// Arm a Theorem-4.3 tiny-field lock using statement-bound coins + armer-private secret.
-///
-/// - `stmt_digest` binds to the WE statement (public inputs + params + gate digest).
-/// - `armer_seed` is private to each armer (N-of-N: each armer uses an independent seed).
-/// - `lock_j` is the armer’s lock index (unique per armer/lock).
-/// - `block_id` selects the chunk (derived from the chunked dR1CS instance).
-/// - `rep_id` selects the public repetition index.
-#[cfg(feature = "we_gate")]
-pub fn arm_theorem43_from_statement<F: PrimeField>(
-    dpp: &dpp::theorem43::Theorem43Dpp<F, impl dpp::dr1cs_flpcp::Dr1csNpFlpcpSparseApi<F>>,
-    stmt_digest: [u8; 32],
-    x: &[F],
-    armer_seed: [u8; 32],
-    lock_j: u64,
-    block_id: usize,
-    rep_id: u64,
-) -> Result<dpp::theorem43::Theorem43LockArtifact<F>, String> {
-    // Statement-binding commitment: 256 boolean field elements.
-    let c_stmt = digest32_to_bits_field::<F>(stmt_digest);
-
-    // Armer-private secret mixed into the hidden-query derivation.
-    let armer_secret = derive_armer_secret::<F>(armer_seed, stmt_digest, lock_j, 4);
-
-    dpp.arm(&c_stmt, x, &armer_secret, block_id, rep_id)
-}
