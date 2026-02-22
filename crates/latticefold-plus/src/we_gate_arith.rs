@@ -1541,18 +1541,30 @@ mod tests {
             }
             let g = crate::lockable_ringlwe::eval_err_gate_mod257_u16(&lock.err_gate_hints, errs.as_slice())?;
             let anchor_abg = &abg_all[anchor_idx];
-            // Use π0-only ABG for completion (y_anchor is π0-only).
-            let alpha = crate::lockable_ringlwe::field_mod257_u16(&anchor_abg.alpha_pi_sparse);
-            let beta = crate::lockable_ringlwe::field_mod257_u16(&anchor_abg.beta_pi_sparse);
+            // IMPORTANT (Thm-4.3 / Prop-4.24 tailless completion, sparse-query backend):
+            // The lock's `qπ` was generated via `stream_queries_for_coins_sparse`, so the streamed
+            // `y_anchor` is algebraically linked to the **sparse** full-vector answers
+            // (x||π0), not the fully-evaluated answers that include dense `w_eval` dot products.
+            //
+            // Therefore use `*_sparse` (full-vector, sparse terms only), NOT:
+            // - `*_pi_sparse` (π-only; missing x-prefix), nor
+            // - `*` (fully evaluated; includes dense `w_eval` terms that were not emitted in `qπ`).
+            let alpha = crate::lockable_ringlwe::field_mod257_u16(&anchor_abg.alpha_sparse);
+            let beta = crate::lockable_ringlwe::field_mod257_u16(&anchor_abg.beta_sparse);
             let rho = crate::lockable_ringlwe::field_mod257_u16(&lock.coins.rho);
             let sigma = crate::lockable_ringlwe::field_mod257_u16(&lock.coins.sigma);
             let u = crate::lockable_ringlwe::add_mod257_u16(
                 crate::lockable_ringlwe::mul_mod257_u16(rho, alpha),
                 crate::lockable_ringlwe::mul_mod257_u16(sigma, beta),
             );
-            let gamma = crate::lockable_ringlwe::field_mod257_u16(&anchor_abg.gamma_pi_sparse);
+            // Pass the π0 `w_eval` contribution to γ (needed to upgrade sparse y into the
+            // Prop-4.24-consistent full cross term): Δγ := γ_pi - γ_pi_sparse.
+            let gamma_pi = crate::lockable_ringlwe::field_mod257_u16(&anchor_abg.gamma_pi);
+            let gamma_pi_sparse = crate::lockable_ringlwe::field_mod257_u16(&anchor_abg.gamma_pi_sparse);
+            let delta_gamma_pi =
+                crate::lockable_ringlwe::sub_mod257_u16(gamma_pi % 257, gamma_pi_sparse % 257);
             let s_sets =
-                st.finish_s_candidate_sets_with_gate(g, None, Some(u), Some(gamma), Some((alpha, beta)))?;
+                st.finish_s_candidate_sets_with_gate(g, None, Some(u), Some(delta_gamma_pi), Some((alpha, beta)))?;
             let hits = s_sets.into_iter().next().unwrap_or_else(|| (1u16..=256u16).collect());
             out_all.push((g, hits));
         }

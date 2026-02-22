@@ -337,6 +337,9 @@ pub struct RingLweLockArtifact<F: PrimeField> {
     pub c_stmt: Vec<F>,
     pub accepting_set: [F; 2],
     pub offset: F,
+    /// Public-prefix dot products for the UV-independent basis queries:
+    /// `(ax,bx,gx) = (⟨qα_x,x⟩, ⟨qβ_x,x⟩, ⟨qγ_x,x⟩)`.
+    pub basis_x_dots: [F; 3],
     /// Public coin-derivation inputs (stored for binding and downstream residual gating).
     pub anchor_block_id: u32,
     pub rep_id: u64,
@@ -349,6 +352,8 @@ pub struct RingLweLockArtifact<F: PrimeField> {
     pub params: RingLweParams,
     /// Anchor hints stored sparsely as `(block_idx, packed_coeffs)`.
     pub anchor_hints: BranchHints,
+    /// UV-independent basis hints (stored sparsely as `(block_idx, packed_coeffs)`).
+    pub anchor_basis_hints: AnchorBasisHints,
     /// Residual-gate hint material (K mixes over the block residual vector).
     ///
     /// When `k=0`, the gate is disabled and treated as `g=1`.
@@ -369,6 +374,14 @@ pub struct RingLweLockArtifact<F: PrimeField> {
 #[derive(Clone, Debug)]
 pub struct BranchHints {
     pub hint_blocks_sparse: Vec<(usize, PackedF257Block64)>,
+}
+
+/// Sparse basis-hint material for the tailless anchor check.
+#[derive(Clone, Debug)]
+pub struct AnchorBasisHints {
+    pub alpha: BranchHints,
+    pub beta: BranchHints,
+    pub gamma: BranchHints,
 }
 
 /// Hint material for the residual gate `g(err)`.
@@ -604,6 +617,10 @@ pub struct RingLweDecapStreamState<'a, F: PrimeField> {
     d: usize,
     /// Anchor stream accumulator.
     anchor: BranchAccum<'a>,
+    /// Basis stream accumulators.
+    basis_alpha: BranchAccum<'a>,
+    basis_beta: BranchAccum<'a>,
+    basis_gamma: BranchAccum<'a>,
     block_idx: usize,
     pos_in_block: usize,
     filled: usize,
@@ -629,6 +646,21 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
                 sparse_pos: 0,
                 y: 0,
             },
+            basis_alpha: BranchAccum {
+                sparse: lock.anchor_basis_hints.alpha.hint_blocks_sparse.as_slice(),
+                sparse_pos: 0,
+                y: 0,
+            },
+            basis_beta: BranchAccum {
+                sparse: lock.anchor_basis_hints.beta.hint_blocks_sparse.as_slice(),
+                sparse_pos: 0,
+                y: 0,
+            },
+            basis_gamma: BranchAccum {
+                sparse: lock.anchor_basis_hints.gamma.hint_blocks_sparse.as_slice(),
+                sparse_pos: 0,
+                y: 0,
+            },
             block_idx: 0,
             pos_in_block: 0,
             filled: 0,
@@ -638,18 +670,36 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
 
     #[inline]
     fn next_needed_block(&self) -> Option<usize> {
-        self.anchor.sparse.get(self.anchor.sparse_pos).map(|t| t.0)
+        let mut out: Option<usize> = None;
+        for a in [
+            (&self.anchor.sparse, self.anchor.sparse_pos),
+            (&self.basis_alpha.sparse, self.basis_alpha.sparse_pos),
+            (&self.basis_beta.sparse, self.basis_beta.sparse_pos),
+            (&self.basis_gamma.sparse, self.basis_gamma.sparse_pos),
+        ] {
+            if let Some(b) = a.0.get(a.1).map(|t| t.0) {
+                out = Some(out.map(|x| x.min(b)).unwrap_or(b));
+            }
+        }
+        out
     }
 
     #[inline]
     fn process_current_block(&mut self, row: &[u16]) {
-        if self.anchor.sparse_pos < self.anchor.sparse.len()
-            && self.anchor.sparse[self.anchor.sparse_pos].0 == self.block_idx
-        {
-            let h = &self.anchor.sparse[self.anchor.sparse_pos].1;
-            let inc = coeff0_mul_row_mod257(h, row);
-            self.anchor.y = add_mod257_u16(self.anchor.y, inc);
-            self.anchor.sparse_pos += 1;
+        for acc in [
+            (&mut self.anchor, "anchor"),
+            (&mut self.basis_alpha, "alpha"),
+            (&mut self.basis_beta, "beta"),
+            (&mut self.basis_gamma, "gamma"),
+        ] {
+            let a = acc.0;
+            let _ = acc.1;
+            if a.sparse_pos < a.sparse.len() && a.sparse[a.sparse_pos].0 == self.block_idx {
+                let h = &a.sparse[a.sparse_pos].1;
+                let inc = coeff0_mul_row_mod257(h, row);
+                a.y = add_mod257_u16(a.y, inc);
+                a.sparse_pos += 1;
+            }
         }
     }
 
@@ -704,7 +754,7 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
         Ok(())
     }
 
-    fn finish_key_seed_mod257(mut self) -> Result<u16, String> {
+    fn finish_stream_dots_mod257(mut self) -> Result<(u16, u16, u16, u16), String> {
         if self.filled != self.lock.pi_len {
             return Err("ringlwe_decap_stream: bad π length".to_string());
         }
@@ -722,10 +772,17 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
         if self.block_idx != nblocks {
             return Err("ringlwe_decap_stream: internal block count mismatch".to_string());
         }
-        if self.anchor.sparse_pos != self.anchor.sparse.len() {
-            return Err("ringlwe_decap_stream: did not consume all sparse blocks".to_string());
+        for a in [
+            (&self.anchor, "anchor"),
+            (&self.basis_alpha, "alpha"),
+            (&self.basis_beta, "beta"),
+            (&self.basis_gamma, "gamma"),
+        ] {
+            if a.0.sparse_pos != a.0.sparse.len() {
+                return Err(format!("ringlwe_decap_stream: did not consume all sparse blocks ({})", a.1));
+            }
         }
-        Ok(self.anchor.y)
+        Ok((self.anchor.y, self.basis_alpha.y, self.basis_beta.y, self.basis_gamma.y))
     }
 
     pub fn finish_decrypt_candidates_with_gate(
@@ -768,7 +825,8 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
         alpha_beta_override: Option<(u16, u16)>,
     ) -> Result<Vec<Vec<u16>>, String> {
         let lock = self.lock;
-        let y_anchor_stream = self.finish_key_seed_mod257()?;
+        let (y_anchor_stream, alpha_pi_stream, beta_pi_stream, gamma_pi_stream) =
+            self.finish_stream_dots_mod257()?;
         let y_anchor = y_anchor_override.unwrap_or(y_anchor_stream) % MOD_257;
         let g = gate_mod257 % MOD_257;
 
@@ -780,6 +838,7 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
 
         let a0_u16 = field_mod257_u16(&lock.accepting_set[0]) % MOD_257;
         let a1_u16 = field_mod257_u16(&lock.accepting_set[1]) % MOD_257;
+        let c_hit_u16 = field_mod257_u16(&lock.coins.c_hit) % MOD_257;
 
         let true_s_dbg = if std::env::var("LFP_DEBUG_IDENTITY").ok().as_deref() == Some("1") {
             debug_get_s_for_rep(lock.rep_id)
@@ -805,20 +864,25 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
         //   u = ρ·α + σ·β
         //   lin = c1·u + c2·(2ρσ)·γ
         // and a single membership bit b(u)=1_{u^{-1}∈U}.
-        let (alpha_u16, beta_u16, gamma_u16): (u16, u16, u16) =
-            match (alpha_beta_override, gamma_override) {
-                (Some((a, b)), Some(g)) => (a % MOD_257, b % MOD_257, g % MOD_257),
-                _ => {
-                    // If caller doesn't provide proof-derived ABG, preserve completeness with full-domain.
-                    return Ok(vec![(1u16..=256u16).collect(), (1u16..=256u16).collect()]);
-                }
-            };
+        let (mut alpha_u16, mut beta_u16, mut gamma_u16): (u16, u16, u16) =
+            (alpha_pi_stream % MOD_257, beta_pi_stream % MOD_257, gamma_pi_stream % MOD_257);
+        // Optional overrides are for debug / regression comparisons.
+        if let Some((a, b)) = alpha_beta_override {
+            alpha_u16 = a % MOD_257;
+            beta_u16 = b % MOD_257;
+        }
+        if let Some(gm) = gamma_override {
+            gamma_u16 = gm % MOD_257;
+        }
         let rho_u16 = field_mod257_u16(&lock.coins.rho) % MOD_257;
         let sigma_u16 = field_mod257_u16(&lock.coins.sigma) % MOD_257;
         // Evaluation point u := ρ·α + σ·β (mod 257).
+        //
+        // IMPORTANT: the WE-gate decapper provides π0-aligned `(alpha,beta,u)` overrides; we must
+        // use the provided `u` to keep the Sq completion consistent with how `y_anchor` was
+        // accumulated (π0-only stream).
         let u_fix = add_mod257_u16(mul_mod257_u16(rho_u16, alpha_u16), mul_mod257_u16(sigma_u16, beta_u16));
-        // Keep u_override only for debug printing; the completion uses u_fix.
-        let _ = u_override;
+        let u_eval = u_override.map(|v| v % MOD_257).unwrap_or(u_fix);
 
         // Fixed-shape scan over s∈F257* (1..=256).
         //
@@ -1237,21 +1301,64 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
                 }
             }
 
-            // Tailless narrowing aligned with what the hint stream actually contains.
+            // Thm-4.3 / Prop-4.24 tailless completion predicate (faithful to the Sq→Mul wiring).
             //
-            // For a candidate `s`, decrypting `Ubits(s)` yields candidate coefficients `(c1,c2)`.
-            // The tailless streamed anchor gives:
-            //   y_div := y_anchor / s  ==  c1*(ρ·α + σ·β) + c2*(2ρσ)·γ
-            // for the correct `s` (and is random-looking for wrong `s`).
+            // For each candidate `s`:
+            // - decrypt Ubits(s) → derive (c1,c2) and membership bit b(u)=1[u^{-1}∈U]
+            // - compute u := ρ·α + σ·β (fixed per rep) and:
+            //      tail = b(u) - c1·u - c2·u^2
+            //      miss = c2·(ρ^2·α^2 + σ^2·β^2)   // the μ/ν contribution not queried/emitted
+            // - accept iff:
+            //      Z(s) := y/s + miss + tail  ∈ {a0,a1}
             //
-            // This gives strong selectivity (~1/257) without any public probe surface.
-            let two_rho_sigma = mul_mod257_u16(2u16, mul_mod257_u16(rho_u16, sigma_u16));
-            let u_ab = u_fix;
-            let y_pred = add_mod257_u16(
-                mul_mod257_u16(c1, u_ab),
-                mul_mod257_u16(c2, mul_mod257_u16(two_rho_sigma, gamma_u16)),
+            // Here {a0,a1} is the *shifted* accepting set stored in the lock (raw accepting set
+            // already moved by `offset` at arming time), so we do NOT add `offset` here.
+            let u = u_eval;
+            let u2 = mul_mod257_u16(u, u);
+
+            let b_u: u16 = if u == 0 {
+                0u16
+            } else {
+                let inv_u = inv_mod257_u16(u).unwrap_or(0u16);
+                if inv_u == 0 {
+                    0u16
+                } else {
+                    let idx = (inv_u as usize).saturating_sub(1);
+                    ((ubits[idx / 8] >> (idx % 8)) & 1) as u16
+                }
+            };
+
+            let rho2 = mul_mod257_u16(rho_u16, rho_u16);
+            let sigma2 = mul_mod257_u16(sigma_u16, sigma_u16);
+            let alpha2 = mul_mod257_u16(alpha_u16, alpha_u16);
+            let beta2 = mul_mod257_u16(beta_u16, beta_u16);
+            let miss = mul_mod257_u16(
+                c2,
+                add_mod257_u16(mul_mod257_u16(rho2, alpha2), mul_mod257_u16(sigma2, beta2)),
             );
-            let hit = y_div == y_pred;
+
+            let tail = sub_mod257_u16(
+                sub_mod257_u16(b_u, mul_mod257_u16(c1, u)),
+                mul_mod257_u16(c2, u2),
+            );
+
+            // Upgrade the sparse cross-term in `y_div` by adding the missing π0 `w_eval`
+            // contribution to γ. The caller passes Δγ := γ_pi - γ_pi_sparse via `gamma_override`.
+            //
+            // The weighted missing term is:
+            //   coeff_gamma * Δγ  where coeff_gamma = c2*(2ρσ).
+            let two_rho_sigma = mul_mod257_u16(2u16, mul_mod257_u16(rho_u16, sigma_u16));
+            let coeff_gamma = mul_mod257_u16(c2, two_rho_sigma);
+            let y_gamma_fix = mul_mod257_u16(coeff_gamma, gamma_u16);
+
+            // Final completed, shifted value:
+            //   z = y/s + coeff_gamma*Δγ + miss(mu/nu) + tail + c_hit
+            // and accept iff z ∈ {a0,a1}.
+            let z = add_mod257_u16(
+                add_mod257_u16(add_mod257_u16(add_mod257_u16(y_div, y_gamma_fix), miss), tail),
+                c_hit_u16,
+            );
+            let hit = z == a0_u16 || z == a1_u16;
 
             if let Some(ts) = true_s_dbg {
                 if s_probe == ts {
@@ -1377,10 +1484,12 @@ pub fn arm_ringlwe_lock<F: PrimeField>(
     poison_blocks: u32,
     coins: dpp::theorem43::Theorem43Coins<F>,
     offset: F,
+    basis_x_dots: [F; 3],
     x_len: usize,
     pi_len: usize,
     ubits_plain: [u8; 32],
     q_blocks: Vec<(usize, PackedF257Block64)>,
+    anchor_basis_hints: AnchorBasisHints,
     err_gate_hints_base: ErrGateHints,
     params: RingLweParams,
     payload: &[u8],
@@ -1510,6 +1619,7 @@ pub fn arm_ringlwe_lock<F: PrimeField>(
         c_stmt,
         accepting_set: accepting_set_shifted,
         offset,
+        basis_x_dots,
         anchor_block_id,
         rep_id,
         poison_blocks,
@@ -1519,6 +1629,7 @@ pub fn arm_ringlwe_lock<F: PrimeField>(
         coins,
         params,
         anchor_hints,
+        anchor_basis_hints,
         err_gate_hints,
         cts,
         ct_ubits,
@@ -1548,6 +1659,12 @@ mod tests {
             c_hit: F257::from(5u64),
         };
         let params = RingLweParams::default();
+        let basis_x_dots = [F257::from(0u64); 3];
+        let empty_basis = AnchorBasisHints {
+            alpha: BranchHints { hint_blocks_sparse: vec![] },
+            beta: BranchHints { hint_blocks_sparse: vec![] },
+            gamma: BranchHints { hint_blocks_sparse: vec![] },
+        };
 
         // Case 1 (insecure): reuse the same 32-byte payload across reps.
         let payload_master = [0xABu8; 32];
@@ -1560,10 +1677,12 @@ mod tests {
             1u32,
             coins.clone(),
             F257::from(0u64),
+            basis_x_dots,
             0usize,
             0usize,
             [0u8; 32],
             Vec::new(),
+            empty_basis.clone(),
             ErrGateHints {
                 k: 0,
                 blocks_per_mix: 1,
@@ -1583,10 +1702,12 @@ mod tests {
             1u32,
             coins.clone(),
             F257::from(0u64),
+            basis_x_dots,
             0usize,
             0usize,
             [0u8; 32],
             Vec::new(),
+            empty_basis.clone(),
             ErrGateHints {
                 k: 0,
                 blocks_per_mix: 1,
@@ -1636,10 +1757,12 @@ mod tests {
             1u32,
             coins.clone(),
             F257::from(0u64),
+            basis_x_dots,
             0usize,
             0usize,
             [0u8; 32],
             Vec::new(),
+            empty_basis.clone(),
             ErrGateHints {
                 k: 0,
                 blocks_per_mix: 1,
@@ -1659,10 +1782,12 @@ mod tests {
             1u32,
             coins,
             F257::from(0u64),
+            basis_x_dots,
             0usize,
             0usize,
             [0u8; 32],
             Vec::new(),
+            empty_basis.clone(),
             ErrGateHints {
                 k: 0,
                 blocks_per_mix: 1,

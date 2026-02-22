@@ -3,7 +3,8 @@
 use ark_ff::Field;
 use latticefold::transcript::poseidon::F257;
 use latticefold_plus::lockable_ringlwe::{
-    arm_ringlwe_lock, eval_err_gate_mod257_u16, ErrGateHints, PackedF257Block64, RingLweParams,
+    arm_ringlwe_lock, eval_err_gate_mod257_u16, AnchorBasisHints, BranchHints, ErrGateHints, PackedF257Block64,
+    RingLweParams,
 };
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
@@ -55,6 +56,12 @@ fn test_anchor_sparse_decap_and_gate_kills() {
 
     // Sparse query blocks: q[0]=1.
     let q_blocks = vec![(0usize, dense_block_with_single(0, 1u16))];
+    let basis_x_dots = [F257::from(0u64); 3];
+    let empty_basis = AnchorBasisHints {
+        alpha: BranchHints { hint_blocks_sparse: vec![] },
+        beta: BranchHints { hint_blocks_sparse: vec![] },
+        gamma: BranchHints { hint_blocks_sparse: vec![] },
+    };
 
     // Gate mixes: one mix with weight 1 on err[0]. The armer scales mixes by secret s, but the
     // gate remains correct because (s*z)^256 == z^256 for s!=0 in F257.
@@ -77,10 +84,12 @@ fn test_anchor_sparse_decap_and_gate_kills() {
         poison_blocks,
         coins,
         offset,
+        basis_x_dots,
         x_len,
         pi_len,
         [0u8; 32],
         q_blocks,
+        empty_basis,
         gate_hints,
         params,
         payload.as_slice(),

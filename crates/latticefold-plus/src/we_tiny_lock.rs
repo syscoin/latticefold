@@ -1299,6 +1299,37 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
         )?;
         let q_blocks = qacc.into_sparse_blocks();
 
+        // Build UV-independent basis query blocks (q1,q2,q3 restricted to π) plus their x-prefix dots.
+        let mut qacc_alpha = QueryBlockAccumulator::<F>::new(pi_len)?;
+        let mut qacc_beta = QueryBlockAccumulator::<F>::new(pi_len)?;
+        let mut qacc_gamma = QueryBlockAccumulator::<F>::new(pi_len)?;
+        let (ax, bx, gx) = dpp.stream_basis_query_terms_for_pi(
+            x,
+            &art.coins,
+            &mut scratch,
+            &mut |idx, coeff| {
+                let _ = qacc_alpha.add_term(&coeff, idx);
+            },
+            &mut |idx, coeff| {
+                let _ = qacc_beta.add_term(&coeff, idx);
+            },
+            &mut |idx, coeff| {
+                let _ = qacc_gamma.add_term(&coeff, idx);
+            },
+        )?;
+        let anchor_basis_hints = crate::lockable_ringlwe::AnchorBasisHints {
+            alpha: crate::lockable_ringlwe::BranchHints {
+                hint_blocks_sparse: qacc_alpha.into_sparse_blocks(),
+            },
+            beta: crate::lockable_ringlwe::BranchHints {
+                hint_blocks_sparse: qacc_beta.into_sparse_blocks(),
+            },
+            gamma: crate::lockable_ringlwe::BranchHints {
+                hint_blocks_sparse: qacc_gamma.into_sparse_blocks(),
+            },
+        };
+        let basis_x_dots = [ax, bx, gx];
+
         let accepting_set_raw = art.accepting_set;
         let accepting_set = [accepting_set_raw[0] - offset, accepting_set_raw[1] - offset];
         if std::env::var("LFP_DEBUG_IDENTITY").ok().as_deref() == Some("1") {
@@ -1389,10 +1420,12 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
             blocks as u32,
             art.coins,
             offset,
+            basis_x_dots,
             x.len(),
             pi_len,
             ubits_plain,
             q_blocks,
+            anchor_basis_hints,
             gate_hints,
             params.clone(),
             payload,

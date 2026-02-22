@@ -434,6 +434,92 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
         Ok(offset)
     }
 
+    /// Stream the **UV-independent basis** query terms that touch the proof portion `π` only.
+    ///
+    /// This emits the raw FLPCP sparse query vectors `q1,q2,q3` (restricted to the proof suffix)
+    /// without applying any Theorem-4.3 linearization weights.
+    ///
+    /// It returns the statement-dependent public-prefix dot products:
+    /// - `ax = ⟨q1_x, x⟩`
+    /// - `bx = ⟨q2_x, x⟩`
+    /// - `gx = ⟨q3_x, x⟩`
+    ///
+    /// These depend only on `(x, coins, schedule)` and are safe to publish.
+    pub fn stream_basis_query_terms_for_pi(
+        &self,
+        x: &[F],
+        coins: &Theorem43Coins<F>,
+        scratch: &mut Dr1csQueryScratch<F>,
+        on_alpha_pi_term: &mut dyn FnMut(usize, F),
+        on_beta_pi_term: &mut dyn FnMut(usize, F),
+        on_gamma_pi_term: &mut dyn FnMut(usize, F),
+    ) -> Result<(F, F, F), String> {
+        let flpcp = &self.flpcp;
+        if x.len() != flpcp.n() {
+            return Err("bad public input length".to_string());
+        }
+        if coins.idx >= flpcp.ell() {
+            return Err("bad idx coin".to_string());
+        }
+
+        struct BasisPiQuerySink<'a, F: PrimeField> {
+            x: &'a [F],
+            x_len: usize,
+            ax: F,
+            bx: F,
+            gx: F,
+            on_alpha_pi_term: &'a mut dyn FnMut(usize, F),
+            on_beta_pi_term: &'a mut dyn FnMut(usize, F),
+            on_gamma_pi_term: &'a mut dyn FnMut(usize, F),
+        }
+        impl<'a, F: PrimeField> QuerySink<F> for BasisPiQuerySink<'a, F> {
+            fn on_q1(&mut self, coeff: F, idx: usize) {
+                if coeff.is_zero() {
+                    return;
+                }
+                if idx < self.x_len {
+                    self.ax += coeff * self.x[idx];
+                } else {
+                    (self.on_alpha_pi_term)(idx - self.x_len, coeff);
+                }
+            }
+            fn on_q2(&mut self, coeff: F, idx: usize) {
+                if coeff.is_zero() {
+                    return;
+                }
+                if idx < self.x_len {
+                    self.bx += coeff * self.x[idx];
+                } else {
+                    (self.on_beta_pi_term)(idx - self.x_len, coeff);
+                }
+            }
+            fn on_q3(&mut self, coeff: F, idx: usize) {
+                if coeff.is_zero() {
+                    return;
+                }
+                if idx < self.x_len {
+                    self.gx += coeff * self.x[idx];
+                } else {
+                    (self.on_gamma_pi_term)(idx - self.x_len, coeff);
+                }
+            }
+        }
+
+        let x_len = x.len();
+        let mut sink = BasisPiQuerySink {
+            x,
+            x_len,
+            ax: F::ZERO,
+            bx: F::ZERO,
+            gx: F::ZERO,
+            on_alpha_pi_term,
+            on_beta_pi_term,
+            on_gamma_pi_term,
+        };
+        flpcp.stream_queries_for_coins_sparse(coins.idx, coins.lambda, x, scratch, &mut sink)?;
+        Ok((sink.ax, sink.bx, sink.gx))
+    }
+
     fn sq_coeffs_from_uv_bits(&self, q_bits: &[u8]) -> Result<Vec<F>, String> {
         let q_minus_1 = (self.p as usize) - 1;
         if q_bits.len() != q_minus_1 {

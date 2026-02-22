@@ -1090,7 +1090,7 @@ fn write_lock_package_to_writer(
     // Sparse-hints + residual-gate lock encoding.
     //
     // H10: H09 minus the high-term LUT ciphertext (we no longer ship any LUT carrier).
-    w.write_all(b"LFP1LOCKH10")?;
+    w.write_all(b"LFP1LOCKH11")?;
     for f in &manifest.stmt_digest {
         w.write_all(&f257_to_u16(f).to_le_bytes())?;
     }
@@ -1133,6 +1133,24 @@ fn write_lock_package_to_writer(
             w.write_all(&f257_to_u16(&lock.coins.rho).to_le_bytes())?;
             w.write_all(&f257_to_u16(&lock.coins.sigma).to_le_bytes())?;
             w.write_all(&f257_to_u16(&lock.coins.c_hit).to_le_bytes())?;
+
+            // basis x dots (ax,bx,gx)
+            w.write_all(&f257_to_u16(&lock.basis_x_dots[0]).to_le_bytes())?;
+            w.write_all(&f257_to_u16(&lock.basis_x_dots[1]).to_le_bytes())?;
+            w.write_all(&f257_to_u16(&lock.basis_x_dots[2]).to_le_bytes())?;
+
+            // basis hints
+            for bh in [
+                &lock.anchor_basis_hints.alpha,
+                &lock.anchor_basis_hints.beta,
+                &lock.anchor_basis_hints.gamma,
+            ] {
+                write_u32(w, bh.hint_blocks_sparse.len() as u32)?;
+                for (block_idx, blk) in &bh.hint_blocks_sparse {
+                    write_u32(w, *block_idx as u32)?;
+                    write_packed_block(w, blk)?;
+                }
+            }
 
             // anchor hints
             write_u32(w, lock.anchor_hints.hint_blocks_sparse.len() as u32)?;
@@ -1183,7 +1201,8 @@ fn read_lock_package_from_reader(
     let is_h08 = &magic == b"LFP1LOCKH08";
     let is_h09 = &magic == b"LFP1LOCKH09";
     let is_h10 = &magic == b"LFP1LOCKH10";
-    if !is_h08 && !is_h09 && !is_h10 {
+    let is_h11 = &magic == b"LFP1LOCKH11";
+    if !is_h08 && !is_h09 && !is_h10 && !is_h11 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "bad lock pkg magic",
@@ -1335,6 +1354,41 @@ fn read_lock_package_from_reader(
                 sigma: u16_to_f257(u16::from_le_bytes(sb)),
                 c_hit: u16_to_f257(u16::from_le_bytes(chb)),
             };
+            // basis x dots + basis hints (H11+); earlier versions set them to zero/empty.
+            let mut basis_x_dots = [u16_to_f257(0u16); 3];
+            let mut anchor_basis_hints = crate::lockable_ringlwe::AnchorBasisHints {
+                alpha: crate::lockable_ringlwe::BranchHints { hint_blocks_sparse: vec![] },
+                beta: crate::lockable_ringlwe::BranchHints { hint_blocks_sparse: vec![] },
+                gamma: crate::lockable_ringlwe::BranchHints { hint_blocks_sparse: vec![] },
+            };
+            if is_h11 {
+                for i in 0..3 {
+                    let mut b = [0u8; 2];
+                    r.read_exact(&mut b)?;
+                    basis_x_dots[i] = u16_to_f257(u16::from_le_bytes(b));
+                }
+                fn read_branch_hints(
+                    r: &mut impl Read,
+                    max_blocks: usize,
+                ) -> std::io::Result<crate::lockable_ringlwe::BranchHints> {
+                    let nb = read_u32(r)? as usize;
+                    if nb > max_blocks {
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "hint block count exceeds cap"));
+                    }
+                    let mut v: Vec<(usize, crate::lockable_ringlwe::PackedF257Block64)> = Vec::with_capacity(nb);
+                    for _ in 0..nb {
+                        let block_idx = read_u32(r)? as usize;
+                        let blk = read_packed_block(r)?;
+                        v.push((block_idx, blk));
+                    }
+                    Ok(crate::lockable_ringlwe::BranchHints { hint_blocks_sparse: v })
+                }
+                let alpha = read_branch_hints(r, MAX_HINT_BLOCKS_DEFAULT)?;
+                let beta = read_branch_hints(r, MAX_HINT_BLOCKS_DEFAULT)?;
+                let gamma = read_branch_hints(r, MAX_HINT_BLOCKS_DEFAULT)?;
+                anchor_basis_hints = crate::lockable_ringlwe::AnchorBasisHints { alpha, beta, gamma };
+            }
+
             // anchor hints
             let nb = read_u32(r)? as usize;
             if nb > MAX_HINT_BLOCKS_DEFAULT {
@@ -1381,7 +1435,7 @@ fn read_lock_package_from_reader(
                 cts.push(crate::lockable_ringlwe::LockCiphertext { nonce, ct });
             }
             // encrypted ubits (H09/H10; H08 sets it to zero for backward compatibility)
-            let ct_ubits: [u8; 32] = if is_h09 || is_h10 {
+            let ct_ubits: [u8; 32] = if is_h09 || is_h10 || is_h11 {
                 let mut b = [0u8; 32];
                 r.read_exact(&mut b)?;
                 b
@@ -1407,6 +1461,7 @@ fn read_lock_package_from_reader(
                 c_stmt,
                 accepting_set,
                 offset,
+                basis_x_dots,
                 anchor_block_id,
                 rep_id,
                 poison_blocks,
@@ -1416,6 +1471,7 @@ fn read_lock_package_from_reader(
                 coins,
                 params,
                 anchor_hints,
+                anchor_basis_hints,
                 err_gate_hints,
                 cts,
                 ct_ubits,
@@ -1478,7 +1534,7 @@ fn read_lock_package(
 ) -> std::io::Result<(Sp1OneProofWeGateLockPkgManifest, Vec<OneProofLogicalLock>)> {
     use std::io::{Seek, SeekFrom};
 
-    // - Uncompressed: LFP1LOCKH08 / LFP1LOCKH09 / LFP1LOCKH10
+    // - Uncompressed: LFP1LOCKH08 / LFP1LOCKH09 / LFP1LOCKH10 / LFP1LOCKH11
     // - Compressed wrapper: LFP1LOCKZ3 || zstd(LFP1LOCKH0x || ...)
     const MAGIC_ZSTD_V3: &[u8; 10] = b"LFP1LOCKZ3";
 
@@ -1491,7 +1547,8 @@ fn read_lock_package(
     const MAGIC_RAW_H08: &[u8; 11] = b"LFP1LOCKH08";
     const MAGIC_RAW_H09: &[u8; 11] = b"LFP1LOCKH09";
     const MAGIC_RAW_H10: &[u8; 11] = b"LFP1LOCKH10";
-    if &magic == MAGIC_RAW_H08 || &magic == MAGIC_RAW_H09 || &magic == MAGIC_RAW_H10 {
+    const MAGIC_RAW_H11: &[u8; 11] = b"LFP1LOCKH11";
+    if &magic == MAGIC_RAW_H08 || &magic == MAGIC_RAW_H09 || &magic == MAGIC_RAW_H10 || &magic == MAGIC_RAW_H11 {
         f.seek(SeekFrom::Start(0))?;
         let mut r = std::io::BufReader::new(f);
         return read_lock_package_from_reader(&mut r);
