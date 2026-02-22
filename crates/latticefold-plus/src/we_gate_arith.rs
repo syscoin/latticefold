@@ -1768,10 +1768,15 @@ mod tests {
 
         // Canonical path: build/load shape + compute assignment in one call.
         let t_shape = Instant::now();
+        let keep_tiny_cache = std::env::var("LFP_KEEP_TINY_GATE_CACHE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let out_dir = {
             let mut p = std::env::temp_dir();
             p.push("lfplus_test_tiny_shape_roundtrip");
-            let _ = std::fs::remove_dir_all(&p);
+            if !keep_tiny_cache {
+                let _ = std::fs::remove_dir_all(&p);
+            }
             std::fs::create_dir_all(&p).expect("create temp out_dir");
             p
         };
@@ -2011,8 +2016,10 @@ mod tests {
             );
         }
 
-        // Now it is safe to reclaim disk space used by the shape files.
-        crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir);
+        // Now it is safe to reclaim disk space used by the shape files (unless caching).
+        if !keep_tiny_cache {
+            crate::fs_cleanup::fast_remove_dir_best_effort(&out_dir);
+        }
     }
 
     #[test]
