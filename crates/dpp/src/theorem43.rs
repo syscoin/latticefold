@@ -16,11 +16,12 @@ use ark_crypto_primitives::sponge::{poseidon::PoseidonSponge, CryptographicSpong
 use ark_ff::{BigInteger, PrimeField};
 use rayon::prelude::*;
 use std::marker::PhantomData;
+use std::time::Instant;
 
 use latticefold::transcript::bytes::field_to_bytes_le_fixed;
 use latticefold::transcript::poseidon::{f257_poseidon_config, F257};
 
-use crate::dr1cs_flpcp::{is_f257_field, Dr1csNpFlpcpSparseApi, Dr1csQueryScratch, QuerySink};
+use crate::dr1cs_flpcp::{f_to_u16, is_f257_field, Dr1csNpFlpcpSparseApi, Dr1csQueryScratch, QuerySink};
 
 #[cfg(test)]
 mod tests {
@@ -91,20 +92,67 @@ pub struct Theorem43Coins<F: PrimeField> {
     pub lambda: F,
     pub rho: F,
     pub sigma: F,
+    /// Public per-instance accepting-set base, so accepting set is `{c_hit, c_hit+1}`.
+    ///
+    /// We keep this public so the lock layer can avoid the degenerate target `0`, while the
+    /// hidden query randomness remains derived from `armer_secret`.
+    pub c_hit: F,
+}
+
+/// Public arming artifact for the hidden-query lockable DPP (arm-before-proof).
+///
+/// This is intentionally minimal: the lock layer needs the accepting set and the hidden-query
+/// coefficient material to build *masked* hint blocks; it must not publish any readable Sq/power
+/// coefficient encodings.
+#[derive(Clone, Debug)]
+pub struct Theorem43LockArtifact<F: PrimeField> {
+    pub c_stmt: Vec<F>,
+    pub accepting_set: [F; 2],
+    pub len: usize,
+    pub coins: Theorem43Coins<F>,
+    /// Hidden UV-derived coefficients (TOXIC WASTE; do not publish directly).
+    pub coeffs: Vec<F>,
+    /// Hidden UV-derived membership bits over `F_p^*` (TOXIC WASTE; do not publish directly).
+    ///
+    /// Layout: `uv_bits[lam-1] = 1_{lam ∈ U}` for `lam ∈ {1..=p-1}`.
+    /// For the tiny-field WE gate, `p=257` so this has length 256.
+    pub uv_bits: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Theorem43ArmingStats {
+    pub fs_permutes: u64,
+    pub q_nnz: usize,
 }
 
 /// Non-enumerating Theorem-4.3-style lockable query generator for the NP dR1CS FLPCP.
 #[derive(Clone, Debug)]
 pub struct Theorem43Dpp<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> {
     flpcp: P,
-    q_minus_3: usize, // p-3
+    p: u64,
     _marker: PhantomData<F>,
 }
 
-/// Output of `stream_pi0_and_collect_abg_full`: per-coin `(alpha,beta,gamma)` over the full
-/// vector `(x || π0)`.
+/// Output of `stream_pi0_and_collect_abg_full`.
+///
+/// We expose both:
+/// - `*_pi`: contribution from `π0` only
+/// - `*_full`: contribution from `(x || π0)`
+///
+/// Additionally, for backends that do **not** emit dense `w_eval` query terms (e.g. tiny-lock),
+/// we expose the **sparse** values that come only from streamed query terms (i.e. before adding
+/// any per-block `w_eval` dot products).
 #[derive(Clone, Debug)]
 pub struct Theorem43AbgFull<F: PrimeField> {
+    pub alpha_pi_sparse: F,
+    pub beta_pi_sparse: F,
+    pub gamma_pi_sparse: F,
+    pub alpha_pi: F,
+    pub beta_pi: F,
+    pub gamma_pi: F,
+    pub alpha_sparse: F,
+    pub beta_sparse: F,
+    pub gamma_sparse: F,
     pub alpha: F,
     pub beta: F,
     pub gamma: F,
@@ -118,6 +166,9 @@ pub struct Theorem43AbgFull<F: PrimeField> {
 struct QueryStreamAcc<F: PrimeField> {
     acc_pi: F,
     acc_full: F,
+    // Snapshot of the streamed-only values (no per-block w_eval dots applied).
+    acc_pi_sparse: F,
+    acc_full_sparse: F,
     // Sparse terms over the selected block's `w_eval` slice in π0.
     //
     // In the canonical block-grouped schedule, each coin corresponds to exactly one block
@@ -201,6 +252,8 @@ impl<'a, F: PrimeField> QueryStreamAccBuilder<'a, F> {
         QueryStreamAcc {
             acc_pi: self.acc_pi,
             acc_full: self.acc_full,
+            acc_pi_sparse: self.acc_pi,
+            acc_full_sparse: self.acc_full,
             w_terms: self.w_terms,
         }
     }
@@ -217,19 +270,192 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
         }
         Ok(Self {
             flpcp,
-            q_minus_3: (p as usize).saturating_sub(3),
+            p,
             _marker: PhantomData,
         })
     }
 
-    /// Length of the produced proof `π` (field elements).
+    /// Length of the lock-layer streamed proof payload `π` (field elements).
     ///
-    /// Layout:
-    /// - π0 = FLPCP NP proof (z_w || w) of length `flpcp.m()`
-    /// - μ, ν (2 elems)
-    /// - u^3..u^{p-1} (p-3 elems)
+    /// Canonical WE lock path is tailless and streams only `π0 = (z_w || w)`.
     pub fn proof_len(&self) -> usize {
-        self.flpcp.m() + 2 + self.q_minus_3
+        self.flpcp.m()
+    }
+
+    /// Arm (host-side FS) and produce a public arming artifact.
+    ///
+    /// This is used by the lock layer (arm-before-proof). It derives:
+    /// - public coins deterministically from `(c_stmt, block_id, rep_id)`
+    /// - hidden UV-derived coefficients from the same transcript plus an armer-secret salt
+    pub fn arm(
+        &self,
+        c_stmt: &[F],
+        x: &[F],
+        armer_secret: &[F],
+        block_id: usize,
+        rep_id: u64,
+    ) -> Result<Theorem43LockArtifact<F>, String> {
+        if x.len() != self.flpcp.n() {
+            return Err("bad public input length".to_string());
+        }
+        if block_id >= self.flpcp.blocks() {
+            return Err("block_id out of range".to_string());
+        }
+
+        let cfg = f257_poseidon_config();
+        let coins = self.derive_public_coins_from_stmt(c_stmt, block_id, rep_id)?;
+
+        // Derive hidden UV bits / coefficients, explicitly binding the public coins.
+        let mut sp_hidden = PoseidonSponge::<F257>::new(&cfg);
+        let ds = vec![F257::from(43u64), F257::from(2u64)]; // theorem43, coeffs-v2
+        sp_hidden.absorb(&ds);
+        absorb_field_bytes_as_f257::<F>(&mut sp_hidden, c_stmt);
+        absorb_usize_base257(&mut sp_hidden, block_id);
+        absorb_u64_base257(&mut sp_hidden, rep_id);
+        absorb_usize_base257(&mut sp_hidden, coins.idx);
+        absorb_field_bytes_as_f257::<F>(&mut sp_hidden, &[coins.lambda, coins.rho, coins.sigma]);
+        absorb_field_bytes_as_f257::<F>(&mut sp_hidden, armer_secret);
+
+        let q_minus_1 = (self.p as usize) - 1;
+        let q_bits = squeeze_unbiased_bits_from_f257_digits(&mut sp_hidden, q_minus_1)?;
+        let coeffs = self.sq_coeffs_from_uv_bits(&q_bits)?;
+
+        let len = x.len() + self.proof_len();
+        Ok(Theorem43LockArtifact {
+            c_stmt: c_stmt.to_vec(),
+            accepting_set: [coins.c_hit, coins.c_hit + F::ONE],
+            len,
+            coins,
+            coeffs,
+            uv_bits: q_bits,
+        })
+    }
+
+    /// Stream the lock-layer query terms that touch the proof portion `π` only.
+    ///
+    /// This emits the coefficients for `q_π` after applying the Theorem-4.3 linearization weights.
+    /// It returns the *statement-dependent* offset contributed by the public prefix `x`.
+    pub fn stream_query_terms_for_pi(
+        &self,
+        x: &[F],
+        coins: &Theorem43Coins<F>,
+        coeffs: &[F],
+        scratch: &mut Dr1csQueryScratch<F>,
+        on_pi_term: &mut dyn FnMut(usize, F),
+    ) -> Result<F, String> {
+        let flpcp = &self.flpcp;
+        if x.len() != flpcp.n() {
+            return Err("bad public input length".to_string());
+        }
+        if coins.idx >= flpcp.ell() {
+            return Err("bad idx coin".to_string());
+        }
+        if coeffs.len() != (self.p as usize) - 1 {
+            return Err("bad coeff length".to_string());
+        }
+
+        // Linearization weights (see TR24-114 rev2 / Theorem 4.3 reduction).
+        let c1 = coeffs[0];
+        let c2 = coeffs[1];
+        let coeff_alpha = c1 * coins.rho;
+        let coeff_beta = c1 * coins.sigma;
+        let coeff_gamma = {
+            let two = F::from(2u64);
+            c2 * (two * coins.rho * coins.sigma)
+        };
+        let _coeff_mu = c2 * (coins.rho * coins.rho);
+        let _coeff_nu = c2 * (coins.sigma * coins.sigma);
+
+        struct PiQuerySink<'a, F: PrimeField> {
+            x: &'a [F],
+            x_len: usize,
+            offset: F,
+            coeff_alpha: F,
+            coeff_beta: F,
+            coeff_gamma: F,
+            on_pi_term: &'a mut dyn FnMut(usize, F),
+        }
+        impl<'a, F: PrimeField> QuerySink<F> for PiQuerySink<'a, F> {
+            fn on_q1(&mut self, coeff: F, idx: usize) {
+                let coeff = coeff * self.coeff_alpha;
+                if coeff.is_zero() {
+                    return;
+                }
+                if idx < self.x_len {
+                    self.offset += coeff * self.x[idx];
+                } else {
+                    (self.on_pi_term)(idx - self.x_len, coeff);
+                }
+            }
+            fn on_q2(&mut self, coeff: F, idx: usize) {
+                let coeff = coeff * self.coeff_beta;
+                if coeff.is_zero() {
+                    return;
+                }
+                if idx < self.x_len {
+                    self.offset += coeff * self.x[idx];
+                } else {
+                    (self.on_pi_term)(idx - self.x_len, coeff);
+                }
+            }
+            fn on_q3(&mut self, coeff: F, idx: usize) {
+                let coeff = coeff * self.coeff_gamma;
+                if coeff.is_zero() {
+                    return;
+                }
+                if idx < self.x_len {
+                    self.offset += coeff * self.x[idx];
+                } else {
+                    (self.on_pi_term)(idx - self.x_len, coeff);
+                }
+            }
+        }
+
+        let x_len = x.len();
+        let offset = {
+            let mut sink = PiQuerySink {
+                x,
+                x_len,
+                // Tailless path: this offset tracks only the public-prefix contribution q_x · x.
+                // The accepting-set base `{c_hit, c_hit+1}` is carried separately in `art.accepting_set`
+                // and must not be folded into this offset.
+                offset: F::ZERO,
+                coeff_alpha,
+                coeff_beta,
+                coeff_gamma,
+                on_pi_term,
+            };
+            flpcp.stream_queries_for_coins_sparse(coins.idx, coins.lambda, x, scratch, &mut sink)?;
+            sink.offset
+        };
+
+        // Tailless lock path: no μ/ν/u^i coordinates are emitted.
+
+        Ok(offset)
+    }
+
+    fn sq_coeffs_from_uv_bits(&self, q_bits: &[u8]) -> Result<Vec<F>, String> {
+        let q_minus_1 = (self.p as usize) - 1;
+        if q_bits.len() != q_minus_1 {
+            return Err("bad uv bit length".to_string());
+        }
+        let mut coeffs = vec![F::ZERO; q_minus_1];
+        for i in 1..=q_minus_1 {
+            let mut acc = F::ZERO;
+            for lam_u in 1..self.p {
+                let bit = q_bits[(lam_u as usize) - 1];
+                if bit == 0 {
+                    continue;
+                }
+                let lam = F::from(lam_u);
+                acc += lam.pow([i as u64]);
+            }
+            coeffs[i - 1] = -acc;
+        }
+        if coeffs.len() < 2 {
+            return Err("field too small for Sq coefficients".to_string());
+        }
+        Ok(coeffs)
     }
 
     /// Deterministically derive the public coins for a given `(c_stmt, block_id, rep_id)`.
@@ -306,12 +532,26 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
         let lambda = squeeze_f257_as_f_reject_digits::<F>(&mut sp_coins, &[0, 1])?;
         let rho = squeeze_f257_as_f_reject_digits::<F>(&mut sp_coins, &[0])?;
         let sigma = squeeze_f257_as_f_reject_digits::<F>(&mut sp_coins, &[0])?;
+        // Derive `c_hit ∈ {1..=127}` to avoid inverse-ratio collisions in `{c,c+1}` decoding and
+        // to keep the accepting set away from 0.
+        let c_hit: F = loop {
+            let x = sp_coins.squeeze_field_elements::<F257>(1)[0];
+            let d = f257_digit_u16(x)?;
+            if (1..=127).contains(&d) {
+                break F::from(d as u64);
+            }
+        };
         Ok(Theorem43Coins {
             idx,
             lambda,
             rho,
             sigma,
+            c_hit,
         })
+    }
+
+    pub fn query_scratch(&self) -> Dr1csQueryScratch<F> {
+        Dr1csQueryScratch::new(self.flpcp.n_total())
     }
 
 }
@@ -324,6 +564,8 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
         coins_list: &[Theorem43Coins<F>],
         mut on_pi0_chunk: Option<&mut dyn FnMut(&[F])>,
     ) -> Result<Vec<Theorem43AbgFull<F>>, String> {
+        let prof = std::env::var("LF_PROFILE").ok().as_deref() == Some("1");
+        let t_total = Instant::now();
         let flpcp = &self.flpcp;
         if x.len() != flpcp.n() {
             return Err("bad public input length".to_string());
@@ -354,6 +596,7 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
             acc1: QueryStreamAcc<F>,
             acc2: QueryStreamAcc<F>,
         }
+        let t_build_accs = Instant::now();
         let mut accs: Vec<AccSet<F>> = coins_list
             .par_iter()
             .map_init(
@@ -433,8 +676,16 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                 },
             )
             .collect::<Result<Vec<_>, String>>()?;
+        if prof {
+            eprintln!(
+                "[LF_PROFILE] theorem43 build_accs elapsed={:.3}s coins={}",
+                t_build_accs.elapsed().as_secs_f64(),
+                coins_list.len()
+            );
+        }
 
         // Block-grouped schedule: each coin updates exactly its selected block.
+        let t_bucket = Instant::now();
         let avg_per_block = (accs.len().saturating_add(blocks).saturating_sub(1)) / blocks.max(1);
         let mut bucket: Vec<Vec<usize>> = (0..blocks)
             .map(|_| Vec::with_capacity(avg_per_block.max(1)))
@@ -442,12 +693,21 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
         for (ci, a) in accs.iter().enumerate() {
             bucket[a.block_id].push(ci);
         }
+        if prof {
+            eprintln!(
+                "[LF_PROFILE] theorem43 bucket_schedule elapsed={:.3}s blocks={} coins={}",
+                t_bucket.elapsed().as_secs_f64(),
+                blocks,
+                coins_list.len()
+            );
+        }
 
         if let Some(cb) = on_pi0_chunk.as_deref_mut() {
             cb(z_w);
         }
         let emit_pi0 = on_pi0_chunk.is_some();
 
+        let t_setup = Instant::now();
         let witness_pos = flpcp.witness_positions_star()?;
         if witness_pos.len() != k_star {
             return Err("witness positions length mismatch".to_string());
@@ -477,6 +737,14 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
         } else {
             None
         };
+        if prof {
+            eprintln!(
+                "[LF_PROFILE] theorem43 pre_stream_setup elapsed={:.3}s blocks={} coins={}",
+                t_setup.elapsed().as_secs_f64(),
+                blocks,
+                coins_list.len()
+            );
+        }
 
         let on_block_hook = |b: usize, w_eval_u16: &[u16]| -> Result<(), String> {
             if b >= bucket.len() {
@@ -504,62 +772,72 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                 q3_w: vec![F::ZERO; n],
             };
 
-            for (j, &ci) in coins_b.iter().enumerate() {
-                let a = accs_ro
-                    .get(ci)
-                    .ok_or_else(|| "stream_w_eval_blocks_with_hook: coin index out of range".to_string())?;
+            // q1/q2 witness dots in parallel over coins in this block.
+            let q12 = coins_b
+                .par_iter()
+                .map(|&ci| -> Result<(F, F), String> {
+                    let a = accs_ro.get(ci).ok_or_else(|| {
+                        "stream_w_eval_blocks_with_hook: coin index out of range".to_string()
+                    })?;
+                    let lut_ref = lut.as_ref().ok_or_else(|| {
+                        "stream_w_eval_blocks_with_hook: q1/q2 requires F257 u16 pipeline".to_string()
+                    })?;
 
-                let mut s1 = F::ZERO;
-                for (c, pos) in a.acc0.w_terms.iter().copied() {
-                    if pos >= w_eval_u16.len() {
-                        return Err("stream_w_eval_blocks_with_hook: q1 w_eval_u16 index out of range".to_string());
+                    let mut s1 = F::ZERO;
+                    for (c, pos) in a.acc0.w_terms.iter().copied() {
+                        if pos >= w_eval_u16.len() {
+                            return Err(
+                                "stream_w_eval_blocks_with_hook: q1 w_eval_u16 index out of range"
+                                    .to_string(),
+                            );
+                        }
+                        s1 += c * lut_ref[w_eval_u16[pos] as usize];
                     }
-                    if let Some(lut) = lut.as_ref() {
-                        s1 += c * lut[w_eval_u16[pos] as usize];
-                    } else {
-                        return Err("stream_w_eval_blocks_with_hook: q1 requires F257 u16 pipeline".to_string());
+
+                    let mut s2 = F::ZERO;
+                    for (c, pos) in a.acc1.w_terms.iter().copied() {
+                        if pos >= w_eval_u16.len() {
+                            return Err(
+                                "stream_w_eval_blocks_with_hook: q2 w_eval_u16 index out of range"
+                                    .to_string(),
+                            );
+                        }
+                        s2 += c * lut_ref[w_eval_u16[pos] as usize];
                     }
-                }
+                    Ok((s1, s2))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            for (j, (s1, s2)) in q12.into_iter().enumerate() {
                 dots.q1_w[j] = s1;
-
-                let mut s2 = F::ZERO;
-                for (c, pos) in a.acc1.w_terms.iter().copied() {
-                    if pos >= w_eval_u16.len() {
-                        return Err("stream_w_eval_blocks_with_hook: q2 w_eval_u16 index out of range".to_string());
-                    }
-                    if let Some(lut) = lut.as_ref() {
-                        s2 += c * lut[w_eval_u16[pos] as usize];
-                    } else {
-                        return Err("stream_w_eval_blocks_with_hook: q2 requires F257 u16 pipeline".to_string());
-                    }
-                }
                 dots.q2_w[j] = s2;
             }
 
             // q3 witness dot: heavy dense part, batched.
             const MAX_BATCH: usize = 64;
-            let mut idxs = [0usize; MAX_BATCH];
-            let mut lambdas = [F::ZERO; MAX_BATCH];
-            let mut out = [F::ZERO; MAX_BATCH];
-
-            let mut off = 0usize;
-            while off < coins_b.len() {
-                let end = (off + MAX_BATCH).min(coins_b.len());
-                let n = end - off;
-                for j in 0..n {
-                    let a = accs_ro
-                        .get(coins_b[off + j])
-                        .ok_or_else(|| "stream_w_eval_blocks_with_hook: coin index out of range (q3)".to_string())?;
-                    idxs[j] = a.coins.idx;
-                    lambdas[j] = a.coins.lambda;
+            let q3_chunks = coins_b
+                .par_chunks(MAX_BATCH)
+                .enumerate()
+                .map(|(chunk_idx, chunk)| -> Result<(usize, Vec<F>), String> {
+                    let mut idxs = Vec::with_capacity(chunk.len());
+                    let mut lambdas = Vec::with_capacity(chunk.len());
+                    for &ci in chunk {
+                        let a = accs_ro.get(ci).ok_or_else(|| {
+                            "stream_w_eval_blocks_with_hook: coin index out of range (q3)".to_string()
+                        })?;
+                        idxs.push(a.coins.idx);
+                        lambdas.push(a.coins.lambda);
+                    }
+                    let mut out = vec![F::ZERO; chunk.len()];
+                    // Backend expects `w_eval_u16` for this block; structured backends override this
+                    // to amortize dense q3 dot products.
+                    flpcp.dot_q3_w_eval_many(&idxs, &lambdas, x, w_eval_u16, &mut out)?;
+                    Ok((chunk_idx * MAX_BATCH, out))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            for (off, vals) in q3_chunks {
+                for (j, v) in vals.into_iter().enumerate() {
+                    dots.q3_w[off + j] = v;
                 }
-                // Backend expects `w_eval_u16` for this block; structured backends override this
-                // to amortize dense q3 dot products.
-                flpcp.dot_q3_w_eval_many(&idxs[..n], &lambdas[..n], x, w_eval_u16, &mut out[..n])?;
-                for j in 0..n {
-                    dots.q3_w[off + j] = out[j];
-                }
-                off = end;
             }
 
             cell.set(dots)
@@ -572,23 +850,43 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                 cb(w_eval);
             }
         };
+        let x_u16_cache = if is_f257_field::<F>() {
+            Some(x.iter().copied().map(f_to_u16).collect::<Vec<_>>())
+        } else {
+            None
+        };
+        let z_u16_cache = if is_f257_field::<F>() {
+            Some(z_w.iter().copied().map(f_to_u16).collect::<Vec<_>>())
+        } else {
+            None
+        };
+        let t_stream = Instant::now();
         flpcp
             .stream_w_eval_blocks(
                 &witness_pos,
                 x,
                 z_w,
-                None,
-                None,
+                x_u16_cache.as_deref(),
+                z_u16_cache.as_deref(),
                 Some(&on_block_hook),
                 if emit_pi0 { Some(&mut on_block) } else { None },
             )
             .map_err(|e| format!("stream_w_eval_blocks failed: {e}"))?;
+        if std::env::var("LF_PROFILE").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[LF_PROFILE] theorem43 stream_w_eval_blocks elapsed={:.3}s blocks={} coins={}",
+                t_stream.elapsed().as_secs_f64(),
+                blocks,
+                coins_list.len()
+            );
+        }
 
         if let Some(e) = err {
             return Err(e);
         }
 
         // Apply per-block witness dots.
+        let t_apply = Instant::now();
         for b in 0..blocks {
             let coins_b = &bucket[b];
             if coins_b.is_empty() {
@@ -622,10 +920,33 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
                 a.acc2.acc_full += t3;
             }
         }
+        if std::env::var("LF_PROFILE").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[LF_PROFILE] theorem43 apply_per_block elapsed={:.3}s blocks={} coins={}",
+                t_apply.elapsed().as_secs_f64(),
+                blocks,
+                coins_list.len()
+            );
+            eprintln!(
+                "[LF_PROFILE] theorem43 total_stream_abg elapsed={:.3}s blocks={} coins={}",
+                t_total.elapsed().as_secs_f64(),
+                blocks,
+                coins_list.len()
+            );
+        }
 
         let mut out = Vec::with_capacity(accs.len());
         for a in accs.into_iter() {
             out.push(Theorem43AbgFull {
+                alpha_pi_sparse: a.acc0.acc_pi_sparse,
+                beta_pi_sparse: a.acc1.acc_pi_sparse,
+                gamma_pi_sparse: a.acc2.acc_pi_sparse,
+                alpha_pi: a.acc0.acc_pi,
+                beta_pi: a.acc1.acc_pi,
+                gamma_pi: a.acc2.acc_pi,
+                alpha_sparse: a.acc0.acc_full_sparse,
+                beta_sparse: a.acc1.acc_full_sparse,
+                gamma_sparse: a.acc2.acc_full_sparse,
                 alpha: a.acc0.acc_full,
                 beta: a.acc1.acc_full,
                 gamma: a.acc2.acc_full,
@@ -716,6 +1037,29 @@ fn squeeze_usize_mod_base257(sp: &mut PoseidonSponge<F257>, modulus: usize) -> R
             return Ok((r % m) as usize);
         }
     }
+}
+
+fn squeeze_unbiased_bits_from_f257_digits(
+    sp: &mut PoseidonSponge<F257>,
+    nbits: usize,
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(nbits);
+    while out.len() < nbits {
+        // Batch a little to amortize sponge calls.
+        let need = (nbits - out.len()).min(64);
+        let digits = sp.squeeze_field_elements::<F257>(need);
+        for dig in digits {
+            let du = f257_digit_u16(dig)?;
+            if du == 256 {
+                continue; // rejection to get uniform 0..255
+            }
+            out.push((du & 1) as u8);
+            if out.len() == nbits {
+                break;
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn f257_to_f<F: PrimeField>(x: F257) -> F {

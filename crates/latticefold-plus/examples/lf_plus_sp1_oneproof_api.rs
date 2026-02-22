@@ -199,7 +199,9 @@ fn main() {
 
         println!("stmt_digest_f257_le16=0x{}", hex_stmt_digest(out.manifest.stmt_digest));
         println!("lock_coin_seed=0x{}", hex32(out.manifest.lock_coin_seed));
-        println!("k_locks={}", out.k_locks);
+        println!("p_locks={}", out.k_locks);
+        println!("r_reps={}", out.r_reps);
+        println!("total_locks={}", out.total_locks);
         println!("lock_pkg_bytes={}", out.lock_pkg_bytes);
         eprintln!("[oneproof] total_elapsed={:?}", t_total.elapsed());
         return;
@@ -218,13 +220,10 @@ fn main() {
 
     println!("stmt_digest_f257_le16=0x{}", hex_stmt_digest(out.stmt_digest));
     println!("lock_coin_seed=0x{}", hex32(out.lock_coin_seed));
-    println!("share_candidates_len={}", out.share_candidates.len());
-    if let Some((share_idx, cands)) = out.share_candidates.first() {
-        println!("first_share_index={}", share_idx);
-        println!("first_share_candidates={}", cands.len());
-        if let Some(c0) = cands.first() {
-            println!("first_candidate=0x{}", hex32(*c0));
-        }
+    println!("selected_shares_len={}", out.selected_shares.len());
+    if let Some((share_idx, share)) = out.selected_shares.first() {
+        println!("first_selected_share_index={}", share_idx);
+        println!("first_selected_share=0x{}", hex32(*share));
     }
     eprintln!("[oneproof] total_elapsed={:?}", t_total.elapsed());
 }

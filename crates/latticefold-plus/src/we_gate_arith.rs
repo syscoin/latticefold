@@ -1268,6 +1268,8 @@ where
 #[cfg(all(test, feature = "we_gate"))]
 #[allow(non_local_definitions)]
 mod tests {
+    use rayon::prelude::*;
+
     #[cfg(feature = "parallel")]
     fn init_rayon_stack() {
         // Same mitigation as the SP1 oneproof harness:
@@ -1307,128 +1309,276 @@ mod tests {
     use crate::lin::LinearizedVerify;
     use crate::recording_transcript::TracePoseidonTranscript;
     use crate::rgchk::DecompParameters;
-
-    fn decap_noisy_lock_candidates(
+    fn decap_locks_candidates_with_gate_meta(
         prover: &crate::we_tiny_lock::WeRingLweProverContext<F257>,
-        lock: &crate::lockable_ringlwe::NoisyLockArtifact<F257>,
+        locks: &[&crate::lockable_ringlwe::RingLweLockArtifact<F257>],
         x: &[F257],
         z_w: &[F257],
-    ) -> Result<Vec<[u8; 32]>, String> {
-        use std::collections::HashMap;
-
-        if lock.sublocks.is_empty() {
-            return Err("decap_noisy_lock_candidates: lock has zero sublocks".to_string());
+    ) -> Result<Vec<(u16, Vec<[u8; 32]>)>, String> {
+        use std::time::{Duration, Instant};
+        if locks.is_empty() {
+            return Ok(Vec::new());
         }
-        let poison_blocks: usize = {
-            let pb0 = lock.sublocks[0].poison_blocks as usize;
-            if pb0 == 0 {
-                return Err("decap_noisy_lock_candidates: poison_blocks=0".to_string());
+        let mut states = Vec::with_capacity(locks.len());
+        let mut poison_blocks_vec: Vec<usize> = Vec::with_capacity(locks.len());
+        let mut coin_ranges: Vec<(usize, usize)> = Vec::with_capacity(locks.len());
+        let mut anchor_coin_idx: Vec<usize> = Vec::with_capacity(locks.len());
+        let mut all_coins = Vec::new();
+
+        for lock in locks {
+            let poison_blocks: usize = (lock.poison_blocks as usize).max(1);
+            let coins_start = all_coins.len();
+            for b in 0..poison_blocks {
+                all_coins.push(prover.derive_public_coins_from_stmt(
+                    lock.c_stmt.as_slice(),
+                    b,
+                    lock.rep_id,
+                )?);
             }
-            for sl in &lock.sublocks {
-                if sl.poison_blocks as usize != pb0 {
-                    return Err("decap_noisy_lock_candidates: poison_blocks mismatch across sublocks"
-                        .to_string());
-                }
+            let coins_end = all_coins.len();
+            let anchor_idx = all_coins.len();
+            all_coins.push(lock.coins.clone());
+
+            poison_blocks_vec.push(poison_blocks);
+            coin_ranges.push((coins_start, coins_end));
+            anchor_coin_idx.push(anchor_idx);
+            states.push(lock.decap_state(x)?);
+        }
+        if all_coins.is_empty() {
+            return Err("decap_locks_candidates_with_gate: no lock coins".to_string());
+        }
+
+        // Shared one-pass π0 stream for all locks.
+        let prof = std::env::var("LF_PROFILE").ok().as_deref() == Some("1");
+        let mut t_absorb = Duration::ZERO;
+        let t_stream_total = Instant::now();
+        let mut on_pi0 = |chunk: &[F257]| {
+            let t0 = Instant::now();
+            states
+                .par_iter_mut()
+                .try_for_each(|st| st.absorb_chunk(chunk))
+                .unwrap();
+            if prof {
+                t_absorb += t0.elapsed();
             }
-            pb0
         };
-        let poison_proj_m: usize = {
-            let m0 = lock.sublocks[0].poison_proj_m as usize;
-            for sl in &lock.sublocks {
-                if sl.poison_proj_m as usize != m0 {
-                    return Err(
-                        "decap_noisy_lock_candidates: poison_proj_m mismatch across sublocks"
-                            .to_string(),
+        let abg_all = prover.stream_pi0_and_collect_abg_full(x, z_w, &all_coins, Some(&mut on_pi0))?;
+        if abg_all.len() != all_coins.len() {
+            return Err("decap_locks_candidates_with_gate: shared abg length mismatch".to_string());
+        }
+        if prof {
+            eprintln!(
+                "[LF_PROFILE] we_gate test shared_stream elapsed={:.3}s absorb_fanout={:.3}s locks={} coins={}",
+                t_stream_total.elapsed().as_secs_f64(),
+                t_absorb.as_secs_f64(),
+                locks.len(),
+                all_coins.len()
+            );
+        }
+
+        let mut out_all: Vec<(u16, Vec<[u8; 32]>)> = Vec::with_capacity(locks.len());
+        let t_post_total = Instant::now();
+        let mut t_err_gate = Duration::ZERO;
+        let mut t_finish = Duration::ZERO;
+        for (i, st) in states.into_iter().enumerate() {
+            let lock = locks[i];
+            let poison_blocks = poison_blocks_vec[i];
+            let (coins_start, coins_end) = coin_ranges[i];
+            if coins_end < coins_start || (coins_end - coins_start) != poison_blocks {
+                return Err("decap_locks_candidates_with_gate: per-lock coin range mismatch".to_string());
+            }
+            let anchor_idx = anchor_coin_idx[i];
+
+            let mut errs: Vec<u16> = Vec::with_capacity(poison_blocks);
+            for b in 0..poison_blocks {
+                let abg = &abg_all[coins_start + b];
+                let a = crate::lockable_ringlwe::field_mod257_u16(&abg.alpha);
+                let bb = crate::lockable_ringlwe::field_mod257_u16(&abg.beta);
+                let gg = crate::lockable_ringlwe::field_mod257_u16(&abg.gamma);
+                errs.push(crate::lockable_ringlwe::sub_mod257_u16(
+                    gg,
+                    crate::lockable_ringlwe::mul_mod257_u16(a, bb),
+                ));
+            }
+            let t0 = Instant::now();
+            let g = crate::lockable_ringlwe::eval_err_gate_mod257_u16(
+                &lock.err_gate_hints,
+                errs.as_slice(),
+            )?;
+            if prof {
+                t_err_gate += t0.elapsed();
+            }
+            let anchor_abg = &abg_all[anchor_idx];
+            // Use π0-only ABG for completion (y_anchor is π0-only).
+            let alpha = crate::lockable_ringlwe::field_mod257_u16(&anchor_abg.alpha_pi_sparse);
+            let beta = crate::lockable_ringlwe::field_mod257_u16(&anchor_abg.beta_pi_sparse);
+            let rho = crate::lockable_ringlwe::field_mod257_u16(&lock.coins.rho);
+            let sigma = crate::lockable_ringlwe::field_mod257_u16(&lock.coins.sigma);
+            // Theorem43 linearization evaluation point:
+            //   u = λ + ρ·α + σ·β  (mod p)
+            let u = crate::lockable_ringlwe::add_mod257_u16(
+                crate::lockable_ringlwe::mul_mod257_u16(rho, alpha),
+                crate::lockable_ringlwe::mul_mod257_u16(sigma, beta),
+            );
+            if std::env::var("LFP_DEBUG_IDENTITY").ok().as_deref() == Some("1") {
+                let rep_filter = std::env::var("LFP_DEBUG_REP_ID")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok());
+                if rep_filter.is_none() || rep_filter == Some(lock.rep_id) {
+                    let gamma = crate::lockable_ringlwe::field_mod257_u16(&anchor_abg.gamma_pi);
+                    eprintln!(
+                        "[LF_ID_ABG] rep_id={} alpha={} beta={} gamma={} rho={} sigma={} u={}",
+                        lock.rep_id, alpha, beta, gamma, rho, sigma, u
                     );
                 }
             }
-            m0
-        };
-
-        let stmt_bytes64 = {
-            let mut out = [0u8; 64];
-            for (i, e) in lock.c_stmt.iter().take(32).enumerate() {
-                let v = crate::lockable_ringlwe::field_mod257_u16(e);
-                let b = v.to_le_bytes();
-                out[2 * i] = b[0];
-                out[2 * i + 1] = b[1];
+            let t1 = Instant::now();
+            let gamma = crate::lockable_ringlwe::field_mod257_u16(&anchor_abg.gamma_pi_sparse);
+            let s_sets =
+                st.finish_s_candidate_sets_with_gate(g, None, Some(u), Some(gamma), Some((alpha, beta)))?;
+            if prof {
+                t_finish += t1.elapsed();
             }
-            out
-        };
-
-        // Cache per-rep MulEq residual vectors `err_b`.
-        let mut err_by_rep: HashMap<u64, Vec<u16>> = HashMap::new();
-        for sl in &lock.sublocks {
-            if err_by_rep.contains_key(&sl.rep_id) {
-                continue;
-            }
-            let mut rep_coins: Vec<_> = Vec::with_capacity(poison_blocks);
-            for b in 0..poison_blocks {
-                rep_coins.push(prover.derive_public_coins_from_stmt(
-                    lock.c_stmt.as_slice(),
-                    b,
-                    sl.rep_id,
-                )?);
-            }
-            let abg_full = prover.stream_pi0_and_collect_abg_full(x, z_w, &rep_coins, None)?;
-            if abg_full.len() != poison_blocks {
-                return Err("decap_noisy_lock_candidates: abg_full length mismatch".to_string());
-            }
-            let mut errs: Vec<u16> = Vec::with_capacity(poison_blocks);
-            for b in 0..poison_blocks {
-                let a = crate::lockable_ringlwe::field_mod257_u16(&abg_full[b].alpha);
-                let bb = crate::lockable_ringlwe::field_mod257_u16(&abg_full[b].beta);
-                let g = crate::lockable_ringlwe::field_mod257_u16(&abg_full[b].gamma);
-                let ab = crate::lockable_ringlwe::mul_mod257_u16(a, bb);
-                errs.push(crate::lockable_ringlwe::sub_mod257_u16(g, ab));
-            }
-            err_by_rep.insert(sl.rep_id, errs);
-        }
-
-        // Tail-free residual gate:
-        // we only need the per-rep MulEq residual vector `err_b` (cached above).
-
-        // Per-sublock: decrypt both branches and collect 32-byte candidates.
-        let mut out: Vec<[u8; 32]> = Vec::new();
-        for sl in lock.sublocks.iter() {
-            let errs = err_by_rep
-                .get(&sl.rep_id)
-                .ok_or_else(|| "decap_noisy_lock_candidates: missing err cache".to_string())?;
-
-            let mut v_mod257: Vec<u16>;
-            if poison_proj_m == 0 {
-                v_mod257 = Vec::with_capacity(1 + poison_blocks);
-                v_mod257.push(1u16);
-                v_mod257.extend_from_slice(errs.as_slice());
-            } else {
-                let z = crate::lockable_ringlwe::project_errs_mod257_u16(
-                    &stmt_bytes64,
-                    sl.rep_id,
-                    errs.as_slice(),
-                    poison_proj_m,
-                );
-                v_mod257 = Vec::with_capacity(1 + poison_proj_m);
-                v_mod257.push(1u16);
-                v_mod257.extend_from_slice(z.as_slice());
-            }
-
-            let plains = crate::lockable_ringlwe::decap_noisy_fanout_candidates(
-                lock,
-                sl,
-                v_mod257.as_slice(),
-            )?;
-            for p in plains {
-                if p.len() != 32 {
-                    continue;
+            let mut seen = std::collections::BTreeSet::<[u8; 32]>::new();
+            let mut out: Vec<[u8; 32]> = Vec::new();
+            for s_hits in s_sets {
+                for s in s_hits {
+                    let p = lock.decrypt_payload_with_s_candidate(s);
+                    if p.len() != 32 {
+                        continue;
+                    }
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(&p);
+                    if seen.insert(a) {
+                        out.push(a);
+                    }
                 }
-                let mut a = [0u8; 32];
-                a.copy_from_slice(&p);
-                out.push(a);
             }
+            out_all.push((g, out));
         }
-        Ok(out)
+        if prof {
+            eprintln!(
+                "[LF_PROFILE] we_gate test post_process elapsed={:.3}s err+gate={:.3}s finish_decrypt={:.3}s locks={}",
+                t_post_total.elapsed().as_secs_f64(),
+                t_err_gate.as_secs_f64(),
+                t_finish.as_secs_f64(),
+                locks.len()
+            );
+        }
+        Ok(out_all)
     }
 
+    fn decap_locks_s_hits_with_gate_meta(
+        prover: &crate::we_tiny_lock::WeRingLweProverContext<F257>,
+        locks: &[&crate::lockable_ringlwe::RingLweLockArtifact<F257>],
+        x: &[F257],
+        z_w: &[F257],
+    ) -> Result<Vec<(u16, Vec<u16>)>, String> {
+        if locks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut states = Vec::with_capacity(locks.len());
+        let mut poison_blocks_vec: Vec<usize> = Vec::with_capacity(locks.len());
+        let mut coin_ranges: Vec<(usize, usize)> = Vec::with_capacity(locks.len());
+        let mut anchor_coin_idx: Vec<usize> = Vec::with_capacity(locks.len());
+        let mut all_coins = Vec::new();
+
+        for lock in locks {
+            let poison_blocks: usize = (lock.poison_blocks as usize).max(1);
+            let coins_start = all_coins.len();
+            for b in 0..poison_blocks {
+                all_coins.push(prover.derive_public_coins_from_stmt(
+                    lock.c_stmt.as_slice(),
+                    b,
+                    lock.rep_id,
+                )?);
+            }
+            let coins_end = all_coins.len();
+            let anchor_idx = all_coins.len();
+            all_coins.push(lock.coins.clone());
+
+            poison_blocks_vec.push(poison_blocks);
+            coin_ranges.push((coins_start, coins_end));
+            anchor_coin_idx.push(anchor_idx);
+            states.push(lock.decap_state(x)?);
+        }
+        if all_coins.is_empty() {
+            return Err("decap_locks_s_hits_with_gate_meta: no lock coins".to_string());
+        }
+
+        // Shared one-pass π0 stream for all locks.
+        let mut on_pi0 = |chunk: &[F257]| {
+            states
+                .par_iter_mut()
+                .try_for_each(|st| st.absorb_chunk(chunk))
+                .unwrap();
+        };
+        let abg_all = prover.stream_pi0_and_collect_abg_full(x, z_w, &all_coins, Some(&mut on_pi0))?;
+        if abg_all.len() != all_coins.len() {
+            return Err("decap_locks_s_hits_with_gate_meta: shared abg length mismatch".to_string());
+        }
+
+        let mut out_all: Vec<(u16, Vec<u16>)> = Vec::with_capacity(locks.len());
+        for (i, st) in states.into_iter().enumerate() {
+            let lock = locks[i];
+            let poison_blocks = poison_blocks_vec[i];
+            let (coins_start, coins_end) = coin_ranges[i];
+            if coins_end < coins_start || (coins_end - coins_start) != poison_blocks {
+                return Err("decap_locks_s_hits_with_gate_meta: per-lock coin range mismatch".to_string());
+            }
+            let anchor_idx = anchor_coin_idx[i];
+
+            let mut errs: Vec<u16> = Vec::with_capacity(poison_blocks);
+            for b in 0..poison_blocks {
+                let abg = &abg_all[coins_start + b];
+                let a = crate::lockable_ringlwe::field_mod257_u16(&abg.alpha);
+                let bb = crate::lockable_ringlwe::field_mod257_u16(&abg.beta);
+                let gg = crate::lockable_ringlwe::field_mod257_u16(&abg.gamma);
+                errs.push(crate::lockable_ringlwe::sub_mod257_u16(
+                    gg,
+                    crate::lockable_ringlwe::mul_mod257_u16(a, bb),
+                ));
+            }
+            let g = crate::lockable_ringlwe::eval_err_gate_mod257_u16(&lock.err_gate_hints, errs.as_slice())?;
+            let anchor_abg = &abg_all[anchor_idx];
+            // Use π0-only ABG for completion (y_anchor is π0-only).
+            let alpha = crate::lockable_ringlwe::field_mod257_u16(&anchor_abg.alpha_pi_sparse);
+            let beta = crate::lockable_ringlwe::field_mod257_u16(&anchor_abg.beta_pi_sparse);
+            let rho = crate::lockable_ringlwe::field_mod257_u16(&lock.coins.rho);
+            let sigma = crate::lockable_ringlwe::field_mod257_u16(&lock.coins.sigma);
+            let u = crate::lockable_ringlwe::add_mod257_u16(
+                crate::lockable_ringlwe::mul_mod257_u16(rho, alpha),
+                crate::lockable_ringlwe::mul_mod257_u16(sigma, beta),
+            );
+            let gamma = crate::lockable_ringlwe::field_mod257_u16(&anchor_abg.gamma_pi_sparse);
+            let s_sets =
+                st.finish_s_candidate_sets_with_gate(g, None, Some(u), Some(gamma), Some((alpha, beta)))?;
+            let hits = s_sets.into_iter().next().unwrap_or_else(|| (1u16..=256u16).collect());
+            out_all.push((g, hits));
+        }
+        Ok(out_all)
+    }
+
+    fn decap_lock_candidates_with_gate_meta(
+        prover: &crate::we_tiny_lock::WeRingLweProverContext<F257>,
+        lock: &crate::lockable_ringlwe::RingLweLockArtifact<F257>,
+        x: &[F257],
+        z_w: &[F257],
+    ) -> Result<(u16, Vec<[u8; 32]>), String> {
+        let mut one = decap_locks_candidates_with_gate_meta(prover, &[lock], x, z_w)?;
+        one.pop()
+            .ok_or_else(|| "decap_lock_candidates_with_gate_meta: missing result".to_string())
+    }
+
+    fn decap_lock_candidates_with_gate(
+        prover: &crate::we_tiny_lock::WeRingLweProverContext<F257>,
+        lock: &crate::lockable_ringlwe::RingLweLockArtifact<F257>,
+        x: &[F257],
+        z_w: &[F257],
+    ) -> Result<Vec<[u8; 32]>, String> {
+        let (_g, cands) = decap_lock_candidates_with_gate_meta(prover, lock, x, z_w)?;
+        Ok(cands)
+    }
     // NOTE: We intentionally do not keep the old “shape builds and constraints check” tests here.
     // They were development scaffolding and are slow/ignored. The tiny gate is now exercised via
     // focused gadget-level tests in `we_gate_tiny/tests.rs`, and will be covered end-to-end by
@@ -1548,7 +1698,7 @@ mod tests {
     fn test_tiny_gate_ringlwe_lock_roundtrip_small() {
         use crate::lockable_ringlwe::RingLweParams;
         use crate::we_statement::encode_public_x;
-        use crate::we_tiny_lock::arm_lfplus_ringlwe_lock;
+        use crate::we_tiny_lock::arm_lfplus_ringlwe_logical_lock;
         use crate::utils::maybe_print_rss;
         use std::time::Instant;
         use rand::{rngs::StdRng, RngCore, SeedableRng};
@@ -1687,8 +1837,6 @@ mod tests {
         let lock_j = 0u64;
 
         let ringlwe_params = RingLweParams::default();
-        // Non-empty payload so the lock actually encrypts/decrypts something.
-        let dummy_payload: [u8; 32] = [7u8; 32];
 
         let mut rng = StdRng::seed_from_u64(42);
         let public_len = shape.public_len;
@@ -1699,8 +1847,8 @@ mod tests {
         .expect("we_ringlwe_prover_from_dr1cs");
         // Scaling harness:
         // - build shape once (done above)
-        // - iterate hits_per_block values and measure arm/prove+decap
-        let hits_list: Vec<u16> = std::env::var("LFP_TEST_HITS_LIST")
+        // - iterate gate-mix K values and measure arm/prove+decap
+        let gate_mix_k_list: Vec<u16> = std::env::var("LFP_TEST_GATE_MIX_K_LIST")
             .ok()
             .map(|s| {
                 s.split(',')
@@ -1709,7 +1857,7 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .filter(|v| !v.is_empty())
-            // Global-hit mode still has a {1,2} ambiguity per hit; with too-few hits it is
+            // With too-few mixes it is
             // statistically possible to remain ambiguous (and decap intentionally refuses).
             // Keep the default high enough to make this test stable.
             .unwrap_or_else(|| vec![16]);
@@ -1718,46 +1866,72 @@ mod tests {
             .unwrap_or(0);
         let rayon_threads = rayon::current_num_threads();
         eprintln!(
-            "[tiny_gate] scale: hits_list={:?} available_parallelism={} rayon_threads={}",
-            hits_list, avail, rayon_threads
+            "[tiny_gate] scale: gate_mix_k_list={:?} available_parallelism={} rayon_threads={}",
+            gate_mix_k_list, avail, rayon_threads
         );
 
-        // Keep deterministic behavior by deriving per-lock RNG seeds sequentially first.
-        // This harness uses a **single lock** (one lock per armer is the intended design).
-        let mut seed0 = [0u8; 32];
-        rng.fill_bytes(&mut seed0);
-        let policy0 = crate::we_tiny_lock::WeRingLweLockArmingPolicy {
-            base_rep_id: 0,
-            max_rep_tries: 32,
-            hint_budget_bytes: None,
-        };
+        // Explicit R x P layout for this roundtrip harness.
+        let p_locks: usize = std::env::var("LFP_TEST_P_LOCKS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2)
+            .max(1);
+        let r_reps: usize = std::env::var("LFP_TEST_R_REPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2)
+            .max(1);
+        let total_locks = p_locks * r_reps;
+        // Keep deterministic behavior by deriving per-logical-lock RNG seeds sequentially first.
+        let mut seeds: Vec<[u8; 32]> = Vec::with_capacity(total_locks);
+        for _ in 0..p_locks {
+            let mut s = [0u8; 32];
+            rng.fill_bytes(&mut s);
+            seeds.push(s);
+        }
+        let payloads_by_lock: Vec<[u8; 32]> = (0..p_locks)
+            .map(|p| {
+                let mut v = [0u8; 32];
+                v.fill((7 + p as u8) as u8);
+                v
+            })
+            .collect();
 
-        for hits_per_block in hits_list {
+        for gate_mix_k in gate_mix_k_list {
         let t_arm = Instant::now();
-            maybe_print_rss(&format!("tiny_gate:h{hits_per_block}:before_arm"));
-            let arm0 = {
-                let mut rng0 = StdRng::from_seed(seed0);
-                arm_lfplus_ringlwe_lock::<R>(
-                shape.clone(),
-                &stmt_digest_f257,
-                armer_seed,
-                lock_j,
-                0,
-                    policy0,
-                ringlwe_params.clone(),
-                    hits_per_block,
-                &dummy_payload,
-                    &mut rng0,
+            maybe_print_rss(&format!("tiny_gate:k{gate_mix_k}:before_arm"));
+            let mut locks_by_p: Vec<Vec<_>> = Vec::with_capacity(p_locks);
+            for p in 0..p_locks {
+                let mut rseed = StdRng::from_seed(seeds[p]);
+                let arm = arm_lfplus_ringlwe_logical_lock::<R>(
+                    shape.clone(),
+                    &stmt_digest_f257,
+                    armer_seed,
+                    lock_j + p as u64,
+                    0,
+                    crate::we_tiny_lock::WeRingLweLockArmingPolicy {
+                        base_rep_id: 0,
+                        max_rep_tries: 32,
+                        hint_budget_bytes: None,
+                    },
+                    ringlwe_params.clone(),
+                    gate_mix_k,
+                    r_reps,
+                    &payloads_by_lock[p],
+                    &mut rseed,
                 )
-                .unwrap_or_else(|e| panic!("arm ctx0 failed: {e}"))
-            };
-            let lock0 = arm0.lock;
-            maybe_print_rss(&format!("tiny_gate:h{hits_per_block}:after_arm"));
+                .unwrap_or_else(|e| panic!("arm p={p} logical lock failed: {e}"));
+                assert_eq!(arm.reps.len(), r_reps, "logical lock rep count mismatch for p={p}");
+                locks_by_p.push(arm.reps);
+            }
+            maybe_print_rss(&format!("tiny_gate:k{gate_mix_k}:after_arm"));
             eprintln!(
-                    "[tiny_gate] h={} armed in {:?}: sublocks(lock0)={} proof_len={}",
-                    hits_per_block,
+                    "[tiny_gate] k={} armed in {:?}: P={} R={} total={} proof_len={}",
+                    gate_mix_k,
                 t_arm.elapsed(),
-                    lock0.sublocks.len(),
+                    p_locks,
+                    r_reps,
+                    total_locks,
                 prover.proof_len()
             );
 
@@ -1771,19 +1945,68 @@ mod tests {
             let z_w = asg[public_len..].to_vec();
 
             let t_prove = Instant::now();
-            maybe_print_rss(&format!("tiny_gate:h{hits_per_block}:before_prove_decap_stream"));
-            let cands = decap_noisy_lock_candidates(&prover, &lock0, &x, &z_w)
-                .unwrap_or_else(|e| panic!("decap_noisy_lock_candidates: {e}"));
-            assert!(
-                cands.contains(&dummy_payload),
-                "expected payload not found in decap candidates (got {} candidates)",
-                cands.len()
-            );
+            maybe_print_rss(&format!("tiny_gate:k{gate_mix_k}:before_prove_decap_stream"));
+            let flat_refs: Vec<&crate::lockable_ringlwe::RingLweLockArtifact<F257>> = locks_by_p
+                .iter()
+                .flat_map(|reps| reps.iter())
+                .collect();
+            let s_hits_batch = decap_locks_s_hits_with_gate_meta(&prover, flat_refs.as_slice(), &x, &z_w)
+                .unwrap_or_else(|e| panic!("batched decap s-hits failed: {e}"));
+            let mut share_indices: Vec<u32> = Vec::with_capacity(s_hits_batch.len());
+            let mut per_rep_hits: Vec<Vec<u16>> = Vec::with_capacity(s_hits_batch.len());
+            for (i, (g, hits)) in s_hits_batch.into_iter().enumerate() {
+                let p = i / r_reps;
+                let r = i % r_reps;
+                assert_eq!(g, 1, "honest decap should open residual gate (p={p}, r={r})");
+                share_indices.push((p as u32) + 1);
+                per_rep_hits.push(hits);
+            }
+            let per_rep_allow = crate::lockable_ringlwe::intersect_s_candidates_across_reps_by_share_index(
+                share_indices.as_slice(),
+                per_rep_hits.as_slice(),
+            )
+            .unwrap_or_else(|e| panic!("rep intersection failed: {e}"));
 
-            maybe_print_rss(&format!("tiny_gate:h{hits_per_block}:after_prove_decap_stream"));
+            // Rep unlinkability: each rep carries a different 32-byte XOR-share, so the logical
+            // master payload is recovered only after XOR-reconstructing across reps.
+            let mut per_rep_for_xor: Vec<(u32, Vec<[u8; 32]>)> = Vec::with_capacity(flat_refs.len());
+            for (i, lock) in flat_refs.iter().enumerate() {
+                let idx = share_indices[i];
+                let mut seen = std::collections::BTreeSet::<[u8; 32]>::new();
+                let mut outs: Vec<[u8; 32]> = Vec::new();
+                for &s in per_rep_allow[i].iter() {
+                    let p = lock.decrypt_payload_with_s_candidate(s);
+                    if p.len() != 32 {
+                        continue;
+                    }
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&p);
+                    if seen.insert(arr) {
+                        outs.push(arr);
+                    }
+                }
+                per_rep_for_xor.push((idx, outs));
+            }
+            let logical = crate::oneproof_combine::oneproof_xor_reconstruct_logical_candidates_v1(
+                per_rep_for_xor.as_slice(),
+                /*max_candidates_per_index=*/ 1 << 14,
+            )
+            .unwrap_or_else(|e| panic!("xor reconstruct failed: {e}"));
+            assert_eq!(logical.len(), p_locks, "logical candidate count mismatch");
+            for (idx, cands) in logical {
+                let p = (idx as usize).saturating_sub(1);
+                assert!(p < p_locks, "bad logical index in xor reconstruct");
+                assert!(
+                    cands.iter().any(|c| *c == payloads_by_lock[p]),
+                    "master payload missing from logical xor candidates (p={})",
+                    p
+                );
+            }
+
+            maybe_print_rss(&format!("tiny_gate:k{gate_mix_k}:after_prove_decap_stream"));
             eprintln!(
-                "[tiny_gate] h={} prove+decap(stream) in {:?}",
-                hits_per_block,
+                "[tiny_gate] k={} prove+decap(stream) in {:?}",
+                gate_mix_k,
                 t_prove.elapsed()
             );
         }
@@ -1798,7 +2021,7 @@ mod tests {
         use crate::lockable_ringlwe::RingLweParams;
         use crate::oneproof_combine::oneproof_hash_combine_shares_v1;
         use crate::we_statement::encode_public_x;
-        use crate::we_tiny_lock::arm_lfplus_ringlwe_lock;
+        use crate::we_tiny_lock::arm_lfplus_ringlwe_logical_lock;
         use crate::utils::maybe_print_rss;
         use rand::{rngs::StdRng, RngCore, SeedableRng};
         use sha2::Digest;
@@ -1941,7 +2164,7 @@ mod tests {
         let t_arm = Instant::now();
         let mut locks = Vec::with_capacity(K_LOCKS);
         for i in 0..K_LOCKS {
-            let lock = arm_lfplus_ringlwe_lock::<R>(
+            let lock = arm_lfplus_ringlwe_logical_lock::<R>(
                 shape.clone(),
                 &stmt_digest_f257,
                 [11u8.wrapping_add(i as u8); 32],
@@ -1954,11 +2177,15 @@ mod tests {
                 },
                 ringlwe_params.clone(),
                 1,
+                1,
                 &shares[i].1,
                 &mut rng,
             )
             .unwrap_or_else(|e| panic!("arm lock[{i}] failed: {e}"))
-            .lock;
+            .reps
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("arm lock[{i}] produced 0 reps"));
             locks.push(lock);
         }
         eprintln!(
@@ -1971,20 +2198,20 @@ mod tests {
         let t_prove = Instant::now();
         maybe_print_rss("tiny_payload_hash:before_prove_decap_stream");
 
-        // No-tag policy: carry candidates forward. For this test, select the correct share by
-        // matching the expected share bytes (test-only oracle), then hash-combine K-of-K.
-        let mut selected: Vec<(u32, [u8; 32])> = Vec::with_capacity(K_LOCKS);
-        for li in 0..K_LOCKS {
-            let cands = decap_noisy_lock_candidates(&prover, &locks[li], &x, &z_w)
-                .unwrap_or_else(|e| panic!("lock[{li}] decap candidates: {e}"));
-            let want = shares[li].1;
-            let got = cands
-                .into_iter()
-                .find(|c| *c == want)
-                .unwrap_or_else(|| {
-                    panic!("lock[{li}] did not yield the correct share among candidates")
-                });
-            selected.push(((li as u32) + 1, got));
+        // No-tag policy: carry candidates forward, then use the canonical library majority selector.
+        let mut per_lock_candidates: Vec<(u32, Vec<[u8; 32]>)> = Vec::with_capacity(K_LOCKS);
+        let lock_refs: Vec<&crate::lockable_ringlwe::RingLweLockArtifact<F257>> =
+            locks.iter().collect();
+        let batch = decap_locks_candidates_with_gate_meta(&prover, lock_refs.as_slice(), &x, &z_w)
+            .unwrap_or_else(|e| panic!("batched decap candidates: {e}"));
+        for (li, (_g, cands)) in batch.into_iter().enumerate() {
+            per_lock_candidates.push(((li as u32) + 1, cands));
+        }
+        let selected = crate::lockable_ringlwe::select_shares_by_majority(&per_lock_candidates);
+        assert_eq!(selected.len(), K_LOCKS, "majority selector must produce one share per lock index");
+        for (i, (idx, val)) in selected.iter().enumerate() {
+            assert_eq!(*idx, (i as u32) + 1);
+            assert_eq!(*val, shares[i].1, "selected share mismatch at lock index {}", idx);
         }
         let recovered =
             oneproof_hash_combine_shares_v1(&stmt_digest_f257, &lock_coin_seed, &selected);
@@ -2012,7 +2239,7 @@ mod tests {
         use crate::lockable_ringlwe::RingLweParams;
         use crate::oneproof_combine::oneproof_hash_combine_shares_v1;
         use crate::we_statement::encode_public_x;
-        use crate::we_tiny_lock::arm_lfplus_ringlwe_lock;
+        use crate::we_tiny_lock::arm_lfplus_ringlwe_logical_lock;
         use crate::utils::maybe_print_rss;
         use k256::{ProjectivePoint, Scalar};
         use rand::{rngs::StdRng, RngCore, SeedableRng};
@@ -2210,7 +2437,7 @@ mod tests {
         let t_arm = Instant::now();
         #[derive(Clone)]
         struct ArmerLockset<F: PrimeField> {
-            locks: Vec<crate::lockable_ringlwe::NoisyLockArtifact<F>>,
+            locks: Vec<crate::lockable_ringlwe::RingLweLockArtifact<F>>,
             share_indices: Vec<u32>,
             share_values: Vec<[u8; 32]>,
             lock_coin_seed: [u8; 32],
@@ -2222,7 +2449,7 @@ mod tests {
             let mut indices = Vec::with_capacity(K_LOCKS_PER_ARMER);
             let mut values = Vec::with_capacity(K_LOCKS_PER_ARMER);
             for i in 0..K_LOCKS_PER_ARMER {
-                let lock = arm_lfplus_ringlwe_lock::<R>(
+                let lock = arm_lfplus_ringlwe_logical_lock::<R>(
                     shape.clone(),
                     &stmt_digest_f257,
                     // Unique armer seed per (armer, lock).
@@ -2241,11 +2468,15 @@ mod tests {
                     },
                     ringlwe_params.clone(),
                     1,
+                    1,
                     &armer_secrets[j].shares[i].1,
                     &mut rng,
                 )
                 .unwrap_or_else(|e| panic!("arm armer[{j}] lock[{i}] failed: {e}"))
-                .lock;
+                .reps
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("arm armer[{j}] lock[{i}] produced 0 reps"));
                 indices.push(armer_secrets[j].shares[i].0);
                 values.push(armer_secrets[j].shares[i].1);
                 locks.push(lock);
@@ -2269,22 +2500,27 @@ mod tests {
         let t_decap = Instant::now();
         maybe_print_rss("btc_3armer:before_decap");
 
-        // No-tag policy: carry candidates forward. For this test, select the correct share by
-        // matching the expected share bytes (test-only oracle), then reconstruct and verify the
-        // Bitcoin address binding.
+        // No-tag policy: carry candidates forward, then apply canonical majority selector.
         let mut armer_decapped_secrets: Vec<[u8; 32]> = Vec::with_capacity(N_ARMERS);
         for j in 0..N_ARMERS {
-            let mut selected: Vec<(u32, [u8; 32])> = Vec::with_capacity(K_LOCKS_PER_ARMER);
+            let mut per_lock_candidates: Vec<(u32, Vec<[u8; 32]>)> = Vec::with_capacity(K_LOCKS_PER_ARMER);
+            let armer_lock_refs: Vec<&crate::lockable_ringlwe::RingLweLockArtifact<F257>> =
+                armer_locksets[j].locks.iter().collect();
+            let batch =
+                decap_locks_candidates_with_gate_meta(&prover, armer_lock_refs.as_slice(), &x, &z_w)
+                    .unwrap_or_else(|e| panic!("armer[{j}] batched decap candidates: {e}"));
+            for (i, (_g, cands)) in batch.into_iter().enumerate() {
+                per_lock_candidates.push((armer_locksets[j].share_indices[i], cands));
+            }
+            let selected = crate::lockable_ringlwe::select_shares_by_majority(&per_lock_candidates);
+            assert_eq!(selected.len(), K_LOCKS_PER_ARMER);
             for i in 0..K_LOCKS_PER_ARMER {
-                let lock = &armer_locksets[j].locks[i];
-                let cands = decap_noisy_lock_candidates(&prover, lock, &x, &z_w)
-                    .unwrap_or_else(|e| panic!("armer[{j}] lock[{i}] decap candidates: {e}"));
-                let want = armer_locksets[j].share_values[i];
-                let got = cands
-                    .into_iter()
-                    .find(|c| *c == want)
-                    .unwrap_or_else(|| panic!("armer[{j}] lock[{i}] did not yield correct share among candidates"));
-                selected.push((armer_locksets[j].share_indices[i], got));
+                assert_eq!(selected[i].0, armer_locksets[j].share_indices[i]);
+                assert_eq!(
+                    selected[i].1,
+                    armer_locksets[j].share_values[i],
+                    "armer[{j}] selected share mismatch at lock[{i}]"
+                );
             }
             let secret = oneproof_hash_combine_shares_v1(
                 &stmt_digest_f257,
@@ -2321,7 +2557,7 @@ mod tests {
     fn test_tiny_gate_ringlwe_lock_roundtrip_large_trace_params() {
         use crate::lockable_ringlwe::RingLweParams;
         use crate::we_statement::encode_public_x;
-        use crate::we_tiny_lock::arm_lfplus_ringlwe_lock;
+        use crate::we_tiny_lock::arm_lfplus_ringlwe_logical_lock;
         use crate::utils::maybe_print_rss;
         use rand::{rngs::StdRng, SeedableRng};
         use std::time::Instant;
@@ -2488,60 +2724,28 @@ mod tests {
             shape.public_len,
         )
         .expect("we_ringlwe_prover_from_dr1cs");
-        let shape1 = shape.clone();
         let t_arm = Instant::now();
-        let mut rep0 = 0u64;
-        let lock0 = loop {
-            match arm_lfplus_ringlwe_lock::<R>(
-                shape.clone(),
-                &stmt_digest_f257,
-                armer_seed,
-                lock_j,
-                0,
-                crate::we_tiny_lock::WeRingLweLockArmingPolicy {
-                    base_rep_id: rep0,
-                    max_rep_tries: 32,
-                    hint_budget_bytes: None,
-                },
-                ringlwe_params.clone(),
-                1,
-                &dummy_payload,
-                &mut rng,
-            ) {
-                Ok(lock_out) => break lock_out.lock,
-                Err(e) if e.contains("resample rep_id") => {
-                    rep0 += 1;
-                    continue;
-                }
-                Err(e) => panic!("arm ctx0 failed: {e}"),
-            }
-        };
-        let mut rep1 = rep0 + 1;
-        let lock1 = loop {
-            match arm_lfplus_ringlwe_lock::<R>(
-                shape1.clone(),
-                &stmt_digest_f257,
-                armer_seed,
-                lock_j,
-                0,
-                crate::we_tiny_lock::WeRingLweLockArmingPolicy {
-                    base_rep_id: rep1,
-                    max_rep_tries: 32,
-                    hint_budget_bytes: None,
-                },
-                ringlwe_params.clone(),
-                1,
-                &dummy_payload,
-                &mut rng,
-            ) {
-                Ok(lock_out) => break lock_out.lock,
-                Err(e) if e.contains("resample rep_id") => {
-                    rep1 += 1;
-                    continue;
-                }
-                Err(e) => panic!("arm ctx1 failed: {e}"),
-            }
-        };
+        let logical = arm_lfplus_ringlwe_logical_lock::<R>(
+            shape.clone(),
+            &stmt_digest_f257,
+            armer_seed,
+            lock_j,
+            0,
+            crate::we_tiny_lock::WeRingLweLockArmingPolicy {
+                base_rep_id: 0,
+                max_rep_tries: 32,
+                hint_budget_bytes: None,
+            },
+            ringlwe_params.clone(),
+            1,
+            2,
+            &dummy_payload,
+            &mut rng,
+        )
+        .unwrap_or_else(|e| panic!("arm logical failed: {e}"));
+        assert_eq!(logical.reps.len(), 2, "expected two reps");
+        let lock0 = &logical.reps[0];
+        let lock1 = &logical.reps[1];
         eprintln!(
             "[tiny_gate_large] armed in {:?}: proof_len={}",
             t_arm.elapsed(),
@@ -2555,18 +2759,26 @@ mod tests {
 
         let t_prove = Instant::now();
         maybe_print_rss("tiny_gate_large:before_prove_decap_stream");
-        let cands0 = decap_noisy_lock_candidates(&prover, &lock0, &x, &z_w)
+        let cands0 = decap_lock_candidates_with_gate(&prover, lock0, &x, &z_w)
             .unwrap_or_else(|e| panic!("lock0 decap candidates: {e}"));
-        assert!(
-            cands0.contains(&dummy_payload),
-            "lock0 payload not found among candidates"
-        );
-        let cands1 = decap_noisy_lock_candidates(&prover, &lock1, &x, &z_w)
+        let cands1 = decap_lock_candidates_with_gate(&prover, lock1, &x, &z_w)
             .unwrap_or_else(|e| panic!("lock1 decap candidates: {e}"));
-        assert!(
-            cands1.contains(&dummy_payload),
-            "lock1 payload not found among candidates"
-        );
+        // Rep unlinkability: each rep encrypts an XOR-share of the logical payload.
+        // Global reconstruction must combine reps; per-rep plaintext equality is not expected.
+        let mut found = false;
+        'outer: for a in &cands0 {
+            for b in &cands1 {
+                let mut x = [0u8; 32];
+                for i in 0..32 {
+                    x[i] = a[i] ^ b[i];
+                }
+                if x == dummy_payload {
+                    found = true;
+                    break 'outer;
+                }
+            }
+        }
+        assert!(found, "failed to reconstruct logical payload from rep candidates");
         maybe_print_rss("tiny_gate_large:after_prove_decap_stream");
         eprintln!("[tiny_gate_large] prove+decap(stream) in {:?}", t_prove.elapsed());
 

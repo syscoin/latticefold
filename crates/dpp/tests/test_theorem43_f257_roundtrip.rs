@@ -1,19 +1,13 @@
-use ark_ff::{BigInteger, Field, Fp64, MontBackend, MontConfig, PrimeField};
+use ark_ff::Field;
+use latticefold::transcript::poseidon::F257;
 
 use dpp::dr1cs_flpcp::{Dr1csInstanceSparse, MulCode, MulCodeDr1csNpFlpcpSparse, TensorRsMulCode};
 use dpp::{SparseVec, Theorem43Dpp};
 
-#[derive(MontConfig)]
-#[modulus = "257"]
-#[generator = "3"]
-pub struct F257Config;
-type F257 = Fp64<MontBackend<F257Config, 1>>;
-
-
 fn tiny_dpp() -> Theorem43Dpp<F257, MulCodeDr1csNpFlpcpSparse<F257, TensorRsMulCode<F257>>> {
     let n_total = 3usize;
     let l_public = 1usize;
-    let code = TensorRsMulCode::<F257>::new(2, 1).expect("tensor code");
+    let code = TensorRsMulCode::<F257>::new(2, 3).expect("tensor code");
     let k = code.dim_k();
 
     // Tiny dR1CS over F257 with one constraint: z0 * z1 = z2.

@@ -37,4 +37,4 @@ pub use embedding::{EmbeddedFlpcpSparse, EmbeddingParams};
 pub use boolean_proof::BooleanProofFlpcpSparse;
 pub use subset_sum::{decode_bounded_subset_sum, SubsetSumError};
 pub use sparse::SparseVec;
-pub use theorem43::{Theorem43Coins, Theorem43Dpp};
+pub use theorem43::{Theorem43Coins, Theorem43Dpp, Theorem43LockArtifact};

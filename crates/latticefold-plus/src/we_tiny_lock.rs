@@ -20,9 +20,7 @@ use dpp::theorem43::{Theorem43Coins, Theorem43Dpp};
 use dpp::SparseVec;
 use symphony::file_backed_dr1cs::{cfg_read_buf_bytes, FileBackedSparseDr1csInstance};
 
-use crate::lockable_ringlwe::{
-    NoisyLockArtifact, NoisySubLock, RingLweParams,
-};
+use crate::lockable_ringlwe::{arm_ringlwe_lock, ErrGateHints, PackedF257Block64, QueryBlockAccumulator, RingLweLockArtifact, RingLweParams};
 
 
 #[cfg(feature = "we_gate")]
@@ -1161,17 +1159,19 @@ pub(crate) struct WeRingLweLockArmingPolicy {
 }
 
 pub(crate) struct WeRingLweLockArmOut<F: PrimeField> {
-    pub lock: NoisyLockArtifact<F>,
+    pub lock: RingLweLockArtifact<F>,
+}
+
+pub(crate) struct WeRingLweLogicalLockArmOut<F: PrimeField> {
+    pub reps: Vec<RingLweLockArtifact<F>>,
 }
 
 /// Arm (publish) a RingLWE lock artifact from a public DR1CS instance and statement `x`.
 ///
-/// Canonical arming uses `hits_per_block` independent sublocks per FLPCP block (full coverage).
+/// Canonical arming uses `gate_mix_k` independent residual-gate mixes per lock.
 ///
 /// Security note:
-/// - `hits_per_block` is used for **soundness amplification** (independent DPP checks per block).
-/// - We also set `P = hits_per_block` channels, so the payload key depends on `P` independent
-///   mod-257 secrets (to avoid trivial 256-try offline brute force when plaintext is checkable).
+/// - `gate_mix_k` controls the multiplicative residual gate strength (`Pr[false-open] ~ 257^-K`).
 fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
     dr1cs: FileBackedSparseDr1csInstance<F>,
     public_len: usize,
@@ -1182,73 +1182,56 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
     _block_id: usize,
     policy: WeRingLweLockArmingPolicy,
     params: RingLweParams,
-    hits_per_block: u16,
+    gate_mix_k: u16,
+    s_override: Option<u16>,
     payload: &[u8],
     rng: &mut impl rand::RngCore,
 ) -> Result<WeRingLweLockArmOut<F>, String> {
-    // Inline canonical construction so we can use the chunked backend for shared per-block precomputes.
-    let code = TensorRsMulCode::<F>::new(48, 3)?;
-    let flpcp = FileBackedChunkedMulCodeDr1csNpFlpcpSparse::<F, _>::new(dr1cs.clone(), public_len, code)?;
-    let dpp = Theorem43Dpp::<F, _>::new(flpcp.clone())?;
-    if hits_per_block == 0 {
-        return Err("arm_we_ringlwe_lock_from_dr1cs: H_global=0".to_string());
+    // Canonical sparse-hint lock + residual-gate mixes (multiplicative kill-switch).
+    if gate_mix_k == 0 {
+        return Err("arm_we_ringlwe_lock_from_dr1cs: gate_mix_k=0".to_string());
     }
-    // Global-hits design:
-    // - interpret `hits_per_block` as `H_global`
-    // - use a fixed `P` (default 32) channels for payload secrecy.
-    let h_global: u16 = hits_per_block;
-    let _p_channels: u16 = std::env::var("LFP_P_CHANNELS")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(32u16);
-    // Arming is a one-time offline step; ensure rejection sampling is robust even if a particular
-    // transcript slice yields degenerate coefficients / low-support indices.
-    //
-    let max_rep_tries = policy.max_rep_tries.max(32);
 
-    // Noisy-hint lock: no mod-257 channel secrets; each sublock yields 2 ciphertext candidates.
+    // Inline construction so we can use the chunked backend.
+    let code = TensorRsMulCode::<F>::new(48, 3)?;
+    let flpcp =
+        FileBackedChunkedMulCodeDr1csNpFlpcpSparse::<F, _>::new(dr1cs.clone(), public_len, code)?;
+    let dpp = Theorem43Dpp::<F, _>::new(flpcp.clone())?;
 
-    // Statement commitment and armer secret are constant across all hits.
-    let c_stmt: Vec<F> = stmt_digest
-        .iter()
-        .map(|e| F::from((e.into_bigint().as_ref()[0] % 257) as u64))
-        .collect();
-    let stmt_bytes64: [u8; 64] = {
-        let mut out = [0u8; 64];
-        for (i, e) in stmt_digest.iter().enumerate() {
-            let v = (e.into_bigint().as_ref()[0] % 257) as u16;
-            let b = v.to_le_bytes();
-            out[2 * i] = b[0];
-            out[2 * i + 1] = b[1];
-        }
-        out
-    };
-    let x_len: usize = x.len();
-    let pi_len: usize = dpp.proof_len();
-
-    // Dense-support policy (preserve existing behavior).
-    const MIN_NNZ_ROW_E: usize = 48usize.pow(3); // base_k^rank
     let blocks: usize = flpcp.blocks();
     if blocks == 0 {
         return Err("arm_we_ringlwe_lock_from_dr1cs: blocks=0".to_string());
     }
-    // Global-hits schedule: `H_global` sublocks total (each yields 2 candidates).
-    let _sublocks_per_channel: u32 = h_global as u32;
 
-    // Arm `R` reps (global mixing is handled by the poison term, not by public folding).
-    #[derive(Clone)]
-    struct RepArm<F: PrimeField> {
-        rep_id: u64,
-        anchor_block_id: u32,
-        accepting_set: [F; 2],
-    }
+    // Statement commitment `c_stmt` is the mod-257 embedding of the public statement digest.
+    let c_stmt: Vec<F> = stmt_digest
+        .iter()
+        .map(|e| F::from((e.into_bigint().as_ref()[0] % 257) as u64))
+        .collect();
 
+    // Hash a 64-byte digest down to 32 bytes for armer-secret derivation.
+    let stmt_digest_bytes32: [u8; 32] = {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(b"LFP_STMT_DIGEST32_V1");
+        for e in &stmt_digest {
+            let v = (e.into_bigint().as_ref()[0] % 257) as u16;
+            h.update(v.to_le_bytes());
+        }
+        h.finalize().into()
+    };
+    let armer_secret: Vec<F> =
+        crate::we_statement::derive_armer_secret::<F>(armer_seed, stmt_digest_bytes32, lock_j, 32);
+
+    // Derive per-lock public coin inputs (anchor_block_id, rep_id) deterministically, with retry.
+    //
+    // We retry because `accepting_set_shifted` must avoid 0 (otherwise the corresponding branch key
+    // is public), and because we may want future hint-budget / sparsity policies to reject.
     #[inline]
     fn derive_anchor_block_id(
         armer_seed32: &[u8; 32],
         stmt_digest: &[F257; 32],
         lock_j: u64,
-        rep_j: usize,
         blocks: usize,
     ) -> u32 {
         use sha2::Digest;
@@ -1260,160 +1243,171 @@ fn arm_we_ringlwe_lock_from_dr1cs<F: PrimeField + FftField>(
             h.update(v.to_le_bytes());
         }
         h.update(&lock_j.to_le_bytes());
-        h.update(&(rep_j as u64).to_le_bytes());
         let out: [u8; 32] = h.finalize().into();
         let v = u64::from_le_bytes(out[0..8].try_into().unwrap_or([0u8; 8]));
-        let b = (v as usize) % blocks.max(1);
-        b as u32
+        ((v as usize) % blocks.max(1)) as u32
     }
 
-    // Tail-free residual gate note:
-    //
-    // In the current decap path, the heavy witness-time work is computing `err_b` for a given
-    // `rep_id` across all blocks. Sublock-specific Theorem-4.3 artifacts are no longer consumed
-    // directly in decap (tails removed); varying `rep_id` per sublock would therefore be pure
-    // cost with no benefit.
-    //
-    // Policy: reuse a single `rep_id` for all sublocks in this lock, but keep sublocks distinct by
-    // varying `anchor_block_id` (key binding) and salting poison weight derivations.
-    let ell_local: usize = flpcp.ell_local().max(1);
-    let mut reps: Vec<RepArm<F>> = Vec::with_capacity(h_global as usize);
+    let anchor_block_id: u32 = derive_anchor_block_id(&armer_seed, &stmt_digest, lock_j, blocks);
+    let anchor_block_usize: usize = anchor_block_id as usize;
 
-    // Pick a canonical anchor for the one-time public-coin derivation (sparsity sanity only).
-    let anchor_block_id0: u32 = derive_anchor_block_id(&armer_seed, &stmt_digest, lock_j, 0usize, blocks);
-    let anchor_block_usize0: usize = anchor_block_id0 as usize;
-    let mut tries = 0usize;
-    let rej_deg: usize = 0;
-    let rej_c2_zero: usize = 0;
-    let mut rej_nnz: usize = 0;
-    let mut chosen: Option<u64> = None;
-    while tries < max_rep_tries {
-        tries += 1;
-        let try_idx = (tries - 1) as u64;
-        // Shared rep_id for all sublocks in this lock instance.
+    let max_tries = policy.max_rep_tries.max(1);
+    for try_i in 0..max_tries {
         let rep_id = derive_rep_id_try(
             &armer_seed,
             &stmt_digest,
             lock_j,
-            /*block_id=*/ anchor_block_usize0,
+            anchor_block_usize,
             policy.base_rep_id,
-            /*channel_id=*/ 0u16,
-            /*rep=*/ 0u16,
-            try_idx,
+            /*channel_id=*/ 0,
+            /*rep=*/ 0,
+            try_i as u64,
         );
-        let coins = dpp.derive_public_coins_from_stmt(c_stmt.as_slice(), anchor_block_usize0, rep_id)?;
-        // Lightweight sanity: keep distribution away from tiny-support indices.
-        let nnz = flpcp.code.nnz_row_e_u16(coins.idx % ell_local)?;
-        if nnz < MIN_NNZ_ROW_E {
-            rej_nnz += 1;
-            continue;
-        }
-        chosen = Some(rep_id);
-        break;
-    }
-    let rep_id_shared = chosen.ok_or_else(|| {
-        format!(
-            "arm_we_ringlwe_lock_from_dr1cs: failed to arm rep within retry budget (anchor_block_id={}, tries={}, rej_deg={}, rej_c2_zero={}, rej_nnz={})",
-            anchor_block_id0, tries, rej_deg, rej_c2_zero, rej_nnz
-        )
-    })?;
-    let accepting_set: [F; 2] = [F::ONE, F::from(2u64)];
 
-    for rep_j in 0..(h_global as usize) {
-        let anchor_block_id: u32 =
-            derive_anchor_block_id(&armer_seed, &stmt_digest, lock_j, rep_j, blocks);
-        reps.push(RepArm {
-            rep_id: rep_id_shared,
-            anchor_block_id,
-            accepting_set,
-        });
-    }
-
-    // Build sublocks: one per rep. Each yields 2 candidate plaintexts (no tag).
-    let mut sublocks: Vec<NoisySubLock<F>> = Vec::with_capacity(h_global as usize);
-    for r in reps.iter() {
-        // Poison compression: number of random projections M.
-        let poison_proj_m: usize = std::env::var("LFP_ONEPROOF_POISON_PROJ_M")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(16)
-            .max(1);
-
-        // Secret coefficient vector q (mod 257 digits).
-        let poison_blocks_u32: u32 = blocks
-            .try_into()
-            .map_err(|_| "arm_we_ringlwe_lock_from_dr1cs: blocks overflow u32".to_string())?;
-        let _poison_blocks: usize = poison_blocks_u32 as usize;
-        let mut q_mod257: Vec<u16> = Vec::with_capacity(1 + poison_proj_m);
-        // Tail-free residual gate (compressed) uses masked scalar:
-        //   a = 1 + Σ_j k_j * z_j  (mod 257),   z_j = <r_j, err>  (mod 257)
-        // so the first secret coefficient is the constant `1` multiplying `v[0]=1`.
-        q_mod257.push(1u16);
-        // Poison weights k_j ∈ {1..=256} (secret, arming-time only).
-        //
-        // This restores global mixing over the projected residuals: decap computes `z_j` from the
-        // full residual vector `err_b` and the public projection coefficients `r_{j,b}`, then the
-        // noisy dot product includes Σ k_j * z_j, which is 0 on SAT and random-looking on UNSAT.
-        {
-            use sha2::Digest;
-            use rand::{RngCore, SeedableRng};
-            use rand_chacha::ChaCha20Rng;
-            let mut seed_hasher = sha2::Sha256::new();
-            seed_hasher.update(b"LFP_POISON_K_NOISY_V1");
-            seed_hasher.update(&armer_seed);
-            seed_hasher.update(&stmt_bytes64);
-            seed_hasher.update(&lock_j.to_le_bytes());
-            seed_hasher.update(&r.rep_id.to_le_bytes());
-            // Ensure sublocks remain distinct even under shared `rep_id`.
-            seed_hasher.update(&r.anchor_block_id.to_le_bytes());
-            let seed: [u8; 32] = seed_hasher.finalize().into();
-            let mut prg = ChaCha20Rng::from_seed(seed);
-            for _j in 0..poison_proj_m {
-                let kb = ((prg.next_u32() as u16) & 255u16) + 1u16; // 1..=256
-                q_mod257.push(kb);
+        // Arm DPP lock artifact (public coins + toxic coeffs).
+        let art = dpp.arm(c_stmt.as_slice(), x, armer_secret.as_slice(), anchor_block_usize, rep_id)?;
+        if std::env::var("LFP_DEBUG_IDENTITY").ok().as_deref() == Some("1") {
+            let rep_filter = std::env::var("LFP_DEBUG_REP_ID")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok());
+            if rep_filter.is_none() || rep_filter == Some(rep_id) {
+                let c1 = art.coeffs.get(0).copied().unwrap_or(F::ZERO);
+                let c2 = art.coeffs.get(1).copied().unwrap_or(F::ZERO);
+                eprintln!(
+                    "[LF_ID_COEFF] rep_id={} c1={} c2={} coeff_len={}",
+                    rep_id,
+                    crate::lockable_ringlwe::field_mod257_u16(&c1),
+                    crate::lockable_ringlwe::field_mod257_u16(&c2),
+                    art.coeffs.len()
+                );
             }
         }
-        let params_noisy = crate::lockable_ringlwe::PvugcNoisyHintParams::default();
-        let (hints, (s0, s1)) =
-            crate::lockable_ringlwe::arm_pvugc_noisy_hints_goldilocks_from_secret_q_mod257(
-                rng,
-                params_noisy,
-                q_mod257.as_slice(),
-            );
-        let cts = crate::lockable_ringlwe::arm_noisy_fanout_ciphertexts_for_accepting_set(
-            rng,
-            &params.domain_label,
-            c_stmt.as_slice(),
-            r.anchor_block_id,
-            r.rep_id,
-            &r.accepting_set,
-            s0,
-            s1,
-            payload,
-        )?;
-        sublocks.push(NoisySubLock::<F> {
-            accepting_set: r.accepting_set,
-            anchor_block_id: r.anchor_block_id,
-            rep_id: r.rep_id,
-            poison_blocks: poison_blocks_u32,
-            poison_proj_m: poison_proj_m as u32,
-            hints: crate::lockable_ringlwe::NoisyBranchHints {
-                params: params_noisy,
-                hints,
-            },
-            cts,
-        });
-    }
 
-    let lock = NoisyLockArtifact::<F> {
-        c_stmt,
-        x_len,
-        pi_len,
-        len: x_len + pi_len,
-        params,
-        sublocks,
-    };
-    Ok(WeRingLweLockArmOut { lock })
+        // Build sparse packed query blocks for the proof `π`.
+        let pi_len = dpp.proof_len();
+        let mut qacc = QueryBlockAccumulator::<F>::new(pi_len)?;
+        let mut scratch = dpp.query_scratch();
+        let offset = dpp.stream_query_terms_for_pi(
+            x,
+            &art.coins,
+            art.coeffs.as_slice(),
+            &mut scratch,
+            &mut |idx, coeff| {
+                // Best-effort: ignore out-of-range indices (should never happen).
+                let _ = qacc.add_term(&coeff, idx);
+            },
+        )?;
+        let q_blocks = qacc.into_sparse_blocks();
+
+        let accepting_set_raw = art.accepting_set;
+        let accepting_set = [accepting_set_raw[0] - offset, accepting_set_raw[1] - offset];
+        if std::env::var("LFP_DEBUG_IDENTITY").ok().as_deref() == Some("1") {
+            let rep_filter = std::env::var("LFP_DEBUG_REP_ID")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok());
+            if rep_filter.is_none() || rep_filter == Some(rep_id) {
+                eprintln!(
+                    "[LF_ID_ARM_PRE] rep_id={} c_hit={} offset={} a_raw=({}, {}) a_shift=({}, {})",
+                    rep_id,
+                    crate::lockable_ringlwe::field_mod257_u16(&art.coins.c_hit),
+                    crate::lockable_ringlwe::field_mod257_u16(&offset),
+                    crate::lockable_ringlwe::field_mod257_u16(&accepting_set_raw[0]),
+                    crate::lockable_ringlwe::field_mod257_u16(&accepting_set_raw[1]),
+                    crate::lockable_ringlwe::field_mod257_u16(&accepting_set[0]),
+                    crate::lockable_ringlwe::field_mod257_u16(&accepting_set[1]),
+                );
+            }
+        }
+
+        // Pack UV membership bits (subset indicator over {1..=256}) into 32 bytes.
+        //
+        // NOTE: these bits are toxic waste and must not be published directly. We encrypt them
+        // under a pad derived from the hidden `s` inside `arm_ringlwe_lock`.
+        if art.uv_bits.len() != 256 {
+            return Err(format!(
+                "arm_we_ringlwe_lock_from_dr1cs: uv_bits length mismatch (got {})",
+                art.uv_bits.len()
+            ));
+        }
+        let mut ubits_plain = [0u8; 32];
+        for lam in 1usize..=256usize {
+            let bit = art.uv_bits[lam - 1] & 1;
+            if bit != 0 {
+                let i = lam - 1;
+                ubits_plain[i / 8] |= 1u8 << (i % 8);
+            }
+        }
+
+        // Residual gate hint material: K mixes over the per-block residual vector err[b].
+        let gate_k: usize = gate_mix_k as usize;
+        let blocks_per_mix: usize = (blocks + 63) / 64;
+        let mut mixes: Vec<PackedF257Block64> = Vec::with_capacity(gate_k * blocks_per_mix);
+        {
+            use rand::{RngCore, SeedableRng};
+            use rand_chacha::ChaCha20Rng;
+            use sha2::Digest;
+            let mut hh = sha2::Sha256::new();
+            hh.update(b"LFP_ERR_GATE_MIX_V1");
+            hh.update(&armer_seed);
+            hh.update(&stmt_digest_bytes32);
+            hh.update(&lock_j.to_le_bytes());
+            hh.update(&rep_id.to_le_bytes());
+            let seed: [u8; 32] = hh.finalize().into();
+            let mut prg = ChaCha20Rng::from_seed(seed);
+            for _mix_i in 0..gate_k {
+                for blk in 0..blocks_per_mix {
+                    let mut vals = [0u8; 64];
+                    let mut is256_mask: u64 = 0;
+                    for j in 0..64 {
+                        let idx = blk * 64 + j;
+                        if idx >= blocks {
+                            vals[j] = 0;
+                            continue;
+                        }
+                        let r = (prg.next_u32() % 257) as u16;
+                        vals[j] = (r & 0xFF) as u8;
+                        if r == 256 {
+                            is256_mask |= 1u64 << j;
+                        }
+                    }
+                    mixes.push(PackedF257Block64::Dense { vals, is256_mask });
+                }
+            }
+        }
+        let gate_hints = ErrGateHints {
+            k: gate_k as u16,
+            blocks_per_mix: blocks_per_mix as u32,
+            mixes,
+        };
+
+        match arm_ringlwe_lock::<F>(
+            c_stmt.clone(),
+            accepting_set,
+            anchor_block_id,
+            rep_id,
+            s_override,
+            blocks as u32,
+            art.coins,
+            offset,
+            x.len(),
+            pi_len,
+            ubits_plain,
+            q_blocks,
+            gate_hints,
+            params.clone(),
+            payload,
+            rng,
+        ) {
+            Ok(lock) => return Ok(WeRingLweLockArmOut { lock }),
+            Err(e) => {
+                if e.contains("shifted accepting set contains 0") && try_i + 1 < max_tries {
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+    Err("arm_we_ringlwe_lock_from_dr1cs: exhausted rep_id retry budget".to_string())
 }
 
 /// Arm the **LF+ tiny-field WE gate** (Poseidon(F257) + CM-coin surfaces) as a Theorem-4.3 lock.
@@ -1436,8 +1430,9 @@ pub(crate) fn arm_lfplus_ringlwe_lock<R>(
     block_id: usize,
     policy: WeRingLweLockArmingPolicy,
     ringlwe_params: RingLweParams,
-    hits_per_block: u16,
+    gate_mix_k: u16,
     payload: &[u8],
+    s_override: Option<u16>,
     rng: &mut impl rand::RngCore,
 ) -> Result<WeRingLweLockArmOut<F257>, String>
 where
@@ -1463,8 +1458,106 @@ where
         block_id,
         policy,
         ringlwe_params,
-        hits_per_block,
+        gate_mix_k,
+        s_override,
         payload,
         rng,
     )
+}
+
+#[cfg(feature = "we_gate")]
+pub(crate) fn arm_lfplus_ringlwe_logical_lock<R>(
+    shape: we_gate_arith::WeDr1csShape<F257>,
+    stmt_digest: &[F257; 32],
+    armer_seed: [u8; 32],
+    lock_j: u64,
+    block_id: usize,
+    policy: WeRingLweLockArmingPolicy,
+    ringlwe_params: RingLweParams,
+    gate_mix_k: u16,
+    reps: usize,
+    payload: &[u8],
+    rng: &mut impl rand::RngCore,
+) -> Result<WeRingLweLogicalLockArmOut<F257>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + ark_ff::Field + ark_ff::PrimeField,
+{
+    use rand::{rngs::StdRng, SeedableRng};
+
+    if reps == 0 {
+        return Err("arm_lfplus_ringlwe_logical_lock: reps=0".to_string());
+    }
+    if payload.len() != 32 {
+        return Err("arm_lfplus_ringlwe_logical_lock: payload must be exactly 32 bytes".to_string());
+    }
+
+    // Rep unlinkability: split the logical-lock master payload into `reps` XOR-shares.
+    //
+    // - Each rep carries a different 32-byte plaintext, so a package-only attacker cannot
+    //   intersect candidate plaintext sets across reps to recover the logical payload.
+    // - Honest recovery can reconstruct the logical payload only after selecting one candidate
+    //   per rep (a global check stage), by XORing the rep plaintexts.
+    let mut rep_payloads: Vec<[u8; 32]> = Vec::with_capacity(reps);
+    if reps == 1 {
+        let mut one = [0u8; 32];
+        one.copy_from_slice(payload);
+        rep_payloads.push(one);
+    } else {
+        let mut acc = [0u8; 32];
+        for _ in 0..(reps - 1) {
+            let mut m = [0u8; 32];
+            rng.fill_bytes(&mut m);
+            for i in 0..32 {
+                acc[i] ^= m[i];
+            }
+            rep_payloads.push(m);
+        }
+        let mut last = [0u8; 32];
+        last.copy_from_slice(payload);
+        for i in 0..32 {
+            last[i] ^= acc[i];
+        }
+        rep_payloads.push(last);
+    }
+
+    // Deterministic per-rep RNG fan-out from caller RNG.
+    let mut rep_seeds: Vec<[u8; 32]> = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let mut s = [0u8; 32];
+        rng.fill_bytes(&mut s);
+        rep_seeds.push(s);
+    }
+
+    let mut out: Vec<RingLweLockArtifact<F257>> = Vec::with_capacity(reps);
+    // Shared scalar `s` across reps enables rep-intersection at decap time (GPT-PRO strategy).
+    let s_shared: u16 = crate::lockable_ringlwe::sample_nonzero_f257_scalar(rng);
+    for r in 0..reps {
+        let mut rrng = StdRng::from_seed(rep_seeds[r]);
+        let rep_base = policy
+            .base_rep_id
+            .checked_add(r as u64)
+            .ok_or_else(|| format!("rep base overflow: base={} r={}", policy.base_rep_id, r))?;
+        let rep_policy = WeRingLweLockArmingPolicy {
+            base_rep_id: rep_base,
+            max_rep_tries: policy.max_rep_tries,
+            hint_budget_bytes: policy.hint_budget_bytes,
+        };
+        let arm = arm_lfplus_ringlwe_lock::<R>(
+            shape.clone(),
+            stmt_digest,
+            armer_seed,
+            lock_j,
+            block_id,
+            rep_policy,
+            ringlwe_params.clone(),
+            gate_mix_k,
+            rep_payloads[r].as_slice(),
+            Some(s_shared),
+            &mut rrng,
+        )?;
+        out.push(arm.lock);
+    }
+
+    Ok(WeRingLweLogicalLockArmOut { reps: out })
 }

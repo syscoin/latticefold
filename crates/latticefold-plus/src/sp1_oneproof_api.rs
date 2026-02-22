@@ -25,7 +25,7 @@ use rand::{rngs::OsRng, rngs::StdRng, RngCore, SeedableRng};
 
 use crate::lin::LinearizedVerify;
 use crate::lockable_ringlwe::{
-    NoisyLockArtifact, RingLweParams,
+    RingLweLockArtifact, RingLweParams,
 };
 use crate::utils::maybe_print_rss;
 use crate::we_statement::{
@@ -45,7 +45,17 @@ pub struct Sp1OneProofWeGateOutput {
     /// No-tag policy: decap returns both branch decryptions per sublock, and downstream code
     /// performs a global check to select a consistent tuple across armers/locks.
     pub share_candidates: Vec<(u32, Vec<[u8; 32]>)>,
+    /// Optional *debug-only* local selector output.
+    ///
+    /// Production policy is **global-only** resolution: callers should apply an application-level
+    /// check across *many* locks/armers (e.g., derived public key / address) to pick a consistent
+    /// tuple. When rep-unlinkability is enabled, per-rep plaintexts are XOR-shares and there is
+    /// no safe per-lock local oracle.
+    ///
+    /// Enable local selection only for debugging by setting `LFP_ONEPROOF_ENABLE_LOCAL_SELECTOR=1`.
+    pub selected_shares: Vec<(u32, [u8; 32])>,
 }
+
 
 /// Manifest embedded in the public lock package file.
 ///
@@ -57,11 +67,22 @@ pub struct Sp1OneProofWeGateLockPkgManifest {
     pub lock_coin_seed: [u8; 32],
 }
 
+#[derive(Clone, Debug)]
+struct OneProofLogicalLock {
+    share_index: u32,
+    reps: Vec<RingLweLockArtifact<F257>>,
+}
+
 /// Structured output for the **arming** endpoint (write lock packages to disk).
 #[derive(Clone, Debug)]
 pub struct Sp1OneProofWeGateArmingOutput {
     pub manifest: Sp1OneProofWeGateLockPkgManifest,
+    /// Number of logical share indices (P).
     pub k_locks: usize,
+    /// Number of repetitions per logical share index (R).
+    pub r_reps: usize,
+    /// Total lock artifacts written (= P * R).
+    pub total_locks: usize,
     /// Size (bytes) of the written lock package file.
     pub lock_pkg_bytes: u64,
 }
@@ -325,14 +346,24 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
 
     // Combine policy: hash-combine only (no Shamir).
     //
-    // The armer samples `k_locks` independent 32-byte secrets (one per lock). Each lock encrypts
-    // its per-lock secret under both branch candidates. Downstream code selects one candidate per
-    // lock and derives the final key by hashing the selected tuple.
+    // `k_locks` is treated as the number of logical share indices (P). Each logical share can be
+    // repeated R times (`LFP_ONEPROOF_REPS`) and resolved via canonical majority selection.
     //
-    // We keep K-of-K to avoid subset-selection ambiguity under the no-per-lock-oracle policy.
+    // We keep K-of-K across logical shares to avoid subset-selection ambiguity under the
+    // no-per-lock-oracle policy.
+    let p_locks = k_locks.max(1);
+    let r_reps: usize = std::env::var("LFP_ONEPROOF_REPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    let total_locks = p_locks
+        .checked_mul(r_reps)
+        .ok_or_else(|| format!("P*R overflow (P={}, R={})", p_locks, r_reps))?;
+
     let shares: Vec<(u32, [u8; 32])> = {
-        let mut out: Vec<(u32, [u8; 32])> = Vec::with_capacity(k_locks);
-        for j in 0..k_locks {
+        let mut out: Vec<(u32, [u8; 32])> = Vec::with_capacity(p_locks);
+        for j in 0..p_locks {
             let mut v = [0u8; 32];
             secret_master_rng.fill_bytes(&mut v);
             // Canonical 1-based indices (helps future-proof ordering).
@@ -341,23 +372,23 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
         out
     };
     let t_arm = Instant::now();
-    let mut locks: Vec<NoisyLockArtifact<F257>> = Vec::with_capacity(k_locks);
-    let mut share_indices: Vec<u32> = Vec::with_capacity(k_locks);
-    // Channels/repetitions:
-    // Hits-per-block policy:
-    // - We use a single channel (`P=1`) to minimize format/logic complexity.
-    // - Per-block soundness and disambiguation both come from `hits_per_block` independent hits
-    //   on every FLPCP block (full coverage).
+    let mut logical_locks: Vec<OneProofLogicalLock> = Vec::with_capacity(p_locks);
+    // Residual-gate mix count (K). Legacy env name is accepted for backward compatibility.
     let _p_channels: u16 = 1;
-    let hits_per_block_raw: usize = std::env::var("LFP_ONEPROOF_HITS_PER_BLOCK")
+    let gate_mix_k_raw: usize = std::env::var("LFP_ONEPROOF_GATE_MIX_K")
         .ok()
         .and_then(|s| s.parse().ok())
+        .or_else(|| {
+            std::env::var("LFP_ONEPROOF_HITS_PER_BLOCK")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
         .unwrap_or(4)
         .max(1);
-    let hits_per_block: u16 = hits_per_block_raw.try_into().map_err(|_| {
+    let gate_mix_k: u16 = gate_mix_k_raw.try_into().map_err(|_| {
         format!(
-            "LFP_ONEPROOF_HITS_PER_BLOCK out of range for u16 (value={})",
-            hits_per_block_raw
+            "LFP_ONEPROOF_GATE_MIX_K out of range for u16 (value={})",
+            gate_mix_k_raw
         )
     })?;
     // Sizing policy:
@@ -374,34 +405,27 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
         .unwrap_or(32)
         .max(1);
 
-    // Pre-sample per-lock RNG seeds *sequentially* from the master RNG so that arming remains
+    // Pre-sample per-logical-lock RNG seeds *sequentially* from the master RNG so that arming remains
     // deterministic under a fixed `LFP_ONEPROOF_MASTER_SEED_HEX`, while allowing parallel lock
     // construction (the heavy part).
-    let mut per_lock_rng_seed32: Vec<[u8; 32]> = Vec::with_capacity(k_locks);
-    for _ in 0..k_locks {
+    let mut per_lock_rng_seed32: Vec<[u8; 32]> = Vec::with_capacity(p_locks);
+    for _ in 0..p_locks {
         let mut s = [0u8; 32];
         secret_master_rng.fill_bytes(&mut s);
         per_lock_rng_seed32.push(s);
     }
 
-    // Always record share indices in canonical order.
-    for j in 0..k_locks {
-        share_indices.push(shares[j].0);
-    }
-
-    let policy = crate::we_tiny_lock::WeRingLweLockArmingPolicy {
-        base_rep_id: 0,
-        max_rep_tries,
-        hint_budget_bytes: hint_budget_bytes_opt,
-    };
-
-    
-    let mut results: Vec<(usize, NoisyLockArtifact<F257>)> = (0..k_locks)
+    let mut results: Vec<(usize, OneProofLogicalLock)> = (0..p_locks)
         .into_par_iter()
-        .map(|j| -> Result<(usize, NoisyLockArtifact<F257>), String> {
-            let lock_j = j as u64;
-            let mut rng = StdRng::from_seed(per_lock_rng_seed32[j]);
-            let arm_out = crate::we_tiny_lock::arm_lfplus_ringlwe_lock::<R>(
+        .map(|p| -> Result<(usize, OneProofLogicalLock), String> {
+            let lock_j = p as u64;
+            let mut rng = StdRng::from_seed(per_lock_rng_seed32[p]);
+            let policy = crate::we_tiny_lock::WeRingLweLockArmingPolicy {
+                base_rep_id: 0,
+                max_rep_tries,
+                hint_budget_bytes: hint_budget_bytes_opt,
+            };
+            let arm_out = crate::we_tiny_lock::arm_lfplus_ringlwe_logical_lock::<R>(
                 shape.clone(),
                 &stmt_digest,
                 secret_dpp_seed32,
@@ -409,21 +433,30 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
                 block_id,
                 policy,
                 ringlwe_params.clone(),
-                hits_per_block,
-                shares[j].1.as_slice(),
+                gate_mix_k,
+                r_reps,
+                shares[p].1.as_slice(),
                 &mut rng,
             )?;
-            Ok((j, arm_out.lock))
+            Ok((
+                p,
+                OneProofLogicalLock {
+                    share_index: shares[p].0,
+                    reps: arm_out.reps,
+                },
+            ))
         })
         .collect::<Result<Vec<_>, String>>()?;
     results.sort_by_key(|(j, _l)| *j);
-    for (_j, lock) in results {
-        locks.push(lock);
+    for (_p, ll) in results {
+        logical_locks.push(ll);
     }
 
     eprintln!(
-        "[oneproof] armed {} locks in {:?}",
-        locks.len(),
+        "[oneproof] armed P={} logical shares × R={} reps = {} artifacts in {:?}",
+        p_locks,
+        r_reps,
+        total_locks,
         t_arm.elapsed()
     );
 
@@ -431,7 +464,7 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
         stmt_digest,
         lock_coin_seed,
     };
-    write_lock_package(lock_pkg_out_path, &manifest, &share_indices, &locks)
+    write_lock_package(lock_pkg_out_path, &manifest, &logical_locks)
         .map_err(|e| format!("oneproof: write lock package failed: {e}"))?;
     let file_bytes = std::fs::metadata(lock_pkg_out_path).map(|m| m.len()).unwrap_or(0);
     eprintln!(
@@ -441,7 +474,9 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
 
     Ok(Sp1OneProofWeGateArmingOutput {
         manifest,
-        k_locks,
+        k_locks: p_locks,
+        r_reps,
+        total_locks,
         lock_pkg_bytes: file_bytes,
     })
 }
@@ -789,20 +824,22 @@ fn decap_sp1_oneproof_we_gate_from_files_inner(
         return Err("oneproof: satisfying assignment public prefix mismatch".to_string());
     }
     let z_w = &assignment[public_len..];
-    let (_m, share_indices, locks) = read_lock_package(lock_pkg_in_path)
-                .map_err(|e| format!("oneproof: read lock package failed: {e}"))?;
-   // DO NOT UNCOMMENT THIS, LEAVE IT FOR TESTING
-    /* if _m.stmt_digest != stmt_digest {
-        return Err("oneproof: lock package stmt_digest mismatch".to_string());
+    let (m, logical_locks) = read_lock_package(lock_pkg_in_path)
+        .map_err(|e| format!("oneproof: read lock package failed: {e}"))?;
+    // Canonical decap must enforce lock-package statement binding.
+    // Keep a debug-only escape hatch for local troubleshooting.
+    let skip_lockpkg_binding =
+        std::env::var("LFP_SKIP_LOCKPKG_BINDING_CHECK").ok().as_deref() == Some("1");
+    if !skip_lockpkg_binding {
+        if m.stmt_digest != stmt_digest {
+            return Err("oneproof: lock package stmt_digest mismatch".to_string());
+        }
+        if m.lock_coin_seed != lock_coin_seed {
+            return Err("oneproof: lock package lock_coin_seed mismatch".to_string());
+        }
     }
-    if _m.lock_coin_seed != lock_coin_seed {
-        return Err("oneproof: lock package lock_coin_seed mismatch".to_string());
-    }*/
-    if locks.is_empty() {
+    if logical_locks.is_empty() {
         return Err("oneproof: lock package contained 0 locks".to_string());
-    }
-    if share_indices.len() != locks.len() {
-        return Err("oneproof: lock package share_indices/locks length mismatch".to_string());
     }
     // Combine policy is implicit: hash-combine of K-of-K per-lock 32-byte shares.
     let prover = crate::we_tiny_lock::we_ringlwe_prover_from_dr1cs::<F257>(
@@ -813,119 +850,172 @@ fn decap_sp1_oneproof_we_gate_from_files_inner(
     let t_prove = Instant::now();
     maybe_print_rss("oneproof:before_prove_decap_stream");
 
-    let stmt_bytes64 = stmt_digest_to_bytes64(&stmt_digest);
+    let _stmt_bytes64 = stmt_digest_to_bytes64(&stmt_digest);
 
-    let mut candidates_per_lock: Vec<(u32, Vec<[u8; 32]>)> = Vec::with_capacity(locks.len());
+    let rep_capacity: usize = logical_locks.iter().map(|ll| ll.reps.len()).sum();
+    let mut flat_locks: Vec<&RingLweLockArtifact<F257>> = Vec::with_capacity(rep_capacity);
+    let mut flat_share_indices: Vec<u32> = Vec::with_capacity(rep_capacity);
+    let mut flat_poison_blocks: Vec<usize> = Vec::with_capacity(rep_capacity);
+    let mut flat_states = Vec::with_capacity(rep_capacity);
+    let mut coin_ranges: Vec<(usize, usize)> = Vec::with_capacity(rep_capacity);
+    let mut anchor_coin_idx: Vec<usize> = Vec::with_capacity(rep_capacity);
+    let mut all_coins = Vec::new();
 
-    for (li, l) in locks.iter().enumerate() {
-        if l.sublocks.is_empty() {
-            return Err("oneproof: lock has zero sublocks".to_string());
+    for ll in &logical_locks {
+        if ll.reps.is_empty() {
+            return Err(format!(
+                "oneproof: logical lock share_index={} has 0 reps",
+                ll.share_index
+            ));
         }
-
-        // Poison residual cache: compute err_b vector once per rep_id.
-        let poison_blocks: usize = {
-            let pb0 = l.sublocks[0].poison_blocks as usize;
-            if pb0 == 0 {
-                return Err("oneproof: poison_blocks=0".to_string());
-            }
-            for sl in &l.sublocks {
-                if sl.poison_blocks as usize != pb0 {
-                    return Err("oneproof: poison_blocks mismatch across sublocks".to_string());
-                }
-            }
-            pb0
-        };
-        let poison_proj_m: usize = {
-            let m0 = l.sublocks[0].poison_proj_m as usize;
-            for sl in &l.sublocks {
-                if sl.poison_proj_m as usize != m0 {
-                    return Err("oneproof: poison_proj_m mismatch across sublocks".to_string());
-                }
-            }
-            m0
-        };
-        let mut err_by_rep: std::collections::HashMap<u64, Vec<u16>> =
-            std::collections::HashMap::new();
-        for sl in &l.sublocks {
-            let rep_id = sl.rep_id;
-            if err_by_rep.contains_key(&rep_id) {
-                continue;
-            }
-            let mut rep_coins: Vec<_> = Vec::with_capacity(poison_blocks);
+        for l in &ll.reps {
+            let poison_blocks: usize = (l.poison_blocks as usize).max(1);
+            let coins_start = all_coins.len();
             for b in 0..poison_blocks {
-                rep_coins.push(prover.derive_public_coins_from_stmt(
+                all_coins.push(prover.derive_public_coins_from_stmt(
                     l.c_stmt.as_slice(),
                     b,
-                    rep_id,
+                    l.rep_id,
                 )?);
             }
-            let abg_full = prover.stream_pi0_and_collect_abg_full(&x, z_w, &rep_coins, None)?;
-            if abg_full.len() != poison_blocks {
-                return Err("oneproof: abg_full length mismatch".to_string());
+            let coins_end = all_coins.len();
+            let anchor_idx = all_coins.len();
+            all_coins.push(l.coins.clone());
+
+            flat_poison_blocks.push(poison_blocks);
+            flat_share_indices.push(ll.share_index);
+            flat_states.push(l.decap_state(&x)?);
+            coin_ranges.push((coins_start, coins_end));
+            anchor_coin_idx.push(anchor_idx);
+            flat_locks.push(l);
+        }
+    }
+    if all_coins.is_empty() {
+        return Err("oneproof: no lock coins for decap".to_string());
+    }
+
+    // Single shared π0 stream for all lock reps.
+    let mut on_pi0 = |chunk: &[F257]| {
+        flat_states
+            .par_iter_mut()
+            .try_for_each(|st| st.absorb_chunk(chunk))
+            .unwrap();
+    };
+    let abg_all =
+        prover.stream_pi0_and_collect_abg_full(&x, z_w, &all_coins, Some(&mut on_pi0))?;
+    if abg_all.len() != all_coins.len() {
+        return Err("oneproof: shared abg length mismatch".to_string());
+    }
+
+    // Phase 1: compute per-rep candidate `s` sets (constant-shape 1..=256 scan).
+    let mut indexed_s_hits = flat_states
+        .into_par_iter()
+        .enumerate()
+        .map(|(i, st)| -> Result<(usize, (u16, Vec<u16>)), String> {
+            let l = flat_locks[i];
+            let poison_blocks = flat_poison_blocks[i];
+            let (coins_start, coins_end) = coin_ranges[i];
+            if coins_end < coins_start || (coins_end - coins_start) != poison_blocks {
+                return Err("oneproof: per-lock coin range mismatch".to_string());
             }
+            let anchor_idx = anchor_coin_idx[i];
+
             let mut errs: Vec<u16> = Vec::with_capacity(poison_blocks);
             for b in 0..poison_blocks {
-                let a = crate::lockable_ringlwe::field_mod257_u16(&abg_full[b].alpha);
-                let bb = crate::lockable_ringlwe::field_mod257_u16(&abg_full[b].beta);
-                let g = crate::lockable_ringlwe::field_mod257_u16(&abg_full[b].gamma);
-                let ab = crate::lockable_ringlwe::mul_mod257_u16(a, bb);
-                let err = crate::lockable_ringlwe::sub_mod257_u16(g, ab);
-                errs.push(err);
+                let abg = &abg_all[coins_start + b];
+                let a = crate::lockable_ringlwe::field_mod257_u16(&abg.alpha);
+                let bb = crate::lockable_ringlwe::field_mod257_u16(&abg.beta);
+                let gg = crate::lockable_ringlwe::field_mod257_u16(&abg.gamma);
+                errs.push(crate::lockable_ringlwe::sub_mod257_u16(
+                    gg,
+                    crate::lockable_ringlwe::mul_mod257_u16(a, bb),
+                ));
             }
-            err_by_rep.insert(rep_id, errs);
-        }
-
-        // Noisy-hint decap: each sublock yields 2 candidate plaintexts.
-        let mut cands_lock: Vec<[u8; 32]> = Vec::new();
-        for (_si, sl) in l.sublocks.iter().enumerate() {
-            // Tail-free residual gate:
-            //   a = 1 + Σ_b k_b * err_b  (mod 257)
-            // so the feature vector is just `v = [1] || [err_0..err_{B-1}]`.
-            //
-            // Append poison features: err_b = gamma - alpha*beta for each block.
-            let errs = err_by_rep
-                .get(&sl.rep_id)
-                .ok_or_else(|| "oneproof: missing err cache for rep_id".to_string())?;
-            if errs.len() != poison_blocks {
-                return Err("oneproof: err cache length mismatch".to_string());
-            }
-            let mut v_mod257: Vec<u16>;
-            if poison_proj_m == 0 {
-                v_mod257 = Vec::with_capacity(1 + poison_blocks);
-                v_mod257.push(1u16);
-                v_mod257.extend_from_slice(errs.as_slice());
-            } else {
-                let z = crate::lockable_ringlwe::project_errs_mod257_u16(
-                    &stmt_bytes64,
-                    sl.rep_id,
-                    errs.as_slice(),
-                    poison_proj_m,
-                );
-                v_mod257 = Vec::with_capacity(1 + poison_proj_m);
-                v_mod257.push(1u16);
-                v_mod257.extend_from_slice(z.as_slice());
-            }
-
-            let plains = crate::lockable_ringlwe::decap_noisy_fanout_candidates(l, sl, v_mod257.as_slice())?;
-            for p in plains {
-                if p.len() != 32 {
-                    continue;
+            // Compute gate bit g(err).
+            let g = crate::lockable_ringlwe::eval_err_gate_mod257_u16(
+                &l.err_gate_hints,
+                errs.as_slice(),
+            )?;
+            let anchor_abg = &abg_all[anchor_idx];
+            // Use the full (x||π0) ABG components for the evaluation point.
+            let alpha = crate::lockable_ringlwe::field_mod257_u16(&anchor_abg.alpha_pi_sparse);
+            let beta = crate::lockable_ringlwe::field_mod257_u16(&anchor_abg.beta_pi_sparse);
+            let gamma = crate::lockable_ringlwe::field_mod257_u16(&anchor_abg.gamma_pi_sparse);
+            let rho = crate::lockable_ringlwe::field_mod257_u16(&l.coins.rho);
+            let sigma = crate::lockable_ringlwe::field_mod257_u16(&l.coins.sigma);
+            let u = crate::lockable_ringlwe::add_mod257_u16(
+                crate::lockable_ringlwe::mul_mod257_u16(rho, alpha),
+                crate::lockable_ringlwe::mul_mod257_u16(sigma, beta),
+            );
+            if std::env::var("LFP_DEBUG_IDENTITY").ok().as_deref() == Some("1") {
+                let rep_filter = std::env::var("LFP_DEBUG_REP_ID")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok());
+                if rep_filter.is_none() || rep_filter == Some(l.rep_id) {
+                    eprintln!(
+                        "[LF_ID_ABG] rep_id={} alpha={} beta={} gamma={} rho={} sigma={} u={}",
+                        l.rep_id, alpha, beta, gamma, rho, sigma, u
+                    );
                 }
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&p);
-                cands_lock.push(arr);
+            }
+            let s_sets =
+                st.finish_s_candidate_sets_with_gate(g, None, Some(u), Some(gamma), Some((alpha, beta)))?;
+            let hits = s_sets.into_iter().next().unwrap_or_else(|| (1u16..=256u16).collect());
+            Ok((i, (g, hits)))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    indexed_s_hits.sort_by_key(|(i, _)| *i);
+    let per_rep_hits: Vec<(u16, Vec<u16>)> = indexed_s_hits.into_iter().map(|(_, v)| v).collect();
+
+    // Phase 2: intersect `s` candidates across reps of the same logical lock, then decrypt only
+    // those `s` values per rep.
+    let per_rep_hits_only: Vec<Vec<u16>> = per_rep_hits.iter().map(|(_, v)| v.clone()).collect();
+    let per_rep_s_intersect = crate::lockable_ringlwe::intersect_s_candidates_across_reps_by_share_index(
+        flat_share_indices.as_slice(),
+        per_rep_hits_only.as_slice(),
+    )?;
+
+    let mut candidates_per_lock: Vec<(u32, Vec<[u8; 32]>)> = Vec::with_capacity(flat_share_indices.len());
+    for (ri, &share_idx) in flat_share_indices.iter().enumerate() {
+        let lock = flat_locks[ri];
+        let s_allow = per_rep_s_intersect
+            .get(ri)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let mut seen = std::collections::BTreeSet::<[u8; 32]>::new();
+        let mut outs: Vec<[u8; 32]> = Vec::new();
+        for &s in s_allow {
+            let p = lock.decrypt_payload_with_s_candidate(s);
+            if p.len() != 32 {
+                continue;
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&p);
+            if seen.insert(arr) {
+                outs.push(arr);
             }
         }
-        candidates_per_lock.push((share_indices[li], cands_lock));
+        candidates_per_lock.push((share_idx, outs));
     }
 
     maybe_print_rss("oneproof:after_prove_decap_stream");
     eprintln!("[oneproof] prove+decap(stream) in {:?}", t_prove.elapsed());
 
+    let selected_shares = if std::env::var("LFP_ONEPROOF_ENABLE_LOCAL_SELECTOR")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        crate::lockable_ringlwe::select_shares_by_majority(&candidates_per_lock)
+    } else {
+        Vec::new()
+    };
+
     Ok(Sp1OneProofWeGateOutput {
         stmt_digest,
         lock_coin_seed,
         share_candidates: candidates_per_lock,
+        selected_shares,
     })
 }
 
@@ -976,91 +1066,124 @@ fn read_u64(r: &mut impl Read) -> std::io::Result<u64> {
 fn write_lock_package_to_writer(
     w: &mut impl Write,
     manifest: &Sp1OneProofWeGateLockPkgManifest,
-    share_indices: &[u32],
-    locks: &[NoisyLockArtifact<F257>],
+    logical_locks: &[OneProofLogicalLock],
 ) -> std::io::Result<()> {
-    // Noisy-hints lock package encoding (no readable mod-257 scales).
-    // Format version: hash-combine only (no Shamir fields in header).
-    // H02 adds `poison_proj_m` per sublock.
-    w.write_all(b"LFP1LOCKH02")?;
-    // Embedded manifest (canonical public metadata).
+    fn write_packed_block(w: &mut impl Write, blk: &crate::lockable_ringlwe::PackedF257Block64) -> std::io::Result<()> {
+        match blk {
+            crate::lockable_ringlwe::PackedF257Block64::Sparse { entries } => {
+                w.write_all(&[0u8])?;
+                write_u32(w, entries.len() as u32)?;
+                for (pf, c) in entries {
+                    w.write_all(&[*pf, *c])?;
+                }
+                Ok(())
+            }
+            crate::lockable_ringlwe::PackedF257Block64::Dense { vals, is256_mask } => {
+                w.write_all(&[1u8])?;
+                w.write_all(vals)?;
+                write_u64(w, *is256_mask)?;
+                Ok(())
+            }
+        }
+    }
+
+    // Sparse-hints + residual-gate lock encoding.
+    //
+    // H10: H09 minus the high-term LUT ciphertext (we no longer ship any LUT carrier).
+    w.write_all(b"LFP1LOCKH10")?;
     for f in &manifest.stmt_digest {
         w.write_all(&f257_to_u16(f).to_le_bytes())?;
     }
     w.write_all(&manifest.lock_coin_seed)?;
-    write_u32(w, locks.len() as u32)?;
-    if share_indices.len() != locks.len() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "share_indices/locks length mismatch",
-        ));
-    }
-    for (i, lock) in locks.iter().enumerate() {
-        w.write_all(&share_indices[i].to_le_bytes())?;
-        // c_stmt
-        write_u32(w, lock.c_stmt.len() as u32)?;
-        for f in &lock.c_stmt {
-            w.write_all(&f257_to_u16(f).to_le_bytes())?;
+
+    write_u32(w, logical_locks.len() as u32)?;
+    for ll in logical_locks {
+        write_u32(w, ll.share_index)?;
+        write_u32(w, ll.reps.len() as u32)?;
+        for lock in &ll.reps {
+
+            // c_stmt
+            write_u32(w, lock.c_stmt.len() as u32)?;
+            for f in &lock.c_stmt {
+                w.write_all(&f257_to_u16(f).to_le_bytes())?;
+            }
+
+            // accepting_set + offset
+            w.write_all(&f257_to_u16(&lock.accepting_set[0]).to_le_bytes())?;
+            w.write_all(&f257_to_u16(&lock.accepting_set[1]).to_le_bytes())?;
+            w.write_all(&f257_to_u16(&lock.offset).to_le_bytes())?;
+
+            // coin inputs / gating dims
+            write_u32(w, lock.anchor_block_id)?;
+            write_u64(w, lock.rep_id)?;
+            write_u32(w, lock.poison_blocks)?;
+
+            // sizes
+            write_u64(w, lock.x_len as u64)?;
+            write_u64(w, lock.pi_len as u64)?;
+            write_u64(w, lock.len as u64)?;
+
+            // params
+            write_u32(w, lock.params._reserved0)?;
+            w.write_all(&lock.params.domain_label)?;
+
+            // coins
+            write_u64(w, lock.coins.idx as u64)?;
+            w.write_all(&f257_to_u16(&lock.coins.lambda).to_le_bytes())?;
+            w.write_all(&f257_to_u16(&lock.coins.rho).to_le_bytes())?;
+            w.write_all(&f257_to_u16(&lock.coins.sigma).to_le_bytes())?;
+            w.write_all(&f257_to_u16(&lock.coins.c_hit).to_le_bytes())?;
+
+            // anchor hints
+            write_u32(w, lock.anchor_hints.hint_blocks_sparse.len() as u32)?;
+            for (block_idx, blk) in &lock.anchor_hints.hint_blocks_sparse {
+                write_u32(w, *block_idx as u32)?;
+                write_packed_block(w, blk)?;
+            }
+
+            // err gate hints
+            w.write_all(&lock.err_gate_hints.k.to_le_bytes())?;
+            write_u32(w, lock.err_gate_hints.blocks_per_mix)?;
+            write_u32(w, lock.err_gate_hints.mixes.len() as u32)?;
+            for blk in &lock.err_gate_hints.mixes {
+                write_packed_block(w, blk)?;
+            }
+
+            // wrapped-key ciphertext entries (canonical count: 1)
+            write_u32(w, lock.cts.len() as u32)?;
+            for ct in &lock.cts {
+                w.write_all(&ct.nonce)?;
+                write_u32(w, ct.ct.len() as u32)?;
+                w.write_all(&ct.ct)?;
+            }
+            // encrypted ubits (fixed 32 bytes)
+            w.write_all(&lock.ct_ubits)?;
+            // payload ciphertext (encrypted under wrapped random payload key)
+            w.write_all(&lock.payload_ct.nonce)?;
+            write_u32(w, lock.payload_ct.ct.len() as u32)?;
+            w.write_all(&lock.payload_ct.ct)?;
         }
-        // sizes
-        write_u64(w, lock.x_len as u64)?;
-        write_u64(w, lock.pi_len as u64)?;
-        write_u64(w, lock.len as u64)?;
-        // params
-        write_u32(w, lock.params._reserved0)?;
-        w.write_all(&lock.params.domain_label)?;
-        // sublocks
-        write_u32(w, lock.sublocks.len() as u32)?;
-        for sl in &lock.sublocks {
-            // accepting_set
-            w.write_all(&f257_to_u16(&sl.accepting_set[0]).to_le_bytes())?;
-            w.write_all(&f257_to_u16(&sl.accepting_set[1]).to_le_bytes())?;
-            // coin-derivation inputs (canonical)
-            write_u32(w, sl.anchor_block_id)?;
-            write_u64(w, sl.rep_id)?;
-            // poison dimension
-            write_u32(w, sl.poison_blocks)?;
-            write_u32(w, sl.poison_proj_m)?;
-            // noisy params
-            write_u64(w, sl.hints.params.noise_bound as i64 as u64)?;
-            write_u32(w, sl.hints.params.round_bits)?;
-            write_u32(w, sl.hints.params.s_bits)?;
-            // noisy hint vectors
-            if sl.hints.hints.hint0.len() != sl.hints.hints.hint1.len() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "noisy hint0/hint1 length mismatch",
-                ));
-            }
-            write_u32(w, sl.hints.hints.hint0.len() as u32)?;
-            for &v in sl.hints.hints.hint0.iter() {
-                write_u64(w, v)?;
-            }
-            for &v in sl.hints.hints.hint1.iter() {
-                write_u64(w, v)?;
-            }
-            // fanout ciphertexts
-            w.write_all(&sl.cts.ct0.nonce)?;
-            write_u32(w, sl.cts.ct0.ct.len() as u32)?;
-            w.write_all(&sl.cts.ct0.ct)?;
-            w.write_all(&sl.cts.ct1.nonce)?;
-            write_u32(w, sl.cts.ct1.ct.len() as u32)?;
-            w.write_all(&sl.cts.ct1.ct)?;
-        }
+
     }
+
     Ok(())
 }
 
 fn read_lock_package_from_reader(
     r: &mut impl Read,
-) -> std::io::Result<(Sp1OneProofWeGateLockPkgManifest, Vec<u32>, Vec<NoisyLockArtifact<F257>>)> {
+) -> std::io::Result<(Sp1OneProofWeGateLockPkgManifest, Vec<OneProofLogicalLock>)> {
     const MAX_LOCKS_DEFAULT: usize = 4096;
     const MAX_C_STMT_LEN_DEFAULT: usize = 1 << 20;
     const MAX_CT_BYTES_DEFAULT: usize = 1 << 20;
+    const MAX_HINT_BLOCKS_DEFAULT: usize = 1 << 20;
+    const MAX_GATE_MIXES_DEFAULT: usize = 1 << 20;
 
     let mut magic = [0u8; 11];
     r.read_exact(&mut magic)?;
-    if &magic != b"LFP1LOCKH02" {
+    let is_h08 = &magic == b"LFP1LOCKH08";
+    let is_h09 = &magic == b"LFP1LOCKH09";
+    let is_h10 = &magic == b"LFP1LOCKH10";
+    if !is_h08 && !is_h09 && !is_h10 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "bad lock pkg magic",
@@ -1094,154 +1217,220 @@ fn read_lock_package_from_reader(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(MAX_CT_BYTES_DEFAULT);
 
-    let n = read_u32(r)? as usize;
-    if n > max_locks {
+    let logical_n = read_u32(r)? as usize;
+    if logical_n > max_locks {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("lock count exceeds limit (n={} max={})", n, max_locks),
+            format!("logical lock count exceeds limit (n={} max={})", logical_n, max_locks),
         ));
     }
-    let mut share_indices: Vec<u32> = Vec::with_capacity(n);
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        let mut b = [0u8; 4];
-        r.read_exact(&mut b)?;
-        share_indices.push(u32::from_le_bytes(b));
-        // c_stmt
-        let c_len = read_u32(r)? as usize;
-        if c_len > max_c_stmt_len {
+    let mut out: Vec<OneProofLogicalLock> = Vec::with_capacity(logical_n);
+    for _ in 0..logical_n {
+        fn read_packed_block(r: &mut impl Read) -> std::io::Result<crate::lockable_ringlwe::PackedF257Block64> {
+            let mut tag = [0u8; 1];
+            r.read_exact(&mut tag)?;
+            match tag[0] {
+                0 => {
+                    let m = read_u32(r)? as usize;
+                    let mut entries: Vec<(u8, u8)> = Vec::with_capacity(m);
+                    for _ in 0..m {
+                        let mut b2 = [0u8; 2];
+                        r.read_exact(&mut b2)?;
+                        entries.push((b2[0], b2[1]));
+                    }
+                    Ok(crate::lockable_ringlwe::PackedF257Block64::Sparse { entries })
+                }
+                1 => {
+                    let mut vals = [0u8; 64];
+                    r.read_exact(&mut vals)?;
+                    let mask = read_u64(r)?;
+                    Ok(crate::lockable_ringlwe::PackedF257Block64::Dense { vals, is256_mask: mask })
+                }
+                _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad packed block tag")),
+            }
+        }
+
+        let share_index = read_u32(r)?;
+        let reps_n = read_u32(r)? as usize;
+        if reps_n == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "logical lock has 0 reps"));
+        }
+        if reps_n > max_locks {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("c_stmt length exceeds limit (len={} max={})", c_len, max_c_stmt_len),
+                format!("rep count exceeds limit (n={} max={})", reps_n, max_locks),
             ));
         }
-        let mut c_stmt = Vec::with_capacity(c_len);
-        for _ in 0..c_len {
-            let mut b = [0u8; 2];
-            r.read_exact(&mut b)?;
-            c_stmt.push(u16_to_f257(u16::from_le_bytes(b)));
-        }
-        // sizes
-        let x_len: usize = read_u64(r)?
-            .try_into()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "x_len overflow"))?;
-        let pi_len: usize = read_u64(r)?
-            .try_into()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "pi_len overflow"))?;
-        let len: usize = read_u64(r)?
-            .try_into()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "len overflow"))?;
-        // params
-        let reserved0 = read_u32(r)?;
-        if reserved0 != 2 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "non-canonical hint encoding (expected params._reserved0=2)",
-            ));
-        }
-        let mut domain_label = [0u8; 32];
-        r.read_exact(&mut domain_label)?;
-        let params = RingLweParams {
-            _reserved0: reserved0,
-            domain_label,
-        };
-        // sublocks
-        let ns = read_u32(r)? as usize;
-        let mut sublocks: Vec<crate::lockable_ringlwe::NoisySubLock<F257>> = Vec::with_capacity(ns);
-        for _ in 0..ns {
+        let mut reps: Vec<RingLweLockArtifact<F257>> = Vec::with_capacity(reps_n);
+        for _ in 0..reps_n {
+            // c_stmt
+            let c_len = read_u32(r)? as usize;
+            if c_len > max_c_stmt_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("c_stmt length exceeds limit (len={} max={})", c_len, max_c_stmt_len),
+                ));
+            }
+            let mut c_stmt = Vec::with_capacity(c_len);
+            for _ in 0..c_len {
+                let mut b = [0u8; 2];
+                r.read_exact(&mut b)?;
+                c_stmt.push(u16_to_f257(u16::from_le_bytes(b)));
+            }
+
+            // accepting_set + offset
             let mut a0b = [0u8; 2];
             let mut a1b = [0u8; 2];
+            let mut offb = [0u8; 2];
             r.read_exact(&mut a0b)?;
             r.read_exact(&mut a1b)?;
-            let a0 = u16_to_f257(u16::from_le_bytes(a0b));
-            let a1 = u16_to_f257(u16::from_le_bytes(a1b));
+            r.read_exact(&mut offb)?;
+            let accepting_set = [u16_to_f257(u16::from_le_bytes(a0b)), u16_to_f257(u16::from_le_bytes(a1b))];
+            let offset = u16_to_f257(u16::from_le_bytes(offb));
+
+            // coin inputs / dims
             let anchor_block_id = read_u32(r)?;
             let rep_id = read_u64(r)?;
             let poison_blocks = read_u32(r)?;
-            let poison_proj_m = read_u32(r)?;
-            let noise_bound = read_u64(r)? as i64;
-            let round_bits = read_u32(r)?;
-            let s_bits = read_u32(r)?;
-            let hlen = read_u32(r)? as usize;
-            const MAX_NOISY_HINT_LEN: usize = 1 << 20;
-            if hlen > MAX_NOISY_HINT_LEN {
+
+            // sizes
+            let x_len: usize = read_u64(r)?
+                .try_into()
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "x_len overflow"))?;
+            let pi_len: usize = read_u64(r)?
+                .try_into()
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "pi_len overflow"))?;
+            let len: usize = read_u64(r)?
+                .try_into()
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "len overflow"))?;
+            // params
+            let reserved0 = read_u32(r)?;
+            if reserved0 != 2 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "noisy hint length exceeds cap",
+                    "non-canonical hint encoding (expected params._reserved0=2)",
                 ));
             }
-            let mut hint0: Vec<u64> = Vec::with_capacity(hlen);
-            let mut hint1: Vec<u64> = Vec::with_capacity(hlen);
-            for _ in 0..hlen {
-                hint0.push(read_u64(r)?);
+            let mut domain_label = [0u8; 32];
+            r.read_exact(&mut domain_label)?;
+            let params = RingLweParams {
+                _reserved0: reserved0,
+                domain_label,
+            };
+
+            // coins
+            let idx = read_u64(r)? as usize;
+            let mut lb = [0u8; 2];
+            let mut rb = [0u8; 2];
+            let mut sb = [0u8; 2];
+            let mut chb = [0u8; 2];
+            r.read_exact(&mut lb)?;
+            r.read_exact(&mut rb)?;
+            r.read_exact(&mut sb)?;
+            r.read_exact(&mut chb)?;
+            let coins = dpp::theorem43::Theorem43Coins {
+                idx,
+                lambda: u16_to_f257(u16::from_le_bytes(lb)),
+                rho: u16_to_f257(u16::from_le_bytes(rb)),
+                sigma: u16_to_f257(u16::from_le_bytes(sb)),
+                c_hit: u16_to_f257(u16::from_le_bytes(chb)),
+            };
+            // anchor hints
+            let nb = read_u32(r)? as usize;
+            if nb > MAX_HINT_BLOCKS_DEFAULT {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "hint block count exceeds cap"));
             }
-            for _ in 0..hlen {
-                hint1.push(read_u64(r)?);
+            let mut v: Vec<(usize, crate::lockable_ringlwe::PackedF257Block64)> = Vec::with_capacity(nb);
+            for _ in 0..nb {
+                let block_idx = read_u32(r)? as usize;
+                let blk = read_packed_block(r)?;
+                v.push((block_idx, blk));
             }
-            // ciphertexts
-            let mut n0 = [0u8; 12];
-            r.read_exact(&mut n0)?;
-            let ct0_len = read_u32(r)? as usize;
-            if ct0_len > max_ct_bytes {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "ct0 length exceeds cap",
-                ));
+            let anchor_hints = crate::lockable_ringlwe::BranchHints { hint_blocks_sparse: v };
+
+            // err gate hints
+            let mut kb = [0u8; 2];
+            r.read_exact(&mut kb)?;
+            let k = u16::from_le_bytes(kb);
+            let blocks_per_mix = read_u32(r)?;
+            let nm = read_u32(r)? as usize;
+            if nm > MAX_GATE_MIXES_DEFAULT {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "gate mixes exceeds cap"));
             }
-            let mut ct0 = vec![0u8; ct0_len];
-            r.read_exact(&mut ct0)?;
-            let mut n1 = [0u8; 12];
-            r.read_exact(&mut n1)?;
-            let ct1_len = read_u32(r)? as usize;
-            if ct1_len > max_ct_bytes {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "ct1 length exceeds cap",
-                ));
+            let mut mixes = Vec::with_capacity(nm);
+            for _ in 0..nm {
+                mixes.push(read_packed_block(r)?);
             }
-            let mut ct1 = vec![0u8; ct1_len];
-            r.read_exact(&mut ct1)?;
-            sublocks.push(crate::lockable_ringlwe::NoisySubLock::<F257> {
-                accepting_set: [a0, a1],
+            let err_gate_hints = crate::lockable_ringlwe::ErrGateHints { k, blocks_per_mix, mixes };
+
+            // wrapped-key ciphertext entries (canonical count: 1)
+            let n_ct = read_u32(r)? as usize;
+            if n_ct != 1 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "wrapped key ciphertext count must be 1"));
+            }
+            let mut cts: Vec<crate::lockable_ringlwe::LockCiphertext> = Vec::with_capacity(n_ct);
+            for _ in 0..n_ct {
+                let mut nonce = [0u8; 12];
+                r.read_exact(&mut nonce)?;
+                let clen = read_u32(r)? as usize;
+                if clen > max_ct_bytes {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "ct length exceeds cap"));
+                }
+                let mut ct = vec![0u8; clen];
+                r.read_exact(&mut ct)?;
+                cts.push(crate::lockable_ringlwe::LockCiphertext { nonce, ct });
+            }
+            // encrypted ubits (H09/H10; H08 sets it to zero for backward compatibility)
+            let ct_ubits: [u8; 32] = if is_h09 || is_h10 {
+                let mut b = [0u8; 32];
+                r.read_exact(&mut b)?;
+                b
+            } else {
+                [0u8; 32]
+            };
+
+            // payload ciphertext
+            let mut payload_nonce = [0u8; 12];
+            r.read_exact(&mut payload_nonce)?;
+            let payload_clen = read_u32(r)? as usize;
+            if payload_clen > max_ct_bytes {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "payload ct length exceeds cap"));
+            }
+            let mut payload_ct_bytes = vec![0u8; payload_clen];
+            r.read_exact(&mut payload_ct_bytes)?;
+            let payload_ct = crate::lockable_ringlwe::LockCiphertext {
+                nonce: payload_nonce,
+                ct: payload_ct_bytes,
+            };
+
+            reps.push(RingLweLockArtifact {
+                c_stmt,
+                accepting_set,
+                offset,
                 anchor_block_id,
                 rep_id,
                 poison_blocks,
-                poison_proj_m,
-                hints: crate::lockable_ringlwe::NoisyBranchHints {
-                    params: crate::lockable_ringlwe::PvugcNoisyHintParams {
-                        noise_bound,
-                        round_bits,
-                        s_bits,
-                    },
-                    hints: crate::lockable_ringlwe::PvugcNoisyHints {
-                        modulus: crate::lockable_ringlwe::GOLDILOCKS_P,
-                        hint0,
-                        hint1,
-                    },
-                },
-                cts: crate::lockable_ringlwe::FanoutCiphertext2 {
-                    ct0: crate::lockable_ringlwe::LockCiphertext { nonce: n0, ct: ct0 },
-                    ct1: crate::lockable_ringlwe::LockCiphertext { nonce: n1, ct: ct1 },
-                },
+                x_len,
+                pi_len,
+                len,
+                coins,
+                params,
+                anchor_hints,
+                err_gate_hints,
+                cts,
+                ct_ubits,
+                payload_ct,
             });
         }
-        out.push(NoisyLockArtifact {
-            c_stmt,
-            x_len,
-            pi_len,
-            len,
-            params,
-            sublocks,
-        });
+        out.push(OneProofLogicalLock { share_index, reps });
     }
-    Ok((manifest, share_indices, out))
+    Ok((manifest, out))
 }
 
 fn write_lock_package(
     path: &str,
     manifest: &Sp1OneProofWeGateLockPkgManifest,
-    share_indices: &[u32],
-    locks: &[NoisyLockArtifact<F257>],
+    logical_locks: &[OneProofLogicalLock],
 ) -> std::io::Result<()> {
     fn zstd_enabled_for_path(path: &str) -> bool {
         let _ = path;
@@ -1264,7 +1453,7 @@ fn write_lock_package(
 
     // Optional wrapper compression:
     // - Outer magic: LFP1LOCKZ3
-    // - Payload: zstd frame whose decompressed bytes begin with inner magic LFP1LOCKH02
+    // - Payload: zstd frame whose decompressed bytes begin with inner magic LFP1LOCKH08
     const MAGIC_ZSTD_V3: &[u8; 10] = b"LFP1LOCKZ3";
 
     let f = std::fs::File::create(path)?;
@@ -1273,12 +1462,12 @@ fn write_lock_package(
         w.write_all(MAGIC_ZSTD_V3)?;
         let level = zstd_level();
         let mut enc = zstd::stream::write::Encoder::new(w, level)?;
-        write_lock_package_to_writer(&mut enc, manifest, share_indices, locks)?;
+        write_lock_package_to_writer(&mut enc, manifest, logical_locks)?;
         let mut w = enc.finish()?;
         w.flush()?;
         Ok(())
     } else {
-        write_lock_package_to_writer(&mut w, manifest, share_indices, locks)?;
+        write_lock_package_to_writer(&mut w, manifest, logical_locks)?;
         w.flush()?;
         Ok(())
     }
@@ -1286,12 +1475,11 @@ fn write_lock_package(
 
 fn read_lock_package(
     path: &str,
-) -> std::io::Result<(Sp1OneProofWeGateLockPkgManifest, Vec<u32>, Vec<NoisyLockArtifact<F257>>)> {
+) -> std::io::Result<(Sp1OneProofWeGateLockPkgManifest, Vec<OneProofLogicalLock>)> {
     use std::io::{Seek, SeekFrom};
 
-    // - Uncompressed: LFP1LOCKH02
-    // - Compressed wrapper: LFP1LOCKZ3 || zstd(LFP1LOCKH02 || ...)
-    const MAGIC_RAW_H02: &[u8; 11] = b"LFP1LOCKH02";
+    // - Uncompressed: LFP1LOCKH08 / LFP1LOCKH09 / LFP1LOCKH10
+    // - Compressed wrapper: LFP1LOCKZ3 || zstd(LFP1LOCKH0x || ...)
     const MAGIC_ZSTD_V3: &[u8; 10] = b"LFP1LOCKZ3";
 
     let mut f = std::fs::File::open(path)?;
@@ -1300,7 +1488,10 @@ fn read_lock_package(
     // - zstd wrapper magic is 10 bytes (prefix)
     let mut magic = [0u8; 11];
     f.read_exact(&mut magic)?;
-    if &magic == MAGIC_RAW_H02 {
+    const MAGIC_RAW_H08: &[u8; 11] = b"LFP1LOCKH08";
+    const MAGIC_RAW_H09: &[u8; 11] = b"LFP1LOCKH09";
+    const MAGIC_RAW_H10: &[u8; 11] = b"LFP1LOCKH10";
+    if &magic == MAGIC_RAW_H08 || &magic == MAGIC_RAW_H09 || &magic == MAGIC_RAW_H10 {
         f.seek(SeekFrom::Start(0))?;
         let mut r = std::io::BufReader::new(f);
         return read_lock_package_from_reader(&mut r);

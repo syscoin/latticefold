@@ -1058,7 +1058,10 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
                 Ok(())
             })
         } else {
-            <Self as MulCode<F>>::eval_e_at_positions_into_u16(self, positions, y_u16, out_u16)
+            Err(
+                "eval_e_at_positions_into_u16: only F257 rank=3 tensor fastpath is supported"
+                    .to_string(),
+            )
         }
     }
 
@@ -1073,12 +1076,9 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
         Self: Sync,
     {
         if !Self::is_f257() || self.rank != 3 {
-            return <Self as MulCode<F>>::dot_row_e_star_many_mod257_u16(
-                self,
-                idxs,
-                w_eval_u16,
-                out_star_u16,
-                out_low_u16,
+            return Err(
+                "dot_row_e_star_many_mod257_u16: only F257 rank=3 tensor fastpath is supported"
+                    .to_string(),
             );
         }
         let batch = idxs.len();
