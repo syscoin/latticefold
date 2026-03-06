@@ -74,6 +74,64 @@ pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
         sink: &mut dyn QuerySink<F>,
     ) -> Result<(), String>;
 
+    /// Export the `q3` witness coefficients over the selected `w_eval[block]` slice.
+    ///
+    /// Returned terms are `(pos_in_w_eval_block, coeff)` and satisfy:
+    ///
+    /// `dot_q3_w_eval(idx, lambda, x, w_eval) = sum coeff[pos] * w_eval[pos]`
+    ///
+    /// for the selected block. Structured backends should override this when they do not emit the
+    /// dense `q3` witness terms from `stream_queries_for_coins_sparse`.
+    ///
+    /// Default implementation is correct for backends that stream the `q3` witness terms directly.
+    fn export_q3_w_eval_terms(
+        &self,
+        idx: usize,
+        lambda: F,
+        x: &[F],
+    ) -> Result<Vec<(usize, F)>, String> {
+        let blocks = self.blocks();
+        let ell_local = self.ell_local();
+        if blocks == 0 || ell_local == 0 {
+            return Err("export_q3_w_eval_terms: invalid blocks/ell_local".to_string());
+        }
+        let block_id = idx / ell_local;
+        if block_id >= blocks {
+            return Err("export_q3_w_eval_terms: bad block id".to_string());
+        }
+        let k_star = self.k_star();
+        let base = self.n() + self.z_w_len();
+        let w_base = base + block_id.saturating_mul(k_star);
+
+        struct Sink<F: PrimeField> {
+            w_base: usize,
+            k_star: usize,
+            out: Vec<(usize, F)>,
+        }
+        impl<F: PrimeField> QuerySink<F> for Sink<F> {
+            fn on_q1(&mut self, _coeff: F, _idx: usize) {}
+            fn on_q2(&mut self, _coeff: F, _idx: usize) {}
+            fn on_q3(&mut self, coeff: F, idx: usize) {
+                if idx < self.w_base {
+                    return;
+                }
+                let pos = idx - self.w_base;
+                if pos < self.k_star && !coeff.is_zero() {
+                    self.out.push((pos, coeff));
+                }
+            }
+        }
+
+        let mut sink = Sink::<F> {
+            w_base,
+            k_star,
+            out: Vec::new(),
+        };
+        let mut scratch = Dr1csQueryScratch::<F>::new(self.n_total());
+        self.stream_queries_for_coins_sparse(idx, lambda, x, &mut scratch, &mut sink)?;
+        Ok(sink.out)
+    }
+
     /// Compute the `q3` contribution against the streamed `w_eval[block]` slice.
     ///
     /// This is a **performance hook** to avoid materializing dense q3 witness terms:

@@ -452,6 +452,53 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
         logical_locks.push(ll);
     }
 
+    if std::env::var("LFP_H12_RCAP_ESTIMATE").ok().is_some_and(|v| v != "0") {
+        let mut all_surfaces = Vec::new();
+        for ll in &logical_locks {
+            let checks = crate::h12_rcap::capsule_checks_from_logical_lock(ll.reps.as_slice());
+            let surfaces = crate::we_tiny_lock::export_lfplus_capsule_schedule(
+                shape.clone(),
+                &stmt_digest,
+                checks.as_slice(),
+            )
+            .map_err(|e| format!("oneproof: export H12 capsule schedule failed: {e}"))?;
+            let est = crate::h12_rcap::estimate_capsule_schedule(
+                surfaces.as_slice(),
+                crate::h12_rcap::H12_RCAP_PACK_D,
+                32,
+            );
+            eprintln!(
+                "[oneproof:h12] share_index={} checks={} g_cap={} pi_pos_exact={} pi_pos_cons={} pi_blocks_exact={} pi_blocks_cons={} aadp_exact_bytes={} aadp_cons_bytes={}",
+                ll.share_index,
+                est.check_count,
+                est.g_cap,
+                est.touched_pi_positions_exact,
+                est.touched_pi_positions_conservative,
+                est.touched_packed_pi_blocks_exact,
+                est.touched_packed_pi_blocks_conservative,
+                est.aadp_size_exact_bytes,
+                est.aadp_size_conservative_bytes,
+            );
+            all_surfaces.extend(surfaces);
+        }
+        let pkg_est = crate::h12_rcap::estimate_capsule_schedule(
+            all_surfaces.as_slice(),
+            crate::h12_rcap::H12_RCAP_PACK_D,
+            32,
+        );
+        eprintln!(
+            "[oneproof:h12:package] checks={} g_cap={} pi_pos_exact={} pi_pos_cons={} pi_blocks_exact={} pi_blocks_cons={} aadp_exact_bytes={} aadp_cons_bytes={}",
+            pkg_est.check_count,
+            pkg_est.g_cap,
+            pkg_est.touched_pi_positions_exact,
+            pkg_est.touched_pi_positions_conservative,
+            pkg_est.touched_packed_pi_blocks_exact,
+            pkg_est.touched_packed_pi_blocks_conservative,
+            pkg_est.aadp_size_exact_bytes,
+            pkg_est.aadp_size_conservative_bytes,
+        );
+    }
+
     eprintln!(
         "[oneproof] armed P={} logical shares × R={} reps = {} artifacts in {:?}",
         p_locks,

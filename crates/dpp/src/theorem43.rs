@@ -15,6 +15,7 @@
 use ark_crypto_primitives::sponge::{poseidon::PoseidonSponge, CryptographicSponge};
 use ark_ff::{BigInteger, PrimeField};
 use rayon::prelude::*;
+use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::time::Instant;
 
@@ -156,6 +157,124 @@ pub struct Theorem43AbgFull<F: PrimeField> {
     pub alpha: F,
     pub beta: F,
     pub gamma: F,
+}
+
+/// Arm-time public surface for one candidate H12 capsule local check.
+///
+/// This describes the exact **statement-fixed** local object a seed capsule can be armed to:
+///
+/// - public coins for one selected outer block / repetition
+/// - sparse `pi0` query terms for `q1`, `q2`, and sparse `q3`
+/// - the selected `w_eval` block span in `pi0`
+///
+/// Important note:
+///
+/// - `q3_w_terms` is the coefficient surface over the selected `w_eval` block
+/// - in the current file-backed backend this may be dense enough that the conservative capsule
+///   sizing regime includes the full selected `w_eval` block in the witness
+#[derive(Clone, Debug)]
+pub struct Theorem43CapsuleLocalCheckSurface<F: PrimeField> {
+    pub block_id: usize,
+    pub rep_id: u64,
+    pub coins: Theorem43Coins<F>,
+    /// `pi0`-relative sparse terms for `q1`.
+    pub q1_pi_terms: Vec<(usize, F)>,
+    /// `pi0`-relative sparse terms for `q2`.
+    pub q2_pi_terms: Vec<(usize, F)>,
+    /// `pi0`-relative sparse terms for `q3`, excluding the dense `w_eval` contribution.
+    pub q3_pi_sparse_terms: Vec<(usize, F)>,
+    /// Public-prefix dot products safe to publish at arm time.
+    pub q1_x_dot: F,
+    pub q2_x_dot: F,
+    pub q3_x_dot_sparse: F,
+    /// Positions within the selected `w_eval` block touched by sparse `q1` / `q2`.
+    pub q1_w_terms: Vec<(usize, F)>,
+    pub q2_w_terms: Vec<(usize, F)>,
+    /// Coefficients for the selected `w_eval` block contribution to `q3`.
+    pub q3_w_terms: Vec<(usize, F)>,
+    /// `pi0` offset of the selected `w_eval` block.
+    pub w_eval_block_pi_offset: usize,
+    /// Length of the selected `w_eval` block.
+    pub w_eval_block_len: usize,
+    /// If set, conservative sizing should include the whole selected `w_eval` block.
+    pub requires_dense_q3_w_eval: bool,
+}
+
+impl<F: PrimeField> Theorem43CapsuleLocalCheckSurface<F> {
+    /// Return the sorted set of exact `pi0` coordinates touched by this surface.
+    ///
+    /// - when `include_full_w_eval_block` is `true`, this includes the whole selected `w_eval`
+    ///   block, which is the conservative sizing regime for the current backend
+    pub fn touched_pi_positions(&self, include_full_w_eval_block: bool) -> Vec<usize> {
+        let mut out = BTreeSet::<usize>::new();
+        for (idx, _) in &self.q1_pi_terms {
+            out.insert(*idx);
+        }
+        for (idx, _) in &self.q2_pi_terms {
+            out.insert(*idx);
+        }
+        for (idx, _) in &self.q3_pi_sparse_terms {
+            out.insert(*idx);
+        }
+        for (pos, _) in &self.q1_w_terms {
+            out.insert(self.w_eval_block_pi_offset + *pos);
+        }
+        for (pos, _) in &self.q2_w_terms {
+            out.insert(self.w_eval_block_pi_offset + *pos);
+        }
+        if include_full_w_eval_block {
+            let start = self.w_eval_block_pi_offset;
+            let end = start.saturating_add(self.w_eval_block_len);
+            for pi_idx in start..end {
+                out.insert(pi_idx);
+            }
+        } else {
+            for (pos, _) in &self.q3_w_terms {
+                out.insert(self.w_eval_block_pi_offset + *pos);
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// Return the sorted set of packed `pi0` blocks touched by this surface.
+    ///
+    /// - `pack_d` is the packed proof chunk size (currently `64` in `lockable_ringlwe.rs`)
+    /// - when `include_full_w_eval_block` is `true`, this includes the whole selected `w_eval`
+    ///   block, which is the conservative sizing regime for the current backend
+    pub fn packed_pi_blocks(&self, pack_d: usize, include_full_w_eval_block: bool) -> Vec<usize> {
+        let mut out = BTreeSet::<usize>::new();
+        let add_idx = |set: &mut BTreeSet<usize>, pi_idx: usize| {
+            set.insert(pi_idx / pack_d.max(1));
+        };
+        for (idx, _) in &self.q1_pi_terms {
+            add_idx(&mut out, *idx);
+        }
+        for (idx, _) in &self.q2_pi_terms {
+            add_idx(&mut out, *idx);
+        }
+        for (idx, _) in &self.q3_pi_sparse_terms {
+            add_idx(&mut out, *idx);
+        }
+        for (pos, _) in &self.q1_w_terms {
+            add_idx(&mut out, self.w_eval_block_pi_offset + *pos);
+        }
+        for (pos, _) in &self.q2_w_terms {
+            add_idx(&mut out, self.w_eval_block_pi_offset + *pos);
+        }
+        if !include_full_w_eval_block {
+            for (pos, _) in &self.q3_w_terms {
+                add_idx(&mut out, self.w_eval_block_pi_offset + *pos);
+            }
+        }
+        if include_full_w_eval_block {
+            let start = self.w_eval_block_pi_offset;
+            let end = start.saturating_add(self.w_eval_block_len);
+            for pi_idx in start..end {
+                add_idx(&mut out, pi_idx);
+            }
+        }
+        out.into_iter().collect()
+    }
 }
 
 /// Streaming query accumulator that tracks both:
@@ -638,6 +757,178 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
 
     pub fn query_scratch(&self) -> Dr1csQueryScratch<F> {
         Dr1csQueryScratch::new(self.flpcp.n_total())
+    }
+
+    /// Export the arm-time public surface for one candidate H12 capsule local check.
+    ///
+    /// This is the correct arm-before-proof object to derive from public statement data plus
+    /// `(block_id, rep_id)`. It intentionally exposes the current backend caveat that full
+    /// `gamma` still depends on a dense `q3` witness dot over the selected `w_eval` block.
+    pub fn export_capsule_local_check_surface_from_stmt(
+        &self,
+        c_stmt: &[F],
+        x: &[F],
+        block_id: usize,
+        rep_id: u64,
+    ) -> Result<Theorem43CapsuleLocalCheckSurface<F>, String> {
+        let flpcp = &self.flpcp;
+        if x.len() != flpcp.n() {
+            return Err("bad public input length".to_string());
+        }
+        if block_id >= flpcp.blocks() {
+            return Err("block_id out of range".to_string());
+        }
+
+        let coins = self.derive_public_coins_from_stmt(c_stmt, block_id, rep_id)?;
+        let z_w_len = flpcp.z_w_len();
+        let k_star = flpcp.k_star();
+        let blocks = flpcp.blocks();
+        let x_len = x.len();
+        let base = x_len
+            .checked_add(z_w_len)
+            .ok_or_else(|| "x_len + z_w_len overflow".to_string())?;
+        let mut scratch = self.query_scratch();
+
+        struct SurfaceSink<'a, F: PrimeField> {
+            x: &'a [F],
+            x_len: usize,
+            z_w_len: usize,
+            k_star: usize,
+            blocks: usize,
+            block_id: usize,
+            q1_pi_terms: Vec<(usize, F)>,
+            q2_pi_terms: Vec<(usize, F)>,
+            q3_pi_sparse_terms: Vec<(usize, F)>,
+            q1_w_terms: Vec<(usize, F)>,
+            q2_w_terms: Vec<(usize, F)>,
+            q1_x_dot: F,
+            q2_x_dot: F,
+            q3_x_dot_sparse: F,
+            base: usize,
+        }
+
+        impl<'a, F: PrimeField> QuerySink<F> for SurfaceSink<'a, F> {
+            fn on_q1(&mut self, coeff: F, idx: usize) {
+                if coeff.is_zero() {
+                    return;
+                }
+                if idx < self.x_len {
+                    self.q1_x_dot += coeff * self.x[idx];
+                    return;
+                }
+                let pi_idx = idx - self.x_len;
+                self.q1_pi_terms.push((pi_idx, coeff));
+                if idx >= self.base {
+                    let off = pi_idx.saturating_sub(self.z_w_len);
+                    let block = off / self.k_star;
+                    let pos = off % self.k_star;
+                    if block < self.blocks && block == self.block_id {
+                        self.q1_w_terms.push((pos, coeff));
+                    }
+                }
+            }
+
+            fn on_q2(&mut self, coeff: F, idx: usize) {
+                if coeff.is_zero() {
+                    return;
+                }
+                if idx < self.x_len {
+                    self.q2_x_dot += coeff * self.x[idx];
+                    return;
+                }
+                let pi_idx = idx - self.x_len;
+                self.q2_pi_terms.push((pi_idx, coeff));
+                if idx >= self.base {
+                    let off = pi_idx.saturating_sub(self.z_w_len);
+                    let block = off / self.k_star;
+                    let pos = off % self.k_star;
+                    if block < self.blocks && block == self.block_id {
+                        self.q2_w_terms.push((pos, coeff));
+                    }
+                }
+            }
+
+            fn on_q3(&mut self, coeff: F, idx: usize) {
+                if coeff.is_zero() {
+                    return;
+                }
+                if idx < self.x_len {
+                    self.q3_x_dot_sparse += coeff * self.x[idx];
+                    return;
+                }
+                let pi_idx = idx - self.x_len;
+                let off = pi_idx.saturating_sub(self.z_w_len);
+                let block = off / self.k_star;
+                if idx >= self.base && block < self.blocks && block == self.block_id {
+                    // The selected `w_eval` block contribution is exported separately via
+                    // `export_q3_w_eval_terms(...)` to keep the local witness surface explicit.
+                    return;
+                }
+                self.q3_pi_sparse_terms.push((pi_idx, coeff));
+            }
+        }
+
+        let mut sink = SurfaceSink::<F> {
+            x,
+            x_len,
+            z_w_len,
+            k_star,
+            blocks,
+            block_id,
+            q1_pi_terms: Vec::new(),
+            q2_pi_terms: Vec::new(),
+            q3_pi_sparse_terms: Vec::new(),
+            q1_w_terms: Vec::new(),
+            q2_w_terms: Vec::new(),
+            q1_x_dot: F::ZERO,
+            q2_x_dot: F::ZERO,
+            q3_x_dot_sparse: F::ZERO,
+            base,
+        };
+        flpcp.stream_queries_for_coins_sparse(coins.idx, coins.lambda, x, &mut scratch, &mut sink)?;
+        let q3_w_terms = flpcp.export_q3_w_eval_terms(coins.idx, coins.lambda, x)?;
+
+        let w_eval_block_pi_offset = z_w_len
+            .checked_add(
+                block_id
+                    .checked_mul(k_star)
+                    .ok_or_else(|| "block_id * k_star overflow".to_string())?,
+            )
+            .ok_or_else(|| "w_eval block offset overflow".to_string())?;
+
+        Ok(Theorem43CapsuleLocalCheckSurface {
+            block_id,
+            rep_id,
+            coins,
+            q1_pi_terms: sink.q1_pi_terms,
+            q2_pi_terms: sink.q2_pi_terms,
+            q3_pi_sparse_terms: sink.q3_pi_sparse_terms,
+            q1_x_dot: sink.q1_x_dot,
+            q2_x_dot: sink.q2_x_dot,
+            q3_x_dot_sparse: sink.q3_x_dot_sparse,
+            q1_w_terms: sink.q1_w_terms,
+            q2_w_terms: sink.q2_w_terms,
+            q3_w_terms,
+            w_eval_block_pi_offset,
+            w_eval_block_len: k_star,
+            requires_dense_q3_w_eval: true,
+        })
+    }
+
+    /// Export a batch of capsule local-check surfaces from public statement data.
+    pub fn export_capsule_schedule_from_stmt(
+        &self,
+        c_stmt: &[F],
+        x: &[F],
+        checks: &[(usize, u64)],
+    ) -> Result<Vec<Theorem43CapsuleLocalCheckSurface<F>>, String> {
+        let mut out = Vec::with_capacity(checks.len());
+        for &(block_id, rep_id) in checks {
+            out.push(self.export_capsule_local_check_surface_from_stmt(
+                c_stmt, x, block_id, rep_id,
+            )?);
+        }
+        Ok(out)
     }
 
 }

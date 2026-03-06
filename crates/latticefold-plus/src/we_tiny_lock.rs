@@ -934,6 +934,28 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         Ok(F::from(dot_u16 as u64))
     }
 
+    fn export_q3_w_eval_terms(
+        &self,
+        idx: usize,
+        lambda: F,
+        _x: &[F],
+    ) -> Result<Vec<(usize, F)>, String> {
+        if !dpp::dr1cs_flpcp::is_f257_field::<F>() {
+            return Err("export_q3_w_eval_terms: unsupported field (tiny-lock requires F257)".to_string());
+        }
+        let (_block_id, local_idx) = self.decode_block_idx(idx)?;
+        let k = self.k();
+        let k_star = self.k_star();
+        let mut out: Vec<(usize, F)> = Vec::new();
+        self.code.row_e_star_stream(local_idx, &mut |j, c| {
+            let coeff = if j < k { c - (lambda * c) } else { c };
+            if j < k_star && !coeff.is_zero() {
+                out.push((j, coeff));
+            }
+        })?;
+        Ok(out)
+    }
+
     fn dot_q3_w_eval_many(
         &self,
         idxs: &[usize],
@@ -1593,4 +1615,26 @@ where
     }
 
     Ok(WeRingLweLogicalLockArmOut { reps: out })
+}
+
+#[cfg(feature = "we_gate")]
+pub(crate) fn export_lfplus_capsule_schedule(
+    shape: we_gate_arith::WeDr1csShape<F257>,
+    stmt_digest: &[F257; 32],
+    checks: &[(usize, u64)],
+) -> Result<Vec<dpp::theorem43::Theorem43CapsuleLocalCheckSurface<F257>>, String> {
+    let x = crate::we_statement::encode_public_x::<F257>(stmt_digest);
+    if x.len() != shape.public_len {
+        return Err(format!(
+            "export_lfplus_capsule_schedule: public_len mismatch (shape={} vs x={})",
+            shape.public_len,
+            x.len()
+        ));
+    }
+    let c_stmt: Vec<F257> = stmt_digest
+        .iter()
+        .map(|e| F257::from((e.into_bigint().as_ref()[0] % 257) as u64))
+        .collect();
+    let dpp = make_theorem43_dpp_from_dr1cs::<F257>(shape.inst, shape.public_len)?;
+    dpp.export_capsule_schedule_from_stmt(c_stmt.as_slice(), &x, checks)
 }

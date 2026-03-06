@@ -35,6 +35,12 @@ pub mod we_gate_tiny;
 pub mod we_tiny_lock;
 #[cfg(feature = "we_gate")]
 pub mod lockable_ringlwe;
+#[cfg(feature = "we_gate")]
+pub mod h12_rcap;
+#[cfg(feature = "we_gate")]
+pub mod lockable_lwe;
+#[cfg(feature = "we_gate")]
+pub mod lockable_pdk;
 
 // SP1 shrink verifier R1LF loader helpers (feature-gated; research only).
 // We gate these under `we_gate` so the WE/DPP benches can reuse them.
