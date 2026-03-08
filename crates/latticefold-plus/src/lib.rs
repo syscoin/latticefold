@@ -28,6 +28,12 @@ pub mod we_statement;
 #[cfg(feature = "we_gate")]
 pub mod we_gate_arith;
 #[cfg(feature = "we_gate")]
+pub mod aadp_we;
+#[cfg(feature = "we_gate")]
+pub mod aadp_we_ext;
+#[cfg(feature = "we_gate")]
+pub mod f257_ext16;
+#[cfg(feature = "we_gate")]
 pub mod we_goldilocks_poseidon_f257;
 #[cfg(feature = "we_gate")]
 pub mod we_gate_tiny;
@@ -37,6 +43,14 @@ pub mod we_tiny_lock;
 pub mod lockable_ringlwe;
 #[cfg(feature = "we_gate")]
 pub mod h12_rcap;
+#[cfg(feature = "we_gate")]
+pub mod h12_alvo;
+#[cfg(feature = "we_gate")]
+pub mod h12_alvo_daleo;
+#[cfg(feature = "we_gate")]
+pub mod h12_pi_commit;
+#[cfg(all(feature = "we_gate", test))]
+mod h12_alvo_verifier;
 #[cfg(feature = "we_gate")]
 pub mod lockable_lwe;
 #[cfg(feature = "we_gate")]
