@@ -177,12 +177,12 @@ where
                 .mlin_seeded_base(&self.scheme, &self.M0, &mut self.transcript);
         maybe_print_rss("PlusProverSparseBase::prove_sparse_base (after mlin_seeded)");
 
-        let decomp = crate::decomp::DecompBase {
-            f: linb2.g,
+        let decomp = crate::decomp::DecompBase0 {
+            f0: linb2.g0,
             r: linb2.x.ro.clone(),
             M0: &self.M0,
         };
-        let dproof = decomp.decompose_seeded_base_one_shot(&self.scheme, self.params.B);
+        let dproof = decomp.decompose_seeded_base0_one_shot(&self.scheme, self.params.B);
         maybe_print_rss("PlusProverSparseBase::prove_sparse_base (after decompose_seeded)");
 
         let proof = PlusProof {

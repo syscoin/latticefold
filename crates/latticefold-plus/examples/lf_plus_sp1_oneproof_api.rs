@@ -18,6 +18,17 @@
 //!   LFP_ONEPROOF_LOCK_PKG_IN=/path/to/lock_pkg.bin \
 //!     cargo run -p latticefold-plus --example lf_plus_sp1_oneproof_api --features we_gate --release
 //!
+//! Or stage-2 H12 ALVO augmentation:
+//!   SP1_R1LF=/path/to/shrink_verifier.r1lf \
+//!   SP1_WITNESS=/path/to/shrink_verifier.witness.bundle \
+//!   LFP_ONEPROOF_LOCK_PKG_IN=/path/to/stage1_lock_pkg.bin \
+//!   LFP_ONEPROOF_H12_ALVO_AUG_PKG_OUT=/path/to/final_augmented_pkg.bin \
+//!     cargo run -p latticefold-plus --example lf_plus_sp1_oneproof_api --features we_gate --release
+//!
+//! Or offline decap from the final augmented H12 ALVO package:
+//!   LFP_ONEPROOF_H12_ALVO_AUG_PKG_IN=/path/to/final_augmented_pkg.bin \
+//!     cargo run -p latticefold-plus --example lf_plus_sp1_oneproof_api --features we_gate --release
+//!
 //! One-time helper (extract statement inputs from witness bundle):
 //!   SP1_R1LF=/path/to/shrink_verifier.r1lf \
 //!   SP1_WITNESS=/path/to/shrink_verifier.witness.bundle \
@@ -203,6 +214,44 @@ fn main() {
         println!("r_reps={}", out.r_reps);
         println!("total_locks={}", out.total_locks);
         println!("lock_pkg_bytes={}", out.lock_pkg_bytes);
+        eprintln!("[oneproof] total_elapsed={:?}", t_total.elapsed());
+        return;
+    }
+
+    // Stage-2 H12 ALVO augmentation: consume a stage-1 package + witness and emit a final
+    // augmented package with `C_pi` and offline-decapsulation material.
+    if let Ok(aug_pkg_out) = std::env::var("LFP_ONEPROOF_H12_ALVO_AUG_PKG_OUT") {
+        let lock_pkg_in = std::env::var("LFP_ONEPROOF_LOCK_PKG_IN")
+            .expect("Set LFP_ONEPROOF_LOCK_PKG_IN=/path/to/stage1_lock_pkg.bin");
+        let out =
+            latticefold_plus::sp1_oneproof_api::augment_sp1_oneproof_we_gate_h12_alvo_lock_package(
+                &r1lf_path,
+                &witness_path,
+                &lock_pkg_in,
+                &aug_pkg_out,
+            )
+            .expect("augment_sp1_oneproof_we_gate_h12_alvo_lock_package");
+        println!("augmented_pkg_bytes={}", out.lock_pkg_bytes);
+        println!("logical_locks={}", out.logical_locks);
+        println!("pi0_len={}", out.pi0_len);
+        println!("pi0_commit_root=0x{}", hex32(out.pi0_commit_root));
+        eprintln!("[oneproof] total_elapsed={:?}", t_total.elapsed());
+        return;
+    }
+
+    // Final offline H12 ALVO decap path: does not require the witness bundle.
+    if let Ok(aug_pkg_in) = std::env::var("LFP_ONEPROOF_H12_ALVO_AUG_PKG_IN") {
+        let out = latticefold_plus::sp1_oneproof_api::decap_sp1_oneproof_we_gate_from_augmented_h12_alvo_package(
+            &aug_pkg_in,
+        )
+        .expect("decap_sp1_oneproof_we_gate_from_augmented_h12_alvo_package");
+        println!("stmt_digest_f257_le16=0x{}", hex_stmt_digest(out.stmt_digest));
+        println!("lock_coin_seed=0x{}", hex32(out.lock_coin_seed));
+        println!("selected_shares_len={}", out.selected_shares.len());
+        if let Some((share_idx, share)) = out.selected_shares.first() {
+            println!("first_selected_share_index={}", share_idx);
+            println!("first_selected_share=0x{}", hex32(*share));
+        }
         eprintln!("[oneproof] total_elapsed={:?}", t_total.elapsed());
         return;
     }

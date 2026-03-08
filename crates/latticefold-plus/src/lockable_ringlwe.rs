@@ -633,6 +633,14 @@ struct BranchAccum<'a> {
     y: u16,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RingLweStreamDots {
+    pub y_anchor_stream: u16,
+    pub alpha_pi_stream: u16,
+    pub beta_pi_stream: u16,
+    pub gamma_pi_stream: u16,
+}
+
 impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
     fn new(lock: &'a RingLweLockArtifact<F>, x: &[F]) -> Result<Self, String> {
         if x.len() != lock.x_len || x.len() + lock.pi_len != lock.len {
@@ -754,7 +762,7 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
         Ok(())
     }
 
-    fn finish_stream_dots_mod257(mut self) -> Result<(u16, u16, u16, u16), String> {
+    fn finish_stream_dots_mod257(mut self) -> Result<RingLweStreamDots, String> {
         if self.filled != self.lock.pi_len {
             return Err("ringlwe_decap_stream: bad π length".to_string());
         }
@@ -782,7 +790,16 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
                 return Err(format!("ringlwe_decap_stream: did not consume all sparse blocks ({})", a.1));
             }
         }
-        Ok((self.anchor.y, self.basis_alpha.y, self.basis_beta.y, self.basis_gamma.y))
+        Ok(RingLweStreamDots {
+            y_anchor_stream: self.anchor.y,
+            alpha_pi_stream: self.basis_alpha.y,
+            beta_pi_stream: self.basis_beta.y,
+            gamma_pi_stream: self.basis_gamma.y,
+        })
+    }
+
+    pub(crate) fn finish_stream_dots(self) -> Result<RingLweStreamDots, String> {
+        self.finish_stream_dots_mod257()
     }
 
     pub fn finish_decrypt_candidates_with_gate(
@@ -795,8 +812,16 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
         if lock.cts.len() != 1 {
             return Err("ringlwe_decap_stream: wrapped key ciphertext count must be 1".to_string());
         }
-        let s_sets =
-            self.finish_s_candidate_sets_with_gate(gate_mod257, y_anchor_override, u_override, None, None)?;
+        let dots = self.finish_stream_dots()?;
+        let s_sets = finish_s_candidate_sets_from_stream_dots(
+            lock,
+            dots,
+            gate_mod257,
+            y_anchor_override,
+            u_override,
+            None,
+            None,
+        )?;
         let mut seen = std::collections::BTreeSet::<[u8; 32]>::new();
         let mut outs: Vec<Vec<u8>> = Vec::new();
         for s_hits in s_sets {
@@ -825,82 +850,92 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
         alpha_beta_override: Option<(u16, u16)>,
     ) -> Result<Vec<Vec<u16>>, String> {
         let lock = self.lock;
-        let (y_anchor_stream, alpha_pi_stream, beta_pi_stream, gamma_pi_stream) =
-            self.finish_stream_dots_mod257()?;
-        let y_anchor = y_anchor_override.unwrap_or(y_anchor_stream) % MOD_257;
-        let g = gate_mod257 % MOD_257;
+        let dots = self.finish_stream_dots()?;
+        finish_s_candidate_sets_from_stream_dots(
+            lock,
+            dots,
+            gate_mod257,
+            y_anchor_override,
+            u_override,
+            gamma_override,
+            alpha_beta_override,
+        )
+    }
 
-        // We only narrow when the residual gate opens.
-        // When g=0, return full-domain to avoid a local reject oracle.
-        if g == 0 {
-            return Ok(vec![(1u16..=256u16).collect(), (1u16..=256u16).collect()]);
+    pub fn finish_decrypt_candidates(self) -> Result<Vec<Vec<u8>>, String> {
+        self.finish_decrypt_candidates_with_gate(1u16, None, None)
+    }
+}
+
+pub(crate) fn finish_s_candidate_sets_from_stream_dots<F: PrimeField>(
+    lock: &RingLweLockArtifact<F>,
+    dots: RingLweStreamDots,
+    gate_mod257: u16,
+    y_anchor_override: Option<u16>,
+    u_override: Option<u16>,
+    gamma_override: Option<u16>,
+    alpha_beta_override: Option<(u16, u16)>,
+) -> Result<Vec<Vec<u16>>, String> {
+    let y_anchor = y_anchor_override.unwrap_or(dots.y_anchor_stream) % MOD_257;
+    let g = gate_mod257 % MOD_257;
+
+    // We only narrow when the residual gate opens.
+    // When g=0, return full-domain to avoid a local reject oracle.
+    if g == 0 {
+        return Ok(vec![(1u16..=256u16).collect(), (1u16..=256u16).collect()]);
+    }
+
+    let a0_u16 = field_mod257_u16(&lock.accepting_set[0]) % MOD_257;
+    let a1_u16 = field_mod257_u16(&lock.accepting_set[1]) % MOD_257;
+    let c_hit_u16 = field_mod257_u16(&lock.coins.c_hit) % MOD_257;
+
+    let true_s_dbg = if std::env::var("LFP_DEBUG_IDENTITY").ok().as_deref() == Some("1") {
+        debug_get_s_for_rep(lock.rep_id)
+    } else {
+        None
+    };
+    // Debug is best-effort and only prints for the true `s` when available.
+    let mut dbg_s_true: Option<u16> = None;
+    let mut dbg_eq_line: Option<String> = None;
+
+    // Fixed-u squaring-gadget completion (tailless path).
+    //
+    // We rely on the proof-derived `u` and `gamma`, but we intentionally do NOT require μ/ν
+    // to be queried/published (avoids package-only correctness predicates).
+    let (mut alpha_u16, mut beta_u16, mut gamma_u16): (u16, u16, u16) = (
+        dots.alpha_pi_stream % MOD_257,
+        dots.beta_pi_stream % MOD_257,
+        dots.gamma_pi_stream % MOD_257,
+    );
+    // Optional overrides are for debug / regression comparisons.
+    if let Some((a, b)) = alpha_beta_override {
+        alpha_u16 = a % MOD_257;
+        beta_u16 = b % MOD_257;
+    }
+    if let Some(gm) = gamma_override {
+        gamma_u16 = gm % MOD_257;
+    }
+    let rho_u16 = field_mod257_u16(&lock.coins.rho) % MOD_257;
+    let sigma_u16 = field_mod257_u16(&lock.coins.sigma) % MOD_257;
+    let u_fix = add_mod257_u16(
+        mul_mod257_u16(rho_u16, alpha_u16),
+        mul_mod257_u16(sigma_u16, beta_u16),
+    );
+    let u_eval = u_override.map(|v| v % MOD_257).unwrap_or(u_fix);
+
+    let mut hits: Vec<u16> = Vec::new();
+    for s_probe in 1u16..=256u16 {
+        let pad = derive_ubits_pad_bytes(
+            &lock.params.domain_label,
+            &lock.c_stmt,
+            &lock.coins,
+            lock.rep_id,
+            s_probe,
+        );
+        let mut ubits = [0u8; 32];
+        for i in 0..32 {
+            ubits[i] = lock.ct_ubits[i] ^ pad[i];
         }
-
-        let a0_u16 = field_mod257_u16(&lock.accepting_set[0]) % MOD_257;
-        let a1_u16 = field_mod257_u16(&lock.accepting_set[1]) % MOD_257;
-        let c_hit_u16 = field_mod257_u16(&lock.coins.c_hit) % MOD_257;
-
-        let true_s_dbg = if std::env::var("LFP_DEBUG_IDENTITY").ok().as_deref() == Some("1") {
-            debug_get_s_for_rep(lock.rep_id)
-        } else {
-            None
-        };
-        // Debug is best-effort and only prints for the true `s` when available.
-        let mut dbg_s_true: Option<u16> = None;
-        let mut dbg_eq_line: Option<String> = None;
-
-        // Fixed-u squaring-gadget completion (tailless path).
-        //
-        // We rely on the proof-derived `u` and `gamma`, but we intentionally do NOT require μ/ν
-        // to be queried/published (avoids package-only correctness predicates).
-        //
-        // Completion identity (cross-only):
-        //   c_req == b(u) - c1*u - c2*(2ρσγ)
-        // where:
-        // - b(u) = 1_{u^{-1} ∈ U} is read from decrypted Ubits(s)
-        // - c1,c2 are derived from Ubits(s)
-        // - c_req = a - y_div with a ∈ accepting_set_shifted and y_div = y_anchor / s
-        // Tailless fixed-u completion needs proof-derived (α,β,γ) to compute:
-        //   u = ρ·α + σ·β
-        //   lin = c1·u + c2·(2ρσ)·γ
-        // and a single membership bit b(u)=1_{u^{-1}∈U}.
-        let (mut alpha_u16, mut beta_u16, mut gamma_u16): (u16, u16, u16) =
-            (alpha_pi_stream % MOD_257, beta_pi_stream % MOD_257, gamma_pi_stream % MOD_257);
-        // Optional overrides are for debug / regression comparisons.
-        if let Some((a, b)) = alpha_beta_override {
-            alpha_u16 = a % MOD_257;
-            beta_u16 = b % MOD_257;
-        }
-        if let Some(gm) = gamma_override {
-            gamma_u16 = gm % MOD_257;
-        }
-        let rho_u16 = field_mod257_u16(&lock.coins.rho) % MOD_257;
-        let sigma_u16 = field_mod257_u16(&lock.coins.sigma) % MOD_257;
-        // Evaluation point u := ρ·α + σ·β (mod 257).
-        //
-        // IMPORTANT: the WE-gate decapper provides π0-aligned `(alpha,beta,u)` overrides; we must
-        // use the provided `u` to keep the Sq completion consistent with how `y_anchor` was
-        // accumulated (π0-only stream).
-        let u_fix = add_mod257_u16(mul_mod257_u16(rho_u16, alpha_u16), mul_mod257_u16(sigma_u16, beta_u16));
-        let u_eval = u_override.map(|v| v % MOD_257).unwrap_or(u_fix);
-
-        // Fixed-shape scan over s∈F257* (1..=256).
-        //
-        // For each `s` guess we:
-        // - decrypt Ubits(s) and derive (c1,c2) and membership bits
-        // - compute y_div = y_anchor / s (mod 257)
-        // - for each accepting-set element a ∈ {a0,a1}, compute c_req = a - y_div
-        // - complete at the fixed proof-derived evaluation point (u,v) when available
-        //   via the identity:
-        //      b(u) == c2*v + c1*u + c_req
-        //   where b(u) = 1_{u^{-1} ∈ U} is read from Ubits(s).
-        let mut hits: Vec<u16> = Vec::new();
-        for s_probe in 1u16..=256u16 {
-            let pad = derive_ubits_pad_bytes(&lock.params.domain_label, &lock.c_stmt, &lock.coins, lock.rep_id, s_probe);
-            let mut ubits = [0u8; 32];
-            for i in 0..32 {
-                ubits[i] = lock.ct_ubits[i] ^ pad[i];
-            }
 
             // Compute (c1, c2) from Ubits.
             let mut sum1: u16 = 0u16;
@@ -1398,11 +1433,6 @@ impl<'a, F: PrimeField> RingLweDecapStreamState<'a, F> {
         // Return same hit set for both accepting-set branches (constant-shape outer API).
         Ok(vec![hits.clone(), hits])
     }
-
-    pub fn finish_decrypt_candidates(self) -> Result<Vec<Vec<u8>>, String> {
-        self.finish_decrypt_candidates_with_gate(1u16, None, None)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Query accumulator

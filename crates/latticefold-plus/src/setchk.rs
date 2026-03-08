@@ -269,6 +269,24 @@ impl<R: OverField + PolyRing> In<R> {
 
         // Streaming MLEs (avoid materializing DenseMultilinearExtension tables).
         use crate::streaming_sumcheck::{StreamingMleEnum, StreamingSumcheck};
+        let setchk_lazy: usize = std::env::var("LF_PLUS_SETCHK_LAZY_FIX")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(8);
+        let mk_base_scalar_mle = |evals: Arc<Vec<R::BaseRing>>, num_vars: usize, square: bool| {
+            let inner = StreamingMleEnum::BaseScalarArc { evals, num_vars, square };
+            if setchk_lazy > 0 && num_vars > setchk_lazy {
+                StreamingMleEnum::LazyFixed {
+                    inner: Box::new(inner),
+                    num_vars,
+                    fixed: Vec::new(),
+                    weights: vec![R::BaseRing::ONE],
+                    max_lazy: setchk_lazy,
+                }
+            } else {
+                inner
+            }
+        };
         let Ms_len = Ms_dense.len() + Ms_digits.len() + Ms_sparse.len();
         let mut mles: Vec<StreamingMleEnum<R>> =
             Vec::with_capacity((Ms_len + ms.len()) * (ncols * 2 + 1));
@@ -408,8 +426,8 @@ impl<R: OverField + PolyRing> In<R> {
 
             for col in 0..ncols {
                 let tab = col_tables[col].clone();
-                mles.push(StreamingMleEnum::BaseScalarArc { evals: tab.clone(), num_vars: tnvars, square: false });
-                mles.push(StreamingMleEnum::BaseScalarArc { evals: tab, num_vars: tnvars, square: true });
+                mles.push(mk_base_scalar_mle(tab.clone(), tnvars, false));
+                mles.push(mk_base_scalar_mle(tab, tnvars, true));
             }
             mles.push(StreamingMleEnum::EqBase {
                 scale: R::BaseRing::ONE,
@@ -452,8 +470,8 @@ impl<R: OverField + PolyRing> In<R> {
                 }
             };
             let tab = Arc::new(v0);
-            mles.push(StreamingMleEnum::BaseScalarArc { evals: tab.clone(), num_vars: tnvars, square: false });
-            mles.push(StreamingMleEnum::BaseScalarArc { evals: tab, num_vars: tnvars, square: true });
+            mles.push(mk_base_scalar_mle(tab.clone(), tnvars, false));
+            mles.push(mk_base_scalar_mle(tab, tnvars, true));
             mles.push(StreamingMleEnum::EqBase {
                 scale: R::BaseRing::ONE,
                 r: c0,

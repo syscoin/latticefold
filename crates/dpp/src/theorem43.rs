@@ -22,7 +22,10 @@ use std::time::Instant;
 use latticefold::transcript::bytes::field_to_bytes_le_fixed;
 use latticefold::transcript::poseidon::{f257_poseidon_config, F257};
 
-use crate::dr1cs_flpcp::{f_to_u16, is_f257_field, Dr1csNpFlpcpSparseApi, Dr1csQueryScratch, QuerySink};
+use crate::dr1cs_flpcp::{
+    f_to_u16, is_f257_field, Dr1csBlockLinearConstraint, Dr1csNpFlpcpSparseApi,
+    Dr1csProofLayoutInfo, Dr1csQueryScratch, QuerySink,
+};
 
 #[cfg(test)]
 mod tests {
@@ -200,6 +203,24 @@ pub struct Theorem43CapsuleLocalCheckSurface<F: PrimeField> {
     pub requires_dense_q3_w_eval: bool,
 }
 
+/// ALVO-facing export wrapper around one local H12 capsule check.
+///
+/// This preserves the exact local affine forms already used by H12 while additionally fixing the
+/// canonical proof layout and the exact/conservative touched `pi0` views at stage 1.
+#[derive(Clone, Debug)]
+pub struct Theorem43AlvoLocalCheckSurface<F: PrimeField> {
+    pub local_check: Theorem43CapsuleLocalCheckSurface<F>,
+    pub proof_layout: Dr1csProofLayoutInfo,
+    /// Current concrete `H_j` block-local linear consistency system:
+    /// the selected `w_eval` block must extend its low-cube prefix to a valid side-cube codeword.
+    pub h_w_eval_constraints: Vec<Dr1csBlockLinearConstraint<F>>,
+    /// Exact touched `pi0` coordinates for the selected local view.
+    pub touched_pi_positions_exact: Vec<usize>,
+    /// Conservative touched `pi0` coordinates, including the full selected `w_eval` block when
+    /// the backend requires the dense q3 witness contribution to be treated conservatively.
+    pub touched_pi_positions_conservative: Vec<usize>,
+}
+
 impl<F: PrimeField> Theorem43CapsuleLocalCheckSurface<F> {
     /// Return the sorted set of exact `pi0` coordinates touched by this surface.
     ///
@@ -272,6 +293,24 @@ impl<F: PrimeField> Theorem43CapsuleLocalCheckSurface<F> {
             for pi_idx in start..end {
                 add_idx(&mut out, pi_idx);
             }
+        }
+        out.into_iter().collect()
+    }
+}
+
+impl<F: PrimeField> Theorem43AlvoLocalCheckSurface<F> {
+    pub fn packed_pi_blocks_exact(&self, pack_d: usize) -> Vec<usize> {
+        let mut out = BTreeSet::<usize>::new();
+        for &pi_idx in &self.touched_pi_positions_exact {
+            out.insert(pi_idx / pack_d.max(1));
+        }
+        out.into_iter().collect()
+    }
+
+    pub fn packed_pi_blocks_conservative(&self, pack_d: usize) -> Vec<usize> {
+        let mut out = BTreeSet::<usize>::new();
+        for &pi_idx in &self.touched_pi_positions_conservative {
+            out.insert(pi_idx / pack_d.max(1));
         }
         out.into_iter().collect()
     }
@@ -915,20 +954,107 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
         })
     }
 
+    /// Export an ALVO-facing local surface from public statement data.
+    ///
+    /// This wraps the existing capsule local-check surface with the canonical proof-layout
+    /// metadata and the exact/conservative touched `pi0` views needed by a later
+    /// commitment/opening layer.
+    pub fn export_alvo_local_check_surface_from_stmt(
+        &self,
+        c_stmt: &[F],
+        x: &[F],
+        block_id: usize,
+        rep_id: u64,
+    ) -> Result<Theorem43AlvoLocalCheckSurface<F>, String> {
+        let profile = std::env::var("LFP_PROFILE_ALVO_EXPORT")
+            .ok()
+            .is_some_and(|v| v != "0");
+        let t_total = std::time::Instant::now();
+        let t0 = std::time::Instant::now();
+        if profile {
+            eprintln!(
+                "[alvo:profile:start] block_id={} rep_id={} phase=export_capsule_local_check_surface_from_stmt",
+                block_id, rep_id
+            );
+        }
+        let local_check =
+            self.export_capsule_local_check_surface_from_stmt(c_stmt, x, block_id, rep_id)?;
+        let dt_local = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        if profile {
+            eprintln!(
+                "[alvo:profile:start] block_id={} rep_id={} phase=proof_layout_info",
+                block_id, rep_id
+            );
+        }
+        let proof_layout = self.flpcp.proof_layout_info()?;
+        let dt_layout = t1.elapsed();
+        let t2 = std::time::Instant::now();
+        if profile {
+            eprintln!(
+                "[alvo:profile:start] block_id={} rep_id={} phase=export_w_eval_block_linear_constraints",
+                block_id, rep_id
+            );
+        }
+        let h_w_eval_constraints = self.flpcp.export_w_eval_block_linear_constraints(block_id)?;
+        let dt_h = t2.elapsed();
+        let touched_pi_positions_exact = local_check.touched_pi_positions(false);
+        let touched_pi_positions_conservative =
+            local_check.touched_pi_positions(local_check.requires_dense_q3_w_eval);
+        if profile {
+            eprintln!(
+                "[alvo:profile] block_id={} rep_id={} local_check={:?} proof_layout={:?} h_constraints={:?} total={:?}",
+                block_id,
+                rep_id,
+                dt_local,
+                dt_layout,
+                dt_h,
+                t_total.elapsed()
+            );
+        }
+        Ok(Theorem43AlvoLocalCheckSurface {
+            local_check,
+            proof_layout,
+            h_w_eval_constraints,
+            touched_pi_positions_exact,
+            touched_pi_positions_conservative,
+        })
+    }
+
     /// Export a batch of capsule local-check surfaces from public statement data.
     pub fn export_capsule_schedule_from_stmt(
         &self,
         c_stmt: &[F],
         x: &[F],
         checks: &[(usize, u64)],
-    ) -> Result<Vec<Theorem43CapsuleLocalCheckSurface<F>>, String> {
-        let mut out = Vec::with_capacity(checks.len());
-        for &(block_id, rep_id) in checks {
-            out.push(self.export_capsule_local_check_surface_from_stmt(
-                c_stmt, x, block_id, rep_id,
-            )?);
-        }
-        Ok(out)
+    ) -> Result<Vec<Theorem43CapsuleLocalCheckSurface<F>>, String>
+    where
+        P: Sync,
+    {
+        checks
+            .par_iter()
+            .map(|&(block_id, rep_id)| {
+                self.export_capsule_local_check_surface_from_stmt(c_stmt, x, block_id, rep_id)
+            })
+            .collect()
+    }
+
+    /// Export a batch of ALVO-facing local surfaces from public statement data.
+    pub fn export_alvo_schedule_from_stmt(
+        &self,
+        c_stmt: &[F],
+        x: &[F],
+        checks: &[(usize, u64)],
+    ) -> Result<Vec<Theorem43AlvoLocalCheckSurface<F>>, String>
+    where
+        P: Sync,
+    {
+        checks
+            .par_iter()
+            .map(|&(block_id, rep_id)| {
+                self.export_alvo_local_check_surface_from_stmt(c_stmt, x, block_id, rep_id)
+            })
+            .collect()
     }
 
 }
@@ -940,8 +1066,11 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
         z_w: &[F],
         coins_list: &[Theorem43Coins<F>],
         mut on_pi0_chunk: Option<&mut dyn FnMut(&[F])>,
+        on_w_eval_block_u16: Option<&(dyn Fn(usize, &[u16]) -> Result<(), String> + Sync)>,
     ) -> Result<Vec<Theorem43AbgFull<F>>, String> {
-        let prof = std::env::var("LF_PROFILE").ok().as_deref() == Some("1");
+        let prof = std::env::var("LF_PROFILE").ok().is_some_and(|v| v != "0")
+            || std::env::var("LF_PLUS_PROFILE").ok().is_some_and(|v| v != "0")
+            || std::env::var("LFP_PROFILE_H12_AUG").ok().is_some_and(|v| v != "0");
         let t_total = Instant::now();
         let flpcp = &self.flpcp;
         if x.len() != flpcp.n() {
@@ -1219,6 +1348,9 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
 
             cell.set(dots)
                 .map_err(|_| "stream_w_eval_blocks_with_hook: once-lock already set".to_string())?;
+            if let Some(hook) = on_w_eval_block_u16 {
+                hook(b, w_eval_u16)?;
+            }
             Ok(())
         };
 
@@ -1344,7 +1476,61 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F> + Sync> Theorem43Dpp<F, P> {
         coins_list: &[Theorem43Coins<F>],
         on_pi0_chunk: Option<&mut dyn FnMut(&[F])>,
     ) -> Result<Vec<Theorem43AbgFull<F>>, String> {
-        self.stream_pi0_and_collect_abg_accs(x, z_w, coins_list, on_pi0_chunk)
+        self.stream_pi0_and_collect_abg_accs(x, z_w, coins_list, on_pi0_chunk, None)
+    }
+
+    pub fn stream_pi0_and_collect_abg_full_with_w_eval_u16_hook(
+        &self,
+        x: &[F],
+        z_w: &[F],
+        coins_list: &[Theorem43Coins<F>],
+        on_pi0_chunk: Option<&mut dyn FnMut(&[F])>,
+        on_w_eval_block_u16: Option<&(dyn Fn(usize, &[u16]) -> Result<(), String> + Sync)>,
+    ) -> Result<Vec<Theorem43AbgFull<F>>, String> {
+        self.stream_pi0_and_collect_abg_accs(
+            x,
+            z_w,
+            coins_list,
+            on_pi0_chunk,
+            on_w_eval_block_u16,
+        )
+    }
+
+ 
+
+    pub fn stream_w_eval_blocks_only_u16(
+        &self,
+        x: &[F],
+        z_w: &[F],
+        on_block: &(dyn Fn(usize, &[u16]) -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        let flpcp = &self.flpcp;
+        if x.len() != flpcp.n() {
+            return Err("bad public input length".to_string());
+        }
+        if z_w.len() != flpcp.z_w_len() {
+            return Err("bad witness length".to_string());
+        }
+        let witness_pos = flpcp.witness_positions_star()?;
+        let x_u16_cache = if is_f257_field::<F>() {
+            Some(x.iter().copied().map(f_to_u16).collect::<Vec<_>>())
+        } else {
+            None
+        };
+        let z_u16_cache = if is_f257_field::<F>() {
+            Some(z_w.iter().copied().map(f_to_u16).collect::<Vec<_>>())
+        } else {
+            None
+        };
+        flpcp.stream_w_eval_blocks(
+            witness_pos.as_slice(),
+            x,
+            z_w,
+            x_u16_cache.as_deref(),
+            z_u16_cache.as_deref(),
+            Some(on_block),
+            None,
+        )
     }
 
 }

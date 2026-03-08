@@ -12,10 +12,79 @@ use rand::RngCore;
 use rayon::prelude::*;
 use rayon::join;
 use std::collections::HashMap;
+use sha2::Digest;
 
 use crate::packing::{BoundedFlpcp, BoundedFlpcpSparse, FlpcpPredicate};
 use crate::rs::{barycentric_weights_consecutive, extrapolate_consecutive_next_block, lagrange_coeffs_at};
 use crate::sparse::SparseVec;
+
+/// Public proof-layout metadata for `pi0 = (z_w || w_eval[0] || ... || w_eval[blocks-1])`.
+///
+/// This is the canonical stage-1 object an ALVO-style export needs in order to:
+/// - interpret touched `pi0` coordinates,
+/// - bind a block-opening layout at stage 1,
+/// - and reconstruct local witness layouts during stage 2 / offline decap.
+#[derive(Clone, Debug)]
+pub struct Dr1csProofLayoutInfo {
+    /// Number of public variables in `z = (x || z_w)`.
+    pub n: usize,
+    /// Total number of variables in `z = (x || z_w)`.
+    pub n_total: usize,
+    /// Private witness length `|z_w|`.
+    pub z_w_len: usize,
+    /// Proof length `|pi0| = |z_w| + blocks * k_star`.
+    pub pi0_len: usize,
+    /// Number of independent `w_eval` blocks appended after `z_w`.
+    pub blocks: usize,
+    /// Verifier-coin range per block.
+    pub ell_local: usize,
+    /// Square-code witness block length.
+    pub k_star: usize,
+    /// Low-cube witness prefix length inside each `w_eval` block.
+    pub low_cube_len: usize,
+    /// Canonical `w_eval` witness layout (Layout A).
+    pub witness_positions_star: Vec<usize>,
+}
+
+/// One block-local linear constraint over a selected `w_eval` block.
+///
+/// Semantics:
+/// `constant + sum_i coeff_i * w_eval[pos_i] = 0`.
+#[derive(Clone, Debug)]
+pub struct Dr1csBlockLinearConstraint<F: PrimeField> {
+    pub constant: F,
+    pub terms: Vec<(usize, F)>,
+}
+
+pub const ALVO_H_COMPRESS_EQS: usize = 16;
+
+pub fn sample_h_constraint_positions(k: usize, k_star: usize, block_id: usize) -> Vec<usize> {
+    if k_star <= k {
+        return Vec::new();
+    }
+    let side_len = k_star - k;
+    let target = side_len.min(ALVO_H_COMPRESS_EQS);
+    let mut out = Vec::with_capacity(target);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut ctr = 0u32;
+    while out.len() < target {
+        let mut h = sha2::Sha256::new();
+        h.update(b"LFP_ALVO_H_COMPRESS_V1");
+        h.update((block_id as u64).to_le_bytes());
+        h.update((k as u64).to_le_bytes());
+        h.update((k_star as u64).to_le_bytes());
+        h.update(ctr.to_le_bytes());
+        let bytes: [u8; 32] = h.finalize().into();
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&bytes[..8]);
+        let pos = k + (u64::from_le_bytes(raw) as usize % side_len);
+        if seen.insert(pos) {
+            out.push(pos);
+        }
+        ctr = ctr.wrapping_add(1);
+    }
+    out
+}
 
 /// Minimal NP-style dR1CS FLPCP API for lockable Theorem-4.3.
 ///
@@ -36,10 +105,40 @@ pub trait Dr1csNpFlpcpSparseApi<F: PrimeField> {
     fn blocks(&self) -> usize;
     /// Codeword length per block ℓ_local (equals `ell()` when `blocks()==1`).
     fn ell_local(&self) -> usize;
+    /// Low-cube witness prefix length inside each `w_eval` block.
+    fn low_cube_len(&self) -> usize;
     /// Square-code witness block length `k*` (length of each `w_eval`).
     fn k_star(&self) -> usize;
     /// Witness positions for `w_eval` (Layout A).
     fn witness_positions_star(&self) -> Result<Vec<usize>, String>;
+
+    /// Return the canonical proof-layout metadata for `pi0 = (z_w || w_eval[0] || ...)`.
+    fn proof_layout_info(&self) -> Result<Dr1csProofLayoutInfo, String> {
+        Ok(Dr1csProofLayoutInfo {
+            n: self.n(),
+            n_total: self.n_total(),
+            z_w_len: self.z_w_len(),
+            pi0_len: self.m(),
+            blocks: self.blocks(),
+            ell_local: self.ell_local(),
+            k_star: self.k_star(),
+            low_cube_len: self.low_cube_len(),
+            witness_positions_star: self.witness_positions_star()?,
+        })
+    }
+
+    /// Export block-local linear consistency constraints for the selected `w_eval` block.
+    ///
+    /// This is the current concrete `H_j` substrate for ALVO:
+    /// - the first `k = dim_k()` entries of `w_eval` are the low cube
+    /// - every remaining side-cube entry must equal the linear extrapolation from that low cube
+    fn export_w_eval_block_linear_constraints(
+        &self,
+        block_id: usize,
+    ) -> Result<Vec<Dr1csBlockLinearConstraint<F>>, String> {
+        let _ = block_id;
+        Err("export_w_eval_block_linear_constraints: not implemented for this backend".to_string())
+    }
 
     /// Stream `w_eval` blocks in order without materializing the full proof.
     ///
@@ -384,6 +483,16 @@ pub trait MulCode<F: PrimeField> {
             }
         }
         Ok(())
+    }
+
+    /// Stream coefficients for the low-cube-only extrapolator to `E*(·)[idx]`.
+    ///
+    /// Semantics:
+    /// - coefficients are indexed in the first `k = dim_k()` Layout-A positions
+    /// - they reconstruct the selected side-cube evaluation from the low cube only
+    fn row_e_star_low_stream(&self, idx: usize, f: &mut dyn FnMut(usize, F)) -> Result<(), String> {
+        let _ = (idx, f);
+        Err("row_e_star_low_stream: not implemented for this MulCode".to_string())
     }
 }
 
@@ -880,6 +989,60 @@ impl<F: PrimeField> MulCode<F> for TensorRsMulCode<F> {
                         f(high, coeff);
                     }
                     high += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn row_e_star_low_stream(&self, idx: usize, f: &mut dyn FnMut(usize, F)) -> Result<(), String> {
+        if idx >= self.len_l() {
+            return Err("row_e_star_low_stream: idx out of range".to_string());
+        }
+        if Self::is_f257() {
+            let coords = self.decompose_index(idx);
+            let mut one_dim: Vec<&[u16]> = Vec::with_capacity(self.rank);
+            let side = 2 * self.base_k - 1;
+            for &c in coords.iter() {
+                let start = c * side;
+                let end = start + side;
+                one_dim.push(&self.lam_star_u16[start..end]);
+            }
+            let total = self.dim_k();
+            let base_k = self.base_k;
+            for flat in 0..total {
+                let mut coeff = 1u16;
+                let mut tmp = flat;
+                for d in 0..self.rank {
+                    let id = tmp % base_k;
+                    coeff = mul_mod(coeff, one_dim[d][id]);
+                    tmp /= base_k;
+                }
+                if coeff != 0 {
+                    f(flat, F::from(coeff as u64));
+                }
+            }
+        } else {
+            let coords = self.decompose_index(idx);
+            let mut one_dim = Vec::with_capacity(self.rank);
+            let side = 2 * self.base_k - 1;
+            for &c in coords.iter() {
+                let alpha = self.points[c];
+                let lam = lagrange_coeffs_at(&self.points[..side], &self.ws_star, alpha);
+                one_dim.push(lam);
+            }
+            let total = self.dim_k();
+            let base_k = self.base_k;
+            for flat in 0..total {
+                let mut coeff = F::ONE;
+                let mut tmp = flat;
+                for d in 0..self.rank {
+                    let id = tmp % base_k;
+                    coeff *= one_dim[d][id];
+                    tmp /= base_k;
+                }
+                if !coeff.is_zero() {
+                    f(flat, coeff);
                 }
             }
         }
@@ -1620,12 +1783,48 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         self.code.len_l()
     }
 
+    fn low_cube_len(&self) -> usize {
+        self.code.dim_k()
+    }
+
     fn k_star(&self) -> usize {
         self.code.dim_k_star()
     }
 
     fn witness_positions_star(&self) -> Result<Vec<usize>, String> {
         self.code.witness_positions_star()
+    }
+
+    fn export_w_eval_block_linear_constraints(
+        &self,
+        block_id: usize,
+    ) -> Result<Vec<Dr1csBlockLinearConstraint<F>>, String> {
+        if block_id != 0 {
+            return Err("export_w_eval_block_linear_constraints: single-block backend expects block_id=0".to_string());
+        }
+        let witness_pos = self.code.witness_positions_star()?;
+        let k = self.code.dim_k();
+        let k_star = self.code.dim_k_star();
+        if witness_pos.len() != k_star {
+            return Err("export_w_eval_block_linear_constraints: witness positions length mismatch".to_string());
+        }
+        let sampled_positions = sample_h_constraint_positions(k, k_star, block_id);
+        sampled_positions
+            .into_par_iter()
+            .map(|pos| -> Result<Dr1csBlockLinearConstraint<F>, String> {
+                let idx = witness_pos[pos];
+                let mut terms = vec![(pos, F::ONE)];
+                self.code.row_e_star_low_stream(idx, &mut |low_pos, coeff| {
+                    if !coeff.is_zero() {
+                        terms.push((low_pos, -coeff));
+                    }
+                })?;
+                Ok(Dr1csBlockLinearConstraint {
+                    constant: F::ZERO,
+                    terms,
+                })
+            })
+            .collect()
     }
 
     fn stream_w_eval_blocks(
@@ -2239,6 +2438,10 @@ impl<F: PrimeField + FftField> Dr1csNpFlpcpSparseApi<F> for RsDr1csNpFlpcpSparse
 
     fn ell_local(&self) -> usize {
         self.ell
+    }
+
+    fn low_cube_len(&self) -> usize {
+        self.inst.k()
     }
 
     fn k_star(&self) -> usize {

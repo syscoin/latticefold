@@ -173,6 +173,12 @@ pub struct Com<R> {
 }
 
 #[derive(Clone, Debug)]
+pub struct ComBase0<R: PolyRing> {
+    pub g0: Vec<Vec<R::BaseRing>>,
+    pub x: ComX<R>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ComX<R> {
     pub cm_g: Vec<Vec<R>>,
     pub ro: Vec<(R, R)>,
@@ -503,7 +509,7 @@ where
         &self,
         M0: &[Arc<SparseMatrix<R::BaseRing>>],
         transcript: &mut impl Transcript<R>,
-    ) -> (Com<R>, CmProof<R>) {
+    ) -> (ComBase0<R>, CmProof<R>) {
         let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
         let t_total = Instant::now();
         maybe_print_rss("cm: prove start");
@@ -953,7 +959,9 @@ where
             );
         }
         let mats_const = true;
-        let (proof_a, evals_a, ro_a, proof_b, evals_b, ro_b, g) = if let Some(hm) = h_mles_full.as_ref() {
+        let s0_c0 = s[0].coeffs()[0];
+        let s2_c0 = s[2].coeffs()[0];
+        let (proof_a, evals_a, ro_a, proof_b, evals_b, ro_b, g0) = if let Some(hm) = h_mles_full.as_ref() {
             let (p0, e0, r0) = self.sumchecker_streaming_base_hmle(
                 &dcom,
                 hm,
@@ -974,7 +982,7 @@ where
                 transcript,
                 profile,
             );
-            let g = self
+            let g0 = self
                 .rg
                 .instances
                 .iter()
@@ -982,51 +990,88 @@ where
                 .map(|(i, inst)| {
                     let n = inst.tau.len();
                     let h_mle = hm[i].clone();
+                    let mtau_const_terms = match &inst.m_tau {
+                        crate::rgchk::MonomialVec::Digits { exp_table, .. } => Some(
+                            exp_table
+                                .iter()
+                                .map(|mono| {
+                                    if let Some((shift, scale)) = mon_info::<R>(mono) {
+                                        mul_negacyclic_by_monomial::<R>(&s[1], shift, scale).coeffs()[0]
+                                    } else {
+                                        (s[1] * *mono).coeffs()[0]
+                                    }
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                        crate::rgchk::MonomialVec::Dense(_) => None,
+                    };
                     #[cfg(feature = "parallel")]
                     {
                         use rayon::prelude::*;
                         (0..n)
                             .into_par_iter()
                             .map(|j| {
-                                let r_tau = inst.tau[j];
-                                let r_mtau = inst.m_tau.get(j);
-                                let r_h = h_mle.eval_at_index(j);
-                                // `s[0..2]` are short challenges; `r_tau` (and often `r_f`) are base scalars.
-                                // Avoid ring×ring multiplication for coefficient-form rings like `GoldilocksRing64`.
-                                let mut acc = scale_by_base_ref(&s[0], r_tau) + (s[1] * r_mtau) + r_h;
-                                match &inst.f {
-                                    WitnessVec::Ring(vr) => acc += s[2] * vr[j],
-                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
-                                        let f0 = v0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
-                                        acc += scale_by_base_ref(&s[2], f0);
+                                let tau0 = inst.tau[j];
+                                let mtau0 = match (&inst.m_tau, mtau_const_terms.as_ref()) {
+                                    (crate::rgchk::MonomialVec::Digits { digits, .. }, Some(tab)) => {
+                                        let di = digits.get(j).copied().unwrap_or(0) as usize;
+                                        tab[di]
                                     }
-                                }
-                                acc
+                                    (crate::rgchk::MonomialVec::Dense(v), None) => {
+                                        let mono = v[j];
+                                        if let Some((shift, scale)) = mon_info::<R>(&mono) {
+                                            mul_negacyclic_by_monomial::<R>(&s[1], shift, scale).coeffs()[0]
+                                        } else {
+                                            (s[1] * mono).coeffs()[0]
+                                        }
+                                    }
+                                    _ => R::BaseRing::ZERO,
+                                };
+                                let h0 = h_mle.eval0_at_index(j);
+                                let f0 = match &inst.f {
+                                    WitnessVec::Ring(vr) => vr[j].coeffs()[0],
+                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
+                                        v0.get(j).copied().unwrap_or(R::BaseRing::ZERO)
+                                    }
+                                };
+                                s0_c0 * tau0 + mtau0 + s2_c0 * f0 + h0
                             })
-                            .collect::<Vec<R>>()
+                            .collect::<Vec<R::BaseRing>>()
                     }
                     #[cfg(not(feature = "parallel"))]
                     {
                         (0..n)
                             .map(|j| {
-                                let r_tau = inst.tau[j];
-                                let r_mtau = inst.m_tau.get(j);
-                                let r_h = h_mle.eval_at_index(j);
-                                let mut acc = scale_by_base_ref(&s[0], r_tau) + (s[1] * r_mtau) + r_h;
-                                match &inst.f {
-                                    WitnessVec::Ring(vr) => acc += s[2] * vr[j],
-                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
-                                        let f0 = v0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
-                                        acc += scale_by_base_ref(&s[2], f0);
+                                let tau0 = inst.tau[j];
+                                let mtau0 = match (&inst.m_tau, mtau_const_terms.as_ref()) {
+                                    (crate::rgchk::MonomialVec::Digits { digits, .. }, Some(tab)) => {
+                                        let di = digits.get(j).copied().unwrap_or(0) as usize;
+                                        tab[di]
                                     }
-                                }
-                                acc
+                                    (crate::rgchk::MonomialVec::Dense(v), None) => {
+                                        let mono = v[j];
+                                        if let Some((shift, scale)) = mon_info::<R>(&mono) {
+                                            mul_negacyclic_by_monomial::<R>(&s[1], shift, scale).coeffs()[0]
+                                        } else {
+                                            (s[1] * mono).coeffs()[0]
+                                        }
+                                    }
+                                    _ => R::BaseRing::ZERO,
+                                };
+                                let h0 = h_mle.eval0_at_index(j);
+                                let f0 = match &inst.f {
+                                    WitnessVec::Ring(vr) => vr[j].coeffs()[0],
+                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
+                                        v0.get(j).copied().unwrap_or(R::BaseRing::ZERO)
+                                    }
+                                };
+                                s0_c0 * tau0 + mtau0 + s2_c0 * f0 + h0
                             })
-                            .collect::<Vec<R>>()
+                            .collect::<Vec<R::BaseRing>>()
                     }
                 })
                 .collect::<Vec<_>>();
-            (p0, e0, r0, p1, e1, r1, g)
+            (p0, e0, r0, p1, e1, r1, g0)
         } else {
             let (p0, e0, r0) = self.sumchecker_streaming_base(
                 &dcom,
@@ -1048,56 +1093,95 @@ where
                 transcript,
                 profile,
             );
-            let g = self
+            let g0 = self
                 .rg
                 .instances
                 .iter()
                 .enumerate()
                 .map(|(i, inst)| {
                     let n = inst.tau.len();
+                    let mtau_const_terms = match &inst.m_tau {
+                        crate::rgchk::MonomialVec::Digits { exp_table, .. } => Some(
+                            exp_table
+                                .iter()
+                                .map(|mono| {
+                                    if let Some((shift, scale)) = mon_info::<R>(mono) {
+                                        mul_negacyclic_by_monomial::<R>(&s[1], shift, scale).coeffs()[0]
+                                    } else {
+                                        (s[1] * *mono).coeffs()[0]
+                                    }
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                        crate::rgchk::MonomialVec::Dense(_) => None,
+                    };
                     #[cfg(feature = "parallel")]
                     {
                         use rayon::prelude::*;
                         (0..n)
                             .into_par_iter()
                             .map(|j| {
-                                let r_tau = inst.tau[j];
-                                let r_mtau = inst.m_tau.get(j);
-                                let r_h = h[i][j];
-                                let mut acc = scale_by_base_ref(&s[0], r_tau) + (s[1] * r_mtau) + r_h;
-                                match &inst.f {
-                                    WitnessVec::Ring(vr) => acc += s[2] * vr[j],
-                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
-                                        let f0 = v0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
-                                        acc += scale_by_base_ref(&s[2], f0);
+                                let tau0 = inst.tau[j];
+                                let mtau0 = match (&inst.m_tau, mtau_const_terms.as_ref()) {
+                                    (crate::rgchk::MonomialVec::Digits { digits, .. }, Some(tab)) => {
+                                        let di = digits.get(j).copied().unwrap_or(0) as usize;
+                                        tab[di]
                                     }
-                                }
-                                acc
+                                    (crate::rgchk::MonomialVec::Dense(v), None) => {
+                                        let mono = v[j];
+                                        if let Some((shift, scale)) = mon_info::<R>(&mono) {
+                                            mul_negacyclic_by_monomial::<R>(&s[1], shift, scale).coeffs()[0]
+                                        } else {
+                                            (s[1] * mono).coeffs()[0]
+                                        }
+                                    }
+                                    _ => R::BaseRing::ZERO,
+                                };
+                                let h0 = h[i][j].coeffs()[0];
+                                let f0 = match &inst.f {
+                                    WitnessVec::Ring(vr) => vr[j].coeffs()[0],
+                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
+                                        v0.get(j).copied().unwrap_or(R::BaseRing::ZERO)
+                                    }
+                                };
+                                s0_c0 * tau0 + mtau0 + s2_c0 * f0 + h0
                             })
-                            .collect::<Vec<R>>()
+                            .collect::<Vec<R::BaseRing>>()
                     }
                     #[cfg(not(feature = "parallel"))]
                     {
                         (0..n)
                             .map(|j| {
-                                let r_tau = inst.tau[j];
-                                let r_mtau = inst.m_tau.get(j);
-                                let r_h = h[i][j];
-                                let mut acc = scale_by_base_ref(&s[0], r_tau) + (s[1] * r_mtau) + r_h;
-                                match &inst.f {
-                                    WitnessVec::Ring(vr) => acc += s[2] * vr[j],
-                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
-                                        let f0 = v0.get(j).copied().unwrap_or(R::BaseRing::ZERO);
-                                        acc += scale_by_base_ref(&s[2], f0);
+                                let tau0 = inst.tau[j];
+                                let mtau0 = match (&inst.m_tau, mtau_const_terms.as_ref()) {
+                                    (crate::rgchk::MonomialVec::Digits { digits, .. }, Some(tab)) => {
+                                        let di = digits.get(j).copied().unwrap_or(0) as usize;
+                                        tab[di]
                                     }
-                                }
-                                acc
+                                    (crate::rgchk::MonomialVec::Dense(v), None) => {
+                                        let mono = v[j];
+                                        if let Some((shift, scale)) = mon_info::<R>(&mono) {
+                                            mul_negacyclic_by_monomial::<R>(&s[1], shift, scale).coeffs()[0]
+                                        } else {
+                                            (s[1] * mono).coeffs()[0]
+                                        }
+                                    }
+                                    _ => R::BaseRing::ZERO,
+                                };
+                                let h0 = h[i][j].coeffs()[0];
+                                let f0 = match &inst.f {
+                                    WitnessVec::Ring(vr) => vr[j].coeffs()[0],
+                                    WitnessVec::ConstCoeffBase { values: v0, .. } => {
+                                        v0.get(j).copied().unwrap_or(R::BaseRing::ZERO)
+                                    }
+                                };
+                                s0_c0 * tau0 + mtau0 + s2_c0 * f0 + h0
                             })
-                            .collect::<Vec<R>>()
+                            .collect::<Vec<R::BaseRing>>()
                     }
                 })
                 .collect::<Vec<_>>();
-            (p0, e0, r0, p1, e1, r1, g)
+            (p0, e0, r0, p1, e1, r1, g0)
         };
 
         let proof = CmProof {
@@ -1109,7 +1193,7 @@ where
 
         let ro = ro_a.into_iter().zip(ro_b).collect::<Vec<_>>();
         let x = proof.x(&s, ro);
-        let com = Com { g, x };
+        let com = ComBase0 { g0, x };
 
         if profile {
             println!("[LF+ Cm::prove] total: {:?}", t_total.elapsed());

@@ -13,7 +13,8 @@ use rayon::prelude::*;
 use std::sync::Arc;
 
 use dpp::dr1cs_flpcp::{
-    reduce_mod257_u64, Dr1csNpFlpcpSparseApi, Dr1csQueryScratch, MulCode, QuerySink, TensorRsMulCode,
+    reduce_mod257_u64, Dr1csBlockLinearConstraint, Dr1csNpFlpcpSparseApi, Dr1csQueryScratch,
+    MulCode, QuerySink, TensorRsMulCode,
 };
 use dpp::packing::FlpcpPredicate;
 use dpp::theorem43::{Theorem43Coins, Theorem43Dpp};
@@ -25,7 +26,6 @@ use crate::lockable_ringlwe::{arm_ringlwe_lock, ErrGateHints, PackedF257Block64,
 
 #[cfg(feature = "we_gate")]
 use crate::we_gate_arith;
-#[cfg(feature = "we_gate")]
 #[cfg(feature = "we_gate")]
 use latticefold::transcript::poseidon::F257;
 #[cfg(feature = "we_gate")]
@@ -439,11 +439,46 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
     fn ell_local(&self) -> usize {
         self.code.len_l()
     }
+    fn low_cube_len(&self) -> usize {
+        self.code.dim_k()
+    }
     fn k_star(&self) -> usize {
         self.code.dim_k_star()
     }
     fn witness_positions_star(&self) -> Result<Vec<usize>, String> {
         self.code.witness_positions_star()
+    }
+
+    fn export_w_eval_block_linear_constraints(
+        &self,
+        block_id: usize,
+    ) -> Result<Vec<Dr1csBlockLinearConstraint<F>>, String> {
+        if block_id >= self.blocks() {
+            return Err("export_w_eval_block_linear_constraints: bad block id".to_string());
+        }
+        let witness_pos = self.code.witness_positions_star()?;
+        let k = self.code.dim_k();
+        let k_star = self.code.dim_k_star();
+        if witness_pos.len() != k_star {
+            return Err("export_w_eval_block_linear_constraints: witness positions length mismatch".to_string());
+        }
+        let sampled_positions = dpp::dr1cs_flpcp::sample_h_constraint_positions(k, k_star, block_id);
+        sampled_positions
+            .into_par_iter()
+            .map(|pos| -> Result<Dr1csBlockLinearConstraint<F>, String> {
+                let idx = witness_pos[pos];
+                let mut terms = vec![(pos, F::ONE)];
+                self.code.row_e_star_low_stream(idx, &mut |low_pos, coeff| {
+                    if !coeff.is_zero() {
+                        terms.push((low_pos, -coeff));
+                    }
+                })?;
+                Ok(Dr1csBlockLinearConstraint {
+                    constant: F::ZERO,
+                    terms,
+                })
+            })
+            .collect()
     }
 
     fn stream_w_eval_blocks(
@@ -1032,12 +1067,30 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         let mut pi = Vec::with_capacity(self.m());
         pi.extend_from_slice(z_w);
         let witness_pos = self.witness_positions_star().expect("witness_positions_star");
+        let x_u16 = if dpp::dr1cs_flpcp::is_f257_field::<F>() {
+            Some(
+                x.iter()
+                    .map(|v| (v.into_bigint().as_ref()[0] % 257) as u16)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+        let z_u16 = if dpp::dr1cs_flpcp::is_f257_field::<F>() {
+            Some(
+                z_w.iter()
+                    .map(|v| (v.into_bigint().as_ref()[0] % 257) as u16)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
         self.stream_w_eval_blocks(
             &witness_pos,
             x,
             z_w,
-            None,
-            None,
+            x_u16.as_deref(),
+            z_u16.as_deref(),
             None,
             Some(&mut |_, w_eval| {
                 pi.extend_from_slice(w_eval);
@@ -1088,6 +1141,96 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
 pub struct WeRingLweProverContext<F: PrimeField + FftField> {
     dpp: Theorem43Dpp<F, FileBackedChunkedMulCodeDr1csNpFlpcpSparse<F, TensorRsMulCode<F>>>,
 }
+
+#[cfg(feature = "we_gate")]
+pub(crate) struct LfplusStmtSurfaceExporter {
+    dpp: Theorem43Dpp<
+        F257,
+        FileBackedChunkedMulCodeDr1csNpFlpcpSparse<F257, TensorRsMulCode<F257>>,
+    >,
+    c_stmt: Vec<F257>,
+    x: Vec<F257>,
+}
+
+#[cfg(feature = "we_gate")]
+impl LfplusStmtSurfaceExporter {
+    pub(crate) fn new(
+        shape: &we_gate_arith::WeDr1csShape<F257>,
+        stmt_digest: &[F257; 32],
+    ) -> Result<Self, String> {
+        let x = crate::we_statement::encode_public_x::<F257>(stmt_digest);
+        if x.len() != shape.public_len {
+            return Err(format!(
+                "LfplusStmtSurfaceExporter::new: public_len mismatch (shape={} vs x={})",
+                shape.public_len,
+                x.len()
+            ));
+        }
+        let c_stmt: Vec<F257> = stmt_digest
+            .iter()
+            .map(|e| F257::from((e.into_bigint().as_ref()[0] % 257) as u64))
+            .collect();
+        let dpp = make_theorem43_dpp_from_dr1cs::<F257>(shape.inst.clone(), shape.public_len)?;
+        Ok(Self { dpp, c_stmt, x })
+    }
+
+    pub(crate) fn export_capsule_schedule(
+        &self,
+        checks: &[(usize, u64)],
+    ) -> Result<Vec<dpp::theorem43::Theorem43CapsuleLocalCheckSurface<F257>>, String> {
+        self.dpp
+            .export_capsule_schedule_from_stmt(self.c_stmt.as_slice(), self.x.as_slice(), checks)
+    }
+
+    pub(crate) fn export_alvo_schedule(
+        &self,
+        checks: &[(usize, u64)],
+    ) -> Result<Vec<dpp::theorem43::Theorem43AlvoLocalCheckSurface<F257>>, String> {
+        self.dpp
+            .export_alvo_schedule_from_stmt(self.c_stmt.as_slice(), self.x.as_slice(), checks)
+    }
+
+
+
+
+    pub(crate) fn stream_w_eval_blocks_only_u16(
+        &self,
+        z_w: &[F257],
+        on_block: &(dyn Fn(usize, &[u16]) -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        self.dpp
+            .stream_w_eval_blocks_only_u16(self.x.as_slice(), z_w, on_block)
+    }
+
+    pub(crate) fn derive_public_coins_schedule(
+        &self,
+        checks: &[(usize, u64)],
+    ) -> Result<Vec<Theorem43Coins<F257>>, String> {
+        checks
+            .par_iter()
+            .map(|&(block_id, rep_id)| {
+                self.dpp
+                    .derive_public_coins_from_stmt(self.c_stmt.as_slice(), block_id, rep_id)
+            })
+            .collect()
+    }
+
+    pub(crate) fn collect_abg_full_for_coins_with_w_eval_hook(
+        &self,
+        z_w: &[F257],
+        coins_list: &[Theorem43Coins<F257>],
+        on_w_eval_block_u16: Option<&(dyn Fn(usize, &[u16]) -> Result<(), String> + Sync)>,
+    ) -> Result<Vec<dpp::theorem43::Theorem43AbgFull<F257>>, String> {
+        self.dpp.stream_pi0_and_collect_abg_full_with_w_eval_u16_hook(
+            self.x.as_slice(),
+            z_w,
+            coins_list,
+            None,
+            on_w_eval_block_u16,
+        )
+    }
+}
+
 
 impl<F: PrimeField + FftField> WeRingLweProverContext<F> {
     pub fn stream_pi0_and_collect_abg_full(
@@ -1623,18 +1766,16 @@ pub(crate) fn export_lfplus_capsule_schedule(
     stmt_digest: &[F257; 32],
     checks: &[(usize, u64)],
 ) -> Result<Vec<dpp::theorem43::Theorem43CapsuleLocalCheckSurface<F257>>, String> {
-    let x = crate::we_statement::encode_public_x::<F257>(stmt_digest);
-    if x.len() != shape.public_len {
-        return Err(format!(
-            "export_lfplus_capsule_schedule: public_len mismatch (shape={} vs x={})",
-            shape.public_len,
-            x.len()
-        ));
-    }
-    let c_stmt: Vec<F257> = stmt_digest
-        .iter()
-        .map(|e| F257::from((e.into_bigint().as_ref()[0] % 257) as u64))
-        .collect();
-    let dpp = make_theorem43_dpp_from_dr1cs::<F257>(shape.inst, shape.public_len)?;
-    dpp.export_capsule_schedule_from_stmt(c_stmt.as_slice(), &x, checks)
+    let exporter = LfplusStmtSurfaceExporter::new(&shape, stmt_digest)?;
+    exporter.export_capsule_schedule(checks)
+}
+
+#[cfg(feature = "we_gate")]
+pub(crate) fn export_lfplus_alvo_schedule(
+    shape: we_gate_arith::WeDr1csShape<F257>,
+    stmt_digest: &[F257; 32],
+    checks: &[(usize, u64)],
+) -> Result<Vec<dpp::theorem43::Theorem43AlvoLocalCheckSurface<F257>>, String> {
+    let exporter = LfplusStmtSurfaceExporter::new(&shape, stmt_digest)?;
+    exporter.export_alvo_schedule(checks)
 }

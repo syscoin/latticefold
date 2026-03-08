@@ -3,7 +3,7 @@ use latticefold::commitment::AjtaiCommitmentScheme;
 use latticefold::transcript::Transcript;
 use stark_rings::{
     balanced_decomposition::{convertible_ring::ConvertibleRing, Decompose},
-    CoeffRing, PolyRing, Zq,
+    CoeffRing, PolyRing, Ring, Zq,
 };
 use stark_rings_linalg::{Matrix, SparseMatrix};
 use std::sync::Arc;
@@ -31,6 +31,12 @@ pub struct LinB2X<R: PolyRing> {
 #[derive(Clone, Debug)]
 pub struct LinB2<R: PolyRing> {
     pub g: Vec<R>,
+    pub x: LinB2X<R>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LinB2Base0<R: PolyRing> {
+    pub g0: Vec<R::BaseRing>,
     pub x: LinB2X<R>,
 }
 
@@ -277,7 +283,7 @@ where
         scheme: &AjtaiCommitmentScheme<R>,
         M0: &[Arc<SparseMatrix<R::BaseRing>>],
         transcript: &mut impl Transcript<R>,
-    ) -> (LinB2<R>, CmProof<R>) {
+    ) -> (LinB2Base0<R>, CmProof<R>) {
         let profile = std::env::var("LF_PLUS_PROFILE").ok().as_deref() == Some("1");
         let t_total = Instant::now();
         let n = self.lins[0].f.len();
@@ -343,7 +349,7 @@ where
             println!("[LF+ Mlin::mlin_seeded_base] Cm::prove_base: {:?}", t.elapsed());
         }
 
-        let crate::cm::Com { g: g_vecs, x: com_x } = com;
+        let crate::cm::ComBase0 { g0: g0_vecs, x: com_x } = com;
 
         let mut cmg_iter = com_x.cm_g.into_iter();
         let mut cm_g = cmg_iter
@@ -373,15 +379,17 @@ where
             vo,
         };
 
-        let mut g_iter = g_vecs.into_iter();
-        let mut g = g_iter.next().unwrap_or_else(|| vec![R::zero(); n]);
+        let mut g_iter = g0_vecs.into_iter();
+        let mut g0 = g_iter
+            .next()
+            .unwrap_or_else(|| vec![R::BaseRing::ZERO; n]);
         for gi in g_iter {
-            debug_assert_eq!(gi.len(), g.len());
-            for (acc_r, gi_r) in g.iter_mut().zip(gi.into_iter()) {
+            debug_assert_eq!(gi.len(), g0.len());
+            for (acc_r, gi_r) in g0.iter_mut().zip(gi.into_iter()) {
                 *acc_r += gi_r;
             }
         }
-        let linb2 = LinB2 { g, x };
+        let linb2 = LinB2Base0 { g0, x };
 
         if profile {
             println!("[LF+ Mlin::mlin_seeded_base] total: {:?}", t_total.elapsed());

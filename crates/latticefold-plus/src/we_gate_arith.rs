@@ -835,7 +835,7 @@ where
 }
 
 #[cfg(feature = "we_gate")]
-fn tiny_extra_witness_from_plus_proof<R>(
+pub(crate) fn tiny_extra_witness_from_plus_proof<R>(
     params: &WeParams,
     proof: &crate::plus::PlusProof<R, crate::r1cs::ComR1CSProof<R>>,
     mlen_mats: usize,
@@ -1085,13 +1085,13 @@ where
 /// Runs the count-only builder pass (Pass 0) for the inner tiny gate, then assembles
 /// the outer merge: `[ONE] ++ params_prefix[1..] ++ tiny_gate_asg[1..]`.
 #[cfg(feature = "we_gate")]
-fn build_we_plus_tiny_assignment_only<R>(
+pub(crate) fn build_we_plus_tiny_assignment_from_extra<R>(
     trace: &PoseidonTranscriptTrace<BF<R>>,
     params: &WeParams,
     stmt_digest: &[F257; 32],
     binding_witness: &WeStatementBindingWitness,
-    proof: &crate::plus::PlusProof<R, crate::r1cs::ComR1CSProof<R>>,
-    mlen_mats: usize,
+    extra: &tiny::TinyExtraWitness,
+    _mlen_mats: usize,
     pairs: &[(usize, usize)],
 ) -> Result<Vec<F257>, String>
 where
@@ -1099,7 +1099,6 @@ where
     R::BaseRing: Zq + Field + PrimeField,
 {
     let ring_dim = R::dimension();
-    let extra = tiny_extra_witness_from_plus_proof::<R>(params, proof, mlen_mats)?;
 
     // Lift recorded ops and infer wiring for the verifier transcript tiny gate.
     let ops_f257 = tiny::lift_recording_trace_ops_to_f257::<BF<R>>(&trace.ops)?;
@@ -1140,7 +1139,7 @@ where
         params,
         &wiring_abs,
         pairs,
-        &extra,
+        extra,
     )?;
 
     // ---- Params prefix assignment -----------------------------------------
@@ -1263,6 +1262,32 @@ where
     merged.extend_from_slice(&asg_stmt[1..]);
 
     Ok(merged)
+}
+
+#[cfg(feature = "we_gate")]
+fn build_we_plus_tiny_assignment_only<R>(
+    trace: &PoseidonTranscriptTrace<BF<R>>,
+    params: &WeParams,
+    stmt_digest: &[F257; 32],
+    binding_witness: &WeStatementBindingWitness,
+    proof: &crate::plus::PlusProof<R, crate::r1cs::ComR1CSProof<R>>,
+    mlen_mats: usize,
+    pairs: &[(usize, usize)],
+) -> Result<Vec<F257>, String>
+where
+    R: OverField + CoeffRing + PolyRing,
+    R::BaseRing: Zq + Field + PrimeField,
+{
+    let extra = tiny_extra_witness_from_plus_proof::<R>(params, proof, mlen_mats)?;
+    build_we_plus_tiny_assignment_from_extra::<R>(
+        trace,
+        params,
+        stmt_digest,
+        binding_witness,
+        &extra,
+        mlen_mats,
+        pairs,
+    )
 }
 
 #[cfg(all(test, feature = "we_gate"))]
