@@ -233,9 +233,20 @@ fn digest_daleo_proof_into(h: &mut sha2::Sha256, proof: &H12DaleoProof) {
     for &v in &proof.blind_values {
         h.update(v.to_le_bytes());
     }
-    h.update((proof.compressed_opening_bytes.len() as u32).to_le_bytes());
-    for &v in &proof.compressed_opening_bytes {
+    h.update((proof.opening_projection_residuals.len() as u32).to_le_bytes());
+    for &v in &proof.opening_projection_residuals {
         h.update(v.to_le_bytes());
+    }
+    h.update((proof.h_projection_residuals.len() as u32).to_le_bytes());
+    for &v in &proof.h_projection_residuals {
+        h.update(v.to_le_bytes());
+    }
+    h.update((proof.h_opened_logical_rows.len() as u32).to_le_bytes());
+    for row in &proof.h_opened_logical_rows {
+        h.update((row.len() as u32).to_le_bytes());
+        for &v in row {
+            h.update(v.to_le_bytes());
+        }
     }
     h.update((proof.ajtai_commitment_rows.len() as u32).to_le_bytes());
     for row in &proof.ajtai_commitment_rows {
@@ -254,7 +265,7 @@ pub fn write_augmented_package(
     w: &mut impl Write,
     pkg: &H12AlvoAugmentedPackage,
 ) -> std::io::Result<()> {
-    w.write_all(b"LFP1ALVOA5")?;
+    w.write_all(b"LFP1ALVOA7")?;
     w.write_all(&pkg.stage1_lock_package_hash)?;
     write_u32(w, pkg.stage1_lock_package.len() as u32)?;
     w.write_all(pkg.stage1_lock_package.as_slice())?;
@@ -295,7 +306,7 @@ pub fn write_augmented_package(
 pub fn read_augmented_package(r: &mut impl Read) -> std::io::Result<H12AlvoAugmentedPackage> {
     let mut magic = [0u8; 10];
     r.read_exact(&mut magic)?;
-    if &magic != b"LFP1ALVOA5" {
+    if &magic != b"LFP1ALVOA7" {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "bad H12 ALVO augmented package magic",
@@ -573,9 +584,20 @@ fn write_daleo_proof(w: &mut impl Write, proof: &H12DaleoProof) -> std::io::Resu
     for &v in &proof.blind_values {
         write_u16(w, v)?;
     }
-    write_u32(w, proof.compressed_opening_bytes.len() as u32)?;
-    for &v in &proof.compressed_opening_bytes {
+    write_u32(w, proof.opening_projection_residuals.len() as u32)?;
+    for &v in &proof.opening_projection_residuals {
         write_u16(w, v)?;
+    }
+    write_u32(w, proof.h_projection_residuals.len() as u32)?;
+    for &v in &proof.h_projection_residuals {
+        write_u16(w, v)?;
+    }
+    write_u32(w, proof.h_opened_logical_rows.len() as u32)?;
+    for row in &proof.h_opened_logical_rows {
+        write_u32(w, row.len() as u32)?;
+        for &v in row {
+            write_u16(w, v)?;
+        }
     }
     write_u32(w, proof.ajtai_commitment_rows.len() as u32)?;
     for row in &proof.ajtai_commitment_rows {
@@ -605,10 +627,25 @@ fn read_daleo_proof(r: &mut impl Read) -> std::io::Result<H12DaleoProof> {
     for _ in 0..blind_n {
         blind_values.push(read_u16(r)?);
     }
-    let compressed_n = read_u32(r)? as usize;
-    let mut compressed_opening_bytes = Vec::with_capacity(compressed_n);
-    for _ in 0..compressed_n {
-        compressed_opening_bytes.push(read_u16(r)?);
+    let opening_proj_n = read_u32(r)? as usize;
+    let mut opening_projection_residuals = Vec::with_capacity(opening_proj_n);
+    for _ in 0..opening_proj_n {
+        opening_projection_residuals.push(read_u16(r)?);
+    }
+    let h_proj_n = read_u32(r)? as usize;
+    let mut h_projection_residuals = Vec::with_capacity(h_proj_n);
+    for _ in 0..h_proj_n {
+        h_projection_residuals.push(read_u16(r)?);
+    }
+    let logical_rows_n = read_u32(r)? as usize;
+    let mut h_opened_logical_rows = Vec::with_capacity(logical_rows_n);
+    for _ in 0..logical_rows_n {
+        let len = read_u32(r)? as usize;
+        let mut row = Vec::with_capacity(len);
+        for _ in 0..len {
+            row.push(read_u16(r)?);
+        }
+        h_opened_logical_rows.push(row);
     }
     let row_n = read_u32(r)? as usize;
     let mut ajtai_commitment_rows = Vec::with_capacity(row_n);
@@ -633,7 +670,9 @@ fn read_daleo_proof(r: &mut impl Read) -> std::io::Result<H12DaleoProof> {
         },
         local_view_values,
         blind_values,
-        compressed_opening_bytes,
+        opening_projection_residuals,
+        h_projection_residuals,
+        h_opened_logical_rows,
         ajtai_commitment_rows,
         designated_challenge,
     })
@@ -732,9 +771,11 @@ mod tests {
             },
             local_view_values: vec![tag as u16, (tag as u16) + 1],
             blind_values: vec![(tag as u16) + 2],
-            compressed_opening_bytes: vec![(tag as u16) + 3],
+            opening_projection_residuals: vec![(tag as u16) + 3],
+            h_projection_residuals: vec![(tag as u16) + 4],
+            h_opened_logical_rows: vec![vec![(tag as u16) + 6, (tag as u16) + 7]],
             ajtai_commitment_rows: vec![vec![tag as u64, (tag as u64) + 1]],
-            designated_challenge: vec![(tag as u16) + 4],
+            designated_challenge: vec![(tag as u16) + 5],
         }
     }
 

@@ -15,7 +15,7 @@
 use ark_crypto_primitives::sponge::{poseidon::PoseidonSponge, CryptographicSponge};
 use ark_ff::{BigInteger, PrimeField};
 use rayon::prelude::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::time::Instant;
 
@@ -737,13 +737,26 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
                 const BASE_K: usize = 48;
                 const RANK: usize = 3;
                 const SIDE: usize = 2 * BASE_K - 1; // 95
+                let max_high_dims = std::env::var("LFP_T43_MAX_HIGH_DIMS")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0)
+                    .min(RANK);
                 let mut tmp = cand;
                 let mut bad = false;
+                let mut high_dims = 0usize;
                 for _ in 0..RANK {
                     let c = tmp % BASE_N;
                     if c >= BASE_K && c < SIDE {
                         bad = true;
                         break;
+                    }
+                    if c >= SIDE {
+                        high_dims += 1;
+                        if high_dims > max_high_dims {
+                            bad = true;
+                            break;
+                        }
                     }
                     tmp /= BASE_N;
                 }
@@ -1049,12 +1062,90 @@ impl<F: PrimeField, P: Dr1csNpFlpcpSparseApi<F>> Theorem43Dpp<F, P> {
     where
         P: Sync,
     {
-        checks
+        let profile = std::env::var("LFP_PROFILE_ALVO_EXPORT")
+            .ok()
+            .is_some_and(|v| v != "0");
+        let t_total = Instant::now();
+        let t_layout = Instant::now();
+        let proof_layout = self.flpcp.proof_layout_info()?;
+        if profile {
+            eprintln!(
+                "[alvo:profile] schedule proof_layout_info elapsed={:?}",
+                t_layout.elapsed()
+            );
+        }
+
+        // `H_j` constraints depend only on `block_id` (not `rep_id`), so compute each block once.
+        let unique_blocks: Vec<usize> = {
+            let mut set = BTreeSet::new();
+            for &(block_id, _) in checks {
+                set.insert(block_id);
+            }
+            set.into_iter().collect()
+        };
+        let t_h_cache = Instant::now();
+        let h_by_block_pairs: Vec<(usize, Vec<Dr1csBlockLinearConstraint<F>>)> = unique_blocks
+            .par_iter()
+            .map(|&block_id| {
+                let t_block = Instant::now();
+                let h_constraints = self.flpcp.export_w_eval_block_linear_constraints(block_id)?;
+                if profile {
+                    eprintln!(
+                        "[alvo:profile] schedule h_cache block_id={} elapsed={:?} constraints={}",
+                        block_id,
+                        t_block.elapsed(),
+                        h_constraints.len()
+                    );
+                }
+                Ok::<_, String>((block_id, h_constraints))
+            })
+            .collect::<Result<_, _>>()?;
+        let h_by_block: BTreeMap<usize, Vec<Dr1csBlockLinearConstraint<F>>> =
+            h_by_block_pairs.into_iter().collect();
+        if profile {
+            eprintln!(
+                "[alvo:profile] schedule h_cache elapsed={:?} unique_blocks={} checks={}",
+                t_h_cache.elapsed(),
+                h_by_block.len(),
+                checks.len()
+            );
+        }
+
+        let t_surfaces = Instant::now();
+        let out = checks
             .par_iter()
             .map(|&(block_id, rep_id)| {
-                self.export_alvo_local_check_surface_from_stmt(c_stmt, x, block_id, rep_id)
+                let local_check =
+                    self.export_capsule_local_check_surface_from_stmt(c_stmt, x, block_id, rep_id)?;
+                let touched_pi_positions_exact = local_check.touched_pi_positions(false);
+                let touched_pi_positions_conservative =
+                    local_check.touched_pi_positions(local_check.requires_dense_q3_w_eval);
+                let h_w_eval_constraints = h_by_block
+                    .get(&block_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "export_alvo_schedule_from_stmt: missing cached H constraints for block_id={}",
+                            block_id
+                        )
+                    })?
+                    .clone();
+                Ok::<_, String>(Theorem43AlvoLocalCheckSurface {
+                    local_check,
+                    proof_layout: proof_layout.clone(),
+                    h_w_eval_constraints,
+                    touched_pi_positions_exact,
+                    touched_pi_positions_conservative,
+                })
             })
-            .collect()
+            .collect::<Result<Vec<_>, String>>()?;
+        if profile {
+            eprintln!(
+                "[alvo:profile] schedule surfaces elapsed={:?} total={:?}",
+                t_surfaces.elapsed(),
+                t_total.elapsed()
+            );
+        }
+        Ok(out)
     }
 
 }

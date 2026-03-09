@@ -12,7 +12,6 @@ use rand::RngCore;
 use rayon::prelude::*;
 use rayon::join;
 use std::collections::HashMap;
-use sha2::Digest;
 
 use crate::packing::{BoundedFlpcp, BoundedFlpcpSparse, FlpcpPredicate};
 use crate::rs::{barycentric_weights_consecutive, extrapolate_consecutive_next_block, lagrange_coeffs_at};
@@ -54,36 +53,6 @@ pub struct Dr1csProofLayoutInfo {
 pub struct Dr1csBlockLinearConstraint<F: PrimeField> {
     pub constant: F,
     pub terms: Vec<(usize, F)>,
-}
-
-pub const ALVO_H_COMPRESS_EQS: usize = 16;
-
-pub fn sample_h_constraint_positions(k: usize, k_star: usize, block_id: usize) -> Vec<usize> {
-    if k_star <= k {
-        return Vec::new();
-    }
-    let side_len = k_star - k;
-    let target = side_len.min(ALVO_H_COMPRESS_EQS);
-    let mut out = Vec::with_capacity(target);
-    let mut seen = std::collections::BTreeSet::new();
-    let mut ctr = 0u32;
-    while out.len() < target {
-        let mut h = sha2::Sha256::new();
-        h.update(b"LFP_ALVO_H_COMPRESS_V1");
-        h.update((block_id as u64).to_le_bytes());
-        h.update((k as u64).to_le_bytes());
-        h.update((k_star as u64).to_le_bytes());
-        h.update(ctr.to_le_bytes());
-        let bytes: [u8; 32] = h.finalize().into();
-        let mut raw = [0u8; 8];
-        raw.copy_from_slice(&bytes[..8]);
-        let pos = k + (u64::from_le_bytes(raw) as usize % side_len);
-        if seen.insert(pos) {
-            out.push(pos);
-        }
-        ctr = ctr.wrapping_add(1);
-    }
-    out
 }
 
 /// Minimal NP-style dR1CS FLPCP API for lockable Theorem-4.3.
@@ -1808,8 +1777,10 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         if witness_pos.len() != k_star {
             return Err("export_w_eval_block_linear_constraints: witness positions length mismatch".to_string());
         }
-        let sampled_positions = sample_h_constraint_positions(k, k_star, block_id);
-        sampled_positions
+        if k >= k_star {
+            return Ok(Vec::new());
+        }
+        (k..k_star)
             .into_par_iter()
             .map(|pos| -> Result<Dr1csBlockLinearConstraint<F>, String> {
                 let idx = witness_pos[pos];

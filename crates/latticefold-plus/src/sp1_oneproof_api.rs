@@ -29,7 +29,10 @@ use crate::h12_alvo::{
     read_augmented_package, write_augmented_package, H12AlvoAnchorProjection, H12AlvoAugmentedPackage, H12AlvoClaim,
     H12AlvoLogicalLockAugmentation, H12AlvoRepSurfaceBundle,
 };
-use crate::h12_alvo_daleo::{prove_daleo_from_local_view, witness_from_daleo_proof};
+use crate::h12_alvo_daleo::{
+    prove_daleo_from_local_view_with_surfaces, verify_daleo_h_projection_from_surfaces,
+    witness_from_daleo_proof,
+};
 use crate::lin::LinearizedVerify;
 use crate::lockable_ringlwe::{
     RingLweLockArtifact, RingLweParams,
@@ -520,7 +523,7 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
     let r_reps: usize = std::env::var("LFP_ONEPROOF_REPS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1)
+        .unwrap_or(16)
         .max(1);
     let total_locks = p_locks
         .checked_mul(r_reps)
@@ -642,11 +645,7 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
         let enable_h12_alvo = std::env::var("LFP_ONEPROOF_ENABLE_H12_ALVO")
             .ok()
             .is_some_and(|v| v != "0");
-        let r_cap_reps: usize = std::env::var("LFP_H12_RCAP_REPS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1)
-            .max(1);
+        let r_cap_reps: usize = r_reps;
         let h12_seed_mode = std::env::var("LFP_H12_SEED_MODE")
             .unwrap_or_else(|_| "ext16".to_string());
         for ll in &mut logical_locks {
@@ -671,14 +670,11 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
                     t_sched.elapsed(),
                     schedule_surfaces.len()
                 );
-                cached_schedule_surfaces = Some(schedule_surfaces.clone());
-                ll.h12_alvo_schedule_digest = Some(crate::h12_alvo::digest_alvo_schedule(
+                let schedule_digest = crate::h12_alvo::digest_alvo_schedule(
                     schedule_surfaces.as_slice(),
                     crate::h12_rcap::H12_RCAP_PACK_D,
-                ));
-                let schedule_digest = ll
-                    .h12_alvo_schedule_digest
-                    .expect("set above");
+                );
+                ll.h12_alvo_schedule_digest = Some(schedule_digest);
                 h12_alvo_stage1_root = Some(derive_stage1_root(
                     &stmt_digest,
                     &lock_coin_seed,
@@ -686,6 +682,7 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
                     r_cap_reps as u16,
                     &schedule_digest,
                 ));
+                cached_schedule_surfaces = Some(schedule_surfaces);
                 let t_rep = Instant::now();
                 let rep_bundle_hashes: Vec<[u8; 32]> = ll
                     .reps
@@ -798,11 +795,7 @@ pub fn arm_sp1_oneproof_we_gate_write_lock_package(
         let enable_h12_alvo = std::env::var("LFP_ONEPROOF_ENABLE_H12_ALVO")
             .ok()
             .is_some_and(|v| v != "0");
-        let r_cap_reps: usize = std::env::var("LFP_H12_RCAP_REPS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1)
-            .max(1);
+        let r_cap_reps: usize = r_reps;
         for ll in &logical_locks {
             let checks = crate::h12_rcap::capsule_checks_from_logical_lock_with_r_cap(
                 ll.reps.as_slice(),
@@ -2229,47 +2222,42 @@ fn build_h12_alvo_lock_augmentations(
                 ));
             }
         }
-        if std::env::var("LFP_H12_DALEO_VALIDATE_H")
-            .ok()
-            .is_some_and(|v| v != "0")
-        {
-            for (surface_idx, surface) in surfaces.iter().enumerate() {
-                let row = streamed_w_eval_by_logical.get(&surface.local_check.block_id).ok_or_else(|| {
-                    format!(
-                        "oneproof: missing streamed row for H_j check: share_index={} block_id={}",
-                        ll.share_index, surface.local_check.block_id
-                    )
-                })?;
-                for (h_idx, h_cons) in surface.h_w_eval_constraints.iter().enumerate() {
-                    let mut acc = crate::lockable_ringlwe::field_mod257_u16(&h_cons.constant);
-                    for &(pos, coeff) in &h_cons.terms {
-                        let v = *row.get(pos).ok_or_else(|| {
-                            format!(
-                                "oneproof: H_j row position out of range: share_index={} block_id={} constraint={} pos={} row_len={}",
-                                ll.share_index,
-                                surface.local_check.block_id,
-                                h_idx,
-                                pos,
-                                row.len()
-                            )
-                        })?;
-                        let coeff_u16 = crate::lockable_ringlwe::field_mod257_u16(&coeff);
-                        acc = crate::lockable_ringlwe::add_mod257_u16(
-                            acc,
-                            crate::lockable_ringlwe::mul_mod257_u16(coeff_u16, v),
-                        );
-                    }
-                    if acc != 0 {
-                        return Err(format!(
-                            "oneproof: direct H_j mismatch for share_index={} surface_idx={} block_id={} rep_id={} constraint={} value={}",
+        // Directly enforce all exported H_j block-linear residual rows:
+        // e^H[p] = w[p] - Σ_{i<k} λ_{p,i} w[i], for all side positions.
+        for (surface_idx, surface) in surfaces.iter().enumerate() {
+            let base = &surface.local_check;
+            let row = streamed_w_eval_by_logical.get(&base.block_id).ok_or_else(|| {
+                format!(
+                    "oneproof: missing streamed row for H_j check: share_index={} block_id={}",
+                    ll.share_index, base.block_id
+                )
+            })?;
+            for (h_idx, h_cons) in surface.h_w_eval_constraints.iter().enumerate() {
+                let mut acc = h_cons.constant;
+                for &(pos, coeff) in &h_cons.terms {
+                    let w_u16 = *row.get(pos).ok_or_else(|| {
+                        format!(
+                            "oneproof: H_j position out of range: share_index={} surface_idx={} constraint={} block_id={} pos={} row_len={}",
                             ll.share_index,
                             surface_idx,
-                            surface.local_check.block_id,
-                            surface.local_check.rep_id,
                             h_idx,
-                            acc
-                        ));
-                    }
+                            base.block_id,
+                            pos,
+                            row.len(),
+                        )
+                    })?;
+                    acc += coeff * F257::from((w_u16 % 257) as u64);
+                }
+                if acc != F257::ZERO {
+                    return Err(format!(
+                        "oneproof: direct H_j mismatch for share_index={} surface_idx={} constraint={} block_id={} rep_id={} value={}",
+                        ll.share_index,
+                        surface_idx,
+                        h_idx,
+                        base.block_id,
+                        base.rep_id,
+                        crate::lockable_ringlwe::field_mod257_u16(&acc)
+                    ));
                 }
             }
         }
@@ -2281,12 +2269,20 @@ fn build_h12_alvo_lock_augmentations(
             z_w,
             &streamed_w_eval_by_logical,
         )?;
-        let daleo_proof = prove_daleo_from_local_view(
+        let daleo_proof = prove_daleo_from_local_view_with_surfaces(
             &daleo_compiled.compiled,
+            surfaces.as_slice(),
+            &streamed_w_eval_by_logical,
             local_view.as_slice(),
             &mut daleo_rng,
         )
         .map_err(|e| format!("oneproof: prove H12 DALEO failed: {e}"))?;
+        verify_daleo_h_projection_from_surfaces(
+            &daleo_compiled.compiled,
+            &daleo_proof,
+            surfaces.as_slice(),
+        )
+        .map_err(|e| format!("oneproof: verify strict H12 DALEO H projection failed: {e}"))?;
         let daleo_witness = witness_from_daleo_proof(&daleo_compiled.compiled, &daleo_proof)
             .map_err(|e| format!("oneproof: rebuild H12 DALEO witness failed: {e}"))?;
         daleo_compiled
@@ -3076,6 +3072,12 @@ pub fn decap_sp1_oneproof_we_gate_from_augmented_h12_alvo_package(
         let daleo_compiled =
             crate::h12_rcap::compile_alvo_seed_constraint_system(aug.surfaces.as_slice(), &aug.stage1_root)
                 .map_err(|e| format!("oneproof: compile H12 DALEO seed relation failed: {e}"))?;
+        verify_daleo_h_projection_from_surfaces(
+            &daleo_compiled.compiled,
+            aug.daleo_proof.as_ref().expect("checked above"),
+            aug.surfaces.as_slice(),
+        )
+        .map_err(|e| format!("oneproof: verify H12 DALEO H projection failed: {e}"))?;
         let witness_values = witness_from_daleo_proof(
             &daleo_compiled.compiled,
             aug.daleo_proof.as_ref().expect("checked above"),
@@ -3701,7 +3703,25 @@ fn write_lock_package(
         std::env::var("LFP_ONEPROOF_LOCKPKG_ZSTD_LEVEL")
             .ok()
             .and_then(|s| s.parse::<i32>().ok())
-            .unwrap_or(7)
+            .unwrap_or(5)
+    }
+    fn zstd_threads() -> u32 {
+        std::env::var("LFP_ONEPROOF_LOCKPKG_ZSTD_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get() as u32)
+                    .unwrap_or(1)
+                    .max(1)
+            })
+    }
+    fn io_buf_bytes() -> usize {
+        std::env::var("LFP_ONEPROOF_LOCKPKG_BUF_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(8 * 1024 * 1024)
+            .max(64 * 1024)
     }
 
     // Optional wrapper compression:
@@ -3710,12 +3730,22 @@ fn write_lock_package(
     const MAGIC_ZSTD_V3: &[u8; 10] = b"LFP1LOCKZ3";
 
     let f = std::fs::File::create(path)?;
-    let mut w = std::io::BufWriter::new(f);
+    let mut w = std::io::BufWriter::with_capacity(io_buf_bytes(), f);
     if zstd_enabled_for_path(path) {
         w.write_all(MAGIC_ZSTD_V3)?;
         let level = zstd_level();
         let mut enc = zstd::stream::write::Encoder::new(w, level)?;
-        write_lock_package_to_writer(&mut enc, manifest, logical_locks)?;
+        let threads = zstd_threads();
+        if threads > 0 {
+            // Stage1 package writing is often the long tail; use zstd workers by default.
+            enc.multithread(threads)?;
+        }
+        {
+            // Buffer tiny field/hint writes into larger chunks before feeding zstd.
+            let mut enc_buf = std::io::BufWriter::with_capacity(io_buf_bytes(), &mut enc);
+            write_lock_package_to_writer(&mut enc_buf, manifest, logical_locks)?;
+            enc_buf.flush()?;
+        }
         let mut w = enc.finish()?;
         w.flush()?;
         Ok(())

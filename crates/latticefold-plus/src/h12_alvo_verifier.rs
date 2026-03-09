@@ -297,7 +297,6 @@ pub fn verify_alvo_surface_relation(
         openings.push(H12PiBlockOpening {
             block_index: need_block as u32,
             values: vals.iter().copied().map(f257_to_u16).collect(),
-            siblings: Vec::new(),
         });
     }
     let witness = compiled.witness_from_openings(openings.as_slice())?;

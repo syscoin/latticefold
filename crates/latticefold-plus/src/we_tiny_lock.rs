@@ -462,8 +462,10 @@ impl<F: PrimeField, C: MulCode<F> + Sync> Dr1csNpFlpcpSparseApi<F>
         if witness_pos.len() != k_star {
             return Err("export_w_eval_block_linear_constraints: witness positions length mismatch".to_string());
         }
-        let sampled_positions = dpp::dr1cs_flpcp::sample_h_constraint_positions(k, k_star, block_id);
-        sampled_positions
+        if k >= k_star {
+            return Ok(Vec::new());
+        }
+        (k..k_star)
             .into_par_iter()
             .map(|pos| -> Result<Dr1csBlockLinearConstraint<F>, String> {
                 let idx = witness_pos[pos];

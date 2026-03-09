@@ -10,6 +10,7 @@
 
 use ark_ff::PrimeField;
 use rand::RngCore;
+use rayon::prelude::*;
 
 use crate::aadp_we::AadpConstraintSystem;
 use crate::f257_ext16::F257Ext16;
@@ -122,15 +123,17 @@ pub fn aadp_encrypt_ext16_seed<R: RngCore>(
         for (dst, src) in matrices[0].iter_mut().zip(b_xi.iter()) {
             *dst += *src * xi_constant;
         }
-        for idx in 0..cs.num_variables {
-            let coeff = F257Ext16::random(rng);
-            let dst = matrices
-                .get_mut(idx + 1)
-                .ok_or_else(|| format!("AADP-ext xi variable index out of range: idx={idx}"))?;
-            for (d, s) in dst.iter_mut().zip(b_xi.iter()) {
-                *d += *s * coeff;
-            }
-        }
+        let xi_coeffs: Vec<F257Ext16> = (0..cs.num_variables)
+            .map(|_| F257Ext16::random(rng))
+            .collect();
+        matrices[1..]
+            .par_iter_mut()
+            .zip(xi_coeffs.into_par_iter())
+            .for_each(|(dst, coeff)| {
+                for (d, s) in dst.iter_mut().zip(b_xi.iter()) {
+                    *d += *s * coeff;
+                }
+            });
     }
 
     let msg = F257Ext16::from_u128_seed(u128::from_le_bytes(seed));
