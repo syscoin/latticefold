@@ -1,4 +1,4 @@
-//! Packed `pi0` opening helpers used by H12 DALEO.
+//! Packed `pi0` opening helpers used by H12 GERM.
 //!
 //! The live path uses Ajtai commitments, so this module only keeps:
 //! - opened block payload shape (`H12PiBlockOpening`)

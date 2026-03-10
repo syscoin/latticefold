@@ -2,7 +2,8 @@
 //!
 //! This example is intentionally a **thin wrapper** over:
 //! - `latticefold_plus::sp1_oneproof_api::arm_sp1_oneproof_we_gate_write_lock_package` (arming)
-//! - `latticefold_plus::sp1_oneproof_api::decap_sp1_oneproof_we_gate_from_files_with_lock_package` (decap)
+//! - `latticefold_plus::sp1_oneproof_api::build_sp1_oneproof_we_gate_write_tiny_extra_sidecar` (sidecar generation)
+//! - `latticefold_plus::sp1_oneproof_api::decap_sp1_oneproof_we_gate_h12_alvo_lock_package` (augmentation/decap)
 //!
 //! Usage:
 //!   SP1_R1LF=/path/to/shrink_verifier.r1lf \
@@ -12,21 +13,17 @@
 //!   SP1_PUBLIC_VALUES_DIGEST_U64_CSV=u0,u1,u2,u3,u4,u5,u6,u7 \
 //!     cargo run -p latticefold-plus --example lf_plus_sp1_oneproof_api --features we_gate --release
 //!
-//! Or decap (read pre-armed package):
+//! Build witness sidecar once from proof/witness:
 //!   SP1_R1LF=/path/to/shrink_verifier.r1lf \
 //!   SP1_WITNESS=/path/to/shrink_verifier.witness.bundle \
-//!   LFP_ONEPROOF_LOCK_PKG_IN=/path/to/lock_pkg.bin \
+//!   LFP_ONEPROOF_TINY_EXTRA_OUT=/path/to/proof_witness.tinyextra \
 //!     cargo run -p latticefold-plus --example lf_plus_sp1_oneproof_api --features we_gate --release
 //!
-//! Or stage-2 H12 ALVO augmentation:
+//! Then decap any compatible stage1 package using that sidecar:
 //!   SP1_R1LF=/path/to/shrink_verifier.r1lf \
 //!   SP1_WITNESS=/path/to/shrink_verifier.witness.bundle \
 //!   LFP_ONEPROOF_LOCK_PKG_IN=/path/to/stage1_lock_pkg.bin \
-//!   LFP_ONEPROOF_H12_ALVO_AUG_PKG_OUT=/path/to/final_augmented_pkg.bin \
-//!     cargo run -p latticefold-plus --example lf_plus_sp1_oneproof_api --features we_gate --release
-//!
-//! Or offline decap from the final augmented H12 ALVO package:
-//!   LFP_ONEPROOF_H12_ALVO_AUG_PKG_IN=/path/to/final_augmented_pkg.bin \
+//!   LFP_ONEPROOF_TINY_EXTRA_IN=/path/to/proof_witness.tinyextra \
 //!     cargo run -p latticefold-plus --example lf_plus_sp1_oneproof_api --features we_gate --release
 //!
 //! One-time helper (extract statement inputs from witness bundle):
@@ -135,8 +132,7 @@ fn main() {
     );
     let t_total = std::time::Instant::now();
     let r1lf_path = std::env::var("SP1_R1LF").expect("Set SP1_R1LF=/path/to/shrink.r1lf");
-    let witness_path = std::env::var("SP1_WITNESS")
-        .unwrap_or_else(|_| "/dev/null".to_string());
+    let witness_path = std::env::var("SP1_WITNESS").unwrap_or_else(|_| "/dev/null".to_string());
 
     // One-time helper: extract statement inputs from the witness bundle so arming can be run
     // witness-free later (WE headspace).
@@ -146,8 +142,9 @@ fn main() {
         == Some("1")
     {
         let hdr = latticefold_plus::sp1_r1lf::read_r1lf_stats(&r1lf_path).expect("read_r1lf_stats");
-        let bundle = latticefold_plus::sp1_witness_io::load_sp1_witness_any(&witness_path, hdr.num_vars)
-            .expect("load_sp1_witness_any");
+        let bundle =
+            latticefold_plus::sp1_witness_io::load_sp1_witness_any(&witness_path, hdr.num_vars)
+                .expect("load_sp1_witness_any");
         if bundle.r1lf_digest != hdr.digest {
             panic!("witness bundle r1lf_digest mismatch vs r1lf header digest");
         }
@@ -156,7 +153,10 @@ fn main() {
         let l_pub = hdr.num_public;
         let pub_words = &bundle.witness[1..1 + l_pub];
         if pub_words.len() < 8 {
-            panic!("expected at least 8 public inputs (got={})", pub_words.len());
+            panic!(
+                "expected at least 8 public inputs (got={})",
+                pub_words.len()
+            );
         }
         let digest_words8_csv = pub_words[0..8]
             .iter()
@@ -189,7 +189,10 @@ fn main() {
             let csv = std::env::var("SP1_PUBLIC_VALUES_DIGEST_U64_CSV")
                 .expect("Set SP1_PUBLIC_VALUES_DIGEST_U64_CSV=u0,u1,u2,u3,u4,u5,u6,u7");
             let xs = parse_u64_csv(&csv);
-            assert!(xs.len() == 8, "SP1_PUBLIC_VALUES_DIGEST_U64_CSV must have 8 values");
+            assert!(
+                xs.len() == 8,
+                "SP1_PUBLIC_VALUES_DIGEST_U64_CSV must have 8 values"
+            );
             xs.try_into().unwrap()
         };
         if hdr.num_public < 8 {
@@ -208,7 +211,10 @@ fn main() {
         )
         .expect("arm_sp1_oneproof_we_gate_write_lock_package");
 
-        println!("stmt_digest_f257_le16=0x{}", hex_stmt_digest(out.manifest.stmt_digest));
+        println!(
+            "stmt_digest_f257_le16=0x{}",
+            hex_stmt_digest(out.manifest.stmt_digest)
+        );
         println!("lock_coin_seed=0x{}", hex32(out.manifest.lock_coin_seed));
         println!("p_locks={}", out.k_locks);
         println!("r_reps={}", out.r_reps);
@@ -218,57 +224,41 @@ fn main() {
         return;
     }
 
-    // Stage-2 H12 ALVO augmentation: consume a stage-1 package + witness and emit a final
-    // augmented package with `C_pi` and offline-decapsulation material.
-    if let Ok(aug_pkg_out) = std::env::var("LFP_ONEPROOF_H12_ALVO_AUG_PKG_OUT") {
-        let lock_pkg_in = std::env::var("LFP_ONEPROOF_LOCK_PKG_IN")
-            .expect("Set LFP_ONEPROOF_LOCK_PKG_IN=/path/to/stage1_lock_pkg.bin");
+    // Build sidecar from witness/proof once (can be reused for multiple decaps).
+    if let Ok(tiny_extra_out) = std::env::var("LFP_ONEPROOF_TINY_EXTRA_OUT") {
         let out =
-            latticefold_plus::sp1_oneproof_api::augment_sp1_oneproof_we_gate_h12_alvo_lock_package(
+            latticefold_plus::sp1_oneproof_api::build_sp1_oneproof_we_gate_write_tiny_extra_sidecar(
                 &r1lf_path,
                 &witness_path,
-                &lock_pkg_in,
-                &aug_pkg_out,
+                &tiny_extra_out,
             )
-            .expect("augment_sp1_oneproof_we_gate_h12_alvo_lock_package");
-        println!("augmented_pkg_bytes={}", out.lock_pkg_bytes);
-        println!("logical_locks={}", out.logical_locks);
-        println!("pi0_len={}", out.pi0_len);
-        println!("pi0_commit_root=0x{}", hex32(out.pi0_commit_root));
-        eprintln!("[oneproof] total_elapsed={:?}", t_total.elapsed());
-        return;
-    }
-
-    // Final offline H12 ALVO decap path: does not require the witness bundle.
-    if let Ok(aug_pkg_in) = std::env::var("LFP_ONEPROOF_H12_ALVO_AUG_PKG_IN") {
-        let out = latticefold_plus::sp1_oneproof_api::decap_sp1_oneproof_we_gate_from_augmented_h12_alvo_package(
-            &aug_pkg_in,
-        )
-        .expect("decap_sp1_oneproof_we_gate_from_augmented_h12_alvo_package");
-        println!("stmt_digest_f257_le16=0x{}", hex_stmt_digest(out.stmt_digest));
+            .expect("build_sp1_oneproof_we_gate_write_tiny_extra_sidecar");
+        println!(
+            "stmt_digest_f257_le16=0x{}",
+            hex_stmt_digest(out.stmt_digest)
+        );
         println!("lock_coin_seed=0x{}", hex32(out.lock_coin_seed));
-        println!("selected_shares_len={}", out.selected_shares.len());
-        if let Some((share_idx, share)) = out.selected_shares.first() {
-            println!("first_selected_share_index={}", share_idx);
-            println!("first_selected_share=0x{}", hex32(*share));
-        }
+        println!("r1lf_digest=0x{}", hex32(out.r1lf_digest));
+        println!("tiny_extra_bytes={}", out.sidecar_bytes);
         eprintln!("[oneproof] total_elapsed={:?}", t_total.elapsed());
         return;
     }
 
-    // Otherwise: decap using pre-armed public package.
     let lock_pkg_in = std::env::var("LFP_ONEPROOF_LOCK_PKG_IN")
-        .expect("Set LFP_ONEPROOF_LOCK_PKG_IN=/path/to/lock_pkg.bin");
-    let out =
-        latticefold_plus::sp1_oneproof_api::decap_sp1_oneproof_we_gate_from_files_with_lock_package(
-            &r1lf_path,
-            &witness_path,
-            &lock_pkg_in,
-        )
-        .expect("decap_sp1_oneproof_we_gate_from_files_with_lock_package");
-
-    println!("stmt_digest_f257_le16=0x{}", hex_stmt_digest(out.stmt_digest));
-    println!("lock_coin_seed=0x{}", hex32(out.lock_coin_seed));
+        .expect("Set LFP_ONEPROOF_LOCK_PKG_IN=/path/to/stage1_lock_pkg.bin");
+    let tiny_extra_in = std::env::var("LFP_ONEPROOF_TINY_EXTRA_IN")
+        .expect("Set LFP_ONEPROOF_TINY_EXTRA_IN=/path/to/proof_witness.tinyextra");
+    let out = latticefold_plus::sp1_oneproof_api::decap_sp1_oneproof_we_gate_h12_alvo_lock_package(
+        &r1lf_path,
+        &witness_path,
+        &lock_pkg_in,
+        &tiny_extra_in,
+    )
+    .expect("decap_sp1_oneproof_we_gate_h12_alvo_lock_package");
+    println!("logical_locks={}", out.logical_locks);
+    println!("pi0_len={}", out.pi0_len);
+    println!("pi0_commit_root=0x{}", hex32(out.pi0_commit_root));
+    println!("share_candidates_len={}", out.share_candidates.len());
     println!("selected_shares_len={}", out.selected_shares.len());
     if let Some((share_idx, share)) = out.selected_shares.first() {
         println!("first_selected_share_index={}", share_idx);
@@ -276,4 +266,3 @@ fn main() {
     }
     eprintln!("[oneproof] total_elapsed={:?}", t_total.elapsed());
 }
-

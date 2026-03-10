@@ -10,8 +10,10 @@
 //!   has order `256`, so `X^16 - 3` gives a true field extension of size `257^16`
 //! - this gives a single monolithic message object with about `128.09` bits
 
-use core::fmt;
-use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+use core::{
+    fmt,
+    ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
+};
 
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
@@ -182,7 +184,11 @@ impl Neg for F257Ext16 {
     fn neg(self) -> Self::Output {
         let mut out = [0u16; F257_EXT16_DEGREE];
         for i in 0..F257_EXT16_DEGREE {
-            out[i] = if self.coeffs[i] == 0 { 0 } else { MOD_257 - self.coeffs[i] };
+            out[i] = if self.coeffs[i] == 0 {
+                0
+            } else {
+                MOD_257 - self.coeffs[i]
+            };
         }
         Self { coeffs: out }
     }
@@ -220,8 +226,9 @@ impl MulAssign for F257Ext16 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rand::{rngs::StdRng, SeedableRng};
+
+    use super::*;
 
     #[test]
     fn test_roundtrip_seed_u128() {
@@ -246,4 +253,3 @@ mod tests {
         }
     }
 }
-

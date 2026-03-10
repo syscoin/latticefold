@@ -6,13 +6,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ark_ff::Field;
-use dpp::dr1cs_flpcp::Dr1csProofLayoutInfo;
-use dpp::theorem43::Theorem43AlvoLocalCheckSurface;
-use latticefold::transcript::poseidon::F257;
 use ark_std::Zero;
+use dpp::{dr1cs_flpcp::Dr1csProofLayoutInfo, theorem43::Theorem43AlvoLocalCheckSurface};
+use latticefold::transcript::poseidon::F257;
 
-use crate::aadp_we::{AadpConstraintSystem, AadpLinearForm, AadpMulConstraint};
-use crate::h12_pi_commit::{f257_to_u16, H12PiBlockOpening};
+use crate::{
+    aadp_we::{AadpConstraintSystem, AadpLinearForm, AadpMulConstraint},
+    h12_pi_commit::{f257_to_u16, H12PiBlockOpening},
+};
 
 #[derive(Clone, Debug)]
 pub struct H12AlvoCompiledConstraintSystem {
@@ -201,7 +202,10 @@ impl H12AlvoCompiledConstraintSystem {
         Ok(out)
     }
 
-    pub fn witness_from_openings(&self, openings: &[H12PiBlockOpening]) -> Result<Vec<F257>, String> {
+    pub fn witness_from_openings(
+        &self,
+        openings: &[H12PiBlockOpening],
+    ) -> Result<Vec<F257>, String> {
         let mut by_block = BTreeMap::<usize, Vec<F257>>::new();
         for opening in openings {
             let block_idx = opening.block_index as usize;
@@ -287,8 +291,10 @@ pub fn verify_alvo_surface_relation(
         crate::h12_rcap::H12_RCAP_PACK_D,
     )?;
     verify_alvo_linear_h_j(surface, block_values.as_slice())?;
-    let compiled =
-        compile_alvo_constraint_system(std::slice::from_ref(surface), crate::h12_rcap::H12_RCAP_PACK_D)?;
+    let compiled = compile_alvo_constraint_system(
+        std::slice::from_ref(surface),
+        crate::h12_rcap::H12_RCAP_PACK_D,
+    )?;
     let mut openings = Vec::new();
     for &need_block in &compiled.opened_packed_pi_blocks {
         let vals = opening_blocks
@@ -317,9 +323,9 @@ fn reconstruct_pi0_slice_from_openings(
         let pi_idx = start_pi_idx + rel;
         let block_idx = pi_idx / pack_d;
         let pos = pi_idx % pack_d;
-        let block = opening_blocks
-            .get(&block_idx)
-            .ok_or_else(|| format!("H12 ALVO missing opening block {block_idx} for pi_idx={pi_idx}"))?;
+        let block = opening_blocks.get(&block_idx).ok_or_else(|| {
+            format!("H12 ALVO missing opening block {block_idx} for pi_idx={pi_idx}")
+        })?;
         let v = block.get(pos).ok_or_else(|| {
             format!(
                 "H12 ALVO opening block too short for pi_idx={} block={} pos={} block_len={}",
@@ -369,10 +375,15 @@ fn block_len_for_index(pi0_len: usize, pack_d: usize, block_index: usize) -> usi
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ark_ff::Field;
-    use dpp::dr1cs_flpcp::Dr1csProofLayoutInfo;
-    use dpp::theorem43::{Theorem43AlvoLocalCheckSurface, Theorem43CapsuleLocalCheckSurface, Theorem43Coins};
+    use dpp::{
+        dr1cs_flpcp::Dr1csProofLayoutInfo,
+        theorem43::{
+            Theorem43AlvoLocalCheckSurface, Theorem43CapsuleLocalCheckSurface, Theorem43Coins,
+        },
+    };
+
+    use super::*;
 
     fn mk_surface(block_id: usize, rep_id: u64) -> Theorem43AlvoLocalCheckSurface<F257> {
         let local = Theorem43CapsuleLocalCheckSurface {
@@ -420,12 +431,27 @@ mod tests {
     #[test]
     fn test_compile_alvo_constraint_system_extracts_block_witness() {
         let surfaces = vec![mk_surface(0, 7)];
-        let compiled = compile_alvo_constraint_system(surfaces.as_slice(), 4).expect("compile alvo");
+        let compiled =
+            compile_alvo_constraint_system(surfaces.as_slice(), 4).expect("compile alvo");
         assert_eq!(compiled.opened_packed_pi_blocks, vec![0, 2]);
         let pi0: Vec<F257> = (0u64..16u64).map(F257::from).collect();
-        let witness = compiled.witness_from_pi0(pi0.as_slice()).expect("witness from pi0");
+        let witness = compiled
+            .witness_from_pi0(pi0.as_slice())
+            .expect("witness from pi0");
         assert_eq!(witness.len(), compiled.cs.num_variables);
-        assert_eq!(witness, vec![F257::from(0), F257::from(1), F257::from(2), F257::from(3), F257::from(8), F257::from(9), F257::from(10), F257::from(11)]);
+        assert_eq!(
+            witness,
+            vec![
+                F257::from(0),
+                F257::from(1),
+                F257::from(2),
+                F257::from(3),
+                F257::from(8),
+                F257::from(9),
+                F257::from(10),
+                F257::from(11)
+            ]
+        );
     }
 
     #[test]
@@ -468,12 +494,10 @@ mod tests {
                 low_cube_len: 2,
                 witness_positions_star: vec![0, 1, 2, 3],
             },
-            h_w_eval_constraints: vec![
-                dpp::dr1cs_flpcp::Dr1csBlockLinearConstraint {
-                    constant: F257::ZERO,
-                    terms: vec![(3, F257::ONE), (0, -F257::ONE)],
-                },
-            ],
+            h_w_eval_constraints: vec![dpp::dr1cs_flpcp::Dr1csBlockLinearConstraint {
+                constant: F257::ZERO,
+                terms: vec![(3, F257::ONE), (0, -F257::ONE)],
+            }],
         };
         let mut opening_blocks = BTreeMap::<usize, Vec<F257>>::new();
         let mut block0 = (0u64..64u64).map(F257::from).collect::<Vec<_>>();

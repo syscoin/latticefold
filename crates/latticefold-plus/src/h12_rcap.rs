@@ -20,7 +20,7 @@ use crate::aadp_we::{
 };
 use crate::aadp_we_ext::{aadp_encrypt_ext16_seed, AadpCiphertextExt16};
 use crate::f257_ext16::F257Ext16;
-use crate::h12_alvo_daleo::{compile_daleo_constraint_system, H12DaleoCompiledConstraintSystem};
+use crate::h12_alvo_germ::{compile_germ_constraint_system, H12GermCompiledConstraintSystem};
 use crate::lockable_ringlwe::RingLweLockArtifact;
 
 /// Current packed `pi0` block size used by `lockable_ringlwe`.
@@ -245,7 +245,7 @@ pub struct H12CompiledConstraintSystem {
 
 #[derive(Clone, Debug)]
 pub struct H12AlvoSeedConstraintSystem {
-    pub compiled: H12DaleoCompiledConstraintSystem,
+    pub compiled: H12GermCompiledConstraintSystem,
 }
 
 /// Compile the current exact per-lock capsule relation over `F257`.
@@ -347,7 +347,7 @@ pub fn compile_alvo_seed_constraint_system(
     stage1_root: &[u8; 32],
 ) -> Result<H12AlvoSeedConstraintSystem, String> {
     Ok(H12AlvoSeedConstraintSystem {
-        compiled: compile_daleo_constraint_system(surfaces, stage1_root, H12_RCAP_PACK_D)?,
+        compiled: compile_germ_constraint_system(surfaces, stage1_root, H12_RCAP_PACK_D)?,
     })
 }
 

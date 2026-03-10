@@ -4,6 +4,7 @@
 
 pub mod cm;
 pub mod decomp;
+pub mod fs_cleanup;
 pub mod lin;
 pub mod mlin;
 pub mod plus;
@@ -14,7 +15,6 @@ pub mod streaming_sumcheck;
 pub mod tensor_eval;
 pub mod transcript;
 pub mod utils;
-pub mod fs_cleanup;
 
 // SP1 lift vacuity/soundness regression tests (WE-gate only).
 #[cfg(all(test, feature = "we_gate"))]
@@ -22,39 +22,41 @@ mod sp1_lift_cheat_tests;
 
 // WE/DPP arithmetization frontends (feature-gated; not needed in production proving path).
 #[cfg(feature = "we_gate")]
-pub mod recording_transcript;
-#[cfg(feature = "we_gate")]
-pub mod we_statement;
-#[cfg(feature = "we_gate")]
-pub mod we_gate_arith;
-#[cfg(feature = "we_gate")]
 pub mod aadp_we;
 #[cfg(feature = "we_gate")]
 pub mod aadp_we_ext;
 #[cfg(feature = "we_gate")]
 pub mod f257_ext16;
 #[cfg(feature = "we_gate")]
-pub mod we_goldilocks_poseidon_f257;
-#[cfg(feature = "we_gate")]
-pub mod we_gate_tiny;
-#[cfg(feature = "we_gate")]
-pub mod we_tiny_lock;
-#[cfg(feature = "we_gate")]
-pub mod lockable_ringlwe;
-#[cfg(feature = "we_gate")]
-pub mod h12_rcap;
+pub mod germ_field;
 #[cfg(feature = "we_gate")]
 pub mod h12_alvo;
 #[cfg(feature = "we_gate")]
-pub mod h12_alvo_daleo;
-#[cfg(feature = "we_gate")]
-pub mod h12_pi_commit;
+pub mod h12_alvo_germ;
 #[cfg(all(feature = "we_gate", test))]
 mod h12_alvo_verifier;
+#[cfg(feature = "we_gate")]
+pub mod h12_pi_commit;
+#[cfg(feature = "we_gate")]
+pub mod h12_rcap;
 #[cfg(feature = "we_gate")]
 pub mod lockable_lwe;
 #[cfg(feature = "we_gate")]
 pub mod lockable_pdk;
+#[cfg(feature = "we_gate")]
+pub mod lockable_ringlwe;
+#[cfg(feature = "we_gate")]
+pub mod recording_transcript;
+#[cfg(feature = "we_gate")]
+pub mod we_gate_arith;
+#[cfg(feature = "we_gate")]
+pub mod we_gate_tiny;
+#[cfg(feature = "we_gate")]
+pub mod we_goldilocks_poseidon_f257;
+#[cfg(feature = "we_gate")]
+pub mod we_statement;
+#[cfg(feature = "we_gate")]
+pub mod we_tiny_lock;
 
 // SP1 shrink verifier R1LF loader helpers (feature-gated; research only).
 // We gate these under `we_gate` so the WE/DPP benches can reuse them.

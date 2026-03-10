@@ -9,12 +9,11 @@
 //! witness input path that would need additional subfield-membership constraints here.
 
 use ark_ff::PrimeField;
+use latticefold::transcript::poseidon::F257;
 use rand::RngCore;
 use rayon::prelude::*;
 
-use crate::aadp_we::AadpConstraintSystem;
-use crate::f257_ext16::F257Ext16;
-use latticefold::transcript::poseidon::F257;
+use crate::{aadp_we::AadpConstraintSystem, f257_ext16::F257Ext16};
 
 #[derive(Clone, Debug)]
 pub struct AadpCiphertextExt16 {
@@ -77,9 +76,10 @@ impl AadpCiphertextExt16 {
         if coeff.is_zero() {
             return Err("AADP-ext decrypt failed: bottom-right cofactor is zero".to_string());
         }
-        let msg = det_eval * coeff.inverse().ok_or_else(|| {
-            "AADP-ext decrypt failed: cofactor inverse missing".to_string()
-        })?;
+        let msg = det_eval
+            * coeff
+                .inverse()
+                .ok_or_else(|| "AADP-ext decrypt failed: cofactor inverse missing".to_string())?;
         let seed = msg.to_u128_seed()?;
         Ok(seed.to_le_bytes())
     }
@@ -200,12 +200,8 @@ fn basis_matrix_contribution_ext16(
                 AadpBasisExt::B => {
                     l[row * 4 + 1] * r[dim + col] + l[row * 4 + 2] * r[2 * dim + col]
                 }
-                AadpBasisExt::C => {
-                    l[row * 4] * r[dim + col] + l[row * 4 + 2] * r[3 * dim + col]
-                }
-                AadpBasisExt::D => {
-                    l[row * 4 + 1] * r[col] + l[row * 4 + 3] * r[2 * dim + col]
-                }
+                AadpBasisExt::C => l[row * 4] * r[dim + col] + l[row * 4 + 2] * r[3 * dim + col],
+                AadpBasisExt::D => l[row * 4 + 1] * r[col] + l[row * 4 + 3] * r[2 * dim + col],
                 AadpBasisExt::Xi => {
                     -l[row * 4] * r[2 * dim + col] + l[row * 4 + 1] * r[3 * dim + col]
                 }
@@ -278,10 +274,11 @@ fn f257_to_u16(f: F257) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::aadp_we::{AadpLinearForm, AadpMulConstraint};
     use ark_ff::Field;
     use rand::{rngs::StdRng, SeedableRng};
+
+    use super::*;
+    use crate::aadp_we::{AadpLinearForm, AadpMulConstraint};
 
     #[test]
     fn test_aadp_ext16_encrypt_decrypt_seed() {
@@ -310,8 +307,9 @@ mod tests {
         let seed = [42u8; 16];
         let mut rng = StdRng::seed_from_u64(7);
         let ct = aadp_encrypt_ext16_seed(&cs, seed, &mut rng).expect("encrypt ext16 seed");
-        let got = ct.decrypt_seed(witness.as_slice()).expect("decrypt ext16 seed");
+        let got = ct
+            .decrypt_seed(witness.as_slice())
+            .expect("decrypt ext16 seed");
         assert_eq!(got, seed);
     }
 }
-

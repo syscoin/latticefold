@@ -329,21 +329,11 @@ fn basis_matrix_contribution<F: PrimeField>(
     for row in 0..dim {
         for col in 0..dim {
             let v = match basis {
-                AadpBasis::A => {
-                    l[row * 4] * r[col] + l[row * 4 + 3] * r[3 * dim + col]
-                }
-                AadpBasis::B => {
-                    l[row * 4 + 1] * r[dim + col] + l[row * 4 + 2] * r[2 * dim + col]
-                }
-                AadpBasis::C => {
-                    l[row * 4] * r[dim + col] + l[row * 4 + 2] * r[3 * dim + col]
-                }
-                AadpBasis::D => {
-                    l[row * 4 + 1] * r[col] + l[row * 4 + 3] * r[2 * dim + col]
-                }
-                AadpBasis::Xi => {
-                    -l[row * 4] * r[2 * dim + col] + l[row * 4 + 1] * r[3 * dim + col]
-                }
+                AadpBasis::A => l[row * 4] * r[col] + l[row * 4 + 3] * r[3 * dim + col],
+                AadpBasis::B => l[row * 4 + 1] * r[dim + col] + l[row * 4 + 2] * r[2 * dim + col],
+                AadpBasis::C => l[row * 4] * r[dim + col] + l[row * 4 + 2] * r[3 * dim + col],
+                AadpBasis::D => l[row * 4 + 1] * r[col] + l[row * 4 + 3] * r[2 * dim + col],
+                AadpBasis::Xi => -l[row * 4] * r[2 * dim + col] + l[row * 4 + 1] * r[3 * dim + col],
             };
             out[row * dim + col] = v;
         }
@@ -432,7 +422,9 @@ impl<F: PrimeField> AadpByteCiphertext<F> {
             }
             let b = *limbs.get(0).unwrap_or(&0u64);
             if b > 255 {
-                return Err(format!("AADP decrypted byte part out of range at index {i}: {b}"));
+                return Err(format!(
+                    "AADP decrypted byte part out of range at index {i}: {b}"
+                ));
             }
             out.push(b as u8);
         }
@@ -449,10 +441,11 @@ impl<F: PrimeField> AadpByteCiphertext<F> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ark_ff::Field;
     use latticefold::transcript::poseidon::F257;
     use rand::{rngs::StdRng, SeedableRng};
+
+    use super::*;
 
     #[test]
     fn test_aadp_encrypt_decrypt_scalar_simple_projective_safe_bitcheck() {
@@ -548,7 +541,9 @@ mod tests {
         let witness = vec![F257::ONE];
         let mut rng = StdRng::seed_from_u64(99);
         let ct = aadp_encrypt_u128(&cs, 123u128, &mut rng).expect("aadp encrypt u128");
-        let got = ct.decrypt_u128(witness.as_slice()).expect("aadp decrypt u128");
+        let got = ct
+            .decrypt_u128(witness.as_slice())
+            .expect("aadp decrypt u128");
         assert_eq!(got, 123u128);
     }
 
@@ -579,8 +574,9 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(1234);
         let msg = [0u8, 1, 2, 3, 250, 251, 252, 253, 254, 255];
         let ct = aadp_encrypt_bytes(&cs, &msg, &mut rng).expect("aadp encrypt bytes");
-        let got = ct.decrypt_bytes(witness.as_slice()).expect("aadp decrypt bytes");
+        let got = ct
+            .decrypt_bytes(witness.as_slice())
+            .expect("aadp decrypt bytes");
         assert_eq!(got, msg);
     }
 }
-

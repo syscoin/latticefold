@@ -3,10 +3,8 @@
 use dpp::theorem43::{Theorem43AlvoLocalCheckSurface, Theorem43Coins};
 use latticefold::transcript::poseidon::F257;
 use sha2::Digest;
-use std::io::{Read, Write};
 
-use crate::h12_alvo_daleo::{H12DaleoParams, H12DaleoProof};
-use crate::h12_pi_commit::f257_to_u16;
+use crate::{h12_alvo_germ::H12GermProof, h12_pi_commit::f257_to_u16};
 
 #[derive(Clone, Debug)]
 pub struct H12AlvoClaim {
@@ -44,15 +42,8 @@ pub struct H12AlvoLogicalLockAugmentation {
     pub stage2_root: [u8; 32],
     pub schedule_digest: [u8; 32],
     pub surfaces: Vec<Theorem43AlvoLocalCheckSurface<F257>>,
-    pub daleo_proof: Option<H12DaleoProof>,
+    pub germ_proof: Option<H12GermProof>,
     pub rep_bundles: Vec<H12AlvoRepSurfaceBundle>,
-}
-
-#[derive(Clone, Debug)]
-pub struct H12AlvoAugmentedPackage {
-    pub stage1_lock_package_hash: [u8; 32],
-    pub stage1_lock_package: Vec<u8>,
-    pub logical_locks: Vec<H12AlvoLogicalLockAugmentation>,
 }
 
 pub fn digest_rep_bundle_hashes(rep_bundle_hashes: &[[u8; 32]], pack_d: usize) -> [u8; 32] {
@@ -106,10 +97,10 @@ pub fn derive_stage2_root(lock: &H12AlvoLogicalLockAugmentation) -> [u8; 32] {
     h.update(lock.r_cap_reps.to_le_bytes());
     h.update(lock.stage1_root);
     h.update(lock.schedule_digest);
-    match &lock.daleo_proof {
+    match &lock.germ_proof {
         Some(proof) => {
             h.update([1u8]);
-            digest_daleo_proof_into(&mut h, proof);
+            digest_germ_proof_into(&mut h, proof);
         }
         None => h.update([0u8]),
     }
@@ -125,14 +116,6 @@ pub fn derive_stage2_root(lock: &H12AlvoLogicalLockAugmentation) -> [u8; 32] {
         h.update(rep.poison_blocks.to_le_bytes());
         h.update(rep.poison_gate.to_le_bytes());
     }
-    h.finalize().into()
-}
-
-pub fn digest_stage1_lock_package_bytes(bytes: &[u8]) -> [u8; 32] {
-    let mut h = sha2::Sha256::new();
-    h.update(b"LFP_H12_ALVO_STAGE1_PKG_V1");
-    h.update((bytes.len() as u64).to_le_bytes());
-    h.update(bytes);
     h.finalize().into()
 }
 
@@ -221,7 +204,7 @@ fn digest_anchor_projection_into(h: &mut sha2::Sha256, proj: &H12AlvoAnchorProje
     h.update(proj.delta_gamma_pi.to_le_bytes());
 }
 
-fn digest_daleo_proof_into(h: &mut sha2::Sha256, proof: &H12DaleoProof) {
+fn digest_germ_proof_into(h: &mut sha2::Sha256, proof: &H12GermProof) {
     h.update(proof.params.pack_d.to_le_bytes());
     h.update(proof.params.commit_rows.to_le_bytes());
     h.update(proof.params.blind_len.to_le_bytes());
@@ -233,21 +216,6 @@ fn digest_daleo_proof_into(h: &mut sha2::Sha256, proof: &H12DaleoProof) {
     for &v in &proof.blind_values {
         h.update(v.to_le_bytes());
     }
-    h.update((proof.opening_projection_residuals.len() as u32).to_le_bytes());
-    for &v in &proof.opening_projection_residuals {
-        h.update(v.to_le_bytes());
-    }
-    h.update((proof.h_projection_residuals.len() as u32).to_le_bytes());
-    for &v in &proof.h_projection_residuals {
-        h.update(v.to_le_bytes());
-    }
-    h.update((proof.h_opened_logical_rows.len() as u32).to_le_bytes());
-    for row in &proof.h_opened_logical_rows {
-        h.update((row.len() as u32).to_le_bytes());
-        for &v in row {
-            h.update(v.to_le_bytes());
-        }
-    }
     h.update((proof.ajtai_commitment_rows.len() as u32).to_le_bytes());
     for row in &proof.ajtai_commitment_rows {
         h.update((row.len() as u32).to_le_bytes());
@@ -255,469 +223,63 @@ fn digest_daleo_proof_into(h: &mut sha2::Sha256, proof: &H12DaleoProof) {
             h.update(v.to_le_bytes());
         }
     }
-    h.update((proof.designated_challenge.len() as u32).to_le_bytes());
-    for &v in &proof.designated_challenge {
+    h.update((proof.verifier_payload.global_err_packed_values.len() as u32).to_le_bytes());
+    for &v in &proof.verifier_payload.global_err_packed_values {
         h.update(v.to_le_bytes());
     }
-}
-
-pub fn write_augmented_package(
-    w: &mut impl Write,
-    pkg: &H12AlvoAugmentedPackage,
-) -> std::io::Result<()> {
-    w.write_all(b"LFP1ALVOA7")?;
-    w.write_all(&pkg.stage1_lock_package_hash)?;
-    write_u32(w, pkg.stage1_lock_package.len() as u32)?;
-    w.write_all(pkg.stage1_lock_package.as_slice())?;
-    write_u32(w, pkg.logical_locks.len() as u32)?;
-    for lock in &pkg.logical_locks {
-        write_u32(w, lock.share_index)?;
-        write_u16(w, lock.r_cap_reps)?;
-        w.write_all(&lock.stage1_root)?;
-        w.write_all(&lock.stage2_root)?;
-        w.write_all(&lock.schedule_digest)?;
-        write_u32(w, lock.surfaces.len() as u32)?;
-        for surface in &lock.surfaces {
-            write_surface(w, surface)?;
+    h.update((proof.verifier_payload.designated_challenge.len() as u32).to_le_bytes());
+    for &v in &proof.verifier_payload.designated_challenge {
+        h.update(v.to_le_bytes());
+    }
+    h.update((proof.verifier_payload.opening_projection_residuals.len() as u32).to_le_bytes());
+    for &v in &proof.verifier_payload.opening_projection_residuals {
+        h.update(v.to_le_bytes());
+    }
+    h.update((proof.verifier_payload.h_projection_residuals.len() as u32).to_le_bytes());
+    for &v in &proof.verifier_payload.h_projection_residuals {
+        h.update(v.to_le_bytes());
+    }
+    h.update((proof.verifier_payload.germ_linear_fingerprints.len() as u32).to_le_bytes());
+    for fp in &proof.verifier_payload.germ_linear_fingerprints {
+        for &v in fp {
+            h.update(v.to_le_bytes());
         }
-        match &lock.daleo_proof {
-            Some(proof) => {
-                w.write_all(&[1u8])?;
-                write_daleo_proof(w, proof)?;
+    }
+    h.update(proof.verifier_payload.germ_mul_sumcheck.nvars.to_le_bytes());
+    h.update((proof.verifier_payload.germ_mul_sumcheck.rounds.len() as u32).to_le_bytes());
+    for round in &proof.verifier_payload.germ_mul_sumcheck.rounds {
+        for eval in &round.evaluations {
+            for &v in eval {
+                h.update(v.to_le_bytes());
             }
-            None => w.write_all(&[0u8])?,
-        }
-        write_u32(w, lock.rep_bundles.len() as u32)?;
-        for rep in &lock.rep_bundles {
-            write_u64(w, rep.rep_id)?;
-            write_u64(w, rep.anchor_block_id as u64)?;
-            write_u32(w, rep.anchor_hint_blocks.len() as u32)?;
-            for &block_idx in &rep.anchor_hint_blocks {
-                write_u64(w, block_idx as u64)?;
-            }
-            write_anchor_projection(w, &rep.anchor_projection)?;
-            write_u32(w, rep.poison_blocks as u32)?;
-            write_u16(w, rep.poison_gate)?;
         }
     }
-    Ok(())
-}
-
-pub fn read_augmented_package(r: &mut impl Read) -> std::io::Result<H12AlvoAugmentedPackage> {
-    let mut magic = [0u8; 10];
-    r.read_exact(&mut magic)?;
-    if &magic != b"LFP1ALVOA7" {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "bad H12 ALVO augmented package magic",
-        ));
+    for &v in &proof.verifier_payload.germ_mul_sumcheck.opening.a_eval {
+        h.update(v.to_le_bytes());
     }
-    let mut stage1_lock_package_hash = [0u8; 32];
-    r.read_exact(&mut stage1_lock_package_hash)?;
-    let stage1_len = read_u32(r)? as usize;
-    let mut stage1_lock_package = vec![0u8; stage1_len];
-    r.read_exact(stage1_lock_package.as_mut_slice())?;
-    let lock_n = read_u32(r)? as usize;
-    let mut logical_locks = Vec::with_capacity(lock_n);
-    for _ in 0..lock_n {
-        let share_index = read_u32(r)?;
-        let r_cap_reps = read_u16(r)?;
-        let mut stage1_root = [0u8; 32];
-        r.read_exact(&mut stage1_root)?;
-        let mut stage2_root = [0u8; 32];
-        r.read_exact(&mut stage2_root)?;
-        let mut schedule_digest = [0u8; 32];
-        r.read_exact(&mut schedule_digest)?;
-        let surface_n = read_u32(r)? as usize;
-        let mut surfaces = Vec::with_capacity(surface_n);
-        for _ in 0..surface_n {
-            surfaces.push(read_surface(r)?);
-        }
-        let mut daleo_proof = None;
-        let mut has_proof = [0u8; 1];
-        r.read_exact(&mut has_proof)?;
-        if has_proof[0] != 0 {
-            daleo_proof = Some(read_daleo_proof(r)?);
-        }
-        let rep_n = read_u32(r)? as usize;
-        let mut rep_bundles = Vec::with_capacity(rep_n);
-        for _ in 0..rep_n {
-            let rep_id = read_u64(r)?;
-            let anchor_block_id = read_u64(r)? as usize;
-            let hint_n = read_u32(r)? as usize;
-            let mut anchor_hint_blocks = Vec::with_capacity(hint_n);
-            for _ in 0..hint_n {
-                anchor_hint_blocks.push(read_u64(r)? as usize);
-            }
-            let anchor_projection = read_anchor_projection(r)?;
-            let poison_blocks = read_u32(r)? as usize;
-            let poison_gate = read_u16(r)?;
-            rep_bundles.push(H12AlvoRepSurfaceBundle {
-                rep_id,
-                anchor_block_id,
-                anchor_hint_blocks,
-                anchor_projection,
-                poison_blocks,
-                poison_gate,
-            });
-        }
-        logical_locks.push(H12AlvoLogicalLockAugmentation {
-            share_index,
-            r_cap_reps,
-            stage1_root,
-            stage2_root,
-            schedule_digest,
-            surfaces,
-            daleo_proof,
-            rep_bundles,
-        });
+    for &v in &proof.verifier_payload.germ_mul_sumcheck.opening.b_eval {
+        h.update(v.to_le_bytes());
     }
-    Ok(H12AlvoAugmentedPackage {
-        stage1_lock_package_hash,
-        stage1_lock_package,
-        logical_locks,
-    })
-}
-
-fn write_surface(
-    w: &mut impl Write,
-    surface: &Theorem43AlvoLocalCheckSurface<F257>,
-) -> std::io::Result<()> {
-    let base = &surface.local_check;
-    write_u64(w, base.block_id as u64)?;
-    write_u64(w, base.rep_id)?;
-    write_coins(w, &base.coins)?;
-    write_sparse_terms(w, base.q1_pi_terms.as_slice())?;
-    write_sparse_terms(w, base.q2_pi_terms.as_slice())?;
-    write_sparse_terms(w, base.q3_pi_sparse_terms.as_slice())?;
-    write_u16(w, f257_to_u16(base.q1_x_dot))?;
-    write_u16(w, f257_to_u16(base.q2_x_dot))?;
-    write_u16(w, f257_to_u16(base.q3_x_dot_sparse))?;
-    write_sparse_terms(w, base.q1_w_terms.as_slice())?;
-    write_sparse_terms(w, base.q2_w_terms.as_slice())?;
-    write_sparse_terms(w, base.q3_w_terms.as_slice())?;
-    write_u64(w, base.w_eval_block_pi_offset as u64)?;
-    write_u64(w, base.w_eval_block_len as u64)?;
-    w.write_all(&[base.requires_dense_q3_w_eval as u8])?;
-    let layout = &surface.proof_layout;
-    write_u64(w, layout.n as u64)?;
-    write_u64(w, layout.n_total as u64)?;
-    write_u64(w, layout.z_w_len as u64)?;
-    write_u64(w, layout.pi0_len as u64)?;
-    write_u64(w, layout.blocks as u64)?;
-    write_u64(w, layout.ell_local as u64)?;
-    write_u64(w, layout.k_star as u64)?;
-    write_u64(w, layout.low_cube_len as u64)?;
-    write_u32(w, layout.witness_positions_star.len() as u32)?;
-    for &pos in &layout.witness_positions_star {
-        write_u64(w, pos as u64)?;
+    for &v in &proof.verifier_payload.germ_mul_sumcheck.opening.c_eval {
+        h.update(v.to_le_bytes());
     }
-    write_u32(w, surface.h_w_eval_constraints.len() as u32)?;
-    for lc in &surface.h_w_eval_constraints {
-        write_u16(w, f257_to_u16(lc.constant))?;
-        write_u32(w, lc.terms.len() as u32)?;
-        for &(pos, coeff) in &lc.terms {
-            write_u64(w, pos as u64)?;
-            write_u16(w, f257_to_u16(coeff))?;
-        }
+    for &v in &proof.verifier_payload.germ_mul_sumcheck.opening.d_eval {
+        h.update(v.to_le_bytes());
     }
-    write_u32(w, surface.touched_pi_positions_exact.len() as u32)?;
-    for &pi_idx in &surface.touched_pi_positions_exact {
-        write_u64(w, pi_idx as u64)?;
-    }
-    write_u32(w, surface.touched_pi_positions_conservative.len() as u32)?;
-    for &pi_idx in &surface.touched_pi_positions_conservative {
-        write_u64(w, pi_idx as u64)?;
-    }
-    Ok(())
-}
-
-fn read_surface(r: &mut impl Read) -> std::io::Result<Theorem43AlvoLocalCheckSurface<F257>> {
-    let block_id = read_u64(r)? as usize;
-    let rep_id = read_u64(r)?;
-    let coins = read_coins(r)?;
-    let q1_pi_terms = read_sparse_terms(r)?;
-    let q2_pi_terms = read_sparse_terms(r)?;
-    let q3_pi_sparse_terms = read_sparse_terms(r)?;
-    let q1_x_dot = u16_to_f257(read_u16(r)?);
-    let q2_x_dot = u16_to_f257(read_u16(r)?);
-    let q3_x_dot_sparse = u16_to_f257(read_u16(r)?);
-    let q1_w_terms = read_sparse_terms(r)?;
-    let q2_w_terms = read_sparse_terms(r)?;
-    let q3_w_terms = read_sparse_terms(r)?;
-    let w_eval_block_pi_offset = read_u64(r)? as usize;
-    let w_eval_block_len = read_u64(r)? as usize;
-    let mut dense = [0u8; 1];
-    r.read_exact(&mut dense)?;
-    let n = read_u64(r)? as usize;
-    let n_total = read_u64(r)? as usize;
-    let z_w_len = read_u64(r)? as usize;
-    let pi0_len = read_u64(r)? as usize;
-    let blocks = read_u64(r)? as usize;
-    let ell_local = read_u64(r)? as usize;
-    let k_star = read_u64(r)? as usize;
-    let low_cube_len = read_u64(r)? as usize;
-    let witness_pos_n = read_u32(r)? as usize;
-    let mut witness_positions_star = Vec::with_capacity(witness_pos_n);
-    for _ in 0..witness_pos_n {
-        witness_positions_star.push(read_u64(r)? as usize);
-    }
-    let lc_n = read_u32(r)? as usize;
-    let mut h_w_eval_constraints = Vec::with_capacity(lc_n);
-    for _ in 0..lc_n {
-        let constant = u16_to_f257(read_u16(r)?);
-        let term_n = read_u32(r)? as usize;
-        let mut terms = Vec::with_capacity(term_n);
-        for _ in 0..term_n {
-            terms.push((read_u64(r)? as usize, u16_to_f257(read_u16(r)?)));
-        }
-        h_w_eval_constraints.push(dpp::dr1cs_flpcp::Dr1csBlockLinearConstraint { constant, terms });
-    }
-    let exact_n = read_u32(r)? as usize;
-    let mut touched_pi_positions_exact = Vec::with_capacity(exact_n);
-    for _ in 0..exact_n {
-        touched_pi_positions_exact.push(read_u64(r)? as usize);
-    }
-    let cons_n = read_u32(r)? as usize;
-    let mut touched_pi_positions_conservative = Vec::with_capacity(cons_n);
-    for _ in 0..cons_n {
-        touched_pi_positions_conservative.push(read_u64(r)? as usize);
-    }
-    Ok(Theorem43AlvoLocalCheckSurface {
-        local_check: dpp::theorem43::Theorem43CapsuleLocalCheckSurface {
-            block_id,
-            rep_id,
-            coins,
-            q1_pi_terms,
-            q2_pi_terms,
-            q3_pi_sparse_terms,
-            q1_x_dot,
-            q2_x_dot,
-            q3_x_dot_sparse,
-            q1_w_terms,
-            q2_w_terms,
-            q3_w_terms,
-            w_eval_block_pi_offset,
-            w_eval_block_len,
-            requires_dense_q3_w_eval: dense[0] != 0,
-        },
-        proof_layout: dpp::dr1cs_flpcp::Dr1csProofLayoutInfo {
-            n,
-            n_total,
-            z_w_len,
-            pi0_len,
-            blocks,
-            ell_local,
-            k_star,
-            low_cube_len,
-            witness_positions_star,
-        },
-        h_w_eval_constraints,
-        touched_pi_positions_exact,
-        touched_pi_positions_conservative,
-    })
-}
-
-fn write_anchor_projection(w: &mut impl Write, proj: &H12AlvoAnchorProjection) -> std::io::Result<()> {
-    write_u16(w, proj.y_anchor_stream)?;
-    write_u16(w, proj.alpha_sparse)?;
-    write_u16(w, proj.beta_sparse)?;
-    write_u16(w, proj.delta_gamma_pi)?;
-    Ok(())
-}
-
-fn read_anchor_projection(r: &mut impl Read) -> std::io::Result<H12AlvoAnchorProjection> {
-    Ok(H12AlvoAnchorProjection {
-        y_anchor_stream: read_u16(r)?,
-        alpha_sparse: read_u16(r)?,
-        beta_sparse: read_u16(r)?,
-        delta_gamma_pi: read_u16(r)?,
-    })
-}
-
-fn write_coins(w: &mut impl Write, coins: &Theorem43Coins<F257>) -> std::io::Result<()> {
-    write_u64(w, coins.idx as u64)?;
-    write_u16(w, f257_to_u16(coins.lambda))?;
-    write_u16(w, f257_to_u16(coins.rho))?;
-    write_u16(w, f257_to_u16(coins.sigma))?;
-    write_u16(w, f257_to_u16(coins.c_hit))?;
-    Ok(())
-}
-
-fn read_coins(r: &mut impl Read) -> std::io::Result<Theorem43Coins<F257>> {
-    Ok(Theorem43Coins {
-        idx: read_u64(r)? as usize,
-        lambda: u16_to_f257(read_u16(r)?),
-        rho: u16_to_f257(read_u16(r)?),
-        sigma: u16_to_f257(read_u16(r)?),
-        c_hit: u16_to_f257(read_u16(r)?),
-    })
-}
-
-fn write_sparse_terms(w: &mut impl Write, terms: &[(usize, F257)]) -> std::io::Result<()> {
-    write_u32(w, terms.len() as u32)?;
-    for &(idx, coeff) in terms {
-        write_u64(w, idx as u64)?;
-        write_u16(w, f257_to_u16(coeff))?;
-    }
-    Ok(())
-}
-
-fn read_sparse_terms(r: &mut impl Read) -> std::io::Result<Vec<(usize, F257)>> {
-    let n = read_u32(r)? as usize;
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        out.push((read_u64(r)? as usize, u16_to_f257(read_u16(r)?)));
-    }
-    Ok(out)
-}
-
-fn write_daleo_proof(w: &mut impl Write, proof: &H12DaleoProof) -> std::io::Result<()> {
-    write_u16(w, proof.params.pack_d)?;
-    write_u16(w, proof.params.commit_rows)?;
-    write_u16(w, proof.params.blind_len)?;
-    write_u32(w, proof.local_view_values.len() as u32)?;
-    for &v in &proof.local_view_values {
-        write_u16(w, v)?;
-    }
-    write_u32(w, proof.blind_values.len() as u32)?;
-    for &v in &proof.blind_values {
-        write_u16(w, v)?;
-    }
-    write_u32(w, proof.opening_projection_residuals.len() as u32)?;
-    for &v in &proof.opening_projection_residuals {
-        write_u16(w, v)?;
-    }
-    write_u32(w, proof.h_projection_residuals.len() as u32)?;
-    for &v in &proof.h_projection_residuals {
-        write_u16(w, v)?;
-    }
-    write_u32(w, proof.h_opened_logical_rows.len() as u32)?;
-    for row in &proof.h_opened_logical_rows {
-        write_u32(w, row.len() as u32)?;
-        for &v in row {
-            write_u16(w, v)?;
-        }
-    }
-    write_u32(w, proof.ajtai_commitment_rows.len() as u32)?;
-    for row in &proof.ajtai_commitment_rows {
-        write_u32(w, row.len() as u32)?;
-        for &v in row {
-            write_u64(w, v)?;
-        }
-    }
-    write_u32(w, proof.designated_challenge.len() as u32)?;
-    for &v in &proof.designated_challenge {
-        write_u16(w, v)?;
-    }
-    Ok(())
-}
-
-fn read_daleo_proof(r: &mut impl Read) -> std::io::Result<H12DaleoProof> {
-    let pack_d = read_u16(r)?;
-    let commit_rows = read_u16(r)?;
-    let blind_len = read_u16(r)?;
-    let local_n = read_u32(r)? as usize;
-    let mut local_view_values = Vec::with_capacity(local_n);
-    for _ in 0..local_n {
-        local_view_values.push(read_u16(r)?);
-    }
-    let blind_n = read_u32(r)? as usize;
-    let mut blind_values = Vec::with_capacity(blind_n);
-    for _ in 0..blind_n {
-        blind_values.push(read_u16(r)?);
-    }
-    let opening_proj_n = read_u32(r)? as usize;
-    let mut opening_projection_residuals = Vec::with_capacity(opening_proj_n);
-    for _ in 0..opening_proj_n {
-        opening_projection_residuals.push(read_u16(r)?);
-    }
-    let h_proj_n = read_u32(r)? as usize;
-    let mut h_projection_residuals = Vec::with_capacity(h_proj_n);
-    for _ in 0..h_proj_n {
-        h_projection_residuals.push(read_u16(r)?);
-    }
-    let logical_rows_n = read_u32(r)? as usize;
-    let mut h_opened_logical_rows = Vec::with_capacity(logical_rows_n);
-    for _ in 0..logical_rows_n {
-        let len = read_u32(r)? as usize;
-        let mut row = Vec::with_capacity(len);
-        for _ in 0..len {
-            row.push(read_u16(r)?);
-        }
-        h_opened_logical_rows.push(row);
-    }
-    let row_n = read_u32(r)? as usize;
-    let mut ajtai_commitment_rows = Vec::with_capacity(row_n);
-    for _ in 0..row_n {
-        let len = read_u32(r)? as usize;
-        let mut row = Vec::with_capacity(len);
-        for _ in 0..len {
-            row.push(read_u64(r)?);
-        }
-        ajtai_commitment_rows.push(row);
-    }
-    let challenge_n = read_u32(r)? as usize;
-    let mut designated_challenge = Vec::with_capacity(challenge_n);
-    for _ in 0..challenge_n {
-        designated_challenge.push(read_u16(r)?);
-    }
-    Ok(H12DaleoProof {
-        params: H12DaleoParams {
-            pack_d,
-            commit_rows,
-            blind_len,
-        },
-        local_view_values,
-        blind_values,
-        opening_projection_residuals,
-        h_projection_residuals,
-        h_opened_logical_rows,
-        ajtai_commitment_rows,
-        designated_challenge,
-    })
-}
-
-fn write_u16(w: &mut impl Write, v: u16) -> std::io::Result<()> {
-    w.write_all(&v.to_le_bytes())
-}
-
-fn write_u32(w: &mut impl Write, v: u32) -> std::io::Result<()> {
-    w.write_all(&v.to_le_bytes())
-}
-
-fn write_u64(w: &mut impl Write, v: u64) -> std::io::Result<()> {
-    w.write_all(&v.to_le_bytes())
-}
-
-fn read_u16(r: &mut impl Read) -> std::io::Result<u16> {
-    let mut b = [0u8; 2];
-    r.read_exact(&mut b)?;
-    Ok(u16::from_le_bytes(b))
-}
-
-fn read_u32(r: &mut impl Read) -> std::io::Result<u32> {
-    let mut b = [0u8; 4];
-    r.read_exact(&mut b)?;
-    Ok(u32::from_le_bytes(b))
-}
-
-fn read_u64(r: &mut impl Read) -> std::io::Result<u64> {
-    let mut b = [0u8; 8];
-    r.read_exact(&mut b)?;
-    Ok(u64::from_le_bytes(b))
-}
-
-fn u16_to_f257(x: u16) -> F257 {
-    F257::from((x % 257) as u64)
 }
 
 #[cfg(test)]
 mod tests {
     use ark_ff::Field;
+    use dpp::{
+        dr1cs_flpcp::Dr1csProofLayoutInfo,
+        theorem43::{Theorem43AlvoLocalCheckSurface, Theorem43CapsuleLocalCheckSurface},
+    };
+
     use super::*;
-    use dpp::dr1cs_flpcp::Dr1csProofLayoutInfo;
-    use dpp::theorem43::{Theorem43AlvoLocalCheckSurface, Theorem43CapsuleLocalCheckSurface};
+    use crate::h12_alvo_germ::{
+        H12GermMulOpening, H12GermMulSumcheckProof, H12GermMulSumcheckRound, H12GermParams,
+    };
 
     fn dummy_surface(rep_id: u64) -> Theorem43AlvoLocalCheckSurface<F257> {
         let local_check = Theorem43CapsuleLocalCheckSurface {
@@ -762,20 +324,40 @@ mod tests {
         }
     }
 
-    fn dummy_daleo_proof(tag: u8) -> H12DaleoProof {
-        H12DaleoProof {
-            params: H12DaleoParams {
+    fn dummy_germ_proof(tag: u8) -> H12GermProof {
+        H12GermProof {
+            params: H12GermParams {
                 pack_d: 64,
                 commit_rows: 16,
                 blind_len: 16,
             },
             local_view_values: vec![tag as u16, (tag as u16) + 1],
             blind_values: vec![(tag as u16) + 2],
-            opening_projection_residuals: vec![(tag as u16) + 3],
-            h_projection_residuals: vec![(tag as u16) + 4],
-            h_opened_logical_rows: vec![vec![(tag as u16) + 6, (tag as u16) + 7]],
             ajtai_commitment_rows: vec![vec![tag as u64, (tag as u64) + 1]],
-            designated_challenge: vec![(tag as u16) + 5],
+            verifier_payload: crate::h12_alvo_germ::H12GermVerifierPayload {
+                global_err_packed_values: vec![(tag as u16) + 3],
+                designated_challenge: vec![(tag as u16) + 4; 16],
+                opening_projection_residuals: vec![(tag as u16) + 5; 4],
+                h_projection_residuals: vec![(tag as u16) + 6; 4],
+                germ_linear_fingerprints: vec![[tag as u16; 16], [(tag as u16) + 1; 16]],
+                germ_mul_sumcheck: H12GermMulSumcheckProof {
+                    nvars: 1,
+                    rounds: vec![H12GermMulSumcheckRound {
+                        evaluations: [
+                            [tag as u16; 16],
+                            [(tag as u16) + 1; 16],
+                            [(tag as u16) + 2; 16],
+                            [(tag as u16) + 3; 16],
+                        ],
+                    }],
+                    opening: H12GermMulOpening {
+                        a_eval: [(tag as u16) + 4; 16],
+                        b_eval: [(tag as u16) + 5; 16],
+                        c_eval: [(tag as u16) + 6; 16],
+                        d_eval: [(tag as u16) + 7; 16],
+                    },
+                },
+            },
         }
     }
 
@@ -793,57 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn test_augmented_package_roundtrip() {
-        let surface = dummy_surface(11);
-        let rep_bundle = H12AlvoRepSurfaceBundle {
-            rep_id: 11,
-            anchor_block_id: 11,
-            anchor_hint_blocks: vec![0, 2, 5],
-            anchor_projection: H12AlvoAnchorProjection {
-                y_anchor_stream: 20,
-                alpha_sparse: 21,
-                beta_sparse: 22,
-                delta_gamma_pi: 23,
-            },
-            poison_blocks: 1,
-            poison_gate: 30,
-        };
-        let mut lock = H12AlvoLogicalLockAugmentation {
-            share_index: 7,
-            r_cap_reps: 1,
-            stage1_root: [3u8; 32],
-            stage2_root: [0u8; 32],
-            schedule_digest: digest_alvo_schedule(std::slice::from_ref(&surface), 64),
-            surfaces: vec![surface],
-            daleo_proof: Some(dummy_daleo_proof(55)),
-            rep_bundles: vec![rep_bundle],
-        };
-        lock.stage2_root = derive_stage2_root(&lock);
-        let pkg = H12AlvoAugmentedPackage {
-            stage1_lock_package_hash: digest_stage1_lock_package_bytes(b"stage1"),
-            stage1_lock_package: b"stage1".to_vec(),
-            logical_locks: vec![lock],
-        };
-        let mut buf = Vec::new();
-        write_augmented_package(&mut buf, &pkg).expect("write augmented package");
-        let got = read_augmented_package(&mut std::io::Cursor::new(buf)).expect("read augmented package");
-        assert_eq!(got.stage1_lock_package_hash, pkg.stage1_lock_package_hash);
-        assert_eq!(got.stage1_lock_package, pkg.stage1_lock_package);
-        assert_eq!(got.logical_locks.len(), 1);
-        assert_eq!(got.logical_locks[0].share_index, 7);
-        assert_eq!(got.logical_locks[0].rep_bundles[0].anchor_hint_blocks, vec![0, 2, 5]);
-        assert_eq!(
-            got.logical_locks[0]
-                .daleo_proof
-                .as_ref()
-                .expect("proof present")
-                .local_view_values,
-            vec![55, 56]
-        );
-    }
-
-    #[test]
-    fn test_stage2_root_changes_with_daleo_proof_payload() {
+    fn test_stage2_root_changes_with_germ_proof_payload() {
         let surface = dummy_surface(5);
         let mut base = H12AlvoLogicalLockAugmentation {
             share_index: 1,
@@ -852,11 +384,11 @@ mod tests {
             stage2_root: [0u8; 32],
             schedule_digest: digest_alvo_schedule(std::slice::from_ref(&surface), 64),
             surfaces: vec![surface],
-            daleo_proof: Some(dummy_daleo_proof(9)),
+            germ_proof: Some(dummy_germ_proof(9)),
             rep_bundles: Vec::new(),
         };
         let root_a = derive_stage2_root(&base);
-        base.daleo_proof = Some(dummy_daleo_proof(10));
+        base.germ_proof = Some(dummy_germ_proof(10));
         let root_b = derive_stage2_root(&base);
         assert_ne!(root_a, root_b);
     }
